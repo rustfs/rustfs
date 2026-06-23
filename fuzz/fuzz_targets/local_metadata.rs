@@ -36,21 +36,19 @@ fuzz_target!(|data: &[u8]| {
     // Full exercise on the complete input.
     exercise_full(data, algorithm);
 
-    // Prefix probing — only the fast parsers, critical boundary lengths:
-    //   0   = empty input
-    //   1-5 = partial magic header ("XL2\0" is 4 bytes + version byte)
-    //   8   = covers the header + start of bin32 length field
-    if data.len() > 0 {
-        exercise_prefix(&data[..0]);
-    }
-    if data.len() > 1 {
-        exercise_prefix(&data[..1]);
-    }
-    if data.len() > 5 {
-        exercise_prefix(&data[..5]);
-    }
-    if data.len() > 8 {
-        exercise_prefix(&data[..8]);
+    // Prefix probing aligned with xl.meta binary layout:
+    //   4  = magic header ("XL2 ")
+    //   5  = magic + version byte
+    //   8  = magic + version + start of bin32 length field
+    //   12 = magic + version + bin32 length (4 bytes) + CRC start
+    //   len-1 = truncated-at-end
+    //
+    // Only test prefixes that are strictly smaller than the full input
+    // (the full input is already tested above).
+    for prefix_len in [4usize, 5, 8, 12] {
+        if prefix_len < data.len() {
+            exercise_prefix(&data[..prefix_len]);
+        }
     }
     if data.len() > 1 {
         exercise_prefix(&data[..data.len() - 1]);

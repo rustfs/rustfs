@@ -34,7 +34,7 @@ Crash reproducers are written under `fuzz/artifacts/<target>/`.
 ## Targets
 
 - `bucket_validation`
-  - Exercises RustFS bucket-name and bucket/object argument validation without pulling in the full `rustfs` binary crate graph.
+  - Exercises RustFS bucket-name and bucket/object argument validation.
 - `archive_extract`
   - Exercises archive entry path normalization, prefix application, and bucket-namespace containment checks.
 - `path_containment`
@@ -53,28 +53,23 @@ cd fuzz
 cargo +nightly fuzz run path_containment
 ```
 
-Run bounded smoke targets from the repository root:
+Use the unified runner script from the repository root:
 
 ```bash
-./scripts/fuzz/run_ci_targets.sh
-```
+# Build + run all smoke targets (60s each)
+./scripts/fuzz/run.sh
 
-Build-only (no fuzz run, useful for CI warm-up):
+# Build only (no fuzz run)
+BUILD_ONLY=1 ./scripts/fuzz/run.sh
 
-```bash
-BUILD_ONLY=1 ./scripts/fuzz/run_ci_targets.sh
-```
+# Build + run a single target
+FUZZ_TARGET=path_containment ./scripts/fuzz/run.sh
 
-Run a single target (no build phase, assumes pre-built harness):
+# Nightly-style: 300s per target
+MAX_TOTAL_TIME=300 ./scripts/fuzz/run.sh
 
-```bash
-FUZZ_TARGET=path_containment ./scripts/fuzz/run_single_target.sh
-```
-
-Run a longer local/nightly-style pass:
-
-```bash
-./scripts/fuzz/run_nightly_targets.sh
+# Skip build (use pre-built harness)
+SKIP_BUILD=1 FUZZ_TARGET=local_metadata ./scripts/fuzz/run.sh
 ```
 
 ## CI Workflow

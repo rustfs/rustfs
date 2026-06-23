@@ -47,6 +47,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   CARGO_BUILD_TARGET: x86_64-unknown-linux-gnu
+  RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
 
 jobs:
   # ──────────────────────────────────────────────────────────────
@@ -62,7 +63,6 @@ jobs:
     timeout-minutes: 45
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -71,7 +71,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: nightly
-          cache-shared-key: fuzz-build-${{ hashFiles('fuzz/Cargo.lock') }}
+          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
 
@@ -81,14 +81,13 @@ jobs:
           tool: cargo-fuzz
 
       - name: Build all fuzz targets
-        run: BUILD_ONLY=1 ./scripts/fuzz/run_ci_targets.sh
+        run: BUILD_ONLY=1 ./scripts/fuzz/run.sh
 
       - name: Upload fuzz build artifacts
         uses: actions/upload-artifact@v6
         with:
           name: fuzz-build-${{ github.run_number }}
-          path: |
-            fuzz/target/
+          path: fuzz/target/
           if-no-files-found: error
           retention-days: 1
 
@@ -110,9 +109,6 @@ jobs:
         target: [path_containment, bucket_validation, local_metadata]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      MAX_TOTAL_TIME: 60
-      ARTIFACT_ROOT: artifacts
-      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -121,7 +117,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: nightly
-          cache-shared-key: fuzz-build-${{ hashFiles('fuzz/Cargo.lock') }}
+          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: "false"
 
@@ -139,7 +135,9 @@ jobs:
       - name: Run ${{ matrix.target }}
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-        run: ./scripts/fuzz/run_single_target.sh
+          MAX_TOTAL_TIME: 60
+          SKIP_BUILD: 1
+        run: ./scripts/fuzz/run.sh
 
       - name: Upload fuzz smoke artifacts
         if: always()
@@ -170,9 +168,6 @@ jobs:
         target: [path_containment, bucket_validation, local_metadata]
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
-      MAX_TOTAL_TIME: 300
-      ARTIFACT_ROOT: artifacts
-      RUSTFLAGS: "--cfg tokio_unstable -C target-feature=-crt-static"
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -181,7 +176,7 @@ jobs:
         uses: ./.github/actions/setup
         with:
           rust-version: nightly
-          cache-shared-key: fuzz-build-${{ hashFiles('fuzz/Cargo.lock') }}
+          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           cache-save-if: "false"
 
@@ -199,7 +194,9 @@ jobs:
       - name: Run ${{ matrix.target }}
         env:
           FUZZ_TARGET: ${{ matrix.target }}
-        run: ./scripts/fuzz/run_single_target.sh
+          MAX_TOTAL_TIME: 300
+          SKIP_BUILD: 1
+        run: ./scripts/fuzz/run.sh
 
       - name: Upload nightly fuzz artifacts
         if: always()
