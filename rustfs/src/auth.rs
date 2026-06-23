@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_action_credentials;
 use http::HeaderMap;
 use http::Uri;
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
     SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
@@ -330,7 +331,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
-    let Some(mut cred) = get_global_action_cred() else {
+    let Some(mut cred) = resolve_action_credentials() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
             format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
@@ -434,7 +435,7 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
     }
 
-    let Some(sys_cred) = get_global_action_cred() else {
+    let Some(sys_cred) = resolve_action_credentials() else {
         return Err(s3_error!(InternalError, "action cred not init"));
     };
 
@@ -610,7 +611,7 @@ pub fn get_condition_values_with_query_and_client_info(
         cred.access_key.clone()
     };
 
-    let sys_cred = get_global_action_cred().unwrap_or_default();
+    let sys_cred = resolve_action_credentials().unwrap_or_default();
 
     let claims = &cred.claims;
 
