@@ -14,6 +14,8 @@
 #   ARTIFACT_ROOT   — artifact output directory (default: artifacts)
 #   BUILD_ONLY      — set to 1 to skip fuzz runs (default: 0)
 #   SKIP_BUILD      — set to 1 to skip build phase (default: 0)
+#   USE_PREBUILT_BINARY — set to 1 to run a prebuilt fuzz binary directly
+#   PREBUILT_BINARY_DIR — directory containing prebuilt fuzz binaries
 
 set -eu
 
@@ -25,6 +27,8 @@ ARTIFACT_ROOT=${ARTIFACT_ROOT:-artifacts}
 FUZZ_TARGET=${FUZZ_TARGET:-}
 BUILD_ONLY=${BUILD_ONLY:-0}
 SKIP_BUILD=${SKIP_BUILD:-0}
+USE_PREBUILT_BINARY=${USE_PREBUILT_BINARY:-0}
+PREBUILT_BINARY_DIR=${PREBUILT_BINARY_DIR:-}
 
 cd "$FUZZ_DIR"
 mkdir -p "$ARTIFACT_ROOT"
@@ -50,7 +54,29 @@ fi
 # Phase 2: run each target (incremental — no recompilation if already built)
 for target in $targets; do
     artifact_dir="$ARTIFACT_ROOT/$target"
+    corpus_dir="$FUZZ_DIR/corpus/$target"
     mkdir -p "$artifact_dir"
+    mkdir -p "$corpus_dir"
+
+    if [ "$USE_PREBUILT_BINARY" = "1" ]; then
+        binary_dir="$PREBUILT_BINARY_DIR"
+        if [ -z "$binary_dir" ]; then
+            if [ -n "${CARGO_BUILD_TARGET:-}" ]; then
+                binary_dir="$FUZZ_DIR/target/${CARGO_BUILD_TARGET}/release"
+            else
+                binary_dir="$FUZZ_DIR/target/release"
+            fi
+        fi
+        binary_path="$binary_dir/$target"
+        if [ ! -x "$binary_path" ]; then
+            echo "Missing executable prebuilt fuzz binary: $binary_path" >&2
+            exit 1
+        fi
+        echo "==> $binary_path (-max_total_time=$MAX_TOTAL_TIME, -artifact_prefix=$artifact_dir/, corpus=$corpus_dir)"
+        "$binary_path" -max_total_time="$MAX_TOTAL_TIME" -artifact_prefix="$artifact_dir/" "$corpus_dir"
+        continue
+    fi
+
     echo "==> cargo +nightly fuzz run $target (-max_total_time=$MAX_TOTAL_TIME, -artifact_prefix=$artifact_dir/)"
     cargo +nightly fuzz run "$target" -- -max_total_time="$MAX_TOTAL_TIME" -artifact_prefix="$artifact_dir/"
 done

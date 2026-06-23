@@ -76,9 +76,9 @@ SKIP_BUILD=1 FUZZ_TARGET=local_metadata ./scripts/fuzz/run.sh
 
 The GitHub Actions workflow (`.github/workflows/fuzz.yml`) uses a **build/run separation** pattern:
 
-1. **`fuzz-build`** — compiles all fuzz targets once, uploads `fuzz/target/` as an artifact.
-2. **`pr-fuzz-smoke`** — matrix job that runs each target in parallel (60s each). Restores the build artifact so there is no recompilation.
-3. **`nightly-fuzz-corpus`** — matrix job that runs each target in parallel (300s each) on a daily schedule.
+1. **`fuzz-build`** — compiles all fuzz targets once, then uploads only the prebuilt smoke harness binaries needed by later jobs.
+2. **`pr-fuzz-smoke`** — matrix job that runs each target in parallel (60s each). Downloads the prebuilt binaries and executes them directly, so the job does not need to restore the full `fuzz/target/` tree or reinstall `cargo-fuzz`.
+3. **`nightly-fuzz-corpus`** — matrix job that reuses the same prebuilt binaries and runs each target in parallel (300s each) on a daily schedule.
 
 This design avoids redundant compilation across targets and keeps wall-clock time low.
 

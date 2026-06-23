@@ -83,13 +83,25 @@ jobs:
       - name: Build all fuzz targets
         run: BUILD_ONLY=1 ./scripts/fuzz/run.sh
 
-      - name: Upload fuzz build artifacts
+      - name: Stage prebuilt fuzz binaries
+        run: |
+          binary_root="fuzz/prebuilt/${CARGO_BUILD_TARGET}/release"
+          mkdir -p "${binary_root}"
+          for target in path_containment bucket_validation local_metadata; do
+            install -Dm755 "fuzz/target/${CARGO_BUILD_TARGET}/release/${target}" "${binary_root}/${target}"
+          done
+
+      - name: Upload prebuilt fuzz binaries
         uses: actions/upload-artifact@v6
         with:
-          name: fuzz-build-${{ github.run_number }}
-          path: fuzz/target/
+          name: fuzz-prebuilt-binaries-${{ github.run_number }}
+          path: |
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/path_containment
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/bucket_validation
+            fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release/local_metadata
           if-no-files-found: error
           retention-days: 1
+          compression-level: 0
 
   # ──────────────────────────────────────────────────────────────
   # Phase 2 (PR): Run smoke targets in parallel via matrix.
@@ -113,30 +125,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Download prebuilt fuzz binaries
+        uses: actions/download-artifact@v7
         with:
-          rust-version: nightly
-          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: "false"
+          name: fuzz-prebuilt-binaries-${{ github.run_number }}
+          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
 
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-
-      - name: Download fuzz build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          name: fuzz-build-${{ github.run_number }}
-          path: fuzz/target/
+      - name: Restore executable bit
+        run: chmod +x "fuzz/prebuilt/${CARGO_BUILD_TARGET}/release/${{ matrix.target }}"
 
       - name: Run ${{ matrix.target }}
         env:
           FUZZ_TARGET: ${{ matrix.target }}
           MAX_TOTAL_TIME: 60
           SKIP_BUILD: 1
+          USE_PREBUILT_BINARY: 1
+          PREBUILT_BINARY_DIR: ${{ github.workspace }}/fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
         run: ./scripts/fuzz/run.sh
 
       - name: Upload fuzz smoke artifacts
@@ -172,30 +176,22 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Setup Rust environment
-        uses: ./.github/actions/setup
+      - name: Download prebuilt fuzz binaries
+        uses: actions/download-artifact@v7
         with:
-          rust-version: nightly
-          cache-shared-key: fuzz-${{ hashFiles('fuzz/Cargo.lock') }}
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          cache-save-if: "false"
+          name: fuzz-prebuilt-binaries-${{ github.run_number }}
+          path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
 
-      - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-fuzz
-
-      - name: Download fuzz build artifacts
-        uses: actions/download-artifact@v6
-        with:
-          name: fuzz-build-${{ github.run_number }}
-          path: fuzz/target/
+      - name: Restore executable bit
+        run: chmod +x "fuzz/prebuilt/${CARGO_BUILD_TARGET}/release/${{ matrix.target }}"
 
       - name: Run ${{ matrix.target }}
         env:
           FUZZ_TARGET: ${{ matrix.target }}
           MAX_TOTAL_TIME: 300
           SKIP_BUILD: 1
+          USE_PREBUILT_BINARY: 1
+          PREBUILT_BINARY_DIR: ${{ github.workspace }}/fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
         run: ./scripts/fuzz/run.sh
 
       - name: Upload nightly fuzz artifacts
