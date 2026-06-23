@@ -598,6 +598,7 @@ mod tests {
         assert_string_return(get_rpc_token);
     }
 
+    #[allow(deprecated)]
     #[test]
     fn test_get_rpc_token_matches_fallible_api_contract() {
         match try_get_rpc_token() {
