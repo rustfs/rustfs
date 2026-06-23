@@ -328,7 +328,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let version_id = req_info.version_id.clone();
 
     if let Some(cred) = &cred {
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),
@@ -841,7 +841,7 @@ async fn authorize_table_data_plane_if_needed(
     let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
         return Ok(());
     };
-    let Ok(iam_store) = rustfs_iam::get() else {
+    let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
 

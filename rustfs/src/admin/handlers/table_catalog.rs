@@ -701,7 +701,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);
 
-        let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+        let iam_store = crate::app::context::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
         iam_store
             .set_temp_user(&credential.access_key, &credential, None)
             .await

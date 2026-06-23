@@ -292,7 +292,7 @@ impl Operation for AddServiceAccount {
             req_is_derived_cred = true;
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -513,7 +513,7 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -642,7 +642,7 @@ impl Operation for InfoServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -719,7 +719,7 @@ impl Operation for TemporaryAccountInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -789,7 +789,7 @@ impl Operation for InfoAccessKey {
             query.access_key
         };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -912,7 +912,7 @@ impl Operation for ListServiceAccount {
         //     cred.parent_user
         // };
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1049,7 +1049,7 @@ impl Operation for ListAccessKeysBulk {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1252,7 +1252,7 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
