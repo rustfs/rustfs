@@ -28,11 +28,10 @@ use crate::{
     admin::{
         EndpointServerPools, PeerRestClient,
         auth::validate_admin_request,
-        get_global_notification_sys,
         router::{AdminOperation, Operation, S3Router},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::{resolve_endpoints_handle, resolve_object_store_handle},
+    app::context::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
@@ -262,7 +261,7 @@ fn decommission_peer_target(
     }
 
     let grid_host = endpoint.grid_host();
-    let Some(notification_sys) = get_global_notification_sys() else {
+    let Some(notification_sys) = resolve_notification_system() else {
         log_pool_request_rejected_with_index_audit(
             operation_to_event(operation),
             "notification_sys_not_initialized",
