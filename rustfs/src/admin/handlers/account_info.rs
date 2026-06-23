@@ -69,7 +69,7 @@ impl Operation for AccountInfoHandler {
 
         let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
 
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 

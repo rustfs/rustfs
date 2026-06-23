@@ -358,6 +358,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
+        "/rustfs/admin/v4/runtime/capabilities",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Get,
         "/rustfs/admin/v4/plugins/catalog",
         SERVER_INFO,
         RouteRiskLevel::Sensitive,

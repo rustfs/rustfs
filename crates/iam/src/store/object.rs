@@ -23,9 +23,9 @@ use crate::{
     error::{is_err_no_such_policy, is_err_no_such_user},
     keyring,
     manager::{extract_jwt_claims, extract_jwt_claims_allow_missing_exp, get_default_policyes},
+    root_credentials,
 };
 use futures::future::join_all;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_policy::{auth::UserIdentity, policy::PolicyDoc};
 use rustfs_storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations};
@@ -165,7 +165,7 @@ impl ObjectStore {
         }
 
         const STREAM_IO_HEADER_LEN: usize = 41;
-        let cred = get_global_action_cred().unwrap_or_default();
+        let cred = root_credentials::credentials_or_default();
         let mut last_err = None;
 
         let mut try_decrypt_with_key = |key: &[u8], source: DecryptSource| -> Option<DecryptOutcome> {
@@ -1273,16 +1273,16 @@ impl Store for ObjectStore {
 mod tests {
     use super::{DecryptSource, ObjectStore};
     use crate::keyring;
-    use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
+    use rustfs_credentials::{Credentials, init_global_action_credentials};
     use serial_test::serial;
     use temp_env::with_vars;
 
     fn test_cred() -> Credentials {
-        if let Some(cred) = get_global_action_cred() {
+        if let Some(cred) = crate::root_credentials::credentials() {
             return cred;
         }
         let _ = init_global_action_credentials(Some("COMPATTESTAK".to_string()), Some("COMPATTESTSK1234567890".to_string()));
-        get_global_action_cred().unwrap_or_default()
+        crate::root_credentials::credentials_or_default()
     }
 
     #[test]
