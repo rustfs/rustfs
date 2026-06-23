@@ -23,7 +23,7 @@ use super::super::{
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    LockClientsInterface, NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface,
+    LockClientsInterface, NotificationSystemInterface, NotifyInterface, OidcInterface, RegionInterface, ReplicationPoolInterface,
     RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
@@ -32,7 +32,7 @@ use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
 use rustfs_config::server_config::get_global_server_config;
 use rustfs_credentials::{Credentials, get_global_action_cred};
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{get_oidc, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
@@ -60,6 +60,16 @@ impl IamInterface for IamHandle {
 
     fn is_ready(&self) -> bool {
         rustfs_iam::get().is_ok()
+    }
+}
+
+/// Default OIDC interface adapter.
+#[derive(Default)]
+pub struct OidcHandle;
+
+impl OidcInterface for OidcHandle {
+    fn handle(&self) -> Option<Arc<OidcSys>> {
+        get_oidc()
     }
 }
 
@@ -316,6 +326,10 @@ pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
 
 pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
     Arc::new(ActionCredentialHandle)
+}
+
+pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
+    Arc::new(OidcHandle)
 }
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {

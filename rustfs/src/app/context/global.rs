@@ -17,14 +17,14 @@ use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
     default_endpoints_interface, default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
-    default_lock_clients_interface, default_notification_system_interface, default_notify_interface, default_region_interface,
-    default_replication_pool_interface, default_runtime_port_interface, default_server_config_interface,
-    default_tier_config_interface,
+    default_lock_clients_interface, default_notification_system_interface, default_notify_interface, default_oidc_interface,
+    default_region_interface, default_replication_pool_interface, default_runtime_port_interface,
+    default_server_config_interface, default_tier_config_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    LockClientsInterface, NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface,
+    LockClientsInterface, NotificationSystemInterface, NotifyInterface, OidcInterface, RegionInterface, ReplicationPoolInterface,
     RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
@@ -36,6 +36,7 @@ use std::sync::{Arc, OnceLock};
 pub struct AppContext {
     object_store: Arc<ECStore>,
     iam: Arc<dyn IamInterface>,
+    oidc: Arc<dyn OidcInterface>,
     #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
@@ -62,6 +63,7 @@ impl AppContext {
         Self {
             object_store,
             iam,
+            oidc: default_oidc_interface(),
             kms,
             kms_runtime: default_kms_runtime_interface(),
             notify: default_notify_interface(),
@@ -97,6 +99,10 @@ impl AppContext {
 
     pub fn iam(&self) -> Arc<dyn IamInterface> {
         self.iam.clone()
+    }
+
+    pub fn oidc(&self) -> Arc<dyn OidcInterface> {
+        self.oidc.clone()
     }
 
     #[allow(dead_code)]
@@ -176,6 +182,7 @@ impl AppContext {
 #[cfg(test)]
 pub(super) struct AppContextTestInterfaces {
     pub(super) iam: Arc<dyn IamInterface>,
+    pub(super) oidc: Arc<dyn OidcInterface>,
     pub(super) kms: Arc<dyn KmsInterface>,
     pub(super) kms_runtime: Arc<dyn KmsRuntimeInterface>,
     pub(super) notify: Arc<dyn NotifyInterface>,
@@ -202,6 +209,7 @@ impl AppContext {
         Self {
             object_store,
             iam: interfaces.iam,
+            oidc: interfaces.oidc,
             kms: interfaces.kms,
             kms_runtime: interfaces.kms_runtime,
             notify: interfaces.notify,
