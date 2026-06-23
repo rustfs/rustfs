@@ -37,7 +37,7 @@ use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
-use std::{future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
@@ -113,6 +113,11 @@ pub fn resolve_runtime_port() -> u16 {
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
     resolve_lock_client_with(get_global_app_context(), || default_lock_client_interface().handle())
+}
+
+/// Resolve lock clients map using AppContext-first precedence.
+pub fn resolve_lock_clients_handle() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+    resolve_lock_clients_handle_with(get_global_app_context(), crate::storage::get_global_lock_clients)
 }
 
 /// Resolve local node name using AppContext-first precedence.
@@ -231,6 +236,13 @@ fn resolve_lock_client_with(
     context.and_then(|context| context.lock_client().handle()).or_else(fallback)
 }
 
+fn resolve_lock_clients_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<&'static HashMap<String, Arc<dyn LockClient>>>,
+) -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+    context.and_then(|context| context.lock_clients().handles()).or_else(fallback)
+}
+
 async fn resolve_local_node_name_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> String
 where
     F: FnOnce() -> Fut,
@@ -291,8 +303,8 @@ mod tests {
     };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
-        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface,
-        RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface,
+        RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -383,6 +395,16 @@ mod tests {
     impl LockClientInterface for TestLockClientInterface {
         fn handle(&self) -> Option<Arc<dyn LockClient>> {
             self.client.clone()
+        }
+    }
+
+    struct TestLockClientsInterface {
+        clients: Option<&'static HashMap<String, Arc<dyn LockClient>>>,
+    }
+
+    impl LockClientsInterface for TestLockClientsInterface {
+        fn handles(&self) -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+            self.clients
         }
     }
 
@@ -508,6 +530,12 @@ mod tests {
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
         let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let context_lock_clients =
+            Box::leak(Box::new(HashMap::from([("context-node:9000".to_string(), context_lock_client.clone())])));
+        let fallback_lock_clients = Box::leak(Box::new(HashMap::from([(
+            "fallback-node:9000".to_string(),
+            fallback_lock_client.clone(),
+        )])));
         let context_node_name = "context-node".to_string();
         let fallback_node_name = "fallback-node".to_string();
         let context_deployment_id = "context-deployment".to_string();
@@ -553,6 +581,9 @@ mod tests {
                 }),
                 lock_client: Arc::new(TestLockClientInterface {
                     client: Some(context_lock_client.clone()),
+                }),
+                lock_clients: Arc::new(TestLockClientsInterface {
+                    clients: Some(context_lock_clients),
                 }),
                 local_node_name: Arc::new(TestLocalNodeNameInterface {
                     name: context_node_name.clone(),
@@ -606,6 +637,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(Some(context.clone()), || None).expect("context lock client"),
             &context_lock_client
+        ));
+        assert!(std::ptr::eq(
+            resolve_lock_clients_handle_with(Some(context.clone()), || None).expect("context lock clients"),
+            context_lock_clients
         ));
         assert_eq!(
             resolve_local_node_name_with(Some(context.clone()), || async { fallback_node_name.clone() }).await,
@@ -663,6 +698,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).expect("fallback lock client"),
             &fallback_lock_client
+        ));
+        assert!(std::ptr::eq(
+            resolve_lock_clients_handle_with(None, || Some(fallback_lock_clients)).expect("fallback lock clients"),
+            fallback_lock_clients
         ));
         assert_eq!(
             resolve_local_node_name_with(None, || async { fallback_node_name.clone() }).await,

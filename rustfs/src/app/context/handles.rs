@@ -17,13 +17,14 @@ use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
     get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
-    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_tier_config_mgr, global_rustfs_port,
+    get_global_lock_clients, get_global_notification_sys, get_global_region, get_global_replication_pool,
+    get_global_tier_config_mgr, global_rustfs_port,
 };
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface, RuntimePortInterface,
-    ServerConfigInterface, TierConfigInterface,
+    LockClientsInterface, NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface,
+    RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -36,6 +37,7 @@ use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_targets::{EventName, arn::TargetID};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -193,6 +195,16 @@ impl LockClientInterface for LockClientHandle {
     }
 }
 
+/// Default lock clients map adapter.
+#[derive(Default)]
+pub struct LockClientsHandle;
+
+impl LockClientsInterface for LockClientsHandle {
+    fn handles(&self) -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+        get_global_lock_clients()
+    }
+}
+
 /// Default local node name interface adapter.
 #[derive(Default)]
 pub struct LocalNodeNameHandle;
@@ -292,6 +304,10 @@ pub fn default_runtime_port_interface() -> Arc<dyn RuntimePortInterface> {
 
 pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {
     Arc::new(LockClientHandle)
+}
+
+pub fn default_lock_clients_interface() -> Arc<dyn LockClientsInterface> {
+    Arc::new(LockClientsHandle)
 }
 
 pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {

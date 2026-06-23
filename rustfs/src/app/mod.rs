@@ -640,6 +640,11 @@ pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::Lo
     crate::storage::get_global_lock_client()
 }
 
+pub(crate) fn get_global_lock_clients()
+-> Option<&'static std::collections::HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+    crate::storage::get_global_lock_clients()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     crate::storage::get_global_region()
 }

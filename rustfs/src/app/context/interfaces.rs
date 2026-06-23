@@ -25,6 +25,7 @@ use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_targets::{EventName, arn::TargetID};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -99,6 +100,11 @@ pub trait RuntimePortInterface: Send + Sync {
 /// Lock client interface for application-layer use-cases.
 pub trait LockClientInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<dyn LockClient>>;
+}
+
+/// Lock clients map interface for readiness and distributed coordination views.
+pub trait LockClientsInterface: Send + Sync {
+    fn handles(&self) -> Option<&'static HashMap<String, Arc<dyn LockClient>>>;
 }
 
 /// Local node name interface for application-layer use-cases.
