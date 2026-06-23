@@ -655,7 +655,7 @@ impl DefaultMultipartUsecase {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
                 let ssekms_key_id = material.kms_key_id.clone();
 
-                let mut encryption_metadata = encryption_material_to_metadata(&material);
+                let mut encryption_metadata = encryption_material_to_metadata(&material)?;
                 if material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
                     mark_encrypted_multipart_metadata(&mut encryption_metadata);
                 }
@@ -1473,7 +1473,8 @@ mod tests {
                     .await
                     .expect("prepare multipart encryption")
                     .expect("managed multipart session material");
-                let mut session_metadata = encryption_material_to_metadata(&session_material);
+                let mut session_metadata =
+                    encryption_material_to_metadata(&session_material).expect("multipart session metadata should be generated");
                 mark_encrypted_multipart_metadata(&mut session_metadata);
 
                 let part_one_plaintext = vec![0x31; rustfs_rio::DEFAULT_ENCRYPTION_BLOCK_SIZE + 23];

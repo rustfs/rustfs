@@ -381,7 +381,12 @@ pub(crate) fn parse_object_lock_retention(retention: Option<ObjectLockRetention>
                     "The retain until date must be in the future".to_string(),
                 ));
             }
-            retain_until.format(&Rfc3339).unwrap()
+            retain_until.format(&Rfc3339).map_err(|_| {
+                S3Error::with_message(
+                    S3ErrorCode::InvalidArgument,
+                    "The retain until date is not a supported RFC3339 timestamp".to_string(),
+                )
+            })?
         } else {
             String::default()
         };
