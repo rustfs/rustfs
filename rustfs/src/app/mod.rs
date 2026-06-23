@@ -566,6 +566,12 @@ pub(crate) mod storageclass {
     pub(crate) const STANDARD_IA: &str = super::ecstore_config::storageclass::STANDARD_IA;
 }
 
+pub(crate) type StorageClassConfig = crate::storage::ecstore_config::storageclass::Config;
+
+pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
+    crate::storage::ecstore_config::set_global_storage_class(cfg);
+}
+
 pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
     ecstore_capacity::get_total_usable_capacity(disks, info)
 }
@@ -670,6 +676,28 @@ pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>>
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     crate::storage::get_global_replication_pool()
+}
+
+pub(crate) type ReplicationStats = crate::storage::ReplicationStats;
+
+pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    crate::storage::get_global_replication_stats()
+}
+
+pub(crate) type DailyAllTierStats = crate::storage::DailyAllTierStats;
+
+pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
+    crate::storage::get_global_boot_time()
+}
+
+pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
+    crate::storage::get_daily_all_tier_stats()
+}
+
+pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+
+pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
+    rustfs_common::metrics::global_metrics().report().await
 }
 
 #[cfg(test)]

@@ -156,23 +156,12 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_check_abandoned_parts(&self, bucket: &str, object: &str, opts: &HealOpts) -> Result<()> {
-        let object = encode_dir_object(object);
-        if self.single_pool() {
-            return self.pools[0].check_abandoned_parts(bucket, &object, opts).await;
-        }
-
-        let mut errs = Vec::new();
-        for pool in self.pools.iter() {
-            //TODO: IsSuspended
-            if let Err(err) = pool.check_abandoned_parts(bucket, &object, opts).await {
-                errs.push(err);
-            }
-        }
-
-        if !errs.is_empty() {
-            return Err(errs[0].clone());
-        }
-
-        Ok(())
+        let _ = (bucket, object, opts);
+        // Stale multipart reconciliation is already owned by the lifecycle-driven
+        // background cleanup path in `bucket_lifecycle_ops.rs`. There is currently
+        // no stable object-heal contract that should fan this request out through
+        // pool/set storage layers, so keep the placeholder explicit at the ECStore
+        // boundary instead of dispatching into lower layers.
+        Err(StorageError::NotImplemented)
     }
 }

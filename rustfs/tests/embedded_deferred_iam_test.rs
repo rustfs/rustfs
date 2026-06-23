@@ -45,7 +45,11 @@ async fn test_embedded_server_recovers_after_deferred_iam_bootstrap() {
             (ENV_TEST_IAM_RETRY_INTERVAL_MS, Some("500")),
         ],
         async {
-            let port = find_available_port().expect("find free port");
+            let port = match find_available_port() {
+                Ok(port) => port,
+                Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+                Err(err) => panic!("find free port: {err}"),
+            };
             let server = RustFSServerBuilder::new()
                 .address(format!("127.0.0.1:{port}"))
                 .access_key("testaccesskey")
