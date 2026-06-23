@@ -33,6 +33,7 @@ use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
 pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
+pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
 pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -412,6 +413,10 @@ impl DefaultAdminUsecase {
     pub fn runtime_capabilities_route(&self) -> &'static str {
         ADMIN_RUNTIME_CAPABILITIES_ROUTE
     }
+
+    pub fn extensions_catalog_route(&self) -> &'static str {
+        ADMIN_EXTENSIONS_CATALOG_ROUTE
+    }
 }
 
 #[cfg(test)]
@@ -460,6 +465,7 @@ mod tests {
 
         assert_eq!(usecase.cluster_snapshot_route(), "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(usecase.runtime_capabilities_route(), "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(usecase.extensions_catalog_route(), "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]

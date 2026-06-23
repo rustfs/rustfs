@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
+use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::app::context::resolve_oidc_handle;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
@@ -151,6 +152,7 @@ impl Config {
             port,
             api: Api {
                 base_url: build_console_api_base_url(&format!("{http_prefix}{local_ip}:{port}")),
+                discovery: console_api_discovery(),
             },
             s3: S3 {
                 endpoint: format!("{http_prefix}{local_ip}:{port}"),
@@ -208,6 +210,26 @@ fn build_console_api_base_url(base_url: &str) -> String {
 struct Api {
     #[serde(rename = "baseURL")]
     base_url: String,
+    discovery: ApiDiscovery,
+}
+
+#[derive(Debug, Serialize, Clone)]
+struct ApiDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+}
+
+fn console_api_discovery() -> ApiDiscovery {
+    let usecase = DefaultAdminUsecase::from_global();
+    ApiDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -789,6 +811,15 @@ mod tests {
             build_console_api_base_url("http://127.0.0.1:9001"),
             "http://127.0.0.1:9001/rustfs/admin/v3"
         );
+    }
+
+    #[test]
+    fn console_config_exposes_admin_discovery_paths() {
+        let cfg = Config::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001, "test", "2026-03-16T00:00:00Z");
+
+        assert_eq!(cfg.api.discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(cfg.api.discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(cfg.api.discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]
