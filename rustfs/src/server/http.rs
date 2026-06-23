@@ -31,7 +31,6 @@ use crate::server::{
     },
 };
 use crate::storage;
-use crate::storage::ecstore_rpc::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
 use crate::storage::rpc::InternodeRpcService;
 use crate::storage::tonic_service::make_server;
