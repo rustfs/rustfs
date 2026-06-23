@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready, resolve_lock_clients_handle};
+use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready, resolve_lock_clients_handle, resolve_object_store_handle};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure, resolve_object_store_handle};
+use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
 use crate::storage::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
