@@ -38,13 +38,14 @@ use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
+use crate::runtime_sources;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{get_global_storage_class, storageclass},
+    config::storageclass,
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -53,7 +54,7 @@ use crate::{
     error::{StorageError, to_object_err},
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
-    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
@@ -396,9 +397,7 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = get_global_storage_class()
-        .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
-        .unwrap_or(default_parity_count);
+    let parity_drives = runtime_sources::storage_class_parity(storage_class).unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
     let mut write_quorum = data_drives;
     if data_drives == parity_drives {
@@ -562,7 +561,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
-            local_lock_manager: rustfs_lock::get_global_lock_manager(),
+            local_lock_manager: runtime_sources::global_lock_manager(),
         })
     }
 
@@ -1028,13 +1027,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -1082,13 +1075,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-            let is_inline_buffer = {
-                if let Some(sc) = get_global_storage_class() {
-                    sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
-                } else {
-                    false
-                }
-            };
+            let is_inline_buffer =
+                runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
 
             let shard_file_size = erasure.shard_file_size(data.size());
             let shard_size = erasure.shard_size();
@@ -3729,8 +3717,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_simd::URL_SAFE_NO_PAD
-                    .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
+                upload_id: runtime_sources::deployment_upload_id(&upload_id),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -3820,13 +3807,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -3897,8 +3878,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
 
         let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_simd::URL_SAFE_NO_PAD
-            .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
+        let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 
