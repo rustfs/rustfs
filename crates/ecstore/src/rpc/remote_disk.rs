@@ -20,6 +20,7 @@ use crate::disk::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
         get_drive_metadata_timeout, get_drive_walkdir_stall_timeout, get_drive_walkdir_timeout, get_max_timeout_duration,
+        get_object_disk_read_timeout,
     },
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
@@ -1691,6 +1692,7 @@ impl DiskAPI for RemoteDisk {
             return Err(DiskError::FaultyDisk);
         }
         let disk = self.disk_ref().await;
+        let stall_timeout = get_object_disk_read_timeout();
         self.data_transport
             .open_read(ReadStreamRequest {
                 endpoint: self.endpoint.grid_host(),
@@ -1699,6 +1701,7 @@ impl DiskAPI for RemoteDisk {
                 path: path.to_string(),
                 offset,
                 length,
+                stall_timeout: (!stall_timeout.is_zero()).then_some(stall_timeout),
             })
             .await
     }
@@ -2925,25 +2928,47 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_read_file_stream_uses_configured_data_transport() {
-        let transport = RecordingInternodeDataTransport::default();
-        let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
-        let expected_disk = remote_disk.disk_ref().await;
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, None::<&str>)], async {
+            let transport = RecordingInternodeDataTransport::default();
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+            let expected_disk = remote_disk.disk_ref().await;
 
-        let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
 
-        let calls = transport.calls();
-        assert_eq!(calls.len(), 1);
-        match &calls[0] {
-            RecordedTransportCall::Read(request) => {
-                assert_eq!(request.endpoint, "http://remote-node:9000");
-                assert_eq!(request.disk, expected_disk);
-                assert_eq!(request.volume, "bucket");
-                assert_eq!(request.path, "object/part.1");
-                assert_eq!(request.offset, 7);
-                assert_eq!(request.length, 11);
+            let calls = transport.calls();
+            assert_eq!(calls.len(), 1);
+            match &calls[0] {
+                RecordedTransportCall::Read(request) => {
+                    assert_eq!(request.endpoint, "http://remote-node:9000");
+                    assert_eq!(request.disk, expected_disk);
+                    assert_eq!(request.volume, "bucket");
+                    assert_eq!(request.path, "object/part.1");
+                    assert_eq!(request.offset, 7);
+                    assert_eq!(request.length, 11);
+                    assert_eq!(request.stall_timeout, Some(get_object_disk_read_timeout()));
+                }
+                other => panic!("expected read transport call, got {other:?}"),
             }
-            other => panic!("expected read transport call, got {other:?}"),
-        }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn test_remote_disk_read_file_stream_disables_stall_timeout_when_configured_zero() {
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("0"))], async {
+            let transport = RecordingInternodeDataTransport::default();
+            let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+
+            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+
+            let calls = transport.calls();
+            assert_eq!(calls.len(), 1);
+            match &calls[0] {
+                RecordedTransportCall::Read(request) => assert_eq!(request.stall_timeout, None),
+                other => panic!("expected read transport call, got {other:?}"),
+            }
+        })
+        .await;
     }
 
     #[tokio::test]

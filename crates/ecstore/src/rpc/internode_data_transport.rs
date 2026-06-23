@@ -76,6 +76,7 @@ pub struct ReadStreamRequest {
     pub path: String,
     pub offset: usize,
     pub length: usize,
+    pub stall_timeout: Option<Duration>,
 }
 
 #[derive(Debug, Clone)]
@@ -122,7 +123,9 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
         let url = build_read_file_stream_url(&request);
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::GET, &mut headers)?;
-        Ok(Box::new(HttpReader::new(url, Method::GET, headers, None).await?))
+        Ok(Box::new(
+            HttpReader::new_with_stall_timeout(url, Method::GET, headers, None, request.stall_timeout).await?,
+        ))
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
@@ -260,6 +263,7 @@ mod tests {
             path: "pool.bin/../part.1".to_string(),
             offset: 7,
             length: 11,
+            stall_timeout: None,
         });
 
         assert_eq!(

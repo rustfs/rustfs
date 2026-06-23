@@ -197,6 +197,14 @@ pub fn get_drive_walkdir_stall_timeout() -> Duration {
     )
 }
 
+pub fn get_object_disk_read_timeout() -> Duration {
+    get_drive_timeout_duration(
+        rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT,
+        rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT,
+        Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS),
+    )
+}
+
 pub fn get_drive_active_check_interval() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_DRIVE_ACTIVE_CHECK_INTERVAL_SECS,
@@ -1514,6 +1522,47 @@ mod tests {
         temp_env::with_var(rustfs_config::ENV_DRIVE_METADATA_TIMEOUT_SECS, Some("7"), || {
             temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
                 assert_eq!(get_drive_metadata_timeout(), Duration::from_secs(7));
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_uses_default_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var_unset(rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE, || {
+                    assert_eq!(
+                        get_object_disk_read_timeout(),
+                        Duration::from_secs(rustfs_config::DEFAULT_OBJECT_DISK_READ_TIMEOUT)
+                    );
+                });
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_uses_high_latency_profile_when_unset() {
+        temp_env::with_var_unset(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, || {
+            temp_env::with_var_unset(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, || {
+                temp_env::with_var(
+                    rustfs_config::ENV_DRIVE_TIMEOUT_PROFILE,
+                    Some(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY),
+                    || {
+                        assert_eq!(
+                            get_object_disk_read_timeout(),
+                            Duration::from_secs(rustfs_config::DRIVE_TIMEOUT_PROFILE_HIGH_LATENCY_SECS)
+                        );
+                    },
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn object_disk_read_timeout_prefers_canonical_over_legacy() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_DISK_READ_TIMEOUT, Some("7"), || {
+            temp_env::with_var(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("17"), || {
+                assert_eq!(get_object_disk_read_timeout(), Duration::from_secs(7));
             });
         });
     }

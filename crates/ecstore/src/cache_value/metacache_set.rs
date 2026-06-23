@@ -63,6 +63,7 @@ fn is_missing_path_error(err: &DiskError) -> bool {
 #[derive(Clone)]
 pub(crate) enum TestReaderBehavior {
     Eof,
+    Entries(Vec<MetaCacheEntry>),
     Stall,
     IgnoreCancel,
     ProducerError(DiskError),
@@ -146,6 +147,13 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
                 match behavior {
                     TestReaderBehavior::Eof => return Ok(()),
+                    TestReaderBehavior::Entries(entries) => {
+                        let mut wr = wr;
+                        let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                        out.write(&entries).await.expect("test entries should be written");
+                        out.close().await.expect("test entries should close");
+                        return Ok(());
+                    }
                     TestReaderBehavior::Stall => {
                         let _held_writer = wr;
                         cancel_rx_clone.cancelled().await;
@@ -564,13 +572,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
-                // All remaining readers are either at EOF or failed. Earlier logic
-                // returned Timeout here for even a single stalled drive, despite
-                // `has_err` being within the tolerated drive-failure budget. That
-                // makes small distributed listings fail once healthy quorum readers
-                // reach EOF but one remote walk stream is slow/stalled. Only the
-                // `has_err > opts.disks.len() - opts.min_disks` branch above should
-                // turn tolerated reader failures into request failures.
+                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
+                    return Err(DiskError::Timeout);
+                }
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
             }
@@ -757,8 +761,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_path_raw_tolerates_stalled_reader_after_quorum_eof() {
-        list_path_raw(
+    async fn list_path_raw_returns_timeout_for_stalled_reader_after_quorum_eof() {
+        let err = list_path_raw(
             CancellationToken::new(),
             ListPathRawOptions {
                 disks: vec![None, None, None],
@@ -769,7 +773,52 @@ mod tests {
             },
         )
         .await
-        .expect("listing should complete when healthy quorum reached EOF and only a tolerated drive stalled");
+        .expect_err("stalled reader should fail instead of returning a partial listing");
+
+        assert_eq!(err, DiskError::Timeout);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_returns_timeout_after_partial_results_when_reader_stalls() {
+        let entry = MetaCacheEntry {
+            name: "bucket/object".to_string(),
+            metadata: vec![1, 2, 3],
+            cached: None,
+            reusable: false,
+        };
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![entry.clone()]),
+                    TestReaderBehavior::Entries(vec![entry]),
+                    TestReaderBehavior::Stall,
+                ],
+                peek_timeout: Some(Duration::from_millis(20)),
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        let mut names = entries.0.iter().flatten().map(|entry| entry.name.clone());
+                        if let Some(name) = names.next()
+                            && names.any(|next| next == name)
+                        {
+                            seen.lock().expect("seen mutex poisoned").push(name);
+                        }
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("stalled reader must fail even after some entries were emitted");
+
+        assert_eq!(err, DiskError::Timeout);
+        assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
     }
 
     #[tokio::test]
@@ -794,7 +843,7 @@ mod tests {
         .await;
 
         let listing = result.expect("list_path_raw should abort unresponsive producer instead of hanging");
-        assert!(listing.is_ok());
+        assert_eq!(listing.expect_err("unresponsive producer should fail the listing"), DiskError::Timeout);
     }
 
     #[tokio::test]

@@ -35,7 +35,7 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
 
-type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>)> + Send + 'a>>;
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
 #[derive(Default)]
 struct ShardReadCostCounts {
@@ -59,7 +59,6 @@ impl ShardReadCostCounts {
         self.local + self.same_node
     }
 }
-
 fn shard_role(index: usize, data_shards: usize) -> &'static str {
     if index < data_shards {
         GET_SHARD_ROLE_DATA
@@ -102,11 +101,12 @@ where
                             reader.last_verify_duration().as_secs_f64(),
                         );
                     }
-                    (index, read_cost, Ok(buf))
+                    (index, read_cost, Ok(buf), false)
                 }
                 Err(e) => {
                     let verify_duration_secs = reader.last_verify_duration().as_secs_f64();
                     let error_class = classify_io_error(&e).as_str();
+                    let should_retire = e.kind() == ErrorKind::TimedOut;
                     if let Some(path) = metrics_path {
                         rustfs_io_metrics::record_get_object_shard_read_observation(
                             path,
@@ -120,7 +120,7 @@ where
                             verify_duration_secs,
                         );
                     }
-                    (index, read_cost, Err(Error::from(e)))
+                    (index, read_cost, Err(Error::from(e)), should_retire)
                 }
             }
         })
@@ -139,7 +139,7 @@ where
                     0.0,
                 );
             }
-            (index, read_cost, Err(Error::FileNotFound))
+            (index, read_cost, Err(Error::FileNotFound), false)
         })
     }
 }
@@ -252,6 +252,7 @@ where
 
         self.buffers.ensure_slots(num_readers);
 
+        let mut retire_readers = Vec::new();
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         if num_readers >= self.data_shards {
             let mut reader_iter = reader_iter.enumerate();
@@ -285,7 +286,7 @@ where
             let mut failed = 0usize;
             let mut first_shard_recorded = false;
             let mut quorum_recorded = false;
-            while let Some((i, read_cost, result)) = sets.next().await {
+            while let Some((i, read_cost, result, should_retire)) = sets.next().await {
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = self.metrics_path {
@@ -307,6 +308,9 @@ where
                     Err(e) => {
                         failed += 1;
                         errs[i] = Some(e);
+                        if should_retire {
+                            retire_readers.push(i);
+                        }
 
                         if let Some((next_i, next_reader)) = reader_iter.next() {
                             let recycled_buf = if next_reader.is_some() {
@@ -365,6 +369,10 @@ where
                 self.data_shards,
                 low_cost_available >= self.data_shards,
             );
+        }
+
+        for i in retire_readers {
+            self.readers[i] = None;
         }
 
         (shards, errs)
@@ -757,6 +765,23 @@ mod tests {
     };
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::ReadBuf;
+
+    enum TestShardReader {
+        Ready(Cursor<Vec<u8>>),
+        TimedOut,
+    }
+
+    impl AsyncRead for TestShardReader {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            match &mut *self {
+                TestShardReader::Ready(cursor) => Pin::new(cursor).poll_read(cx, buf),
+                TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_write_data_blocks_writes_range_across_blocks() {
@@ -1092,6 +1117,44 @@ mod tests {
                     .count()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_replaces_timed_out_shard_with_parity() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 1;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::TimedOut, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader = ParallelReader::new(readers, erasure, 0, NUM_SHARDS * BLOCK_SIZE);
+
+        let (bufs, errs) = parallel_reader.read().await;
+
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
     }
 
     async fn create_reader(
