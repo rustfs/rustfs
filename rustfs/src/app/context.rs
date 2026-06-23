@@ -41,6 +41,13 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
 }
 
+/// Resolve IAM readiness using AppContext-first precedence.
+pub fn resolve_iam_ready() -> bool {
+    resolve_iam_ready_with(get_global_app_context(), || {
+        rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
+    })
+}
+
 /// Resolve bucket metadata handle using AppContext-first precedence.
 pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
     resolve_bucket_metadata_handle_with(get_global_app_context(), || default_bucket_metadata_interface().handle())
@@ -91,6 +98,10 @@ fn resolve_kms_runtime_service_manager_with(
     context
         .and_then(|context| context.kms_runtime().service_manager())
         .or_else(fallback)
+}
+
+fn resolve_iam_ready_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> bool) -> bool {
+    context.map_or_else(fallback, |context| context.iam().is_ready())
 }
 
 fn resolve_bucket_metadata_handle_with(
@@ -154,7 +165,9 @@ mod tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    struct TestIamInterface;
+    struct TestIamInterface {
+        ready: bool,
+    }
 
     impl IamInterface for TestIamInterface {
         fn handle(&self) -> Arc<IamSys<ObjectStore>> {
@@ -162,7 +175,7 @@ mod tests {
         }
 
         fn is_ready(&self) -> bool {
-            true
+            self.ready
         }
     }
 
@@ -299,7 +312,7 @@ mod tests {
         let context = Arc::new(AppContext::with_test_interfaces(
             object_store.clone(),
             AppContextTestInterfaces {
-                iam: Arc::new(TestIamInterface),
+                iam: Arc::new(TestIamInterface { ready: true }),
                 kms: Arc::new(TestKmsInterface {
                     kms: context_kms.clone(),
                 }),
@@ -329,6 +342,7 @@ mod tests {
                 .expect("context KMS runtime"),
             &context_kms
         ));
+        assert!(resolve_iam_ready_with(Some(context.clone()), || false));
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
             &bucket_metadata
@@ -361,6 +375,7 @@ mod tests {
             &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
             &fallback_kms
         ));
+        assert!(!resolve_iam_ready_with(None, || false));
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
