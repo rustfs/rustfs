@@ -368,6 +368,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
         for _ in 0..readers.len() {
             errs.push(None);
         }
+        let mut pending_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
 
         loop {
             let mut current = MetaCacheEntry::default();
@@ -395,90 +396,94 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     continue;
                 }
 
-                let entry = match peek_with_timeout(r, peek_timeout).await {
-                    PeekOutcome::Ready(res) => {
-                        if let Some(entry) = res {
-                            // info!("read entry disk: {}, name: {}", i, entry.name);
-                            entry
-                        } else {
+                let entry = if let Some(entry) = pending_entries[i].take() {
+                    entry
+                } else {
+                    match peek_with_timeout(r, peek_timeout).await {
+                        PeekOutcome::Ready(res) => {
+                            if let Some(entry) = res {
+                                // info!("read entry disk: {}, name: {}", i, entry.name);
+                                entry
+                            } else {
+                                if let Some(err) = producer_error(&producer_errs, i) {
+                                    has_err += 1;
+                                    errs[i] = Some(err);
+                                    continue;
+                                }
+                                // eof
+                                at_eof += 1;
+                                // warn!("list_path_raw: peek eof, disk: {}", i);
+                                continue;
+                            }
+                        }
+                        PeekOutcome::Error(err) => {
                             if let Some(err) = producer_error(&producer_errs, i) {
                                 has_err += 1;
                                 errs[i] = Some(err);
                                 continue;
                             }
-                            // eof
-                            at_eof += 1;
-                            // warn!("list_path_raw: peek eof, disk: {}", i);
-                            continue;
+
+                            if err == rustfs_filemeta::Error::Unexpected {
+                                at_eof += 1;
+                                // warn!("list_path_raw: peek err eof, disk: {}", i);
+                                continue;
+                            }
+
+                            // warn!("list_path_raw: peek err00, err: {:?}", err);
+
+                            if is_io_eof(&err) {
+                                at_eof += 1;
+                                // warn!("list_path_raw: peek eof, disk: {}", i);
+                                continue;
+                            }
+
+                            if err == rustfs_filemeta::Error::FileNotFound {
+                                at_eof += 1;
+                                fnf += 1;
+                                // warn!("list_path_raw: peek fnf, disk: {}", i);
+                                continue;
+                            } else if err == rustfs_filemeta::Error::VolumeNotFound {
+                                at_eof += 1;
+                                fnf += 1;
+                                vnf += 1;
+                                // warn!("list_path_raw: peek vnf, disk: {}", i);
+                                continue;
+                            } else {
+                                has_err += 1;
+                                errs[i] = Some(err.into());
+                                // warn!("list_path_raw: peek err, disk: {}", i);
+                                continue;
+                            }
                         }
-                    }
-                    PeekOutcome::Error(err) => {
-                        if let Some(err) = producer_error(&producer_errs, i) {
+                        PeekOutcome::TimedOut => {
                             has_err += 1;
-                            errs[i] = Some(err);
+                            errs[i] = Some(DiskError::Timeout);
+                            let endpoint = opts
+                                .disks
+                                .get(i)
+                                .and_then(|disk| disk.as_ref().map(|disk| disk.endpoint().to_string()))
+                                .unwrap_or_else(|| "missing".to_string());
+                            counter!(
+                                "rustfs_list_path_raw_stall_total",
+                                "drive" => endpoint.clone()
+                            )
+                            .increment(1);
+                            warn!(
+                                event = EVENT_METACACHE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_METACACHE,
+                                drive = %endpoint,
+                                bucket = %opts.bucket,
+                                path = %opts.path,
+                                timeout_ms = peek_timeout.as_millis(),
+                                state = "peek_timed_out",
+                                "Metacache reader peek timed out"
+                            );
+                            let (detached_rd, write_half) = tokio::io::duplex(1);
+                            drop(write_half);
+                            *r = MetacacheReader::new(detached_rd);
                             continue;
                         }
-
-                        if err == rustfs_filemeta::Error::Unexpected {
-                            at_eof += 1;
-                            // warn!("list_path_raw: peek err eof, disk: {}", i);
-                            continue;
-                        }
-
-                        // warn!("list_path_raw: peek err00, err: {:?}", err);
-
-                        if is_io_eof(&err) {
-                            at_eof += 1;
-                            // warn!("list_path_raw: peek eof, disk: {}", i);
-                            continue;
-                        }
-
-                        if err == rustfs_filemeta::Error::FileNotFound {
-                            at_eof += 1;
-                            fnf += 1;
-                            // warn!("list_path_raw: peek fnf, disk: {}", i);
-                            continue;
-                        } else if err == rustfs_filemeta::Error::VolumeNotFound {
-                            at_eof += 1;
-                            fnf += 1;
-                            vnf += 1;
-                            // warn!("list_path_raw: peek vnf, disk: {}", i);
-                            continue;
-                        } else {
-                            has_err += 1;
-                            errs[i] = Some(err.into());
-                            // warn!("list_path_raw: peek err, disk: {}", i);
-                            continue;
-                        }
-                    }
-                    PeekOutcome::TimedOut => {
-                        has_err += 1;
-                        errs[i] = Some(DiskError::Timeout);
-                        let endpoint = opts
-                            .disks
-                            .get(i)
-                            .and_then(|disk| disk.as_ref().map(|disk| disk.endpoint().to_string()))
-                            .unwrap_or_else(|| "missing".to_string());
-                        counter!(
-                            "rustfs_list_path_raw_stall_total",
-                            "drive" => endpoint.clone()
-                        )
-                        .increment(1);
-                        warn!(
-                            event = EVENT_METACACHE_LISTING,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_METACACHE,
-                            drive = %endpoint,
-                            bucket = %opts.bucket,
-                            path = %opts.path,
-                            timeout_ms = peek_timeout.as_millis(),
-                            state = "peek_timed_out",
-                            "Metacache reader peek timed out"
-                        );
-                        let (detached_rd, write_half) = tokio::io::duplex(1);
-                        drop(write_half);
-                        *r = MetacacheReader::new(detached_rd);
-                        continue;
                     }
                 };
 
@@ -506,11 +511,14 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 }
                 // We got different entries
                 if entry.name > current.name {
+                    pending_entries[i] = Some(entry);
                     continue;
                 }
 
-                for item in top_entries.iter_mut().take(i) {
-                    *item = None;
+                for (idx, item) in top_entries.iter_mut().enumerate().take(i) {
+                    if let Some(entry) = item.take() {
+                        pending_entries[idx] = Some(entry);
+                    }
                 }
 
                 agree = 1;
@@ -721,7 +729,10 @@ fn producer_error(producer_errs: &[OnceLock<DiskError>], idx: usize) -> Option<D
 mod tests {
     use super::*;
     use rustfs_filemeta::MetacacheWriter;
+    use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
     use std::sync::Mutex;
+    use time::OffsetDateTime;
+    use uuid::Uuid;
 
     #[tokio::test]
     async fn list_path_raw_empty_disks_returns_read_quorum() {
@@ -876,6 +887,88 @@ mod tests {
 
         assert_eq!(err, DiskError::Timeout);
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_continues_after_single_disk_delete_marker_gap() {
+        fn object_entry(name: &str, version_id: &str) -> MetaCacheEntry {
+            let mut meta = FileMeta::default();
+            let mut fi = FileInfo::new(name, 1, 1);
+            fi.version_id = Some(Uuid::parse_str(version_id).expect("test version id should parse"));
+            fi.mod_time = Some(OffsetDateTime::now_utc());
+            meta.add_version(fi).expect("object metadata should be valid");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("object metadata should encode"),
+                cached: Some(meta),
+                reusable: false,
+            }
+        }
+
+        fn delete_marker_entry(name: &str, version_id: &str) -> MetaCacheEntry {
+            let mut meta = FileMeta::default();
+            meta.add_version(FileInfo {
+                deleted: true,
+                version_id: Some(Uuid::parse_str(version_id).expect("test version id should parse")),
+                mod_time: Some(OffsetDateTime::now_utc()),
+                ..Default::default()
+            })
+            .expect("delete marker metadata should be valid");
+            MetaCacheEntry {
+                name: name.to_string(),
+                metadata: meta.marshal_msg().expect("delete marker metadata should encode"),
+                cached: Some(meta),
+                reusable: false,
+            }
+        }
+
+        let visible_before = object_entry("object-000003", "11111111-1111-1111-1111-111111111111");
+        let hidden_delete = delete_marker_entry("object-000004", "22222222-2222-2222-2222-222222222222");
+        let visible_after = object_entry("object-000005", "33333333-3333-3333-3333-333333333333");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let agreed_seen = seen.clone();
+        let partial_seen = seen.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![visible_before.clone(), hidden_delete, visible_after.clone()]),
+                    TestReaderBehavior::Entries(vec![visible_before.clone(), visible_after.clone()]),
+                    TestReaderBehavior::Entries(vec![visible_before.clone(), visible_after.clone()]),
+                    TestReaderBehavior::Entries(vec![visible_before, visible_after]),
+                ],
+                agreed: Some(Box::new(move |entry| {
+                    let seen = agreed_seen.clone();
+                    Box::pin(async move {
+                        seen.lock().expect("seen mutex poisoned").push(entry.name);
+                    })
+                })),
+                partial: Some(Box::new(move |entries, _| {
+                    let seen = partial_seen.clone();
+                    Box::pin(async move {
+                        if let Some(entry) = entries.resolve(MetadataResolutionParams {
+                            obj_quorum: 2,
+                            requested_versions: 1,
+                            bucket: "bucket".to_string(),
+                            ..Default::default()
+                        }) {
+                            seen.lock().expect("seen mutex poisoned").push(entry.name);
+                        }
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("single-disk delete marker gap should not end listing");
+
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &["object-000003".to_string(), "object-000005".to_string()]
+        );
     }
 
     #[tokio::test]
