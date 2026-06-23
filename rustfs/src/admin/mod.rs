@@ -136,7 +136,7 @@ mod ecstore_error {
 }
 
 mod ecstore_global {
-    pub(crate) use crate::storage::ecstore_global::{GLOBAL_BOOT_TIME, get_global_bucket_monitor};
+    pub(crate) use crate::storage::ecstore_global::GLOBAL_BOOT_TIME;
 }
 
 #[allow(unused_imports)]
@@ -149,7 +149,7 @@ mod ecstore_metrics {
 }
 
 mod ecstore_notification {
-    pub(crate) use crate::storage::ecstore_notification::{NotificationSys, get_global_notification_sys};
+    pub(crate) use crate::storage::ecstore_notification::NotificationSys;
 }
 
 #[allow(unused_imports)]
@@ -250,7 +250,6 @@ impl AdminVersioningConfigExt for s3s::dto::VersioningConfiguration {
 pub(crate) mod bandwidth {
     pub(crate) mod monitor {
         pub(crate) type BandwidthDetails = super::super::ecstore_bucket::bandwidth::monitor::BandwidthDetails;
-        pub(crate) type Monitor = super::super::ecstore_bucket::bandwidth::monitor::Monitor;
     }
 }
 
@@ -399,7 +398,6 @@ pub(crate) mod replication {
 
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
-    pub(crate) type DynReplicationPool = super::ecstore_bucket::replication::DynReplicationPool;
     pub(crate) type ObjectOpts = super::ecstore_bucket::replication::ObjectOpts;
     pub(crate) type ReplicationStats = super::ecstore_bucket::replication::ReplicationStats;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
@@ -416,10 +414,6 @@ pub(crate) mod replication {
         pub(crate) fn get(&self) -> Option<&'static Arc<ReplicationStats>> {
             super::ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get()
         }
-    }
-
-    pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
-        super::ecstore_bucket::replication::get_global_replication_pool()
     }
 }
 
@@ -510,19 +504,11 @@ pub(crate) async fn load_data_usage_from_backend(
     ecstore_data_usage::load_data_usage_from_backend(store).await
 }
 
-pub(crate) fn get_global_bucket_monitor() -> Option<Arc<bandwidth::monitor::Monitor>> {
-    ecstore_global::get_global_bucket_monitor()
-}
-
 pub(crate) async fn collect_local_metrics(
     types: MetricType,
     opts: &CollectMetricsOpts,
 ) -> rustfs_madmin::metrics::RealtimeMetrics {
     ecstore_metrics::collect_local_metrics(types, opts).await
-}
-
-pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
-    ecstore_notification::get_global_notification_sys()
 }
 
 pub(crate) struct BootTimeCompat;

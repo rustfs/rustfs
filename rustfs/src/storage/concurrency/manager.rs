@@ -684,10 +684,7 @@ mod integration_tests {
 
         let permit = manager.acquire_disk_read_permit().await;
         assert!(permit.is_ok());
-        let _permit = match permit {
-            Ok(permit) => permit,
-            Err(error) => panic!("disk read permit acquisition failed: {error}"),
-        };
+        let _permit = permit.ok();
         let snapshot = manager.get_object_admission_snapshot();
 
         assert_eq!(snapshot.active, Some(1));

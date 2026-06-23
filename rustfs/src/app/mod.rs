@@ -94,10 +94,12 @@ pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DI
 
 pub(crate) type DiskError = crate::storage::DiskError;
 pub(crate) type DynReader = crate::storage::DynReader;
+pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
 pub(crate) type HashReader = crate::storage::HashReader;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
+pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
 pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
@@ -660,6 +662,14 @@ pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> b
 
 pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
     crate::storage::get_global_notification_sys()
+}
+
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    crate::storage::get_global_bucket_monitor()
+}
+
+pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    crate::storage::get_global_replication_pool()
 }
 
 #[cfg(test)]

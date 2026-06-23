@@ -15,7 +15,9 @@
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use tokio::time::{Instant, interval};
+use tracing::warn;
 
+use crate::LockError;
 use crate::fast_lock::{
     guard::FastLockGuard,
     manager_trait::LockManager,
@@ -42,8 +44,37 @@ impl FastObjectLockManager {
 
     /// Create new lock manager with custom config
     pub fn with_config(config: LockConfig) -> Self {
+        if let Err(err) = Self::validate_config(&config) {
+            warn!(
+                error = %err,
+                shard_count = config.shard_count,
+                fallback_shard_count = crate::fast_lock::DEFAULT_SHARD_COUNT,
+                "Invalid lock manager configuration, falling back to defaults"
+            );
+            return Self::build(LockConfig::default());
+        }
+
+        Self::build(config)
+    }
+
+    /// Create new lock manager with custom config, returning an explicit error for invalid input.
+    pub fn try_with_config(config: LockConfig) -> crate::Result<Self> {
+        Self::validate_config(&config)?;
+        Ok(Self::build(config))
+    }
+
+    fn validate_config(config: &LockConfig) -> crate::Result<()> {
+        if config.shard_count == 0 || !config.shard_count.is_power_of_two() {
+            return Err(LockError::configuration(format!(
+                "shard count must be a non-zero power of 2, got {}",
+                config.shard_count
+            )));
+        }
+        Ok(())
+    }
+
+    fn build(config: LockConfig) -> Self {
         let shard_count = config.shard_count;
-        assert!(shard_count.is_power_of_two(), "Shard count must be power of 2");
 
         let shards: Vec<Arc<LockShard>> = (0..shard_count).map(|i| Arc::new(LockShard::new(i))).collect();
 

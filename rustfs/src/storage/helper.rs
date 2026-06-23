@@ -500,10 +500,10 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
-                let event_args = match &helper {
-                    OperationHelper::Enabled(state) => state.event_builder.clone().expect("event builder should exist").build(),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
                 };
+                let event_args = state.event_builder.clone().expect("event builder should exist").build();
 
                 assert_eq!(event_args.bucket_name, "issue-2292-bucket");
                 assert_eq!(event_args.object.bucket, "issue-2292-bucket");
@@ -552,13 +552,11 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper stored the RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => {
-                        assert!(state.request_context.is_some());
-                        assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
-                    }
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_some());
+                assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
             },
         );
     }
@@ -595,10 +593,10 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper has no RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => assert!(state.request_context.is_none()),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_none());
             },
         );
     }
