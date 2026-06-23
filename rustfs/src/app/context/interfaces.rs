@@ -24,12 +24,15 @@ use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
+use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use std::{sync::Arc, time::SystemTime};
+use s3s::dto::SelectObjectContentInput;
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
@@ -131,6 +134,31 @@ pub trait RuntimePortInterface: Send + Sync {
 /// Lock client interface for application-layer use-cases.
 pub trait LockClientInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<dyn LockClient>>;
+}
+
+/// Lock clients interface for runtime readiness integration.
+pub trait LockClientsInterface: Send + Sync {
+    fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>>;
+}
+
+/// Performance metrics interface for storage runtime integration.
+pub trait PerformanceMetricsInterface: Send + Sync {
+    fn handle(&self) -> Arc<PerformanceMetrics>;
+}
+
+/// Internode metrics interface for RPC runtime integration.
+pub trait InternodeMetricsInterface: Send + Sync {
+    fn handle(&self) -> Arc<InternodeMetrics>;
+}
+
+/// S3 Select database interface for object query execution.
+#[async_trait]
+pub trait S3SelectDbInterface: Send + Sync {
+    async fn get(
+        &self,
+        input: SelectObjectContentInput,
+        enable_debug: bool,
+    ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>;
 }
 
 /// Local node name interface for application-layer use-cases.
