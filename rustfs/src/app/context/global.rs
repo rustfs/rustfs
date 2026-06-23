@@ -15,12 +15,12 @@
 use super::super::{ECStore, set_object_store_resolver};
 use super::handles::{
     IamHandle, KmsHandle, default_bucket_metadata_interface, default_buffer_config_interface, default_endpoints_interface,
-    default_kms_runtime_interface, default_notify_interface, default_region_interface, default_server_config_interface,
-    default_tier_config_interface,
+    default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface, default_notify_interface,
+    default_region_interface, default_server_config_interface, default_tier_config_interface,
 };
 use super::interfaces::{
     BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
-    NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
+    LocalNodeNameInterface, LockClientInterface, NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -37,6 +37,8 @@ pub struct AppContext {
     notify: Arc<dyn NotifyInterface>,
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
+    lock_client: Arc<dyn LockClientInterface>,
+    local_node_name: Arc<dyn LocalNodeNameInterface>,
     region: Arc<dyn RegionInterface>,
     tier_config: Arc<dyn TierConfigInterface>,
     server_config: Arc<dyn ServerConfigInterface>,
@@ -53,6 +55,8 @@ impl AppContext {
             notify: default_notify_interface(),
             bucket_metadata: default_bucket_metadata_interface(),
             endpoints: default_endpoints_interface(),
+            lock_client: default_lock_client_interface(),
+            local_node_name: default_local_node_name_interface(),
             region: default_region_interface(),
             tier_config: default_tier_config_interface(),
             server_config: default_server_config_interface(),
@@ -97,6 +101,14 @@ impl AppContext {
         self.endpoints.clone()
     }
 
+    pub fn lock_client(&self) -> Arc<dyn LockClientInterface> {
+        self.lock_client.clone()
+    }
+
+    pub fn local_node_name(&self) -> Arc<dyn LocalNodeNameInterface> {
+        self.local_node_name.clone()
+    }
+
     pub fn region(&self) -> Arc<dyn RegionInterface> {
         self.region.clone()
     }
@@ -122,6 +134,8 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) notify: Arc<dyn NotifyInterface>,
     pub(super) bucket_metadata: Arc<dyn BucketMetadataInterface>,
     pub(super) endpoints: Arc<dyn EndpointsInterface>,
+    pub(super) lock_client: Arc<dyn LockClientInterface>,
+    pub(super) local_node_name: Arc<dyn LocalNodeNameInterface>,
     pub(super) region: Arc<dyn RegionInterface>,
     pub(super) tier_config: Arc<dyn TierConfigInterface>,
     pub(super) server_config: Arc<dyn ServerConfigInterface>,
@@ -139,6 +153,8 @@ impl AppContext {
             notify: interfaces.notify,
             bucket_metadata: interfaces.bucket_metadata,
             endpoints: interfaces.endpoints,
+            lock_client: interfaces.lock_client,
+            local_node_name: interfaces.local_node_name,
             region: interfaces.region,
             tier_config: interfaces.tier_config,
             server_config: interfaces.server_config,
