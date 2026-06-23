@@ -54,6 +54,16 @@ pub(crate) struct ClusterSnapshotResponse {
     pub snapshot: Option<ClusterSnapshotView>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ClusterSnapshotDiscoveryResponse {
+    pub path: String,
+    pub summary: Option<CapabilityStatus>,
+    pub topology: Option<CapabilityStatus>,
+    pub peer_health: Option<CapabilityStatus>,
+    pub workload_admission: Option<CapabilityStatus>,
+    pub runtime: Option<CapabilityStatus>,
+}
+
 async fn authorize_cluster_snapshot_request(req: &S3Request<Body>) -> S3Result<()> {
     let Some(input_cred) = &req.credentials else {
         return Err(s3_error!(InvalidRequest, "authentication required"));
@@ -98,6 +108,35 @@ impl Operation for GetClusterSnapshotHandler {
             .await
             .map(ClusterSnapshotView::from);
         build_json_response(StatusCode::OK, &ClusterSnapshotResponse { snapshot }, req.headers.get("x-request-id"))
+    }
+}
+
+pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapshotDiscoveryResponse {
+    let path = format!("{}{}", ADMIN_PREFIX, "/v4/cluster/snapshot");
+    let snapshot = DefaultAdminUsecase::from_global()
+        .execute_collect_cluster_read_only_snapshot()
+        .await;
+
+    match snapshot {
+        Some(snapshot) => {
+            let summary = ClusterSnapshotSummary::from(&snapshot);
+            ClusterSnapshotDiscoveryResponse {
+                path,
+                summary: Some(summary.actionable_pressure.clone()),
+                topology: Some(summary.topology),
+                peer_health: Some(summary.peer_health),
+                workload_admission: Some(summary.workload_admission),
+                runtime: Some(summary.runtime),
+            }
+        }
+        None => ClusterSnapshotDiscoveryResponse {
+            path,
+            summary: None,
+            topology: None,
+            peer_health: None,
+            workload_admission: None,
+            runtime: None,
+        },
     }
 }
 
@@ -584,6 +623,18 @@ mod tests {
     fn cluster_snapshot_response_serializes_none_snapshot() {
         let value = serde_json::to_value(ClusterSnapshotResponse { snapshot: None }).expect("serialize response");
         assert_eq!(value, serde_json::json!({ "snapshot": null }));
+    }
+
+    #[tokio::test]
+    async fn cluster_snapshot_discovery_reports_path_without_snapshot() {
+        let response = super::build_cluster_snapshot_discovery_response().await;
+
+        assert_eq!(response.path, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.summary, None);
+        assert_eq!(response.topology, None);
+        assert_eq!(response.peer_health, None);
+        assert_eq!(response.workload_admission, None);
+        assert_eq!(response.runtime, None);
     }
 
     #[test]
