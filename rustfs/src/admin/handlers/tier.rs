@@ -13,7 +13,6 @@
 // limitations under the License.
 #![allow(unused_variables, unused_mut, unused_must_use)]
 
-use super::super::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
 use super::super::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
     ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
@@ -24,7 +23,9 @@ use crate::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle},
+    app::context::{
+        resolve_daily_tier_stats, resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle,
+    },
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
     storage::request_context::spawn_traced,
@@ -748,7 +749,7 @@ impl Operation for GetTierInfo {
         } else {
             None
         };
-        let info = filter_tier_stats(GLOBAL_TransitionState.get_daily_all_tier_stats(), tier_name);
+        let info = filter_tier_stats(resolve_daily_tier_stats(), tier_name);
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
