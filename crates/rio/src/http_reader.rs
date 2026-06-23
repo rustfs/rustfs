@@ -496,7 +496,7 @@ impl HttpReader {
             headers,
             track_internode_metrics,
             internode_operation,
-            stall_timer: stall_timeout.map(|timeout| Box::pin(time::sleep(timeout))),
+            stall_timer: None,
             stall_timeout,
         })
     }
@@ -522,19 +522,15 @@ impl AsyncRead for HttpReader {
                 if bytes_read > 0 {
                     record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
                 }
-                if bytes_read > 0 {
-                    if let Some(stall_timeout) = *this.stall_timeout {
-                        *this.stall_timer = Some(Box::pin(time::sleep(stall_timeout)));
-                    }
-                } else {
-                    *this.stall_timer = None;
-                }
+                *this.stall_timer = None;
                 Poll::Ready(Ok(()))
             }
             Poll::Pending => {
-                if let Some(timer) = this.stall_timer.as_mut()
-                    && timer.as_mut().poll(cx).is_ready()
-                {
+                let Some(stall_timeout) = *this.stall_timeout else {
+                    return Poll::Pending;
+                };
+                let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
+                if timer.as_mut().poll(cx).is_ready() {
                     record_internode_error(*this.track_internode_metrics, *this.internode_operation);
                     Poll::Ready(Err(Error::new(
                         io::ErrorKind::TimedOut,
@@ -951,7 +947,7 @@ mod tests {
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
-        sync::Mutex,
+        sync::{Mutex, Notify},
     };
 
     #[derive(Clone, Default)]
@@ -960,6 +956,7 @@ mod tests {
         get_count: Arc<AtomicUsize>,
         put_count: Arc<AtomicUsize>,
         put_bodies: Arc<Mutex<Vec<Vec<u8>>>>,
+        delayed_body: Arc<Notify>,
     }
 
     async fn get_stream(State(state): State<TestState>) -> impl IntoResponse {
@@ -970,6 +967,16 @@ mod tests {
     async fn get_stalling_stream(State(state): State<TestState>) -> impl IntoResponse {
         state.get_count.fetch_add(1, Ordering::SeqCst);
         let body_stream = stream::once(async { Ok::<Bytes, io::Error>(Bytes::from_static(b"hello")) }).chain(stream::pending());
+        (StatusCode::OK, Body::from_stream(body_stream))
+    }
+
+    async fn get_delayed_first_chunk(State(state): State<TestState>) -> impl IntoResponse {
+        state.get_count.fetch_add(1, Ordering::SeqCst);
+        let delayed_body = state.delayed_body;
+        let body_stream = stream::once(async move {
+            delayed_body.notified().await;
+            Ok::<Bytes, io::Error>(Bytes::from_static(b"hello"))
+        });
         (StatusCode::OK, Body::from_stream(body_stream))
     }
 
@@ -995,6 +1002,7 @@ mod tests {
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
             .route("/stall", get(get_stalling_stream))
+            .route("/delayed-first", get(get_delayed_first_chunk))
             .with_state(state);
 
         let handle = tokio::spawn(async move {
@@ -1069,6 +1077,41 @@ mod tests {
             Err(err) => err,
         };
         assert_eq!(err.kind(), io::ErrorKind::TimedOut);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_reader_stall_timeout_starts_when_read_is_polled() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/delayed-first");
+
+        let mut reader =
+            HttpReader::new_with_stall_timeout(url, Method::GET, HeaderMap::new(), None, Some(Duration::from_millis(30)))
+                .await
+                .expect("reader should be created before the body is ready");
+
+        time::sleep(Duration::from_millis(60)).await;
+
+        let delayed_body = state.delayed_body.clone();
+        let read_result = tokio::time::timeout(Duration::from_secs(1), async move {
+            let mut first = [0u8; 5];
+            let read = tokio::spawn(async move {
+                reader.read_exact(&mut first).await?;
+                Ok::<_, io::Error>(first)
+            });
+            time::sleep(Duration::from_millis(5)).await;
+            delayed_body.notify_waiters();
+            read.await.expect("read task should not panic")
+        })
+        .await
+        .expect("delayed body should arrive before the active stall timeout")
+        .expect("reader should not time out before its first active poll");
+
+        assert_eq!(&read_result, b"hello");
 
         handle.abort();
     }
