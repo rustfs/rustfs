@@ -18,11 +18,11 @@ use super::handles::{
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
     default_endpoints_interface, default_internode_metrics_interface, default_kms_runtime_interface,
     default_local_node_name_interface, default_lock_client_interface, default_lock_clients_interface,
-    default_notification_system_interface, default_notify_interface, default_oidc_interface, default_outbound_tls_runtime_interface,
-    default_performance_metrics_interface, default_region_interface, default_replication_pool_interface,
-    default_replication_stats_interface, default_runtime_port_interface, default_s3select_db_interface,
-    default_scanner_metrics_interface, default_server_config_interface, default_storage_class_interface,
-    default_tier_config_interface, default_tier_stats_interface,
+    default_notification_system_interface, default_notify_interface, default_oidc_interface,
+    default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
+    default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
+    default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
+    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
