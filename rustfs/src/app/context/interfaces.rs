@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::DailyAllTierStats;
 use super::super::EndpointServerPools;
+use super::super::ScannerMetricsReport;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::BucketMetadataSys;
 use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
@@ -26,7 +28,7 @@ use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// IAM interface for application-layer use-cases.
@@ -92,6 +94,22 @@ pub trait ReplicationPoolInterface: Send + Sync {
 /// Replication statistics interface for admin metrics integration.
 pub trait ReplicationStatsInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<ReplicationStats>>;
+}
+
+/// Boot time interface for admin metric integration.
+pub trait BootTimeInterface: Send + Sync {
+    fn get(&self) -> Option<SystemTime>;
+}
+
+/// Tier transition statistics interface for admin metric integration.
+pub trait TierStatsInterface: Send + Sync {
+    fn daily_all(&self) -> DailyAllTierStats;
+}
+
+/// Scanner metrics report interface for admin status integration.
+#[async_trait]
+pub trait ScannerMetricsInterface: Send + Sync {
+    async fn report(&self) -> ScannerMetricsReport;
 }
 
 /// Endpoints interface for application-layer use-cases.

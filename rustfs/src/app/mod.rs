@@ -678,6 +678,22 @@ pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
     crate::storage::get_global_replication_stats()
 }
 
+pub(crate) type DailyAllTierStats = crate::storage::DailyAllTierStats;
+
+pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
+    crate::storage::get_global_boot_time()
+}
+
+pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
+    crate::storage::get_daily_all_tier_stats()
+}
+
+pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+
+pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
+    rustfs_common::metrics::global_metrics().report().await
+}
+
 #[cfg(test)]
 pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
 where

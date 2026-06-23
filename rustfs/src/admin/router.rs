@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::GLOBAL_BOOT_TIME;
 use super::PeerRestClient;
 use super::bandwidth::monitor::BandwidthDetails;
 use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient};
@@ -26,8 +25,9 @@ use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::app::context::{
-    resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system, resolve_object_store_handle,
-    resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_server_config,
+    resolve_boot_time, resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system,
+    resolve_object_store_handle, resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle,
+    resolve_server_config,
 };
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
@@ -1437,9 +1437,8 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
 }
 
 fn replication_metrics_uptime_seconds() -> i64 {
-    GLOBAL_BOOT_TIME
-        .get()
-        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+    resolve_boot_time()
+        .and_then(|boot_time| SystemTime::now().duration_since(boot_time).ok())
         .map(|uptime| uptime.as_secs() as i64)
         .unwrap_or_default()
 }
