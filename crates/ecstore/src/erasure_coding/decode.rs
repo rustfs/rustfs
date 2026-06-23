@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_codec::workspace::ShardBufferPool;
@@ -29,7 +30,7 @@ use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -74,6 +75,7 @@ fn read_shard<'a, R>(
     recycled_buf: Option<Vec<u8>>,
     shard_size: usize,
     data_shards: usize,
+    read_timeout: Duration,
     metrics_path: Option<&'static str>,
 ) -> ShardReadFuture<'a>
 where
@@ -85,7 +87,33 @@ where
             let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
             debug_assert_eq!(buf.len(), shard_size);
             let read_start = Instant::now();
-            match reader.read(&mut buf).await {
+            let read_result = if read_timeout.is_zero() {
+                reader.read(&mut buf).await
+            } else {
+                match tokio::time::timeout(read_timeout, reader.read(&mut buf)).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let timeout_error = io::Error::new(ErrorKind::TimedOut, "shard read timed out");
+                        let error_class = classify_io_error(&timeout_error).as_str();
+                        if let Some(path) = metrics_path {
+                            rustfs_io_metrics::record_get_object_shard_read_observation(
+                                path,
+                                index,
+                                role,
+                                read_cost.as_str(),
+                                GET_SHARD_READ_OUTCOME_ERROR,
+                                error_class,
+                                0,
+                                read_start.elapsed().as_secs_f64(),
+                                reader.last_verify_duration().as_secs_f64(),
+                            );
+                        }
+                        return (index, read_cost, Err(Error::from(timeout_error)), true);
+                    }
+                }
+            };
+
+            match read_result {
                 Ok(n) => {
                     buf.truncate(n);
                     if let Some(path) = metrics_path {
@@ -155,6 +183,7 @@ pub(crate) struct ParallelReader<R> {
     total_shards: usize,
     metrics_path: Option<&'static str>,
     read_costs: Vec<ShardReadCost>,
+    read_timeout: Duration,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -187,7 +216,46 @@ where
         offset: usize,
         total_length: usize,
         metrics_path: Option<&'static str>,
+        read_costs: Vec<ShardReadCost>,
+    ) -> Self {
+        Self::new_with_metrics_path_read_costs_and_read_timeout(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            read_costs,
+            get_object_disk_read_timeout(),
+        )
+    }
+
+    fn new_with_read_timeout(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        read_timeout: Duration,
+    ) -> Self {
+        let read_costs = vec![ShardReadCost::Unknown; readers.len()];
+        Self::new_with_metrics_path_read_costs_and_read_timeout(
+            readers,
+            e,
+            offset,
+            total_length,
+            None,
+            read_costs,
+            read_timeout,
+        )
+    }
+
+    fn new_with_metrics_path_read_costs_and_read_timeout(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
         mut read_costs: Vec<ShardReadCost>,
+        read_timeout: Duration,
     ) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
@@ -207,6 +275,7 @@ where
             total_shards: e.data_shards + e.parity_shards,
             metrics_path,
             read_costs,
+            read_timeout,
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
@@ -276,6 +345,7 @@ where
                         recycled_buf,
                         shard_size,
                         self.data_shards,
+                        self.read_timeout,
                         self.metrics_path,
                     ));
                 }
@@ -327,6 +397,7 @@ where
                                 recycled_buf,
                                 shard_size,
                                 self.data_shards,
+                                self.read_timeout,
                                 self.metrics_path,
                             ));
                         }
@@ -771,6 +842,7 @@ mod tests {
 
     enum TestShardReader {
         Ready(Cursor<Vec<u8>>),
+        Pending,
         TimedOut,
     }
 
@@ -778,6 +850,10 @@ mod tests {
         fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
             match &mut *self {
                 TestShardReader::Ready(cursor) => Pin::new(cursor).poll_read(cx, buf),
+                TestShardReader::Pending => {
+                    cx.waker().wake_by_ref();
+                    Poll::Pending
+                }
                 TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
             }
         }
@@ -1149,6 +1225,47 @@ mod tests {
 
         let (bufs, errs) = parallel_reader.read().await;
 
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_replaces_pending_shard_after_timeout_with_parity() {
+        const NUM_SHARDS: usize = 1;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 1;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(TestShardReader::Pending, SHARD_SIZE, hash_algo.clone(), false)),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader =
+            ParallelReader::new_with_read_timeout(readers, erasure, 0, NUM_SHARDS * BLOCK_SIZE, Duration::from_millis(20));
+
+        let started = std::time::Instant::now();
+        let (bufs, errs) = parallel_reader.read().await;
+
+        assert!(started.elapsed() < Duration::from_secs(1));
         assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
         assert!(parallel_reader.readers[0].is_none());
         assert!(bufs[0].is_none());

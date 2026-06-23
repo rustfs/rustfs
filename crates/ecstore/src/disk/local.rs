@@ -1825,6 +1825,7 @@ impl LocalDisk {
                         error = ?er,
                         "Disk local scan failed"
                     );
+                    return Err(er);
                 }
             }
 
@@ -1894,9 +1895,20 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             schedule_dir(&mut dir_stack, meta.name, false, None);
                         }
+
+                        continue;
                     }
 
-                    continue;
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %fname,
+                        operation = "read_metadata",
+                        error = ?err,
+                        "Disk local scan failed"
+                    );
+                    return Err(err);
                 }
             };
         }
@@ -1917,7 +1929,7 @@ impl LocalDisk {
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                warn!(
+                error!(
                     event = EVENT_DISK_LOCAL_SCAN_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
@@ -1926,6 +1938,7 @@ impl LocalDisk {
                     error = ?er,
                     "Disk local recursive scan failed"
                 );
+                return Err(er);
             }
         }
 
@@ -4323,6 +4336,51 @@ mod test {
 
         assert!(has_visible_object);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_scan_dir_propagates_metadata_read_errors() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let object_dir = bucket_dir.join("broken");
+        let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        fs::create_dir_all(&object_dir).await.unwrap();
+        fs::write(&meta_path, b"meta").await.unwrap();
+
+        let original_permissions = fs::metadata(&meta_path).await.unwrap().permissions();
+        fs::set_permissions(&meta_path, Permissions::from_mode(0o000)).await.unwrap();
+        if fs::File::open(&meta_path).await.is_ok() {
+            fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+            return;
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (_reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        let result = disk
+            .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await;
+
+        fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+
+        assert!(matches!(result, Err(DiskError::FileAccessDenied)));
     }
 
     #[tokio::test]
