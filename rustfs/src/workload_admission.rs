@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{bucket_metadata_runtime_initialized, get_global_replication_pool, replication_queue_current_count};
+use crate::app::context::resolve_replication_pool_handle;
+use crate::storage::{bucket_metadata_runtime_initialized, replication_queue_current_count};
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
     WorkloadClass,
@@ -151,7 +152,7 @@ fn repair_workload_admission_snapshot_from_counts(
 }
 
 pub fn replication_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = resolve_replication_pool_handle() else {
         return replication_workload_admission_snapshot_from_counts(false, None, None);
     };
 

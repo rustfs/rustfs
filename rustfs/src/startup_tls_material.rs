@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_outbound_tls_generation;
 use crate::config::Config;
 use std::io::{Error, Result};
 use tracing::{error, info};
@@ -28,7 +29,7 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
             Ok(snapshot) => {
                 use rustfs_tls_runtime::{publish_global_outbound_tls_state, record_tls_generation};
 
-                let generation = next_tls_generation(rustfs_common::get_global_outbound_tls_generation());
+                let generation = next_tls_generation(resolve_outbound_tls_generation().0);
                 publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
                 record_tls_generation(TLS_STARTUP_GENERATION_CONSUMER, generation.0);
                 info!(
