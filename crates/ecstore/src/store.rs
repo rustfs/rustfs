@@ -44,9 +44,8 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, TypeLocalDiskSetDrives,
-    get_global_deployment_id, get_global_endpoints, get_global_region, get_global_tier_config_mgr, init_global_bucket_monitor,
-    set_global_deployment_id, set_object_layer,
+    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, TypeLocalDiskSetDrives, get_global_endpoints, get_global_region,
+    get_global_tier_config_mgr, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
@@ -56,7 +55,7 @@ use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
-    disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET, new_disk},
+    disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     endpoints::EndpointServerPools,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     rpc::S3PeerSys,
@@ -805,7 +804,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_find_local_disk() {
-        let result = peer::find_local_disk(&"/nonexistent/path".to_string()).await;
+        let result = peer::find_local_disk("/nonexistent/path").await;
         assert!(result.is_none(), "Should return None for nonexistent path");
     }
 

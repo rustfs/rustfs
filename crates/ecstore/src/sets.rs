@@ -25,8 +25,9 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_lock_clients, is_dist_erasure},
+    global::{get_global_lock_clients, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    runtime_sources,
     set_disk::SetDisks,
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
@@ -138,10 +139,7 @@ impl Sets {
                 }
 
                 if disk.as_ref().unwrap().is_local() && is_dist_erasure().await {
-                    let local_disk = {
-                        let local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.read().await;
-                        local_set_drives[pool_idx][i][j].clone()
-                    };
+                    let local_disk = runtime_sources::local_disk_set_drive(pool_idx, i, j).await;
 
                     if local_disk.is_none() {
                         warn!("sets new set_drive {}-{} local_disk is none", i, j);

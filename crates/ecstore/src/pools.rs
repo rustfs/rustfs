@@ -37,11 +37,11 @@ use crate::error::{
     is_err_version_not_found,
 };
 use crate::global::resolve_object_store_handle;
-use crate::notification_sys::get_global_notification_sys;
 use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
+use crate::runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
-use crate::{global::GLOBAL_LifecycleSys, sets::Sets, store::ECStore};
+use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use http::HeaderMap;
@@ -2051,7 +2051,7 @@ impl ECStore {
             return Err(err);
         }
 
-        if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
+        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("decommission_cancel for pool {idx}");
             resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
@@ -2083,7 +2083,7 @@ impl ECStore {
             return Err(err);
         }
 
-        if should_reload_pool_meta && let Some(notification_sys) = get_global_notification_sys() {
+        if should_reload_pool_meta && let Some(notification_sys) = runtime_sources::notification_sys() {
             let stage = format!("clear_decommission for pool {idx}");
             resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
         }
@@ -2099,7 +2099,7 @@ impl ECStore {
 
         if promoted {
             self.save_current_pool_meta().await?;
-            if let Some(notification_sys) = get_global_notification_sys() {
+            if let Some(notification_sys) = runtime_sources::notification_sys() {
                 let stage = format!("promote_queued_decommission for pool {idx}");
                 resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str())?;
             }
@@ -2613,7 +2613,7 @@ impl ECStore {
             } else {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
-                if let Some(notification_sys) = get_global_notification_sys()
+                if let Some(notification_sys) = runtime_sources::notification_sys()
                     && let Err(err) = resolve_decommission_entry_reload_result(
                         notification_sys.reload_pool_meta().await,
                         bucket.as_str(),
@@ -2664,7 +2664,7 @@ impl ECStore {
                 "versioning",
                 BucketVersioningSys::get(&bi.name).await,
             )?;
-            lifecycle_config = GLOBAL_LifecycleSys.get(&bi.name).await;
+            lifecycle_config = runtime_sources::bucket_lifecycle_config(&bi.name).await;
             lock_retention = BucketObjectLockSys::get(&bi.name).await;
             replication_config = resolve_decommission_optional_bucket_config_result(
                 &bi.name,
@@ -3105,7 +3105,7 @@ impl ECStore {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            if let Some(notification_sys) = get_global_notification_sys() {
+            if let Some(notification_sys) = runtime_sources::notification_sys() {
                 let stage = format!("decommission_failed for pool {idx}");
                 if let Some(err) = observe_decommission_terminal_reload_result(
                     resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
@@ -3155,7 +3155,7 @@ impl ECStore {
                 let mut pool_meta = self.pool_meta.write().await;
                 pool_meta.mark_decommission_progress_saved();
             }
-            if let Some(notification_sys) = get_global_notification_sys() {
+            if let Some(notification_sys) = runtime_sources::notification_sys() {
                 let stage = format!("complete_decommission for pool {idx}");
                 if let Some(err) = observe_decommission_terminal_reload_result(
                     resolve_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await, stage.as_str()),
@@ -3339,7 +3339,7 @@ impl ECStore {
             .save_current_pool_meta_for_decommission_start(&indices, space_infos, decom_buckets)
             .await?;
 
-        if let Some(notification_sys) = get_global_notification_sys()
+        if let Some(notification_sys) = runtime_sources::notification_sys()
             && let Err(err) = resolve_start_decommission_pool_meta_reload_result(notification_sys.reload_pool_meta().await)
         {
             warn!(
@@ -3438,7 +3438,7 @@ impl ECStore {
                 let mut lock_retention = None;
                 let mut replication_config = None;
                 if bucket_info.name != RUSTFS_META_BUCKET {
-                    lifecycle_config = GLOBAL_LifecycleSys.get(&bucket_info.name).await;
+                    lifecycle_config = runtime_sources::bucket_lifecycle_config(&bucket_info.name).await;
                     lock_retention = BucketObjectLockSys::get(&bucket_info.name).await;
                     replication_config = resolve_decommission_optional_bucket_config_result(
                         &bucket_info.name,
