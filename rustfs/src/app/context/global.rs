@@ -20,14 +20,14 @@ use super::handles::{
     default_notification_system_interface, default_notify_interface, default_outbound_tls_runtime_interface,
     default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
     default_runtime_port_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_tier_config_interface, default_tier_stats_interface,
+    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
     LockClientInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface,
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface, ServerConfigInterface,
-    TierConfigInterface, TierStatsInterface,
+    StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -60,6 +60,7 @@ pub struct AppContext {
     region: Arc<dyn RegionInterface>,
     tier_config: Arc<dyn TierConfigInterface>,
     server_config: Arc<dyn ServerConfigInterface>,
+    storage_class: Arc<dyn StorageClassInterface>,
     buffer_config: Arc<dyn BufferConfigInterface>,
 }
 
@@ -89,6 +90,7 @@ impl AppContext {
             region: default_region_interface(),
             tier_config: default_tier_config_interface(),
             server_config: default_server_config_interface(),
+            storage_class: default_storage_class_interface(),
             buffer_config: default_buffer_config_interface(),
         }
     }
@@ -194,6 +196,10 @@ impl AppContext {
         self.server_config.clone()
     }
 
+    pub fn storage_class(&self) -> Arc<dyn StorageClassInterface> {
+        self.storage_class.clone()
+    }
+
     pub fn buffer_config(&self) -> Arc<dyn BufferConfigInterface> {
         self.buffer_config.clone()
     }
@@ -223,6 +229,7 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) region: Arc<dyn RegionInterface>,
     pub(super) tier_config: Arc<dyn TierConfigInterface>,
     pub(super) server_config: Arc<dyn ServerConfigInterface>,
+    pub(super) storage_class: Arc<dyn StorageClassInterface>,
     pub(super) buffer_config: Arc<dyn BufferConfigInterface>,
 }
 
@@ -253,6 +260,7 @@ impl AppContext {
             region: interfaces.region,
             tier_config: interfaces.tier_config,
             server_config: interfaces.server_config,
+            storage_class: interfaces.storage_class,
             buffer_config: interfaces.buffer_config,
         }
     }

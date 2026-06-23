@@ -15,6 +15,7 @@
 use super::super::DailyAllTierStats;
 use super::super::EndpointServerPools;
 use super::super::ScannerMetricsReport;
+use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::BucketMetadataSys;
 use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
@@ -156,6 +157,12 @@ pub trait TierConfigInterface: Send + Sync {
 /// Server config interface for application-layer and server modules.
 pub trait ServerConfigInterface: Send + Sync {
     fn get(&self) -> Option<Config>;
+    fn set(&self, config: Config);
+}
+
+/// Storage class config interface for admin runtime config publication.
+pub trait StorageClassInterface: Send + Sync {
+    fn set(&self, config: StorageClassConfig);
 }
 
 /// Buffer profile config interface for application-layer use-cases.
