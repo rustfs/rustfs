@@ -32,7 +32,7 @@ use crate::admin::site_replication_identity::{
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::{
-    resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle,
+    resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle, resolve_oidc_handle,
     resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
     resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config,
 };
@@ -52,7 +52,6 @@ use rustfs_config::{
     MAX_ADMIN_REQUEST_BODY_SIZE,
 };
 use rustfs_iam::error::is_err_no_such_service_account;
-use rustfs_iam::get_oidc;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{
     NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
@@ -4229,7 +4228,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
         let mut settings = IDPSettings::default();
-        if let Some(oidc) = get_oidc() {
+        if let Some(oidc) = resolve_oidc_handle() {
             let providers = oidc.list_providers();
             settings.open_id.enabled = !providers.is_empty();
             settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();
