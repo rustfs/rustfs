@@ -16,14 +16,14 @@ use super::super::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata,
-    reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
+    set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::app::context::{resolve_iam_handle, resolve_lock_client};
+use crate::app::context::{AppContext, get_global_app_context, resolve_iam_handle, resolve_lock_client, resolve_object_store_handle_for_context};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -153,17 +153,35 @@ mod lock;
 #[path = "metrics.rs"]
 mod metrics;
 
-#[derive(Debug)]
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
+    context: Option<Arc<AppContext>>,
+}
+
+impl std::fmt::Debug for NodeService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NodeService")
+            .field("local_peer", &self.local_peer)
+            .field("context_present", &self.context.is_some())
+            .finish()
+    }
 }
 
 pub fn make_server() -> NodeService {
+    let context = get_global_app_context();
+    make_server_for_context(context)
+}
+
+pub fn make_server_for_context(context: Option<Arc<AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
-    NodeService { local_peer }
+    NodeService { local_peer, context }
 }
 
 impl NodeService {
+    fn resolve_object_store(&self) -> Option<Arc<crate::app::ECStore>> {
+        resolve_object_store_handle_for_context(self.context.as_deref())
+    }
+
     async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
         find_local_disk_by_ref(disk_path).await
     }
@@ -882,7 +900,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadSiteReplicationConfigRequest>,
     ) -> Result<Response<ReloadSiteReplicationConfigResponse>, Status> {
-        let Some(_store) = resolve_object_store_handle() else {
+        let Some(_store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadSiteReplicationConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -971,7 +989,7 @@ impl Node for NodeService {
         &self,
         _request: Request<ReloadPoolMetaRequest>,
     ) -> Result<Response<ReloadPoolMetaResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(ReloadPoolMetaResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -996,7 +1014,7 @@ impl Node for NodeService {
     }
 
     async fn stop_rebalance(&self, request: Request<StopRebalanceRequest>) -> Result<Response<StopRebalanceResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(StopRebalanceResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1017,7 +1035,7 @@ impl Node for NodeService {
         request: Request<LoadRebalanceMetaRequest>,
     ) -> Result<Response<LoadRebalanceMetaResponse>, Status> {
         let LoadRebalanceMetaRequest { start_rebalance } = request.into_inner();
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             log_load_rebalance_meta_rejected!("server_not_initialized", start_rebalance);
             return Ok(Response::new(LoadRebalanceMetaResponse {
                 success: false,
@@ -1061,7 +1079,7 @@ impl Node for NodeService {
         &self,
         _request: Request<LoadTransitionTierConfigRequest>,
     ) -> Result<Response<LoadTransitionTierConfigResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LoadTransitionTierConfigResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
