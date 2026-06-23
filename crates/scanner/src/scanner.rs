@@ -17,8 +17,8 @@ use std::sync::Arc;
 use crate::ScannerObjectIO;
 use crate::data_usage_define::{BACKGROUND_HEAL_INFO_PATH, DATA_USAGE_BLOOM_NAME_PATH, DATA_USAGE_OBJ_NAME_PATH};
 use crate::runtime_config::{
-    current_scanner_runtime_config, lookup_scanner_runtime_config, refresh_scanner_runtime_config_from_global,
-    scanner_bitrot_cycle, scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
+    refresh_scanner_runtime_config_from_global, resolve_scanner_runtime_config_from_global, scanner_bitrot_cycle,
+    scanner_cycle_interval, scanner_start_delay, set_scanner_default_cycle_secs,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetConfig, ScannerCycleBudgetReason};
 use crate::scanner_folder::{data_usage_update_dir_cycles, heal_object_select_prob};
@@ -82,22 +82,7 @@ fn scanner_cycle_max_duration() -> Option<Duration> {
 }
 
 fn resolve_scanner_runtime_config() -> crate::runtime_config::ScannerRuntimeConfig {
-    let config = rustfs_config::server_config::get_global_server_config();
-    match lookup_scanner_runtime_config(config.as_ref()) {
-        Ok(config) => config,
-        Err(err) => {
-            warn!(
-                target: "rustfs::scanner",
-                event = EVENT_SCANNER_RUNTIME_CONFIG,
-                component = LOG_COMPONENT_SCANNER,
-                subsystem = LOG_SUBSYSTEM_RUNTIME,
-                state = "resolve_failed",
-                error = %err,
-                "Scanner runtime config fallback applied"
-            );
-            current_scanner_runtime_config()
-        }
-    }
+    resolve_scanner_runtime_config_from_global()
 }
 
 fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCyclePartialReason {
