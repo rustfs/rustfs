@@ -16,14 +16,16 @@ use super::super::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-    set_bucket_metadata,
+    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata,
+    reload_transition_tier_config, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::app::context::{AppContext, get_global_app_context, resolve_iam_handle, resolve_lock_client, resolve_object_store_handle_for_context};
+use crate::app::context::{
+    AppContext, get_global_app_context, resolve_iam_handle, resolve_lock_client, resolve_object_store_handle_for_context,
+};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
