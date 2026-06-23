@@ -16,14 +16,14 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::app::context::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_kms::{KmsError, init_global_kms_service_manager, types::*};
+use rustfs_kms::{KmsError, types::*};
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -121,7 +121,7 @@ fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsSe
 }
 
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
-    let manager = kms_service_manager_from_context().unwrap_or_else(init_global_kms_service_manager);
+    let manager = resolve_or_init_kms_runtime_service_manager();
     manager.get_encryption_service().await
 }
 

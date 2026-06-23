@@ -16,15 +16,16 @@ use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
-    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
-    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
-    get_global_tier_config_mgr, global_rustfs_port,
+    collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
+    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_notification_sys, get_global_region,
+    get_global_replication_pool, get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port,
 };
 use super::interfaces::{
-    ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
-    EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface, ReplicationPoolInterface,
-    ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+    ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
+    DeploymentIdInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
+    LockClientInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface,
+    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface, ServerConfigInterface,
+    TierConfigInterface, TierStatsInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -40,7 +41,7 @@ use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{
     GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
 };
-use std::sync::Arc;
+use std::{sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
@@ -182,6 +183,37 @@ impl ReplicationStatsInterface for ReplicationStatsHandle {
     }
 }
 
+/// Default boot time interface adapter.
+#[derive(Default)]
+pub struct BootTimeHandle;
+
+impl BootTimeInterface for BootTimeHandle {
+    fn get(&self) -> Option<SystemTime> {
+        get_global_boot_time()
+    }
+}
+
+/// Default tier transition statistics interface adapter.
+#[derive(Default)]
+pub struct TierStatsHandle;
+
+impl TierStatsInterface for TierStatsHandle {
+    fn daily_all(&self) -> super::super::DailyAllTierStats {
+        get_daily_all_tier_stats()
+    }
+}
+
+/// Default scanner metrics report interface adapter.
+#[derive(Default)]
+pub struct ScannerMetricsHandle;
+
+#[async_trait]
+impl ScannerMetricsInterface for ScannerMetricsHandle {
+    async fn report(&self) -> super::super::ScannerMetricsReport {
+        collect_scanner_metrics_report().await
+    }
+}
+
 /// Default endpoints interface adapter.
 #[derive(Default)]
 pub struct EndpointsHandle;
@@ -313,6 +345,18 @@ pub fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface>
 
 pub fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
     Arc::new(ReplicationStatsHandle)
+}
+
+pub fn default_boot_time_interface() -> Arc<dyn BootTimeInterface> {
+    Arc::new(BootTimeHandle)
+}
+
+pub fn default_tier_stats_interface() -> Arc<dyn TierStatsInterface> {
+    Arc::new(TierStatsHandle)
+}
+
+pub fn default_scanner_metrics_interface() -> Arc<dyn ScannerMetricsInterface> {
+    Arc::new(ScannerMetricsHandle)
 }
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {

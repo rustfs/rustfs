@@ -25,8 +25,10 @@ pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
 
+use super::DailyAllTierStats;
 use super::ECStore;
 use super::EndpointServerPools;
+use super::ScannerMetricsReport;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
@@ -35,15 +37,20 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::KmsServiceManager;
+use rustfs_kms::{KmsServiceManager, init_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use std::{future::Future, sync::Arc};
+use std::{future::Future, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
+}
+
+/// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
+pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
+    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), init_global_kms_service_manager)
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
@@ -116,6 +123,22 @@ pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
     resolve_replication_stats_handle_with(get_global_app_context(), || default_replication_stats_interface().handle())
 }
 
+/// Resolve boot time using AppContext-first precedence.
+pub fn resolve_boot_time() -> Option<SystemTime> {
+    resolve_boot_time_with(get_global_app_context(), || default_boot_time_interface().get())
+}
+
+/// Resolve daily tier transition statistics using AppContext-first precedence.
+pub fn resolve_daily_tier_stats() -> DailyAllTierStats {
+    resolve_daily_tier_stats_with(get_global_app_context(), || default_tier_stats_interface().daily_all())
+}
+
+/// Resolve scanner metrics report using AppContext-first precedence.
+pub async fn resolve_scanner_metrics_report() -> ScannerMetricsReport {
+    resolve_scanner_metrics_report_with(get_global_app_context(), || async { default_scanner_metrics_interface().report().await })
+        .await
+}
+
 /// Resolve deployment identity using AppContext-first precedence.
 pub fn resolve_deployment_id() -> Option<String> {
     resolve_deployment_id_with(get_global_app_context(), || default_deployment_id_interface().get())
@@ -168,6 +191,15 @@ fn resolve_kms_runtime_service_manager_with(
     context
         .and_then(|context| context.kms_runtime().service_manager())
         .or_else(fallback)
+}
+
+fn resolve_or_init_kms_runtime_service_manager_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<KmsServiceManager>,
+) -> Arc<KmsServiceManager> {
+    context
+        .and_then(|context| context.kms_runtime().service_manager())
+        .unwrap_or_else(fallback)
 }
 
 fn resolve_outbound_tls_generation_with(
@@ -239,6 +271,29 @@ fn resolve_replication_stats_handle_with(
     context
         .and_then(|context| context.replication_stats().handle())
         .or_else(fallback)
+}
+
+fn resolve_boot_time_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<SystemTime>) -> Option<SystemTime> {
+    context.and_then(|context| context.boot_time().get()).or_else(fallback)
+}
+
+fn resolve_daily_tier_stats_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> DailyAllTierStats,
+) -> DailyAllTierStats {
+    context.map_or_else(fallback, |context| context.tier_stats().daily_all())
+}
+
+async fn resolve_scanner_metrics_report_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> ScannerMetricsReport
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = ScannerMetricsReport>,
+{
+    if let Some(context) = context {
+        return context.scanner_metrics().report().await;
+    }
+
+    fallback().await
 }
 
 #[cfg(test)]
@@ -330,16 +385,17 @@ mod tests {
         default_replication_pool_interface,
     };
     use crate::app::context::interfaces::{
-        ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
-        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-        OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface,
-        TierConfigInterface,
+        ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface,
+        EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+        OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface,
+        ServerConfigInterface, TierConfigInterface, TierStatsInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_lock::{LocalClient, LockClient};
     use std::path::PathBuf;
+    use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
@@ -409,6 +465,37 @@ mod tests {
     impl ReplicationStatsInterface for TestReplicationStatsInterface {
         fn handle(&self) -> Option<Arc<ReplicationStats>> {
             self.stats.clone()
+        }
+    }
+
+    struct TestBootTimeInterface {
+        boot_time: Option<SystemTime>,
+    }
+
+    impl BootTimeInterface for TestBootTimeInterface {
+        fn get(&self) -> Option<SystemTime> {
+            self.boot_time.clone()
+        }
+    }
+
+    struct TestTierStatsInterface {
+        daily_stats: DailyAllTierStats,
+    }
+
+    impl TierStatsInterface for TestTierStatsInterface {
+        fn daily_all(&self) -> DailyAllTierStats {
+            self.daily_stats.clone()
+        }
+    }
+
+    struct TestScannerMetricsInterface {
+        report: ScannerMetricsReport,
+    }
+
+    #[async_trait]
+    impl ScannerMetricsInterface for TestScannerMetricsInterface {
+        async fn report(&self) -> ScannerMetricsReport {
+            self.report.clone()
         }
     }
 
@@ -571,6 +658,20 @@ mod tests {
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
         let fallback_replication_stats = Arc::new(ReplicationStats::new());
+        let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
+        let fallback_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
+        let mut context_daily_tier_stats = DailyAllTierStats::new();
+        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
+        let mut fallback_daily_tier_stats = DailyAllTierStats::new();
+        fallback_daily_tier_stats.insert("FALLBACK".to_string(), Default::default());
+        let context_scanner_metrics = ScannerMetricsReport {
+            current_cycle: 7,
+            ..Default::default()
+        };
+        let fallback_scanner_metrics = ScannerMetricsReport {
+            current_cycle: 13,
+            ..Default::default()
+        };
         let tier_config = TierConfigMgr::new();
         let server_config = Config::new();
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
@@ -621,6 +722,15 @@ mod tests {
                 replication_stats: Arc::new(TestReplicationStatsInterface {
                     stats: Some(context_replication_stats.clone()),
                 }),
+                boot_time: Arc::new(TestBootTimeInterface {
+                    boot_time: Some(context_boot_time),
+                }),
+                tier_stats: Arc::new(TestTierStatsInterface {
+                    daily_stats: context_daily_tier_stats.clone(),
+                }),
+                scanner_metrics: Arc::new(TestScannerMetricsInterface {
+                    report: context_scanner_metrics.clone(),
+                }),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
                 }),
@@ -657,6 +767,10 @@ mod tests {
                 .expect("context KMS runtime"),
             &context_kms
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_or_init_kms_runtime_service_manager_with(Some(context.clone()), || fallback_kms.clone()),
+            &context_kms
+        ));
         assert_eq!(
             resolve_outbound_tls_generation_with(Some(context.clone()), || TlsGeneration(99)),
             context_outbound_tls_state.generation
@@ -678,6 +792,19 @@ mod tests {
             &resolve_replication_stats_handle_with(Some(context.clone()), || None).expect("context replication stats"),
             &context_replication_stats
         ));
+        assert_eq!(
+            resolve_boot_time_with(Some(context.clone()), || Some(fallback_boot_time)).expect("context boot time"),
+            context_boot_time
+        );
+        assert!(
+            resolve_daily_tier_stats_with(Some(context.clone()), || fallback_daily_tier_stats.clone()).contains_key("CONTEXT")
+        );
+        assert_eq!(
+            resolve_scanner_metrics_report_with(Some(context.clone()), || async { fallback_scanner_metrics.clone() })
+                .await
+                .current_cycle,
+            context_scanner_metrics.current_cycle
+        );
         assert_eq!(
             resolve_endpoints_handle_with(Some(context.clone()), || None)
                 .expect("context endpoints")
@@ -729,6 +856,10 @@ mod tests {
             &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
             &fallback_kms
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_or_init_kms_runtime_service_manager_with(None, || fallback_kms.clone()),
+            &fallback_kms
+        ));
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
@@ -745,6 +876,17 @@ mod tests {
                 .expect("fallback replication stats"),
             &fallback_replication_stats
         ));
+        assert_eq!(
+            resolve_boot_time_with(None, || Some(fallback_boot_time)).expect("fallback boot time"),
+            fallback_boot_time
+        );
+        assert!(resolve_daily_tier_stats_with(None, || fallback_daily_tier_stats.clone()).contains_key("FALLBACK"));
+        assert_eq!(
+            resolve_scanner_metrics_report_with(None, || async { fallback_scanner_metrics.clone() })
+                .await
+                .current_cycle,
+            fallback_scanner_metrics.current_cycle
+        );
         assert_eq!(
             resolve_endpoints_handle_with(None, || Some(endpoints.clone()))
                 .expect("fallback endpoints")

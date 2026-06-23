@@ -5,13 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-replication-stats-context`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165`.
-- Based on: API-164/API-165 local branch stacked on API-163 PR #3777.
+- Branch: `overtrue/arch-admin-kms-manager-context`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168`.
+- Based on: API-168 local branch stacked on API-167 local branch after API-163 PR #3777 merged.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route admin replication stats reads through AppContext
-  resolvers with legacy global fallback.
+- Rust code changes: route admin KMS service-manager initialization fallback
+  through an AppContext-first resolver with legacy global initialization
+  preserved when no manager is available.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -20,7 +21,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166 owner facade cleanup.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4401,6 +4402,35 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     stats global-read scan, Rust risk scan, branch freshness check, and
     three-expert review.
 
+- [x] `API-167` Route admin status and metrics reads through AppContext.
+  - Do: add AppContext interfaces for boot time, daily tier transition stats,
+    and scanner metrics report reads, then route admin replication uptime, tier
+    stats, and scanner status through those resolvers.
+  - Acceptance: admin production handlers no longer directly read
+    `GLOBAL_BOOT_TIME`, `GLOBAL_TransitionState`, or scanner `global_metrics`,
+    while AppContext default adapters keep the existing global fallback.
+  - Must preserve: replication metrics uptime defaults, tier stats filtering,
+    scanner status payload shape, scanner runtime-config reporting, and existing
+    storage owner global initialization.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual admin
+    status global-read scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-168` Route admin KMS manager initialization through AppContext.
+  - Do: add an AppContext-first KMS runtime resolver that initializes the
+    legacy global manager only after context/default lookup misses, then route
+    admin KMS key, management, and dynamic handlers through it.
+  - Acceptance: admin production handlers no longer directly initialize the
+    global KMS service manager, while the AppContext default path preserves
+    legacy global initialization fallback.
+  - Must preserve: KMS key encryption-service lookup, KMS status/config/cache
+    handlers, dynamic KMS configure/start/stop/reconfigure behavior, and
+    existing fallback warning logs.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual admin KMS
+    init scan, Rust risk scan, branch freshness check, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4455,6 +4485,12 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-166 keeps admin replication stats reads behind AppContext resolver boundaries with a storage-owner fallback wrapper. |
 | Migration preservation | pass | Admin replication metrics, site-replication summaries, bandwidth enrichment, and missing-stats defaults are preserved. |
 | Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual stats scan, and Rust risk scan passed for API-166. |
+| Quality/architecture | pass | API-167 keeps admin boot-time, tier-transition, and scanner metrics reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Replication uptime enrichment, tier stats filtering, scanner metrics JSON, and scanner runtime-config reporting are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual admin status scan, and Rust risk scan passed for API-167. |
+| Quality/architecture | pass | API-168 keeps admin KMS service-manager initialization behind the AppContext resolver boundary. |
+| Migration preservation | pass | KMS key, management, and dynamic handlers preserve legacy initialization fallback and existing fallback logs. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual KMS init scan, and Rust risk scan passed for API-168. |
 
 ## Verification Notes
 
@@ -4502,6 +4538,37 @@ Passed before push:
   - `./scripts/check_layer_dependencies.sh`: passed.
   - AppContext replication stats resolver scan: passed; direct admin production
     `GLOBAL_REPLICATION_STATS` reads are removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-167 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext admin status resolver scan: passed; direct admin production
+    `GLOBAL_BOOT_TIME`, `GLOBAL_TransitionState`, and scanner `global_metrics`
+    reads are removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-168 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext admin KMS init resolver scan: passed; direct admin production
+    `init_global_kms_service_manager` calls are removed.
   - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
     risks added.
 
