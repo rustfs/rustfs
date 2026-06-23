@@ -13,10 +13,9 @@
 // limitations under the License.
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
-use crate::storage::ECStore;
 use crate::storage::{
-    ecstore_bucket::replication as ecstore_replication, ecstore_config, ecstore_global, ecstore_layout::EndpointServerPools,
-    ecstore_storage,
+    ECStore, EndpointServerPools, init_background_replication, init_ecstore_config, init_global_config_sys, init_local_disks,
+    init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config, update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
@@ -71,8 +70,8 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
         .map_err(Error::other)?;
     enforce_unsupported_fs_policy(&endpoint_pools)?;
 
-    ecstore_global::set_global_endpoints(endpoint_pools.as_ref().clone());
-    ecstore_global::update_erasure_type(setup_type).await;
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
 
     debug!(
         target: "rustfs::main::run",
@@ -83,7 +82,7 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
         state = "starting",
         "starting local disk initialization"
     );
-    ecstore_storage::init_local_disks(endpoint_pools.clone())
+    init_local_disks(endpoint_pools.clone())
         .await
         .inspect_err(|err| {
             error!(
@@ -98,8 +97,8 @@ pub(crate) async fn init_startup_storage_foundation(server_address: &str, volume
             );
         })
         .map_err(Error::other)?;
-    ecstore_storage::prewarm_local_disk_id_map().await;
-    ecstore_storage::init_lock_clients(endpoint_pools.clone());
+    prewarm_local_disk_id_map().await;
+    init_lock_clients(endpoint_pools.clone());
 
     log_storage_pool_layout(&endpoint_pools);
 
@@ -115,13 +114,13 @@ pub(crate) async fn init_embedded_startup_storage_foundation(
         .map_err(|err| Error::other(format!("endpoints: {err}")))?;
     enforce_unsupported_fs_policy(&endpoint_pools).map_err(|err| Error::other(format!("unsupported fs guard: {err}")))?;
 
-    ecstore_global::set_global_endpoints(endpoint_pools.as_ref().clone());
-    ecstore_global::update_erasure_type(setup_type).await;
+    set_global_endpoints(endpoint_pools.as_ref().clone());
+    update_erasure_type(setup_type).await;
 
-    ecstore_storage::init_local_disks(endpoint_pools.clone())
+    init_local_disks(endpoint_pools.clone())
         .await
         .map_err(|err| Error::other(format!("local disks: {err}")))?;
-    ecstore_storage::init_lock_clients(endpoint_pools.clone());
+    init_lock_clients(endpoint_pools.clone());
 
     Ok(endpoint_pools)
 }
@@ -159,7 +158,7 @@ pub(crate) async fn init_startup_storage_runtime(
 
     init_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
-    ecstore_replication::init_background_replication(store.clone()).await;
+    init_background_replication(store.clone()).await;
 
     Ok(StartupStorageRuntime {
         store,
@@ -190,17 +189,17 @@ pub(crate) async fn init_embedded_startup_storage_runtime(
 
     init_embedded_startup_storage_global_config(store.clone()).await?;
     readiness.mark_stage(SystemStage::StorageReady);
-    ecstore_replication::init_background_replication(store.clone()).await;
+    init_background_replication(store.clone()).await;
 
     Ok(StartupStorageRuntime { store, shutdown_token })
 }
 
 async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
-    ecstore_config::init();
-    ecstore_config::try_migrate_server_config(store.clone()).await;
+    init_ecstore_config();
+    try_migrate_server_config(store.clone()).await;
 
     let mut retry_count = 0;
-    while let Err(e) = ecstore_config::init_global_config_sys(store.clone()).await {
+    while let Err(e) = init_global_config_sys(store.clone()).await {
         let next_retry_count = retry_count + 1;
         error!(
             target: "rustfs::main::run",
@@ -225,11 +224,11 @@ async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
 }
 
 async fn init_embedded_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
-    ecstore_config::init();
-    ecstore_config::try_migrate_server_config(store.clone()).await;
+    init_ecstore_config();
+    try_migrate_server_config(store.clone()).await;
 
     let mut retry = 0;
-    while let Err(err) = ecstore_config::init_global_config_sys(store.clone()).await {
+    while let Err(err) = init_global_config_sys(store.clone()).await {
         retry += 1;
         if retry > GLOBAL_CONFIG_INIT_MAX_RETRIES {
             return Err(Error::other(format!(

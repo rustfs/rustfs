@@ -12,13 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod collectors;
-pub mod config;
-pub mod report;
-pub mod scheduler;
-pub mod schema;
-pub mod stats_collector;
-
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     GLOBAL_ExpiryState as OBS_GLOBAL_EXPIRY_STATE, GLOBAL_TransitionState as OBS_GLOBAL_TRANSITION_STATE,
 };
@@ -34,6 +27,13 @@ pub(crate) use rustfs_ecstore::api::global::{
     get_global_bucket_monitor as obs_get_global_bucket_monitor, resolve_object_store_handle as obs_resolve_object_store_handle,
 };
 pub(crate) use rustfs_ecstore::api::storage::ECStore as ObsStore;
+
+pub mod collectors;
+pub mod config;
+pub mod report;
+pub mod scheduler;
+pub mod schema;
+pub mod stats_collector;
 
 pub use collectors::*;
 pub use config::*;
