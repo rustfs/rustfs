@@ -119,7 +119,7 @@ mod ecstore_client {
 }
 
 mod ecstore_config {
-    pub(crate) use crate::storage::ecstore_config::{com, init, set_global_storage_class, storageclass};
+    pub(crate) use crate::storage::ecstore_config::{com, init, storageclass};
 }
 
 mod ecstore_data_usage {
@@ -460,10 +460,6 @@ pub(crate) async fn save_admin_server_config(api: Arc<ECStore>, cfg: &rustfs_con
 
 pub(crate) fn init_admin_config_defaults() {
     ecstore_config::init();
-}
-
-pub(crate) fn set_global_storage_class(cfg: storageclass::Config) {
-    ecstore_config::set_global_storage_class(cfg);
 }
 
 pub(crate) async fn load_data_usage_from_backend(

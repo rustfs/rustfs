@@ -29,6 +29,7 @@ use super::DailyAllTierStats;
 use super::ECStore;
 use super::EndpointServerPools;
 use super::ScannerMetricsReport;
+use super::StorageClassConfig;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
@@ -177,6 +178,18 @@ pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
     resolve_server_config_with(get_global_app_context(), || default_server_config_interface().get())
+}
+
+/// Publish server config using AppContext-first precedence.
+pub fn publish_server_config(config: Config) {
+    publish_server_config_with(get_global_app_context(), config, |config| default_server_config_interface().set(config));
+}
+
+/// Publish storage class config using AppContext-first precedence.
+pub fn publish_storage_class_config(config: StorageClassConfig) {
+    publish_storage_class_config_with(get_global_app_context(), config, |config| {
+        default_storage_class_interface().set(config);
+    });
 }
 
 /// Resolve buffer profile config using AppContext-first precedence.
@@ -365,6 +378,26 @@ fn resolve_server_config_with(context: Option<Arc<AppContext>>, fallback: impl F
     context.map_or_else(fallback, |context| context.server_config().get())
 }
 
+fn publish_server_config_with(context: Option<Arc<AppContext>>, config: Config, fallback: impl FnOnce(Config)) {
+    if let Some(context) = context {
+        context.server_config().set(config);
+    } else {
+        fallback(config);
+    }
+}
+
+fn publish_storage_class_config_with(
+    context: Option<Arc<AppContext>>,
+    config: StorageClassConfig,
+    fallback: impl FnOnce(StorageClassConfig),
+) {
+    if let Some(context) = context {
+        context.storage_class().set(config);
+    } else {
+        fallback(config);
+    }
+}
+
 fn resolve_buffer_config_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> RustFSBufferConfig,
@@ -388,13 +421,14 @@ mod tests {
         ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface,
         EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
         OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface,
-        ServerConfigInterface, TierConfigInterface, TierStatsInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
     use rustfs_lock::{LocalClient, LockClient};
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -582,11 +616,26 @@ mod tests {
 
     struct TestServerConfigInterface {
         config: Option<Config>,
+        published: Arc<AtomicUsize>,
     }
 
     impl ServerConfigInterface for TestServerConfigInterface {
         fn get(&self) -> Option<Config> {
             self.config.clone()
+        }
+
+        fn set(&self, _config: Config) {
+            self.published.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct TestStorageClassInterface {
+        published: Arc<AtomicUsize>,
+    }
+
+    impl StorageClassInterface for TestStorageClassInterface {
+        fn set(&self, _config: StorageClassConfig) {
+            self.published.fetch_add(1, Ordering::SeqCst);
         }
     }
 
@@ -674,6 +723,10 @@ mod tests {
         };
         let tier_config = TierConfigMgr::new();
         let server_config = Config::new();
+        let context_server_config_published = Arc::new(AtomicUsize::new(0));
+        let fallback_server_config_published = Arc::new(AtomicUsize::new(0));
+        let context_storage_class_published = Arc::new(AtomicUsize::new(0));
+        let fallback_storage_class_published = Arc::new(AtomicUsize::new(0));
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
         let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
@@ -757,6 +810,10 @@ mod tests {
                 }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
+                    published: context_server_config_published.clone(),
+                }),
+                storage_class: Arc::new(TestStorageClassInterface {
+                    published: context_storage_class_published.clone(),
                 }),
                 buffer_config: Arc::new(TestBufferConfigInterface { config: buffer_config }),
             },
@@ -847,6 +904,18 @@ mod tests {
             resolve_server_config_with(Some(context.clone()), || None).expect("context server config"),
             server_config
         );
+        publish_server_config_with(Some(context.clone()), Config::new(), |config| {
+            drop(config);
+            fallback_server_config_published.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(context_server_config_published.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_server_config_published.load(Ordering::SeqCst), 0);
+        publish_storage_class_config_with(Some(context.clone()), StorageClassConfig::default(), |config| {
+            drop(config);
+            fallback_storage_class_published.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(context_storage_class_published.load(Ordering::SeqCst), 1);
+        assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 0);
         assert_eq!(
             resolve_buffer_config_with(Some(context), || RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose)).workload,
             WorkloadProfile::AiTraining
@@ -922,6 +991,16 @@ mod tests {
             resolve_server_config_with(None, || Some(server_config.clone())).expect("fallback server config"),
             server_config
         );
+        publish_server_config_with(None, Config::new(), |config| {
+            drop(config);
+            fallback_server_config_published.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(fallback_server_config_published.load(Ordering::SeqCst), 1);
+        publish_storage_class_config_with(None, StorageClassConfig::default(), |config| {
+            drop(config);
+            fallback_storage_class_published.fetch_add(1, Ordering::SeqCst);
+        });
+        assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 1);
         assert_eq!(
             resolve_buffer_config_with(None, || RustFSBufferConfig::new(WorkloadProfile::DataAnalytics)).workload,
             WorkloadProfile::DataAnalytics

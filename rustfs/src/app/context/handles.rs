@@ -13,25 +13,27 @@
 // limitations under the License.
 
 use super::super::EndpointServerPools;
+use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
     collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
     get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_notification_sys, get_global_region,
     get_global_replication_pool, get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port,
+    set_global_storage_class,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
     LockClientInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface,
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface, ServerConfigInterface,
-    TierConfigInterface, TierStatsInterface,
+    StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
+use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
@@ -303,6 +305,20 @@ impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
         get_global_server_config()
     }
+
+    fn set(&self, config: Config) {
+        set_global_server_config(config);
+    }
+}
+
+/// Default storage class config interface adapter.
+#[derive(Default)]
+pub struct StorageClassHandle;
+
+impl StorageClassInterface for StorageClassHandle {
+    fn set(&self, config: StorageClassConfig) {
+        set_global_storage_class(config);
+    }
 }
 
 /// Default buffer profile config interface adapter.
@@ -393,6 +409,10 @@ pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
     Arc::new(ServerConfigHandle)
+}
+
+pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
+    Arc::new(StorageClassHandle)
 }
 
 pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {
