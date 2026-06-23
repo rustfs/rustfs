@@ -423,20 +423,70 @@ fn invalid_decommission_pool_index_error(pool_count: usize, idx: usize) -> Error
     Error::other(format!("invalid decommission pool index {idx} for {pool_count} pools"))
 }
 
-fn ensure_decommission_start_allowed(pool_present: bool, decommission_active: bool, decommission_complete: bool) -> Result<()> {
-    if !pool_present {
-        return Err(Error::other("failed to start decommission: target pool was not found"));
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DecommissionStartPoolState {
+    Missing,
+    Active,
+    Decommissioning,
+    Decommissioned,
+    Blocked,
+}
 
-    if decommission_active {
-        return Err(StorageError::DecommissionAlreadyRunning);
-    }
+fn decommission_start_pool_state(pool: Option<&PoolStatus>) -> DecommissionStartPoolState {
+    let Some(pool) = pool else {
+        return DecommissionStartPoolState::Missing;
+    };
+    let Some(info) = pool.decommission.as_ref() else {
+        return DecommissionStartPoolState::Active;
+    };
 
-    if decommission_complete {
-        return Err(Error::other("failed to start decommission: target pool decommission is already complete"));
+    if info.complete {
+        DecommissionStartPoolState::Decommissioned
+    } else if info.failed || info.canceled {
+        DecommissionStartPoolState::Blocked
+    } else {
+        DecommissionStartPoolState::Decommissioning
+    }
+}
+
+fn is_decommission_start_active_pool(pool: &PoolStatus) -> bool {
+    decommission_start_pool_state(Some(pool)) == DecommissionStartPoolState::Active
+}
+
+fn ensure_decommission_start_allowed(state: DecommissionStartPoolState) -> Result<()> {
+    match state {
+        DecommissionStartPoolState::Missing => Err(Error::other("failed to start decommission: target pool was not found")),
+        DecommissionStartPoolState::Active => Ok(()),
+        DecommissionStartPoolState::Decommissioning => Err(StorageError::DecommissionAlreadyRunning),
+        DecommissionStartPoolState::Decommissioned => {
+            Err(Error::other("failed to start decommission: target pool is already decommissioned"))
+        }
+        DecommissionStartPoolState::Blocked => Err(Error::other(
+            "failed to start decommission: target pool decommission is blocked; clear failed or canceled metadata before starting again",
+        )),
+    }
+}
+
+fn ensure_decommission_start_keeps_active_pool(meta: &PoolMeta, indices: &[usize]) -> Result<()> {
+    let active_count = meta
+        .pools
+        .iter()
+        .filter(|pool| is_decommission_start_active_pool(pool))
+        .count();
+    if active_count <= indices.len() {
+        return Err(Error::other(
+            "failed to start decommission: at least one active pool must remain after decommission start",
+        ));
     }
 
     Ok(())
+}
+
+fn ensure_decommission_start_pool_states(meta: &PoolMeta, indices: &[usize]) -> Result<()> {
+    for idx in indices.iter().copied() {
+        ensure_decommission_start_allowed(decommission_start_pool_state(meta.pools.get(idx)))?;
+    }
+    ensure_decommission_start_keeps_active_pool(meta, indices)
 }
 
 fn ensure_valid_decommission_pool_index(pool_count: usize, idx: usize) -> Result<()> {
@@ -781,19 +831,6 @@ fn is_decommission_target_capacity_error(err: &Error) -> bool {
 
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
     decommissioned.saturating_add(expired) == total_versions
-}
-
-fn decommission_start_guard_state(pool: Option<&PoolStatus>) -> (bool, bool, bool) {
-    if let Some(pool) = pool {
-        let active = pool
-            .decommission
-            .as_ref()
-            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
-        let complete = pool.decommission.as_ref().is_some_and(|info| info.complete);
-        (true, active, complete)
-    } else {
-        (false, false, false)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1547,12 +1584,7 @@ impl PoolMeta {
             return Err(invalid_decommission_pool_index_error(pool_count, idx));
         };
 
-        let decommission_active = pool
-            .decommission
-            .as_ref()
-            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled));
-        let decommission_complete = pool.decommission.as_ref().is_some_and(|info| info.complete);
-        ensure_decommission_start_allowed(true, decommission_active, decommission_complete)?;
+        ensure_decommission_start_allowed(decommission_start_pool_state(Some(pool)))?;
 
         let previous = pool.decommission.as_ref();
         let now = OffsetDateTime::now_utc();
@@ -2120,11 +2152,7 @@ impl ECStore {
             latest_pool_meta = current_pool_meta;
         }
 
-        for idx in indices.iter().copied() {
-            let (pool_present, decommission_active, decommission_complete) =
-                decommission_start_guard_state(latest_pool_meta.pools.get(idx));
-            ensure_decommission_start_allowed(pool_present, decommission_active, decommission_complete)?;
-        }
+        ensure_decommission_start_pool_states(&latest_pool_meta, indices)?;
 
         let previous_pool_meta = latest_pool_meta.clone();
         let first_idx = indices.first().copied();
@@ -3605,11 +3633,7 @@ impl ECStore {
 
         {
             let pool_meta = self.pool_meta.read().await;
-            for idx in indices.iter().copied() {
-                let (pool_present, decommission_active, decommission_complete) =
-                    decommission_start_guard_state(pool_meta.pools.get(idx));
-                ensure_decommission_start_allowed(pool_present, decommission_active, decommission_complete)?;
-            }
+            ensure_decommission_start_pool_states(&pool_meta, &indices)?;
         }
 
         let decom_buckets = self.get_buckets_to_decommission().await?;
@@ -4738,13 +4762,14 @@ pub(crate) fn fallback_free_capacity_dedup(disks: &[rustfs_madmin::Disk]) -> usi
 mod pools_tests {
     use super::{
         DECOMMISSION_PROGRESS_SAVE_INTERVAL, DECOMMISSION_PROGRESS_SAVE_ITEM_THRESHOLD, DecomBucketInfo,
-        DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
+        DecommissionStartPoolState, DecommissionTerminalState, PoolDecommissionInfo, PoolMeta, PoolSpaceInfo, PoolStatus,
         apply_decommission_status_space_info, bind_decommission_cancelers, bind_missing_decommission_cancelers,
         cancel_decommission_canceler, classify_decommission_terminal_state, count_decommission_item,
         decommission_cancel_signal_result, decommission_item_size, decommission_meta_bucket_options,
-        decommission_start_guard_state, dedup_indices, default_decommission_bucket_concurrency,
+        decommission_start_pool_state, dedup_indices, default_decommission_bucket_concurrency,
         ensure_decommission_cancel_allowed, ensure_decommission_clear_allowed, ensure_decommission_listing_disks_available,
-        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_local_leader,
+        ensure_decommission_not_rebalancing, ensure_decommission_start_allowed, ensure_decommission_start_keeps_active_pool,
+        ensure_decommission_start_local_leader, ensure_decommission_start_pool_states,
         ensure_decommission_start_rebalance_meta_allowed, ensure_decommission_terminal_operation_supported,
         ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
@@ -5080,14 +5105,15 @@ mod pools_tests {
         active.pools[0].decommission = Some(PoolDecommissionInfo::default());
 
         assert!(active.is_suspended(0));
-        let (_, decommission_active, _) = decommission_start_guard_state(active.pools.first());
-        assert!(decommission_active);
+        assert_eq!(
+            decommission_start_pool_state(active.pools.first()),
+            DecommissionStartPoolState::Decommissioning
+        );
 
         rollback_start_decommission_pool_meta(&mut active, previous);
 
         assert!(!active.is_suspended(0));
-        let (_, decommission_active, _) = decommission_start_guard_state(active.pools.first());
-        assert!(!decommission_active);
+        assert_eq!(decommission_start_pool_state(active.pools.first()), DecommissionStartPoolState::Active);
     }
 
     #[test]
@@ -6075,7 +6101,8 @@ mod pools_tests {
 
     #[test]
     fn test_ensure_decommission_start_allowed_rejects_missing_pool() {
-        let err = ensure_decommission_start_allowed(false, false, false).expect_err("missing pool should be invalid");
+        let err =
+            ensure_decommission_start_allowed(DecommissionStartPoolState::Missing).expect_err("missing pool should be invalid");
         assert!(
             err.to_string()
                 .contains("failed to start decommission: target pool was not found")
@@ -6084,28 +6111,37 @@ mod pools_tests {
 
     #[test]
     fn test_ensure_decommission_start_allowed_rejects_running_state() {
-        let err = ensure_decommission_start_allowed(true, true, false).expect_err("active decommission should be rejected");
+        let err = ensure_decommission_start_allowed(DecommissionStartPoolState::Decommissioning)
+            .expect_err("active decommission should be rejected");
         assert!(matches!(err, Error::DecommissionAlreadyRunning));
     }
 
     #[test]
     fn test_ensure_decommission_start_allowed_rejects_completed_state() {
-        let err = ensure_decommission_start_allowed(true, false, true).expect_err("completed decommission should be rejected");
-        assert!(err.to_string().contains("target pool decommission is already complete"));
+        let err = ensure_decommission_start_allowed(DecommissionStartPoolState::Decommissioned)
+            .expect_err("completed decommission should be rejected");
+        assert!(err.to_string().contains("target pool is already decommissioned"));
     }
 
     #[test]
-    fn test_ensure_decommission_start_allowed_allows_failed_or_canceled_state() {
-        assert!(ensure_decommission_start_allowed(true, false, false).is_ok());
+    fn test_ensure_decommission_start_allowed_rejects_blocked_state() {
+        let err = ensure_decommission_start_allowed(DecommissionStartPoolState::Blocked)
+            .expect_err("blocked decommission should be rejected");
+        assert!(err.to_string().contains("target pool decommission is blocked"));
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_missing_pool() {
-        assert_eq!(decommission_start_guard_state(None), (false, false, false));
+    fn test_ensure_decommission_start_allowed_allows_active_state() {
+        assert!(ensure_decommission_start_allowed(DecommissionStartPoolState::Active).is_ok());
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_idle_pool_without_decommission_info() {
+    fn test_decommission_start_pool_state_reports_missing_pool() {
+        assert_eq!(decommission_start_pool_state(None), DecommissionStartPoolState::Missing);
+    }
+
+    #[test]
+    fn test_decommission_start_pool_state_reports_idle_pool_without_decommission_info() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -6113,11 +6149,11 @@ mod pools_tests {
             decommission: None,
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
+        assert_eq!(decommission_start_pool_state(Some(&pool)), DecommissionStartPoolState::Active);
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_active_pool_when_not_terminal() {
+    fn test_decommission_start_pool_state_reports_decommissioning_pool_when_not_terminal() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -6130,11 +6166,11 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, true, false));
+        assert_eq!(decommission_start_pool_state(Some(&pool)), DecommissionStartPoolState::Decommissioning);
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_canceled_pool_as_restartable() {
+    fn test_decommission_start_pool_state_reports_canceled_pool_as_blocked() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -6147,11 +6183,11 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
+        assert_eq!(decommission_start_pool_state(Some(&pool)), DecommissionStartPoolState::Blocked);
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_failed_pool_as_restartable() {
+    fn test_decommission_start_pool_state_reports_failed_pool_as_blocked() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -6162,11 +6198,11 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, false));
+        assert_eq!(decommission_start_pool_state(Some(&pool)), DecommissionStartPoolState::Blocked);
     }
 
     #[test]
-    fn test_decommission_start_guard_state_reports_completed_pool() {
+    fn test_decommission_start_pool_state_reports_completed_pool() {
         let pool = PoolStatus {
             id: 0,
             cmd_line: "pool-0".to_string(),
@@ -6177,7 +6213,75 @@ mod pools_tests {
             }),
         };
 
-        assert_eq!(decommission_start_guard_state(Some(&pool)), (true, false, true));
+        assert_eq!(decommission_start_pool_state(Some(&pool)), DecommissionStartPoolState::Decommissioned);
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_keeps_active_pool_rejects_last_active_pool() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            }],
+            ..Default::default()
+        };
+
+        let err = ensure_decommission_start_keeps_active_pool(&meta, &[0]).expect_err("last active pool should be rejected");
+
+        assert!(err.to_string().contains("at least one active pool must remain"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_pool_states_rejects_blocked_pool() {
+        let meta = PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: Some(PoolDecommissionInfo {
+                        failed: true,
+                        ..Default::default()
+                    }),
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        let err = ensure_decommission_start_pool_states(&meta, &[0]).expect_err("blocked pool should be rejected");
+
+        assert!(err.to_string().contains("target pool decommission is blocked"));
+    }
+
+    #[test]
+    fn test_ensure_decommission_start_pool_states_allows_active_pool_with_remaining_active_pool() {
+        let meta = PoolMeta {
+            pools: vec![
+                PoolStatus {
+                    id: 0,
+                    cmd_line: "pool-0".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+                PoolStatus {
+                    id: 1,
+                    cmd_line: "pool-1".to_string(),
+                    last_update: OffsetDateTime::UNIX_EPOCH,
+                    decommission: None,
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert!(ensure_decommission_start_pool_states(&meta, &[0]).is_ok());
     }
 
     #[test]

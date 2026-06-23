@@ -105,6 +105,7 @@ pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub(crate) type PoolDecommissionInfo = ecstore_capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = ecstore_capacity::PoolStatus;
+pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
 pub(crate) type StorageError = crate::storage::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;

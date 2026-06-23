@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::{HeaderMap, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::{
@@ -383,6 +383,7 @@ fn operation_to_event(operation: &str) -> &'static str {
     match operation {
         "list pools" => "list_pools",
         "load pool status" => "query_pool_status",
+        "load decommission status" => "query_decommission_status",
         "start decommission" => "start_decommission",
         "cancel decommission" => "cancel_decommission",
         "clear decommission" => "clear_decommission",
@@ -416,6 +417,12 @@ pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
         AdminOperation(&StatusPool {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/decommission/status").as_str(),
+        AdminOperation(&StatusDecommission {}),
     )?;
 
     r.insert(
@@ -582,6 +589,62 @@ impl Operation for StatusPool {
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
         log_pool_response_emitted!("query_pool_status");
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
+pub struct StatusDecommission {}
+
+#[async_trait::async_trait]
+impl Operation for StatusDecommission {
+    // GET <endpoint>/<admin-API>/decommission/status[?pool=http://server{1...4}/disk{1...4}]
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(pool_admin_missing_credentials_error("load decommission status"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![
+                Action::AdminAction(AdminAction::ServerInfoAdminAction),
+                Action::AdminAction(AdminAction::DecommissionAdminAction),
+            ],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load decommission status"))?;
+
+        let usecase = DefaultAdminUsecase::from_global();
+        let data = if query.pool.is_empty() {
+            let status = usecase.execute_list_decommission_status().await.map_err(S3Error::from)?;
+            serde_json::to_vec(&status)
+        } else {
+            let status = usecase
+                .execute_query_decommission_status(QueryPoolStatusRequest {
+                    pool: query.pool,
+                    by_id: query.by_id.as_str() == "true",
+                })
+                .await
+                .map_err(S3Error::from)?;
+            serde_json::to_vec(&status)
+        }
+        .map_err(|e| {
+            log_pool_request_failed!("query_decommission_status", "serialize_decommission_status_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "serialize decommission status failed")
+        })?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_pool_response_emitted!("query_decommission_status");
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }

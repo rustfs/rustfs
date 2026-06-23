@@ -440,6 +440,15 @@ impl ECStore {
         false
     }
 
+    pub async fn pool_rebalance_status(&self, pool_index: usize) -> (RebalStatus, bool) {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        rebalance_meta
+            .as_ref()
+            .and_then(|meta| meta.pool_stats.get(pool_index))
+            .map(|pool_stat| (pool_stat.info.status, pool_stat.info.stopping))
+            .unwrap_or_default()
+    }
+
     pub async fn current_rebalance_id(&self) -> Option<String> {
         let rebalance_meta = self.rebalance_meta.read().await;
         rebalance_meta
