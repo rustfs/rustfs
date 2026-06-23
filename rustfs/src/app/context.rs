@@ -32,6 +32,7 @@ use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
+use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::Arc;
 use tokio::sync::RwLock;
@@ -46,6 +47,11 @@ pub fn resolve_iam_ready() -> bool {
     resolve_iam_ready_with(get_global_app_context(), || {
         rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
     })
+}
+
+/// Resolve IAM system handle using AppContext-first precedence.
+pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
+    resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
@@ -102,6 +108,13 @@ fn resolve_kms_runtime_service_manager_with(
 
 fn resolve_iam_ready_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> bool) -> bool {
     context.map_or_else(fallback, |context| context.iam().is_ready())
+}
+
+fn resolve_iam_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<IamSys<ObjectStore>>>,
+) -> Option<Arc<IamSys<ObjectStore>>> {
+    context.map(|context| context.iam().handle()).or_else(fallback)
 }
 
 fn resolve_bucket_metadata_handle_with(
@@ -376,6 +389,7 @@ mod tests {
             &fallback_kms
         ));
         assert!(!resolve_iam_ready_with(None, || false));
+        assert!(resolve_iam_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
