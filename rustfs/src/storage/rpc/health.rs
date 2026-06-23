@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::app::context::resolve_local_node_name;
 use crate::storage::rpc::encode_msgpack_map;
 use rustfs_storage_api::StorageAdminApi;
 
@@ -21,7 +22,7 @@ impl NodeService {
         &self,
         _request: Request<GetProcInfoRequest>,
     ) -> Result<Response<GetProcInfoResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_proc_info(&addr);
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetProcInfoResponse {
@@ -41,7 +42,7 @@ impl NodeService {
         &self,
         _request: Request<GetMemInfoRequest>,
     ) -> Result<Response<GetMemInfoResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_mem_info(&addr);
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetMemInfoResponse {
@@ -61,7 +62,7 @@ impl NodeService {
         &self,
         _request: Request<GetSysErrorsRequest>,
     ) -> Result<Response<GetSysErrorsResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_sys_errors(&addr);
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetSysErrorsResponse {
@@ -81,7 +82,7 @@ impl NodeService {
         &self,
         _request: Request<GetSysConfigRequest>,
     ) -> Result<Response<GetSysConfigResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_sys_config(&addr);
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetSysConfigResponse {
@@ -101,7 +102,7 @@ impl NodeService {
         &self,
         _request: Request<GetSeLinuxInfoRequest>,
     ) -> Result<Response<GetSeLinuxInfoResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_sys_services(&addr);
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetSeLinuxInfoResponse {
@@ -159,7 +160,7 @@ impl NodeService {
         &self,
         _request: Request<GetNetInfoRequest>,
     ) -> Result<Response<GetNetInfoResponse>, Status> {
-        let addr = get_global_local_node_name().await;
+        let addr = resolve_local_node_name().await;
         let info = get_net_info(&addr, "");
         match encode_msgpack_map(&info) {
             Ok(buf) => Ok(Response::new(GetNetInfoResponse {
