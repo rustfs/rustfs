@@ -41,11 +41,13 @@ dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs
 dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
 dep|rustfs/src/auth.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/config/info.rs|infra->app|crate::app::context::resolve_buffer_config
+dep|rustfs/src/init.rs|infra->app|crate::app::context::resolve_notify_interface
 dep|rustfs/src/init.rs|infra->app|crate::app::context::resolve_region
 dep|rustfs/src/init.rs|infra->interface|crate::admin
 dep|rustfs/src/protocols/client.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
 dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_notify_interface
 dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
 dep|rustfs/src/server/http.rs|infra->interface|crate::admin
 dep|rustfs/src/server/layer.rs|infra->app|crate::app::context::resolve_kms_runtime_service_manager
@@ -69,6 +71,7 @@ dep|rustfs/src/storage/access.rs|infra->app|crate::app::context::resolve_region
 dep|rustfs/src/storage/concurrency/manager.rs|infra->app|crate::app::context::resolve_performance_metrics
 dep|rustfs/src/storage/sse.rs|infra->app|crate::app::context::resolve_encryption_service
 dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_action_credentials
+dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_notify_interface
 dep|rustfs/src/storage/rpc/disk.rs|infra->app|crate::app::context::resolve_internode_metrics
 dep|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name
 dep|rustfs/src/storage/rpc/http_service.rs|infra->app|crate::app::context::resolve_internode_metrics
