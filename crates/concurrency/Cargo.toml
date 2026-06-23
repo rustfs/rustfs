@@ -14,6 +14,7 @@ categories = ["concurrency", "filesystem"]
 # Internal crates
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
+serde = { workspace = true }
 
 # Async runtime
 tokio = { workspace = true, features = ["sync", "time", "rt"] }
@@ -26,6 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util","macros","rt-multi-thread"] }
 
 [features]
