@@ -23,13 +23,14 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
+use crate::app::context::resolve_iam_handle;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
 use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
 use rustfs_filemeta::{FileInfo, MetacacheReader};
-use rustfs_iam::{get_global_iam_sys, store::UserType};
+use rustfs_iam::store::UserType;
 use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
@@ -632,7 +633,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -661,7 +662,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -700,7 +701,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -728,7 +729,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -760,7 +761,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -790,7 +791,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -826,7 +827,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -857,7 +858,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),

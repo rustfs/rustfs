@@ -12,15 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::disk as ecstore_disk;
+use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
 use rustfs_heal::heal::{
     event::{HealEvent, Severity},
     task::{HealPriority, HealType},
     utils,
 };
-
-type DiskStore = ecstore_disk::DiskStore;
-type Endpoint = ecstore_disk::endpoint::Endpoint;
 
 #[test]
 fn test_heal_event_to_heal_request_no_panic() {

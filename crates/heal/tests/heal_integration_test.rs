@@ -14,10 +14,10 @@
 
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::layout as ecstore_layout;
-use rustfs_ecstore::api::storage as ecstore_storage;
+use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
@@ -38,12 +38,6 @@ use walkdir::WalkDir;
 const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
 const NON_INLINE_TEST_DATA_SIZE: usize = 256 * 1024 + 137;
-
-type ECStore = ecstore_storage::ECStore;
-type Endpoint = ecstore_disk::endpoint::Endpoint;
-type EndpointServerPools = ecstore_layout::EndpointServerPools;
-type Endpoints = ecstore_layout::Endpoints;
-type PoolEndpoints = ecstore_layout::PoolEndpoints;
 
 fn non_inline_test_data() -> Vec<u8> {
     (0..NON_INLINE_TEST_DATA_SIZE).map(|idx| (idx % 251) as u8).collect()
@@ -127,7 +121,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
     let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // format disks (only first time)
-    ecstore_storage::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
     let port = 9001; // for simplicity
@@ -145,7 +139,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
         .await
         .unwrap();
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
-    ecstore_bucket::metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
+    init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
     // Create heal storage layer
     let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));

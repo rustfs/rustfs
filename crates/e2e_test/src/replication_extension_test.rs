@@ -22,7 +22,7 @@ use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
 use reqwest::StatusCode;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
+use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,
@@ -37,7 +37,6 @@ use time::Duration as TimeDuration;
 use tokio::time::{Duration, sleep};
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
-type BucketTargetSys = ecstore_bucket::bucket_target_sys::BucketTargetSys;
 
 #[derive(Debug, Clone, serde::Deserialize)]
 struct ReplicationResetStatusResponse {
