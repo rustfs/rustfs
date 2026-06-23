@@ -1084,6 +1084,8 @@ mod tests {
             context_outbound_tls_state.generation
         );
         assert!(resolve_iam_ready_with(Some(context.clone()), || false));
+        // OIDC context path: TestOidcInterface returns None, so the result is None.
+        assert!(resolve_oidc_handle_with(Some(context.clone()), || None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
             &bucket_metadata
@@ -1202,6 +1204,8 @@ mod tests {
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
+        // OIDC fallback path: both context absent and fallback return None.
+        assert!(resolve_oidc_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata

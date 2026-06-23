@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
+use crate::app::context::resolve_oidc_handle;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
@@ -134,7 +135,8 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        let oidc = rustfs_iam::get_oidc()
+        // RUSTFS_COMPAT_TODO(CTX-002): resolve_oidc_handle uses AppContext-first with global fallback.
+        let oidc = resolve_oidc_handle()
             .map(|sys| {
                 sys.list_visible_providers()
                     .into_iter()

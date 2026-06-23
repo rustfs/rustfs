@@ -19,7 +19,7 @@ use crate::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::resolve_action_credentials,
+    app::context::{resolve_action_credentials, resolve_oidc_handle},
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,
@@ -59,7 +59,8 @@ fn has_identity_authorization_context(policies: &[String], groups: &[String]) ->
 }
 
 fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
-    rustfs_iam::get_oidc()
+    // RUSTFS_COMPAT_TODO(CTX-002): resolve_oidc_handle uses AppContext-first with global fallback.
+    resolve_oidc_handle()
         .as_ref()
         .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
         .map(|cfg| cfg.roles_claim.trim().to_string())
@@ -316,7 +317,8 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     }
 
     // Verify the JWT and extract claims
-    let oidc_sys = rustfs_iam::get_oidc().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+    // RUSTFS_COMPAT_TODO(CTX-002): resolve_oidc_handle uses AppContext-first with global fallback.
+    let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
     let (claims, provider_id) = oidc_sys
         .verify_web_identity_token(&body.web_identity_token)
