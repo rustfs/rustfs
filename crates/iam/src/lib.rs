@@ -48,6 +48,7 @@ pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
 mod root_credentials;
+mod server_config;
 pub mod store;
 pub mod sys;
 pub mod utils;
