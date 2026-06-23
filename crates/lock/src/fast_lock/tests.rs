@@ -14,8 +14,9 @@
 
 #[cfg(test)]
 mod fast_lock_tests {
-    use crate::fast_lock::FastObjectLockManager;
+    use crate::LockError;
     use crate::fast_lock::types::{LockConfig, LockMode, LockPriority, LockResult, ObjectKey, ObjectLockRequest};
+    use crate::fast_lock::{DEFAULT_SHARD_COUNT, FastObjectLockManager};
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::time::sleep;
@@ -29,6 +30,32 @@ mod fast_lock_tests {
             ..LockConfig::default()
         };
         FastObjectLockManager::with_config(config)
+    }
+
+    #[test]
+    fn try_with_config_returns_error_for_invalid_shard_count() {
+        let config = LockConfig {
+            shard_count: 3,
+            ..LockConfig::default()
+        };
+
+        let err = FastObjectLockManager::try_with_config(config)
+            .expect_err("non-power-of-two shard counts should return an explicit configuration error");
+
+        assert!(matches!(err, LockError::Configuration { .. }));
+        assert!(err.to_string().contains("shard count must be a non-zero power of 2"));
+    }
+
+    #[tokio::test]
+    async fn with_config_falls_back_to_default_for_invalid_shard_count() {
+        let config = LockConfig {
+            shard_count: 3,
+            ..LockConfig::default()
+        };
+
+        let manager = FastObjectLockManager::with_config(config);
+
+        assert_eq!(manager.shards.len(), DEFAULT_SHARD_COUNT);
     }
 
     #[tokio::test]
