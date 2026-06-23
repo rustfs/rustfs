@@ -109,6 +109,14 @@ impl NotificationSys {
         self.all_peer_clients[idx].clone()
     }
 
+    pub fn peer_client_for_grid_host(&self, grid_host: &str) -> Option<PeerRestClient> {
+        self.all_peer_clients
+            .iter()
+            .flatten()
+            .find(|client| client.grid_host == grid_host)
+            .cloned()
+    }
+
     pub async fn delete_policy(&self, policy_name: &str) -> Vec<NotificationPeerErr> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
         for client in self.peer_clients.iter() {
@@ -1213,6 +1221,24 @@ mod tests {
         assert!(msg.contains("2 failure(s)"));
         assert!(msg.contains("peer-1 failed"));
         assert!(msg.contains("local save failed"));
+    }
+
+    #[test]
+    fn peer_client_for_grid_host_matches_exact_grid_host() {
+        let sys = NotificationSys {
+            peer_clients: Vec::new(),
+            all_peer_clients: vec![Some(PeerRestClient::new(
+                "127.0.0.1:9000".to_string().try_into().expect("peer host should parse"),
+                "http://127.0.0.1:9000".to_string(),
+            ))],
+            peer_admin_caches: Vec::new(),
+        };
+
+        let client = sys
+            .peer_client_for_grid_host("http://127.0.0.1:9000")
+            .expect("matching grid host should return peer client");
+        assert_eq!(client.grid_host, "http://127.0.0.1:9000");
+        assert!(sys.peer_client_for_grid_host("http://node-b:9000").is_none());
     }
 
     #[test]
