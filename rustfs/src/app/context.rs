@@ -111,6 +111,12 @@ pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> 
     context.map(|context| context.object_store()).or_else(new_object_layer_fn)
 }
 
+/// Resolve notify interface using AppContext-first precedence.
+pub fn resolve_notify_interface() -> Arc<dyn NotifyInterface> {
+    let context = get_global_app_context();
+    resolve_notify_interface_for_context(context.as_deref())
+}
+
 /// Resolve notify interface using an explicit AppContext, falling back to the legacy global notifier.
 pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc<dyn NotifyInterface> {
     context
