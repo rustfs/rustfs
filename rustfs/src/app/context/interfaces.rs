@@ -70,6 +70,16 @@ pub trait EndpointsInterface: Send + Sync {
     fn handle(&self) -> Option<EndpointServerPools>;
 }
 
+/// Deployment identity interface for admin topology integration.
+pub trait DeploymentIdInterface: Send + Sync {
+    fn get(&self) -> Option<String>;
+}
+
+/// Runtime port interface for admin topology integration.
+pub trait RuntimePortInterface: Send + Sync {
+    fn get(&self) -> u16;
+}
+
 /// Lock client interface for application-layer use-cases.
 pub trait LockClientInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<dyn LockClient>>;

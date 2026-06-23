@@ -16,6 +16,7 @@ use super::GLOBAL_BOOT_TIME;
 use super::PeerRestClient;
 use super::bandwidth::monitor::BandwidthDetails;
 use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient};
+use super::get_global_bucket_monitor;
 use super::get_global_notification_sys;
 use super::metadata::BUCKET_TARGETS_FILE;
 use super::metadata_sys;
@@ -26,10 +27,9 @@ use super::replication::{
 use super::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::versioning_sys::BucketVersioningSys;
 use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use super::{get_global_bucket_monitor, get_global_deployment_id};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::app::context::{resolve_object_store_handle, resolve_region, resolve_server_config};
+use crate::app::context::{resolve_deployment_id, resolve_object_store_handle, resolve_region, resolve_server_config};
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -1829,7 +1829,7 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
 
     if target.target_bucket == bucket
         && !target.deployment_id.is_empty()
-        && get_global_deployment_id().as_deref() == Some(target.deployment_id.as_str())
+        && resolve_deployment_id().as_deref() == Some(target.deployment_id.as_str())
     {
         result.status = "FAILED".to_string();
         result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
