@@ -15,7 +15,7 @@
 use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::BucketMetadataSys;
-use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
+use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
@@ -87,6 +87,11 @@ pub trait BucketMonitorInterface: Send + Sync {
 /// Replication pool interface for admin resync integration.
 pub trait ReplicationPoolInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<DynReplicationPool>>;
+}
+
+/// Replication statistics interface for admin metrics integration.
+pub trait ReplicationStatsInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<ReplicationStats>>;
 }
 
 /// Endpoints interface for application-layer use-cases.

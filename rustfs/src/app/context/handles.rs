@@ -17,13 +17,14 @@ use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
     get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
-    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_tier_config_mgr, global_rustfs_port,
+    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
+    get_global_tier_config_mgr, global_rustfs_port,
 };
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
     NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface, ReplicationPoolInterface,
-    RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+    ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -171,6 +172,16 @@ impl ReplicationPoolInterface for ReplicationPoolHandle {
     }
 }
 
+/// Default replication statistics interface adapter.
+#[derive(Default)]
+pub struct ReplicationStatsHandle;
+
+impl ReplicationStatsInterface for ReplicationStatsHandle {
+    fn handle(&self) -> Option<Arc<super::super::ReplicationStats>> {
+        get_global_replication_stats()
+    }
+}
+
 /// Default endpoints interface adapter.
 #[derive(Default)]
 pub struct EndpointsHandle;
@@ -298,6 +309,10 @@ pub fn default_bucket_monitor_interface() -> Arc<dyn BucketMonitorInterface> {
 
 pub fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
     Arc::new(ReplicationPoolHandle)
+}
+
+pub fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
+    Arc::new(ReplicationStatsHandle)
 }
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {

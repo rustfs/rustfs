@@ -19,7 +19,7 @@ use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOp
 use super::metadata::BUCKET_TARGETS_FILE;
 use super::metadata_sys;
 use super::read_admin_config_without_migrate;
-use super::replication::{BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts};
+use super::replication::{BucketReplicationResyncStatus, BucketStats, ObjectOpts, ResyncOpts};
 use super::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::versioning_sys::BucketVersioningSys;
 use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
@@ -27,7 +27,7 @@ use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::app::context::{
     resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system, resolve_object_store_handle,
-    resolve_region, resolve_replication_pool_handle, resolve_server_config,
+    resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_server_config,
 };
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
@@ -1421,7 +1421,7 @@ async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
 }
 
 async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
-    let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+    let bucket_stats = match resolve_replication_stats_handle() {
         Some(stats) => stats.get_latest_replication_stats(bucket).await,
         None => BucketStats::default(),
     };
