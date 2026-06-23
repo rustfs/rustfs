@@ -19,6 +19,7 @@ use super::io_schedule::{
     get_advanced_buffer_size,
 };
 use super::request_guard::GetObjectGuard;
+use crate::app::context::resolve_performance_metrics;
 use rustfs_concurrency::{
     AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
     WorkloadAdmissionSnapshotProvider, WorkloadClass,
@@ -27,7 +28,6 @@ use rustfs_config::{KI_B, MI_B};
 use rustfs_io_core::BytesPool;
 use rustfs_io_core::io_profile::{AccessPattern, IoPatternDetector, StorageMedia, detect_storage_media};
 use rustfs_io_metrics::bandwidth::{BandwidthMonitor, BandwidthSnapshot};
-use rustfs_io_metrics::global_metrics::get_global_metrics;
 use rustfs_io_metrics::{MetricsCollector, PerformanceMetrics};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
@@ -118,7 +118,7 @@ impl ConcurrencyManager {
 
         // Use global performance metrics instance for consistent metrics tracking
         // This allows AutoTuner and other components to access the same metrics data
-        let performance_metrics = get_global_metrics();
+        let performance_metrics = resolve_performance_metrics();
 
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
@@ -231,7 +231,7 @@ impl ConcurrencyManager {
     ///
     /// Arc-wrapped PerformanceMetrics instance
     pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
-        get_global_metrics()
+        resolve_performance_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.

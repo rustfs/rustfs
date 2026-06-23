@@ -5,14 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-config-writes-context`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169`.
-- Based on: API-169 local branch after API-168 PR #3781 merged.
+- Branch: `overtrue/arch-iam-global-read-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178`.
+- Based on: API-171 through API-177 prepared in PR #3785; this branch batches
+  the next IAM consumer migration on top of that branch.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route admin server-config and storage-class runtime
-  publication through AppContext-first publish helpers, with legacy global
-  setters preserved as default adapters.
+- Rust code changes: route replication pool, outbound TLS generation, runtime
+  region, KMS encryption service, runtime support handles, S3 Select DB,
+  internode RPC metrics, and IAM authorization/handler reads through
+  AppContext-first resolvers.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -21,7 +23,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169 owner facade cleanup.
+- Docs changes: record the API-136 through API-178 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4446,6 +4448,129 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     config publication scan, Rust risk scan, branch freshness check, and
     three-expert review.
 
+- [x] `API-170` Route action credential reads through AppContext.
+  - Do: route auth validation, protocol storage-client owner checks, and
+    storage audit helper access-key enrichment through the AppContext
+    action-credential resolver.
+  - Acceptance: production auth/protocol/storage helper paths no longer read
+    action credentials directly from the credentials singleton, while the
+    AppContext default adapter preserves the legacy global fallback.
+  - Must preserve: owner detection, session-token claim validation, policy
+    principal type derivation, protocol request metadata, and audit access-key
+    enrichment.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual action
+    credential scan, Rust risk scan, branch freshness check, and three-expert
+    review.
+
+- [x] `API-171` Route runtime replication pool reads through AppContext.
+  - Do: route bucket metadata startup resync and workload admission
+    replication pool reads through the AppContext replication-pool resolver.
+  - Acceptance: production startup/workload admission consumers no longer read
+    the replication pool directly from the storage global facade, while the
+    AppContext default adapter preserves the legacy global fallback.
+  - Must preserve: bucket metadata resync initialization, replication admission
+    active worker counts, queued replication counts, and unknown-runtime
+    reporting.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual
+    replication-pool scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-172` Route outbound TLS generation reads through AppContext.
+  - Do: route startup TLS material initialization and TLS reload loop
+    generation reads through the AppContext outbound TLS generation resolver.
+  - Acceptance: production startup/reload paths no longer read outbound TLS
+    generation directly from `rustfs_common`, while the AppContext default
+    adapter preserves the legacy global fallback.
+  - Must preserve: generation increment semantics, outbound TLS state publish,
+    TLS generation metrics, reload-loop enrichment, and TLS acceptor rebuilds.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual outbound
+    TLS generation scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-173` Route runtime region reads through AppContext.
+  - Do: route bucket notification setup and S3 request context region reads
+    through the AppContext region resolver.
+  - Acceptance: production init/storage request paths no longer read region
+    directly from the storage global facade, while the AppContext default
+    adapter preserves the legacy global fallback.
+  - Must preserve: notification ARN target mapping fallback region behavior,
+    request context region propagation, auth/policy request construction, and
+    existing startup region setters.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual region
+    scan, Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-174` Route KMS encryption service reads through AppContext.
+  - Do: route app bucket encryption defaults and storage SSE managed
+    encryption/decryption provider reads through an AppContext-first KMS
+    encryption service resolver.
+  - Acceptance: production app/storage paths no longer read the KMS encryption
+    service directly from the global service manager, while the resolver
+    preserves the legacy global fallback.
+  - Must preserve: default SSE-KMS key population, managed SSE encryption and
+    decryption metadata handling, DEK provider selection, and KMS service
+    initialization fallback semantics.
+  - Verification: RustFS compile coverage, targeted SSE/KMS tests, migration
+    guard, layer guard, formatting, diff hygiene, residual encryption-service
+    scan, Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-175` Route runtime support reads through AppContext.
+  - Do: route runtime readiness lock-client collections, storage concurrency
+    performance metrics, and config-info buffer profile reads through
+    AppContext-first resolvers.
+  - Acceptance: production readiness, storage concurrency, and config-info paths
+    no longer read those runtime globals directly, while default adapters
+    preserve the legacy global fallbacks.
+  - Must preserve: distributed readiness lock quorum aggregation, performance
+    metric singleton sharing, workload profile display output, and existing
+    buffer-profile enablement behavior.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual global-read
+    scans, Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-176` Route S3 Select DB factory reads through AppContext.
+  - Do: route S3 Select object execution database creation through an
+    AppContext-first S3 Select DB resolver.
+  - Acceptance: production S3 Select object execution no longer reads the
+    S3 Select DB factory directly, while the default adapter preserves the
+    cached global component behavior.
+  - Must preserve: request validation, preflight object metadata checks,
+    DataFusion execution flow, output event streaming, and cached S3 Select
+    component reuse.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual S3 Select
+    DB scan, Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-177` Route internode RPC metrics through AppContext.
+  - Do: route HTTP and gRPC internode RPC metric recording through an
+    AppContext-first internode metrics resolver.
+  - Acceptance: production internode HTTP and disk RPC paths no longer read
+    the internode metrics singleton directly, while the default adapter
+    preserves the shared global metrics instance.
+  - Must preserve: HTTP read/write/walk counters, gRPC read/write counters,
+    byte accounting, classified transport backend labels, and error recording.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual internode
+    metrics scan, Rust risk scan, branch freshness check, and three-expert
+    review.
+
+- [x] `API-178` Route IAM runtime reads through AppContext.
+  - Do: route auth, storage authorization, admin auth, admin IAM handlers, STS,
+    and table-catalog credential issuance through an AppContext-first ready IAM
+    resolver.
+  - Acceptance: production auth/admin/storage request paths no longer call the
+    IAM global getter directly, while the resolver preserves the legacy ready
+    check and global fallback.
+  - Must preserve: signature secret lookup, access-key validation, S3 policy
+    authorization, table data-plane authorization, admin IAM CRUD, STS temp-user
+    creation, service-account flows, and table credential issuance.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual IAM getter
+    scan, Rust risk scan, branch freshness check, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4509,10 +4634,183 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-169 keeps admin config runtime publication behind AppContext publish helpers with default global-setter adapters. |
 | Migration preservation | pass | Config writes, runtime reload, dynamic subsystem application, and storage-class parsing preserve existing persistence and runtime side effects. |
 | Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual config publication scan, and Rust risk scan passed for API-169. |
+| Quality/architecture | pass | API-170 keeps action-credential reads behind the AppContext action-credential resolver across auth, protocols, and storage helper paths. |
+| Migration preservation | pass | Owner checks, claim validation, policy principal classification, protocol metadata, and audit access-key enrichment preserve existing fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual action credential scan, and Rust risk scan passed for API-170. |
+| Quality/architecture | pass | API-171 keeps replication pool reads behind the AppContext replication-pool resolver in startup and workload admission paths. |
+| Migration preservation | pass | Bucket metadata resync, replication worker counts, queue counts, and unknown-runtime reporting preserve existing fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, workload admission tests, targeted context tests, formatting, migration/layer guards, diff hygiene, residual replication-pool scan, and Rust risk scan passed for API-171. |
+| Quality/architecture | pass | API-172 keeps outbound TLS generation reads behind the AppContext outbound TLS generation resolver in startup and reload paths. |
+| Migration preservation | pass | Generation increments, outbound TLS publication, generation metrics, reload enrichment, and acceptor rebuild behavior preserve existing semantics. |
+| Testing/verification | pass | RustFS focused compile, TLS generation test, targeted context test, formatting, migration/layer guards, diff hygiene, residual outbound TLS generation scan, and Rust risk scan passed for API-172. |
+| Quality/architecture | pass | API-173 keeps region reads behind the AppContext region resolver in notification setup and storage request context paths. |
+| Migration preservation | pass | Notification fallback region, request context propagation, auth/policy request construction, and startup setters preserve existing behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context test, formatting, migration/layer guards, diff hygiene, residual region scan, and Rust risk scan passed for API-173. |
+| Quality/architecture | pass | API-174 keeps app/storage KMS encryption service reads behind an AppContext-first resolver using the existing KMS runtime manager boundary. |
+| Migration preservation | pass | Default SSE-KMS key population, managed SSE metadata handling, DEK provider selection, and legacy global fallback behavior are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted SSE/KMS and bucket encryption tests, formatting, migration/layer guards, diff hygiene, residual encryption-service scan, and Rust risk scan passed for API-174. |
+| Quality/architecture | pass | API-175 keeps readiness lock clients, storage performance metrics, and config-info buffer profile reads behind AppContext-first resolvers. |
+| Migration preservation | pass | Lock quorum aggregation, performance metrics sharing, workload profile display, and legacy global fallback behavior are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual global-read scans, and Rust risk scan passed for API-175. |
+| Quality/architecture | pass | API-176 keeps S3 Select DB factory access behind an AppContext-first resolver in object select execution. |
+| Migration preservation | pass | Request validation, object preflight, query execution, event streaming, and cached component fallback behavior are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual S3 Select DB scan, and Rust risk scan passed for API-176. |
+| Quality/architecture | pass | API-177 keeps internode RPC metrics behind an AppContext-first resolver across HTTP and gRPC RPC paths. |
+| Migration preservation | pass | Request counters, byte accounting, transport backend labels, and error metrics preserve existing global fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual internode metrics scan, and Rust risk scan passed for API-177. |
+| Quality/architecture | pass | API-178 keeps ready IAM access behind an AppContext-first resolver without widening handler semantics. |
+| Migration preservation | pass | Auth, storage authorization, admin IAM handlers, STS, and table credential flows keep existing error mapping and ready-check fallback. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual IAM getter scan, Rust risk scan, and pre-commit passed for API-178. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-178 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - IAM getter scan: passed; production auth/admin/storage IAM reads now go
+    through the AppContext ready IAM resolver.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-176 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - S3 Select DB scan: passed; direct production `get_global_db` reads are
+    removed from S3 Select object execution.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-177 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Internode metrics scan: passed; direct production
+    `global_internode_metrics` reads are removed from RustFS HTTP and disk RPC
+    paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-175 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Runtime support scan: passed; direct production lock-client collection,
+    performance metrics, and config-info buffer profile reads now go through
+    AppContext resolvers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-174 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs test_kms_sse_dek_provider_uses_latest_reconfigured_service --lib`:
+    passed.
+  - `cargo test -p rustfs test_sse_encryption_fails_closed_without_local_sse_master_key --lib`:
+    passed.
+  - `cargo test -p rustfs execute_put_bucket_encryption_returns_internal_error_when_store_uninitialized --lib`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext KMS encryption service scan: passed; direct production
+    `get_global_encryption_service` reads are removed from app bucket
+    encryption and storage SSE paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-173 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext region scan: passed; direct production `get_global_region`
+    reads are removed from notification setup and storage request context
+    paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-172 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs next_tls_generation --lib`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext outbound TLS generation scan: passed; direct production
+    `get_global_outbound_tls_generation` reads are removed from startup TLS
+    material and TLS reload paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-171 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs workload_admission --lib`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext replication pool scan: passed; direct production
+    `get_global_replication_pool` reads are removed from bucket metadata
+    startup and workload admission paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-170 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext action credential scan: passed; direct production
+    `get_global_action_cred` and `get_global_access_key_opt` reads are removed
+    from auth, protocol client, and storage helper paths.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
 
 - Issue #660 API-169 current slice:
   - `cargo check --tests -p rustfs`: passed.

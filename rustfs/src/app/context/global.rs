@@ -16,17 +16,20 @@ use super::super::{ECStore, set_object_store_resolver};
 use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_boot_time_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
-    default_endpoints_interface, default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
+    default_endpoints_interface, default_internode_metrics_interface, default_kms_runtime_interface,
+    default_local_node_name_interface, default_lock_client_interface, default_lock_clients_interface,
     default_notification_system_interface, default_notify_interface, default_outbound_tls_runtime_interface,
-    default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
-    default_runtime_port_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface,
+    default_performance_metrics_interface, default_region_interface, default_replication_pool_interface,
+    default_replication_stats_interface, default_runtime_port_interface, default_s3select_db_interface,
+    default_scanner_metrics_interface, default_server_config_interface, default_storage_class_interface,
+    default_tier_config_interface, default_tier_stats_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
-    LockClientInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface,
-    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface, ServerConfigInterface,
+    DeploymentIdInterface, EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
+    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
+    OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
+    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
     StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
@@ -55,6 +58,10 @@ pub struct AppContext {
     deployment_id: Arc<dyn DeploymentIdInterface>,
     runtime_port: Arc<dyn RuntimePortInterface>,
     lock_client: Arc<dyn LockClientInterface>,
+    lock_clients: Arc<dyn LockClientsInterface>,
+    performance_metrics: Arc<dyn PerformanceMetricsInterface>,
+    internode_metrics: Arc<dyn InternodeMetricsInterface>,
+    s3select_db: Arc<dyn S3SelectDbInterface>,
     local_node_name: Arc<dyn LocalNodeNameInterface>,
     action_credentials: Arc<dyn ActionCredentialInterface>,
     region: Arc<dyn RegionInterface>,
@@ -85,6 +92,10 @@ impl AppContext {
             deployment_id: default_deployment_id_interface(),
             runtime_port: default_runtime_port_interface(),
             lock_client: default_lock_client_interface(),
+            lock_clients: default_lock_clients_interface(),
+            performance_metrics: default_performance_metrics_interface(),
+            internode_metrics: default_internode_metrics_interface(),
+            s3select_db: default_s3select_db_interface(),
             local_node_name: default_local_node_name_interface(),
             action_credentials: default_action_credential_interface(),
             region: default_region_interface(),
@@ -176,6 +187,22 @@ impl AppContext {
         self.lock_client.clone()
     }
 
+    pub fn lock_clients(&self) -> Arc<dyn LockClientsInterface> {
+        self.lock_clients.clone()
+    }
+
+    pub fn performance_metrics(&self) -> Arc<dyn PerformanceMetricsInterface> {
+        self.performance_metrics.clone()
+    }
+
+    pub fn internode_metrics(&self) -> Arc<dyn InternodeMetricsInterface> {
+        self.internode_metrics.clone()
+    }
+
+    pub fn s3select_db(&self) -> Arc<dyn S3SelectDbInterface> {
+        self.s3select_db.clone()
+    }
+
     pub fn local_node_name(&self) -> Arc<dyn LocalNodeNameInterface> {
         self.local_node_name.clone()
     }
@@ -224,6 +251,10 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) deployment_id: Arc<dyn DeploymentIdInterface>,
     pub(super) runtime_port: Arc<dyn RuntimePortInterface>,
     pub(super) lock_client: Arc<dyn LockClientInterface>,
+    pub(super) lock_clients: Arc<dyn LockClientsInterface>,
+    pub(super) performance_metrics: Arc<dyn PerformanceMetricsInterface>,
+    pub(super) internode_metrics: Arc<dyn InternodeMetricsInterface>,
+    pub(super) s3select_db: Arc<dyn S3SelectDbInterface>,
     pub(super) local_node_name: Arc<dyn LocalNodeNameInterface>,
     pub(super) action_credentials: Arc<dyn ActionCredentialInterface>,
     pub(super) region: Arc<dyn RegionInterface>,
@@ -255,6 +286,10 @@ impl AppContext {
             deployment_id: interfaces.deployment_id,
             runtime_port: interfaces.runtime_port,
             lock_client: interfaces.lock_client,
+            lock_clients: interfaces.lock_clients,
+            performance_metrics: interfaces.performance_metrics,
+            internode_metrics: interfaces.internode_metrics,
+            s3select_db: interfaces.s3select_db,
             local_node_name: interfaces.local_node_name,
             action_credentials: interfaces.action_credentials,
             region: interfaces.region,
