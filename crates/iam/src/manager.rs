@@ -25,7 +25,7 @@ use crate::{
     },
 };
 use futures::future::join_all;
-use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE};
 use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq, GroupDesc};
 use rustfs_policy::{
     arn::ARN,
@@ -2137,11 +2137,7 @@ fn set_default_canned_policies(policies: &mut HashMap<String, PolicyDoc>) {
 }
 
 pub fn get_token_signing_key() -> Option<String> {
-    if let Some(s) = get_global_action_cred() {
-        Some(s.secret_key)
-    } else {
-        None
-    }
+    crate::root_credentials::token_signing_key()
 }
 
 pub fn extract_jwt_claims(u: &UserIdentity) -> Result<HashMap<String, Value>> {

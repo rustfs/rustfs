@@ -38,13 +38,14 @@ use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
+use crate::runtime_sources;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{get_global_storage_class, storageclass},
+    config::storageclass,
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -53,7 +54,7 @@ use crate::{
     error::{StorageError, to_object_err},
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
-    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
+    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
@@ -148,6 +149,7 @@ const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
+const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
@@ -395,9 +397,7 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = get_global_storage_class()
-        .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
-        .unwrap_or(default_parity_count);
+    let parity_drives = runtime_sources::storage_class_parity(storage_class).unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
     let mut write_quorum = data_drives;
     if data_drives == parity_drives {
@@ -561,7 +561,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             lockers,
-            local_lock_manager: rustfs_lock::get_global_lock_manager(),
+            local_lock_manager: runtime_sources::global_lock_manager(),
         })
     }
 
@@ -1027,13 +1027,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -1081,13 +1075,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-            let is_inline_buffer = {
-                if let Some(sc) = get_global_storage_class() {
-                    sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
-                } else {
-                    false
-                }
-            };
+            let is_inline_buffer =
+                runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
 
             let shard_file_size = erasure.shard_file_size(data.size());
             let shard_size = erasure.shard_size();
@@ -1138,10 +1127,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_writer_setup",
-                writer_setup_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
+            let writer_setup_ms = writer_setup_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_writer_setup", writer_setup_ms as f64);
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1202,10 +1189,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                     }
                 },
             };
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_encode",
-                encode_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
+            let encode_ms = encode_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", encode_ms as f64);
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1314,12 +1299,9 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 write_quorum,
             )
             .await?;
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_rename",
-                rename_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
-            let rename_stage_ms = rename_stage_start.elapsed().as_millis();
-            if rename_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+            let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
+            if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                 warn!(
                     event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1328,23 +1310,22 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                     bucket = %bucket,
                     object = %object,
                     tmp_dir = %tmp_dir,
-                    duration_ms = rename_stage_ms as u64,
+                    duration_ms = { rename_stage_ms },
                     write_quorum,
                     state = "slow",
                     "SetDisk commit tail stage is slow"
                 );
             }
 
+            let mut cleanup_stage_ms: Option<u64> = None;
             if let Some(old_dir) = op_old_dir {
                 let cleanup_stage_start = Instant::now();
                 self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
-                rustfs_io_metrics::record_put_object_stage_duration(
-                    "set_disk_old_data_cleanup",
-                    cleanup_stage_start.elapsed().as_secs_f64() * 1000.0,
-                );
-                let cleanup_stage_ms = cleanup_stage_start.elapsed().as_millis();
-                if cleanup_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                let cleanup_ms = cleanup_stage_start.elapsed().as_millis() as u64;
+                cleanup_stage_ms = Some(cleanup_ms);
+                rustfs_io_metrics::record_put_object_stage_duration("set_disk_old_data_cleanup", cleanup_ms as f64);
+                if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                     warn!(
                         event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1354,7 +1335,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                         object = %object,
                         tmp_dir = %tmp_dir,
                         old_dir = %old_dir,
-                        duration_ms = cleanup_stage_ms as u64,
+                        duration_ms = cleanup_ms,
                         write_quorum,
                         state = "slow",
                         "SetDisk commit tail stage is slow"
@@ -1411,9 +1392,50 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 );
             }
 
+            if issue3031_diag_enabled() {
+                warn!(
+                    event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket = %bucket,
+                    object = %object,
+                    write_quorum,
+                    write_path = write_path.metric_label(),
+                    writer_setup_ms,
+                    encode_ms,
+                    rename_ms = rename_stage_ms,
+                    cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
+                    cleanup_present = cleanup_stage_ms.is_some(),
+                    commit_tail_ms = total_commit_tail_ms as u64,
+                    result = "success",
+                    "SetDisk put_object stage summary"
+                );
+            }
+
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
         }
         .await;
+
+        if issue3031_diag_enabled()
+            && let Err(err) = &result
+        {
+            let stage_hint = if err.to_string().contains("not enough disks to write") {
+                "writer_setup_or_quorum"
+            } else {
+                "unknown"
+            };
+            warn!(
+                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = %bucket,
+                object = %object,
+                result = "error",
+                stage_hint,
+                error = %err,
+                "SetDisk put_object stage summary"
+            );
+        }
 
         if issue3031_diag_enabled() {
             warn!(
@@ -3695,8 +3717,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_simd::URL_SAFE_NO_PAD
-                    .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
+                upload_id: runtime_sources::deployment_upload_id(&upload_id),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -3786,13 +3807,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -3863,8 +3878,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
 
         let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_simd::URL_SAFE_NO_PAD
-            .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
+        let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 

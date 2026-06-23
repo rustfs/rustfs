@@ -5,16 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-iam-global-read-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178`.
-- Based on: API-171 through API-177 prepared in PR #3785; this branch batches
-  the next IAM consumer migration on top of that branch.
+- Branch: `overtrue/arch-ecstore-data-plane-runtime-sources`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186`.
+- Based on: latest `origin/main` after PR #3796 merged API-185.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
-  internode RPC metrics, and IAM authorization/handler reads through
-  AppContext-first resolvers.
+  internode RPC metrics, IAM authorization/handler reads, notification
+  rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
+  consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
+  runtime source reads, RIO HTTP reader TLS/metrics runtime source reads, and
+  gRPC/transition network client TLS/metrics runtime source reads, plus ECStore
+  data-plane KMS/storage-class/deployment-id/lock-manager/erasure metric reads,
+  through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -23,7 +27,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-178 owner facade cleanup.
+- Docs changes: record the API-136 through API-186 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4571,6 +4575,131 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration guard, layer guard, formatting, diff hygiene, residual IAM getter
     scan, Rust risk scan, branch freshness check, and three-expert review.
 
+- [x] `API-179` Route notification dispatch through AppContext.
+  - Do: route startup notification rule registration, storage event
+    notifications, and ECStore event dispatch hooks through the AppContext
+    notify interface.
+  - Acceptance: production RustFS notification dispatch paths no longer call
+    the notify global directly, while the default adapter preserves the legacy
+    notifier fallback.
+  - Must preserve: bucket notification rule registration, operation helper
+    success-only event emission, replication-request suppression, ECStore event
+    conversion, and background spawn behavior.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual notify
+    dispatch scan, Rust risk scan, branch freshness check, and three-expert
+    review.
+
+- [x] `API-180` Route admin OIDC and token-signing reads through AppContext.
+  - Do: expose AppContext-first resolvers for the OIDC system and token
+    signing key, then route console config, OIDC handlers, STS credential
+    generation, table credential vending, and site-replication STS validation
+    through those resolvers.
+  - Acceptance: targeted RustFS admin OIDC/token-signing consumers no longer
+    read IAM globals directly, while default adapters preserve the existing
+    global OIDC and action-credential fallback.
+  - Must preserve: OIDC provider listing, authorize/callback/logout behavior,
+    STS web-identity verification, STS/table credential claims, session-policy
+    handling, and site-replication STS token validation.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual
+    admin/global IAM scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-181` Centralize IAM root credential reads behind IAM boundary.
+  - Do: add an IAM-owned root credential helper, route IAM store/sys/token
+    signing consumers through it, and make protocol gateway owner checks call an
+    IAM predicate instead of reading credentials directly.
+  - Acceptance: production IAM and protocol gateway paths no longer call the
+    action credential global directly outside the IAM boundary module, while
+    root user detection, legacy IAM decrypt fallback, and token-signing behavior
+    remain unchanged.
+  - Must preserve: root credential lookup, owner-policy bypass decisions,
+    legacy secret-key decrypt fallback, STS token signing key selection,
+    service-account/STSes authorization, and protocol gateway policy args.
+  - Verification: IAM/protocol compile coverage, IAM focused tests, formatting,
+    migration guard, layer guard, diff hygiene, residual direct credential scan,
+    Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-182` Centralize owner server config reads behind crate boundaries.
+  - Do: route IAM OIDC server-config reads through an IAM-owned helper and
+    scanner runtime-config global reads through scanner-owned resolver
+    functions.
+  - Acceptance: production IAM OIDC and scanner runtime-config consumers no
+    longer call the server-config global directly outside owner boundary
+    modules, while parser fallback and effective-provider behavior remain
+    unchanged.
+  - Must preserve: OIDC provider parsing, config fallback handling, scanner
+    runtime config defaults, warning logs, and runtime config refresh behavior.
+  - Verification: IAM/scanner compile coverage, IAM/scanner focused tests,
+    formatting, migration guard, layer guard, diff hygiene, residual server
+    config scan, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `API-183` Centralize OBS metrics runtime source reads.
+  - Do: add an OBS metrics runtime-source boundary for IAM metrics, bucket
+    monitor availability, replication stats, and ILM runtime state, then route
+    the metrics collector and scheduler through that boundary.
+  - Acceptance: OBS metrics collector and scheduler code no longer imports
+    IAM or ECStore global runtime symbols directly outside the OBS runtime
+    source boundary, while metric field mapping and unavailable-state behavior
+    remain unchanged.
+  - Must preserve: IAM sync/plugin metrics, bucket replication bandwidth
+    availability warnings, ILM pending/transition counters, site/bucket
+    replication stats, and object-store/data-usage collection.
+  - Verification: OBS compile coverage, formatting, migration guard, layer
+    guard, diff hygiene, residual OBS global scan, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `API-184` Centralize RIO HTTP runtime source reads.
+  - Do: add a RIO HTTP runtime-source boundary for outbound TLS generation,
+    outbound TLS state, stale-generation reporting, and TCP/HTTP internode
+    metrics recording, then route `http_reader` through that boundary.
+  - Acceptance: RIO HTTP reader code no longer imports outbound TLS global
+    readers or internode metrics globals directly outside the RIO runtime
+    source boundary, while client-cache invalidation and metric labels remain
+    unchanged.
+  - Must preserve: proxy bypass behavior, HTTP client cache generation checks,
+    outbound TLS material loading, stale-generation reporting, internode
+    request/byte/error counters, and classified error labels.
+  - Verification: RIO compile coverage, RIO unit tests, formatting, migration
+    guard, layer guard, diff hygiene, residual RIO runtime source scan, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
+- [x] `API-185` Centralize network client runtime source reads.
+  - Do: add runtime-source boundaries for `rustfs-protos` gRPC channel TLS and
+    dial metrics, ECStore transition-client outbound TLS state and generation
+    reporting, and ECStore remote-disk gRPC/TCP HTTP internode metric recording.
+  - Acceptance: gRPC channel creation, transition-client TLS config, and remote
+    disk RPC/write-stream retry paths no longer import outbound TLS global
+    readers or internode metrics globals directly outside their owner runtime
+    source boundary modules.
+  - Must preserve: gRPC channel TLS generation cache invalidation, dial success
+    and error metrics, transition-client TLS material loading, TLS generation
+    gauges, remote-disk write-stream retry metrics, and gRPC read/write
+    request/error/byte counters.
+  - Verification: protos/ECStore compile coverage, focused unit tests,
+    formatting, migration guard, layer guard, diff hygiene, residual network
+    client runtime source scan, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `API-186` Centralize ECStore data-plane runtime source reads.
+  - Do: add an ECStore runtime-source boundary for erasure quorum failure
+    metrics, object-read managed KMS service lookup, storage-class parity and
+    inline decisions, deployment-prefixed multipart upload ids, and the local
+    lock-manager handle.
+  - Acceptance: ECStore data-plane write/read/multipart paths no longer import
+    those global runtime sources directly outside the owner runtime-source
+    module.
+  - Must preserve: erasure quorum metric stage/error labels, managed-KMS
+    decrypt fallback behavior, storage-class parity and inline decisions,
+    multipart upload id encoding, and local lock-manager initialization.
+  - Verification: ECStore compile coverage, focused unit tests, formatting,
+    migration guard, layer guard, diff hygiene, residual data-plane runtime
+    source scan, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4661,10 +4790,175 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-178 keeps ready IAM access behind an AppContext-first resolver without widening handler semantics. |
 | Migration preservation | pass | Auth, storage authorization, admin IAM handlers, STS, and table credential flows keep existing error mapping and ready-check fallback. |
 | Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual IAM getter scan, Rust risk scan, and pre-commit passed for API-178. |
+| Quality/architecture | pass | API-179 keeps notification rule registration and event dispatch behind the AppContext notify resolver. |
+| Migration preservation | pass | Startup rules, success-only storage events, replication suppression, ECStore hook conversion, and default notifier fallback are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual notify dispatch scan, Rust risk scan, and pre-commit passed for API-179. |
+| Quality/architecture | pass | API-180 keeps admin OIDC and token-signing reads behind IAM/AppContext resolver methods without widening handler behavior. |
+| Migration preservation | pass | OIDC provider discovery, STS credential generation, table credential vending, and site-replication STS validation keep existing error mapping and fallback semantics. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting/migration/layer guards, diff hygiene, residual admin IAM scan, and Rust risk scan passed for API-180. |
+| Quality/architecture | pass | API-181 keeps IAM root credential reads centralized in an IAM-owned helper and exposes only a root access-key predicate to protocol code. |
+| Migration preservation | pass | Root owner checks, legacy IAM decrypt fallback, token signing, and gateway policy args preserve existing credential semantics. |
+| Testing/verification | pass | IAM/protocol compile, IAM unit tests, formatting, migration/layer guards, diff hygiene, residual credential scan, and Rust risk scan passed for API-181. |
+| Quality/architecture | pass | API-182 keeps server-config global reads inside IAM and scanner owner boundary helpers without widening public APIs. |
+| Migration preservation | pass | OIDC provider parsing and scanner runtime-config fallback semantics keep the same inputs, defaults, and warning behavior. |
+| Testing/verification | pass | IAM/scanner compile, focused tests, formatting, migration/layer guards, diff hygiene, residual server-config scan, Rust risk scan, and pre-commit passed for API-182. |
+| Quality/architecture | pass | API-183 keeps OBS metrics runtime globals behind a metrics-owned runtime-source module without widening public APIs. |
+| Migration preservation | pass | IAM metrics, replication bandwidth availability, ILM counters, and replication stats keep the same source data and fallback behavior. |
+| Testing/verification | pass | OBS compile/tests, formatting, residual OBS global scan, targeted guard checks, and pre-commit passed for API-183. |
+| Quality/architecture | pass | API-184 keeps RIO HTTP outbound TLS and internode metric globals behind a RIO-owned runtime-source module without widening public APIs. |
+| Migration preservation | pass | HTTP client cache generation checks, TLS material loading, stale-generation reporting, and TCP/HTTP internode metrics keep existing behavior. |
+| Testing/verification | pass | RIO compile/tests, formatting, residual RIO runtime source scan, targeted guard checks, and pre-commit passed for API-184. |
+| Quality/architecture | pass | API-185 keeps protos and ECStore network client TLS/metrics globals behind owner runtime-source modules without widening public APIs. |
+| Migration preservation | pass | gRPC TLS cache invalidation, transition-client TLS generation reporting, dial metrics, retry metrics, and read/write byte/error counters keep existing behavior. |
+| Testing/verification | pass | Protos/ECStore compile/tests, formatting, residual network client runtime source scan, targeted guard checks, and pre-commit passed for API-185. |
+| Quality/architecture | pass | API-186 keeps ECStore data-plane runtime globals behind an ECStore-owned runtime-source module without widening public APIs. |
+| Migration preservation | pass | Erasure quorum metric labels, managed-KMS fallback, storage-class decisions, multipart upload id encoding, and lock-manager initialization keep existing behavior. |
+| Testing/verification | pass | ECStore compile/focused tests, formatting, residual data-plane runtime source scan, targeted guard checks, and pre-commit passed for API-186. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-186 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib erasure_coding -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib set_disk -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib readers -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECStore data-plane runtime source scan: passed; direct storage-class,
+    deployment id, KMS encryption service, lock-manager, and erasure internode
+    metric global reads are isolated to the ECStore runtime source module.
+  - Rust risk scan: passed; diff adds no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: rebased onto latest `origin/main` after PR #3796
+    merged API-185.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-185 current slice:
+  - `cargo check -p rustfs-protos -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-protos --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib remote_disk -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Network client runtime source scan: passed; direct outbound TLS and
+    internode metrics global reads are isolated to the protos and ECStore
+    runtime source modules.
+  - Rust risk scan: passed; diff adds no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: based on latest `origin/main` after PR #3795
+    merged API-184.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-184 current slice:
+  - `cargo check -p rustfs-rio --tests`: passed.
+  - `cargo test -p rustfs-rio --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - RIO HTTP runtime source scan: passed; direct outbound TLS and internode
+    metrics global reads are isolated to `crates/rio/src/http_runtime_sources.rs`.
+  - Rust risk scan: passed; diff adds no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: based on latest `origin/main` after PR #3793
+    merged the API-182/API-183 stack.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-183 current slice:
+  - `cargo check -p rustfs-obs --tests`: passed.
+  - `cargo test -p rustfs-obs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - OBS global scan: passed; touched direct IAM and ECStore metrics runtime
+    globals are isolated to `crates/obs/src/metrics/runtime_sources.rs`.
+  - Rust risk scan: passed; diff only adds owner-symbol aliases and bounded
+    integer-conversion fallbacks, with no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: based on API-182 PR #3793 head.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-182 current slice:
+  - `cargo check -p rustfs-iam -p rustfs-scanner --tests`: passed.
+  - `cargo test -p rustfs-iam --lib`: passed.
+  - `cargo test -p rustfs-scanner --lib -- --test-threads=1`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - IAM/scanner server-config scan: passed; touched production direct
+    `get_global_server_config` calls are isolated to IAM and scanner boundary
+    modules, while existing app context, config, and ECStore owner reads remain
+    unchanged.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risk.
+  - Branch freshness check: rebased on latest `origin/main` after PR #3789 and
+    API-181 content landed upstream.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-181 current slice:
+  - `cargo check -p rustfs-iam -p rustfs-protocols --tests`: passed.
+  - `cargo test -p rustfs-iam --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - IAM/protocol credential scan: passed; production direct
+    `get_global_action_cred` calls are isolated to the IAM root credential
+    boundary.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-180 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin IAM/OIDC scan: passed; targeted admin OIDC and token-signing reads
+    now go through AppContext IAM resolvers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-179 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Notify dispatch scan: passed; production startup, storage helper, and
+    ECStore event hook dispatch no longer call the notify global directly.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-178 current slice:
   - `cargo check --tests -p rustfs`: passed.

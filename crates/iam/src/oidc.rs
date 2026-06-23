@@ -26,7 +26,6 @@ use openidconnect::{
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
@@ -410,7 +409,8 @@ impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
         let http_client = ReqwestHttpClient::new()?;
-        let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
+        let server_config = crate::server_config::current_server_config();
+        let parsed_configs = load_effective_oidc_provider_configs(server_config.as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
 

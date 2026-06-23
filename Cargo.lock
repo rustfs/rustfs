@@ -7830,9 +7830,9 @@ dependencies = [
 
 [[package]]
 name = "primefield"
-version = "0.14.0-rc.12"
+version = "0.14.0-rc.13"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8675564771a62f69a0af716b03e89b917b963c7b173b5855575e84fd4f605ca0"
+checksum = "2db02b39ea98560a1fec81df6266f3c1ef7fdde06ac5ef17f69aee6101602630"
 dependencies = [
  "crypto-bigint 0.7.5",
  "crypto-common 0.2.2",
@@ -8250,9 +8250,9 @@ dependencies = [
 
 [[package]]
 name = "quinn"
-version = "0.11.9"
+version = "0.11.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b9e20a958963c291dc322d98411f541009df2ced7b5a4f2bd52337638cfccf20"
+checksum = "0c1a41e437b6bbd489372cd4971de128e85c855f56c57f283d20ff016cf7c0a8"
 dependencies = [
  "bytes",
  "cfg_aliases",
@@ -8270,9 +8270,9 @@ dependencies = [
 
 [[package]]
 name = "quinn-proto"
-version = "0.11.14"
+version = "0.11.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "434b42fec591c96ef50e21e886936e66d3cc3f737104fdb9b737c40ffb94c098"
+checksum = "4fcb935c5bec503c2f0e306bdd3e58bb9029dcb14fa8d9ac76e3a5256ac0763e"
 dependencies = [
  "aws-lc-rs",
  "bytes",
@@ -8306,9 +8306,9 @@ dependencies = [
 
 [[package]]
 name = "quote"
-version = "1.0.45"
+version = "1.0.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41f2619966050689382d2b44f664f4bc593e129785a36d6ee376ddf37259b924"
+checksum = "dfbc457d0c7a0759a614551b11a6409e5951f6c7537be1f1b7682b9ae9230368"
 dependencies = [
  "proc-macro2",
 ]
@@ -9347,7 +9347,6 @@ dependencies = [
  "rmp-serde",
  "rustfs-checksums",
  "rustfs-common",
- "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-data-usage",
@@ -9628,7 +9627,6 @@ dependencies = [
  "rustfs-utils",
  "serde",
  "serde_json",
- "sha2 0.11.0",
  "temp-env",
  "tempfile",
  "thiserror 2.0.18",
@@ -9694,14 +9692,12 @@ dependencies = [
  "rustfs-ecstore",
  "rustfs-s3-ops",
  "rustfs-s3-types",
- "rustfs-storage-api",
  "rustfs-targets",
  "rustfs-utils",
  "serde",
  "serde_json",
  "starshard",
  "thiserror 2.0.18",
- "time",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -9966,7 +9962,6 @@ dependencies = [
  "futures-core",
  "http 1.4.2",
  "metrics",
- "object_store",
  "parking_lot",
  "pin-project-lite",
  "rustfs-common",
@@ -10282,9 +10277,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.40"
+version = "0.23.41"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef86cd5876211988985292b91c96a8f2d298df24e75989a43a3c73f2d4d8168b"
+checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
 dependencies = [
  "aws-lc-rs",
  "log",
@@ -11454,9 +11449,9 @@ dependencies = [
 
 [[package]]
 name = "sysinfo"
-version = "0.39.4"
+version = "0.39.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a71c821502e2786cc74c965f86561090a2b08fea91507cb599b5da291486a2aa"
+checksum = "2c8bd2130a9b60bee2581bf82cfe89ee836424d1f37dcfa4ce21509611684673"
 dependencies = [
  "libc",
  "memchr",
@@ -11666,9 +11661,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.49"
+version = "0.3.51"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "711a53c2d47bbd818258c498c8dbfe186a2526c631495cfe7e078567f86b8469"
+checksum = "85c17d80feb7334b40c484e45ed1a5273dfd8bfda537c3be2e74a06a6686f327"
 dependencies = [
  "deranged",
  "js-sys",
@@ -11689,9 +11684,9 @@ checksum = "9e1c906769ad99c88eaa54e728060edef082f8e358ff32030cb7c7d315e81109"
 
 [[package]]
 name = "time-macros"
-version = "0.2.29"
+version = "0.2.30"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "71c652a3727a9cbb9a02f707f530b618ce00d0ccd762009c8c23bd191df3c17d"
+checksum = "dcef1a61bdb119096e153208ec5cbec23944ce8bca13be5c7f60c634f7403935"
 dependencies = [
  "num-conv",
  "time-core",

@@ -17,7 +17,7 @@ use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_token_signing_key};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
@@ -26,7 +26,7 @@ use hyper::Method;
 use matchit::Params;
 use metrics::{counter, histogram};
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_iam::{manager::get_token_signing_key, sys::SESSION_POLICY_NAME};
+use rustfs_iam::sys::SESSION_POLICY_NAME;
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
     policy::{
@@ -696,7 +696,7 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             serde_json::Value::String(request.scope_prefix.clone()),
         );
 
-        let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+        let secret = resolve_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
         let mut credential = get_new_credentials_with_metadata(&claims, &secret)
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);

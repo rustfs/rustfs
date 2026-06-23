@@ -40,7 +40,9 @@ use std::time::Duration;
 use tracing::warn;
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
+const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const LOG_SUBSYSTEM_RUNTIME_CONFIG: &str = "runtime_config";
+const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
 const EVENT_SCANNER_RUNTIME_CONFIG_PARSE: &str = "scanner_runtime_config_parse";
 
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
@@ -671,6 +673,29 @@ fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) {
     }
 }
 
+fn current_server_config() -> Option<ServerConfig> {
+    rustfs_config::server_config::get_global_server_config()
+}
+
+pub(crate) fn resolve_scanner_runtime_config_from_global() -> ScannerRuntimeConfig {
+    let config = current_server_config();
+    match lookup_scanner_runtime_config(config.as_ref()) {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(
+                target: "rustfs::scanner",
+                event = EVENT_SCANNER_RUNTIME_CONFIG,
+                component = LOG_COMPONENT_SCANNER,
+                subsystem = LOG_SUBSYSTEM_RUNTIME,
+                state = "resolve_failed",
+                error = %err,
+                "Scanner runtime config fallback applied"
+            );
+            current_scanner_runtime_config()
+        }
+    }
+}
+
 pub fn validate_scanner_runtime_config(config: &ServerConfig) -> Result<(), ScannerRuntimeConfigError> {
     validate_persisted_scanner_runtime_config(config)
 }
@@ -683,7 +708,7 @@ pub fn apply_scanner_runtime_config(config: &ServerConfig) -> Result<(), Scanner
 }
 
 pub(crate) fn refresh_scanner_runtime_config_from_global() -> Result<(), ScannerRuntimeConfigError> {
-    let config = rustfs_config::server_config::get_global_server_config();
+    let config = current_server_config();
     let resolved = lookup_scanner_runtime_config(config.as_ref())?;
     apply_resolved_runtime_config(resolved);
     Ok(())

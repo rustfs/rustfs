@@ -11,7 +11,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
-use rustfs_kms::{service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
+use rustfs_kms::types::ObjectEncryptionContext;
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::path::path_join_buf;
 #[cfg(feature = "rio-v2")]
@@ -95,6 +95,14 @@ fn build_object_encryption_context(
         object_context = object_context.with_encryption_context(ctx_key, ctx_value);
     }
     object_context
+}
+
+#[cfg(feature = "rio-v2")]
+fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool {
+    metadata_get(metadata, INTERNAL_ENCRYPTION_KEY_HEADER).is_some()
+        && metadata_get(metadata, INTERNAL_ENCRYPTION_IV_HEADER).is_some()
+        && metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER).is_none()
+        && metadata_get(metadata, MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER).is_none()
 }
 
 fn part_plaintext_size(part: &ObjectPartInfo) -> i64 {
@@ -1300,10 +1308,17 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     let kms_context: Option<HashMap<String, String>> = None;
     let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
 
-    let decrypted_key = if let Some(service) = get_global_encryption_service().await {
-        service
-            .decrypt_data_key(&encrypted_dek, &object_context)
-            .await
+    let decrypted_key = if let Some(service) = crate::runtime_sources::object_encryption_service().await {
+        #[cfg(feature = "rio-v2")]
+        let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
+            service.decrypt_legacy_data_key(&encrypted_dek).await
+        } else {
+            service.decrypt_data_key(&encrypted_dek, &object_context).await
+        };
+        #[cfg(not(feature = "rio-v2"))]
+        let data_key = service.decrypt_data_key(&encrypted_dek, &object_context).await;
+
+        data_key
             .map_err(|e| Error::other(format!("failed to decrypt managed data key: {e}")))?
             .plaintext_key
     } else {
@@ -1599,6 +1614,24 @@ mod tests {
             HeaderValue::from_str(&BASE64_STANDARD.encode(md5_bytes(key_bytes))).expect("valid md5 header"),
         );
         headers
+    }
+
+    #[cfg(feature = "rio-v2")]
+    #[test]
+    fn test_legacy_managed_metadata_excludes_sealed_keys() {
+        let legacy_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+        ]);
+        assert!(is_legacy_rustfs_managed_metadata(&legacy_metadata));
+
+        let sealed_metadata = HashMap::from([
+            (INTERNAL_ENCRYPTION_KEY_HEADER.to_string(), "encrypted-dek".to_string()),
+            (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), "nonce".to_string()),
+            (MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER.to_string(), "sealed-key".to_string()),
+        ]);
+
+        assert!(!is_legacy_rustfs_managed_metadata(&sealed_metadata));
     }
 
     #[cfg(feature = "rio-v2")]

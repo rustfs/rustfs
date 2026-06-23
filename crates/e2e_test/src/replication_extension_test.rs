@@ -1619,6 +1619,46 @@ async fn test_delete_bucket_replication_removes_remote_target() -> Result<(), Bo
 
 #[tokio::test]
 #[serial]
+async fn test_bucket_replication_replicates_put_object_issue_2539() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = RustFSTestEnvironment::new().await?;
+    source_env.start_rustfs_server(vec![]).await?;
+
+    let mut target_env = RustFSTestEnvironment::new().await?;
+    target_env.start_rustfs_server_without_cleanup(vec![]).await?;
+
+    let source_bucket = "issue-2539-src";
+    let target_bucket = "issue-2539-dst";
+    let object_key = "put-object.txt";
+    let body = "bucket replication should copy PutObject payload";
+
+    let source_client = source_env.create_s3_client();
+    let target_client = target_env.create_s3_client();
+
+    source_client.create_bucket().bucket(source_bucket).send().await?;
+    target_client.create_bucket().bucket(target_bucket).send().await?;
+    enable_bucket_versioning(&source_env, source_bucket).await?;
+    enable_bucket_versioning(&target_env, target_bucket).await?;
+
+    let target_arn = set_replication_target(&source_env, source_bucket, &target_env, target_bucket).await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object(&target_client, target_bucket, object_key, body).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
 async fn test_single_bucket_replication_fans_out_to_multiple_targets() -> Result<(), Box<dyn Error + Send + Sync>> {
     init_logging();
 

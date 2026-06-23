@@ -74,6 +74,14 @@ impl IamInterface for IamHandle {
     fn is_ready(&self) -> bool {
         rustfs_iam::get().is_ok()
     }
+
+    fn oidc(&self) -> Option<Arc<OidcSys>> {
+        rustfs_iam::get_oidc()
+    }
+
+    fn token_signing_key(&self) -> Option<String> {
+        rustfs_iam::manager::get_token_signing_key()
+    }
 }
 
 /// Default OIDC interface adapter.

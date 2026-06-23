@@ -185,7 +185,7 @@ jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
 rsa = { version = "0.10.0-rc.18" }
-rustls = { version = "0.23.40", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
+rustls = { version = "0.23.41", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.14.1"
 sha1 = "0.11.0"
@@ -197,7 +197,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.29", features = ["serde"] }
-time = { version = "0.3.49", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "0.3.51", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
@@ -253,7 +253,6 @@ moka = { version = "0.12.15", features = ["future"] }
 netif = "0.1.6"
 num_cpus = { version = "1.17.0" }
 nvml-wrapper = "0.12.1"
-object_store = "0.13.2"
 parking_lot = "0.12.5"
 path-absolutize = "3.1.1"
 path-clean = "1.0.1"
@@ -282,7 +281,7 @@ snafu = "0.9.1"
 snap = "1.1.1"
 starshard = { version = "2.2.1", features = ["rayon", "async", "serde"] }
 strum = { version = "0.28.0", features = ["derive"] }
-sysinfo = "0.39.4"
+sysinfo = "0.39.5"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.3.1"

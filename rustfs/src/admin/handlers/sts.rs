@@ -19,7 +19,7 @@ use crate::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_action_credentials, resolve_oidc_handle},
+    app::context::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,
@@ -29,7 +29,7 @@ use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
+use rustfs_iam::{oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
     auth::get_new_credentials_with_metadata,
@@ -240,7 +240,7 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidArgument, "invalid policy arg"));
     }
 
-    let Some(secret) = get_token_signing_key() else {
+    let Some(secret) = resolve_token_signing_key() else {
         return Err(s3_error!(InvalidArgument, "global active sk not init"));
     };
 
@@ -431,7 +431,7 @@ pub async fn create_oidc_sts_credentials(
     }
 
     // Generate STS temp credentials
-    let secret = get_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+    let secret = resolve_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
 
     let mut new_cred = get_new_credentials_with_metadata(&token_claims, &secret)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("credential generation failed: {e}")))?;

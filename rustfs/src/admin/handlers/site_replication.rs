@@ -34,7 +34,7 @@ use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin
 use crate::app::context::{
     resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle, resolve_oidc_handle,
     resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
-    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config,
+    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config, resolve_token_signing_key,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
@@ -3556,7 +3556,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             let Some(sts_credential) = item.sts_credential else {
                 return Err(s3_error!(InvalidRequest, "stsCredential is required"));
             };
-            let Some(secret) = rustfs_iam::manager::get_token_signing_key() else {
+            let Some(secret) = resolve_token_signing_key() else {
                 return Err(s3_error!(InvalidRequest, "token signing key not initialized"));
             };
             let claims = get_claims_from_token_with_secret(&sts_credential.session_token, &secret)
