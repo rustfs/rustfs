@@ -21,13 +21,14 @@ use crate::{
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
+    app::context::resolve_action_credentials,
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
 use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_SIZE};
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
     sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
@@ -220,7 +221,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "secret key is required"));
         }
 
-        if let Some(sys_cred) = get_global_action_cred()
+        if let Some(sys_cred) = resolve_action_credentials()
             && constant_time_eq(&sys_cred.access_key, ak)
         {
             return Err(s3_error!(InvalidArgument, "cannot create a user with the system access key"));
@@ -473,7 +474,7 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let sys_cred = get_global_action_cred()
+        let sys_cred = resolve_action_credentials()
             .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "failed to load global credentials"))?;
 
         if ak == sys_cred.access_key || ak == cred.access_key || cred.parent_user == ak {
@@ -932,7 +933,7 @@ impl Operation for ImportIam {
             }
         }
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = resolve_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 

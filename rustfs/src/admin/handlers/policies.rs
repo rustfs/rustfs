@@ -20,6 +20,7 @@ use crate::{
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
+    app::context::resolve_action_credentials,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -27,7 +28,6 @@ use http::{HeaderMap, StatusCode};
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::is_err_no_such_user;
 use rustfs_iam::store::MappedPolicy;
 use rustfs_madmin::{
@@ -520,7 +520,7 @@ impl Operation for SetPolicyForUserOrGroup {
                 }
             };
 
-            let Some(sys_cred) = get_global_action_cred() else {
+            let Some(sys_cred) = resolve_action_credentials() else {
                 return Err(s3_error!(InternalError, "failed to load global credentials"));
             };
 
@@ -982,7 +982,7 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
             }
         }
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = resolve_action_credentials() else {
             return Err(s3_error!(InternalError, "get global action cred failed"));
         };
 

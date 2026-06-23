@@ -20,6 +20,7 @@ use crate::{
         router::{AdminOperation, Operation, S3Router},
         utils::has_space_be,
     },
+    app::context::resolve_action_credentials,
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -28,7 +29,6 @@ use hyper::Method;
 use matchit::Params;
 use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::error::{is_err_no_such_group, is_err_no_such_user};
 use rustfs_madmin::{GroupAddRemove, GroupStatus, SITE_REPL_API_VERSION, SRGroupInfo, SRIAMItem};
 use rustfs_policy::policy::action::{Action, AdminAction};
@@ -551,7 +551,7 @@ impl Operation for UpdateGroupMembers {
                         ));
                     }
 
-                    get_global_action_cred()
+                    resolve_action_credentials()
                         .map(|cred| {
                             if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(

@@ -630,6 +630,10 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     crate::storage::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+    crate::storage::get_global_lock_client()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     crate::storage::get_global_region()
 }
