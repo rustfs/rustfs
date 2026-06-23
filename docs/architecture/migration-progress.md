@@ -18,7 +18,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   regressions, plus external runtime, test, fuzz, and storage-owner module
   ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
   and storage owner thin bridge regressions, plus app context and notify
-  event-bridge thin module regressions.
+  event-bridge thin module regressions; accept the reviewed AppContext resolver
+  reverse dependencies in the layer baseline.
 - Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161 owner facade cleanup.
 
 ## Phase 0 Tasks
@@ -4364,6 +4365,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-161 keeps admin topology endpoint, deployment id, and runtime port reads behind AppContext resolver boundaries. |
 | Migration preservation | pass | Site replication endpoint inference, same-target checks, same-deployment stale target detection, and runtime-port fallback keep legacy behavior. |
 | Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-161. |
+| Testing/verification | pass | CI follow-up: layer dependency baseline accepts the reviewed AppContext resolver reverse dependencies, and the layer guard passes. |
 
 ## Verification Notes
 
@@ -4378,6 +4380,8 @@ Passed before push:
   - `git diff --check`: passed.
   - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after CI baseline
+    follow-up.
   - `make pre-commit`: passed.
   - AppContext admin topology resolver scan: passed; direct admin deployment
     id, endpoint, and runtime port global reads are isolated to AppContext
