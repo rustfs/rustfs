@@ -34,10 +34,6 @@ use bytes::Bytes;
 use futures::lock::Mutex;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
-use rustfs_io_metrics::internode_metrics::{
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
-};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
@@ -187,22 +183,14 @@ impl RemoteDisk {
                     if attempt > 1
                         && let Some(classification) = last_retry_classification
                     {
-                        global_internode_metrics().record_retry_success_for_operation_and_backend(
-                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
-                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-                            classification,
-                        );
+                        crate::rpc::runtime_sources::record_remote_disk_open_write_retry_success(classification);
                     }
                     return Ok(writer);
                 }
                 Err(err) if attempt < REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS && Self::is_retryable_open_write_error(&err) => {
                     if let Some(classification) = err.internode_http_error_kind() {
                         let classification = classification.metric_label();
-                        global_internode_metrics().record_retry_for_operation_and_backend(
-                            rustfs_io_metrics::internode_metrics::INTERNODE_OPERATION_PUT_FILE_STREAM,
-                            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-                            classification,
-                        );
+                        crate::rpc::runtime_sources::record_remote_disk_open_write_retry(classification);
                         last_retry_classification = Some(classification);
                     }
                     debug!(
@@ -2109,10 +2097,7 @@ impl DiskAPI for RemoteDisk {
                 let data_len = data.len();
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await.map_err(|err| {
-                    global_internode_metrics().record_error_for_operation_and_backend(
-                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
-                        INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    );
+                    crate::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let request = Request::new(WriteAllRequest {
@@ -2122,32 +2107,19 @@ impl DiskAPI for RemoteDisk {
                     data,
                 });
 
-                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
-                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
-                    INTERNODE_TRANSPORT_BACKEND_GRPC,
-                );
+                crate::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
-                        global_internode_metrics().record_error_for_operation_and_backend(
-                            INTERNODE_OPERATION_GRPC_WRITE_ALL,
-                            INTERNODE_TRANSPORT_BACKEND_GRPC,
-                        );
+                        crate::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                         return Err(err.into());
                     }
                 };
 
-                global_internode_metrics().record_sent_bytes_for_operation_and_backend(
-                    INTERNODE_OPERATION_GRPC_WRITE_ALL,
-                    INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    data_len,
-                );
+                crate::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
-                    global_internode_metrics().record_error_for_operation_and_backend(
-                        INTERNODE_OPERATION_GRPC_WRITE_ALL,
-                        INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    );
+                    crate::rpc::runtime_sources::record_remote_disk_grpc_write_all_error();
                     return Err(response.error.unwrap_or_default().into());
                 }
 
@@ -2176,10 +2148,7 @@ impl DiskAPI for RemoteDisk {
             || async {
                 let disk = self.disk_ref().await;
                 let mut client = self.get_client().await.map_err(|err| {
-                    global_internode_metrics().record_error_for_operation_and_backend(
-                        INTERNODE_OPERATION_GRPC_READ_ALL,
-                        INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    );
+                    crate::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                     Error::other(format!("can not get client, err: {err}"))
                 })?;
                 let request = Request::new(ReadAllRequest {
@@ -2188,34 +2157,21 @@ impl DiskAPI for RemoteDisk {
                     path: path.to_string(),
                 });
 
-                global_internode_metrics().record_outgoing_request_for_operation_and_backend(
-                    INTERNODE_OPERATION_GRPC_READ_ALL,
-                    INTERNODE_TRANSPORT_BACKEND_GRPC,
-                );
+                crate::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
-                        global_internode_metrics().record_error_for_operation_and_backend(
-                            INTERNODE_OPERATION_GRPC_READ_ALL,
-                            INTERNODE_TRANSPORT_BACKEND_GRPC,
-                        );
+                        crate::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                         return Err(err.into());
                     }
                 };
 
                 if !response.success {
-                    global_internode_metrics().record_error_for_operation_and_backend(
-                        INTERNODE_OPERATION_GRPC_READ_ALL,
-                        INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    );
+                    crate::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                global_internode_metrics().record_recv_bytes_for_operation_and_backend(
-                    INTERNODE_OPERATION_GRPC_READ_ALL,
-                    INTERNODE_TRANSPORT_BACKEND_GRPC,
-                    response.data.len(),
-                );
+                crate::rpc::runtime_sources::record_remote_disk_grpc_read_all_recv_bytes(response.data.len());
                 Ok(response.data)
             },
             get_max_timeout_duration(),
@@ -2972,7 +2928,7 @@ mod tests {
             OpenWriteTestStep::Success,
         ]);
         let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
-        rustfs_io_metrics::internode_metrics::global_internode_metrics().reset_for_test();
+        crate::rpc::runtime_sources::reset_internode_metrics_for_test();
 
         let _created = remote_disk
             .create_file("orig-bucket", "bucket", "object/part.1", 4096)
@@ -2981,7 +2937,7 @@ mod tests {
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 2, "create_file should retry exactly once");
-        let snapshot = rustfs_io_metrics::internode_metrics::global_internode_metrics().snapshot();
+        let snapshot = crate::rpc::runtime_sources::internode_metrics_snapshot_for_test();
         assert_eq!(snapshot.outgoing_requests_total, 0);
     }
 

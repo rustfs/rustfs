@@ -20,6 +20,7 @@ mod peer_rest_client;
 mod peer_s3_client;
 mod remote_disk;
 mod remote_locker;
+mod runtime_sources;
 
 pub use client::{
     TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
