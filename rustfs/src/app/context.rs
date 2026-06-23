@@ -37,8 +37,7 @@ use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, Replica
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::oidc::OidcSys;
-use rustfs_iam::{error::Error as IamError, store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{error::Error as IamError, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::{KmsServiceManager, ObjectEncryptionService, init_global_kms_service_manager};
 use rustfs_lock::LockClient;
@@ -85,14 +84,19 @@ pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
 }
 
-/// Resolve OIDC handle using AppContext-first precedence.
+/// Resolve a ready IAM system handle using AppContext-first precedence.
+pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
+}
+
+/// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
     resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
 }
 
-/// Resolve a ready IAM system handle using AppContext-first precedence.
-pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
+/// Resolve token signing key using AppContext-first precedence.
+pub fn resolve_token_signing_key() -> Option<String> {
+    resolve_token_signing_key_with(get_global_app_context(), rustfs_iam::manager::get_token_signing_key)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
@@ -329,6 +333,12 @@ fn resolve_ready_iam_handle_with(
     fallback()
 }
 
+fn resolve_token_signing_key_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+    context
+        .and_then(|context| context.iam().token_signing_key())
+        .or_else(fallback)
+}
+
 fn resolve_bucket_metadata_handle_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> Option<Arc<RwLock<BucketMetadataSys>>>,
@@ -552,7 +562,7 @@ mod tests {
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
-    use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
     use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
     use rustfs_lock::{LocalClient, LockClient};
     use rustfs_s3select_api::{
@@ -568,6 +578,8 @@ mod tests {
 
     struct TestIamInterface {
         ready: bool,
+        oidc: Option<Arc<OidcSys>>,
+        token_signing_key: Option<String>,
     }
 
     impl IamInterface for TestIamInterface {
@@ -578,13 +590,23 @@ mod tests {
         fn is_ready(&self) -> bool {
             self.ready
         }
+
+        fn oidc(&self) -> Option<Arc<OidcSys>> {
+            self.oidc.clone()
+        }
+
+        fn token_signing_key(&self) -> Option<String> {
+            self.token_signing_key.clone()
+        }
     }
 
-    struct TestOidcInterface;
+    struct TestOidcInterface {
+        oidc: Option<Arc<OidcSys>>,
+    }
 
     impl OidcInterface for TestOidcInterface {
         fn handle(&self) -> Option<Arc<rustfs_iam::oidc::OidcSys>> {
-            None
+            self.oidc.clone()
         }
     }
 
@@ -991,12 +1013,30 @@ mod tests {
         };
         let context_region: s3s::region::Region = "context-region".parse().expect("test region");
         let fallback_region: s3s::region::Region = "fallback-region".parse().expect("test region");
+        let context_oidc_sys = match OidcSys::empty() {
+            Ok(sys) => sys,
+            Err(err) => unreachable!("test OIDC sys should initialize: {err}"),
+        };
+        let fallback_oidc_sys = match OidcSys::empty() {
+            Ok(sys) => sys,
+            Err(err) => unreachable!("test OIDC fallback sys should initialize: {err}"),
+        };
+        let context_oidc = Arc::new(context_oidc_sys);
+        let fallback_oidc = Arc::new(fallback_oidc_sys);
+        let context_token_signing_key = "context-token-signing-key".to_string();
+        let fallback_token_signing_key = "fallback-token-signing-key".to_string();
 
         let context = Arc::new(AppContext::with_test_interfaces(
             object_store.clone(),
             AppContextTestInterfaces {
-                iam: Arc::new(TestIamInterface { ready: true }),
-                oidc: Arc::new(TestOidcInterface),
+                iam: Arc::new(TestIamInterface {
+                    ready: true,
+                    oidc: None,
+                    token_signing_key: Some(context_token_signing_key.clone()),
+                }),
+                oidc: Arc::new(TestOidcInterface {
+                    oidc: Some(context_oidc.clone()),
+                }),
                 kms: Arc::new(TestKmsInterface {
                     kms: context_kms.clone(),
                 }),
@@ -1090,6 +1130,12 @@ mod tests {
             context_outbound_tls_state.generation
         );
         assert!(resolve_iam_ready_with(Some(context.clone()), || false));
+        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()), || Some(fallback_oidc.clone()));
+        assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &context_oidc)));
+        assert_eq!(
+            resolve_token_signing_key_with(Some(context.clone()), || Some(fallback_token_signing_key.clone())).as_deref(),
+            Some(context_token_signing_key.as_str())
+        );
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
             &bucket_metadata
