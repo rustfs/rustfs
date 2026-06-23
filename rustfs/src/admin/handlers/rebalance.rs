@@ -14,14 +14,14 @@
 
 use super::super::{
     DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-    StorageError, decode_rebalance_stop_propagation_record, get_global_notification_sys,
+    StorageError, decode_rebalance_stop_propagation_record,
 };
 use crate::{
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::resolve_object_store_handle,
+    app::context::{resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -496,7 +496,7 @@ impl Operation for RebalanceStart {
             rebalance_id = %id,
             "admin rebalance state"
         );
-        if let Some(notification_sys) = get_global_notification_sys() {
+        if let Some(notification_sys) = resolve_notification_system() {
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -747,7 +747,7 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
 
-        let notification_sys = get_global_notification_sys();
+        let notification_sys = resolve_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
         let mut stop_failures = Vec::new();
         if let Some(notification_sys) = notification_sys {

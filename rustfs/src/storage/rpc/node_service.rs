@@ -16,21 +16,21 @@ use super::super::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
     LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
     SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
-    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_global_lock_client,
-    get_local_server_property, load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle,
-    set_bucket_metadata,
+    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
+    load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
+use crate::app::context::{resolve_iam_handle, resolve_lock_client};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfo, MetacacheReader};
-use rustfs_iam::{get_global_iam_sys, store::UserType};
+use rustfs_iam::store::UserType;
 use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
@@ -190,9 +190,9 @@ impl NodeService {
         all_local_disk_path().await
     }
 
-    /// Get the global lock client, returning an error if not initialized
+    /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        get_global_lock_client()
+        resolve_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
@@ -651,7 +651,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -680,7 +680,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -719,7 +719,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -747,7 +747,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -779,7 +779,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -809,7 +809,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -845,7 +845,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -876,7 +876,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -2926,9 +2926,13 @@ mod tests {
         );
     }
 
-    async fn connect_test_node_service_client() -> NodeServiceClient<tonic::transport::Channel> {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn connect_test_node_service_client() -> Option<NodeServiceClient<tonic::transport::Channel>> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let service = create_test_node_service();
 
         tokio::spawn(async move {
@@ -2939,12 +2943,18 @@ mod tests {
                 .unwrap();
         });
 
-        NodeServiceClient::connect(format!("http://{addr}")).await.unwrap()
+        Some(
+            NodeServiceClient::connect(format!("http://{addr}"))
+                .await
+                .expect("node service test client should connect"),
+        )
     }
 
     #[tokio::test]
     async fn test_write_stream_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([WriteRequest::default()]);
 
         let response = client.write_stream(request).await;
@@ -2956,7 +2966,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_at_unimplemented() {
-        let mut client = connect_test_node_service_client().await;
+        let Some(mut client) = connect_test_node_service_client().await else {
+            return;
+        };
         let request = tokio_stream::iter([ReadAtRequest::default()]);
 
         let response = client.read_at(request).await;

@@ -14,26 +14,24 @@
 
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
-use rustfs_ecstore::api::{
-    bucket::{
-        lifecycle::{
-            bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, init_background_expiry},
-            lifecycle::TransitionOptions,
-        },
-        metadata::BUCKET_LIFECYCLE_CONFIG,
-        metadata_sys::{self, init_bucket_metadata_sys},
-        versioning_sys::BucketVersioningSys,
-    },
-    capacity::path2_bucket_object_with_base_path,
-    client::transition_api::{ReadCloser, ReaderImpl},
-    disk::{DiskAPI as _, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk},
-    global::GLOBAL_TierConfigMgr,
-    layout::{EndpointServerPools, Endpoints, PoolEndpoints},
-    storage::{ECStore, init_local_disks},
-    tier::{
-        tier_config::{TierConfig, TierMinIO, TierType},
-        warm_backend::{WarmBackend as ScannerWarmBackend, WarmBackendGetOpts, build_transition_put_options},
-    },
+use rustfs_ecstore::api::bucket::lifecycle::{
+    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, init_background_expiry},
+    lifecycle::TransitionOptions,
+};
+use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+use rustfs_ecstore::api::bucket::metadata_sys::{
+    get as get_bucket_metadata, init_bucket_metadata_sys, update as update_bucket_metadata,
+};
+use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
+use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
+use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
+use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+use rustfs_ecstore::api::tier::tier_config::{TierConfig, TierMinIO, TierType};
+use rustfs_ecstore::api::tier::warm_backend::{
+    WarmBackend as ScannerWarmBackend, WarmBackendGetOpts, build_transition_put_options,
 };
 use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
@@ -281,7 +279,7 @@ async fn set_bucket_lifecycle(bucket_name: &str) -> Result<(), Box<dyn std::erro
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
@@ -305,7 +303,7 @@ async fn set_bucket_lifecycle_deletemarker(bucket_name: &str) -> Result<(), Box<
     </Rule>
 </LifecycleConfiguration>"#;
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec()).await?;
 
     Ok(())
 }
@@ -328,7 +326,7 @@ async fn set_bucket_lifecycle_delmarker_expiration(bucket_name: &str, days: i64)
 </LifecycleConfiguration>"#
     );
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -372,7 +370,7 @@ async fn set_bucket_lifecycle_transition_with_tier(
 </LifecycleConfiguration>"#
     );
 
-    metadata_sys::update(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
+    update_bucket_metadata(bucket_name, BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes()).await?;
 
     Ok(())
 }
@@ -607,7 +605,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         .await
         .expect("failed to stat object metadata")
         .file_type();
-    let lifecycle = metadata_sys::get(bucket)
+    let lifecycle = get_bucket_metadata(bucket)
         .await
         .expect("failed to load bucket metadata")
         .lifecycle_config
@@ -872,7 +870,7 @@ mod serial_tests {
         println!("✅ Lifecycle configuration set for bucket: {bucket_name}");
 
         // Verify lifecycle configuration was set
-        match metadata_sys::get(bucket_name.as_str()).await {
+        match get_bucket_metadata(bucket_name.as_str()).await {
             Ok(bucket_meta) => {
                 assert!(bucket_meta.lifecycle_config.is_some());
                 println!("✅ Bucket metadata retrieved successfully");
@@ -1429,7 +1427,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1514,7 +1512,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1741,7 +1739,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
 
@@ -1806,7 +1804,7 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
@@ -1844,7 +1842,7 @@ mod serial_tests {
         </NoncurrentVersionExpiration>
     </Rule>
 </LifecycleConfiguration>"#;
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.as_bytes().to_vec())
             .await
             .expect("Failed to set noncurrent lifecycle configuration");
 
@@ -1931,7 +1929,7 @@ mod serial_tests {
     </Rule>
 </LifecycleConfiguration>"#
         );
-        metadata_sys::update(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
+        update_bucket_metadata(bucket_name.as_str(), BUCKET_LIFECYCLE_CONFIG, lifecycle_xml.into_bytes())
             .await
             .expect("Failed to set lifecycle configuration");
         upload_test_object(&ecstore, bucket_name.as_str(), object_name, b"expire immediately").await;

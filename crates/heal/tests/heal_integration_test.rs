@@ -14,12 +14,10 @@
 
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::api::{
-    bucket::metadata_sys::init_bucket_metadata_sys,
-    disk::endpoint::Endpoint,
-    layout::{EndpointServerPools, Endpoints, PoolEndpoints},
-    storage::{ECStore, init_local_disks},
-};
+use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},

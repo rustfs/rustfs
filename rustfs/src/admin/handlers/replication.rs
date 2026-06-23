@@ -14,18 +14,16 @@
 
 use super::super::StorageError;
 use super::super::bucket_target_sys::{BucketTargetError, BucketTargetSys};
-use super::super::global_rustfs_port;
 use super::super::metadata::BUCKET_TARGETS_FILE;
 use super::super::metadata_sys;
 use super::super::metadata_sys::get_replication_config;
 use super::super::replication::BucketStats;
-use super::super::replication::GLOBAL_REPLICATION_STATS;
 use super::super::target::BucketTarget;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::utils::read_compatible_admin_body;
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -159,7 +157,7 @@ impl Operation for GetReplicationMetricsHandler {
         // TODO cluster cache
         // In actual implementation, statistics would be obtained from cluster
         // This is simplified to get from local cache
-        let bucket_stats = match GLOBAL_REPLICATION_STATS.get() {
+        let bucket_stats = match resolve_replication_stats_handle() {
             Some(s) => s.get_latest_replication_stats(bucket).await,
             None => BucketStats::default(),
         };
@@ -223,7 +221,7 @@ impl Operation for SetRemoteTargetHandler {
         let same_target = rustfs_utils::net::is_local_host(
             target_url.host().unwrap_or(Host::Domain("localhost")),
             target_url.port().unwrap_or(80),
-            global_rustfs_port(),
+            resolve_runtime_port(),
         )
         .unwrap_or_default();
 

@@ -14,11 +14,9 @@
 
 //! test endpoint index settings
 
-use rustfs_ecstore::api::{
-    disk::endpoint::Endpoint,
-    layout::{EndpointServerPools, Endpoints, PoolEndpoints},
-    storage::{ECStore, init_local_disks},
-};
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;

@@ -5,17 +5,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-rustfs-ecstore-boundary-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128`.
-- Based on: API-128 slice.
-- PR type for this branch: `pure-move`
+- Branch: `overtrue/arch-admin-config-writes-context`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169`.
+- Based on: API-169 local branch after API-168 PR #3781 merged.
+- PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route RustFS crate startup, server, capacity, config,
-  table-catalog, workload, and S3 API consumers through the storage owner
-  ECStore boundary instead of direct ECStore facade imports.
-- CI/script changes: narrow RustFS direct ECStore import allowance to the
-  app/admin/storage owner modules.
-- Docs changes: record the API-129 RustFS internal ECStore boundary cleanup.
+- Rust code changes: route admin server-config and storage-class runtime
+  publication through AppContext-first publish helpers, with legacy global
+  setters preserved as default adapters.
+- CI/script changes: lock completed owner and test/fuzz boundaries against
+  bare/glob imports, scattered raw ECStore facade subpaths, and startup
+  runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
+  regressions, plus external runtime, test, fuzz, and storage-owner module
+  ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
+  and storage owner thin bridge regressions, plus app context and notify
+  event-bridge thin module regressions; accept the reviewed AppContext resolver
+  reverse dependencies in the layer baseline.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -3845,21 +3851,1213 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `API-130` Centralize external ECStore facade alias imports.
+  - Do: replace grouped and raw-subpath `rustfs_ecstore::api` imports in IAM,
+    notify, observability, Swift, S3 Select, e2e helpers, heal/scanner tests,
+    and fuzz targets with per-module `ecstore_*` aliases plus local type
+    aliases or module-qualified calls.
+  - Acceptance: non-ECStore source no longer uses grouped
+    `rustfs_ecstore::api::{...}` imports or raw
+    `rustfs_ecstore::api::<module>::...` subpaths, while owner alias imports
+    remain explicit.
+  - Must preserve: IAM config IO, notify config persistence, observability
+    metrics collection, Swift metadata access, S3 Select object-store access,
+    e2e RPC helpers, heal/scanner ECStore test setup, and fuzz validation
+    semantics.
+  - Verification: focused external crate compile, grouped/raw facade residual
+    scans, migration/layer guards, formatting, diff hygiene, Rust risk scan,
+    branch freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `API-131` Route nested external production ECStore imports through owner roots.
+  - Do: expose notify, observability metrics, and S3 Select ECStore facade
+    aliases from their crate or module owner roots, and migrate nested
+    production files to import those local aliases instead of importing
+    `rustfs_ecstore::api` directly.
+  - Acceptance: nested production files under notify, observability, and S3
+    Select no longer import ECStore facade modules directly, while IAM,
+    scanner, heal, Swift, and owner root files remain the only approved
+    external production direct facade import points.
+  - Must preserve: notify config persistence, observability metrics collection
+    and scheduler bucket-monitor checks, S3 Select object-store error and
+    storage access behavior, and all public crate APIs.
+  - Verification: focused notify/obs/S3 Select compile, nested direct-import
+    residual scan, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
+- [x] `API-132` Replace completed external owner module aliases with symbols.
+  - Do: replace notify, Swift, and S3 Select owner-root `ecstore_*` module
+    aliases with explicit local ECStore symbols, type aliases, constants, and
+    wrapper functions.
+  - Acceptance: completed external owner roots no longer expose broad
+    `ecstore_*` module aliases, while nested modules keep using owner-local
+    symbols and the remaining larger observability, IAM, scanner, and heal
+    owner roots stay unchanged for later slices.
+  - Must preserve: notify config persistence, Swift bucket metadata access, S3
+    Select object-store error mapping, object reads, scan buffering, and all
+    public crate APIs.
+  - Verification: focused notify/Swift/S3 Select compile, completed-owner
+    alias residual scan, migration/layer guards, formatting, diff hygiene, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and
+    three-expert review.
+
+- [x] `API-133` Replace scanner owner module aliases with symbols.
+  - Do: replace scanner owner-root `ecstore_*` module aliases with explicit
+    local ECStore symbols, type aliases, constants, and wrapper functions.
+  - Acceptance: scanner no longer exposes broad `ecstore_*` module aliases,
+    nested scanner modules continue to consume scanner-local symbols, and the
+    migration guard prevents reintroducing scanner owner-root module aliases.
+  - Must preserve: scanner lifecycle config reads, versioning/replication
+    helper traits, disk metadata access, tier listing, erasure checks,
+    replication-heal queueing, config persistence, raw list traversal, and
+    bucket usage replacement behavior.
+  - Verification: focused scanner compile, completed-owner alias residual scan,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `API-134` Replace remaining external owner module aliases with symbols.
+  - Do: replace heal, IAM, and observability owner-root `ecstore_*` module
+    aliases with explicit local ECStore symbols, type aliases, constants, and
+    wrapper functions.
+  - Acceptance: heal, IAM, and observability no longer expose broad `ecstore_*`
+    module aliases, nested modules continue to consume owner-local symbols, and
+    the migration guard prevents reintroducing these owner-root module aliases.
+  - Must preserve: heal disk metadata and local disk lookup, IAM config
+    persistence and notification fanout, observability storage/data-usage,
+    quota, lifecycle, replication, capacity, and bucket monitor collection.
+  - Verification: focused heal/IAM/observability compile, completed-owner alias
+    residual scan, migration/layer guards, formatting, diff hygiene, Rust risk
+    scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
+- [x] `API-135` Replace test and fuzz owner module aliases with symbols.
+  - Do: replace e2e, heal/scanner integration-test, and fuzz-target
+    `ecstore_*` module aliases with explicit ECStore symbols.
+  - Acceptance: the completed test/fuzz files no longer import broad
+    `ecstore_*` owner modules, direct symbols preserve the same ECStore facade
+    contracts, and the migration guard prevents reintroducing module aliases in
+    these files.
+  - Must preserve: e2e RPC client construction, replication target tests, heal
+    ECStore setup, scanner lifecycle/tier/transition behavior, and bucket/path
+    fuzz validation semantics.
+  - Verification: focused e2e/heal/scanner compile, fuzz manifest compile,
+    completed test/fuzz alias residual scan, migration/layer guards, formatting,
+    diff hygiene, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `API-136` Replace RustFS runtime owner module aliases with symbols.
+  - Do: replace RustFS app/admin/storage owner-root `ecstore_*` facade aliases
+    with owner-local curated symbol modules that expose only the ECStore
+    submodules, functions, types, and constants consumed by those runtime
+    boundaries.
+  - Acceptance: `rustfs/src/app/mod.rs`, `rustfs/src/admin/mod.rs`, and
+    `rustfs/src/storage/mod.rs` no longer import broad ECStore facade modules
+    as `ecstore_*`; migration guards reject reintroducing those broad aliases.
+  - Must preserve: app object/lifecycle/replication helpers, admin config,
+    metrics, tiering, rebalance helpers, storage S3/RPC metadata helpers, and
+    startup/server consumers of the storage owner boundary.
+  - Verification: focused RustFS compile, runtime owner alias residual scan,
+    migration/layer guards, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit quality gate, and three-expert review.
+
+- [x] `API-137` Guard completed owner facade import shapes.
+  - Do: extend migration rules so completed owner and test/fuzz boundaries
+    cannot reintroduce bare `rustfs_ecstore::api::<module>` imports or glob
+    facade imports.
+  - Acceptance: completed owner roots and completed test/fuzz boundaries keep
+    explicit symbol imports, type aliases, constants, or wrappers; migration
+    guards reject bare module and glob facade imports.
+  - Must preserve: all API-136 RustFS owner symbol boundaries, API-135 test/fuzz
+    direct symbol imports, and external owner root symbol imports.
+  - Verification: architecture migration guard, shell syntax check, formatting,
+    diff hygiene, branch freshness check, and three-expert review.
+
+- [x] `API-138` Centralize completed owner raw facade subpaths.
+  - Do: move completed notify and S3 Select owner wrapper raw ECStore facade
+    calls into explicit import declarations, then guard completed owner and
+    test/fuzz boundaries against raw facade subpaths outside import
+    declarations.
+  - Acceptance: completed owner and test/fuzz files keep raw ECStore facade
+    subpaths centralized at import declarations; wrapper bodies use local
+    aliases, constants, or functions.
+  - Must preserve: notify config read/save wrappers, S3 Select object-store
+    handle/error helpers, default read-buffer constant, and all existing public
+    crate APIs.
+  - Verification: focused notify/S3 Select compile, architecture migration
+    guard, shell syntax check, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, and three-expert review.
+
+- [x] `API-139` Route startup runtime consumers through storage owner symbols.
+  - Do: expose storage-owner aliases and wrappers for startup layout, global
+    endpoint/region state, local disk initialization, config initialization,
+    background replication, and notification setup, then migrate startup
+    runtime files away from `ecstore_*` owner-module consumers.
+  - Acceptance: `startup_notification`, `startup_fs_guard`, `startup_services`,
+    `startup_server`, and `startup_storage` use storage-owner symbols and
+    wrappers instead of `crate::storage::ecstore_*` modules; migration guards
+    reject restoring those module consumers.
+  - Must preserve: endpoint parsing, unsupported-filesystem policy checks,
+    global endpoint/erasure state setup, local disk and lock-client
+    initialization, config migration/retry behavior, readiness marking,
+    background replication start, region/port registration, and notification
+    initialization.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
+- [x] `API-140` Route server/capacity/workload consumers through storage owner symbols.
+  - Do: expose storage-owner symbols for local disk enumeration, disk endpoint
+    labels, RPC signature prefix/verification, bucket metadata runtime state,
+    replication pool access, and replication queue counts, then migrate
+    server, capacity, and workload-admission consumers away from `ecstore_*`
+    owner modules.
+  - Acceptance: `server/http.rs`, `capacity/service.rs`, and
+    `workload_admission.rs` use storage-owner symbols and wrappers instead of
+    `crate::storage::ecstore_*` modules; migration guards reject restoring
+    those module consumers.
+  - Must preserve: internode RPC signature verification, active HTTP request
+    metrics, capacity manager disk discovery/labels, metadata workload state,
+    replication active/queue counts, and all storage-owner backend calls.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
+- [x] `API-141` Route root/server runtime consumers through storage owner symbols.
+  - Do: expose storage-owner aliases and wrappers for notification config,
+    topology capability mapping, readiness globals, event dispatch hook
+    installation, module-switch config persistence, endpoint test builders,
+    and quota/error types, then migrate remaining root/server runtime
+    consumers away from `ecstore_*` owner modules.
+  - Acceptance: `init.rs`, `runtime_capabilities.rs`, `server/readiness.rs`,
+    `server/event.rs`, `server/module_switch.rs`, and `error.rs` use
+    storage-owner symbols and wrappers instead of
+    `crate::storage::ecstore_*` modules; migration guards reject restoring
+    those module consumers.
+  - Must preserve: bucket notification preload behavior, topology capability
+    labels, runtime readiness lock-quorum checks, live event dispatch,
+    module-switch persistence semantics, S3 error conversion, and test
+    endpoint construction.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
+- [x] `API-142` Route table/S3/startup consumers through storage owner symbols.
+  - Do: expose storage-owner constants, aliases, and wrappers for table catalog
+    metadata roots, catalog path hashing, metadata lookup, lock timeout,
+    shutdown, bucket metadata migration/init, S3 etag conversion, and config
+    test disk layout parsing, then migrate the remaining table/S3/startup
+    consumers away from `ecstore_*` owner modules.
+  - Acceptance: `startup_bucket_metadata.rs`, `startup_shutdown.rs`,
+    `table_catalog.rs`, `storage/s3_api/bucket.rs`,
+    `storage/s3_api/multipart.rs`, and `config/config_test.rs` use
+    storage-owner symbols and wrappers instead of
+    `crate::storage::ecstore_*` modules; migration guards reject restoring
+    those module consumers.
+  - Must preserve: startup bucket metadata and IAM migration order,
+    replication resync initialization, background-service shutdown, S3 ETag
+    rendering, table catalog reserved paths and metadata hash layout,
+    table-bucket mutation guard behavior, catalog lock acquisition timeout,
+    and config test disk-layout parsing.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
+- [x] `API-143` Route app shared runtime facade through storage owner symbols.
+  - Do: expose storage-owner aliases and wrappers for app-shared ECStore,
+    endpoint layout, rio readers, notification access, global object-store
+    resolver, shared error helpers, storage-class validation, and test local
+    disk initialization, then migrate the duplicate app facade entries to
+    delegate to storage-owner symbols.
+  - Acceptance: `rustfs/src/app/mod.rs` delegates shared IO/error/global/
+    notification/storage wrappers to `crate::storage` owner symbols instead
+    of duplicate `ecstore_*` calls; migration guards reject restoring those
+    duplicate calls.
+  - Must preserve: app context resolution, object-store resolver fallback,
+    notification system access, rio reader boxing/wrapping, lock timeout,
+    storage-class validation, S3 ETag rendering, and app test disk setup.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, and three-expert review.
+
+- [x] `API-144` Route app bucket facade source imports through storage owner re-exports.
+  - Do: expose bucket target/lifecycle/target, client transition API, and
+    storageclass through storage owner re-exports, then source the app bucket,
+    client, and config facade entries through `crate::storage`.
+  - Acceptance: `rustfs/src/app/mod.rs` no longer imports direct
+    `rustfs_ecstore::api::{bucket,client,config}::` source paths; migration
+    guards reject restoring those direct source paths.
+  - Must preserve: bucket target, lifecycle, metadata, object lock,
+    policy/quota/replication/tagging/target/versioning, transition reader, and
+    storageclass compatibility paths.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-145` Route remaining app facade ECStore source imports through storage owner re-exports.
+  - Do: expose app-needed admin, capacity, compression, data-usage, global, and
+    tier modules through storage owner re-exports, then source the remaining
+    app facade entries through `crate::storage`.
+  - Acceptance: `rustfs/src/app/mod.rs` contains no direct
+    `rustfs_ecstore::api::` source imports; migration guards reject restoring
+    any direct ECStore API source path in the app facade.
+  - Must preserve: server info, pool capacity summaries, compression checks,
+    bucket usage memory accounting, global tier manager access, and tier
+    config/warm backend compatibility paths.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-146` Route admin facade ECStore source imports through storage owner re-exports.
+  - Do: expose admin-needed bucket, capacity, client, config, data-usage, disk,
+    error, global, layout, metrics, notification, rebalance, RPC, storage, and
+    tier symbols through storage owner re-exports, then source the admin facade
+    through `crate::storage`.
+  - Acceptance: `rustfs/src/admin/mod.rs` contains no direct
+    `rustfs_ecstore::api::` source imports; migration guards reject restoring
+    any direct ECStore API source path in the admin facade.
+  - Must preserve: admin handler utilities, bucket controls, storage class
+    updates, data usage reads, cluster/global metadata, metrics/notification
+    views, rebalance status, peer RPC, ECStore handle, and tier admin paths.
+  - Verification: focused RustFS test-target compile, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-147` Route external runtime crate ECStore source imports through local compatibility boundaries.
+  - Do: move direct ECStore facade source imports in notify, observability
+    metrics, S3 Select, Swift, IAM, heal, and scanner runtime entry modules
+    into crate-local `ecstore_compat` modules while preserving existing
+    wrappers and aliases at each crate boundary.
+  - Acceptance: target runtime crate source directories contain no direct
+    `rustfs_ecstore::api::` source paths outside `ecstore_compat.rs`; migration
+    guards reject restoring those bypasses.
+  - Must preserve: notify config persistence and object-store resolution,
+    observability storage/ILM/replication metrics, S3 Select storage error
+    mapping and object reads, Swift metadata/object-store access, IAM config
+    and notification behavior, heal disk wrappers, and scanner lifecycle/disk
+    runtime wrappers.
+  - Verification: focused external crate compile, migration guard, shell syntax
+    check, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-148` Route external test ECStore source imports through local compatibility boundaries.
+  - Do: move direct ECStore facade source imports in heal integration tests,
+    scanner lifecycle tests, and e2e reliant/replication helpers into local
+    `ecstore_test_compat` modules while preserving existing test aliases and
+    helper call paths.
+  - Acceptance: target external test/e2e paths contain no direct
+    `rustfs_ecstore::api::` source paths outside `ecstore_test_compat.rs`;
+    migration guards reject restoring those bypasses.
+  - Must preserve: heal endpoint setup and resume disk types, scanner
+    lifecycle transition setup, e2e node RPC client helpers, and replication
+    bucket target cleanup behavior.
+  - Verification: focused test-target compile, migration guard, shell syntax
+    check, formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-149` Route fuzz ECStore source imports through a local compatibility boundary.
+  - Do: move direct ECStore facade source imports in bucket validation and path
+    containment fuzz targets into `ecstore_fuzz_compat` wrapper functions.
+  - Acceptance: fuzz targets contain no direct `rustfs_ecstore::api::` source
+    paths outside `ecstore_fuzz_compat.rs`; migration guards reject restoring
+    those bypasses.
+  - Must preserve: bucket/object validation fuzz semantics, meta bucket
+    compatibility checks, object prefix/path component validation, and root
+    containment assertions.
+  - Verification: focused fuzz compile, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-150` Move storage owner ECStore source imports into a compatibility module.
+  - Do: move the storage owner `ecstore_*` facade source modules out of
+    `rustfs/src/storage/mod.rs` and into `rustfs/src/storage/ecstore_compat.rs`.
+  - Acceptance: `rustfs/src/storage/mod.rs` contains no direct
+    `rustfs_ecstore::api::` source paths, while existing `crate::storage::*`
+    aliases and helper functions keep their public shape.
+  - Must preserve: storage owner type aliases, constants, wrapper functions,
+    disk RPC extension traits, bucket metadata helpers, runtime globals, and
+    startup storage wiring.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-151` Collapse thin runtime crate ECStore compatibility bridges.
+  - Do: remove the thin `ecstore_compat.rs` files from notify, obs metrics,
+    Swift, and S3 Select, moving their aliases and wrappers to the owner root
+    modules.
+  - Acceptance: those crates no longer declare local `ecstore_compat` modules,
+    while their public/internal owner-root aliases and wrapper functions keep
+    the same call paths for downstream modules.
+  - Must preserve: notify server-config IO, metrics data/quota/replication
+    reads, S3 Select object-reader/error mapping, and Swift bucket metadata and
+    object reader aliases.
+  - Verification: focused runtime crate compile coverage, migration guard,
+    shell syntax check, formatting, diff hygiene, Rust risk scan, branch
+    freshness check, pre-commit, and three-expert review.
+
+- [x] `API-152` Collapse thin test and fuzz ECStore compatibility bridges.
+  - Do: remove the thin e2e, heal, scanner, and fuzz ECStore compatibility
+    bridge modules, moving their aliases and wrappers into the owner test/fuzz
+    files that consume them.
+  - Acceptance: those tests and fuzz targets no longer declare local
+    `ecstore_test_compat` or `ecstore_fuzz_compat` modules, while the same
+    ECStore API symbols remain available to the existing test and fuzz logic.
+  - Must preserve: e2e replication and reliant gRPC clients, heal endpoint and
+    integration fixtures, scanner lifecycle fixtures, bucket validation fuzzing,
+    and path containment fuzzing.
+  - Verification: focused test/fuzz compile coverage, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-153` Collapse thin owner ECStore compatibility bridges.
+  - Do: remove the thin IAM, heal, and scanner `ecstore_compat.rs` modules,
+    moving their aliases and wrappers into the owner root modules.
+  - Acceptance: those owner crates no longer declare local `ecstore_compat`
+    modules, while their owner-root aliases and wrapper functions keep the same
+    call paths for downstream modules.
+  - Must preserve: IAM config/notification helpers, heal disk/local-map
+    contracts, scanner lifecycle/replication/data-usage helpers, and owner-root
+    storage aliases.
+  - Verification: focused owner crate compile coverage, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-154` Collapse storage owner ECStore compatibility bridge.
+  - Do: remove `rustfs/src/storage/ecstore_compat.rs`, moving its `ecstore_*`
+    source modules into `rustfs/src/storage/mod.rs`.
+  - Acceptance: no storage owner `ecstore_compat` bridge file remains, while
+    existing downstream `crate::storage::ecstore_*` paths keep the same shape.
+  - Must preserve: storage owner type aliases, constants, wrapper functions,
+    disk RPC extension traits, bucket metadata helpers, runtime globals, and
+    startup storage wiring.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-155` Collapse app context and notify thin compatibility modules.
+  - Do: remove `rustfs/src/app/context/compat.rs` by moving resolver helpers
+    into `rustfs/src/app/context.rs`, and remove the notify event-bridge
+    re-export module by exporting pipeline symbols directly from the notify
+    owner root.
+  - Acceptance: no app context `compat` module or notify `event_bridge` module
+    remains, while existing `crate::app::context::*` and `rustfs_notify::*`
+    public symbols keep the same paths.
+  - Must preserve: AppContext-first resolver precedence, legacy global
+    fallback behavior, bucket metadata/endpoints/tier/server config handles,
+    notify live event history, and notify event bridge type aliases.
+  - Verification: RustFS and notify compile coverage, migration guard, shell
+    syntax check, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-156` Route app runtime consumers through AppContext resolvers.
+  - Do: add notify and buffer profile resolver helpers, route bucket/object
+    notification users through the notify resolver, route ECFS buffer sizing
+    through the buffer resolver, and route public health KMS readiness through
+    the KMS runtime resolver.
+  - Acceptance: selected app/server/storage consumers no longer open-code
+    direct global notifier, buffer config, or KMS service manager fallback when
+    an AppContext resolver already owns the migration boundary.
+  - Must preserve: context-first behavior when an AppContext exists, legacy
+    global fallback when it does not, notification delivery semantics, buffer
+    opt-in behavior, and public health readiness behavior.
+  - Verification: RustFS compile coverage, migration guard, shell syntax check,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit, and three-expert review.
+
+- [x] `API-157` Route server readiness through AppContext resolvers.
+  - Do: add an IAM readiness resolver, use it for cached and uncached server
+    dependency readiness, and use the endpoints resolver for lock quorum
+    endpoint discovery.
+  - Acceptance: readiness no longer directly reads global IAM or endpoint state
+    when an AppContext resolver already owns that boundary.
+  - Must preserve: IAM-ready semantics, distributed lock quorum behavior, storage
+    readiness behavior, and legacy global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted readiness/context tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-158` Route RPC node IAM operations through AppContext resolver.
+  - Do: add an IAM handle resolver and use it for RPC node IAM policy, user,
+    group, and service-account reload/delete operations.
+  - Acceptance: RPC node IAM operations no longer directly read the global IAM
+    singleton when an AppContext resolver owns that boundary.
+  - Must preserve: request validation messages, `errServerNotInitialized`
+    fallback, IAM operation arguments, and legacy global fallback when
+    AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-159` Route RPC node lock and identity reads through AppContext.
+  - Do: add lock-client and local-node-name AppContext interfaces, default
+    legacy adapters, resolver helpers, and use them in RPC node lock and health
+    handlers.
+  - Acceptance: RPC node lock operations and health metric node identity no
+    longer read legacy global state directly when AppContext owns the boundary.
+  - Must preserve: lock-client initialization error text, health metric node
+    labels, async local-node-name behavior, and legacy global fallback when
+    AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-160` Route admin runtime reads through AppContext resolvers.
+  - Do: add action-credential and region AppContext interfaces, resolver
+    helpers, default legacy adapters, and use them with the existing server
+    config resolver across admin/server read paths.
+  - Acceptance: admin handlers and router code no longer directly read action
+    credentials, region, or server config globals when an AppContext resolver
+    owns that boundary.
+  - Must preserve: admin auth decisions, object-ZIP token signing, object lambda
+    signing region fallback, OIDC restart detection, site replication metadata,
+    and legacy global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-161` Route admin topology reads through AppContext resolvers.
+  - Do: add deployment-id and runtime-port AppContext interfaces, reuse the
+    endpoints resolver, default legacy adapters, and route admin topology
+    consumers through resolvers.
+  - Acceptance: admin site replication, replication handlers, and router code
+    no longer directly read endpoints, deployment id, or runtime port globals
+    outside AppContext default adapters.
+  - Must preserve: site replication endpoint inference, console-port fallback,
+    replication same-target validation, stale same-deployment target detection,
+    and legacy global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-162` Route admin peer-system reads through AppContext resolvers.
+  - Do: add notification-system, bucket-monitor, and replication-pool
+    AppContext interfaces, default legacy adapters, and route admin and app
+    peer-system consumers through resolvers.
+  - Acceptance: admin tier/rebalance/config/router/site-replication and app
+    bucket metadata reload paths no longer directly read notification system,
+    bucket monitor, or replication pool globals outside AppContext default
+    adapters.
+  - Must preserve: tier config propagation, dynamic config reload propagation,
+    config snapshot refresh, live event peer listing, replication bandwidth
+    metric collection, replication resync start/status/cancel behavior,
+    rebalance stop fallback, and legacy global fallback when AppContext is
+    absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, residual global-read scan, Rust
+    risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-163` Route admin site-replication IAM reads through AppContext.
+  - Do: replace admin site-replication direct IAM global reads with the
+    AppContext IAM handle resolver.
+  - Acceptance: site-replication service-account, IAM export, IAM item import,
+    and peer-join service-account paths no longer directly call the IAM global
+    accessor.
+  - Must preserve: site-replicator service-account lookup/update/create,
+    exported IAM policy/user/group/policy-mapping payloads, imported IAM item
+    reconciliation, peer join service-account upsert, and legacy fallback when
+    AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, residual IAM global-read scan,
+    Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-164` Route admin site-replication outbound TLS reads through AppContext.
+  - Do: add an outbound TLS runtime AppContext interface and route
+    site-replication peer-client TLS generation/state reads through resolvers.
+  - Acceptance: site-replication peer-client cache lookup and client rebuild
+    paths no longer directly call outbound TLS global loaders.
+  - Must preserve: peer-client cache invalidation by TLS generation, root CA
+    parsing, mTLS identity propagation via the published TLS state, and legacy
+    global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual outbound
+    TLS global-read scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-165` Route admin TLS debug outbound TLS reads through AppContext.
+  - Do: route admin TLS debug status outbound TLS generation/state reads
+    through the AppContext outbound TLS runtime resolver.
+  - Acceptance: TLS debug status no longer directly calls outbound TLS global
+    summary helpers while preserving the same JSON status fields and consumer
+    generation flags.
+  - Must preserve: profile authorization, TLS source path reporting, reload
+    enable reporting, consumer labels, root CA status, mTLS identity status, and
+    legacy global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual outbound
+    TLS global-read scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-166` Route admin replication stats reads through AppContext.
+  - Do: add a replication stats AppContext interface and storage-owner wrapper,
+    then route admin replication metrics, extended replication metrics, and
+    site-replication metrics summary reads through the resolver.
+  - Acceptance: admin production handlers no longer directly read
+    `GLOBAL_REPLICATION_STATS`, while AppContext default adapters keep the
+    existing global fallback.
+  - Must preserve: replication metrics defaults when stats are absent, bucket
+    latest-stat lookup, site-replication node metric mapping, bandwidth report
+    enrichment, runtime-field enrichment, and existing storage owner global
+    initialization.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual replication
+    stats global-read scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-167` Route admin status and metrics reads through AppContext.
+  - Do: add AppContext interfaces for boot time, daily tier transition stats,
+    and scanner metrics report reads, then route admin replication uptime, tier
+    stats, and scanner status through those resolvers.
+  - Acceptance: admin production handlers no longer directly read
+    `GLOBAL_BOOT_TIME`, `GLOBAL_TransitionState`, or scanner `global_metrics`,
+    while AppContext default adapters keep the existing global fallback.
+  - Must preserve: replication metrics uptime defaults, tier stats filtering,
+    scanner status payload shape, scanner runtime-config reporting, and existing
+    storage owner global initialization.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual admin
+    status global-read scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-168` Route admin KMS manager initialization through AppContext.
+  - Do: add an AppContext-first KMS runtime resolver that initializes the
+    legacy global manager only after context/default lookup misses, then route
+    admin KMS key, management, and dynamic handlers through it.
+  - Acceptance: admin production handlers no longer directly initialize the
+    global KMS service manager, while the AppContext default path preserves
+    legacy global initialization fallback.
+  - Must preserve: KMS key encryption-service lookup, KMS status/config/cache
+    handlers, dynamic KMS configure/start/stop/reconfigure behavior, and
+    existing fallback warning logs.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual admin KMS
+    init scan, Rust risk scan, branch freshness check, and three-expert review.
+
+- [x] `API-169` Route admin config publication through AppContext.
+  - Do: add AppContext-first publish helpers for server config and storage
+    class config, then route admin config write/reload publication through
+    those helpers.
+  - Acceptance: admin production handlers and services no longer directly call
+    `set_global_server_config` or the admin storage-class global setter, while
+    AppContext default adapters preserve the legacy global-setter fallback.
+  - Must preserve: config validation, config history persistence, runtime
+    snapshot reload semantics, dynamic subsystem application, storage-class
+    parsing, and store persistence behavior.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual admin
+    config publication scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
 ## Next PRs
 
-1. `pure-move`: continue pruning remaining facade compatibility and owner boundaries.
+1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
-| Quality/architecture | pass | API-129 keeps ECStore facade exposure in the storage owner boundary and migrates RustFS internal consumers without new wrappers. |
-| Migration preservation | pass | Startup, readiness, server, capacity, table-catalog, workload, and S3 helper call paths keep the same ECStore symbols through `crate::storage`. |
-| Testing/verification | pass | Full pre-commit, focused RustFS compile, residual scan, migration/layer guards, formatting, diff hygiene, and diff-only Rust risk scan passed. |
+| Quality/architecture | pass | API-152 removes thin test/fuzz ECStore bridge files and keeps direct imports in owner test/fuzz files. |
+| Migration preservation | pass | E2E, heal, scanner, and fuzz consumers keep the same ECStore API symbols and call paths. |
+| Testing/verification | pass | Focused test/fuzz compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-152. |
+| Quality/architecture | pass | API-153 removes thin owner ECStore bridge files and keeps direct imports at owner roots. |
+| Migration preservation | pass | IAM, heal, and scanner owner-root aliases and wrapper functions keep the same call paths. |
+| Testing/verification | pass | Focused owner crate compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-153. |
+| Quality/architecture | pass | API-154 removes the final storage owner ECStore bridge file and keeps direct imports at the storage owner root. |
+| Migration preservation | pass | Existing `crate::storage::ecstore_*` modules, constants, wrappers, and downstream call paths keep the same shape. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration guard, shell syntax, diff hygiene, bridge scan, Rust risk scan, and pre-commit passed for API-154. |
+| Quality/architecture | pass | API-155 removes app context and notify thin compatibility modules while keeping owner-root exports. |
+| Migration preservation | pass | AppContext resolver precedence and notify pipeline public aliases keep the same public call paths. |
+| Testing/verification | pass | RustFS/notify focused compile, targeted tests, formatting, migration guard, shell syntax, diff hygiene, bridge scan, Rust risk scan, and pre-commit passed for API-155. |
+| Quality/architecture | pass | API-156 centralizes selected app/server/storage runtime fallbacks behind AppContext resolver helpers without adding new abstractions. |
+| Migration preservation | pass | KMS readiness, notification dispatch, and ECFS buffer sizing keep existing global fallback semantics when no AppContext is available. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-156. |
+| Quality/architecture | pass | API-157 keeps readiness dependency checks behind AppContext-owned IAM and endpoints resolver boundaries. |
+| Migration preservation | pass | IAM readiness and lock quorum endpoint discovery keep legacy global fallback semantics when no AppContext is available. |
+| Testing/verification | pass | RustFS focused compile, targeted readiness/context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-157. |
+| Quality/architecture | pass | API-158 keeps RPC node IAM operations behind the AppContext-owned IAM handle resolver boundary. |
+| Migration preservation | pass | RPC IAM policy, user, group, and service-account operations keep validation, arguments, and legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-158. |
+| Quality/architecture | pass | API-159 keeps RPC node lock client and node identity reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | RPC lock initialization errors and health metric node-name inputs keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-159. |
+| Quality/architecture | pass | API-160 keeps admin runtime action credentials, region, and server config reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Admin authorization, object-ZIP token encryption, object-lambda signing, OIDC restart detection, and site replication metadata keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-160. |
+| Quality/architecture | pass | API-161 keeps admin topology endpoint, deployment id, and runtime port reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Site replication endpoint inference, same-target checks, same-deployment stale target detection, and runtime-port fallback keep legacy behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-161. |
+| Testing/verification | pass | CI follow-up: layer dependency baseline accepts the reviewed AppContext resolver reverse dependencies, and the layer guard passes. |
+| Quality/architecture | pass | API-162 keeps admin peer-system notification, bucket-monitor, and replication-pool reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Tier/rebalance/config propagation, live event peers, replication metrics, and resync operations keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, residual scan, Rust risk scan, and pre-commit passed for API-162. |
+| Quality/architecture | pass | API-163 keeps admin site-replication IAM reads behind the AppContext IAM resolver boundary. |
+| Migration preservation | pass | Site-replicator service-account, IAM export/import, and peer-join service-account paths keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, residual IAM scan, and Rust risk scan passed for API-163. |
+| Quality/architecture | pass | API-164 keeps admin site-replication outbound TLS generation/state reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Peer-client cache invalidation, root CA parsing, and published TLS-state fallback behavior are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual TLS scan, and Rust risk scan passed for API-164. |
+| Quality/architecture | pass | API-165 keeps admin TLS debug outbound TLS status reads behind the AppContext resolver boundary. |
+| Migration preservation | pass | TLS debug status JSON fields, consumer labels, reload/env reporting, and legacy fallback behavior are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual TLS scan, and Rust risk scan passed for API-165. |
+| Quality/architecture | pass | API-166 keeps admin replication stats reads behind AppContext resolver boundaries with a storage-owner fallback wrapper. |
+| Migration preservation | pass | Admin replication metrics, site-replication summaries, bandwidth enrichment, and missing-stats defaults are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual stats scan, and Rust risk scan passed for API-166. |
+| Quality/architecture | pass | API-167 keeps admin boot-time, tier-transition, and scanner metrics reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Replication uptime enrichment, tier stats filtering, scanner metrics JSON, and scanner runtime-config reporting are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual admin status scan, and Rust risk scan passed for API-167. |
+| Quality/architecture | pass | API-168 keeps admin KMS service-manager initialization behind the AppContext resolver boundary. |
+| Migration preservation | pass | KMS key, management, and dynamic handlers preserve legacy initialization fallback and existing fallback logs. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual KMS init scan, and Rust risk scan passed for API-168. |
+| Quality/architecture | pass | API-169 keeps admin config runtime publication behind AppContext publish helpers with default global-setter adapters. |
+| Migration preservation | pass | Config writes, runtime reload, dynamic subsystem application, and storage-class parsing preserve existing persistence and runtime side effects. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration/layer guards, diff hygiene, residual config publication scan, and Rust risk scan passed for API-169. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-169 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext admin config publication scan: passed; direct admin production
+    `set_global_server_config` and storage-class global setter calls are
+    removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-164 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext site-replication outbound TLS resolver scan: passed; direct admin
+    site-replication TLS global reads are isolated to tests.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-165 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext outbound TLS resolver scan: passed; direct admin outbound TLS
+    global reads are removed from production handlers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-166 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext replication stats resolver scan: passed; direct admin production
+    `GLOBAL_REPLICATION_STATS` reads are removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-167 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext admin status resolver scan: passed; direct admin production
+    `GLOBAL_BOOT_TIME`, `GLOBAL_TransitionState`, and scanner `global_metrics`
+    reads are removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-168 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext admin KMS init resolver scan: passed; direct admin production
+    `init_global_kms_service_manager` calls are removed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-163 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - AppContext site-replication IAM resolver scan: passed; direct admin
+    site-replication IAM global reads are isolated to AppContext fallback
+    plumbing.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-162 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext peer-system resolver scan: passed; direct admin and app
+    notification-system, bucket-monitor, and replication-pool global reads are
+    isolated to AppContext default adapters.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+
+- Issue #660 API-161 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after CI baseline
+    follow-up.
+  - `make pre-commit`: passed.
+  - AppContext admin topology resolver scan: passed; direct admin deployment
+    id, endpoint, and runtime port global reads are isolated to AppContext
+    default adapters.
+  - Rust risk scan: no new production panic/todo/unsafe/cast risks added; new
+    unwrap/expect hits are resolver fallback plumbing or test assertions.
+
+- Issue #660 API-160 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext admin runtime resolver scan: passed; direct admin action
+    credential, server config, and region global reads are isolated to
+    AppContext default adapters or tests.
+  - Rust risk scan: no new production panic/todo/unsafe/cast risks added; new
+    unwrap/expect hits are resolver fallback plumbing or test assertions.
+
+- Issue #660 API-159 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext RPC node resolver scan: passed; direct RPC node lock-client and
+    local-node-name global reads are isolated to AppContext default adapters.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
+
+- Issue #660 API-158 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext IAM resolver scan: passed; RPC node IAM operations use the IAM
+    handle resolver, with lock clients kept on the legacy global boundary.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
+
+- Issue #660 API-157 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo test -p rustfs readiness --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext readiness resolver scan: passed; server readiness uses IAM and
+    endpoints resolver helpers, with lock clients kept on the legacy global
+    boundary.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
+
+- Issue #660 API-156 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext runtime resolver scan: passed; selected bucket/object notify,
+    ECFS buffer sizing, and public health KMS readiness consumers use resolver
+    helpers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
+
+- Issue #660 API-155 current slice:
+  - `cargo check --tests -p rustfs -p rustfs-notify`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo test -p rustfs-notify --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - App context and notify thin bridge scan: passed; no
+    `rustfs/src/app/context/compat.rs` or `crates/notify/src/event_bridge.rs`
+    remains.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added; changed unwrap/expect matches are moved test setup only.
+
+- Issue #660 API-154 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Storage ECStore thin bridge scan: passed; no `ecstore_compat.rs` files
+    remain outside `crates/ecstore`.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added; changes only move storage owner import boundaries.
+
+- Issue #660 API-153 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p rustfs-iam`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Owner ECStore thin bridge scan: passed; IAM, heal, and scanner no longer
+    declare local `ecstore_compat` modules.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added; changes only move owner-root import boundaries.
+
+- Issue #660 API-152 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
+    passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --manifest-path fuzz/Cargo.toml`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `cargo fmt --all --check --manifest-path fuzz/Cargo.toml`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Test/fuzz thin bridge scan: passed; e2e, heal, scanner, and fuzz targets no
+    longer declare local `ecstore_test_compat` or `ecstore_fuzz_compat`
+    modules.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move test/fuzz import boundaries.
+
+- Issue #660 API-140 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; existing capacity metrics casts, HTTP atomic
+    relaxed counters, and HTTP test unwrap/expect calls remain unchanged.
+
+- Issue #660 API-141 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only import aliases were reported by the textual
+    `as` scan.
+
+- Issue #660 API-142 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only type/import aliases were reported by the
+    textual `as` scan.
+
+- Issue #660 API-143 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only existing `DiskResult<Vec<String>>`
+    textual matches were reported by the broad error-type scan.
+
+- Issue #660 API-144 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only existing `DiskResult<Vec<String>>`
+    textual matches were reported by the broad error-type scan.
+
+- Issue #660 API-145 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only existing `DiskResult<Vec<String>>`
+    textual matches were reported by the broad error-type scan.
+
+- Issue #660 API-146 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; only existing `DiskResult<Vec<String>>`
+    textual matches were reported by the broad error-type scan.
+
+- Issue #660 API-147 current slice:
+  - `cargo check -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api -p rustfs-protocols -p rustfs-iam -p rustfs-heal -p rustfs-scanner`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Runtime crate ECStore source bypass scan: passed; target runtime crate
+    source paths now reference `rustfs_ecstore::api::` only inside
+    `ecstore_compat.rs`.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move import/source boundaries.
+
+- Issue #660 API-148 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-scanner -p e2e_test`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - External test ECStore source bypass scan: passed; target test/e2e paths now
+    reference `rustfs_ecstore::api::` only inside `ecstore_test_compat.rs`.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move import/source boundaries.
+
+- Issue #660 API-149 current slice:
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed; Cargo
+    refreshed the stale fuzz lockfile during verification and the generated
+    lockfile change was not retained.
+  - `cargo fmt --all --manifest-path fuzz/Cargo.toml`: passed.
+  - `cargo fmt --all --check --manifest-path fuzz/Cargo.toml`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Fuzz ECStore source bypass scan: passed; fuzz targets now reference
+    `rustfs_ecstore::api::` only inside `ecstore_fuzz_compat.rs`.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move fuzz import/source boundaries.
+
+- Issue #660 API-150 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - Storage owner direct ECStore source scan: passed; `rustfs/src/storage/mod.rs`
+    contains no direct `rustfs_ecstore::api::` source path.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; changes only move storage owner import/source
+    boundaries.
+
+- Issue #660 API-139 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; existing startup-server test `expect` calls
+    remain test-only and unchanged.
+
+- Issue #660 API-138 current slice:
+  - `cargo check -p rustfs-notify -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Rust risk scan: no new production unwrap/expect, casts, panic/todo/unsafe,
+    or error-type risks added; existing S3 Select unwrap and Notify
+    `Result<String>` wrapper signatures remain unchanged.
+
+- Issue #660 API-137 current slice:
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Stacked-base freshness check against
+    `origin/overtrue/arch-test-fuzz-owner-symbols`: passed.
+
+- Issue #660 API-136 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed.
+  - Completed runtime-owner module-alias residual scan: passed.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    risky behavior added; existing `Result<Vec<String>>` storage trait
+    signatures remain unchanged compatibility surfaces.
+
+- Issue #660 API-135 current slice:
+  - `cargo check --tests -p e2e_test -p rustfs-heal -p rustfs-scanner`: passed.
+  - `cargo check --manifest-path fuzz/Cargo.toml --bins`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed.
+  - Completed test/fuzz module-alias residual scan: passed.
+  - Rust risk scan: diff-only scan found import and call-target rewrites only;
+    no new production unwrap/expect, panic/todo/unsafe, or risky behavior added.
+
+- Issue #660 API-134 current slice:
+  - `cargo check --tests -p rustfs-heal -p rustfs-iam -p rustfs-obs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed.
+  - Heal/IAM/observability completed-owner module-alias residual scan: passed.
+  - Rust risk scan: diff-only scan found explicit symbol imports and wrapper
+    calls only; no new unwrap/expect, panic/todo/unsafe, or risky behavior
+    added.
+
+- Issue #660 API-133 current slice:
+  - `cargo check --tests -p rustfs-scanner`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed.
+  - Scanner completed-owner module-alias residual scan: passed.
+  - Rust risk scan: diff-only scan found explicit symbol imports and wrapper
+    calls only; no new unwrap/expect, panic/todo/unsafe, or risky behavior
+    added.
+
+- Issue #660 API-132 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs-s3select-api -p rustfs-protocols --features rustfs-protocols/swift`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6518 passed, 111 skipped`, and doc-tests.
+  - Completed external owner module-alias residual scan: passed.
+  - Rust risk scan: diff-only scan found explicit `as` symbol imports only; no
+    new unwrap/expect, panic/todo/unsafe, or risky behavior added.
+
+- Issue #660 API-131 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs-obs -p rustfs-s3select-api`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6518 passed, 111 skipped`, and doc-tests.
+  - Nested external production ECStore facade residual scan: passed.
+  - Rust risk scan: diff-only scan found new `as ecstore_*` import aliases
+    only; no new risky behavior added.
+
+- Issue #660 API-130 current slice:
+  - `cargo check --tests -p rustfs-notify -p rustfs-obs -p rustfs-protocols -p rustfs-s3select-api -p e2e_test -p rustfs-heal -p rustfs-scanner -p rustfs-iam`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `make pre-commit`: passed, including clippy, script tests, nextest
+    `6518 passed, 111 skipped`, and doc-tests.
+  - Grouped/raw ECStore facade residual scan outside ECStore: passed.
+  - Rust risk scan: diff-only scan found path-rewritten existing test
+    unwraps/expects only; no new risky behavior added.
 
 - Issue #660 API-129 current slice:
   - `cargo check --tests -p rustfs`: passed.

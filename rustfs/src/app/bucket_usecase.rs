@@ -16,7 +16,6 @@
 
 use super::ECStore;
 use super::StorageError;
-use super::get_global_notification_sys;
 use super::object_api_utils::to_s3s_etag;
 use super::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
 use super::{
@@ -40,7 +39,8 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::context::{
-    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+    AppContext, get_global_app_context, resolve_notification_system, resolve_notify_interface_for_context,
+    resolve_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
@@ -207,7 +207,7 @@ fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
 ) {
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = get_global_notification_sys()
+        if let Some(notification_sys) = resolve_notification_system()
             && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
         {
             warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
@@ -1712,11 +1712,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
+        let notify = resolve_notify_interface_for_context(self.context.as_deref());
         let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
