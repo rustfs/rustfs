@@ -186,7 +186,7 @@ impl S3Auth for IAMAuth {
             return Ok(key);
         }
 
-        if let Ok(iam_store) = rustfs_iam::get() {
+        if let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() {
             // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
             // This is important for newly created users that may not be in cache yet.
             // check_key will automatically attempt to load the user from disk if not found in cache.
@@ -341,7 +341,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     let sys_cred = cred.clone();
 
     if !constant_time_eq(&cred.access_key, access_key) {
-        let Ok(iam_store) = rustfs_iam::get() else {
+        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
