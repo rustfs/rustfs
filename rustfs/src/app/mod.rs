@@ -41,7 +41,7 @@ mod lifecycle_transition_api_test;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 mod ecstore_admin {
     pub(crate) use crate::storage::ecstore_admin::get_server_info;
@@ -644,6 +644,10 @@ pub(crate) fn get_global_deployment_id() -> Option<String> {
 
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     crate::storage::get_global_lock_client()
+}
+
+pub(crate) fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+    crate::storage::get_global_lock_clients()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {

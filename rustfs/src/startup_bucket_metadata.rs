@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{
-    ECStore, get_global_replication_pool, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
-};
+use crate::app::context::resolve_replication_pool_handle;
+use crate::storage::{ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config};
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use std::{
     io::{Error, Result},
@@ -53,7 +52,7 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     try_migrate_bucket_metadata(store.clone()).await;
 
-    if let Some(pool) = get_global_replication_pool() {
+    if let Some(pool) = resolve_replication_pool_handle() {
         pool.init_resync(ctx, buckets.clone()).await?;
     }
 
