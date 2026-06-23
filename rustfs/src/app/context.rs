@@ -37,7 +37,7 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::KmsServiceManager;
+use rustfs_kms::{KmsServiceManager, init_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use std::{future::Future, sync::Arc, time::SystemTime};
@@ -46,6 +46,11 @@ use tokio::sync::RwLock;
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
+}
+
+/// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
+pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
+    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), init_global_kms_service_manager)
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
@@ -186,6 +191,15 @@ fn resolve_kms_runtime_service_manager_with(
     context
         .and_then(|context| context.kms_runtime().service_manager())
         .or_else(fallback)
+}
+
+fn resolve_or_init_kms_runtime_service_manager_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<KmsServiceManager>,
+) -> Arc<KmsServiceManager> {
+    context
+        .and_then(|context| context.kms_runtime().service_manager())
+        .unwrap_or_else(fallback)
 }
 
 fn resolve_outbound_tls_generation_with(
@@ -753,6 +767,10 @@ mod tests {
                 .expect("context KMS runtime"),
             &context_kms
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_or_init_kms_runtime_service_manager_with(Some(context.clone()), || fallback_kms.clone()),
+            &context_kms
+        ));
         assert_eq!(
             resolve_outbound_tls_generation_with(Some(context.clone()), || TlsGeneration(99)),
             context_outbound_tls_state.generation
@@ -836,6 +854,10 @@ mod tests {
 
         assert!(Arc::ptr_eq(
             &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
+            &fallback_kms
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_or_init_kms_runtime_service_manager_with(None, || fallback_kms.clone()),
             &fallback_kms
         ));
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
