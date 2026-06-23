@@ -294,6 +294,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -308,6 +310,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -322,6 +326,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -844,6 +850,8 @@ mod test {
             replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 checked: 62,
                 queued: 63,
                 executed: 64,
@@ -854,6 +862,8 @@ mod test {
             current_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "delete_marker".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 checked: 68,
                 queued: 69,
                 executed: 70,
@@ -864,6 +874,8 @@ mod test {
             last_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "site_replication".to_string(),
                 kind: "active_resync".to_string(),
+                scanner_role: "boundary_signal".to_string(),
+                execution_owner: "site_replication_runtime".to_string(),
                 checked: 74,
                 queued: 75,
                 executed: 76,
@@ -943,11 +955,17 @@ mod test {
         assert_eq!(scanner.last_cycle_source_work[0].skipped, 60);
         assert_eq!(scanner.replication_repair[0].source, "bucket_replication");
         assert_eq!(scanner.replication_repair[0].kind, "object");
+        assert_eq!(scanner.replication_repair[0].scanner_role, "repair_admission");
+        assert_eq!(scanner.replication_repair[0].execution_owner, "bucket_replication_queue");
         assert_eq!(scanner.replication_repair[0].missed, 67);
         assert_eq!(scanner.current_cycle_replication_repair[0].kind, "delete_marker");
+        assert_eq!(scanner.current_cycle_replication_repair[0].scanner_role, "repair_admission");
+        assert_eq!(scanner.current_cycle_replication_repair[0].execution_owner, "bucket_replication_queue");
         assert_eq!(scanner.current_cycle_replication_repair[0].queued, 69);
         assert_eq!(scanner.last_cycle_replication_repair[0].source, "site_replication");
         assert_eq!(scanner.last_cycle_replication_repair[0].kind, "active_resync");
+        assert_eq!(scanner.last_cycle_replication_repair[0].scanner_role, "boundary_signal");
+        assert_eq!(scanner.last_cycle_replication_repair[0].execution_owner, "site_replication_runtime");
         assert_eq!(scanner.last_cycle_replication_repair[0].skipped, 78);
         assert_eq!(scanner.partial_cycles, 80);
     }

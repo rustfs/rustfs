@@ -52,6 +52,9 @@ docs/*
 !docs/architecture/
 !docs/architecture/**
 docs/heal-scanner-logging-governance.md
+.codegraph/*
+.docker/compat/data/*
+.docker/compat/kms/*
 
 # nix stuff
 result*
@@ -66,3 +69,4 @@ tmp/
 crates/*/docs
 fuzz/target
 outputs
+worktrees/*

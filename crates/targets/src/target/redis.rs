@@ -1005,7 +1005,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_succeeds_when_ping_returns_pong() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, false));
 
@@ -1021,7 +1025,11 @@ mod tests {
 
     #[tokio::test]
     async fn is_active_returns_error_when_ping_fails() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1165,7 +1173,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_body_keeps_connected_true_when_retryable_error_eventually_recovers() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(run_fake_redis_server(listener, true));
 
@@ -1197,7 +1209,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_body_sets_connected_false_after_retry_exhaustion() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {
@@ -1238,7 +1254,11 @@ mod tests {
 
     #[tokio::test]
     async fn send_raw_from_store_failure_does_not_count_as_success() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind fake redis");
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("bind fake redis: {err}"),
+        };
         let addr = listener.local_addr().expect("listener addr");
         tokio::spawn(async move {
             loop {

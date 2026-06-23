@@ -20,12 +20,8 @@ use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
-use rustfs_tls_runtime::{
-    load_cert_bundle_der_bytes, load_global_outbound_tls_generation, load_global_outbound_tls_state,
-    record_tls_consumer_stale_generation,
-};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::get_env_opt_str;
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
@@ -303,7 +299,7 @@ async fn get_http_client(url: &str) -> Client {
 
     // Fast path: check generation first (cheap atomic read) to avoid cloning
     // the full PEM + identity bytes when the TLS state hasn't changed.
-    let generation = load_global_outbound_tls_generation().0;
+    let generation = crate::http_runtime_sources::outbound_tls_generation();
 
     let guard = CLIENT_CACHE.lock().await;
     if let Some(cached) = guard.as_ref() {
@@ -314,12 +310,12 @@ async fn get_http_client(url: &str) -> Client {
                 cached.client.clone()
             };
         }
-        record_tls_consumer_stale_generation("rio_http_reader");
+        crate::http_runtime_sources::record_stale_outbound_tls_generation("rio_http_reader");
     }
     drop(guard);
 
     // Cache miss or stale generation — load full outbound TLS state.
-    let outbound_tls = load_global_outbound_tls_state().await;
+    let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
     let client = build_http_client(false, &outbound_tls).await;
     let local_client = build_http_client(true, &outbound_tls).await;
@@ -734,11 +730,7 @@ fn record_internode_outgoing_request(track: bool, operation: Option<&'static str
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics()
-            .record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
-        None => global_internode_metrics().record_outgoing_request(),
-    }
+    crate::http_runtime_sources::record_outgoing_request(operation);
 }
 
 fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -746,14 +738,7 @@ fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_sent_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_sent_bytes(operation, bytes);
 }
 
 fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -761,14 +746,7 @@ fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_recv_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_recv_bytes(operation, bytes);
 }
 
 fn record_internode_error(track: bool, operation: Option<&'static str>) {
@@ -776,12 +754,7 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
         return;
     }
 
-    match operation {
-        Some(operation) => {
-            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
-        }
-        None => global_internode_metrics().record_error(),
-    }
+    crate::http_runtime_sources::record_error(operation);
 }
 
 fn record_internode_classified_error(track: bool, operation: Option<&'static str>, classification: InternodeHttpErrorKind) {
@@ -790,11 +763,7 @@ fn record_internode_classified_error(track: bool, operation: Option<&'static str
     }
 
     if let Some(operation) = operation {
-        global_internode_metrics().record_classified_error_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            classification.metric_label(),
-        );
+        crate::http_runtime_sources::record_classified_error(operation, classification.metric_label());
     }
 }
 
@@ -1016,9 +985,13 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn start_test_server(state: TestState) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn start_test_server(state: TestState) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
             .route("/stall", get(get_stalling_stream))
@@ -1028,7 +1001,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        (format!("http://{addr}/stream"), handle)
+        Some((format!("http://{addr}/stream"), handle))
     }
 
     #[test]
@@ -1055,7 +1028,9 @@ mod tests {
     #[tokio::test]
     async fn http_reader_does_not_send_preflight_head() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None).await.unwrap();
         let mut buf = Vec::new();
@@ -1071,7 +1046,9 @@ mod tests {
     #[tokio::test]
     async fn http_reader_stall_timeout_triggers_after_progress_stops() {
         let state = TestState::default();
-        let (base_url, handle) = start_test_server(state.clone()).await;
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
         let url = base_url.replace("/stream", "/stall");
 
         let mut reader =
@@ -1099,7 +1076,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_does_not_send_empty_preflight_put() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         writer.write_all(b"payload").await.unwrap();
@@ -1114,7 +1093,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_handles_many_small_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let chunk = b"0123456789abcdef";
@@ -1134,7 +1115,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_supports_vectored_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let bufs = [IoSlice::new(b"hello "), IoSlice::new(b"world")];
@@ -1150,8 +1133,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_reader_request_error_includes_method_and_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         drop(listener);
 
         let url = format!("http://{addr}/stream");

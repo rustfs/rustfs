@@ -15,51 +15,69 @@
 #   accepted - reviewed and intentionally allowed
 #   todo     - should be resolved in a future refactor
 
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_bucket_meta_hook|bucket use-case calls site replication hooks
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook|bucket use-case calls site replication hooks
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook|bucket use-case calls site replication hooks
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::ListObjectVersionsParams|bucket use-case uses current S3 API bucket helper types
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::ListObjectsV2Params|bucket use-case uses current S3 API bucket helper types
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_buckets_output|bucket use-case uses current S3 API bucket response helpers
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_object_versions_output|bucket use-case uses current S3 API bucket response helpers
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_objects_output|bucket use-case uses current S3 API bucket response helpers
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_objects_v2_output|bucket use-case uses current S3 API bucket response helpers
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::parse_list_object_versions_params|bucket use-case uses current S3 API bucket query parser
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::parse_list_objects_v2_params|bucket use-case uses current S3 API bucket query parser
-accepted|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::common::rustfs_owner|bucket use-case uses current S3 API owner helper
-accepted|rustfs/src/app/lifecycle_transition_api_test.rs|app->interface|crate::storage::ecfs::FS|app test exercises ECFS through current interface path
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::ListMultipartUploadsParams|multipart use-case uses current S3 API multipart helper types
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::build_list_multipart_uploads_output|multipart use-case uses current S3 API multipart response helpers
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::build_list_parts_output|multipart use-case uses current S3 API multipart response helpers
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_multipart_uploads_params|multipart use-case uses current S3 API multipart query parser
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params|multipart use-case uses current S3 API multipart query parser
-accepted|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_upload_part_number|multipart use-case uses current S3 API multipart part parser
-accepted|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs|object use-case uses current ECFS interface helpers
-accepted|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params|object use-case uses current S3 API multipart query parser
-accepted|rustfs/src/init.rs|infra->interface|crate::admin|init wires the admin module during process setup
-accepted|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS|protocol client delegates to the current ECFS S3 implementation
-accepted|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
-accepted|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
-accepted|rustfs/src/server/http.rs|infra->interface|crate::admin|HTTP server routes to admin handlers
-accepted|rustfs/src/server/layer.rs|infra->app|crate::app::context::resolve_kms_runtime_service_manager|HTTP layer reads KMS runtime through AppContext resolver
-accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path|pure path predicate for routing
-accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::HealthProbe|HTTP layer builds health responses
-accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::build_health_response_parts|HTTP layer builds health responses
-accepted|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_endpoints_handle|readiness checks endpoint availability through AppContext resolver
-accepted|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_iam_ready|readiness checks IAM availability through AppContext resolver
-accepted|rustfs/src/startup_iam.rs|infra->app|crate::app::context::AppContext|startup wires IAM bootstrap through AppContext
-accepted|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config|storage buffer sizing reads runtime config through AppContext resolver
-accepted|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery|storage extension uses current ECFS interface query type
-accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS|storage tests exercise current ECFS interface path
-accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input|storage tests exercise current ECFS object-lock validator
-accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator|storage tests use current S3 API initiator helper
-accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_owner|storage tests use current S3 API owner helper
-accepted|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name|RPC health labels node identity through AppContext resolver
-accepted|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_iam_handle|node RPC IAM operations use AppContext resolver fallback
-accepted|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_lock_client|node RPC locking uses AppContext resolver fallback
-accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state|node RPC reloads admin runtime state
-accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot|node RPC reloads admin runtime state
-accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state|node RPC reloads admin runtime state
-accepted|cycle|app<->infra|existing intra-crate cross-layer references
-accepted|cycle|app<->interface|existing intra-crate cross-layer references
-accepted|cycle|infra<->interface|existing intra-crate cross-layer references
+cycle|app<->infra
+cycle|app<->interface
+cycle|infra<->interface
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_bucket_meta_hook
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::ListObjectVersionsParams
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::ListObjectsV2Params
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_buckets_output
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_object_versions_output
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_objects_output
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::build_list_objects_v2_output
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::parse_list_object_versions_params
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::bucket::parse_list_objects_v2_params
+dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::storage::s3_api::common::rustfs_owner
+dep|rustfs/src/app/lifecycle_transition_api_test.rs|app->interface|crate::storage::ecfs::FS
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::ListMultipartUploadsParams
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::build_list_multipart_uploads_output
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::build_list_parts_output
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_multipart_uploads_params
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
+dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_upload_part_number
+dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs
+dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
+dep|rustfs/src/auth.rs|infra->app|crate::app::context::resolve_action_credentials
+dep|rustfs/src/config/info.rs|infra->app|crate::app::context::resolve_buffer_config
+dep|rustfs/src/init.rs|infra->app|crate::app::context::resolve_notify_interface
+dep|rustfs/src/init.rs|infra->app|crate::app::context::resolve_region
+dep|rustfs/src/init.rs|infra->interface|crate::admin
+dep|rustfs/src/protocols/client.rs|infra->app|crate::app::context::resolve_action_credentials
+dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
+dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_notify_interface
+dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/http.rs|infra->interface|crate::admin
+dep|rustfs/src/server/layer.rs|infra->app|crate::app::context::resolve_kms_runtime_service_manager
+dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path
+dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::HealthProbe
+dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::build_health_response_parts
+dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_endpoints_handle
+dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_iam_ready
+dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_lock_clients_handle
+dep|rustfs/src/server/tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
+dep|rustfs/src/startup_bucket_metadata.rs|infra->app|crate::app::context::resolve_replication_pool_handle
+dep|rustfs/src/startup_tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
+dep|rustfs/src/startup_iam.rs|infra->app|crate::app::context::AppContext
+dep|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config
+dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery
+dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS
+dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input
+dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator
+dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_owner
+dep|rustfs/src/storage/access.rs|infra->app|crate::app::context::resolve_region
+dep|rustfs/src/storage/concurrency/manager.rs|infra->app|crate::app::context::resolve_performance_metrics
+dep|rustfs/src/storage/sse.rs|infra->app|crate::app::context::resolve_encryption_service
+dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_action_credentials
+dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_notify_interface
+dep|rustfs/src/storage/rpc/disk.rs|infra->app|crate::app::context::resolve_internode_metrics
+dep|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name
+dep|rustfs/src/storage/rpc/http_service.rs|infra->app|crate::app::context::resolve_internode_metrics
+dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_iam_handle
+dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_lock_client
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
+dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
+dep|rustfs/src/workload_admission.rs|infra->app|crate::app::context::resolve_replication_pool_handle

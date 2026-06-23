@@ -15,6 +15,7 @@
 #[cfg(test)]
 #[allow(unsafe_op_in_unsafe_fn)]
 mod tests {
+    use crate::config::cli::default_server_opts;
     use crate::config::{CommandResult, Config, Opt, TlsCommands};
     use crate::storage::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
@@ -98,6 +99,18 @@ mod tests {
             },
             _ => panic!("expected TLS command result"),
         }
+    }
+
+    #[test]
+    #[serial]
+    fn test_parse_from_non_server_commands_falls_back_without_panicking() {
+        let info_opt = Opt::parse_from(["rustfs", "info"]);
+        let tls_opt = Opt::parse_from(["rustfs", "tls", "inspect", "--path", "/tmp/certs"]);
+
+        assert!(info_opt.volumes.is_empty());
+        assert!(tls_opt.volumes.is_empty());
+        assert_eq!(info_opt.address, default_server_opts().address);
+        assert_eq!(tls_opt.address, default_server_opts().address);
     }
 
     #[test]

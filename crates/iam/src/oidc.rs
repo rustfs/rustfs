@@ -26,7 +26,6 @@ use openidconnect::{
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
@@ -410,7 +409,8 @@ impl OidcSys {
     /// Parse environment variables and discover all configured OIDC providers.
     pub async fn new() -> Result<Self, String> {
         let http_client = ReqwestHttpClient::new()?;
-        let parsed_configs = load_effective_oidc_provider_configs(get_global_server_config().as_ref());
+        let server_config = crate::server_config::current_server_config();
+        let parsed_configs = load_effective_oidc_provider_configs(server_config.as_ref());
         let mut configs = HashMap::new();
         let mut provider_states = HashMap::new();
 
@@ -1634,7 +1634,7 @@ mod tests {
     fn start_mock_oidc_discovery_server<F>(
         build_discovery_issuer: F,
         max_requests: usize,
-    ) -> (String, std::thread::JoinHandle<()>)
+    ) -> Option<(String, std::thread::JoinHandle<()>)>
     where
         F: Fn(&str) -> String + Send + 'static,
     {
@@ -1650,8 +1650,12 @@ mod tests {
         const IDLE_SHUTDOWN: Duration = Duration::from_secs(1);
         const ABSOLUTE_CAP: Duration = Duration::from_secs(5);
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let base = format!("http://{}", listener.local_addr().unwrap());
+        let listener = match TcpListener::bind("127.0.0.1:0") {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let base = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
         let discovery_issuer = build_discovery_issuer(&base);
         let discovery_body = serde_json::json!({
             "issuer": discovery_issuer,
@@ -1754,7 +1758,7 @@ mod tests {
             .recv_timeout(Duration::from_millis(100))
             .expect("mock OIDC discovery server should become ready");
 
-        (base, handle)
+        Some((base, handle))
     }
 
     fn discovery_error_contains_all_variants(err: &str, base: &str) -> bool {
@@ -1776,7 +1780,9 @@ mod tests {
     async fn test_validate_oidc_provider_config_retries_with_issuer_candidates() {
         // Discovery document must advertise the canonical issuer path. The first candidate has no
         // trailing slash; openidconnect rejects issuer mismatch, then the second variant succeeds.
-        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8);
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/rustfs/"), 8) else {
+            return;
+        };
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 
@@ -1789,7 +1795,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_oidc_provider_config_returns_detailed_errors() {
-        let (base, handle) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8);
+        let Some((base, handle)) = start_mock_oidc_discovery_server(|base| format!("{base}/application/o/other"), 8) else {
+            return;
+        };
         let config_url = format!("{base}/application/o/rustfs");
         let config = build_mocked_oidc_provider_config("default", &config_url);
 

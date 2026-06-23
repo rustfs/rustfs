@@ -12,17 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::{resolve_notify_interface, resolve_region};
 use crate::server::ShutdownHandle;
 use crate::storage::{
-    get_bucket_notification_config, get_global_region, process_lambda_configurations, process_queue_configurations,
-    process_topic_configurations,
+    get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::{admin, config, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
 };
-use rustfs_notify::notifier_global;
 use rustfs_targets::arn::{ARN, TargetIDError};
 use rustfs_utils::get_env_usize;
 use s3s::s3_error;
@@ -159,7 +158,7 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let global_region = get_global_region();
+    let global_region = resolve_region();
     let region = global_region
         .as_ref()
         .filter(|r| !r.as_str().is_empty())
@@ -245,7 +244,8 @@ pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
                     );
                 }
 
-                if let Err(e) = notifier_global::add_event_specific_rules(bucket, region, &event_rules)
+                if let Err(e) = resolve_notify_interface()
+                    .add_event_specific_rules(bucket, region, &event_rules)
                     .await
                     .map_err(|e| s3_error!(InternalError, "Failed to add rules: {e}"))
                 {
@@ -491,7 +491,7 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
 /// # Arguments
 /// * `config` - The application configuration options
 pub fn init_buffer_profile_system(config: &config::Config) {
-    use crate::config::{RustFSBufferConfig, WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
+    use crate::config::{WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
 
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
@@ -563,43 +563,20 @@ pub fn init_buffer_profile_system(config: &config::Config) {
             "Selected buffer profile"
         );
 
-        // Create and validate buffer configuration
-        let mut buffer_config = RustFSBufferConfig::new(profile);
-        if let Err(e) = buffer_config.validate() {
+        let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
+        let Some(buffer_config) = resolve_buffer_profile_config(profile, fallback_profile) else {
             warn!(
                 target: "rustfs::init",
                 event = "buffer_profile_validation_failed",
                 component = LOG_COMPONENT_INIT,
                 subsystem = LOG_SUBSYSTEM_BUFFER,
-                error = %e,
+                error = "all buffer profile configurations rejected",
                 fallback_profile = DEFAULT_BUFFER_PROFILE,
-                "Buffer profile validation failed"
+                "Buffer profile initialization disabled after validation failures"
             );
-            // Fall back to a known-good profile to avoid installing an invalid configuration
-            let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
-            info!(
-                target: "rustfs::init",
-                event = "buffer_profile_fallback",
-                component = LOG_COMPONENT_INIT,
-                subsystem = LOG_SUBSYSTEM_BUFFER,
-                profile = ?fallback_profile,
-                "Using fallback buffer profile"
-            );
-            let fallback_config = RustFSBufferConfig::new(fallback_profile);
-            if let Err(e2) = fallback_config.validate() {
-                error!(
-                    target: "rustfs::init",
-                    event = "buffer_profile_validation_failed",
-                    component = LOG_COMPONENT_INIT,
-                    subsystem = LOG_SUBSYSTEM_BUFFER,
-                    error = %e2,
-                    fallback_profile = DEFAULT_BUFFER_PROFILE,
-                    "Fallback buffer profile validation failed"
-                );
-                panic!("Failed to initialize a valid RustFS buffer configuration");
-            }
-            buffer_config = fallback_config;
-        }
+            set_buffer_profile_enabled(false);
+            return;
+        };
 
         // Log the workload profile name
         let workload_name = buffer_config.workload_name();
@@ -627,6 +604,53 @@ pub fn init_buffer_profile_system(config: &config::Config) {
             workload = %workload_name,
             "Buffer profile state changed"
         );
+    }
+}
+
+fn resolve_buffer_profile_config(
+    profile: crate::config::WorkloadProfile,
+    fallback_profile: crate::config::WorkloadProfile,
+) -> Option<crate::config::RustFSBufferConfig> {
+    use crate::config::RustFSBufferConfig;
+
+    let buffer_config = RustFSBufferConfig::new(profile);
+    if let Err(err) = buffer_config.validate() {
+        warn!(
+            target: "rustfs::init",
+            event = "buffer_profile_validation_failed",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            error = %err,
+            fallback_profile = DEFAULT_BUFFER_PROFILE,
+            "Buffer profile validation failed"
+        );
+
+        info!(
+            target: "rustfs::init",
+            event = "buffer_profile_fallback",
+            component = LOG_COMPONENT_INIT,
+            subsystem = LOG_SUBSYSTEM_BUFFER,
+            profile = ?fallback_profile,
+            "Using fallback buffer profile"
+        );
+
+        let fallback_config = RustFSBufferConfig::new(fallback_profile);
+        if let Err(fallback_err) = fallback_config.validate() {
+            error!(
+                target: "rustfs::init",
+                event = "buffer_profile_validation_failed",
+                component = LOG_COMPONENT_INIT,
+                subsystem = LOG_SUBSYSTEM_BUFFER,
+                error = %fallback_err,
+                fallback_profile = DEFAULT_BUFFER_PROFILE,
+                "Fallback buffer profile validation failed"
+            );
+            return None;
+        }
+
+        Some(fallback_config)
+    } else {
+        Some(buffer_config)
     }
 }
 
@@ -1256,5 +1280,41 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
             "Protocol runtime started"
         );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_buffer_profile_config;
+    use crate::config::{BufferConfig, WorkloadProfile};
+    use rustfs_config::KI_B;
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
+        let invalid_primary = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid_primary, WorkloadProfile::GeneralPurpose)
+            .expect("fallback profile should be accepted");
+
+        assert_eq!(resolved.workload, WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_none_when_primary_and_fallback_are_invalid() {
+        let invalid = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
+
+        assert!(resolved.is_none());
     }
 }

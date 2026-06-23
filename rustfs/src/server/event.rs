@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
-use crate::app::context::resolve_server_config;
+use crate::app::context::{resolve_notify_interface, resolve_server_config};
 use crate::storage::{EventArgs as EcstoreEventArgs, StorageObjectInfo, register_event_dispatch_hook};
 use chrono::{DateTime, Utc};
 use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
@@ -118,7 +118,7 @@ fn install_ecstore_event_dispatch_hook() {
             return;
         };
         spawn(async move {
-            rustfs_notify::notifier_global::notify(notify_args).await;
+            resolve_notify_interface().notify(notify_args).await;
         });
     });
 

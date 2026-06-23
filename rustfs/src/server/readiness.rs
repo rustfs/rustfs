@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready};
+use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready, resolve_lock_clients_handle};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage::{Endpoint, EndpointServerPools, get_global_lock_clients, is_dist_erasure, resolve_object_store_handle};
+use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure, resolve_object_store_handle};
 #[cfg(test)]
 use crate::storage::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
@@ -595,7 +595,7 @@ async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
     let Some(pool_endpoints) = resolve_endpoints_handle() else {
         return LockQuorumStatus::default();
     };
-    let Some(lock_clients) = get_global_lock_clients() else {
+    let Some(lock_clients) = resolve_lock_clients_handle() else {
         return LockQuorumStatus::default();
     };
 

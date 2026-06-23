@@ -28,7 +28,7 @@ use crate::{
     notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
     notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
 };
-use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
+use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE};
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;
 use rustfs_policy::arn::ARN;
@@ -748,7 +748,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub async fn check_key(&self, access_key: &str) -> Result<(Option<UserIdentity>, bool)> {
-        if let Some(sys_cred) = get_global_action_cred()
+        if let Some(sys_cred) = crate::root_credentials::credentials()
             && sys_cred.access_key == access_key
         {
             return Ok((Some(UserIdentity::new(sys_cred)), true));
@@ -1010,7 +1010,7 @@ impl<T: Store> IamSys<T> {
     }
 
     pub(crate) async fn prepare_sts_auth(&self, args: &Args<'_>, parent_user: &str) -> PreparedIamAuth {
-        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
+        let is_owner = crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let (effective_groups, groups_source, policies) = if is_owner {
@@ -1162,7 +1162,7 @@ impl<T: Store> IamSys<T> {
             && matches!(mode, PreparedServicePolicyMode::SessionBound)
             && matches!(session_policy, PreparedSessionPolicy::Policy(_));
 
-        let is_owner = matches!(get_global_action_cred(), Some(cred) if cred.access_key == parent_user);
+        let is_owner = crate::is_root_access_key(parent_user);
         let role_arn = args.get_role_arn();
 
         let svc_policies = if is_owner || bypass_parent_policy {
@@ -1352,7 +1352,7 @@ mod tests {
     use crate::error::Error;
     use crate::manager::get_default_policyes;
     use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
-    use rustfs_credentials::{Credentials, get_global_action_cred, init_global_action_credentials};
+    use rustfs_credentials::{Credentials, init_global_action_credentials};
     use rustfs_policy::auth::{UserIdentity, get_new_credentials_with_metadata};
     use rustfs_policy::policy::Args;
     use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
@@ -1660,7 +1660,7 @@ mod tests {
     }
 
     fn ensure_test_global_credentials() {
-        if get_global_action_cred().is_none() {
+        if crate::root_credentials::credentials().is_none() {
             let _ = init_global_action_credentials(Some("TESTROOTACCESSKEY".to_string()), Some("TESTROOTSECRET123".to_string()));
         }
     }
@@ -1940,9 +1940,8 @@ mod tests {
         let iam_sys = IamSys::new(cache_manager);
 
         let parent_user = "sts-fallback-test-parent";
-        let token_secret = get_global_action_cred()
-            .expect("global action credentials should be initialized")
-            .secret_key;
+        let token_secret = crate::root_credentials::token_signing_key()
+            .unwrap_or_else(|| unreachable!("global action credentials should be initialized"));
         let mut claims = HashMap::new();
         claims.insert("parent".to_string(), Value::String(parent_user.to_string()));
         claims.insert(

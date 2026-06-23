@@ -20,6 +20,7 @@ mod peer_rest_client;
 mod peer_s3_client;
 mod remote_disk;
 mod remote_locker;
+mod runtime_sources;
 
 pub use client::{
     TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
@@ -31,6 +32,7 @@ pub use internode_data_transport::build_internode_data_transport_from_env;
 pub use peer_rest_client::{
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
 };
+pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
 pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys};
 pub use remote_disk::RemoteDisk;
 pub use remote_locker::RemoteClient;

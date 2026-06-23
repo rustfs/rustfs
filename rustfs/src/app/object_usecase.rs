@@ -14,12 +14,43 @@
 
 //! Object application use-case contracts.
 
+use super::object_api_utils::to_s3s_etag;
+use super::quota::checker::QuotaChecker;
+use super::storageclass;
+// Performance metrics recording (with zero-copy-metrics integration)
+use super::ECStore;
+use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
+use super::{DiskError, is_all_buckets_not_found};
+use super::{DynReader, HashReader, WritePlan, wrap_reader};
+use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
+use super::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use super::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::{
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
+    },
+    metadata_sys,
+    object_lock::{
+        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
+        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
+    },
+    quota::QuotaOperation,
+    replication::{
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
+        must_replicate, schedule_replication, schedule_replication_delete,
+    },
+    tagging::decode_tags,
+    versioning_sys::BucketVersioningSys,
+};
 use crate::app::context::{
     AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
+use crate::server::convert_ecstore_object_info;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
     ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
@@ -46,38 +77,6 @@ use http::{HeaderMap, HeaderValue, StatusCode};
 use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
-use rustfs_object_capacity::capacity_manager::get_capacity_manager;
-// Performance metrics recording (with zero-copy-metrics integration)
-use super::ECStore;
-use super::object_api_utils::to_s3s_etag;
-use super::quota::checker::QuotaChecker;
-use super::storageclass;
-use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
-use super::{DiskError, is_all_buckets_not_found};
-use super::{DynReader, HashReader, WritePlan, wrap_reader};
-use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use super::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::{get_lock_acquire_timeout, is_valid_storage_class};
-use super::{
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
-    },
-    metadata_sys,
-    object_lock::{
-        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
-    },
-    quota::QuotaOperation,
-    replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
-        must_replicate, schedule_replication, schedule_replication_delete,
-    },
-    tagging::decode_tags,
-    versioning_sys::BucketVersioningSys,
-};
-use crate::server::convert_ecstore_object_info;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
@@ -88,6 +87,7 @@ use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
+use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
@@ -119,7 +119,7 @@ use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -337,14 +337,14 @@ impl MemoryTrackedBytesStream {
 impl futures::Stream for MemoryTrackedBytesStream {
     type Item = std::io::Result<Bytes>;
 
-    fn poll_next(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<Option<Self::Item>> {
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
         if *this.emitted {
-            return std::task::Poll::Ready(None);
+            return Poll::Ready(None);
         }
 
         *this.emitted = true;
-        std::task::Poll::Ready(Some(Ok(this.bytes.clone())))
+        Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
 
@@ -360,16 +360,12 @@ impl<R> ExtractArchiveEtagReader<R> {
 }
 
 impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
-    fn poll_read(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         let this = self.project();
         let before = buf.filled().len();
         match this.inner.poll_read(cx, buf) {
-            std::task::Poll::Pending => std::task::Poll::Pending,
-            std::task::Poll::Ready(Ok(())) => {
+            Poll::Pending => Poll::Pending,
+            Poll::Ready(Ok(())) => {
                 let filled = &buf.filled()[before..];
                 if !filled.is_empty() {
                     this.md5.consume(filled);
@@ -379,9 +375,9 @@ impl<R: AsyncRead> AsyncRead for ExtractArchiveEtagReader<R> {
                         *etag = Some(format!("{:x}", this.md5.clone().finalize()));
                     }
                 }
-                std::task::Poll::Ready(Ok(()))
+                Poll::Ready(Ok(()))
             }
-            std::task::Poll::Ready(Err(err)) => std::task::Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => Poll::Ready(Err(err)),
         }
     }
 }
@@ -988,21 +984,12 @@ fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &s
     snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-fn contains_parent_dir_component(path: &str) -> bool {
-    path.split(['/', '\\']).any(|component| component == "..")
-}
-
+/// Validates that an archive entry path does not escape the target bucket.
+///
+/// Delegates to [`rustfs_utils::path::validate_extract_relative_path`] and wraps
+/// the result as an S3 error on failure.
 pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
-    let path = Path::new(path);
-    if path
-        .components()
-        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
-        || contains_parent_dir_component(path.to_string_lossy().as_ref())
-    {
-        return Err(s3_error!(InvalidArgument, "archive entry path must stay within the target bucket"));
-    }
-
-    Ok(())
+    rustfs_utils::path::validate_extract_relative_path(path).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
@@ -1016,22 +1003,13 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
+/// Normalizes an archive entry key by applying a prefix, trimming slashes,
+/// and ensuring directory entries end with `/`.
+///
+/// Delegates to [`rustfs_utils::path::normalize_extract_entry_key`] and wraps
+/// the result as an S3 error on failure.
 pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
-    validate_extract_relative_path(path)?;
-    let path = path.trim_matches('/');
-    let mut key = match prefix {
-        Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
-        Some(prefix) => prefix.to_string(),
-        None => path.to_string(),
-    };
-
-    if is_dir && !key.ends_with('/') {
-        key.push('/');
-    }
-
-    validate_extract_relative_path(&key)?;
-
-    Ok(key)
+    rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
@@ -1614,7 +1592,7 @@ impl DefaultObjectUsecase {
     #[allow(clippy::too_many_arguments)]
     async fn prepare_get_object_read(
         req: &S3Request<GetObjectInput>,
-        store: &super::ECStore,
+        store: &ECStore,
         manager: &ConcurrencyManager,
         bucket: &str,
         key: &str,
@@ -2298,7 +2276,7 @@ impl DefaultObjectUsecase {
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-            let encryption_metadata = encryption_material_to_metadata(&material);
+            let encryption_metadata = encryption_material_to_metadata(&material)?;
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
@@ -2895,7 +2873,6 @@ impl DefaultObjectUsecase {
         validate_ssec_for_read(&info.user_defined, sse_customer_key.as_ref(), sse_customer_key_md5.as_ref())?;
 
         let metadata_map = info.user_defined.clone();
-
         debug!(
             "GetObjectAttributes raw object_attributes={:?}",
             object_attributes.iter().map(|value| value.as_str()).collect::<Vec<_>>()
@@ -2952,7 +2929,6 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
-
         let object_parts = if requested(ObjectAttributes::OBJECT_PARTS) && info.is_multipart() {
             let params = parse_list_parts_params(part_number_marker, max_parts)?;
             let mut parts = Vec::new();
@@ -3333,7 +3309,7 @@ impl DefaultObjectUsecase {
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-            user_defined.extend(encryption_material_to_metadata(&material));
+            user_defined.extend(encryption_material_to_metadata(&material)?);
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
@@ -4875,7 +4851,7 @@ impl DefaultObjectUsecase {
 
                 write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-                let encryption_metadata = encryption_material_to_metadata(&material);
+                let encryption_metadata = encryption_material_to_metadata(&material)?;
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }

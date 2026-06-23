@@ -387,6 +387,7 @@ fn endpoint_labels(endpoint: &Endpoint) -> TopologyLabels {
     additional.insert(LOCAL_ENDPOINT_LABEL.to_owned(), endpoint.is_local.to_string());
 
     TopologyLabels {
+        node: Some(endpoint_node_id(endpoint)),
         additional,
         ..TopologyLabels::default()
     }
@@ -453,6 +454,7 @@ mod tests {
                 .map(String::as_str),
             Some("path")
         );
+        assert_eq!(snapshot.pools[0].sets[0].disks[0].labels.node.as_deref(), Some(LOCAL_NODE_ID));
 
         let encoded = serde_json::to_string(&snapshot).expect("serialize topology snapshot");
         assert!(!encoded.contains("/tmp/rustfs-cluster-control-plane"));
@@ -464,6 +466,7 @@ mod tests {
         let snapshot = topology_snapshot_from_endpoint_pools(&endpoint_pools);
 
         assert_eq!(snapshot.pools[0].sets[0].disks[0].disk_id.as_deref(), Some("node1.example:9000"));
+        assert_eq!(snapshot.pools[0].sets[0].disks[0].labels.node.as_deref(), Some("node1.example:9000"));
         assert_eq!(
             snapshot.pools[0].sets[0].disks[0]
                 .labels

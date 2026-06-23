@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::{resolve_action_credentials, resolve_notify_interface};
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -23,7 +24,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::EventArgsBuilder;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_targets::{
@@ -311,8 +312,8 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
-                final_builder = final_builder.access_key(&sk);
+            if let Some(cred) = resolve_action_credentials() {
+                final_builder = final_builder.access_key(&cred.access_key);
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
@@ -382,7 +383,7 @@ impl Drop for OperationHelper {
             if !event_args.is_replication_request() {
                 let ctx = state.request_context.clone();
                 spawn_background_with_context(ctx, async move {
-                    notifier_global::notify(event_args).await;
+                    resolve_notify_interface().notify(event_args).await;
                 });
             }
         }
@@ -500,10 +501,10 @@ mod tests {
                 });
 
                 let helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
-                let event_args = match &helper {
-                    OperationHelper::Enabled(state) => state.event_builder.clone().expect("event builder should exist").build(),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
                 };
+                let event_args = state.event_builder.clone().expect("event builder should exist").build();
 
                 assert_eq!(event_args.bucket_name, "issue-2292-bucket");
                 assert_eq!(event_args.object.bucket, "issue-2292-bucket");
@@ -552,13 +553,11 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper stored the RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => {
-                        assert!(state.request_context.is_some());
-                        assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
-                    }
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_some());
+                assert_eq!(state.request_context.as_ref().unwrap().request_id, "ingress-canonical-uuid");
             },
         );
     }
@@ -595,10 +594,10 @@ mod tests {
                 let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
 
                 // Verify the helper has no RequestContext
-                match &helper {
-                    OperationHelper::Enabled(state) => assert!(state.request_context.is_none()),
-                    OperationHelper::Disabled => panic!("helper should be enabled when notify/audit switches are on"),
-                }
+                let OperationHelper::Enabled(state) = &helper else {
+                    panic!("helper should be enabled when notify/audit switches are on");
+                };
+                assert!(state.request_context.is_none());
             },
         );
     }

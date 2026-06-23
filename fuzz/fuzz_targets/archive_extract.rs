@@ -1,7 +1,7 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs::app::object_usecase::{normalize_extract_entry_key, validate_extract_relative_path};
+use rustfs_utils::path::{normalize_extract_entry_key, validate_extract_relative_path};
 
 fn parse_case(data: &[u8]) -> (String, Option<String>, bool, Vec<String>) {
     let text = String::from_utf8_lossy(data);

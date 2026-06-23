@@ -17,6 +17,7 @@ use super::super::StorageDiskRpcExt as _;
 use super::super::WalkDirOptions;
 use super::super::find_local_disk_by_ref;
 use super::super::verify_rpc_signature;
+use crate::app::context::resolve_internode_metrics;
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use bytes::{Bytes, BytesMut};
@@ -27,7 +28,7 @@ use hyper::body::Incoming;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
+    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
 };
 use rustfs_utils::net::bytes_stream;
 use s3s::Body;
@@ -37,6 +38,7 @@ use serde_urlencoded::from_bytes;
 use std::future::Future;
 use std::pin::Pin;
 use std::task::{Context, Poll};
+use std::time::Instant;
 use tokio::io::{self, AsyncWriteExt};
 use tokio_util::io::ReaderStream;
 use tower::Service;
@@ -279,6 +281,7 @@ fn is_internode_rpc_path(path: &str) -> bool {
 
 async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     let operation = internode_http_operation(req.uri().path());
+    let started_at = Instant::now();
     if let Err(response) = verify_internode_rpc_signature(req.uri(), req.method(), req.headers()) {
         record_internode_rpc_error(operation);
         return *response;
@@ -298,6 +301,14 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         record_internode_rpc_error(operation);
     }
 
+    if let Some(operation) = operation {
+        resolve_internode_metrics().record_duration_for_operation_and_backend(
+            operation,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            started_at.elapsed(),
+        );
+    }
+
     response
 }
 
@@ -311,11 +322,10 @@ fn internode_http_operation(path: &str) -> Option<&'static str> {
 }
 
 fn record_internode_rpc_error(operation: Option<&'static str>) {
+    let metrics = resolve_internode_metrics();
     match operation {
-        Some(operation) => {
-            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
-        }
-        None => global_internode_metrics().record_error(),
+        Some(operation) => metrics.record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
+        None => metrics.record_error(),
     }
 }
 
@@ -400,7 +410,7 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+    resolve_internode_metrics().record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
@@ -420,7 +430,7 @@ fn read_file_body_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
-    let metrics = global_internode_metrics().clone();
+    let metrics = resolve_internode_metrics();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
@@ -535,9 +545,9 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
-    global_internode_metrics()
+    resolve_internode_metrics()
         .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
-    let metrics = global_internode_metrics().clone();
+    let metrics = resolve_internode_metrics();
     let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
@@ -604,14 +614,15 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    global_internode_metrics().record_incoming_request_for_operation_and_backend(
+    let metrics = resolve_internode_metrics();
+    metrics.record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
-    global_internode_metrics().record_recv_bytes_for_operation_and_backend(
+    metrics.record_recv_bytes_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-        copied as usize,
+        usize::try_from(copied).unwrap_or(usize::MAX),
     );
 
     if let Err(e) = file.flush().await {
@@ -634,7 +645,7 @@ where
     let mut pending = BytesMut::with_capacity(DEFAULT_READ_BUFFER_SIZE);
 
     while let Some(bytes) = body.try_next().await.map_err(io::Error::other)? {
-        copied += bytes.len() as u64;
+        copied = copied.saturating_add(u64::try_from(bytes.len()).unwrap_or(u64::MAX));
         pending.extend_from_slice(&bytes);
 
         if pending.len() >= DEFAULT_READ_BUFFER_SIZE {

@@ -954,7 +954,11 @@ pub async fn heal_bucket_local(bucket: &str, opts: &HealOpts) -> Result<HealResu
     heal_bucket_local_on_disks(bucket, opts, disks).await
 }
 
-async fn heal_bucket_local_on_disks(bucket: &str, opts: &HealOpts, disks: Vec<Option<DiskStore>>) -> Result<HealResultItem> {
+pub(crate) async fn heal_bucket_local_on_disks(
+    bucket: &str,
+    opts: &HealOpts,
+    disks: Vec<Option<DiskStore>>,
+) -> Result<HealResultItem> {
     let before_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
     let after_state = Arc::new(RwLock::new(vec![String::new(); disks.len()]));
 
