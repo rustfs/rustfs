@@ -36,7 +36,7 @@ use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
 use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{
     PerformanceMetrics,
     global_metrics::get_global_metrics,
@@ -73,6 +73,14 @@ impl IamInterface for IamHandle {
 
     fn is_ready(&self) -> bool {
         rustfs_iam::get().is_ok()
+    }
+
+    fn oidc(&self) -> Option<Arc<OidcSys>> {
+        rustfs_iam::get_oidc()
+    }
+
+    fn token_signing_key(&self) -> Option<String> {
+        rustfs_iam::manager::get_token_signing_key()
     }
 }
 
