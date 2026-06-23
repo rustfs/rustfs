@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_region;
 use crate::server::ShutdownHandle;
 use crate::storage::{
-    get_bucket_notification_config, get_global_region, process_lambda_configurations, process_queue_configurations,
-    process_topic_configurations,
+    get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::{admin, config, version};
 use rustfs_config::{
@@ -159,7 +159,7 @@ fn arn_to_target_id(arn_str: &str) -> Result<rustfs_targets::arn::TargetID, Targ
 /// * `buckets` - A vector of bucket names to process
 #[instrument(skip_all)]
 pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
-    let global_region = get_global_region();
+    let global_region = resolve_region();
     let region = global_region
         .as_ref()
         .filter(|r| !r.as_str().is_empty())

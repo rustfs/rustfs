@@ -18,6 +18,7 @@ use super::resolve_object_store_handle;
 use super::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
+use crate::app::context::resolve_region;
 use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_info, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -930,7 +931,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: super::get_global_region(),
+            region: resolve_region(),
             request_context,
             ..Default::default()
         };
