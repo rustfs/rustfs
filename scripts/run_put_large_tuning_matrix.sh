@@ -26,6 +26,7 @@ WARP_BIN="warp"
 EXTRA_ARGS=""
 INSECURE=false
 DRY_RUN=false
+COOLDOWN_SECS=30
 
 TOPOLOGY_NODES=""
 TOPOLOGY_DISKS_PER_NODE=""
@@ -76,6 +77,7 @@ Core options:
   --out-root <dir>                   Default: target/bench/put-large-tuning-<timestamp>
   --warp-bin <path>                  Default: warp
   --extra-args "<args>"
+  --cooldown-secs <n>                Sleep between profiles (default: 30)
   --insecure
   --dry-run
 
@@ -157,6 +159,7 @@ parse_args() {
       --out-root) OUT_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --warp-bin) WARP_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --nodes) TOPOLOGY_NODES="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --disks-per-node) TOPOLOGY_DISKS_PER_NODE="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --total-disks) TOPOLOGY_TOTAL_DISKS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -199,8 +202,8 @@ validate_args() {
     all|baseline|inflight|io-buffer|runtime|duplex) ;;
     *) echo "ERROR: --group must be all|baseline|inflight|io-buffer|runtime|duplex" >&2; exit 1 ;;
   esac
-  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$CAPTURE_INTERVAL_SECS" || ! is_positive_int "$APPLY_WAIT_SECS"; then
-    echo "ERROR: --rounds, --capture-interval-secs, and --apply-wait-secs must be positive integers" >&2
+  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$CAPTURE_INTERVAL_SECS" || ! is_positive_int "$APPLY_WAIT_SECS" || ! [[ "$COOLDOWN_SECS" =~ ^[0-9]+$ ]]; then
+    echo "ERROR: --rounds, --capture-interval-secs, and --apply-wait-secs must be positive integers; --cooldown-secs must be a nonnegative integer" >&2
     exit 1
   fi
   if [[ -n "$APPLY_CMD" ]]; then
@@ -401,10 +404,23 @@ main() {
   echo "Group: $GROUP"
   echo "Concurrencies: $CONCURRENCIES"
   echo "Sizes: $SIZES"
+  echo "Cooldown between profiles: ${COOLDOWN_SECS}s"
 
-  local profile
-  for profile in $(profiles_for_group "$GROUP"); do
+  local profiles profile index total_profiles
+  profiles=($(profiles_for_group "$GROUP"))
+  total_profiles="${#profiles[@]}"
+  for ((index = 0; index < total_profiles; index++)); do
+    profile="${profiles[$index]}"
     run_profile "$profile"
+    if (( index + 1 < total_profiles )) && (( COOLDOWN_SECS > 0 )); then
+      echo
+      echo "[${profile}] cooldown ${COOLDOWN_SECS}s before next profile..."
+      if [[ "$DRY_RUN" == "true" ]]; then
+        echo "[DRY-RUN] sleep ${COOLDOWN_SECS}"
+      else
+        sleep "$COOLDOWN_SECS"
+      fi
+    fi
   done
 
   echo
