@@ -32,6 +32,7 @@ use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
+use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
@@ -91,6 +92,16 @@ pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
 /// Resolve local node name using AppContext-first precedence.
 pub async fn resolve_local_node_name() -> String {
     resolve_local_node_name_with(get_global_app_context(), rustfs_common::get_global_local_node_name).await
+}
+
+/// Resolve action credentials using AppContext-first precedence.
+pub fn resolve_action_credentials() -> Option<Credentials> {
+    resolve_action_credentials_with(get_global_app_context(), || default_action_credential_interface().get())
+}
+
+/// Resolve region using AppContext-first precedence.
+pub fn resolve_region() -> Option<s3s::region::Region> {
+    resolve_region_with(get_global_app_context(), || default_region_interface().get())
 }
 
 /// Resolve tier config handle using AppContext-first precedence.
@@ -171,6 +182,22 @@ where
     fallback().await
 }
 
+fn resolve_action_credentials_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Credentials>,
+) -> Option<Credentials> {
+    context
+        .map(|context| context.action_credentials().get())
+        .unwrap_or_else(fallback)
+}
+
+fn resolve_region_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<s3s::region::Region>,
+) -> Option<s3s::region::Region> {
+    context.map(|context| context.region().get()).unwrap_or_else(fallback)
+}
+
 fn resolve_tier_config_handle_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> Arc<RwLock<TierConfigMgr>>,
@@ -197,10 +224,11 @@ mod tests {
     use super::super::{Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
-    use crate::app::context::handles::{default_notify_interface, default_region_interface};
+    use crate::app::context::handles::default_notify_interface;
     use crate::app::context::interfaces::{
-        BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
-        LocalNodeNameInterface, LockClientInterface, ServerConfigInterface, TierConfigInterface,
+        ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface,
+        KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface, ServerConfigInterface,
+        TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -282,6 +310,26 @@ mod tests {
     impl LocalNodeNameInterface for TestLocalNodeNameInterface {
         async fn get(&self) -> String {
             self.name.clone()
+        }
+    }
+
+    struct TestActionCredentialInterface {
+        credentials: Option<Credentials>,
+    }
+
+    impl ActionCredentialInterface for TestActionCredentialInterface {
+        fn get(&self) -> Option<Credentials> {
+            self.credentials.clone()
+        }
+    }
+
+    struct TestRegionInterface {
+        region: Option<s3s::region::Region>,
+    }
+
+    impl RegionInterface for TestRegionInterface {
+        fn get(&self) -> Option<s3s::region::Region> {
+            self.region.clone()
         }
     }
 
@@ -378,6 +426,16 @@ mod tests {
         let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let context_node_name = "context-node".to_string();
         let fallback_node_name = "fallback-node".to_string();
+        let context_credentials = Credentials {
+            access_key: "context-access-key".to_string(),
+            ..Default::default()
+        };
+        let fallback_credentials = Credentials {
+            access_key: "fallback-access-key".to_string(),
+            ..Default::default()
+        };
+        let context_region: s3s::region::Region = "context-region".parse().expect("test region");
+        let fallback_region: s3s::region::Region = "fallback-region".parse().expect("test region");
 
         let context = Arc::new(AppContext::with_test_interfaces(
             object_store.clone(),
@@ -402,7 +460,12 @@ mod tests {
                 local_node_name: Arc::new(TestLocalNodeNameInterface {
                     name: context_node_name.clone(),
                 }),
-                region: default_region_interface(),
+                action_credentials: Arc::new(TestActionCredentialInterface {
+                    credentials: Some(context_credentials.clone()),
+                }),
+                region: Arc::new(TestRegionInterface {
+                    region: Some(context_region.clone()),
+                }),
                 tier_config: Arc::new(TestTierConfigInterface {
                     tier_config: tier_config.clone(),
                 }),
@@ -441,6 +504,16 @@ mod tests {
         assert_eq!(
             resolve_local_node_name_with(Some(context.clone()), || async { fallback_node_name.clone() }).await,
             context_node_name
+        );
+        assert_eq!(
+            resolve_action_credentials_with(Some(context.clone()), || Some(fallback_credentials.clone()))
+                .expect("context action credentials")
+                .access_key,
+            context_credentials.access_key
+        );
+        assert_eq!(
+            resolve_region_with(Some(context.clone()), || Some(fallback_region.clone())).expect("context region"),
+            context_region
         );
         assert!(Arc::ptr_eq(
             &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
@@ -483,6 +556,16 @@ mod tests {
         assert_eq!(
             resolve_local_node_name_with(None, || async { fallback_node_name.clone() }).await,
             fallback_node_name
+        );
+        assert_eq!(
+            resolve_action_credentials_with(None, || Some(fallback_credentials.clone()))
+                .expect("fallback action credentials")
+                .access_key,
+            fallback_credentials.access_key
+        );
+        assert_eq!(
+            resolve_region_with(None, || Some(fallback_region.clone())).expect("fallback region"),
+            fallback_region
         );
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
         assert_eq!(

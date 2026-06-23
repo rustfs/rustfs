@@ -26,10 +26,10 @@ use super::replication::{
 use super::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::versioning_sys::BucketVersioningSys;
 use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use super::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
+use super::{get_global_bucket_monitor, get_global_deployment_id};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_region, resolve_server_config};
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -54,7 +54,6 @@ use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
@@ -648,7 +647,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         }
     }
 
-    let config = get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    let config = resolve_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
     Ok(config)
 }
 
@@ -751,7 +750,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(get_global_region)
+        .or_else(resolve_region)
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -1515,7 +1514,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         bucket: Some(ext_req.bucket.clone()),
         object: None,
         version_id: None,
-        region: get_global_region(),
+        region: resolve_region(),
         ..Default::default()
     });
 
@@ -2244,7 +2243,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         bucket,
         object,
         version_id: None,
-        region: get_global_region(),
+        region: resolve_region(),
         ..Default::default()
     });
 
@@ -3663,7 +3662,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: get_global_region(),
+            region: resolve_region(),
             service: None,
             trailing_headers: None,
         };

@@ -18,6 +18,7 @@ use super::super::metadata_sys::BucketMetadataSys;
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
+use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
@@ -78,6 +79,11 @@ pub trait LockClientInterface: Send + Sync {
 #[async_trait]
 pub trait LocalNodeNameInterface: Send + Sync {
     async fn get(&self) -> String;
+}
+
+/// Action credentials interface for admin handler integration.
+pub trait ActionCredentialInterface: Send + Sync {
+    fn get(&self) -> Option<Credentials>;
 }
 
 /// Region interface for application-layer use-cases.

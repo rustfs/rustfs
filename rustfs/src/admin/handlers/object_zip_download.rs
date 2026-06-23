@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::get_global_region;
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -31,7 +30,6 @@ use hyper::{Method, Uri};
 use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_storage_api::{BucketOperations, ListOperations as _, ObjectIO as _, ObjectOperations as _, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
@@ -206,7 +204,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             bucket: snapshot.bucket,
             object: snapshot.object,
             version_id: snapshot.version_id,
-            region: get_global_region(),
+            region: resolve_region(),
             request_context: None,
         }
     }
@@ -284,7 +282,7 @@ impl From<ClientInfoSnapshot> for ClientInfo {
 
 fn download_token_encryption_key() -> S3Result<[u8; 32]> {
     let credentials =
-        get_global_action_cred().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))?;
+        resolve_action_credentials().ok_or_else(|| s3_error!(InternalError, "global action credentials are not initialized"))?;
     if credentials.secret_key.is_empty() {
         return Err(s3_error!(InternalError, "global action credentials are not initialized"));
     }
@@ -401,7 +399,7 @@ async fn authenticate_object_zip_download_request(req: &mut S3Request<Body>) -> 
     req.extensions.insert(ReqInfo {
         cred: Some(cred),
         is_owner: owner,
-        region: get_global_region(),
+        region: resolve_region(),
         request_context: req.extensions.get().cloned(),
         ..Default::default()
     });
@@ -698,7 +696,7 @@ async fn authorize_zip_items_for_download(record: &ObjectZipDownloadToken, items
                 extensions
             },
             credentials: None,
-            region: get_global_region(),
+            region: resolve_region(),
             service: None,
             trailing_headers: None,
         };
@@ -1093,7 +1091,7 @@ mod tests {
             "object ZIP download token should carry an authenticated payload"
         );
         assert!(
-            src.contains("get_global_action_cred"),
+            src.contains("resolve_action_credentials"),
             "object ZIP download token should be verifiable by any node sharing global credentials"
         );
         assert!(
@@ -1378,7 +1376,7 @@ mod tests {
     }
 
     fn ensure_test_signing_credentials() {
-        if get_global_action_cred().is_none() {
+        if resolve_action_credentials().is_none() {
             let _ = init_global_action_credentials(
                 Some("TESTROOTACCESSKEY".to_string()),
                 Some("TESTROOTSECRET1234567890".to_string()),
@@ -1401,7 +1399,7 @@ mod tests {
             bucket: Some("photos".to_string()),
             object: None,
             version_id: None,
-            region: get_global_region(),
+            region: resolve_region(),
             request_context: None,
         }
     }
