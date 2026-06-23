@@ -768,6 +768,17 @@ fn is_decommission_copy_cleanup_safe_error(err: &Error) -> bool {
     is_err_object_not_found(err) || is_err_version_not_found(err)
 }
 
+fn is_decommission_target_capacity_error(err: &Error) -> bool {
+    if matches!(err, Error::DiskFull | Error::StorageFull) {
+        return true;
+    }
+
+    let message = err.to_string();
+    let disk_full = Error::DiskFull.to_string();
+    let storage_full = Error::StorageFull.to_string();
+    message.contains(&disk_full) || message.contains(&storage_full)
+}
+
 fn should_cleanup_decommission_source_entry(decommissioned: usize, total_versions: usize, expired: usize) -> bool {
     decommissioned.saturating_add(expired) == total_versions
 }
@@ -2564,6 +2575,15 @@ impl ECStore {
                         ignore = true;
                         cleanup_ignored = true;
                     } else {
+                        if is_decommission_target_capacity_error(&err) {
+                            return Err(with_decommission_entry_context(
+                                "delete_marker_copy",
+                                bucket.as_str(),
+                                version.name.as_str(),
+                                err,
+                            ));
+                        }
+
                         failure = true;
 
                         error = Some(err)
@@ -2635,6 +2655,15 @@ impl ECStore {
                             break;
                         }
 
+                        if is_decommission_target_capacity_error(&err) {
+                            return Err(with_decommission_entry_context(
+                                "decommission_tiered_object",
+                                bucket.as_str(),
+                                version.name.as_str(),
+                                err,
+                            ));
+                        }
+
                         failure = true;
                         error!("decommission_pool: decommission_tiered_object err {:?}", &err);
                         error = Some(err);
@@ -2693,6 +2722,15 @@ impl ECStore {
                         ignore = true;
                         cleanup_ignored = true;
                         break;
+                    }
+
+                    if is_decommission_target_capacity_error(&err) {
+                        return Err(with_decommission_entry_context(
+                            DECOMMISSION_STAGE_MIGRATE_OBJECT,
+                            bucket_name.as_str(),
+                            object_name.as_str(),
+                            err,
+                        ));
                     }
 
                     failure = true;
@@ -3927,6 +3965,29 @@ mod tests {
         let err = Error::DataMovementOverwriteErr("bucket".to_string(), "object".to_string(), "version".to_string());
 
         assert!(!is_decommission_copy_cleanup_safe_error(&err));
+    }
+
+    #[test]
+    fn decommission_target_capacity_error_accepts_direct_capacity_errors() {
+        assert!(is_decommission_target_capacity_error(&Error::DiskFull));
+        assert!(is_decommission_target_capacity_error(&Error::StorageFull));
+    }
+
+    #[test]
+    fn decommission_target_capacity_error_accepts_wrapped_capacity_errors() {
+        let disk_full = Error::other(format!("decommission_object: put_object failed for bucket/object: {}", Error::DiskFull));
+        let storage_full = Error::other(format!(
+            "decommission_object: put_object failed for bucket/object: {}",
+            Error::StorageFull
+        ));
+
+        assert!(is_decommission_target_capacity_error(&disk_full));
+        assert!(is_decommission_target_capacity_error(&storage_full));
+    }
+
+    #[test]
+    fn decommission_target_capacity_error_rejects_unrelated_errors() {
+        assert!(!is_decommission_target_capacity_error(&Error::SlowDown));
     }
 
     #[test]
