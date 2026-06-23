@@ -18,6 +18,7 @@ use crate::disk::error_reduce::{
 };
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
+use crate::runtime_sources;
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -138,8 +139,7 @@ impl<'a> MultiWriter<'a> {
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
             let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
             let summary_text = format_write_quorum_failure(&summary);
-            rustfs_io_metrics::internode_metrics::global_internode_metrics()
-                .record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
+            runtime_sources::record_erasure_write_quorum_failure("write", quorum_dominant_error_metric_label(&summary));
             error!("reduce_write_quorum_errs: {:?}, {}, errs={:?}", write_err, summary_text, self.errs);
             return Err(std::io::Error::other(format!("Failed to write data: {summary_text}")));
         }
@@ -193,8 +193,7 @@ impl<'a> MultiWriter<'a> {
         if let Some(write_err) = reduce_write_quorum_errs(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum) {
             let summary = build_write_quorum_failure_summary(&self.errs, OBJECT_OP_IGNORED_ERRS, self.write_quorum);
             let summary_text = format_write_quorum_failure(&summary);
-            rustfs_io_metrics::internode_metrics::global_internode_metrics()
-                .record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
+            runtime_sources::record_erasure_write_quorum_failure("shutdown", quorum_dominant_error_metric_label(&summary));
             error!(
                 "reduce_write_quorum_errs during shutdown: {:?}, {}, errs={:?}",
                 write_err, summary_text, self.errs
