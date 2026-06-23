@@ -564,7 +564,7 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         );
 
         let fallback_profile = WorkloadProfile::from_name(DEFAULT_BUFFER_PROFILE);
-        let Some(buffer_config) = resolve_buffer_profile_config(profile, fallback_profile.clone()) else {
+        let Some(buffer_config) = resolve_buffer_profile_config(profile, fallback_profile) else {
             warn!(
                 target: "rustfs::init",
                 event = "buffer_profile_validation_failed",
@@ -651,42 +651,6 @@ fn resolve_buffer_profile_config(
         Some(fallback_config)
     } else {
         Some(buffer_config)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::resolve_buffer_profile_config;
-    use crate::config::{BufferConfig, WorkloadProfile};
-    use rustfs_config::KI_B;
-
-    #[test]
-    fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
-        let invalid_primary = WorkloadProfile::Custom(BufferConfig {
-            min_size: 64 * KI_B,
-            max_size: 1024,
-            default_unknown: 64 * KI_B,
-            thresholds: vec![(1024, 64 * KI_B)],
-        });
-
-        let resolved = resolve_buffer_profile_config(invalid_primary, WorkloadProfile::GeneralPurpose)
-            .expect("fallback profile should be accepted");
-
-        assert_eq!(resolved.workload, WorkloadProfile::GeneralPurpose);
-    }
-
-    #[test]
-    fn resolve_buffer_profile_config_returns_none_when_primary_and_fallback_are_invalid() {
-        let invalid = WorkloadProfile::Custom(BufferConfig {
-            min_size: 64 * KI_B,
-            max_size: 1024,
-            default_unknown: 64 * KI_B,
-            thresholds: vec![(1024, 64 * KI_B)],
-        });
-
-        let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
-
-        assert!(resolved.is_none());
     }
 }
 
@@ -1316,5 +1280,41 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
             "Protocol runtime started"
         );
         Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_buffer_profile_config;
+    use crate::config::{BufferConfig, WorkloadProfile};
+    use rustfs_config::KI_B;
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_fallback_when_primary_is_invalid() {
+        let invalid_primary = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid_primary, WorkloadProfile::GeneralPurpose)
+            .expect("fallback profile should be accepted");
+
+        assert_eq!(resolved.workload, WorkloadProfile::GeneralPurpose);
+    }
+
+    #[test]
+    fn resolve_buffer_profile_config_returns_none_when_primary_and_fallback_are_invalid() {
+        let invalid = WorkloadProfile::Custom(BufferConfig {
+            min_size: 64 * KI_B,
+            max_size: 1024,
+            default_unknown: 64 * KI_B,
+            thresholds: vec![(1024, 64 * KI_B)],
+        });
+
+        let resolved = resolve_buffer_profile_config(invalid.clone(), invalid);
+
+        assert!(resolved.is_none());
     }
 }
