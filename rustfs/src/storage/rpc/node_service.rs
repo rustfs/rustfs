@@ -16,19 +16,19 @@ use super::super::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
+    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata,
     reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::app::context::resolve_iam_handle;
+use crate::app::context::{resolve_iam_handle, resolve_lock_client};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfo, MetacacheReader};
 use rustfs_iam::store::UserType;
 use rustfs_lock::{LockClient, LockRequest};
@@ -172,9 +172,9 @@ impl NodeService {
         all_local_disk_path().await
     }
 
-    /// Get the global lock client, returning an error if not initialized
+    /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        get_global_lock_client()
+        resolve_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }

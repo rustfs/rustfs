@@ -34,7 +34,8 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
-use std::sync::Arc;
+use rustfs_lock::LockClient;
+use std::{future::Future, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
@@ -80,6 +81,16 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
+}
+
+/// Resolve lock client using AppContext-first precedence.
+pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
+    resolve_lock_client_with(get_global_app_context(), || default_lock_client_interface().handle())
+}
+
+/// Resolve local node name using AppContext-first precedence.
+pub async fn resolve_local_node_name() -> String {
+    resolve_local_node_name_with(get_global_app_context(), rustfs_common::get_global_local_node_name).await
 }
 
 /// Resolve tier config handle using AppContext-first precedence.
@@ -141,6 +152,25 @@ fn resolve_endpoints_handle_with(
     context.and_then(|context| context.endpoints().handle()).or_else(fallback)
 }
 
+fn resolve_lock_client_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<dyn LockClient>>,
+) -> Option<Arc<dyn LockClient>> {
+    context.and_then(|context| context.lock_client().handle()).or_else(fallback)
+}
+
+async fn resolve_local_node_name_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> String
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = String>,
+{
+    if let Some(context) = context {
+        return context.local_node_name().get().await;
+    }
+
+    fallback().await
+}
+
 fn resolve_tier_config_handle_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> Arc<RwLock<TierConfigMgr>>,
@@ -170,10 +200,12 @@ mod tests {
     use crate::app::context::handles::{default_notify_interface, default_region_interface};
     use crate::app::context::interfaces::{
         BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
-        ServerConfigInterface, TierConfigInterface,
+        LocalNodeNameInterface, LockClientInterface, ServerConfigInterface, TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
+    use async_trait::async_trait;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_lock::{LocalClient, LockClient};
     use std::path::PathBuf;
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -229,6 +261,27 @@ mod tests {
     impl EndpointsInterface for TestEndpointsInterface {
         fn handle(&self) -> Option<EndpointServerPools> {
             self.endpoints.clone()
+        }
+    }
+
+    struct TestLockClientInterface {
+        client: Option<Arc<dyn LockClient>>,
+    }
+
+    impl LockClientInterface for TestLockClientInterface {
+        fn handle(&self) -> Option<Arc<dyn LockClient>> {
+            self.client.clone()
+        }
+    }
+
+    struct TestLocalNodeNameInterface {
+        name: String,
+    }
+
+    #[async_trait]
+    impl LocalNodeNameInterface for TestLocalNodeNameInterface {
+        async fn get(&self) -> String {
+            self.name.clone()
         }
     }
 
@@ -321,6 +374,10 @@ mod tests {
         let tier_config = TierConfigMgr::new();
         let server_config = Config::new();
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
+        let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let context_node_name = "context-node".to_string();
+        let fallback_node_name = "fallback-node".to_string();
 
         let context = Arc::new(AppContext::with_test_interfaces(
             object_store.clone(),
@@ -338,6 +395,12 @@ mod tests {
                 }),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
+                }),
+                lock_client: Arc::new(TestLockClientInterface {
+                    client: Some(context_lock_client.clone()),
+                }),
+                local_node_name: Arc::new(TestLocalNodeNameInterface {
+                    name: context_node_name.clone(),
                 }),
                 region: default_region_interface(),
                 tier_config: Arc::new(TestTierConfigInterface {
@@ -372,6 +435,14 @@ mod tests {
             endpoints.as_ref()[0].drives_per_set
         );
         assert!(Arc::ptr_eq(
+            &resolve_lock_client_with(Some(context.clone()), || None).expect("context lock client"),
+            &context_lock_client
+        ));
+        assert_eq!(
+            resolve_local_node_name_with(Some(context.clone()), || async { fallback_node_name.clone() }).await,
+            context_node_name
+        );
+        assert!(Arc::ptr_eq(
             &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
             &tier_config
         ));
@@ -404,6 +475,14 @@ mod tests {
                 .as_ref()[0]
                 .drives_per_set,
             endpoints.as_ref()[0].drives_per_set
+        );
+        assert!(Arc::ptr_eq(
+            &resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).expect("fallback lock client"),
+            &fallback_lock_client
+        ));
+        assert_eq!(
+            resolve_local_node_name_with(None, || async { fallback_node_name.clone() }).await,
+            fallback_node_name
         );
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
         assert_eq!(

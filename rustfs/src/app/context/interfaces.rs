@@ -20,6 +20,7 @@ use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
+use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::Arc;
@@ -66,6 +67,17 @@ pub trait BucketMetadataInterface: Send + Sync {
 /// Endpoints interface for application-layer use-cases.
 pub trait EndpointsInterface: Send + Sync {
     fn handle(&self) -> Option<EndpointServerPools>;
+}
+
+/// Lock client interface for application-layer use-cases.
+pub trait LockClientInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<dyn LockClient>>;
+}
+
+/// Local node name interface for application-layer use-cases.
+#[async_trait]
+pub trait LocalNodeNameInterface: Send + Sync {
+    async fn get(&self) -> String;
 }
 
 /// Region interface for application-layer use-cases.
