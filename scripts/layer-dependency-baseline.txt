@@ -1,3 +1,20 @@
+# Layer dependency baseline for the rustfs binary crate.
+#
+# These are intra-crate module references within rustfs/ that cross the
+# conceptual layer boundaries (app, infra/server, interface/admin).
+# Since they live inside one Cargo crate, Rust doesn't enforce separation.
+# The list is maintained for architectural awareness during code review.
+#
+# Format for dependency entries:
+#   status|source_file|direction|imported_symbol|reason
+#
+# Format for conceptual cycles:
+#   status|cycle|direction_pair|reason
+#
+# Status:
+#   accepted - reviewed and intentionally allowed
+#   todo     - should be resolved in a future refactor
+
 cycle|app<->infra
 cycle|app<->interface
 cycle|infra<->interface
