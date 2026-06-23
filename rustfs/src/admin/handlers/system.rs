@@ -490,7 +490,7 @@ mod tests {
                 .workload_admission
                 .get(WorkloadClass::ForegroundWrite)
                 .map(|snapshot| snapshot.state),
-            Some(AdmissionState::Unknown)
+            Some(AdmissionState::Disabled)
         );
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
     }
