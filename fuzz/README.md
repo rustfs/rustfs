@@ -34,7 +34,7 @@ Crash reproducers are written under `fuzz/artifacts/<target>/`.
 ## Targets
 
 - `bucket_validation`
-  - Exercises RustFS bucket-name and bucket/object argument validation without pulling in the full `rustfs` binary crate graph.
+  - Exercises RustFS bucket-name and bucket/object argument validation.
 - `archive_extract`
   - Exercises archive entry path normalization, prefix application, and bucket-namespace containment checks.
 - `path_containment`
@@ -53,17 +53,34 @@ cd fuzz
 cargo +nightly fuzz run path_containment
 ```
 
-Run bounded smoke targets from the repository root:
+Use the unified runner script from the repository root:
 
 ```bash
-./scripts/fuzz/run_ci_targets.sh
+# Build + run all smoke targets (60s each)
+./scripts/fuzz/run.sh
+
+# Build only (no fuzz run)
+BUILD_ONLY=1 ./scripts/fuzz/run.sh
+
+# Build + run a single target
+FUZZ_TARGET=path_containment ./scripts/fuzz/run.sh
+
+# Nightly-style: 300s per target
+MAX_TOTAL_TIME=300 ./scripts/fuzz/run.sh
+
+# Skip build (use pre-built harness)
+SKIP_BUILD=1 FUZZ_TARGET=local_metadata ./scripts/fuzz/run.sh
 ```
 
-Run a longer local/nightly-style pass:
+## CI Workflow
 
-```bash
-./scripts/fuzz/run_nightly_targets.sh
-```
+The GitHub Actions workflow (`.github/workflows/fuzz.yml`) uses a **build/run separation** pattern:
+
+1. **`fuzz-build`** — compiles all fuzz targets once, then uploads only the prebuilt smoke harness binaries needed by later jobs.
+2. **`pr-fuzz-smoke`** — matrix job that runs each target in parallel (60s each). Downloads the prebuilt binaries and executes them directly, so the job does not need to restore the full `fuzz/target/` tree or reinstall `cargo-fuzz`.
+3. **`nightly-fuzz-corpus`** — matrix job that reuses the same prebuilt binaries and runs each target in parallel (300s each) on a daily schedule.
+
+This design avoids redundant compilation across targets and keeps wall-clock time low.
 
 ## Seed Corpus
 
