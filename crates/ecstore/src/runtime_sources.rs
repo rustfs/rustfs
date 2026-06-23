@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
+    bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
     config::get_global_storage_class,
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     endpoints::EndpointServerPools,
@@ -24,7 +25,7 @@ use crate::{
     event_notification::EventNotifier,
     global::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
-        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
+        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
         get_global_endpoints_opt, init_global_bucket_monitor, resolve_object_store_handle, set_global_deployment_id,
     },
@@ -58,6 +59,10 @@ pub(crate) fn endpoint_pools() -> Option<EndpointServerPools> {
 
 pub(crate) async fn local_node_name() -> String {
     GLOBAL_LOCAL_NODE_NAME.read().await.clone()
+}
+
+pub(crate) fn default_local_node_name() -> String {
+    GLOBAL_LocalNodeName.to_string()
 }
 
 pub(crate) async fn rustfs_addr() -> String {
@@ -115,6 +120,18 @@ pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
 
 pub(crate) fn deployment_id() -> Option<String> {
     get_global_deployment_id()
+}
+
+pub(crate) fn replication_pool() -> Option<Arc<DynReplicationPool>> {
+    GLOBAL_REPLICATION_POOL.get().cloned()
+}
+
+pub(crate) fn replication_stats() -> Option<Arc<ReplicationStats>> {
+    GLOBAL_REPLICATION_STATS.get().cloned()
+}
+
+pub(crate) fn replication_runtime_initialized() -> bool {
+    GLOBAL_REPLICATION_STATS.get().is_some() && GLOBAL_REPLICATION_POOL.get().is_some()
 }
 
 pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {

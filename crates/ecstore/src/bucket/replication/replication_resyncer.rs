@@ -19,7 +19,6 @@ use crate::bucket::bucket_target_sys::{
 use crate::bucket::metadata_sys;
 use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
-use crate::bucket::replication::replication_pool::GLOBAL_REPLICATION_STATS;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
@@ -29,10 +28,10 @@ use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::event_notification::{EventArgs, send_event};
-use crate::global::GLOBAL_LocalNodeName;
 use crate::global::get_global_bucket_monitor;
 use crate::global::resolve_object_store_handle;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
@@ -226,7 +225,7 @@ fn is_head_proxy_failure(err: &SdkError<HeadObjectError>) -> bool {
 }
 
 async fn record_proxy_request(bucket: &str, api: &str, is_err: bool) {
-    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+    if let Some(stats) = runtime_sources::replication_stats() {
         stats.inc_proxy(bucket, api, is_err).await;
     }
 }
@@ -1857,7 +1856,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
 
@@ -1884,7 +1883,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -1983,7 +1982,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2016,7 +2015,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2047,7 +2046,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2096,7 +2095,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             continue;
@@ -2189,7 +2188,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         )
     };
 
-    if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+    if let Some(stats) = runtime_sources::replication_stats() {
         for tgt in rinfos.targets.iter() {
             if tgt.replication_status != tgt.prev_replication_status {
                 stats
@@ -2348,7 +2347,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2372,7 +2371,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2404,7 +2403,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2433,7 +2432,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2471,7 +2470,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             continue;
@@ -2501,7 +2500,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                         ..Default::default()
                     },
                     user_agent: "Internal: [Replication]".to_string(),
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     ..Default::default()
                 });
                 return;
@@ -2544,7 +2543,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                         ..Default::default()
                     },
                     user_agent: "Internal: [Replication]".to_string(),
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     ..Default::default()
                 });
             }
@@ -2738,7 +2737,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2758,7 +2757,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2797,7 +2796,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2821,7 +2820,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2846,7 +2845,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2889,7 +2888,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: roi.to_object_info(),
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -2916,7 +2915,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             object_info = u;
         }
 
-        if let Some(stats) = GLOBAL_REPLICATION_STATS.get() {
+        if let Some(stats) = runtime_sources::replication_stats() {
             for tgt in &rinfos.targets {
                 if tgt.replication_status != tgt.prev_replication_status {
                     stats
@@ -2937,14 +2936,14 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         event_name,
         bucket_name: bucket.clone(),
         object: object_info,
-        host: GLOBAL_LocalNodeName.to_string(),
+        host: runtime_sources::default_local_node_name(),
         user_agent: "Internal: [Replication]".to_string(),
         ..Default::default()
     });
 
     if rinfos.replication_status() != ReplicationStatusType::Completed
         && roi.replication_status_internal == rinfos.replication_status_internal()
-        && let Some(stats) = GLOBAL_REPLICATION_STATS.get()
+        && let Some(stats) = runtime_sources::replication_stats()
     {
         for tgt in &rinfos.targets {
             if tgt.replication_status != tgt.prev_replication_status {
@@ -3005,7 +3004,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3045,7 +3044,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -3076,7 +3075,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3098,7 +3097,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3193,7 +3192,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3292,7 +3291,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3331,7 +3330,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -3371,7 +3370,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: GLOBAL_LocalNodeName.to_string(),
+                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3395,7 +3394,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3458,7 +3457,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             event_name: EventName::ObjectReplicationNotTracked.to_string(),
                             bucket_name: bucket.clone(),
                             object: object_info.clone(),
-                            host: GLOBAL_LocalNodeName.to_string(),
+                            host: runtime_sources::default_local_node_name(),
                             user_agent: "Internal: [Replication]".to_string(),
                             ..Default::default()
                         });
@@ -3516,7 +3515,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                                 bucket_name: bucket.clone(),
                                 object: object_info,
-                                host: GLOBAL_LocalNodeName.to_string(),
+                                host: runtime_sources::default_local_node_name(),
                                 user_agent: "Internal: [Replication]".to_string(),
                                 ..Default::default()
                             });
@@ -3543,7 +3542,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -3579,7 +3578,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
