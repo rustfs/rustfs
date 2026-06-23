@@ -26,15 +26,16 @@ use crate::metrics::collectors::{
     DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
     ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
+use crate::metrics::runtime_sources::{
+    ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot, replication_stats_handle,
+};
 use crate::metrics::{
-    OBS_GLOBAL_EXPIRY_STATE, OBS_GLOBAL_REPLICATION_STATS, OBS_GLOBAL_TRANSITION_STATE, ObsEcstoreResult, ObsStore,
-    obs_get_global_bucket_monitor, obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free,
+    ObsEcstoreResult, ObsStore, obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free,
     obs_load_data_usage_from_backend, obs_resolve_object_store_handle,
 };
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
-use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
@@ -72,18 +73,6 @@ struct ObsBucketReplicationBandwidthStats {
     target_arn: String,
     limit_bytes_per_sec: i64,
     current_bandwidth_bytes_per_sec: f64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ObsIlmRuntimeSnapshot {
-    expiry_pending_tasks: u64,
-    transition_active_tasks: u64,
-    transition_pending_tasks: u64,
-    transition_missed_immediate_tasks: u64,
-    transition_queue_full_tasks: u64,
-    transition_queue_send_timeout_tasks: u64,
-    transition_compensation_scheduled_tasks: u64,
-    transition_compensation_running_tasks: u64,
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
@@ -148,7 +137,7 @@ async fn obs_bucket_quota_limit_bytes(bucket: &str) -> u64 {
 }
 
 fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketReplicationBandwidthStats>> {
-    let monitor = obs_get_global_bucket_monitor()?;
+    let monitor = bucket_monitor_handle()?;
     Some(
         monitor
             .get_report(|_| true)
@@ -165,26 +154,11 @@ fn obs_bucket_replication_bandwidth_stats() -> Option<Vec<ObsBucketReplicationBa
 }
 
 async fn obs_ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
-    let expiry_pending_tasks = {
-        let expiry = OBS_GLOBAL_EXPIRY_STATE.read().await;
-        usize_to_u64_saturating(expiry.pending_tasks())
-    };
-    let transition = &OBS_GLOBAL_TRANSITION_STATE;
-
-    ObsIlmRuntimeSnapshot {
-        expiry_pending_tasks,
-        transition_active_tasks: i64_to_u64_floor_zero(transition.active_tasks()),
-        transition_pending_tasks: usize_to_u64_saturating(transition.pending_tasks()),
-        transition_missed_immediate_tasks: i64_to_u64_floor_zero(transition.missed_immediate_tasks()),
-        transition_queue_full_tasks: i64_to_u64_floor_zero(transition.queue_full_tasks()),
-        transition_queue_send_timeout_tasks: i64_to_u64_floor_zero(transition.queue_send_timeout_tasks()),
-        transition_compensation_scheduled_tasks: i64_to_u64_floor_zero(transition.compensation_scheduled_tasks()),
-        transition_compensation_running_tasks: i64_to_u64_floor_zero(transition.compensation_running_tasks()),
-    }
+    ilm_runtime_snapshot().await
 }
 
 async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
-    let Some(stats) = OBS_GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = replication_stats_handle() else {
         return Vec::new();
     };
 
@@ -256,7 +230,7 @@ async fn obs_bucket_replication_detail_stats() -> Vec<BucketReplicationStats> {
 }
 
 async fn obs_site_replication_stats() -> ReplicationStats {
-    let Some(stats) = OBS_GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = replication_stats_handle() else {
         return ReplicationStats::default();
     };
 
@@ -904,21 +878,19 @@ pub async fn collect_erasure_set_stats() -> Vec<ErasureSetStats> {
 }
 
 pub async fn collect_iam_stats() -> Option<IamStats> {
-    let iam_sys = get_global_iam_sys()?;
-    let sync = iam_sys.sync_metrics_snapshot();
-    let oidc = oidc_plugin_authn_metrics_snapshot();
+    let snapshot = iam_metrics_snapshot()?;
 
     Some(IamStats {
-        last_sync_duration_millis: sync.last_sync_duration_millis,
-        plugin_authn_service_failed_requests_minute: oidc.failed_requests_minute,
-        plugin_authn_service_last_fail_seconds: oidc.last_fail_seconds,
-        plugin_authn_service_last_succ_seconds: oidc.last_succ_seconds,
-        plugin_authn_service_succ_avg_rtt_ms_minute: oidc.succ_avg_rtt_ms_minute,
-        plugin_authn_service_succ_max_rtt_ms_minute: oidc.succ_max_rtt_ms_minute,
-        plugin_authn_service_total_requests_minute: oidc.total_requests_minute,
-        since_last_sync_millis: sync.since_last_sync_millis,
-        sync_failures: sync.sync_failures,
-        sync_successes: sync.sync_successes,
+        last_sync_duration_millis: snapshot.last_sync_duration_millis,
+        plugin_authn_service_failed_requests_minute: snapshot.plugin_authn_service_failed_requests_minute,
+        plugin_authn_service_last_fail_seconds: snapshot.plugin_authn_service_last_fail_seconds,
+        plugin_authn_service_last_succ_seconds: snapshot.plugin_authn_service_last_succ_seconds,
+        plugin_authn_service_succ_avg_rtt_ms_minute: snapshot.plugin_authn_service_succ_avg_rtt_ms_minute,
+        plugin_authn_service_succ_max_rtt_ms_minute: snapshot.plugin_authn_service_succ_max_rtt_ms_minute,
+        plugin_authn_service_total_requests_minute: snapshot.plugin_authn_service_total_requests_minute,
+        since_last_sync_millis: snapshot.since_last_sync_millis,
+        sync_failures: snapshot.sync_failures,
+        sync_successes: snapshot.sync_successes,
     })
 }
 
