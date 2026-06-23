@@ -394,27 +394,14 @@ pub(crate) mod quota {
 }
 
 pub(crate) mod replication {
-    use std::sync::Arc;
-
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
     pub(crate) type ObjectOpts = super::ecstore_bucket::replication::ObjectOpts;
-    pub(crate) type ReplicationStats = super::ecstore_bucket::replication::ReplicationStats;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
     #[cfg(test)]
     pub(crate) type TargetReplicationResyncStatus = super::ecstore_bucket::replication::TargetReplicationResyncStatus;
-
-    pub(crate) struct GlobalReplicationStatsCompat;
-
-    pub(crate) static GLOBAL_REPLICATION_STATS: GlobalReplicationStatsCompat = GlobalReplicationStatsCompat;
-
-    impl GlobalReplicationStatsCompat {
-        pub(crate) fn get(&self) -> Option<&'static Arc<ReplicationStats>> {
-            super::ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get()
-        }
-    }
 }
 
 pub(crate) mod target {

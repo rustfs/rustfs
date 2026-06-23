@@ -30,19 +30,30 @@ use super::EndpointServerPools;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
-use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
+use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use std::{future::Future, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
+}
+
+/// Resolve outbound TLS generation using AppContext-first precedence.
+pub fn resolve_outbound_tls_generation() -> TlsGeneration {
+    resolve_outbound_tls_generation_with(get_global_app_context(), || default_outbound_tls_runtime_interface().generation())
+}
+
+/// Resolve outbound TLS state using AppContext-first precedence.
+pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+    resolve_outbound_tls_state_with(get_global_app_context()).await
 }
 
 /// Resolve IAM readiness using AppContext-first precedence.
@@ -100,6 +111,11 @@ pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
     resolve_replication_pool_handle_with(get_global_app_context(), || default_replication_pool_interface().handle())
 }
 
+/// Resolve replication statistics handle using AppContext-first precedence.
+pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
+    resolve_replication_stats_handle_with(get_global_app_context(), || default_replication_stats_interface().handle())
+}
+
 /// Resolve deployment identity using AppContext-first precedence.
 pub fn resolve_deployment_id() -> Option<String> {
     resolve_deployment_id_with(get_global_app_context(), || default_deployment_id_interface().get())
@@ -154,6 +170,21 @@ fn resolve_kms_runtime_service_manager_with(
         .or_else(fallback)
 }
 
+fn resolve_outbound_tls_generation_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> TlsGeneration,
+) -> TlsGeneration {
+    context.map_or_else(fallback, |context| context.outbound_tls_runtime().generation())
+}
+
+async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> GlobalPublishedOutboundTlsState {
+    if let Some(context) = context {
+        return context.outbound_tls_runtime().state().await;
+    }
+
+    default_outbound_tls_runtime_interface().state().await
+}
+
 fn resolve_iam_ready_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> bool) -> bool {
     context.map_or_else(fallback, |context| context.iam().is_ready())
 }
@@ -198,6 +229,15 @@ fn resolve_replication_pool_handle_with(
 ) -> Option<Arc<DynReplicationPool>> {
     context
         .and_then(|context| context.replication_pool().handle())
+        .or_else(fallback)
+}
+
+fn resolve_replication_stats_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<ReplicationStats>>,
+) -> Option<Arc<ReplicationStats>> {
+    context
+        .and_then(|context| context.replication_stats().handle())
         .or_else(fallback)
 }
 
@@ -291,8 +331,9 @@ mod tests {
     };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
-        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface,
-        RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+        OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface,
+        TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -336,6 +377,21 @@ mod tests {
         }
     }
 
+    struct TestOutboundTlsRuntimeInterface {
+        state: GlobalPublishedOutboundTlsState,
+    }
+
+    #[async_trait]
+    impl OutboundTlsRuntimeInterface for TestOutboundTlsRuntimeInterface {
+        fn generation(&self) -> TlsGeneration {
+            self.state.generation
+        }
+
+        async fn state(&self) -> GlobalPublishedOutboundTlsState {
+            self.state.clone()
+        }
+    }
+
     struct TestBucketMetadataInterface {
         metadata: Option<Arc<RwLock<BucketMetadataSys>>>,
     }
@@ -343,6 +399,16 @@ mod tests {
     impl BucketMetadataInterface for TestBucketMetadataInterface {
         fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
             self.metadata.clone()
+        }
+    }
+
+    struct TestReplicationStatsInterface {
+        stats: Option<Arc<ReplicationStats>>,
+    }
+
+    impl ReplicationStatsInterface for TestReplicationStatsInterface {
+        fn handle(&self) -> Option<Arc<ReplicationStats>> {
+            self.stats.clone()
         }
     }
 
@@ -503,6 +569,8 @@ mod tests {
         let context_kms = Arc::new(KmsServiceManager::new());
         let fallback_kms = Arc::new(KmsServiceManager::new());
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
+        let context_replication_stats = Arc::new(ReplicationStats::new());
+        let fallback_replication_stats = Arc::new(ReplicationStats::new());
         let tier_config = TierConfigMgr::new();
         let server_config = Config::new();
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
@@ -514,6 +582,11 @@ mod tests {
         let fallback_deployment_id = "fallback-deployment".to_string();
         let context_runtime_port = 19000;
         let fallback_runtime_port = 29000;
+        let context_outbound_tls_state = GlobalPublishedOutboundTlsState {
+            generation: TlsGeneration(41),
+            root_ca_pem: Some(b"context-root-ca".to_vec()),
+            mtls_identity: None,
+        };
         let context_credentials = Credentials {
             access_key: "context-access-key".to_string(),
             ..Default::default()
@@ -535,6 +608,9 @@ mod tests {
                 kms_runtime: Arc::new(TestKmsRuntimeInterface {
                     kms: Some(context_kms.clone()),
                 }),
+                outbound_tls_runtime: Arc::new(TestOutboundTlsRuntimeInterface {
+                    state: context_outbound_tls_state.clone(),
+                }),
                 notify: default_notify_interface(),
                 notification_system: default_notification_system_interface(),
                 bucket_metadata: Arc::new(TestBucketMetadataInterface {
@@ -542,6 +618,9 @@ mod tests {
                 }),
                 bucket_monitor: default_bucket_monitor_interface(),
                 replication_pool: default_replication_pool_interface(),
+                replication_stats: Arc::new(TestReplicationStatsInterface {
+                    stats: Some(context_replication_stats.clone()),
+                }),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
                 }),
@@ -578,6 +657,14 @@ mod tests {
                 .expect("context KMS runtime"),
             &context_kms
         ));
+        assert_eq!(
+            resolve_outbound_tls_generation_with(Some(context.clone()), || TlsGeneration(99)),
+            context_outbound_tls_state.generation
+        );
+        assert_eq!(
+            resolve_outbound_tls_state_with(Some(context.clone())).await.generation,
+            context_outbound_tls_state.generation
+        );
         assert!(resolve_iam_ready_with(Some(context.clone()), || false));
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
@@ -586,6 +673,10 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_object_store_handle_with(Some(context.clone()), || None).expect("context object store"),
             &object_store
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_replication_stats_handle_with(Some(context.clone()), || None).expect("context replication stats"),
+            &context_replication_stats
         ));
         assert_eq!(
             resolve_endpoints_handle_with(Some(context.clone()), || None)
@@ -638,6 +729,7 @@ mod tests {
             &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
             &fallback_kms
         ));
+        assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
@@ -647,6 +739,11 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_object_store_handle_with(None, || Some(object_store.clone())).expect("fallback object store"),
             &object_store
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone()))
+                .expect("fallback replication stats"),
+            &fallback_replication_stats
         ));
         assert_eq!(
             resolve_endpoints_handle_with(None, || Some(endpoints.clone()))

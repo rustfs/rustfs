@@ -17,15 +17,15 @@ use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
     default_endpoints_interface, default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
-    default_notification_system_interface, default_notify_interface, default_region_interface,
-    default_replication_pool_interface, default_runtime_port_interface, default_server_config_interface,
-    default_tier_config_interface,
+    default_notification_system_interface, default_notify_interface, default_outbound_tls_runtime_interface,
+    default_region_interface, default_replication_pool_interface, default_replication_stats_interface,
+    default_runtime_port_interface, default_server_config_interface, default_tier_config_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface, RuntimePortInterface,
-    ServerConfigInterface, TierConfigInterface,
+    NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface, ReplicationPoolInterface,
+    ReplicationStatsInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -39,11 +39,13 @@ pub struct AppContext {
     #[allow(dead_code)]
     kms: Arc<dyn KmsInterface>,
     kms_runtime: Arc<dyn KmsRuntimeInterface>,
+    outbound_tls_runtime: Arc<dyn OutboundTlsRuntimeInterface>,
     notify: Arc<dyn NotifyInterface>,
     notification_system: Arc<dyn NotificationSystemInterface>,
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     bucket_monitor: Arc<dyn BucketMonitorInterface>,
     replication_pool: Arc<dyn ReplicationPoolInterface>,
+    replication_stats: Arc<dyn ReplicationStatsInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
     deployment_id: Arc<dyn DeploymentIdInterface>,
     runtime_port: Arc<dyn RuntimePortInterface>,
@@ -63,11 +65,13 @@ impl AppContext {
             iam,
             kms,
             kms_runtime: default_kms_runtime_interface(),
+            outbound_tls_runtime: default_outbound_tls_runtime_interface(),
             notify: default_notify_interface(),
             notification_system: default_notification_system_interface(),
             bucket_metadata: default_bucket_metadata_interface(),
             bucket_monitor: default_bucket_monitor_interface(),
             replication_pool: default_replication_pool_interface(),
+            replication_stats: default_replication_stats_interface(),
             endpoints: default_endpoints_interface(),
             deployment_id: default_deployment_id_interface(),
             runtime_port: default_runtime_port_interface(),
@@ -106,6 +110,10 @@ impl AppContext {
         self.kms_runtime.clone()
     }
 
+    pub fn outbound_tls_runtime(&self) -> Arc<dyn OutboundTlsRuntimeInterface> {
+        self.outbound_tls_runtime.clone()
+    }
+
     pub fn notify(&self) -> Arc<dyn NotifyInterface> {
         self.notify.clone()
     }
@@ -124,6 +132,10 @@ impl AppContext {
 
     pub fn replication_pool(&self) -> Arc<dyn ReplicationPoolInterface> {
         self.replication_pool.clone()
+    }
+
+    pub fn replication_stats(&self) -> Arc<dyn ReplicationStatsInterface> {
+        self.replication_stats.clone()
     }
 
     pub fn endpoints(&self) -> Arc<dyn EndpointsInterface> {
@@ -172,11 +184,13 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) iam: Arc<dyn IamInterface>,
     pub(super) kms: Arc<dyn KmsInterface>,
     pub(super) kms_runtime: Arc<dyn KmsRuntimeInterface>,
+    pub(super) outbound_tls_runtime: Arc<dyn OutboundTlsRuntimeInterface>,
     pub(super) notify: Arc<dyn NotifyInterface>,
     pub(super) notification_system: Arc<dyn NotificationSystemInterface>,
     pub(super) bucket_metadata: Arc<dyn BucketMetadataInterface>,
     pub(super) bucket_monitor: Arc<dyn BucketMonitorInterface>,
     pub(super) replication_pool: Arc<dyn ReplicationPoolInterface>,
+    pub(super) replication_stats: Arc<dyn ReplicationStatsInterface>,
     pub(super) endpoints: Arc<dyn EndpointsInterface>,
     pub(super) deployment_id: Arc<dyn DeploymentIdInterface>,
     pub(super) runtime_port: Arc<dyn RuntimePortInterface>,
@@ -197,11 +211,13 @@ impl AppContext {
             iam: interfaces.iam,
             kms: interfaces.kms,
             kms_runtime: interfaces.kms_runtime,
+            outbound_tls_runtime: interfaces.outbound_tls_runtime,
             notify: interfaces.notify,
             notification_system: interfaces.notification_system,
             bucket_metadata: interfaces.bucket_metadata,
             bucket_monitor: interfaces.bucket_monitor,
             replication_pool: interfaces.replication_pool,
+            replication_stats: interfaces.replication_stats,
             endpoints: interfaces.endpoints,
             deployment_id: interfaces.deployment_id,
             runtime_port: interfaces.runtime_port,

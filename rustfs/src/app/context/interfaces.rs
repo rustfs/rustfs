@@ -15,7 +15,7 @@
 use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::BucketMetadataSys;
-use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
+use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
@@ -25,6 +25,7 @@ use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -44,6 +45,13 @@ pub trait KmsInterface: Send + Sync {
 /// KMS runtime interface for application-layer and admin handler integration.
 pub trait KmsRuntimeInterface: Send + Sync {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>>;
+}
+
+/// Outbound TLS runtime interface for client material consumers.
+#[async_trait]
+pub trait OutboundTlsRuntimeInterface: Send + Sync {
+    fn generation(&self) -> TlsGeneration;
+    async fn state(&self) -> GlobalPublishedOutboundTlsState;
 }
 
 /// Notify interface for application-layer use-cases.
@@ -79,6 +87,11 @@ pub trait BucketMonitorInterface: Send + Sync {
 /// Replication pool interface for admin resync integration.
 pub trait ReplicationPoolInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<DynReplicationPool>>;
+}
+
+/// Replication statistics interface for admin metrics integration.
+pub trait ReplicationStatsInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<ReplicationStats>>;
 }
 
 /// Endpoints interface for application-layer use-cases.

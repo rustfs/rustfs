@@ -672,6 +672,12 @@ pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     crate::storage::get_global_replication_pool()
 }
 
+pub(crate) type ReplicationStats = crate::storage::ReplicationStats;
+
+pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    crate::storage::get_global_replication_stats()
+}
+
 #[cfg(test)]
 pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
 where

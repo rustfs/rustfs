@@ -14,15 +14,13 @@
 
 use super::profile::authorize_profile_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::app::context::resolve_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
 use http::{HeaderMap, HeaderValue};
 use hyper::Method;
 use matchit::Params;
-use rustfs_tls_runtime::{
-    OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot,
-    summarize_global_outbound_tls_state,
-};
+use rustfs_tls_runtime::{OutboundOnlySnapshotArgs, TlsConsumerStatusItem, TlsDebugStatusResponse, TlsRuntimeStatusSnapshot};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 
@@ -47,10 +45,13 @@ impl Operation for TlsStatusHandler {
         authorize_profile_request(&req).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
-        let outbound = summarize_global_outbound_tls_state().await;
+        let outbound = resolve_outbound_tls_state().await;
+        let generation = outbound.generation.0;
+        let has_root_ca = outbound.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty());
+        let has_mtls_identity = outbound.mtls_identity.is_some();
         let status = TlsRuntimeStatusSnapshot::from_outbound_only(OutboundOnlySnapshotArgs {
             source_path: tls_path,
-            generation: outbound.generation.0,
+            generation,
             reload_enabled: rustfs_utils::get_env_bool(
                 rustfs_config::ENV_TLS_RELOAD_ENABLE,
                 rustfs_config::DEFAULT_TLS_RELOAD_ENABLE,
@@ -59,28 +60,28 @@ impl Operation for TlsStatusHandler {
             last_attempt_time: None,
             last_success_time: None,
             last_error: None,
-            has_roots: outbound.has_root_ca,
-            has_mtls_identity: outbound.has_mtls_identity,
+            has_roots: has_root_ca,
+            has_mtls_identity,
         });
         let payload = TlsDebugStatusResponse::builder(status)
             .push_consumers([
                 TlsConsumerStatusItem {
                     consumer: PROTOS_GRPC_CHANNEL_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
                 TlsConsumerStatusItem {
                     consumer: RIO_HTTP_READER_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
                 TlsConsumerStatusItem {
                     consumer: ECSTORE_TRANSITION_CLIENT_CONSUMER,
-                    generation: outbound.generation.0,
-                    has_root_ca: outbound.has_root_ca,
-                    has_mtls_identity: outbound.has_mtls_identity,
+                    generation,
+                    has_root_ca,
+                    has_mtls_identity,
                 },
             ])
             .build();
