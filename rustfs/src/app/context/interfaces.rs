@@ -25,6 +25,7 @@ use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -44,6 +45,13 @@ pub trait KmsInterface: Send + Sync {
 /// KMS runtime interface for application-layer and admin handler integration.
 pub trait KmsRuntimeInterface: Send + Sync {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>>;
+}
+
+/// Outbound TLS runtime interface for client material consumers.
+#[async_trait]
+pub trait OutboundTlsRuntimeInterface: Send + Sync {
+    fn generation(&self) -> TlsGeneration;
+    async fn state(&self) -> GlobalPublishedOutboundTlsState;
 }
 
 /// Notify interface for application-layer use-cases.

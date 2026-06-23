@@ -22,8 +22,8 @@ use super::super::{
 use super::interfaces::{
     ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
     EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface, RuntimePortInterface,
-    ServerConfigInterface, TierConfigInterface,
+    NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface, ReplicationPoolInterface,
+    RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -36,6 +36,9 @@ use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_targets::{EventName, arn::TargetID};
+use rustfs_tls_runtime::{
+    GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
+};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -86,6 +89,21 @@ pub struct KmsRuntimeHandle;
 impl KmsRuntimeInterface for KmsRuntimeHandle {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
         get_global_kms_service_manager()
+    }
+}
+
+/// Default outbound TLS runtime interface adapter.
+#[derive(Default)]
+pub struct OutboundTlsRuntimeHandle;
+
+#[async_trait]
+impl OutboundTlsRuntimeInterface for OutboundTlsRuntimeHandle {
+    fn generation(&self) -> TlsGeneration {
+        load_global_outbound_tls_generation()
+    }
+
+    async fn state(&self) -> GlobalPublishedOutboundTlsState {
+        load_global_outbound_tls_state().await
     }
 }
 
@@ -264,6 +282,10 @@ pub fn default_notification_system_interface() -> Arc<dyn NotificationSystemInte
 
 pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
     Arc::new(KmsRuntimeHandle)
+}
+
+pub fn default_outbound_tls_runtime_interface() -> Arc<dyn OutboundTlsRuntimeInterface> {
+    Arc::new(OutboundTlsRuntimeHandle)
 }
 
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
