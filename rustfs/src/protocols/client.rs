@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::resolve_action_credentials;
 use crate::storage::ecfs::FS;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -139,7 +140,7 @@ impl ProtocolStorageClient {
     ) -> S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
 
-        let is_owner = if let Some(global_cred) = rustfs_credentials::get_global_action_cred() {
+        let is_owner = if let Some(global_cred) = resolve_action_credentials() {
             params.access_key == global_cred.access_key
         } else {
             false

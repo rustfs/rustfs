@@ -39,7 +39,9 @@ dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::m
 dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_upload_part_number
 dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs
 dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
+dep|rustfs/src/auth.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/init.rs|infra->interface|crate::admin
+dep|rustfs/src/protocols/client.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
 dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
 dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
@@ -57,6 +59,7 @@ dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS
 dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input
 dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator
 dep|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_owner
+dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name
 dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_iam_handle
 dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_lock_client
