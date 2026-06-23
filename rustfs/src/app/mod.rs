@@ -94,10 +94,12 @@ pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DI
 
 pub(crate) type DiskError = crate::storage::DiskError;
 pub(crate) type DynReader = crate::storage::DynReader;
+pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
 pub(crate) type HashReader = crate::storage::HashReader;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
+pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
 pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
@@ -630,12 +632,20 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     crate::storage::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    crate::storage::get_global_deployment_id()
+}
+
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     crate::storage::get_global_lock_client()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     crate::storage::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    crate::storage::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
@@ -652,6 +662,14 @@ pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> b
 
 pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
     crate::storage::get_global_notification_sys()
+}
+
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    crate::storage::get_global_bucket_monitor()
+}
+
+pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    crate::storage::get_global_replication_pool()
 }
 
 #[cfg(test)]

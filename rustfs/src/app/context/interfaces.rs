@@ -15,6 +15,7 @@
 use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::BucketMetadataSys;
+use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
@@ -60,14 +61,39 @@ pub trait NotifyInterface: Send + Sync {
     async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError>;
 }
 
+/// Notification system handle interface for admin peer orchestration.
+pub trait NotificationSystemInterface: Send + Sync {
+    fn handle(&self) -> Option<&'static NotificationSys>;
+}
+
 /// Bucket metadata interface for application-layer use-cases.
 pub trait BucketMetadataInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>>;
 }
 
+/// Bucket bandwidth monitor interface for admin metric integration.
+pub trait BucketMonitorInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<BucketBandwidthMonitor>>;
+}
+
+/// Replication pool interface for admin resync integration.
+pub trait ReplicationPoolInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<DynReplicationPool>>;
+}
+
 /// Endpoints interface for application-layer use-cases.
 pub trait EndpointsInterface: Send + Sync {
     fn handle(&self) -> Option<EndpointServerPools>;
+}
+
+/// Deployment identity interface for admin topology integration.
+pub trait DeploymentIdInterface: Send + Sync {
+    fn get(&self) -> Option<String>;
+}
+
+/// Runtime port interface for admin topology integration.
+pub trait RuntimePortInterface: Send + Sync {
+    fn get(&self) -> u16;
 }
 
 /// Lock client interface for application-layer use-cases.

@@ -210,6 +210,7 @@ pub(crate) type BucketMetadata = ecstore_bucket::metadata::BucketMetadata;
 #[cfg(test)]
 pub(crate) type BucketMetadataSys = ecstore_bucket::metadata_sys::BucketMetadataSys;
 pub(crate) type BucketVersioningSys = ecstore_bucket::versioning_sys::BucketVersioningSys;
+pub(crate) type BucketBandwidthMonitor = ecstore_bucket::bandwidth::monitor::Monitor;
 pub(crate) type CheckPartsResp = ecstore_disk::CheckPartsResp;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
 pub(crate) type DeleteOptions = ecstore_disk::DeleteOptions;
@@ -809,12 +810,24 @@ pub(crate) fn get_global_lock_clients()
     ecstore_global::get_global_lock_clients()
 }
 
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    ecstore_global::get_global_bucket_monitor()
+}
+
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     ecstore_global::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    ecstore_global::get_global_deployment_id()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     ecstore_global::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    ecstore_global::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {

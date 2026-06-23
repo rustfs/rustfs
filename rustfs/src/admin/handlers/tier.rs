@@ -17,14 +17,14 @@ use super::super::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState;
 use super::super::{
     AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
     ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
-    ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, get_global_notification_sys, storageclass,
+    ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, storageclass,
 };
 use crate::{
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_object_store_handle, resolve_tier_config_handle},
+    app::context::{resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
     storage::request_context::spawn_traced,
@@ -80,7 +80,7 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 
 fn spawn_transition_tier_config_propagation(action: &'static str) {
-    if let Some(notification_sys) = get_global_notification_sys() {
+    if let Some(notification_sys) = resolve_notification_system() {
         spawn_traced(async move {
             for peer_result in notification_sys.load_transition_tier_config().await {
                 if let Some(err) = peer_result.err {
