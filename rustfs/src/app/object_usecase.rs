@@ -2294,7 +2294,7 @@ impl DefaultObjectUsecase {
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-            let encryption_metadata = encryption_material_to_metadata(&material);
+            let encryption_metadata = encryption_material_to_metadata(&material)?;
             metadata.extend(encryption_metadata.clone());
             opts.user_defined.extend(encryption_metadata);
         }
@@ -3327,7 +3327,7 @@ impl DefaultObjectUsecase {
 
             write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-            user_defined.extend(encryption_material_to_metadata(&material));
+            user_defined.extend(encryption_material_to_metadata(&material)?);
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
@@ -4869,7 +4869,7 @@ impl DefaultObjectUsecase {
 
                 write_plan = write_plan.with_encryption(material.write_encryption(None));
 
-                let encryption_metadata = encryption_material_to_metadata(&material);
+                let encryption_metadata = encryption_material_to_metadata(&material)?;
                 metadata.extend(encryption_metadata.clone());
                 opts.user_defined.extend(encryption_metadata);
             }
