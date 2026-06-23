@@ -37,12 +37,23 @@ use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use std::{future::Future, sync::Arc};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
+}
+
+/// Resolve outbound TLS generation using AppContext-first precedence.
+pub fn resolve_outbound_tls_generation() -> TlsGeneration {
+    resolve_outbound_tls_generation_with(get_global_app_context(), || default_outbound_tls_runtime_interface().generation())
+}
+
+/// Resolve outbound TLS state using AppContext-first precedence.
+pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+    resolve_outbound_tls_state_with(get_global_app_context()).await
 }
 
 /// Resolve IAM readiness using AppContext-first precedence.
@@ -152,6 +163,21 @@ fn resolve_kms_runtime_service_manager_with(
     context
         .and_then(|context| context.kms_runtime().service_manager())
         .or_else(fallback)
+}
+
+fn resolve_outbound_tls_generation_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> TlsGeneration,
+) -> TlsGeneration {
+    context.map_or_else(fallback, |context| context.outbound_tls_runtime().generation())
+}
+
+async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> GlobalPublishedOutboundTlsState {
+    if let Some(context) = context {
+        return context.outbound_tls_runtime().state().await;
+    }
+
+    default_outbound_tls_runtime_interface().state().await
 }
 
 fn resolve_iam_ready_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> bool) -> bool {
@@ -291,8 +317,8 @@ mod tests {
     };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
-        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface,
-        RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+        OutboundTlsRuntimeInterface, RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -333,6 +359,21 @@ mod tests {
     impl KmsRuntimeInterface for TestKmsRuntimeInterface {
         fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
             self.kms.clone()
+        }
+    }
+
+    struct TestOutboundTlsRuntimeInterface {
+        state: GlobalPublishedOutboundTlsState,
+    }
+
+    #[async_trait]
+    impl OutboundTlsRuntimeInterface for TestOutboundTlsRuntimeInterface {
+        fn generation(&self) -> TlsGeneration {
+            self.state.generation
+        }
+
+        async fn state(&self) -> GlobalPublishedOutboundTlsState {
+            self.state.clone()
         }
     }
 
@@ -514,6 +555,11 @@ mod tests {
         let fallback_deployment_id = "fallback-deployment".to_string();
         let context_runtime_port = 19000;
         let fallback_runtime_port = 29000;
+        let context_outbound_tls_state = GlobalPublishedOutboundTlsState {
+            generation: TlsGeneration(41),
+            root_ca_pem: Some(b"context-root-ca".to_vec()),
+            mtls_identity: None,
+        };
         let context_credentials = Credentials {
             access_key: "context-access-key".to_string(),
             ..Default::default()
@@ -534,6 +580,9 @@ mod tests {
                 }),
                 kms_runtime: Arc::new(TestKmsRuntimeInterface {
                     kms: Some(context_kms.clone()),
+                }),
+                outbound_tls_runtime: Arc::new(TestOutboundTlsRuntimeInterface {
+                    state: context_outbound_tls_state.clone(),
                 }),
                 notify: default_notify_interface(),
                 notification_system: default_notification_system_interface(),
@@ -578,6 +627,14 @@ mod tests {
                 .expect("context KMS runtime"),
             &context_kms
         ));
+        assert_eq!(
+            resolve_outbound_tls_generation_with(Some(context.clone()), || TlsGeneration(99)),
+            context_outbound_tls_state.generation
+        );
+        assert_eq!(
+            resolve_outbound_tls_state_with(Some(context.clone())).await.generation,
+            context_outbound_tls_state.generation
+        );
         assert!(resolve_iam_ready_with(Some(context.clone()), || false));
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
@@ -638,6 +695,7 @@ mod tests {
             &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
             &fallback_kms
         ));
+        assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
