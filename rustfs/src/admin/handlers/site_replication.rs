@@ -20,7 +20,7 @@ use super::super::metadata::{
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
 use super::super::metadata_sys;
-use super::super::replication::{GLOBAL_REPLICATION_STATS, ResyncOpts};
+use super::super::replication::ResyncOpts;
 use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use super::super::{delete_admin_config, read_admin_config, save_admin_config};
@@ -33,7 +33,8 @@ use crate::admin::site_replication_identity::{
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::{
     resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle, resolve_oidc_handle,
-    resolve_region, resolve_replication_pool_handle, resolve_runtime_port, resolve_server_config,
+    resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
+    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
@@ -51,6 +52,7 @@ use rustfs_config::{
     MAX_ADMIN_REQUEST_BODY_SIZE,
 };
 use rustfs_iam::error::is_err_no_such_service_account;
+use rustfs_iam::get_oidc;
 use rustfs_iam::store::{MappedPolicy, UserType};
 use rustfs_iam::sys::{
     NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
@@ -70,7 +72,7 @@ use rustfs_policy::policy::{
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use rustfs_storage_api::{BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
-use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state};
+use rustfs_tls_runtime::GlobalPublishedOutboundTlsState;
 use rustfs_utils::http::get_source_scheme;
 use rustls_pki_types::pem::PemObject;
 use s3s::dto::{
@@ -626,14 +628,14 @@ fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsS
 }
 
 async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
-    let generation = load_global_outbound_tls_generation().0;
+    let generation = resolve_outbound_tls_generation().0;
     let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
     if let Some(hit) = site_replication_peer_client_cache_hit(&cache, generation) {
         return hit;
     }
     drop(cache);
 
-    let outbound_tls = load_global_outbound_tls_state().await;
+    let outbound_tls = resolve_outbound_tls_state().await;
     let built = build_site_replication_peer_client(&outbound_tls);
     let cache_entry = match &built {
         Ok(client) => SiteReplicationPeerClientCacheEntry::Ready(client.clone()),
@@ -1738,7 +1740,7 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
 }
 
 async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
-    let Some(stats) = GLOBAL_REPLICATION_STATS.get() else {
+    let Some(stats) = resolve_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 
@@ -4227,7 +4229,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
         let mut settings = IDPSettings::default();
-        if let Some(oidc) = resolve_oidc_handle() {
+        if let Some(oidc) = get_oidc() {
             let providers = oidc.list_providers();
             settings.open_id.enabled = !providers.is_empty();
             settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();

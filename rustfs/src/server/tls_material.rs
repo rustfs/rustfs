@@ -20,7 +20,8 @@
 //! (system roots, leaf-as-CA, mTLS env-var path overrides) and builds the server
 //! TLS acceptor directly from the pre-loaded server material — no double reads.
 
-use rustfs_common::{MtlsIdentityPem, get_global_outbound_tls_generation};
+use crate::app::context::resolve_outbound_tls_generation;
+use rustfs_common::MtlsIdentityPem;
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
     DEFAULT_TRUST_LEAF_CERT_AS_CA, DEFAULT_TRUST_SYSTEM_CA, ENV_MTLS_CLIENT_CERT, ENV_MTLS_CLIENT_KEY, ENV_SERVER_MTLS_ENABLE,
@@ -552,7 +553,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                         continue;
                     }
 
-                    let generation = get_global_outbound_tls_generation().saturating_add(1);
+                    let generation = resolve_outbound_tls_generation().0.saturating_add(1);
                     publish_global_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
                     record_tls_generation("rustfs_server_reload_loop", generation);
                     if !snapshot.outbound.root_ca_pem.is_empty() {

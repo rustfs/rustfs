@@ -1,3 +1,4 @@
+use crate::app::context::resolve_s3select_db;
 use crate::error::ApiError;
 use crate::storage::options::get_opts;
 use crate::storage::request_context::spawn_traced;
@@ -15,7 +16,6 @@ use rustfs_s3select_api::{
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
-use rustfs_s3select_query::get_global_db;
 use rustfs_storage_api::ObjectOperations as _;
 use s3s::dto::*;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -55,7 +55,9 @@ pub async fn execute_select_object_content(
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
-    let db = get_global_db((*input).clone(), false).await.map_err(map_query_error_to_s3)?;
+    let db = resolve_s3select_db((*input).clone(), false)
+        .await
+        .map_err(map_query_error_to_s3)?;
     let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());
     let output = db
         .execute(&query)

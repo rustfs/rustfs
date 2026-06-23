@@ -24,7 +24,7 @@ use crate::admin::service::config::{
     validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
-use crate::app::context::{resolve_object_store_handle, resolve_server_config};
+use crate::app::context::{publish_server_config, resolve_object_store_handle, resolve_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -54,7 +54,7 @@ use rustfs_config::oidc::{
     OIDC_CLIENT_ID, OIDC_CLIENT_SECRET, OIDC_CONFIG_URL, OIDC_DISPLAY_NAME, OIDC_EMAIL_CLAIM, OIDC_GROUPS_CLAIM,
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
-use rustfs_config::server_config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS, set_global_server_config};
+use rustfs_config::server_config::{Config as ServerConfig, DEFAULT_KVS, KV, KVS};
 use rustfs_config::{
     COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, ENV_PREFIX, ENV_SCANNER_ALERT_EXCESS_FOLDERS,
     ENV_SCANNER_ALERT_EXCESS_VERSION_SIZE, ENV_SCANNER_ALERT_EXCESS_VERSIONS, ENV_SCANNER_BITROT_CYCLE_SECS,
@@ -1592,7 +1592,7 @@ impl Operation for SetConfigKVHandler {
         validate_server_config(&config, sub_system).await?;
         save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
-        set_global_server_config(config.clone());
+        publish_server_config(config.clone());
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
             && is_dynamic_config_subsystem(sub_system)
@@ -1628,7 +1628,7 @@ impl Operation for DelConfigKVHandler {
         validate_server_config(&config, sub_system).await?;
         save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
-        set_global_server_config(config.clone());
+        publish_server_config(config.clone());
         let mut config_applied = false;
         if let Some(sub_system) = sub_system
             && is_dynamic_config_subsystem(sub_system)
@@ -1726,7 +1726,7 @@ impl Operation for RestoreConfigHistoryKVHandler {
         apply_set_directives(&mut config, &directives)?;
         validate_server_config(&config, None).await?;
         save_server_config_to_store(&config).await?;
-        set_global_server_config(config.clone());
+        publish_server_config(config.clone());
         apply_and_signal_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 
@@ -1765,7 +1765,7 @@ impl Operation for SetConfigHandler {
         validate_server_config(&config, None).await?;
         save_server_config_history(&body).await?;
         save_server_config_to_store(&config).await?;
-        set_global_server_config(config.clone());
+        publish_server_config(config.clone());
         apply_and_signal_dynamic_subsystems(&config).await;
         signal_config_snapshot_reload().await;
 

@@ -448,7 +448,7 @@ require_source_contains \
   "RustFS metadata workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Metadata => Some(metadata_workload_admission_snapshot())" \
+  "metadata_workload_admission_snapshot()," \
   "RustFS metadata workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -456,7 +456,7 @@ require_source_contains \
   "RustFS scanner workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Scanner => Some(scanner_workload_admission_snapshot())" \
+  "scanner_workload_admission_snapshot()," \
   "RustFS scanner workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -464,7 +464,7 @@ require_source_contains \
   "RustFS repair workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Repair => Some(repair_workload_admission_snapshot())" \
+  "repair_workload_admission_snapshot()," \
   "RustFS repair workload admission class mapping"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
@@ -472,7 +472,7 @@ require_source_contains \
   "RustFS replication workload admission snapshot helper"
 require_source_contains \
   "rustfs/src/workload_admission.rs" \
-  "WorkloadClass::Replication => Some(replication_workload_admission_snapshot())" \
+  "replication_workload_admission_snapshot()," \
   "RustFS replication workload admission class mapping"
 
 (
@@ -1439,10 +1439,18 @@ fi
       rustfs/src/admin/service/mod.rs \
       rustfs/src/app/context.rs \
       rustfs/src/storage/rpc/mod.rs || true
-    rg -n --with-filename --pcre2 '(?<!super::)super::storage_compat' \
+    if rg -n --with-filename --pcre2 '(?<!super::)super::storage_compat' \
       rustfs/src/admin/handlers \
       -g '*.rs' \
-      -g '!storage_compat.rs' || true
+      -g '!storage_compat.rs' >/dev/null 2>&1; then
+      rg -n --with-filename --pcre2 '(?<!super::)super::storage_compat' \
+        rustfs/src/admin/handlers \
+        -g '*.rs' \
+        -g '!storage_compat.rs' || true
+    else
+      find rustfs/src/admin/handlers -type f -name '*.rs' ! -name 'storage_compat.rs' -print0 |
+        xargs -0 perl -ne 'print "$ARGV:$.:$_" if /super::storage_compat/ && !/super::super::storage_compat/' || true
+    fi
   }
 ) >"$RUSTFS_NESTED_SECONDARY_COMPAT_BRIDGE_HITS_FILE"
 

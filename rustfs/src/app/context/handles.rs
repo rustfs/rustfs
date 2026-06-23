@@ -13,32 +13,45 @@
 // limitations under the License.
 
 use super::super::EndpointServerPools;
+use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
-    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
-    get_global_lock_clients, get_global_notification_sys, get_global_region, get_global_replication_pool,
-    get_global_tier_config_mgr, global_rustfs_port,
+    collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
+    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients,
+    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
+    get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
 };
 use super::interfaces::{
-    ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
-    EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-    LockClientsInterface, NotificationSystemInterface, NotifyInterface, OidcInterface, RegionInterface, ReplicationPoolInterface,
-    RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+    ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
+    DeploymentIdInterface, EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
+    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
+    OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
+    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
+    StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
 use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
+use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{get_oidc, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_io_metrics::{
+    PerformanceMetrics,
+    global_metrics::get_global_metrics,
+    internode_metrics::{InternodeMetrics, global_internode_metrics},
+};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
-use std::collections::HashMap;
-use std::sync::Arc;
+use rustfs_tls_runtime::{
+    GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
+};
+use s3s::dto::SelectObjectContentInput;
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
@@ -98,6 +111,21 @@ pub struct KmsRuntimeHandle;
 impl KmsRuntimeInterface for KmsRuntimeHandle {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
         get_global_kms_service_manager()
+    }
+}
+
+/// Default outbound TLS runtime interface adapter.
+#[derive(Default)]
+pub struct OutboundTlsRuntimeHandle;
+
+#[async_trait]
+impl OutboundTlsRuntimeInterface for OutboundTlsRuntimeHandle {
+    fn generation(&self) -> TlsGeneration {
+        load_global_outbound_tls_generation()
+    }
+
+    async fn state(&self) -> GlobalPublishedOutboundTlsState {
+        load_global_outbound_tls_state().await
     }
 }
 
@@ -165,6 +193,47 @@ impl ReplicationPoolInterface for ReplicationPoolHandle {
     }
 }
 
+/// Default replication statistics interface adapter.
+#[derive(Default)]
+pub struct ReplicationStatsHandle;
+
+impl ReplicationStatsInterface for ReplicationStatsHandle {
+    fn handle(&self) -> Option<Arc<super::super::ReplicationStats>> {
+        get_global_replication_stats()
+    }
+}
+
+/// Default boot time interface adapter.
+#[derive(Default)]
+pub struct BootTimeHandle;
+
+impl BootTimeInterface for BootTimeHandle {
+    fn get(&self) -> Option<SystemTime> {
+        get_global_boot_time()
+    }
+}
+
+/// Default tier transition statistics interface adapter.
+#[derive(Default)]
+pub struct TierStatsHandle;
+
+impl TierStatsInterface for TierStatsHandle {
+    fn daily_all(&self) -> super::super::DailyAllTierStats {
+        get_daily_all_tier_stats()
+    }
+}
+
+/// Default scanner metrics report interface adapter.
+#[derive(Default)]
+pub struct ScannerMetricsHandle;
+
+#[async_trait]
+impl ScannerMetricsInterface for ScannerMetricsHandle {
+    async fn report(&self) -> super::super::ScannerMetricsReport {
+        collect_scanner_metrics_report().await
+    }
+}
+
 /// Default endpoints interface adapter.
 #[derive(Default)]
 pub struct EndpointsHandle;
@@ -205,13 +274,48 @@ impl LockClientInterface for LockClientHandle {
     }
 }
 
-/// Default lock clients map adapter.
+/// Default lock clients interface adapter.
 #[derive(Default)]
 pub struct LockClientsHandle;
 
 impl LockClientsInterface for LockClientsHandle {
-    fn handles(&self) -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
-        get_global_lock_clients()
+    fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+        get_global_lock_clients().cloned()
+    }
+}
+
+/// Default performance metrics interface adapter.
+#[derive(Default)]
+pub struct PerformanceMetricsHandle;
+
+impl PerformanceMetricsInterface for PerformanceMetricsHandle {
+    fn handle(&self) -> Arc<PerformanceMetrics> {
+        get_global_metrics()
+    }
+}
+
+/// Default internode metrics interface adapter.
+#[derive(Default)]
+pub struct InternodeMetricsHandle;
+
+impl InternodeMetricsInterface for InternodeMetricsHandle {
+    fn handle(&self) -> Arc<InternodeMetrics> {
+        global_internode_metrics().clone()
+    }
+}
+
+/// Default S3 Select database interface adapter.
+#[derive(Default)]
+pub struct S3SelectDbHandle;
+
+#[async_trait]
+impl S3SelectDbInterface for S3SelectDbHandle {
+    async fn get(
+        &self,
+        input: SelectObjectContentInput,
+        enable_debug: bool,
+    ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+        rustfs_s3select_query::get_global_db(input, enable_debug).await
     }
 }
 
@@ -264,6 +368,20 @@ impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
         get_global_server_config()
     }
+
+    fn set(&self, config: Config) {
+        set_global_server_config(config);
+    }
+}
+
+/// Default storage class config interface adapter.
+#[derive(Default)]
+pub struct StorageClassHandle;
+
+impl StorageClassInterface for StorageClassHandle {
+    fn set(&self, config: StorageClassConfig) {
+        set_global_storage_class(config);
+    }
 }
 
 /// Default buffer profile config interface adapter.
@@ -288,6 +406,10 @@ pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
     Arc::new(KmsRuntimeHandle)
 }
 
+pub fn default_outbound_tls_runtime_interface() -> Arc<dyn OutboundTlsRuntimeInterface> {
+    Arc::new(OutboundTlsRuntimeHandle)
+}
+
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
 }
@@ -298,6 +420,22 @@ pub fn default_bucket_monitor_interface() -> Arc<dyn BucketMonitorInterface> {
 
 pub fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
     Arc::new(ReplicationPoolHandle)
+}
+
+pub fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
+    Arc::new(ReplicationStatsHandle)
+}
+
+pub fn default_boot_time_interface() -> Arc<dyn BootTimeInterface> {
+    Arc::new(BootTimeHandle)
+}
+
+pub fn default_tier_stats_interface() -> Arc<dyn TierStatsInterface> {
+    Arc::new(TierStatsHandle)
+}
+
+pub fn default_scanner_metrics_interface() -> Arc<dyn ScannerMetricsInterface> {
+    Arc::new(ScannerMetricsHandle)
 }
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
@@ -318,6 +456,18 @@ pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {
 
 pub fn default_lock_clients_interface() -> Arc<dyn LockClientsInterface> {
     Arc::new(LockClientsHandle)
+}
+
+pub fn default_performance_metrics_interface() -> Arc<dyn PerformanceMetricsInterface> {
+    Arc::new(PerformanceMetricsHandle)
+}
+
+pub fn default_internode_metrics_interface() -> Arc<dyn InternodeMetricsInterface> {
+    Arc::new(InternodeMetricsHandle)
+}
+
+pub fn default_s3select_db_interface() -> Arc<dyn S3SelectDbInterface> {
+    Arc::new(S3SelectDbHandle)
 }
 
 pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
@@ -342,6 +492,10 @@ pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {
     Arc::new(ServerConfigHandle)
+}
+
+pub fn default_storage_class_interface() -> Arc<dyn StorageClassInterface> {
+    Arc::new(StorageClassHandle)
 }
 
 pub fn default_buffer_config_interface() -> Arc<dyn BufferConfigInterface> {

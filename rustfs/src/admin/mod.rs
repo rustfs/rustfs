@@ -119,7 +119,7 @@ mod ecstore_client {
 }
 
 mod ecstore_config {
-    pub(crate) use crate::storage::ecstore_config::{com, init, set_global_storage_class, storageclass};
+    pub(crate) use crate::storage::ecstore_config::{com, init, storageclass};
 }
 
 mod ecstore_data_usage {
@@ -133,10 +133,6 @@ mod ecstore_disk {
 
 mod ecstore_error {
     pub(crate) use crate::storage::ecstore_error::StorageError;
-}
-
-mod ecstore_global {
-    pub(crate) use crate::storage::ecstore_global::GLOBAL_BOOT_TIME;
 }
 
 #[allow(unused_imports)]
@@ -264,21 +260,6 @@ pub(crate) mod bucket_target_sys {
 }
 
 pub(crate) mod lifecycle {
-    pub(crate) mod bucket_lifecycle_ops {
-        use super::super::DailyAllTierStats;
-
-        pub(crate) struct GlobalTransitionStateCompat;
-
-        #[allow(non_upper_case_globals)]
-        pub(crate) static GLOBAL_TransitionState: GlobalTransitionStateCompat = GlobalTransitionStateCompat;
-
-        impl GlobalTransitionStateCompat {
-            pub(crate) fn get_daily_all_tier_stats(&self) -> DailyAllTierStats {
-                super::super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState.get_daily_all_tier_stats()
-            }
-        }
-    }
-
     pub(crate) mod tier_last_day_stats {
         #[cfg(test)]
         pub(crate) type LastDayTierStats = super::super::ecstore_bucket::lifecycle::tier_last_day_stats::LastDayTierStats;
@@ -394,27 +375,14 @@ pub(crate) mod quota {
 }
 
 pub(crate) mod replication {
-    use std::sync::Arc;
-
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
     pub(crate) type ObjectOpts = super::ecstore_bucket::replication::ObjectOpts;
-    pub(crate) type ReplicationStats = super::ecstore_bucket::replication::ReplicationStats;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
     #[cfg(test)]
     pub(crate) type TargetReplicationResyncStatus = super::ecstore_bucket::replication::TargetReplicationResyncStatus;
-
-    pub(crate) struct GlobalReplicationStatsCompat;
-
-    pub(crate) static GLOBAL_REPLICATION_STATS: GlobalReplicationStatsCompat = GlobalReplicationStatsCompat;
-
-    impl GlobalReplicationStatsCompat {
-        pub(crate) fn get(&self) -> Option<&'static Arc<ReplicationStats>> {
-            super::ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get()
-        }
-    }
 }
 
 pub(crate) mod target {
@@ -494,10 +462,6 @@ pub(crate) fn init_admin_config_defaults() {
     ecstore_config::init();
 }
 
-pub(crate) fn set_global_storage_class(cfg: storageclass::Config) {
-    ecstore_config::set_global_storage_class(cfg);
-}
-
 pub(crate) async fn load_data_usage_from_backend(
     store: Arc<ECStore>,
 ) -> std::result::Result<rustfs_data_usage::DataUsageInfo, Error> {
@@ -509,16 +473,6 @@ pub(crate) async fn collect_local_metrics(
     opts: &CollectMetricsOpts,
 ) -> rustfs_madmin::metrics::RealtimeMetrics {
     ecstore_metrics::collect_local_metrics(types, opts).await
-}
-
-pub(crate) struct BootTimeCompat;
-
-pub(crate) static GLOBAL_BOOT_TIME: BootTimeCompat = BootTimeCompat;
-
-impl BootTimeCompat {
-    pub(crate) fn get(&self) -> Option<&'static std::time::SystemTime> {
-        ecstore_global::GLOBAL_BOOT_TIME.get()
-    }
 }
 
 pub(crate) struct AdminErrorRef(fn() -> &'static AdminError);

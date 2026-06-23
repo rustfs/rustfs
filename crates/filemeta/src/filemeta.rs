@@ -652,7 +652,7 @@ impl FileMeta {
         } else {
             self.versions.remove(i);
 
-            let (free_version, to_free) = obj.init_free_version(fi);
+            let (free_version, to_free) = obj.init_free_version(fi)?;
 
             if to_free {
                 self.add_version_filemata(free_version).err()
