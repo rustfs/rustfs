@@ -48,6 +48,7 @@ CAPTURE_DURATION_SECS=""
 CAPTURE_INTERVAL_SECS=15
 CAPTURE_RUSTFS_PID=""
 CAPTURE_SKIP_HOST_TELEMETRY=false
+SKIP_CAPTURE=false
 
 usage() {
   cat <<'USAGE'
@@ -94,6 +95,7 @@ Capture options:
   --capture-interval-secs <n>         Default: 15
   --capture-rustfs-pid <pid>
   --capture-skip-host-telemetry
+  --skip-capture                     Run benchmark only and do not start capture
 
 Behavior:
   - If --capture-duration-secs is omitted, the wrapper derives a nominal
@@ -154,6 +156,7 @@ parse_args() {
       --capture-interval-secs) CAPTURE_INTERVAL_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --capture-rustfs-pid) CAPTURE_RUSTFS_PID="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --capture-skip-host-telemetry) CAPTURE_SKIP_HOST_TELEMETRY=true; shift ;;
+      --skip-capture) SKIP_CAPTURE=true; shift ;;
       --insecure) INSECURE=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -369,18 +372,23 @@ main() {
   require_cmd "$WARP_BIN"
 
   setup_output
-  local capture_duration
-  capture_duration="$(derive_capture_duration)"
-
   echo "Output dir: $OUT_DIR"
-  echo "Derived capture duration seconds: $capture_duration"
-  echo "Capture label: $CAPTURE_LABEL"
+  if [[ "$SKIP_CAPTURE" != "true" ]]; then
+    local capture_duration
+    capture_duration="$(derive_capture_duration)"
+    echo "Derived capture duration seconds: $capture_duration"
+    echo "Capture label: $CAPTURE_LABEL"
+    trap cleanup_capture EXIT
+    run_capture "$capture_duration"
+  else
+    echo "Capture: skipped"
+  fi
 
-  trap cleanup_capture EXIT
-  run_capture "$capture_duration"
   run_benchmark
-  wait "$CAPTURE_PID"
-  CAPTURE_PID=""
+  if [[ "$SKIP_CAPTURE" != "true" ]]; then
+    wait "$CAPTURE_PID"
+    CAPTURE_PID=""
+  fi
 
   echo
   echo "One-shot benchmark + capture run finished."

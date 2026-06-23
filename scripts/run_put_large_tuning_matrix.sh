@@ -42,6 +42,7 @@ CAPTURE_PROM_METRICS_URLS=""
 CAPTURE_INTERVAL_SECS=15
 CAPTURE_RUSTFS_PID=""
 CAPTURE_SKIP_HOST_TELEMETRY=false
+SKIP_CAPTURE=false
 
 APPLY_CMD=""
 APPLY_CMD_ARR=()
@@ -95,6 +96,7 @@ Capture options:
   --capture-interval-secs <n>        Default: 15
   --capture-rustfs-pid <pid>
   --capture-skip-host-telemetry
+  --skip-capture                     Reuse benchmark runner without starting capture
 
 Optional apply hook:
   --apply-cmd "<cmd>"                Optional plain command + args, no shell operators.
@@ -169,6 +171,7 @@ parse_args() {
       --capture-interval-secs) CAPTURE_INTERVAL_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --capture-rustfs-pid) CAPTURE_RUSTFS_PID="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --capture-skip-host-telemetry) CAPTURE_SKIP_HOST_TELEMETRY=true; shift ;;
+      --skip-capture) SKIP_CAPTURE=true; shift ;;
       --apply-cmd) APPLY_CMD="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --apply-wait-secs) APPLY_WAIT_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --insecure) INSECURE=true; shift ;;
@@ -359,6 +362,9 @@ run_profile() {
   fi
   if [[ "$CAPTURE_SKIP_HOST_TELEMETRY" == "true" ]]; then
     cmd+=(--capture-skip-host-telemetry)
+  fi
+  if [[ "$SKIP_CAPTURE" == "true" ]]; then
+    cmd+=(--skip-capture)
   fi
   if [[ "$INSECURE" == "true" ]]; then
     cmd+=(--insecure)
