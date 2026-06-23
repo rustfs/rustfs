@@ -15,14 +15,14 @@
 use super::super::{ECStore, set_object_store_resolver};
 use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_bucket_metadata_interface,
-    default_buffer_config_interface, default_endpoints_interface, default_kms_runtime_interface,
+    default_buffer_config_interface, default_deployment_id_interface, default_endpoints_interface, default_kms_runtime_interface,
     default_local_node_name_interface, default_lock_client_interface, default_notify_interface, default_region_interface,
-    default_server_config_interface, default_tier_config_interface,
+    default_runtime_port_interface, default_server_config_interface, default_tier_config_interface,
 };
 use super::interfaces::{
-    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface,
-    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface, RegionInterface, ServerConfigInterface,
-    TierConfigInterface,
+    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
+    IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface,
+    RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -39,6 +39,8 @@ pub struct AppContext {
     notify: Arc<dyn NotifyInterface>,
     bucket_metadata: Arc<dyn BucketMetadataInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
+    deployment_id: Arc<dyn DeploymentIdInterface>,
+    runtime_port: Arc<dyn RuntimePortInterface>,
     lock_client: Arc<dyn LockClientInterface>,
     local_node_name: Arc<dyn LocalNodeNameInterface>,
     action_credentials: Arc<dyn ActionCredentialInterface>,
@@ -58,6 +60,8 @@ impl AppContext {
             notify: default_notify_interface(),
             bucket_metadata: default_bucket_metadata_interface(),
             endpoints: default_endpoints_interface(),
+            deployment_id: default_deployment_id_interface(),
+            runtime_port: default_runtime_port_interface(),
             lock_client: default_lock_client_interface(),
             local_node_name: default_local_node_name_interface(),
             action_credentials: default_action_credential_interface(),
@@ -105,6 +109,14 @@ impl AppContext {
         self.endpoints.clone()
     }
 
+    pub fn deployment_id(&self) -> Arc<dyn DeploymentIdInterface> {
+        self.deployment_id.clone()
+    }
+
+    pub fn runtime_port(&self) -> Arc<dyn RuntimePortInterface> {
+        self.runtime_port.clone()
+    }
+
     pub fn lock_client(&self) -> Arc<dyn LockClientInterface> {
         self.lock_client.clone()
     }
@@ -142,6 +154,8 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) notify: Arc<dyn NotifyInterface>,
     pub(super) bucket_metadata: Arc<dyn BucketMetadataInterface>,
     pub(super) endpoints: Arc<dyn EndpointsInterface>,
+    pub(super) deployment_id: Arc<dyn DeploymentIdInterface>,
+    pub(super) runtime_port: Arc<dyn RuntimePortInterface>,
     pub(super) lock_client: Arc<dyn LockClientInterface>,
     pub(super) local_node_name: Arc<dyn LocalNodeNameInterface>,
     pub(super) action_credentials: Arc<dyn ActionCredentialInterface>,
@@ -162,6 +176,8 @@ impl AppContext {
             notify: interfaces.notify,
             bucket_metadata: interfaces.bucket_metadata,
             endpoints: interfaces.endpoints,
+            deployment_id: interfaces.deployment_id,
+            runtime_port: interfaces.runtime_port,
             lock_client: interfaces.lock_client,
             local_node_name: interfaces.local_node_name,
             action_credentials: interfaces.action_credentials,

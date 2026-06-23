@@ -41,15 +41,22 @@ accepted|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::F
 accepted|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
 accepted|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config|config resolution uses global AppContext
 accepted|rustfs/src/server/http.rs|infra->interface|crate::admin|HTTP server routes to admin handlers
+accepted|rustfs/src/server/layer.rs|infra->app|crate::app::context::resolve_kms_runtime_service_manager|HTTP layer reads KMS runtime through AppContext resolver
 accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path|pure path predicate for routing
 accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::HealthProbe|HTTP layer builds health responses
 accepted|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::build_health_response_parts|HTTP layer builds health responses
+accepted|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_endpoints_handle|readiness checks endpoint availability through AppContext resolver
+accepted|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_iam_ready|readiness checks IAM availability through AppContext resolver
 accepted|rustfs/src/startup_iam.rs|infra->app|crate::app::context::AppContext|startup wires IAM bootstrap through AppContext
+accepted|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config|storage buffer sizing reads runtime config through AppContext resolver
 accepted|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery|storage extension uses current ECFS interface query type
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS|storage tests exercise current ECFS interface path
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input|storage tests exercise current ECFS object-lock validator
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator|storage tests use current S3 API initiator helper
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_owner|storage tests use current S3 API owner helper
+accepted|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name|RPC health labels node identity through AppContext resolver
+accepted|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_iam_handle|node RPC IAM operations use AppContext resolver fallback
+accepted|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_lock_client|node RPC locking uses AppContext resolver fallback
 accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state|node RPC reloads admin runtime state
 accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot|node RPC reloads admin runtime state
 accepted|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state|node RPC reloads admin runtime state
