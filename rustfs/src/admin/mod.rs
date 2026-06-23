@@ -137,8 +137,7 @@ mod ecstore_error {
 
 mod ecstore_global {
     pub(crate) use crate::storage::ecstore_global::{
-        GLOBAL_BOOT_TIME, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_region,
-        global_rustfs_port,
+        GLOBAL_BOOT_TIME, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, global_rustfs_port,
     };
 }
 
@@ -523,10 +522,6 @@ pub(crate) fn get_global_deployment_id() -> Option<String> {
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     ecstore_global::get_global_endpoints_opt()
-}
-
-pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_global::get_global_region()
 }
 
 pub(crate) fn global_rustfs_port() -> u16 {

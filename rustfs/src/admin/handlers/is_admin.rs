@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
+use crate::app::context::resolve_action_credentials;
 use crate::auth::{check_key_valid, constant_time_eq, get_condition_values, get_session_token};
 use http::{HeaderMap, HeaderValue};
 use hyper::StatusCode;
 use matchit::Params;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_policy::policy::Args;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
@@ -47,7 +47,7 @@ impl Operation for IsAdminHandler {
         let access_key_to_check = input_cred.access_key.clone();
 
         // Check if the user is admin: root user check, then evaluate through the policy engine
-        let is_admin = if let Some(sys_cred) = get_global_action_cred() {
+        let is_admin = if let Some(sys_cred) = resolve_action_credentials() {
             constant_time_eq(&access_key_to_check, &sys_cred.access_key)
                 || constant_time_eq(&cred.parent_user, &sys_cred.access_key)
         } else {

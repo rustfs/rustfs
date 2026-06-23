@@ -16,6 +16,7 @@ use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
+use crate::app::context::resolve_action_credentials;
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use crate::{
@@ -26,7 +27,7 @@ use http::HeaderMap;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::{Credentials as StoredCredentials, get_global_action_cred};
+use rustfs_credentials::Credentials as StoredCredentials;
 use rustfs_iam::error::{is_err_no_such_service_account, is_err_no_such_temp_account};
 use rustfs_iam::store::Store as IamStore;
 use rustfs_iam::sys::{NewServiceAccountOpts, UpdateServiceAccountOpts};
@@ -267,7 +268,7 @@ impl Operation for AddServiceAccount {
             None
         };
 
-        let Some(sys_cred) = get_global_action_cred() else {
+        let Some(sys_cred) = resolve_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
@@ -1120,7 +1121,7 @@ impl Operation for ListAccessKeysBulk {
                 .into_keys()
                 .collect::<Vec<_>>();
 
-            if let Some(sys_cred) = get_global_action_cred() {
+            if let Some(sys_cred) = resolve_action_credentials() {
                 users.push(sys_cred.access_key);
             }
             users
