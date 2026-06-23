@@ -817,7 +817,7 @@ pub(crate) fn scanner_alert_excess_folders() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{ScannerRuntimeConfigSource, lookup_scanner_runtime_config, validate_scanner_runtime_config};
-    use crate::storage_compat::init_ecstore_config_for_scanner_tests;
+    use crate::init_ecstore_config_for_scanner_tests;
     use rustfs_config::server_config::{Config as ServerConfig, KVS};
     use rustfs_config::{
         DEFAULT_DELIMITER, ENV_SCANNER_BITROT_CYCLE_SECS, ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS, ENV_SCANNER_CYCLE,

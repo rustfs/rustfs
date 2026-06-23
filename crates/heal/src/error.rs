@@ -14,7 +14,7 @@
 
 use thiserror::Error;
 
-use crate::heal::storage_compat::{DiskError, EcstoreError};
+use super::heal::{DiskError, EcstoreError};
 
 /// Custom error type for heal operations
 /// This enum defines various error variants that can occur during

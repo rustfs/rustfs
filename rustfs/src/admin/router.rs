@@ -12,26 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::router_storage_compat::GLOBAL_BOOT_TIME;
-use super::router_storage_compat::PeerRestClient;
-use super::router_storage_compat::bandwidth::monitor::BandwidthDetails;
-use super::router_storage_compat::bucket_target_sys::{
-    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
-};
-use super::router_storage_compat::get_global_notification_sys;
-use super::router_storage_compat::metadata::BUCKET_TARGETS_FILE;
-use super::router_storage_compat::metadata_sys;
-use super::router_storage_compat::read_admin_config_without_migrate;
-use super::router_storage_compat::replication::{
+use super::GLOBAL_BOOT_TIME;
+use super::PeerRestClient;
+use super::bandwidth::monitor::BandwidthDetails;
+use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient};
+use super::get_global_notification_sys;
+use super::metadata::BUCKET_TARGETS_FILE;
+use super::metadata_sys;
+use super::read_admin_config_without_migrate;
+use super::replication::{
     BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts, get_global_replication_pool,
 };
-use super::router_storage_compat::target::{BucketTarget, BucketTargetType, BucketTargets};
-use super::router_storage_compat::versioning_sys::BucketVersioningSys;
-use super::router_storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use super::router_storage_compat::{get_global_bucket_monitor, get_global_deployment_id, get_global_region};
+use super::target::{BucketTarget, BucketTargetType, BucketTargets};
+use super::versioning_sys::BucketVersioningSys;
+use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use super::{get_global_bucket_monitor, get_global_deployment_id};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_region, resolve_server_config};
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -56,7 +54,6 @@ use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
@@ -650,7 +647,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         }
     }
 
-    let config = get_global_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    let config = resolve_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
     Ok(config)
 }
 
@@ -753,7 +750,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(get_global_region)
+        .or_else(resolve_region)
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -1419,7 +1416,7 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(super::router_storage_compat::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
+        Err(super::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -1517,7 +1514,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         bucket: Some(ext_req.bucket.clone()),
         object: None,
         version_id: None,
-        region: get_global_region(),
+        region: resolve_region(),
         ..Default::default()
     });
 
@@ -1944,7 +1941,7 @@ async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) 
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
     PutObjectOptions {
-        internal: super::router_storage_compat::bucket_target_sys::AdvancedPutOptions {
+        internal: super::bucket_target_sys::AdvancedPutOptions {
             source_version_id: Uuid::new_v4().to_string(),
             replication_status: ReplicationStatusType::Replica,
             source_mtime: now,
@@ -2059,7 +2056,7 @@ async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
             .object_lock_enabled
             .as_ref()
             .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
-        Err(super::router_storage_compat::StorageError::ConfigNotFound) => Ok(false),
+        Err(super::StorageError::ConfigNotFound) => Ok(false),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -2246,7 +2243,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         bucket,
         object,
         version_id: None,
-        region: get_global_region(),
+        region: resolve_region(),
         ..Default::default()
     });
 
@@ -2773,7 +2770,7 @@ mod tests {
     #[test]
     fn apply_replication_reset_to_targets_updates_matching_target() {
         let mut targets = BucketTargets {
-            targets: vec![super::super::router_storage_compat::target::BucketTarget {
+            targets: vec![super::super::target::BucketTarget {
                 arn: "arn:target".to_string(),
                 ..Default::default()
             }],
@@ -2795,10 +2792,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            super::super::router_storage_compat::replication::TargetReplicationResyncStatus {
+            super::super::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-01-03 00:00 UTC)),
-                resync_status: super::super::router_storage_compat::replication::ResyncStatusType::ResyncFailed,
+                resync_status: super::super::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2808,10 +2805,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            super::super::router_storage_compat::replication::TargetReplicationResyncStatus {
+            super::super::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
-                resync_status: super::super::router_storage_compat::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: super::super::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -2841,10 +2838,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            super::super::router_storage_compat::replication::TargetReplicationResyncStatus {
+            super::super::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-02-03 00:00 UTC)),
-                resync_status: super::super::router_storage_compat::replication::ResyncStatusType::ResyncFailed,
+                resync_status: super::super::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2854,10 +2851,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            super::super::router_storage_compat::replication::TargetReplicationResyncStatus {
+            super::super::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-02-02 00:00 UTC)),
-                resync_status: super::super::router_storage_compat::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: super::super::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -3665,7 +3662,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: get_global_region(),
+            region: resolve_region(),
             service: None,
             trailing_headers: None,
         };

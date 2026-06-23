@@ -14,12 +14,12 @@
 
 //! Bucket application use-case contracts.
 
-use super::usecase_storage_compat::ECStore;
-use super::usecase_storage_compat::StorageError;
-use super::usecase_storage_compat::get_global_notification_sys;
-use super::usecase_storage_compat::object_api_utils::to_s3s_etag;
-use super::usecase_storage_compat::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
-use super::usecase_storage_compat::{
+use super::ECStore;
+use super::StorageError;
+use super::get_global_notification_sys;
+use super::object_api_utils::to_s3s_etag;
+use super::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
+use super::{
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
@@ -40,7 +40,7 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::context::{
-    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+    AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
@@ -685,7 +685,7 @@ fn assign_lifecycle_rule_ids(rules: &mut [LifecycleRule]) {
     }
 }
 
-fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> Result<(), &'static str> {
+fn validate_lifecycle_rule_status(rules: &[LifecycleRule]) -> std::result::Result<(), &'static str> {
     for rule in rules {
         if rule.status != ExpirationStatus::from_static(ExpirationStatus::ENABLED)
             && rule.status != ExpirationStatus::from_static(ExpirationStatus::DISABLED)
@@ -1712,11 +1712,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
+        let notify = resolve_notify_interface_for_context(self.context.as_deref());
         let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();
@@ -2285,7 +2281,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| super::super::usecase_storage_compat::target::BucketTarget {
+                .map(|arn| super::super::target::BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

@@ -12,24 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_compat::{
+use super::super::{
     CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, FileInfoVersions, LocalPeerS3Client, MetricType,
     PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path,
-    collect_local_metrics, find_local_disk_by_ref, get_global_lock_client, get_local_server_property, load_bucket_metadata,
+    collect_local_metrics, find_local_disk_by_ref, get_local_server_property, load_bucket_metadata,
     reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
+use crate::app::context::{resolve_iam_handle, resolve_lock_client};
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::{get_global_local_node_name, heal_channel::HealOpts};
+use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfo, MetacacheReader};
-use rustfs_iam::{get_global_iam_sys, store::UserType};
+use rustfs_iam::store::UserType;
 use rustfs_lock::{LockClient, LockRequest};
 use rustfs_madmin::health::{
     get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
@@ -122,11 +123,11 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(result: super::storage_compat::Result<()>) -> Option<String> {
+fn background_rebalance_start_error_message(result: super::super::Result<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
-fn stop_rebalance_response(result: super::storage_compat::Result<()>) -> StopRebalanceResponse {
+fn stop_rebalance_response(result: super::super::Result<()>) -> StopRebalanceResponse {
     match result {
         Ok(_) => StopRebalanceResponse {
             success: true,
@@ -171,9 +172,9 @@ impl NodeService {
         all_local_disk_path().await
     }
 
-    /// Get the global lock client, returning an error if not initialized
+    /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        get_global_lock_client()
+        resolve_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
@@ -632,7 +633,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -661,7 +662,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -700,7 +701,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -728,7 +729,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -760,7 +761,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -790,7 +791,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -826,7 +827,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -857,7 +858,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = get_global_iam_sys() else {
+        let Some(iam_sys) = resolve_iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -2389,7 +2390,7 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message = background_rebalance_start_error_message(Err(super::super::storage_compat::Error::other("boom")))
+        let message = background_rebalance_start_error_message(Err(super::super::super::Error::other("boom")))
             .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
@@ -2398,7 +2399,7 @@ mod tests {
 
     #[test]
     fn test_stop_rebalance_response_reports_local_stop_error() {
-        let response = stop_rebalance_response(Err(super::super::storage_compat::Error::other("boom")));
+        let response = stop_rebalance_response(Err(super::super::super::Error::other("boom")));
 
         assert!(!response.success);
         assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
@@ -2734,10 +2735,7 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
-        vars.insert(
-            PEER_RESTSUB_SYS.to_string(),
-            super::super::storage_compat::STORAGE_CLASS_SUB_SYS.to_string(),
-        );
+        vars.insert(PEER_RESTSUB_SYS.to_string(), super::super::super::STORAGE_CLASS_SUB_SYS.to_string());
 
         let request = Request::new(SignalServiceRequest {
             vars: Some(Mss { value: vars }),

@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod common;
-
+use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
 use rustfs_heal::heal::{
     event::{HealEvent, Severity},
     task::{HealPriority, HealType},
@@ -22,8 +21,6 @@ use rustfs_heal::heal::{
 
 #[test]
 fn test_heal_event_to_heal_request_no_panic() {
-    use crate::common::storage_compat::Endpoint;
-
     // Test that invalid pool/set indices don't cause panic
     // Create endpoint using try_from or similar method
     let endpoint_result = Endpoint::try_from("http://localhost:9000");
@@ -47,8 +44,6 @@ fn test_heal_event_to_heal_request_no_panic() {
 
 #[test]
 fn test_heal_event_to_heal_request_valid_indices() {
-    use crate::common::storage_compat::Endpoint;
-
     // Test that valid indices work correctly
     let endpoint_result = Endpoint::try_from("http://localhost:9000");
     if let Ok(mut endpoint) = endpoint_result {
@@ -190,13 +185,10 @@ fn test_heal_task_status_atomic_update() {
         async fn ec_decode_rebuild(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<Vec<u8>> {
             Ok(vec![])
         }
-        async fn get_disk_status(
-            &self,
-            _endpoint: &crate::common::storage_compat::Endpoint,
-        ) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<rustfs_heal::heal::storage::DiskStatus> {
             Ok(rustfs_heal::heal::storage::DiskStatus::Ok)
         }
-        async fn format_disk(&self, _endpoint: &crate::common::storage_compat::Endpoint) -> rustfs_heal::Result<()> {
+        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
         async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_storage_api::BucketInfo>> {
@@ -250,7 +242,7 @@ fn test_heal_task_status_atomic_update() {
         ) -> rustfs_heal::Result<(Vec<String>, Option<String>, bool)> {
             Ok((vec![], None, false))
         }
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<crate::common::storage_compat::DiskStore> {
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<DiskStore> {
             Err(rustfs_heal::Error::other("Not implemented in mock"))
         }
     }
@@ -320,11 +312,11 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(Vec::new())
         }
 
-        async fn get_disk_status(&self, _endpoint: &crate::common::storage_compat::Endpoint) -> rustfs_heal::Result<DiskStatus> {
+        async fn get_disk_status(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<DiskStatus> {
             Ok(DiskStatus::Ok)
         }
 
-        async fn format_disk(&self, _endpoint: &crate::common::storage_compat::Endpoint) -> rustfs_heal::Result<()> {
+        async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
 
@@ -394,7 +386,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok((Vec::new(), None, false))
         }
 
-        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<crate::common::storage_compat::DiskStore> {
+        async fn get_disk_for_resume(&self, _set_disk_id: &str) -> rustfs_heal::Result<DiskStore> {
             Err(rustfs_heal::Error::other("not implemented"))
         }
     }

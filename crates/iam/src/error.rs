@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::IamStorageError;
+use crate::IamStorageError;
 use rustfs_policy::policy::Error as PolicyError;
 
 pub type Result<T> = core::result::Result<T, Error>;

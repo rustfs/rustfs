@@ -19,15 +19,15 @@ use crate::error::{Error, Result};
 use crate::manager::extract_jwt_claims;
 use crate::manager::get_default_policyes;
 use crate::manager::{IamCache, IamSyncMetricsSnapshot};
-use crate::storage_compat::{
-    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
-    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
-};
 use crate::store::GroupInfo;
 use crate::store::MappedPolicy;
 use crate::store::Store;
 use crate::store::UserType;
 use crate::utils::{extract_claims, extract_claims_allow_missing_exp};
+use crate::{
+    notify_iam_delete_policy, notify_iam_delete_service_account, notify_iam_delete_user, notify_iam_load_group,
+    notify_iam_load_policy, notify_iam_load_policy_mapping, notify_iam_load_service_account, notify_iam_load_user,
+};
 use rustfs_credentials::{Credentials, EMBEDDED_POLICY_TYPE, INHERITED_POLICY_TYPE, get_global_action_cred};
 use rustfs_madmin::AddOrUpdateUserReq;
 use rustfs_madmin::GroupDesc;

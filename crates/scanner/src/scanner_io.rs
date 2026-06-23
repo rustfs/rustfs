@@ -43,7 +43,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
 use crate::ScannerObjectInfo as ObjectInfo;
-use crate::storage_compat::{
+use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_global_free_version,
@@ -1524,7 +1524,7 @@ impl ScannerIODisk for Disk {
 mod tests {
     use super::*;
     use crate::scanner_folder::ScannerItem;
-    use crate::storage_compat::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
+    use crate::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
     use serial_test::serial;
     use temp_env::with_var;
     use uuid::Uuid;

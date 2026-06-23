@@ -12,30 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::auth::validate_admin_request;
-use crate::admin::handlers::storage_compat::Error as StorageError;
-use crate::admin::handlers::storage_compat::bucket_target_sys::BucketTargetSys;
-use crate::admin::handlers::storage_compat::metadata::{
+use super::super::Error as StorageError;
+use super::super::bucket_target_sys::BucketTargetSys;
+use super::super::ecstore_utils::{deserialize, serialize};
+use super::super::metadata::{
     BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
-use crate::admin::handlers::storage_compat::metadata_sys;
-use crate::admin::handlers::storage_compat::replication::GLOBAL_REPLICATION_STATS;
-use crate::admin::handlers::storage_compat::replication::{ResyncOpts, get_global_replication_pool};
-use crate::admin::handlers::storage_compat::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use crate::admin::handlers::storage_compat::utils::{deserialize, serialize};
-use crate::admin::handlers::storage_compat::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use crate::admin::handlers::storage_compat::{delete_admin_config, read_admin_config, save_admin_config};
-use crate::admin::handlers::storage_compat::{
-    get_global_deployment_id, get_global_endpoints_opt, get_global_region, global_rustfs_port,
-};
+use super::super::metadata_sys;
+use super::super::replication::GLOBAL_REPLICATION_STATS;
+use super::super::replication::{ResyncOpts, get_global_replication_pool};
+use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use super::super::{delete_admin_config, read_admin_config, save_admin_config};
+use super::super::{get_global_deployment_id, get_global_endpoints_opt, global_rustfs_port};
+use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_region, resolve_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -47,7 +45,6 @@ use http::header::{CONTENT_TYPE, HOST};
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{
     DEFAULT_CONSOLE_ADDRESS, DEFAULT_DELIMITER, DEFAULT_RUSTFS_TLS_PATH, ENV_RUSTFS_CONSOLE_ADDRESS, ENV_RUSTFS_TLS_PATH,
     MAX_ADMIN_REQUEST_BODY_SIZE,
@@ -654,7 +651,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::handlers::storage_compat::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&super::super::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -785,7 +782,7 @@ fn ldap_settings_from_kvs(kvs: &rustfs_config::server_config::KVS) -> (LDAPSetti
 }
 
 fn load_ldap_idp_settings() -> (LDAPSettings, LDAPConfigSettings) {
-    let Some(config) = get_global_server_config() else {
+    let Some(config) = resolve_server_config() else {
         return (LDAPSettings::default(), LDAPConfigSettings::default());
     };
 
@@ -1233,7 +1230,7 @@ async fn send_peer_admin_request<T: Serialize>(
         access_key,
         secret_key,
         "",
-        get_global_region()
+        resolve_region()
             .map(|region| region.to_string())
             .as_deref()
             .unwrap_or("us-east-1"),
@@ -1346,7 +1343,7 @@ async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &st
         access_key,
         secret_key,
         "",
-        get_global_region()
+        resolve_region()
             .map(|region| region.to_string())
             .as_deref()
             .unwrap_or("us-east-1"),
@@ -1592,7 +1589,7 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
         let mut entry = SRBucketInfo {
             bucket: bucket.name.clone(),
             created_at: bucket.created,
-            location: get_global_region().map(|region| region.to_string()).unwrap_or_default(),
+            location: resolve_region().map(|region| region.to_string()).unwrap_or_default(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         };
@@ -2736,6 +2733,10 @@ fn site_replication_bucket_target_for_peer(
     let port = parsed.port_or_known_default().ok_or_else(|| {
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing port: {}", peer.endpoint))
     })?;
+    let region = resolve_region()
+        .map(|region| region.to_string())
+        .filter(|region| !region.is_empty())
+        .unwrap_or_else(|| "us-east-1".to_string());
     let arn = arn_override.unwrap_or_else(|| {
         ARN::new(
             BucketTargetType::ReplicationService,
@@ -2758,6 +2759,7 @@ fn site_replication_bucket_target_for_peer(
         target_bucket: bucket.to_string(),
         secure: parsed.scheme().eq_ignore_ascii_case("https"),
         arn,
+        region,
         target_type: BucketTargetType::ReplicationService,
         deployment_id: peer.deployment_id.clone(),
         ..Default::default()
@@ -3354,10 +3356,7 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
     incoming_updated_at.is_some_and(|incoming_updated_at| incoming_updated_at < local_updated_at)
 }
 
-fn bucket_meta_local_updated_at(
-    bucket_meta: &crate::admin::handlers::storage_compat::metadata::BucketMetadata,
-    config_file: &str,
-) -> OffsetDateTime {
+fn bucket_meta_local_updated_at(bucket_meta: &super::super::metadata::BucketMetadata, config_file: &str) -> OffsetDateTime {
     match config_file {
         BUCKET_POLICY_CONFIG => bucket_meta.policy_config_updated_at,
         BUCKET_TAGGING_CONFIG => bucket_meta.tagging_config_updated_at,
@@ -3469,6 +3468,31 @@ async fn apply_bucket_meta_item(item: SRBucketMeta) -> S3Result<()> {
         )
         .await?;
     }
+
+    if item.r#type == "version-config"
+        && metadata_sys::get_versioning_config(&item.bucket)
+            .await
+            .ok()
+            .is_some_and(|(config, _)| config.enabled())
+        && let Some(runtime) = runtime_site_replication_targets().await?
+    {
+        ensure_site_replication_bucket_targets(
+            &item.bucket,
+            &runtime.state,
+            &runtime.local_peer,
+            replication_config.as_ref(),
+            &runtime.service_account_secret_key,
+        )
+        .await?;
+        ensure_site_replication_bucket_replication_config(
+            &item.bucket,
+            &runtime.state,
+            &runtime.local_peer,
+            &runtime.service_account_secret_key,
+        )
+        .await?;
+    }
+
     Ok(())
 }
 
@@ -4206,7 +4230,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
         if let Some(oidc) = get_oidc() {
             let providers = oidc.list_providers();
             settings.open_id.enabled = !providers.is_empty();
-            settings.open_id.region = get_global_region().map(|region| region.to_string()).unwrap_or_default();
+            settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();
 
             for provider in providers {
                 let Some(config) = oidc.get_provider_config(&provider.provider_id) else {
@@ -4575,9 +4599,9 @@ impl Operation for SRRotateServiceAccountHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::super::Endpoint;
+    use super::super::super::{EndpointServerPools, Endpoints, PoolEndpoints};
     use super::*;
-    use crate::admin::handlers::storage_compat::Endpoint;
-    use crate::admin::handlers::storage_compat::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;
@@ -5494,6 +5518,7 @@ mod tests {
         assert_eq!(target.target_bucket, "photos");
         assert_eq!(target.deployment_id, "remote");
         assert_eq!(target.arn, "arn:rustfs:replication::remote:photos");
+        assert_eq!(target.region, "us-east-1");
         let credentials = target
             .credentials
             .as_ref()

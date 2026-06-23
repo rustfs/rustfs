@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{get_global_region, get_notification_config};
 use crate::server::ShutdownHandle;
-use crate::storage::{process_lambda_configurations, process_queue_configurations, process_topic_configurations};
+use crate::storage::{
+    get_bucket_notification_config, get_global_region, process_lambda_configurations, process_queue_configurations,
+    process_topic_configurations,
+};
 use crate::{admin, config, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
@@ -174,7 +176,7 @@ pub async fn add_bucket_notification_configuration(buckets: Vec<String>) {
             RUSTFS_REGION
         });
     for bucket in buckets.iter() {
-        let has_notification_config = get_notification_config(bucket).await.unwrap_or_else(|err| {
+        let has_notification_config = get_bucket_notification_config(bucket).await.unwrap_or_else(|err| {
             warn!(
                 target: "rustfs::init",
                 event = "notification_config_load_failed",

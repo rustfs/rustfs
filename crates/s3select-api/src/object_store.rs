@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_compat::{
+use crate::{
     SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
-    SelectStore, resolve_select_object_store_handle, select_default_read_buffer_size_u64, select_is_err_bucket_not_found,
-    select_is_err_object_not_found, select_is_err_version_not_found,
+    SelectStore, resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
+    select_is_err_version_not_found,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -48,6 +48,10 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
+
+fn select_default_read_buffer_size_u64() -> u64 {
+    u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)
+}
 
 /// Maximum allowed object size for JSON DOCUMENT mode.
 ///

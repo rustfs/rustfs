@@ -19,11 +19,103 @@ pub mod manager;
 pub mod progress;
 pub mod resume;
 pub mod storage;
-pub(crate) mod storage_compat;
 pub mod task;
 pub mod utils;
+
+use rustfs_ecstore::api::data_usage::DATA_USAGE_CACHE_NAME as ECSTORE_DATA_USAGE_CACHE_NAME;
+use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
+use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
+use rustfs_ecstore::api::disk::{
+    BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes, DeleteOptions as EcstoreDeleteOptions,
+    DiskAPI as EcstoreDiskAPI, DiskStore as EcstoreDiskStore, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+};
+#[cfg(test)]
+use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
+use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
+use rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP as ECSTORE_GLOBAL_LOCAL_DISK_MAP;
+use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
 pub use resume::{CheckpointManager, ResumeCheckpoint, ResumeManager, ResumeState, ResumeUtils};
 pub use task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
+
+pub(crate) const DATA_USAGE_CACHE_NAME: &str = ECSTORE_DATA_USAGE_CACHE_NAME;
+pub(crate) const BUCKET_META_PREFIX: &str = ECSTORE_BUCKET_META_PREFIX;
+pub(crate) const RUSTFS_META_BUCKET: &str = ECSTORE_RUSTFS_META_BUCKET;
+
+pub(crate) type DiskError = EcstoreDiskError;
+pub(crate) type DiskResult<T> = EcstoreDiskResult<T>;
+pub(crate) type DiskStore = EcstoreDiskStore;
+pub(crate) type ECStore = EcstoreStore;
+pub(crate) type EcstoreError = EcstoreErrorType;
+pub(crate) type Endpoint = EcstoreEndpoint;
+pub(crate) type StorageError = EcstoreStorageError;
+pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
+
+pub(crate) struct GlobalLocalDiskMap;
+
+pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap;
+
+impl GlobalLocalDiskMap {
+    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
+        ECSTORE_GLOBAL_LOCAL_DISK_MAP.read().await
+    }
+}
+
+#[cfg(test)]
+pub(crate) type DiskOption = EcstoreDiskOption;
+
+#[cfg(test)]
+pub(crate) async fn new_disk(ep: &Endpoint, opt: &DiskOption) -> DiskResult<DiskStore> {
+    ecstore_new_disk(ep, opt).await
+}
+
+pub(crate) trait HealDiskExt {
+    fn endpoint(&self) -> Endpoint;
+    async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>>;
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<EcstoreDiskBytes>;
+    async fn write_all(&self, volume: &str, path: &str, data: EcstoreDiskBytes) -> DiskResult<()>;
+    async fn delete(&self, volume: &str, path: &str, options: EcstoreDeleteOptions) -> DiskResult<()>;
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>>;
+    #[cfg(test)]
+    async fn make_volume(&self, volume: &str) -> DiskResult<()>;
+}
+
+impl<T> HealDiskExt for T
+where
+    T: EcstoreDiskAPI,
+{
+    fn endpoint(&self) -> Endpoint {
+        EcstoreDiskAPI::endpoint(self)
+    }
+
+    async fn get_disk_id(&self) -> DiskResult<Option<uuid::Uuid>> {
+        EcstoreDiskAPI::get_disk_id(self).await
+    }
+
+    async fn read_all(&self, volume: &str, path: &str) -> DiskResult<EcstoreDiskBytes> {
+        EcstoreDiskAPI::read_all(self, volume, path).await
+    }
+
+    async fn write_all(&self, volume: &str, path: &str, data: EcstoreDiskBytes) -> DiskResult<()> {
+        EcstoreDiskAPI::write_all(self, volume, path, data).await
+    }
+
+    async fn delete(&self, volume: &str, path: &str, options: EcstoreDeleteOptions) -> DiskResult<()> {
+        EcstoreDiskAPI::delete(self, volume, path, options).await
+    }
+
+    async fn list_dir(&self, origvolume: &str, volume: &str, dir_path: &str, count: i32) -> DiskResult<Vec<String>> {
+        EcstoreDiskAPI::list_dir(self, origvolume, volume, dir_path, count).await
+    }
+
+    #[cfg(test)]
+    async fn make_volume(&self, volume: &str) -> DiskResult<()> {
+        EcstoreDiskAPI::make_volume(self, volume).await
+    }
+}
+
+pub type HealObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
+pub type HealObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub type HealPutObjReader = <ECStore as rustfs_storage_api::ObjectIO>::PutObjectReader;

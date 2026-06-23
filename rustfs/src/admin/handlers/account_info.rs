@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::versioning_sys::BucketVersioningSys;
 use crate::admin::auth::authenticate_request;
-use crate::admin::handlers::storage_compat::versioning_sys::BucketVersioningSys;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_action_credentials, resolve_object_store_handle};
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
@@ -145,10 +144,10 @@ impl Operation for AccountInfoHandler {
             cred.access_key.clone()
         };
 
-        let Some(admin_cred) = get_global_action_cred() else {
+        let Some(admin_cred) = resolve_action_credentials() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
-                "get_global_action_cred failed".to_string(),
+                "action credentials are not initialized".to_string(),
             ));
         };
 

@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::ECStore;
 use crate::{
     server::{ServiceStateManager, ShutdownHandle, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_services::StartupServiceRuntime,
     startup_shutdown::run_startup_shutdown_sequence,
-    startup_storage_compat::ECStore,
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_scanner::init_data_scanner;

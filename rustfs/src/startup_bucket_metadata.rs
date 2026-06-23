@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{
+use crate::storage::{
     ECStore, get_global_replication_pool, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use rustfs_storage_api::{BucketOperations, BucketOptions};

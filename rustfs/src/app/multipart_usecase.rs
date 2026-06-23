@@ -14,16 +14,16 @@
 
 //! Multipart application use-case contracts.
 
-use super::usecase_storage_compat::ECStore;
-use super::usecase_storage_compat::is_disk_compressible;
-use super::usecase_storage_compat::is_valid_storage_class;
-use super::usecase_storage_compat::object_api_utils::to_s3s_etag;
-use super::usecase_storage_compat::quota::checker::QuotaChecker;
+use super::ECStore;
+use super::is_disk_compressible;
+use super::is_valid_storage_class;
+use super::object_api_utils::to_s3s_etag;
+use super::quota::checker::QuotaChecker;
 #[cfg(test)]
-use super::usecase_storage_compat::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::usecase_storage_compat::{HashReader, WritePlan};
-use super::usecase_storage_compat::{StorageError, is_err_object_not_found, is_err_version_not_found};
-use super::usecase_storage_compat::{
+use super::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
+use super::{HashReader, WritePlan};
+use super::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
@@ -482,12 +482,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    super::usecase_storage_compat::record_bucket_object_write_memory(
-                        &bucket,
-                        previous_current_size,
-                        obj_info.size.max(0) as u64,
-                    )
-                    .await;
+                    super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);
@@ -675,7 +670,7 @@ impl DefaultMultipartUsecase {
             rustfs_utils::http::insert_str(
                 &mut metadata,
                 rustfs_utils::http::SUFFIX_COMPRESSION,
-                super::usecase_storage_compat::compression_metadata_value(CompressionAlgorithm::default()),
+                super::compression_metadata_value(CompressionAlgorithm::default()),
             );
         }
 
@@ -894,13 +889,11 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    super::usecase_storage_compat::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
+                    super::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => super::usecase_storage_compat::WriteEncryption::multipart(
-                    ssec_material.key_bytes,
-                    ssec_material.base_nonce,
-                    part_id,
-                ),
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    super::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
+                }
             };
             write_plan = write_plan.with_encryption(ssec_write);
             (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
@@ -916,16 +909,11 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    super::usecase_storage_compat::WriteEncryption::multipart_object_key(
-                        managed_material.key_bytes,
-                        part_id as u32,
-                    )
+                    super::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => super::usecase_storage_compat::WriteEncryption::multipart(
-                    managed_material.key_bytes,
-                    managed_material.base_nonce,
-                    part_id,
-                ),
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    super::WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
+                }
             };
             write_plan = write_plan.with_encryption(managed_write);
             (Some(server_side_encryption), ssekms_key_id)
@@ -1240,13 +1228,11 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    super::usecase_storage_compat::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
+                    super::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => super::usecase_storage_compat::WriteEncryption::multipart(
-                    ssec_material.key_bytes,
-                    ssec_material.base_nonce,
-                    part_id,
-                ),
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    super::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
+                }
             };
             write_plan = write_plan.with_encryption(ssec_write);
             (
@@ -1266,16 +1252,11 @@ impl DefaultMultipartUsecase {
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
                 crate::storage::sse::EncryptionKeyKind::Object => {
-                    super::usecase_storage_compat::WriteEncryption::multipart_object_key(
-                        managed_material.key_bytes,
-                        part_id as u32,
-                    )
+                    super::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => super::usecase_storage_compat::WriteEncryption::multipart(
-                    managed_material.key_bytes,
-                    managed_material.base_nonce,
-                    part_id,
-                ),
+                crate::storage::sse::EncryptionKeyKind::Direct => {
+                    super::WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
+                }
             };
             write_plan = write_plan.with_encryption(managed_write);
             (Some(server_side_encryption), ssekms_key_id, mp_info.user_defined.clone())

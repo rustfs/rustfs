@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::{read_admin_config_without_migrate, save_admin_server_config};
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
-use crate::admin::handlers::storage_compat::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{resolve_object_store_handle, resolve_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -29,7 +29,6 @@ use rustfs_config::oidc::{
     OIDC_REDIRECT_URI, OIDC_REDIRECT_URI_DYNAMIC, OIDC_ROLE_POLICY, OIDC_ROLES_CLAIM, OIDC_SCOPES, OIDC_USERNAME_CLAIM,
 };
 use rustfs_config::server_config::Config as ServerConfig;
-use rustfs_config::server_config::get_global_server_config;
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::egress::validate_outbound_url;
@@ -827,7 +826,7 @@ fn provider_instance_key(provider_id: &str) -> String {
 }
 
 fn oidc_restart_required(config: &ServerConfig) -> bool {
-    let active_config = get_global_server_config();
+    let active_config = resolve_server_config();
     oidc_restart_required_from_active_config(config, active_config.as_ref())
 }
 

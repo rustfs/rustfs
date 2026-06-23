@@ -52,7 +52,6 @@
 
 pub mod capacity_integration;
 pub mod service;
-mod storage_compat;
 
 pub use service::{
     capacity_disk_ref, get_cached_capacity_with_metrics, init_capacity_management_for_local_disks, record_capacity_write,

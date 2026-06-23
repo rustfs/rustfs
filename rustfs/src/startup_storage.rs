@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::startup_storage_compat::{
+use crate::startup_fs_guard::enforce_unsupported_fs_policy;
+use crate::storage::{
     ECStore, EndpointServerPools, init_background_replication, init_ecstore_config, init_global_config_sys, init_local_disks,
     init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config, update_erasure_type,
 };
-use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
     io::{Error, Result},

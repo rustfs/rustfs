@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod common;
-
-use crate::common::storage_compat::{
-    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
-};
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
@@ -119,7 +118,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // format disks (only first time)
     init_local_disks(endpoint_pools.clone()).await.unwrap();

@@ -14,9 +14,9 @@
 
 //! test endpoint index settings
 
-mod common;
-
-use crate::common::storage_compat::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
+use rustfs_ecstore::api::disk::endpoint::Endpoint;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use std::net::SocketAddr;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -58,7 +58,7 @@ async fn test_endpoint_index_settings() -> anyhow::Result<()> {
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // validate all endpoint indexes are in valid range
     for (i, ep) in endpoints.iter().enumerate() {

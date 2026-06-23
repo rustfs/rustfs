@@ -12,17 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod common;
-
-use crate::common::storage_compat::{
-    BUCKET_LIFECYCLE_CONFIG, BucketVersioningSys, DiskOption, ECStore, Endpoint, EndpointServerPools, Endpoints,
-    GLOBAL_TierConfigMgr, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerTestDiskExt as _,
-    ScannerWarmBackend, TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
-    enqueue_transition_for_existing_objects, get_bucket_metadata, init_background_expiry, init_bucket_metadata_sys,
-    init_local_disks, new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
-};
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
+use rustfs_ecstore::api::bucket::lifecycle::{
+    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, init_background_expiry},
+    lifecycle::TransitionOptions,
+};
+use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
+use rustfs_ecstore::api::bucket::metadata_sys::{
+    get as get_bucket_metadata, init_bucket_metadata_sys, update as update_bucket_metadata,
+};
+use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
+use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
+use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
+use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
+use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
+use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+use rustfs_ecstore::api::tier::tier_config::{TierConfig, TierMinIO, TierType};
+use rustfs_ecstore::api::tier::warm_backend::{
+    WarmBackend as ScannerWarmBackend, WarmBackendGetOpts, build_transition_put_options,
+};
 use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
@@ -110,7 +120,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
     // format disks (only first time)
     init_local_disks(endpoint_pools.clone()).await.unwrap();
@@ -181,7 +191,7 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
     };
 
-    let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
+    let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
     init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();

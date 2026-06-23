@@ -69,7 +69,7 @@
 //! }
 //! ```
 
-use super::core_storage_compat::StorageError;
+use super::StorageError;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
 use aes_gcm::{
@@ -133,8 +133,8 @@ const SEALED_KEY_SIZE: usize = DARE_HEADER_SIZE + 32 + DARE_TAG_SIZE;
 #[cfg(feature = "rio-v2")]
 const OBJECT_KEY_DERIVATION_CONTEXT: &[u8] = b"object-encryption-key generation";
 
-use super::core_storage_compat::Error;
-use super::core_storage_compat::get_bucket_sse_config;
+use super::Error;
+use super::get_bucket_sse_config;
 use crate::error::ApiError;
 use rustfs_utils::http::headers::{
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY,
@@ -751,20 +751,16 @@ pub struct ManagedSealedKey {
 }
 
 impl EncryptionMaterial {
-    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> super::core_storage_compat::WriteEncryption {
+    pub fn write_encryption(&self, multipart_part_number: Option<usize>) -> super::WriteEncryption {
         match (self.key_kind, multipart_part_number) {
             (EncryptionKeyKind::Object, Some(part_number)) => {
-                super::core_storage_compat::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
+                super::WriteEncryption::multipart_object_key(self.key_bytes, part_number as u32)
             }
-            (EncryptionKeyKind::Object, None) => {
-                super::core_storage_compat::WriteEncryption::singlepart_object_key(self.key_bytes)
-            }
+            (EncryptionKeyKind::Object, None) => super::WriteEncryption::singlepart_object_key(self.key_bytes),
             (EncryptionKeyKind::Direct, Some(part_number)) => {
-                super::core_storage_compat::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
+                super::WriteEncryption::multipart(self.key_bytes, self.base_nonce, part_number)
             }
-            (EncryptionKeyKind::Direct, None) => {
-                super::core_storage_compat::WriteEncryption::singlepart(self.key_bytes, self.base_nonce)
-            }
+            (EncryptionKeyKind::Direct, None) => super::WriteEncryption::singlepart(self.key_bytes, self.base_nonce),
         }
     }
 }

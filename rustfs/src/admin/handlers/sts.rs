@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::ecstore_utils::serialize;
 use super::is_admin::IsAdminHandler;
-use crate::admin::handlers::storage_compat::utils::serialize;
 use crate::{
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
+    app::context::resolve_action_credentials,
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,
@@ -28,7 +29,6 @@ use http::header::HeaderValue;
 use hyper::Method;
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
-use rustfs_credentials::get_global_action_cred;
 use rustfs_iam::{manager::get_token_signing_key, oidc::OidcClaims, sys::SESSION_POLICY_NAME};
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRIAMItem, SRSTSCredential};
 use rustfs_policy::{
@@ -262,7 +262,7 @@ async fn handle_assume_role(
         .await
         .map_err(|_| s3_error!(InternalError, "set_temp_user failed"))?;
 
-    let root_access_key = get_global_action_cred().map(|cred| cred.access_key);
+    let root_access_key = resolve_action_credentials().map(|cred| cred.access_key);
     if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
         && let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "sts-credential".to_string(),

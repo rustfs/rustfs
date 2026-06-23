@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::usecase_storage_compat::{
+use super::{
     AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
     WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
@@ -107,9 +107,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    super::usecase_storage_compat::init_local_disks(endpoint_pools.clone())
-        .await
-        .unwrap();
+    super::init_local_disks(endpoint_pools.clone()).await.unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -126,7 +124,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    super::usecase_storage_compat::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    super::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -926,12 +924,9 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::usecase_storage_compat::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
-        ecstore.clone(),
-        bucket.as_str(),
-    )
-    .await
-    .expect("Failed to enqueue transitioned object");
+    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+        .await
+        .expect("Failed to enqueue transitioned object");
 
     let transitioned = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await
@@ -986,12 +981,9 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::usecase_storage_compat::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(
-        ecstore.clone(),
-        bucket.as_str(),
-    )
-    .await
-    .expect("Failed to enqueue transitioned object");
+    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+        .await
+        .expect("Failed to enqueue transitioned object");
 
     let _ = wait_for_transition(&ecstore, bucket.as_str(), object, TRANSITION_WAIT_TIMEOUT)
         .await

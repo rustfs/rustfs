@@ -50,7 +50,7 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use crate::storage_compat::{
+use crate::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
     ReplicationConfig, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
@@ -2420,7 +2420,7 @@ mod tests {
     use crate::SCANNER_SLEEPER;
 
     use super::*;
-    use crate::storage_compat::{DiskOption, Endpoint, new_disk};
+    use crate::{DiskOption, Endpoint, new_disk};
     use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType};
     use serial_test::serial;
     #[cfg(unix)]

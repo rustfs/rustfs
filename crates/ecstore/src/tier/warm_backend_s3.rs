@@ -36,6 +36,7 @@ use crate::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };
+use rustfs_utils::egress::validate_outbound_url;
 use rustfs_utils::path::SLASH_SEPARATOR;
 
 pub struct WarmBackendS3 {
@@ -54,6 +55,7 @@ impl WarmBackendS3 {
                 return Err(std::io::Error::other(err.to_string()));
             }
         };
+        validate_outbound_url(&u).map_err(|err| std::io::Error::other(format!("tier endpoint is not allowed: {err}")))?;
 
         if conf.aws_role_web_identity_token_file == "" && conf.aws_role_arn != ""
             || conf.aws_role_web_identity_token_file != "" && conf.aws_role_arn == ""
@@ -117,6 +119,28 @@ impl WarmBackendS3 {
             dest_obj = format!("{}/{}", &self.prefix, object);
         }
         return dest_obj;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn new_rejects_loopback_endpoint_before_network_setup() {
+        let conf = TierS3 {
+            endpoint: "https://127.0.0.1:9000".to_string(),
+            bucket: "tier-bucket".to_string(),
+            access_key: "access".to_string(),
+            secret_key: "secret".to_string(),
+            region: "us-east-1".to_string(),
+            ..Default::default()
+        };
+
+        match WarmBackendS3::new(&conf, "tier").await {
+            Ok(_) => panic!("loopback endpoint should be rejected"),
+            Err(err) => assert!(err.to_string().contains("not allowed")),
+        }
     }
 }
 
