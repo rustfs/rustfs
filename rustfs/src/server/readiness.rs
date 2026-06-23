@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage::{
-    Endpoint, EndpointServerPools, get_global_endpoints_opt, get_global_lock_clients, is_dist_erasure,
-    resolve_object_store_handle,
-};
+use crate::storage::{Endpoint, EndpointServerPools, get_global_lock_clients, is_dist_erasure, resolve_object_store_handle};
 #[cfg(test)]
 use crate::storage::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
@@ -27,7 +25,6 @@ use http_body_util::{BodyExt, Full};
 use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
-use rustfs_iam::get_global_iam_sys;
 use rustfs_madmin::{Disk, StorageInfo};
 use rustfs_storage_api::StorageAdminApi;
 use std::future::Future;
@@ -441,7 +438,7 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
 }
 
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let iam_ready_raw = resolve_iam_ready();
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
@@ -475,7 +472,7 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
 }
 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready_raw = get_global_iam_sys().is_some_and(|sys| sys.is_ready());
+    let iam_ready_raw = resolve_iam_ready();
     let storage_ready = collect_storage_readiness_uncached().await;
     let lock_quorum_status = collect_lock_quorum_status_uncached().await;
 
@@ -584,7 +581,7 @@ async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
         };
     }
 
-    let Some(pool_endpoints) = get_global_endpoints_opt() else {
+    let Some(pool_endpoints) = resolve_endpoints_handle() else {
         return LockQuorumStatus::default();
     };
     let Some(lock_clients) = get_global_lock_clients() else {
