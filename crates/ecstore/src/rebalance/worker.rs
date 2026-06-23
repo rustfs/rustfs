@@ -10,6 +10,7 @@ use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
 };
 use crate::pools::ListCallback;
+use crate::runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use rand::RngExt as _;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
@@ -382,7 +383,7 @@ pub(super) async fn load_rebalance_bucket_configs(bucket: &str) -> Result<Rebala
     )?;
 
     Ok(RebalanceBucketConfigs {
-        lifecycle_config: crate::global::GLOBAL_LifecycleSys.get(bucket).await,
+        lifecycle_config: runtime_sources::bucket_lifecycle_config(bucket).await,
         lock_retention: crate::bucket::object_lock::objectlock_sys::BucketObjectLockSys::get(bucket).await,
         replication_config: resolve_rebalance_optional_bucket_config_result(
             bucket,

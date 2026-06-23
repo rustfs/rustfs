@@ -35,7 +35,6 @@ use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
 use crate::runtime_sources;
@@ -2731,7 +2730,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+        let mut tier_config_mgr = tier_config_mgr.write().await;
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
@@ -2893,7 +2893,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 bucket_name: bucket.to_string(),
                 object: obj_info,
                 user_agent: "Internal: [ILM-Transition]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
         }
@@ -2951,7 +2951,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                         bucket_name: bucket.to_string(),
                         object: restored_info,
                         user_agent: "Internal: [Restore-Completed]".to_string(),
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         ..Default::default()
                     });
                     Ok(())
@@ -3062,7 +3062,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             bucket_name: bucket.to_string(),
             object: restored_info,
             user_agent: "Internal: [Restore-Completed]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
+            host: runtime_sources::default_local_node_name(),
             ..Default::default()
         });
         Ok(())
