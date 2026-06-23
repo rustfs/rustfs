@@ -18,11 +18,19 @@
 //! It supports sending events to various targets
 //! (like Webhook and MQTT) and includes features like event persistence and retry on failure.
 
+use std::sync::Arc;
+
+use rustfs_ecstore::api::config::com::{
+    read_config_without_migrate as read_notify_config_without_migrate_from_backend,
+    save_server_config as save_notify_server_config_to_backend,
+};
+use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_notify_object_store_handle_from_backend;
+pub(crate) use rustfs_ecstore::api::storage::ECStore as NotifyStore;
+
 mod bucket_config_manager;
 mod config_manager;
 mod error;
 mod event;
-mod event_bridge;
 pub mod factory;
 mod global;
 pub mod integration;
@@ -37,24 +45,40 @@ mod runtime_view;
 mod services;
 mod status_view;
 
-pub(crate) use rustfs_ecstore::api::config as ecstore_config;
-pub(crate) use rustfs_ecstore::api::global as ecstore_global;
-pub(crate) use rustfs_ecstore::api::storage as ecstore_storage;
-
 pub use bucket_config_manager::NotifyBucketConfigManager;
 pub use config_manager::{NotifyConfigManager, runtime_target_id_for_subsystem};
 pub use error::{LifecycleError, NotificationError};
 pub use event::{Event, EventArgs, EventArgsBuilder, NotifyObjectInfo};
-pub use event_bridge::{LiveEventHistory, NotifyEventBridge};
 pub use global::{
     initialize, initialize_live_events, is_notification_system_initialized, notification_metrics_snapshot, notification_system,
     notification_target_metrics, notifier_global,
 };
 pub use integration::{NotificationMetricSnapshot, NotificationSystem, NotificationTargetMetricSnapshot};
-pub use pipeline::NotifyPipeline;
+pub use pipeline::{LiveEventHistory, NotifyEventBridge, NotifyPipeline};
 pub use rule_engine::NotifyRuleEngine;
 pub use rules::BucketNotificationConfig;
 pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
+
+pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {
+    resolve_notify_object_store_handle_from_backend()
+}
+
+pub(crate) async fn read_notify_server_config_without_migrate(
+    store: Arc<NotifyStore>,
+) -> Result<rustfs_config::server_config::Config, String> {
+    read_notify_config_without_migrate_from_backend(store)
+        .await
+        .map_err(|err| err.to_string())
+}
+
+pub(crate) async fn save_notify_server_config(
+    store: Arc<NotifyStore>,
+    config: &rustfs_config::server_config::Config,
+) -> Result<(), String> {
+    save_notify_server_config_to_backend(store, config)
+        .await
+        .map_err(|err| err.to_string())
+}

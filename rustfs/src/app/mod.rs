@@ -43,54 +43,84 @@ mod lifecycle_transition_api_test;
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::admin as ecstore_admin;
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::capacity as ecstore_capacity;
-use rustfs_ecstore::api::client as ecstore_client;
-use rustfs_ecstore::api::compression as ecstore_compression;
-use rustfs_ecstore::api::config as ecstore_config;
-use rustfs_ecstore::api::data_usage as ecstore_data_usage;
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::layout as ecstore_layout;
-use rustfs_ecstore::api::notification as ecstore_notification;
-use rustfs_ecstore::api::rio as ecstore_rio;
-use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-use rustfs_ecstore::api::storage as ecstore_storage;
-use rustfs_ecstore::api::tier as ecstore_tier;
+mod ecstore_admin {
+    pub(crate) use crate::storage::ecstore_admin::get_server_info;
+}
+
+mod ecstore_bucket {
+    pub(crate) use crate::storage::ecstore_bucket::{
+        bucket_target_sys, lifecycle, metadata, metadata_sys, object_lock, policy_sys, quota, replication, tagging, target,
+        utils, versioning, versioning_sys,
+    };
+}
+
+mod ecstore_capacity {
+    pub(crate) use crate::storage::ecstore_capacity::{
+        PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+    };
+}
+
+#[allow(unused_imports)]
+mod ecstore_client {
+    pub(crate) use crate::storage::ecstore_client::{object_api_utils, transition_api};
+}
+
+mod ecstore_compression {
+    pub(crate) use crate::storage::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+}
+
+mod ecstore_config {
+    pub(crate) use crate::storage::ecstore_config::storageclass;
+}
+
+mod ecstore_data_usage {
+    pub(crate) use crate::storage::ecstore_data_usage::{
+        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
+        record_bucket_object_write_memory,
+    };
+}
+
+#[cfg(test)]
+mod ecstore_global {
+    pub(crate) use crate::storage::ecstore_global::GLOBAL_TierConfigMgr;
+}
+
+#[allow(unused_imports)]
+mod ecstore_tier {
+    pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
+}
 
 pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DISK_COMPRESSIBLE_SIZE;
 
-pub(crate) type DiskError = ecstore_disk::error::DiskError;
-pub(crate) type DynReader = ecstore_rio::DynReader;
-pub(crate) type ECStore = ecstore_storage::ECStore;
-pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
-pub(crate) type HashReader = ecstore_rio::HashReader;
-pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
-pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
+pub(crate) type DiskError = crate::storage::DiskError;
+pub(crate) type DynReader = crate::storage::DynReader;
+pub(crate) type ECStore = crate::storage::ECStore;
+pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
+pub(crate) type HashReader = crate::storage::HashReader;
+pub(crate) type NotificationSys = crate::storage::NotificationSys;
+pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub(crate) type PoolDecommissionInfo = ecstore_capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = ecstore_capacity::PoolStatus;
-pub(crate) type StorageError = ecstore_error::StorageError;
+pub(crate) type StorageError = crate::storage::StorageError;
 pub(crate) type Error = StorageError;
-pub(crate) type TierConfigMgr = ecstore_tier::tier::TierConfigMgr;
-pub(crate) type WriteEncryption = ecstore_rio::WriteEncryption;
-pub(crate) type WritePlan = ecstore_rio::WritePlan;
+pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
+pub(crate) type WriteEncryption = crate::storage::WriteEncryption;
+pub(crate) type WritePlan = crate::storage::WritePlan;
 
 #[cfg(test)]
-pub(crate) type DecryptReader<R> = ecstore_rio::DecryptReader<R>;
+pub(crate) type DecryptReader<R> = crate::storage::DecryptReader<R>;
 #[cfg(test)]
-pub(crate) type EncryptReader<R> = ecstore_rio::EncryptReader<R>;
+pub(crate) type EncryptReader<R> = crate::storage::EncryptReader<R>;
 #[cfg(test)]
-pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
+pub(crate) type Endpoint = crate::storage::Endpoint;
 #[cfg(test)]
-pub(crate) type Endpoints = ecstore_layout::Endpoints;
+pub(crate) type Endpoints = crate::storage::Endpoints;
 #[cfg(test)]
-pub(crate) type HardLimitReader<R> = ecstore_rio::HardLimitReader<R>;
+pub(crate) type HardLimitReader<R> = crate::storage::HardLimitReader<R>;
 #[cfg(test)]
-pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
+pub(crate) type PoolEndpoints = crate::storage::PoolEndpoints;
 #[cfg(test)]
 pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 #[cfg(test)]
@@ -103,7 +133,7 @@ pub(crate) type WarmBackendGetOpts = ecstore_tier::warm_backend::WarmBackendGetO
 #[cfg(test)]
 #[allow(non_snake_case)]
 pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
-    ecstore_layout::EndpointServerPools::from(pools)
+    crate::storage::EndpointServerPools::from(pools)
 }
 
 pub(crate) trait AppObjectLockConfigExt {
@@ -396,7 +426,7 @@ pub(crate) mod metadata_sys {
 
 pub(crate) mod object_api_utils {
     pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-        super::ecstore_client::object_api_utils::to_s3s_etag(etag)
+        crate::storage::to_s3s_etag(etag)
     }
 }
 
@@ -565,19 +595,19 @@ pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_cur
 }
 
 pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
-    ecstore_disk::error_reduce::is_all_buckets_not_found(errs)
+    crate::storage::is_all_buckets_not_found(errs)
 }
 
 pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
-    ecstore_error::is_err_bucket_not_found(err)
+    crate::storage::is_err_bucket_not_found(err)
 }
 
 pub(crate) fn is_err_object_not_found(err: &Error) -> bool {
-    ecstore_error::is_err_object_not_found(err)
+    crate::storage::is_err_object_not_found(err)
 }
 
 pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
-    ecstore_error::is_err_version_not_found(err)
+    crate::storage::is_err_version_not_found(err)
 }
 
 #[cfg(test)]
@@ -597,57 +627,69 @@ impl std::ops::Deref for GlobalTierConfigMgrCompat {
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    ecstore_global::get_global_endpoints_opt()
+    crate::storage::get_global_endpoints_opt()
+}
+
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    crate::storage::get_global_deployment_id()
+}
+
+pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+    crate::storage::get_global_lock_client()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_global::get_global_region()
+    crate::storage::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    crate::storage::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
-    ecstore_global::get_global_tier_config_mgr()
+    crate::storage::get_global_tier_config_mgr()
 }
 
 pub(crate) fn new_object_layer_fn() -> Option<Arc<ECStore>> {
-    ecstore_global::new_object_layer_fn()
+    crate::storage::new_object_layer_fn()
 }
 
 pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
-    ecstore_global::set_object_store_resolver(resolver)
+    crate::storage::set_object_store_resolver(resolver)
 }
 
 pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
-    ecstore_notification::get_global_notification_sys()
+    crate::storage::get_global_notification_sys()
 }
 
 #[cfg(test)]
 pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
 where
-    R: ecstore_rio::Reader + 'static,
+    R: crate::storage::ecstore_rio::Reader + 'static,
 {
-    ecstore_rio::boxed_reader(reader)
+    crate::storage::boxed_reader(reader)
 }
 
 pub(crate) fn compression_metadata_value(algorithm: rustfs_utils::CompressionAlgorithm) -> String {
-    ecstore_rio::compression_metadata_value(algorithm)
+    crate::storage::compression_metadata_value(algorithm)
 }
 
 pub(crate) fn wrap_reader<R>(reader: R) -> DynReader
 where
-    R: ecstore_rio::ReadStream + 'static,
+    R: crate::storage::ecstore_rio::ReadStream + 'static,
 {
-    ecstore_rio::wrap_reader(reader)
+    crate::storage::wrap_reader(reader)
 }
 
 pub(crate) fn get_lock_acquire_timeout() -> tokio::time::Duration {
-    ecstore_set_disk::get_lock_acquire_timeout()
+    crate::storage::get_lock_acquire_timeout()
 }
 
 pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
-    ecstore_set_disk::is_valid_storage_class(storage_class)
+    crate::storage::is_valid_storage_class(storage_class)
 }
 
 #[cfg(test)]
 pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<(), Error> {
-    ecstore_storage::init_local_disks(endpoint_pools).await
+    crate::storage::init_local_disks(endpoint_pools).await
 }

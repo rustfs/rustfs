@@ -103,21 +103,75 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
 use std::ops::Deref;
 use std::sync::Arc;
 
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::capacity as ecstore_capacity;
-use rustfs_ecstore::api::client as ecstore_client;
-use rustfs_ecstore::api::config as ecstore_config;
-use rustfs_ecstore::api::data_usage as ecstore_data_usage;
-use rustfs_ecstore::api::disk as ecstore_disk;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::layout as ecstore_layout;
-use rustfs_ecstore::api::metrics as ecstore_metrics;
-use rustfs_ecstore::api::notification as ecstore_notification;
-use rustfs_ecstore::api::rebalance as ecstore_rebalance;
-use rustfs_ecstore::api::rpc as ecstore_rpc;
-use rustfs_ecstore::api::storage as ecstore_storage;
-use rustfs_ecstore::api::tier as ecstore_tier;
+mod ecstore_bucket {
+    pub(crate) use crate::storage::ecstore_bucket::{
+        bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, quota, replication, target, utils, versioning,
+        versioning_sys,
+    };
+}
+
+mod ecstore_capacity {
+    pub(crate) use crate::storage::ecstore_capacity::is_reserved_or_invalid_bucket;
+}
+
+mod ecstore_client {
+    pub(crate) use crate::storage::ecstore_client::admin_handler_utils;
+}
+
+mod ecstore_config {
+    pub(crate) use crate::storage::ecstore_config::{com, init, set_global_storage_class, storageclass};
+}
+
+mod ecstore_data_usage {
+    pub(crate) use crate::storage::ecstore_data_usage::load_data_usage_from_backend;
+}
+
+#[allow(unused_imports)]
+mod ecstore_disk {
+    pub(crate) use crate::storage::ecstore_disk::{RUSTFS_META_BUCKET, endpoint};
+}
+
+mod ecstore_error {
+    pub(crate) use crate::storage::ecstore_error::StorageError;
+}
+
+mod ecstore_global {
+    pub(crate) use crate::storage::ecstore_global::{GLOBAL_BOOT_TIME, get_global_bucket_monitor};
+}
+
+#[allow(unused_imports)]
+mod ecstore_layout {
+    pub(crate) use crate::storage::ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+}
+
+mod ecstore_metrics {
+    pub(crate) use crate::storage::ecstore_metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+}
+
+mod ecstore_notification {
+    pub(crate) use crate::storage::ecstore_notification::{NotificationSys, get_global_notification_sys};
+}
+
+#[allow(unused_imports)]
+mod ecstore_rebalance {
+    pub(crate) use crate::storage::ecstore_rebalance::{
+        DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
+        RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
+        encode_rebalance_stop_propagation_record,
+    };
+}
+
+mod ecstore_rpc {
+    pub(crate) use crate::storage::ecstore_rpc::PeerRestClient;
+}
+
+mod ecstore_storage {
+    pub(crate) use crate::storage::ecstore_storage::ECStore;
+}
+
+mod ecstore_tier {
+    pub(crate) use crate::storage::ecstore_tier::{tier, tier_admin, tier_config, tier_handlers};
+}
 
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
 pub(crate) const STORAGE_CLASS_SUB_SYS: &str = ecstore_config::com::STORAGE_CLASS_SUB_SYS;
@@ -458,22 +512,6 @@ pub(crate) async fn load_data_usage_from_backend(
 
 pub(crate) fn get_global_bucket_monitor() -> Option<Arc<bandwidth::monitor::Monitor>> {
     ecstore_global::get_global_bucket_monitor()
-}
-
-pub(crate) fn get_global_deployment_id() -> Option<String> {
-    ecstore_global::get_global_deployment_id()
-}
-
-pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    ecstore_global::get_global_endpoints_opt()
-}
-
-pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_global::get_global_region()
-}
-
-pub(crate) fn global_rustfs_port() -> u16 {
-    ecstore_global::global_rustfs_port()
 }
 
 pub(crate) async fn collect_local_metrics(

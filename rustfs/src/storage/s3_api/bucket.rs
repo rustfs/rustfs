@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::ecstore_client::object_api_utils::to_s3s_etag;
 use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::to_s3s_etag;
 use percent_encoding::percent_decode_str;
 use rustfs_storage_api::{
     BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,

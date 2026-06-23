@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{ecstore_cluster, ecstore_layout::EndpointServerPools};
+use crate::storage::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 use rustfs_storage_api::{
     CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
     ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
@@ -79,7 +79,7 @@ impl TopologySnapshotProvider for EndpointTopologySnapshotProvider {
 }
 
 pub fn topology_snapshot_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> TopologySnapshot {
-    ecstore_cluster::topology_snapshot_from_endpoint_pools_with_capabilities(
+    topology_snapshot_from_endpoint_pools_with_capabilities(
         endpoint_pools,
         TopologyCapabilities {
             profiling: cpu_profiling_status(),
@@ -131,10 +131,7 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{
-        ecstore_disk::endpoint::Endpoint,
-        ecstore_layout::{Endpoints, PoolEndpoints},
-    };
+    use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
 
     #[tokio::test]

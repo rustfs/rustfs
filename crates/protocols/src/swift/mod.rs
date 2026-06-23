@@ -35,10 +35,13 @@
 
 use std::sync::Arc;
 
-use rustfs_ecstore::api::bucket as ecstore_bucket;
-use rustfs_ecstore::api::error as ecstore_error;
-use rustfs_ecstore::api::global as ecstore_global;
-use rustfs_ecstore::api::storage as ecstore_storage;
+pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
+use rustfs_ecstore::api::bucket::metadata_sys::{
+    get as get_swift_bucket_metadata_from_backend, set_bucket_metadata as set_swift_bucket_metadata_in_backend,
+};
+pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
+pub(crate) use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_swift_object_store_handle;
+use rustfs_ecstore::api::storage::ECStore as SwiftStore;
 
 pub mod account;
 pub mod acl;
@@ -70,22 +73,15 @@ pub use router::{SwiftRoute, SwiftRouter};
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};
 
-type SwiftBucketMetadata = ecstore_bucket::metadata::BucketMetadata;
-type SwiftStorageResult<T> = ecstore_error::Result<T>;
-type SwiftStore = ecstore_storage::ECStore;
 pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
 pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
 
-fn resolve_swift_object_store_handle() -> Option<Arc<SwiftStore>> {
-    ecstore_global::resolve_object_store_handle()
+pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
+    get_swift_bucket_metadata_from_backend(bucket).await
 }
 
-async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
-    ecstore_bucket::metadata_sys::get(bucket).await
-}
-
-async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
-    ecstore_bucket::metadata_sys::set_bucket_metadata(bucket, metadata).await
+pub(crate) async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
+    set_swift_bucket_metadata_in_backend(bucket, metadata).await
 }
