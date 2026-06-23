@@ -21,7 +21,6 @@ use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
 use crate::bucket::replication::check_replicate_delete;
-use crate::bucket::utils::{check_new_multipart_args, check_put_object_part_args};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
@@ -3279,42 +3278,19 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        upload_id: &str,
-        part_id: usize,
-        start_offset: i64,
-        length: i64,
+        _src_bucket: &str,
+        _src_object: &str,
+        _dst_bucket: &str,
+        _dst_object: &str,
+        _upload_id: &str,
+        _part_id: usize,
+        _start_offset: i64,
+        _length: i64,
         _src_info: &ObjectInfo,
-        src_opts: &ObjectOptions,
-        dst_opts: &ObjectOptions,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
     ) -> Result<()> {
-        check_new_multipart_args(src_bucket, src_object)?;
-        check_put_object_part_args(dst_bucket, dst_object, upload_id)?;
-
-        if length <= 0 {
-            return Err(StorageError::InvalidRangeSpec("copy part length must be positive".to_string()));
-        }
-
-        let end = start_offset
-            .checked_add(length - 1)
-            .ok_or_else(|| StorageError::InvalidRangeSpec("copy part range overflow".to_string()))?;
-        let range = Some(HTTPRangeSpec {
-            is_suffix_length: false,
-            start: start_offset,
-            end,
-        });
-
-        let src_reader = self
-            .get_object_reader(src_bucket, src_object, range, HeaderMap::new(), src_opts)
-            .await?;
-        let hash_reader = HashReader::from_stream(src_reader.stream, length, length, None, None, false)?;
-        let mut put_reader = PutObjReader::new(hash_reader);
-        self.put_object_part(dst_bucket, dst_object, upload_id, part_id, &mut put_reader, dst_opts)
-            .await?;
-        Ok(())
+        Err(StorageError::NotImplemented)
     }
 
     #[tracing::instrument(level = "debug", skip(self, data, opts))]
@@ -4383,7 +4359,12 @@ impl rustfs_storage_api::HealOperations for SetDisks {
         let ref_format = match get_format_erasure_in_quorum(&formats) {
             Ok(format) => format,
             Err(err) => {
-                if count_errs(&errs, &DiskError::UnformattedDisk) > 0 {
+                let can_use_cached_layout = count_errs(&errs, &DiskError::UnformattedDisk) > 0
+                    && formats.iter().flatten().all(|format| self.format.check_other(format).is_ok())
+                    && errs
+                        .iter()
+                        .all(|err| err.is_none() || matches!(err, Some(DiskError::UnformattedDisk)));
+                if can_use_cached_layout {
                     self.format.clone()
                 } else {
                     return Ok((HealResultItem::default(), Some(err)));
@@ -4521,12 +4502,10 @@ impl rustfs_storage_api::HealOperations for SetDisks {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn check_abandoned_parts(&self, bucket: &str, object: &str, _opts: &HealOpts) -> Result<()> {
-        check_new_multipart_args(bucket, object)?;
-        // Lifecycle cleanup already owns stale multipart reconciliation. Keep the
-        // set-level trait entrypoint non-panicking and treat it as a validated
-        // no-op for direct callers.
-        Ok(())
+    async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
+        // Multipart orphan reconciliation is intentionally retained above the set layer
+        // until there is a concrete caller and a stable lower-level contract to implement.
+        Err(StorageError::NotImplemented)
     }
 }
 
@@ -7742,76 +7721,39 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_level_copy_object_part_uses_live_copy_path() {
-        let set_disks = make_local_bucket_test_set_disks().await;
-        let bucket = "bucket-copy-part";
+    async fn remaining_unsupported_trait_stubs_return_typed_errors() {
+        let set_disks = make_test_set_disks(Vec::new()).await;
 
-        set_disks
-            .make_bucket(bucket, &MakeBucketOptions::default())
+        let (heal_result, heal_err) = make_local_bucket_test_set_disks()
             .await
-            .expect("bucket should be created");
-
-        let mut source = PutObjReader::from_vec(b"hello world".to_vec());
-        set_disks
-            .put_object(bucket, "src", &mut source, &ObjectOptions::default())
-            .await
-            .expect("source object should be written");
-
-        let upload = set_disks
-            .new_multipart_upload(bucket, "dst", &ObjectOptions::default())
-            .await
-            .expect("multipart upload should be created");
-        let src_info = set_disks
-            .get_object_info(bucket, "src", &ObjectOptions::default())
-            .await
-            .expect("source object info should be available");
-
-        set_disks
-            .copy_object_part(
-                bucket,
-                "src",
-                bucket,
-                "dst",
-                &upload.upload_id,
-                1,
-                0,
-                src_info.size,
-                &src_info,
-                &ObjectOptions::default(),
-                &ObjectOptions::default(),
-            )
-            .await
-            .expect("copy_object_part should succeed");
-
-        let parts = set_disks
-            .list_object_parts(bucket, "dst", &upload.upload_id, None, 1000, &ObjectOptions::default())
-            .await
-            .expect("copied part should be listed");
-        assert_eq!(parts.parts.len(), 1);
-        assert_eq!(parts.parts[0].part_num, 1);
-        assert_eq!(parts.parts[0].actual_size, src_info.size);
-    }
-
-    #[tokio::test]
-    async fn remaining_legacy_trait_entrypoints_are_validated_non_panicking_paths() {
-        let set_disks = make_local_bucket_test_set_disks().await;
-        let bucket = "bucket-noop";
-
-        let (heal_result, heal_err) = set_disks
             .heal_format(false)
             .await
             .expect("heal_format should be callable on formatted disks");
         assert!(matches!(heal_err, Some(StorageError::NoHealRequired)));
         assert_eq!(heal_result.disk_count, 2);
 
-        set_disks
-            .make_bucket(bucket, &MakeBucketOptions::default())
+        let copy_part_err = set_disks
+            .copy_object_part(
+                "bucket",
+                "src",
+                "bucket",
+                "dst",
+                "upload-id",
+                1,
+                0,
+                1,
+                &ObjectInfo::default(),
+                &ObjectOptions::default(),
+                &ObjectOptions::default(),
+            )
             .await
-            .expect("bucket should be created");
+            .expect_err("unsupported copy_object_part should return a typed error");
+        assert!(matches!(copy_part_err, StorageError::NotImplemented));
 
-        set_disks
+        let abandoned_err = set_disks
             .check_abandoned_parts("bucket", "object", &HealOpts::default())
             .await
-            .expect("abandoned-parts check should be a validated no-op");
+            .expect_err("abandoned-parts check should stay in the upper reconciliation layer");
+        assert!(matches!(abandoned_err, StorageError::NotImplemented));
     }
 }

@@ -16,9 +16,7 @@
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
-use crate::rio::HashReader;
 use crate::{
-    bucket::utils::{check_new_multipart_args, check_put_object_part_args},
     disk::{
         DiskAPI, DiskOption, DiskStore,
         error::DiskError,
@@ -805,42 +803,19 @@ impl rustfs_storage_api::MultipartOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn copy_object_part(
         &self,
-        src_bucket: &str,
-        src_object: &str,
-        dst_bucket: &str,
-        dst_object: &str,
-        upload_id: &str,
-        part_id: usize,
-        start_offset: i64,
-        length: i64,
+        _src_bucket: &str,
+        _src_object: &str,
+        _dst_bucket: &str,
+        _dst_object: &str,
+        _upload_id: &str,
+        _part_id: usize,
+        _start_offset: i64,
+        _length: i64,
         _src_info: &ObjectInfo,
-        src_opts: &ObjectOptions,
-        dst_opts: &ObjectOptions,
+        _src_opts: &ObjectOptions,
+        _dst_opts: &ObjectOptions,
     ) -> Result<()> {
-        check_new_multipart_args(src_bucket, src_object)?;
-        check_put_object_part_args(dst_bucket, dst_object, upload_id)?;
-
-        if length <= 0 {
-            return Err(StorageError::InvalidRangeSpec("copy part length must be positive".to_string()));
-        }
-
-        let end = start_offset
-            .checked_add(length - 1)
-            .ok_or_else(|| StorageError::InvalidRangeSpec("copy part range overflow".to_string()))?;
-        let range = Some(HTTPRangeSpec {
-            is_suffix_length: false,
-            start: start_offset,
-            end,
-        });
-
-        let src_reader = self
-            .get_object_reader(src_bucket, src_object, range, HeaderMap::new(), src_opts)
-            .await?;
-        let hash_reader = HashReader::from_stream(src_reader.stream, length, length, None, None, false)?;
-        let mut put_reader = PutObjReader::new(hash_reader);
-        self.put_object_part(dst_bucket, dst_object, upload_id, part_id, &mut put_reader, dst_opts)
-            .await?;
-        Ok(())
+        Err(StorageError::NotImplemented)
     }
 
     #[tracing::instrument(skip(self))]
@@ -1041,11 +1016,9 @@ impl rustfs_storage_api::HealOperations for Sets {
     }
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        check_new_multipart_args(_bucket, _object)?;
-        // Lifecycle cleanup already owns stale multipart reconciliation. Keep the
-        // trait surface non-panicking and treat this legacy entrypoint as a
-        // validated no-op.
-        Ok(())
+        // Multipart orphan reconciliation is intentionally retained above the pool/set layers
+        // until there is a concrete caller and a stable lower-level contract to implement.
+        Err(StorageError::NotImplemented)
     }
 }
 
@@ -1327,7 +1300,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn sets_check_abandoned_parts_is_a_validated_noop() {
+    async fn sets_check_abandoned_parts_returns_typed_not_implemented_error() {
         let format = FormatV3::new(1, 1);
         let sets = Sets {
             id: format.id,
@@ -1350,8 +1323,10 @@ mod tests {
             exit_signal: None,
         };
 
-        sets.check_abandoned_parts("bucket", "object", &HealOpts::default())
+        let err = sets
+            .check_abandoned_parts("bucket", "object", &HealOpts::default())
             .await
-            .expect("abandoned-parts ownership should no-op without panicking");
+            .expect_err("abandoned-parts ownership should stay above the pool/set storage layers");
+        assert!(matches!(err, StorageError::NotImplemented));
     }
 }
