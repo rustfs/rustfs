@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
@@ -23,18 +23,21 @@ use crate::{
     error::Result,
     event_notification::EventNotifier,
     global::{
-        GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys,
-        GLOBAL_TierConfigMgr, TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        init_global_bucket_monitor, set_global_deployment_id,
+        GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
+        GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
+        TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
+        get_global_endpoints_opt, init_global_bucket_monitor, resolve_object_store_handle, set_global_deployment_id,
     },
     notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
     tier::tier::TierConfigMgr,
 };
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use s3s::dto::BucketLifecycleConfiguration;
 use tokio::sync::RwLock;
+use tonic::transport::Channel;
 use uuid::Uuid;
 
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
@@ -43,6 +46,46 @@ pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_
 
 pub(crate) async fn object_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
     get_global_encryption_service().await
+}
+
+pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
+    resolve_object_store_handle()
+}
+
+pub(crate) fn endpoint_pools() -> Option<EndpointServerPools> {
+    get_global_endpoints_opt()
+}
+
+pub(crate) async fn local_node_name() -> String {
+    GLOBAL_LOCAL_NODE_NAME.read().await.clone()
+}
+
+pub(crate) async fn rustfs_addr() -> String {
+    GLOBAL_RUSTFS_ADDR.read().await.clone()
+}
+
+pub(crate) fn boot_uptime_secs() -> u64 {
+    GLOBAL_BOOT_TIME
+        .get()
+        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+        .unwrap_or_default()
+        .as_secs()
+}
+
+pub(crate) async fn scanner_init_time() -> Option<chrono::DateTime<chrono::Utc>> {
+    rustfs_common::get_global_init_time().await
+}
+
+pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
+    if *GLOBAL_IsErasureSD.read().await {
+        None
+    } else {
+        Some(*GLOBAL_RootDiskThreshold.read().await)
+    }
+}
+
+pub(crate) async fn cached_node_channel(addr: &str) -> Option<Channel> {
+    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
 }
 
 pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
@@ -68,6 +111,10 @@ pub(crate) fn storage_class_should_inline(shard_size: i64, versioned: bool) -> b
 pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
     base64_simd::URL_SAFE_NO_PAD
         .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes())
+}
+
+pub(crate) fn deployment_id() -> Option<String> {
+    get_global_deployment_id()
 }
 
 pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {

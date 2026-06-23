@@ -29,7 +29,7 @@ use crate::disk::{
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure_coding::bitrot_verify;
-use crate::global::{GLOBAL_IsErasureSD, GLOBAL_RootDiskThreshold};
+use crate::runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use parking_lot::RwLock as ParkingLotRwLock;
@@ -3721,8 +3721,7 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
     let disk_info = get_info(&drive_path).inspect_err(|err| {
         log_startup_disk_io_error("get_disk_info_stat", Path::new(&drive_path), err);
     })?;
-    let root_drive = if !*GLOBAL_IsErasureSD.read().await {
-        let root_disk_threshold = *GLOBAL_RootDiskThreshold.read().await;
+    let root_drive = if let Some(root_disk_threshold) = runtime_sources::root_disk_threshold_for_erasure_disk().await {
         if root_disk_threshold > 0 {
             disk_info.total <= root_disk_threshold
         } else {
