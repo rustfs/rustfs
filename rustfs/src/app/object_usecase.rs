@@ -15,7 +15,7 @@
 //! Object application use-case contracts.
 
 use crate::app::context::{
-    AppContext, default_notify_interface, get_global_app_context, resolve_object_store_handle_for_context,
+    AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -3707,11 +3707,7 @@ impl DefaultObjectUsecase {
         }
 
         let req_headers = req.headers.clone();
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
+        let notify = resolve_notify_interface_for_context(self.context.as_deref());
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let notify_bucket = bucket.clone();
@@ -4712,11 +4708,7 @@ impl DefaultObjectUsecase {
             None => String::new(),
         };
 
-        let notify = self
-            .context
-            .as_ref()
-            .map(|context| context.notify())
-            .unwrap_or_else(default_notify_interface);
+        let notify = resolve_notify_interface_for_context(self.context.as_deref());
         let req_params = extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
