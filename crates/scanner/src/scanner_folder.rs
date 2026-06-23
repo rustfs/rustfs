@@ -2643,6 +2643,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == ScannerWorkSource::BucketReplication.as_str() && repair.kind == "object")
             .expect("bucket object repair work should be visible");
+        assert_eq!(object_repair.scanner_role, "repair_admission");
+        assert_eq!(object_repair.execution_owner, "bucket_replication_queue");
         assert_eq!(object_repair.skipped, 1);
         assert_eq!(object_repair.queued, 1);
         assert_eq!(object_repair.missed, 1);

@@ -1,0 +1,104 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0.
+
+x-rustfs-env: &rustfs-env
+  RUSTFS_VOLUMES: "http://rustfs-beta5-node{1...4}:9000/data/disk{1...4}"
+  RUSTFS_ADDRESS: ":9000"
+  RUSTFS_CONSOLE_ADDRESS: ":9001"
+  RUSTFS_CONSOLE_ENABLE: "true"
+  RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS: "*"
+  RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:-rustfsadmin}"
+  RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:-rustfsadmin}"
+  RUSTFS_OBS_LOGGER_LEVEL: "${RUSTFS_OBS_LOGGER_LEVEL:-info}"
+  RUSTFS_OBS_LOG_DIRECTORY: "/logs"
+  RUSTFS_COMPRESSION_ENABLED: "${RUSTFS_COMPRESSION_ENABLED:-true}"
+  RUSTFS_COMPRESSION_EXTENSIONS: "${RUSTFS_COMPRESSION_EXTENSIONS:-.txt,.log,.csv,.json,.tar,.xml,.bin}"
+  RUSTFS_COMPRESSION_MIME_TYPES: "${RUSTFS_COMPRESSION_MIME_TYPES:-text/*,application/json,application/xml,binary/octet-stream}"
+  RUSTFS_KMS_ENABLE: "${RUSTFS_KMS_ENABLE:-false}"
+  RUSTFS_KMS_BACKEND: "${RUSTFS_KMS_BACKEND:-local}"
+  RUSTFS_KMS_KEY_DIR: "${RUSTFS_KMS_KEY_DIR:-/kms}"
+  RUSTFS_KMS_DEFAULT_KEY_ID: "${RUSTFS_KMS_DEFAULT_KEY_ID:-compat-key}"
+  RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS: "${RUSTFS_KMS_ALLOW_INSECURE_DEV_DEFAULTS:-false}"
+  RUSTFS_UNSAFE_BYPASS_DISK_CHECK: "${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}"
+
+x-rustfs-node: &rustfs-node
+  image: "${RUSTFS_BETA5_IMAGE:-rustfs/rustfs:1.0.0-beta.5}"
+  build:
+    context: ../..
+    dockerfile: Dockerfile
+    args:
+      RELEASE: "1.0.0-beta.5"
+  environment: *rustfs-env
+  depends_on:
+    rustfs-beta5-permission-helper:
+      condition: service_completed_successfully
+  networks:
+    - rustfs-beta5-net
+  restart: unless-stopped
+
+services:
+  rustfs-beta5-permission-helper:
+    image: alpine:3.23
+    command: sh -c "mkdir -p /compat-data /kms && chown -R 10001:10001 /compat-data /kms"
+    volumes:
+      - ./data/rustfs-beta5:/compat-data
+      - ./kms/rustfs-compat:/kms
+    restart: "no"
+
+  rustfs-beta5-node1:
+    <<: *rustfs-node
+    hostname: rustfs-beta5-node1
+    volumes:
+      - ./data/rustfs-beta5/node1/disk1:/data/disk1
+      - ./data/rustfs-beta5/node1/disk2:/data/disk2
+      - ./data/rustfs-beta5/node1/disk3:/data/disk3
+      - ./data/rustfs-beta5/node1/disk4:/data/disk4
+      - ./data/rustfs-beta5/logs/node1:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_BETA5_API_PORT:-9100}:9000"
+      - "${RUSTFS_BETA5_CONSOLE_PORT:-9101}:9001"
+
+  rustfs-beta5-node2:
+    <<: *rustfs-node
+    hostname: rustfs-beta5-node2
+    volumes:
+      - ./data/rustfs-beta5/node2/disk1:/data/disk1
+      - ./data/rustfs-beta5/node2/disk2:/data/disk2
+      - ./data/rustfs-beta5/node2/disk3:/data/disk3
+      - ./data/rustfs-beta5/node2/disk4:/data/disk4
+      - ./data/rustfs-beta5/logs/node2:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_BETA5_NODE2_PORT:-9102}:9000"
+
+  rustfs-beta5-node3:
+    <<: *rustfs-node
+    hostname: rustfs-beta5-node3
+    volumes:
+      - ./data/rustfs-beta5/node3/disk1:/data/disk1
+      - ./data/rustfs-beta5/node3/disk2:/data/disk2
+      - ./data/rustfs-beta5/node3/disk3:/data/disk3
+      - ./data/rustfs-beta5/node3/disk4:/data/disk4
+      - ./data/rustfs-beta5/logs/node3:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_BETA5_NODE3_PORT:-9103}:9000"
+
+  rustfs-beta5-node4:
+    <<: *rustfs-node
+    hostname: rustfs-beta5-node4
+    volumes:
+      - ./data/rustfs-beta5/node4/disk1:/data/disk1
+      - ./data/rustfs-beta5/node4/disk2:/data/disk2
+      - ./data/rustfs-beta5/node4/disk3:/data/disk3
+      - ./data/rustfs-beta5/node4/disk4:/data/disk4
+      - ./data/rustfs-beta5/logs/node4:/logs
+      - ./kms/rustfs-compat:/kms
+    ports:
+      - "${RUSTFS_BETA5_NODE4_PORT:-9104}:9000"
+
+networks:
+  rustfs-beta5-net:
+    driver: bridge

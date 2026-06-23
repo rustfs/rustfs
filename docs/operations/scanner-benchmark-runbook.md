@@ -335,7 +335,7 @@ Compare these fields between baseline and tuned runs:
 | `metrics.source_work` | Shows cumulative work found, queued, skipped, missed, executed, and failed by source. |
 | `metrics.current_cycle_source_work` | Shows which source is consuming the current scan cycle. |
 | `metrics.last_cycle_source_work` | Shows which source consumed the previous scan cycle. |
-| `metrics.replication_repair` | Splits scanner-discovered replication repair by source and kind, including bucket object, delete-marker, version-purge, existing-object repair, and site replication boundary states. |
+| `metrics.replication_repair` | Splits scanner-discovered replication repair by source, kind, scanner role, and execution owner, including bucket object, delete-marker, version-purge, existing-object repair, and site replication boundary states. |
 | `metrics.current_cycle_replication_repair` | Shows which replication repair kind is being discovered or admitted in the current cycle. |
 | `metrics.last_cycle_replication_repair` | Shows which replication repair kind consumed the previous cycle. |
 | `metrics.lifecycle_expiry.current_queued` | Shows scanner-driven expiry/delete work waiting in the expiry worker queue. |
@@ -425,6 +425,13 @@ Treat these as failure signals:
   reduce backlog;
 - bucket metrics show zero usage after post-start uploads while dirty usage
   remains pending and `life_time_save_usage` does not advance;
+- `bucket_replication` missed work with `scanner_role=repair_admission` grows
+  while replication worker queues or target failures are also growing; treat
+  this as downstream replication pressure, not only scanner pacing pressure;
+- `site_replication` `active_resync` grows and is interpreted as scanner-owned
+  repair execution; `scanner_role=boundary_signal` and
+  `execution_owner=site_replication_runtime` mean active site resync remains
+  owned by the site replication runtime and admin resync path;
 - heal or bitrot work moves from `queued` to `missed` after a scanner pacing
   change.
 
@@ -458,7 +465,7 @@ at least these runs:
 | Single-node post-start bucket metrics freshness | Empty data path startup, post-start bucket creation/upload, bucket metrics snapshots, `scanner-summary.csv` usage freshness columns, and evidence that `DataUsageInfo` save work occurred before accepting bucket usage metrics. |
 | Single-node erasure or multi-disk | Checkpoint movement, active path age, set/disk scan pressure, data usage freshness, and before/after scanner config. |
 | Distributed lifecycle backlog | `maintenance_control`, lifecycle expiry/transition queue fields, source work missed/failed counts, and by-host admin metrics. |
-| Distributed replication backlog | Bucket replication repair kind counters, site replication passive/active boundary counters, source work queued/skipped/missed counts, and by-host admin metrics. |
+| Distributed replication backlog | Bucket replication repair kind counters, `scanner_role`, `execution_owner`, site replication passive/active boundary counters, source work queued/skipped/missed counts, and by-host admin metrics. |
 | Heal or bitrot pressure | Background heal `healOperations` queued/active source and priority counts, scanner source work for heal/bitrot, and by-host admin metrics. |
 
 The expected conclusion is MinIO-style scanner behavior at the operational

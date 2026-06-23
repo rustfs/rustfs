@@ -20,12 +20,8 @@ use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
-    INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, global_internode_metrics,
 };
-use rustfs_tls_runtime::{
-    load_cert_bundle_der_bytes, load_global_outbound_tls_generation, load_global_outbound_tls_state,
-    record_tls_consumer_stale_generation,
-};
+use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::get_env_opt_str;
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
@@ -303,7 +299,7 @@ async fn get_http_client(url: &str) -> Client {
 
     // Fast path: check generation first (cheap atomic read) to avoid cloning
     // the full PEM + identity bytes when the TLS state hasn't changed.
-    let generation = load_global_outbound_tls_generation().0;
+    let generation = crate::http_runtime_sources::outbound_tls_generation();
 
     let guard = CLIENT_CACHE.lock().await;
     if let Some(cached) = guard.as_ref() {
@@ -314,12 +310,12 @@ async fn get_http_client(url: &str) -> Client {
                 cached.client.clone()
             };
         }
-        record_tls_consumer_stale_generation("rio_http_reader");
+        crate::http_runtime_sources::record_stale_outbound_tls_generation("rio_http_reader");
     }
     drop(guard);
 
     // Cache miss or stale generation — load full outbound TLS state.
-    let outbound_tls = load_global_outbound_tls_state().await;
+    let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
     let client = build_http_client(false, &outbound_tls).await;
     let local_client = build_http_client(true, &outbound_tls).await;
@@ -734,11 +730,7 @@ fn record_internode_outgoing_request(track: bool, operation: Option<&'static str
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics()
-            .record_outgoing_request_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
-        None => global_internode_metrics().record_outgoing_request(),
-    }
+    crate::http_runtime_sources::record_outgoing_request(operation);
 }
 
 fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -746,14 +738,7 @@ fn record_internode_sent_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_sent_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_sent_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_sent_bytes(operation, bytes);
 }
 
 fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, bytes: usize) {
@@ -761,14 +746,7 @@ fn record_internode_recv_bytes(track: bool, operation: Option<&'static str>, byt
         return;
     }
 
-    match operation {
-        Some(operation) => global_internode_metrics().record_recv_bytes_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            bytes,
-        ),
-        None => global_internode_metrics().record_recv_bytes(bytes),
-    }
+    crate::http_runtime_sources::record_recv_bytes(operation, bytes);
 }
 
 fn record_internode_error(track: bool, operation: Option<&'static str>) {
@@ -776,12 +754,7 @@ fn record_internode_error(track: bool, operation: Option<&'static str>) {
         return;
     }
 
-    match operation {
-        Some(operation) => {
-            global_internode_metrics().record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP)
-        }
-        None => global_internode_metrics().record_error(),
-    }
+    crate::http_runtime_sources::record_error(operation);
 }
 
 fn record_internode_classified_error(track: bool, operation: Option<&'static str>, classification: InternodeHttpErrorKind) {
@@ -790,11 +763,7 @@ fn record_internode_classified_error(track: bool, operation: Option<&'static str
     }
 
     if let Some(operation) = operation {
-        global_internode_metrics().record_classified_error_for_operation_and_backend(
-            operation,
-            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
-            classification.metric_label(),
-        );
+        crate::http_runtime_sources::record_classified_error(operation, classification.metric_label());
     }
 }
 

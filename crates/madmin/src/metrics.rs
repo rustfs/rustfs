@@ -164,6 +164,10 @@ pub struct ScannerReplicationRepairSnapshot {
     pub source: String,
     #[serde(rename = "kind", default)]
     pub kind: String,
+    #[serde(rename = "scanner_role", default)]
+    pub scanner_role: String,
+    #[serde(rename = "execution_owner", default)]
+    pub execution_owner: String,
     #[serde(rename = "checked", default)]
     pub checked: u64,
     #[serde(rename = "queued", default)]
@@ -330,6 +334,12 @@ impl ScannerSourceWorkSnapshot {
 
 impl ScannerReplicationRepairSnapshot {
     fn merge(&mut self, other: &Self) {
+        if self.scanner_role.is_empty() && !other.scanner_role.is_empty() {
+            self.scanner_role = other.scanner_role.clone();
+        }
+        if self.execution_owner.is_empty() && !other.execution_owner.is_empty() {
+            self.execution_owner = other.execution_owner.clone();
+        }
         self.checked = self.checked.saturating_add(other.checked);
         self.queued = self.queued.saturating_add(other.queued);
         self.executed = self.executed.saturating_add(other.executed);
@@ -1662,6 +1672,8 @@ mod tests {
             replication_repair: vec![ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 queued: 2,
                 ..Default::default()
             }],
@@ -1674,18 +1686,24 @@ mod tests {
                 ScannerReplicationRepairSnapshot {
                     source: "bucket_replication".to_string(),
                     kind: "object".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
                     missed: 3,
                     ..Default::default()
                 },
                 ScannerReplicationRepairSnapshot {
                     source: "bucket_replication".to_string(),
                     kind: "delete_marker".to_string(),
+                    scanner_role: "repair_admission".to_string(),
+                    execution_owner: "bucket_replication_queue".to_string(),
                     skipped: 4,
                     ..Default::default()
                 },
                 ScannerReplicationRepairSnapshot {
                     source: "site_replication".to_string(),
                     kind: "active_resync".to_string(),
+                    scanner_role: "boundary_signal".to_string(),
+                    execution_owner: "site_replication_runtime".to_string(),
                     queued: 5,
                     ..Default::default()
                 },
@@ -1698,6 +1716,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
             .expect("bucket object repair snapshot should be merged");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
         assert_eq!(object.queued, 2);
         assert_eq!(object.missed, 3);
 
@@ -1706,6 +1726,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
             .expect("bucket delete-marker repair snapshot should be merged");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
         assert_eq!(delete_marker.skipped, 4);
 
         let site_resync = scanner
@@ -1713,7 +1735,92 @@ mod tests {
             .iter()
             .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
             .expect("site active resync snapshot should remain separate");
+        assert_eq!(site_resync.scanner_role, "boundary_signal");
+        assert_eq!(site_resync.execution_owner, "site_replication_runtime");
         assert_eq!(site_resync.queued, 5);
+    }
+
+    #[test]
+    fn scanner_metrics_merge_preserves_replication_repair_metadata_from_newer_nodes() {
+        let collected_at = Utc::now();
+        let mut scanner = ScannerMetrics {
+            collected_at,
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                checked: 2,
+                ..Default::default()
+            }],
+            current_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "delete_marker".to_string(),
+                queued: 3,
+                ..Default::default()
+            }],
+            last_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "site_replication".to_string(),
+                kind: "active_resync".to_string(),
+                missed: 4,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        scanner.merge(&ScannerMetrics {
+            collected_at: collected_at + chrono::Duration::seconds(1),
+            replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
+                checked: 5,
+                ..Default::default()
+            }],
+            current_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "bucket_replication".to_string(),
+                kind: "delete_marker".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
+                queued: 7,
+                ..Default::default()
+            }],
+            last_cycle_replication_repair: vec![ScannerReplicationRepairSnapshot {
+                source: "site_replication".to_string(),
+                kind: "active_resync".to_string(),
+                scanner_role: "boundary_signal".to_string(),
+                execution_owner: "site_replication_runtime".to_string(),
+                missed: 11,
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+
+        let object = scanner
+            .replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "object")
+            .expect("mixed-version object repair snapshot should be merged");
+        assert_eq!(object.scanner_role, "repair_admission");
+        assert_eq!(object.execution_owner, "bucket_replication_queue");
+        assert_eq!(object.checked, 7);
+
+        let delete_marker = scanner
+            .current_cycle_replication_repair
+            .iter()
+            .find(|repair| repair.source == "bucket_replication" && repair.kind == "delete_marker")
+            .expect("mixed-version current-cycle repair snapshot should be merged");
+        assert_eq!(delete_marker.scanner_role, "repair_admission");
+        assert_eq!(delete_marker.execution_owner, "bucket_replication_queue");
+        assert_eq!(delete_marker.queued, 10);
+
+        let active_resync = scanner
+            .last_cycle_replication_repair
+            .iter()
+            .find(|repair| repair.source == "site_replication" && repair.kind == "active_resync")
+            .expect("mixed-version last-cycle repair snapshot should be merged");
+        assert_eq!(active_resync.scanner_role, "boundary_signal");
+        assert_eq!(active_resync.execution_owner, "site_replication_runtime");
+        assert_eq!(active_resync.missed, 15);
     }
 
     #[test]

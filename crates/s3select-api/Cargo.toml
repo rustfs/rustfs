@@ -37,7 +37,6 @@ rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
 http.workspace = true
-object_store = { workspace = true }
 pin-project-lite.workspace = true
 s3s.workspace = true
 serde_json = { workspace = true }

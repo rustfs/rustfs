@@ -110,7 +110,6 @@ memmap2 = { workspace = true }
 libc.workspace = true
 rustix = { workspace = true }
 rustfs-madmin.workspace = true
-rustfs-concurrency.workspace = true
 reqwest = { workspace = true }
 aes-gcm.workspace = true
 chacha20poly1305.workspace = true

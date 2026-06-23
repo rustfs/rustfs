@@ -5,19 +5,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-obs-metrics-runtime-sources`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183`.
-- Based on: API-182 prepared in PR #3793; this branch batches OBS metrics
-  runtime source boundary cleanup on top of that branch.
+- Branch: `overtrue/arch-rio-http-runtime-sources`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184`.
+- Based on: latest `origin/main` after PR #3793 merged the API-182/API-183
+  stack; this branch batches RIO HTTP runtime source boundary cleanup on top of
+  that baseline.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
   rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
-  consumers, IAM OIDC config reads, scanner runtime-config reads, and OBS
-  metrics runtime source reads through AppContext-first or owner-crate resolver
-  boundaries.
+  consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
+  runtime source reads, and RIO HTTP reader TLS/metrics runtime source reads
+  through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -26,7 +27,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-183 owner facade cleanup.
+- Docs changes: record the API-136 through API-184 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4650,6 +4651,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guard, diff hygiene, residual OBS global scan, Rust risk scan, branch
     freshness check, pre-commit quality gate, and three-expert review.
 
+- [x] `API-184` Centralize RIO HTTP runtime source reads.
+  - Do: add a RIO HTTP runtime-source boundary for outbound TLS generation,
+    outbound TLS state, stale-generation reporting, and TCP/HTTP internode
+    metrics recording, then route `http_reader` through that boundary.
+  - Acceptance: RIO HTTP reader code no longer imports outbound TLS global
+    readers or internode metrics globals directly outside the RIO runtime
+    source boundary, while client-cache invalidation and metric labels remain
+    unchanged.
+  - Must preserve: proxy bypass behavior, HTTP client cache generation checks,
+    outbound TLS material loading, stale-generation reporting, internode
+    request/byte/error counters, and classified error labels.
+  - Verification: RIO compile coverage, RIO unit tests, formatting, migration
+    guard, layer guard, diff hygiene, residual RIO runtime source scan, Rust
+    risk scan, branch freshness check, pre-commit quality gate, and three-expert
+    review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4755,10 +4772,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-183 keeps OBS metrics runtime globals behind a metrics-owned runtime-source module without widening public APIs. |
 | Migration preservation | pass | IAM metrics, replication bandwidth availability, ILM counters, and replication stats keep the same source data and fallback behavior. |
 | Testing/verification | pass | OBS compile/tests, formatting, residual OBS global scan, targeted guard checks, and pre-commit passed for API-183. |
+| Quality/architecture | pass | API-184 keeps RIO HTTP outbound TLS and internode metric globals behind a RIO-owned runtime-source module without widening public APIs. |
+| Migration preservation | pass | HTTP client cache generation checks, TLS material loading, stale-generation reporting, and TCP/HTTP internode metrics keep existing behavior. |
+| Testing/verification | pass | RIO compile/tests, formatting, residual RIO runtime source scan, targeted guard checks, and pre-commit passed for API-184. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-184 current slice:
+  - `cargo check -p rustfs-rio --tests`: passed.
+  - `cargo test -p rustfs-rio --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - RIO HTTP runtime source scan: passed; direct outbound TLS and internode
+    metrics global reads are isolated to `crates/rio/src/http_runtime_sources.rs`.
+  - Rust risk scan: passed; diff adds no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: based on latest `origin/main` after PR #3793
+    merged the API-182/API-183 stack.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-183 current slice:
   - `cargo check -p rustfs-obs --tests`: passed.

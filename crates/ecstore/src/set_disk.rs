@@ -148,6 +148,7 @@ const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
+const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
@@ -1138,10 +1139,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 writers.push(w);
                 errors.push(e);
             }
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_writer_setup",
-                writer_setup_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
+            let writer_setup_ms = writer_setup_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_writer_setup", writer_setup_ms as f64);
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < write_quorum {
@@ -1202,10 +1201,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                     }
                 },
             };
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_encode",
-                encode_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
+            let encode_ms = encode_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_encode", encode_ms as f64);
 
             let _ = mem::replace(&mut data.stream, reader);
             // if let Err(err) = close_bitrot_writers(&mut writers).await {
@@ -1314,12 +1311,9 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 write_quorum,
             )
             .await?;
-            rustfs_io_metrics::record_put_object_stage_duration(
-                "set_disk_rename",
-                rename_stage_start.elapsed().as_secs_f64() * 1000.0,
-            );
-            let rename_stage_ms = rename_stage_start.elapsed().as_millis();
-            if rename_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+            let rename_stage_ms = rename_stage_start.elapsed().as_millis() as u64;
+            rustfs_io_metrics::record_put_object_stage_duration("set_disk_rename", rename_stage_ms as f64);
+            if (rename_stage_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                 warn!(
                     event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                     component = LOG_COMPONENT_ECSTORE,
@@ -1328,23 +1322,22 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                     bucket = %bucket,
                     object = %object,
                     tmp_dir = %tmp_dir,
-                    duration_ms = rename_stage_ms as u64,
+                    duration_ms = { rename_stage_ms },
                     write_quorum,
                     state = "slow",
                     "SetDisk commit tail stage is slow"
                 );
             }
 
+            let mut cleanup_stage_ms: Option<u64> = None;
             if let Some(old_dir) = op_old_dir {
                 let cleanup_stage_start = Instant::now();
                 self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                     .await?;
-                rustfs_io_metrics::record_put_object_stage_duration(
-                    "set_disk_old_data_cleanup",
-                    cleanup_stage_start.elapsed().as_secs_f64() * 1000.0,
-                );
-                let cleanup_stage_ms = cleanup_stage_start.elapsed().as_millis();
-                if cleanup_stage_ms >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
+                let cleanup_ms = cleanup_stage_start.elapsed().as_millis() as u64;
+                cleanup_stage_ms = Some(cleanup_ms);
+                rustfs_io_metrics::record_put_object_stage_duration("set_disk_old_data_cleanup", cleanup_ms as f64);
+                if (cleanup_ms as u128) >= SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS {
                     warn!(
                         event = EVENT_SET_DISK_COMMIT_TAIL_SLOW,
                         component = LOG_COMPONENT_ECSTORE,
@@ -1354,7 +1347,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                         object = %object,
                         tmp_dir = %tmp_dir,
                         old_dir = %old_dir,
-                        duration_ms = cleanup_stage_ms as u64,
+                        duration_ms = cleanup_ms,
                         write_quorum,
                         state = "slow",
                         "SetDisk commit tail stage is slow"
@@ -1411,9 +1404,50 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 );
             }
 
+            if issue3031_diag_enabled() {
+                warn!(
+                    event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket = %bucket,
+                    object = %object,
+                    write_quorum,
+                    write_path = write_path.metric_label(),
+                    writer_setup_ms,
+                    encode_ms,
+                    rename_ms = rename_stage_ms,
+                    cleanup_ms = cleanup_stage_ms.unwrap_or_default(),
+                    cleanup_present = cleanup_stage_ms.is_some(),
+                    commit_tail_ms = total_commit_tail_ms as u64,
+                    result = "success",
+                    "SetDisk put_object stage summary"
+                );
+            }
+
             Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
         }
         .await;
+
+        if issue3031_diag_enabled()
+            && let Err(err) = &result
+        {
+            let stage_hint = if err.to_string().contains("not enough disks to write") {
+                "writer_setup_or_quorum"
+            } else {
+                "unknown"
+            };
+            warn!(
+                event = EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket = %bucket,
+                object = %object,
+                result = "error",
+                stage_hint,
+                error = %err,
+                "SetDisk put_object stage summary"
+            );
+        }
 
         if issue3031_diag_enabled() {
             warn!(
