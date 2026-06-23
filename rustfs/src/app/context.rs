@@ -474,7 +474,7 @@ mod tests {
 
     impl BootTimeInterface for TestBootTimeInterface {
         fn get(&self) -> Option<SystemTime> {
-            self.boot_time.clone()
+            self.boot_time
         }
     }
 
