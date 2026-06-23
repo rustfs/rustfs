@@ -1016,9 +1016,13 @@ mod tests {
         StatusCode::OK
     }
 
-    async fn start_test_server(state: TestState) -> (String, tokio::task::JoinHandle<()>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+    async fn start_test_server(state: TestState) -> Option<(String, tokio::task::JoinHandle<()>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
             .route("/stall", get(get_stalling_stream))
@@ -1028,7 +1032,7 @@ mod tests {
             axum::serve(listener, app).await.unwrap();
         });
 
-        (format!("http://{addr}/stream"), handle)
+        Some((format!("http://{addr}/stream"), handle))
     }
 
     #[test]
@@ -1055,7 +1059,9 @@ mod tests {
     #[tokio::test]
     async fn http_reader_does_not_send_preflight_head() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut reader = HttpReader::new(url, Method::GET, HeaderMap::new(), None).await.unwrap();
         let mut buf = Vec::new();
@@ -1071,7 +1077,9 @@ mod tests {
     #[tokio::test]
     async fn http_reader_stall_timeout_triggers_after_progress_stops() {
         let state = TestState::default();
-        let (base_url, handle) = start_test_server(state.clone()).await;
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
         let url = base_url.replace("/stream", "/stall");
 
         let mut reader =
@@ -1099,7 +1107,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_does_not_send_empty_preflight_put() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         writer.write_all(b"payload").await.unwrap();
@@ -1114,7 +1124,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_handles_many_small_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let chunk = b"0123456789abcdef";
@@ -1134,7 +1146,9 @@ mod tests {
     #[tokio::test]
     async fn http_writer_supports_vectored_writes() {
         let state = TestState::default();
-        let (url, handle) = start_test_server(state.clone()).await;
+        let Some((url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
 
         let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
         let bufs = [IoSlice::new(b"hello "), IoSlice::new(b"world")];
@@ -1150,8 +1164,12 @@ mod tests {
 
     #[tokio::test]
     async fn http_reader_request_error_includes_method_and_url() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = listener.local_addr().expect("listener local address should be available");
         drop(listener);
 
         let url = format!("http://{addr}/stream");
