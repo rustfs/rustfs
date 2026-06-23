@@ -985,22 +985,10 @@ mod tests {
 
     #[test]
     fn test_normalize_extract_entry_key_basic() {
-        assert_eq!(
-            normalize_extract_entry_key("file.txt", None, false).unwrap(),
-            "file.txt"
-        );
-        assert_eq!(
-            normalize_extract_entry_key("file.txt", Some("prefix"), false).unwrap(),
-            "prefix/file.txt"
-        );
-        assert_eq!(
-            normalize_extract_entry_key("dir", None, true).unwrap(),
-            "dir/"
-        );
-        assert_eq!(
-            normalize_extract_entry_key("", Some("prefix"), false).unwrap(),
-            "prefix"
-        );
+        assert_eq!(normalize_extract_entry_key("file.txt", None, false).unwrap(), "file.txt");
+        assert_eq!(normalize_extract_entry_key("file.txt", Some("prefix"), false).unwrap(), "prefix/file.txt");
+        assert_eq!(normalize_extract_entry_key("dir", None, true).unwrap(), "dir/");
+        assert_eq!(normalize_extract_entry_key("", Some("prefix"), false).unwrap(), "prefix");
     }
 
     #[test]

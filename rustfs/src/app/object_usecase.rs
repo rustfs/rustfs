@@ -989,8 +989,7 @@ fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &s
 /// Delegates to [`rustfs_utils::path::validate_extract_relative_path`] and wraps
 /// the result as an S3 error on failure.
 pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
-    rustfs_utils::path::validate_extract_relative_path(path)
-        .map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
+    rustfs_utils::path::validate_extract_relative_path(path).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
@@ -1010,8 +1009,7 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
 /// Delegates to [`rustfs_utils::path::normalize_extract_entry_key`] and wraps
 /// the result as an S3 error on failure.
 pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
-    rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir)
-        .map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
+    rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir).map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
