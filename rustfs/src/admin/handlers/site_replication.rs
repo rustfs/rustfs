@@ -20,8 +20,7 @@ use super::super::metadata::{
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
 use super::super::metadata_sys;
-use super::super::replication::GLOBAL_REPLICATION_STATS;
-use super::super::replication::{ResyncOpts, get_global_replication_pool};
+use super::super::replication::{GLOBAL_REPLICATION_STATS, ResyncOpts};
 use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use super::super::{delete_admin_config, read_admin_config, save_admin_config};
@@ -33,8 +32,8 @@ use crate::admin::site_replication_identity::{
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::app::context::{
-    resolve_deployment_id, resolve_endpoints_handle, resolve_object_store_handle, resolve_region, resolve_runtime_port,
-    resolve_server_config,
+    resolve_deployment_id, resolve_endpoints_handle, resolve_object_store_handle, resolve_region,
+    resolve_replication_pool_handle, resolve_runtime_port, resolve_server_config,
 };
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
@@ -3219,7 +3218,7 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
     }
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = resolve_replication_pool_handle() else {
         bucket_status.status = "failed".to_string();
         bucket_status.err_detail = "replication pool is not initialized".to_string();
         return bucket_status;
@@ -3287,7 +3286,7 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
     }
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = resolve_replication_pool_handle() else {
         bucket_status.status = "failed".to_string();
         bucket_status.err_detail = "replication pool is not initialized".to_string();
         return bucket_status;

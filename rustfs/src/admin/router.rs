@@ -16,20 +16,19 @@ use super::GLOBAL_BOOT_TIME;
 use super::PeerRestClient;
 use super::bandwidth::monitor::BandwidthDetails;
 use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient};
-use super::get_global_bucket_monitor;
-use super::get_global_notification_sys;
 use super::metadata::BUCKET_TARGETS_FILE;
 use super::metadata_sys;
 use super::read_admin_config_without_migrate;
-use super::replication::{
-    BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts, get_global_replication_pool,
-};
+use super::replication::{BucketReplicationResyncStatus, BucketStats, GLOBAL_REPLICATION_STATS, ObjectOpts, ResyncOpts};
 use super::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::versioning_sys::BucketVersioningSys;
 use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::app::context::{resolve_deployment_id, resolve_object_store_handle, resolve_region, resolve_server_config};
+use crate::app::context::{
+    resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system, resolve_object_store_handle,
+    resolve_region, resolve_replication_pool_handle, resolve_server_config,
+};
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -1189,7 +1188,7 @@ fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<By
 }
 
 fn list_remote_live_event_peers() -> Vec<PeerLiveEventCursor> {
-    get_global_notification_sys()
+    resolve_notification_system()
         .map(|system| {
             system
                 .peer_clients
@@ -1446,7 +1445,7 @@ fn replication_metrics_uptime_seconds() -> i64 {
 }
 
 fn collect_replication_metrics_bandwidth(bucket: &str) -> HashMap<String, BandwidthDetails> {
-    get_global_bucket_monitor()
+    resolve_bucket_monitor_handle()
         .map(|monitor| {
             monitor
                 .get_report(|name| name == bucket)
@@ -2150,7 +2149,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
         .map_err(ApiError::from)?;
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = resolve_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
@@ -2170,7 +2169,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
 }
 
 async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
-    let Some(pool) = get_global_replication_pool() else {
+    let Some(pool) = resolve_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
