@@ -630,12 +630,20 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     crate::storage::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    crate::storage::get_global_deployment_id()
+}
+
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     crate::storage::get_global_lock_client()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     crate::storage::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    crate::storage::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {

@@ -813,8 +813,16 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     ecstore_global::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    ecstore_global::get_global_deployment_id()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     ecstore_global::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    ecstore_global::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
