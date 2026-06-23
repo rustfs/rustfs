@@ -32,6 +32,8 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
+pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
@@ -402,6 +404,14 @@ impl DefaultAdminUsecase {
     pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
         collect_cluster_read_only_snapshot().await
     }
+
+    pub fn cluster_snapshot_route(&self) -> &'static str {
+        ADMIN_CLUSTER_SNAPSHOT_ROUTE
+    }
+
+    pub fn runtime_capabilities_route(&self) -> &'static str {
+        ADMIN_RUNTIME_CAPABILITIES_ROUTE
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +452,14 @@ mod tests {
         let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
 
         assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn admin_usecase_exposes_stable_discovery_routes() {
+        let usecase = DefaultAdminUsecase::without_context();
+
+        assert_eq!(usecase.cluster_snapshot_route(), "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(usecase.runtime_capabilities_route(), "/rustfs/admin/v4/runtime/capabilities");
     }
 
     #[test]

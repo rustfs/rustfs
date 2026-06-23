@@ -112,10 +112,9 @@ impl Operation for GetClusterSnapshotHandler {
 }
 
 pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapshotDiscoveryResponse {
-    let path = format!("{}{}", ADMIN_PREFIX, "/v4/cluster/snapshot");
-    let snapshot = DefaultAdminUsecase::from_global()
-        .execute_collect_cluster_read_only_snapshot()
-        .await;
+    let usecase = DefaultAdminUsecase::from_global();
+    let path = usecase.cluster_snapshot_route().to_string();
+    let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
 
     match snapshot {
         Some(snapshot) => {

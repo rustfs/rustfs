@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::metrics;
+use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
@@ -250,11 +250,14 @@ pub struct RuntimeCapabilitiesSummary {
     pub memory_sampling: CapabilityStatus,
     pub platform: CapabilityStatus,
     pub topology: CapabilityStatus,
+    pub cluster_snapshot: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub cluster_snapshot_path: String,
+    pub cluster_snapshot_summary: Option<CapabilityStatus>,
     pub observability: rustfs_storage_api::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
@@ -265,9 +268,11 @@ pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
 -> Result<RuntimeCapabilitiesResponse, rustfs_storage_api::CapabilitySnapshotError> {
+    let usecase = DefaultAdminUsecase::from_global();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
+    let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
 
     let (topology, topology_status) = if let Some(endpoint_pools) = resolve_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
@@ -276,10 +281,17 @@ pub(crate) async fn build_runtime_capabilities_response()
     } else {
         (None, CapabilityStatus::unknown().with_reason(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE))
     };
-    let summary = build_runtime_capabilities_summary(&observability, topology.as_ref(), &topology_status);
+    let summary = build_runtime_capabilities_summary(
+        &observability,
+        topology.as_ref(),
+        &topology_status,
+        cluster_snapshot_discovery.summary.as_ref(),
+    );
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
+        cluster_snapshot_summary: cluster_snapshot_discovery.summary,
         observability,
         workload_admission,
         topology,
@@ -291,6 +303,7 @@ fn build_runtime_capabilities_summary(
     observability: &rustfs_storage_api::ObservabilitySnapshot,
     topology: Option<&TopologySnapshot>,
     topology_status: &CapabilityStatus,
+    cluster_snapshot_summary: Option<&CapabilityStatus>,
 ) -> RuntimeCapabilitiesSummary {
     let userspace_profiling = summarize_named_capability_statuses(
         [
@@ -347,6 +360,9 @@ fn build_runtime_capabilities_summary(
         memory_sampling,
         platform,
         topology: topology_summary,
+        cluster_snapshot: cluster_snapshot_summary.cloned().unwrap_or_else(|| {
+            CapabilityStatus::unknown().with_reason("cluster snapshot is not available before storage endpoint pools initialize")
+        }),
     }
 }
 
@@ -477,6 +493,9 @@ mod tests {
         assert_eq!(response.topology_status.reason.as_deref(), Some(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE));
         assert_eq!(response.summary.topology.state, CapabilityState::Unknown);
         assert_eq!(response.summary.topology.reason.as_deref(), Some(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE));
+        assert_eq!(response.cluster_snapshot_path, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.cluster_snapshot_summary, None);
+        assert_eq!(response.summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert_eq!(response.observability.platform.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(
             response
@@ -529,7 +548,12 @@ mod tests {
             },
         };
 
-        let summary = build_runtime_capabilities_summary(&observability, Some(&topology), &CapabilityStatus::supported());
+        let summary = build_runtime_capabilities_summary(
+            &observability,
+            Some(&topology),
+            &CapabilityStatus::supported(),
+            Some(&CapabilityStatus::supported().with_reason("cluster snapshot is available")),
+        );
 
         assert_eq!(summary.observability.state, CapabilityState::Supported);
         assert_eq!(summary.observability.reason.as_deref(), Some(OBSERVABILITY_SUMMARY_RESOLVED));
@@ -538,6 +562,7 @@ mod tests {
         assert_eq!(summary.platform.state, CapabilityState::Supported);
         assert_eq!(summary.topology.state, CapabilityState::Supported);
         assert_eq!(summary.topology.reason.as_deref(), Some(TOPOLOGY_SUMMARY_RESOLVED));
+        assert_eq!(summary.cluster_snapshot.state, CapabilityState::Supported);
     }
 
     #[test]
@@ -574,13 +599,19 @@ mod tests {
             },
         };
 
-        let summary = build_runtime_capabilities_summary(&observability, Some(&topology), &CapabilityStatus::supported());
+        let summary = build_runtime_capabilities_summary(
+            &observability,
+            Some(&topology),
+            &CapabilityStatus::supported(),
+            Some(&CapabilityStatus::unknown().with_reason("cluster snapshot unresolved")),
+        );
 
         assert_eq!(summary.observability.state, CapabilityState::Unknown);
         assert_eq!(summary.userspace_profiling.state, CapabilityState::Unknown);
         assert_eq!(summary.memory_sampling.state, CapabilityState::Unknown);
         assert_eq!(summary.platform.state, CapabilityState::Unknown);
         assert_eq!(summary.topology.state, CapabilityState::Unknown);
+        assert_eq!(summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert!(
             summary
                 .userspace_profiling
