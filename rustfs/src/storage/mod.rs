@@ -210,6 +210,7 @@ pub(crate) type BucketMetadata = ecstore_bucket::metadata::BucketMetadata;
 #[cfg(test)]
 pub(crate) type BucketMetadataSys = ecstore_bucket::metadata_sys::BucketMetadataSys;
 pub(crate) type BucketVersioningSys = ecstore_bucket::versioning_sys::BucketVersioningSys;
+pub(crate) type BucketBandwidthMonitor = ecstore_bucket::bandwidth::monitor::Monitor;
 pub(crate) type CheckPartsResp = ecstore_disk::CheckPartsResp;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
 pub(crate) type DeleteOptions = ecstore_disk::DeleteOptions;
@@ -807,6 +808,10 @@ pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::Lo
 pub(crate) fn get_global_lock_clients()
 -> Option<&'static std::collections::HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
     ecstore_global::get_global_lock_clients()
+}
+
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    ecstore_global::get_global_bucket_monitor()
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {

@@ -16,13 +16,14 @@ use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
-    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_region, get_global_tier_config_mgr,
-    global_rustfs_port,
+    get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
+    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_tier_config_mgr, global_rustfs_port,
 };
 use super::interfaces::{
-    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
-    IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface,
-    RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
+    ActionCredentialInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface, DeploymentIdInterface,
+    EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
+    NotificationSystemInterface, NotifyInterface, RegionInterface, ReplicationPoolInterface, RuntimePortInterface,
+    ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -112,6 +113,16 @@ impl NotifyInterface for NotifyHandle {
     }
 }
 
+/// Default notification system handle adapter.
+#[derive(Default)]
+pub struct NotificationSystemHandle;
+
+impl NotificationSystemInterface for NotificationSystemHandle {
+    fn handle(&self) -> Option<&'static super::super::NotificationSys> {
+        get_global_notification_sys()
+    }
+}
+
 /// Default bucket metadata interface adapter.
 #[derive(Default)]
 pub struct BucketMetadataHandle;
@@ -119,6 +130,26 @@ pub struct BucketMetadataHandle;
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
         get_global_bucket_metadata_sys()
+    }
+}
+
+/// Default bucket monitor interface adapter.
+#[derive(Default)]
+pub struct BucketMonitorHandle;
+
+impl BucketMonitorInterface for BucketMonitorHandle {
+    fn handle(&self) -> Option<Arc<super::super::BucketBandwidthMonitor>> {
+        get_global_bucket_monitor()
+    }
+}
+
+/// Default replication pool interface adapter.
+#[derive(Default)]
+pub struct ReplicationPoolHandle;
+
+impl ReplicationPoolInterface for ReplicationPoolHandle {
+    fn handle(&self) -> Option<Arc<super::super::DynReplicationPool>> {
+        get_global_replication_pool()
     }
 }
 
@@ -227,12 +258,24 @@ pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
     Arc::new(NotifyHandle)
 }
 
+pub fn default_notification_system_interface() -> Arc<dyn NotificationSystemInterface> {
+    Arc::new(NotificationSystemHandle)
+}
+
 pub fn default_kms_runtime_interface() -> Arc<dyn KmsRuntimeInterface> {
     Arc::new(KmsRuntimeHandle)
 }
 
 pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
     Arc::new(BucketMetadataHandle)
+}
+
+pub fn default_bucket_monitor_interface() -> Arc<dyn BucketMonitorInterface> {
+    Arc::new(BucketMonitorHandle)
+}
+
+pub fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
+    Arc::new(ReplicationPoolHandle)
 }
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {

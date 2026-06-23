@@ -30,6 +30,7 @@ use super::EndpointServerPools;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
+use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
@@ -79,9 +80,24 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc
         .unwrap_or_else(default_notify_interface)
 }
 
+/// Resolve notification system handle using AppContext-first precedence.
+pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
+    resolve_notification_system_with(get_global_app_context(), || default_notification_system_interface().handle())
+}
+
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
+}
+
+/// Resolve bucket bandwidth monitor using AppContext-first precedence.
+pub fn resolve_bucket_monitor_handle() -> Option<Arc<BucketBandwidthMonitor>> {
+    resolve_bucket_monitor_handle_with(get_global_app_context(), || default_bucket_monitor_interface().handle())
+}
+
+/// Resolve replication pool handle using AppContext-first precedence.
+pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
+    resolve_replication_pool_handle_with(get_global_app_context(), || default_replication_pool_interface().handle())
 }
 
 /// Resolve deployment identity using AppContext-first precedence.
@@ -155,6 +171,33 @@ fn resolve_bucket_metadata_handle_with(
 ) -> Option<Arc<RwLock<BucketMetadataSys>>> {
     context
         .and_then(|context| context.bucket_metadata().handle())
+        .or_else(fallback)
+}
+
+fn resolve_notification_system_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<&'static NotificationSys>,
+) -> Option<&'static NotificationSys> {
+    context
+        .and_then(|context| context.notification_system().handle())
+        .or_else(fallback)
+}
+
+fn resolve_bucket_monitor_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<BucketBandwidthMonitor>>,
+) -> Option<Arc<BucketBandwidthMonitor>> {
+    context
+        .and_then(|context| context.bucket_monitor().handle())
+        .or_else(fallback)
+}
+
+fn resolve_replication_pool_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<DynReplicationPool>>,
+) -> Option<Arc<DynReplicationPool>> {
+    context
+        .and_then(|context| context.replication_pool().handle())
         .or_else(fallback)
 }
 
@@ -242,7 +285,10 @@ mod tests {
     use super::super::{Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
-    use crate::app::context::handles::default_notify_interface;
+    use crate::app::context::handles::{
+        default_bucket_monitor_interface, default_notification_system_interface, default_notify_interface,
+        default_replication_pool_interface,
+    };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
         IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface,
@@ -490,9 +536,12 @@ mod tests {
                     kms: Some(context_kms.clone()),
                 }),
                 notify: default_notify_interface(),
+                notification_system: default_notification_system_interface(),
                 bucket_metadata: Arc::new(TestBucketMetadataInterface {
                     metadata: Some(bucket_metadata.clone()),
                 }),
+                bucket_monitor: default_bucket_monitor_interface(),
+                replication_pool: default_replication_pool_interface(),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
                 }),
