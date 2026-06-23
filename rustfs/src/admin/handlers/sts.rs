@@ -187,7 +187,7 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidRequest, "AccessDenied"));
     }
 
-    let Ok(iam_store) = rustfs_iam::get() else {
+    let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
     let conditions = crate::auth::get_condition_values(&headers, &cred, None, None, remote_addr);
@@ -438,7 +438,8 @@ pub async fn create_oidc_sts_credentials(
     new_cred.groups = Some(groups.to_vec());
 
     // Store temp user in IAM
-    let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
+    let iam_store =
+        crate::app::context::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)

@@ -5,15 +5,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-context-consumer-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177`.
-- Based on: API-170 merged in PR #3783; this branch batches API-171 through
-  API-177 on top of latest `main`.
+- Branch: `overtrue/arch-iam-global-read-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178`.
+- Based on: API-171 through API-177 prepared in PR #3785; this branch batches
+  the next IAM consumer migration on top of that branch.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
-  region, KMS encryption service, runtime support handles, S3 Select DB, and
-  internode RPC metrics through AppContext-first resolvers.
+  region, KMS encryption service, runtime support handles, S3 Select DB,
+  internode RPC metrics, and IAM authorization/handler reads through
+  AppContext-first resolvers.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -22,7 +23,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-177 owner facade cleanup.
+- Docs changes: record the API-136 through API-178 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4556,6 +4557,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     metrics scan, Rust risk scan, branch freshness check, and three-expert
     review.
 
+- [x] `API-178` Route IAM runtime reads through AppContext.
+  - Do: route auth, storage authorization, admin auth, admin IAM handlers, STS,
+    and table-catalog credential issuance through an AppContext-first ready IAM
+    resolver.
+  - Acceptance: production auth/admin/storage request paths no longer call the
+    IAM global getter directly, while the resolver preserves the legacy ready
+    check and global fallback.
+  - Must preserve: signature secret lookup, access-key validation, S3 policy
+    authorization, table data-plane authorization, admin IAM CRUD, STS temp-user
+    creation, service-account flows, and table credential issuance.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual IAM getter
+    scan, Rust risk scan, branch freshness check, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4643,10 +4658,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-177 keeps internode RPC metrics behind an AppContext-first resolver across HTTP and gRPC RPC paths. |
 | Migration preservation | pass | Request counters, byte accounting, transport backend labels, and error metrics preserve existing global fallback behavior. |
 | Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual internode metrics scan, and Rust risk scan passed for API-177. |
+| Quality/architecture | pass | API-178 keeps ready IAM access behind an AppContext-first resolver without widening handler semantics. |
+| Migration preservation | pass | Auth, storage authorization, admin IAM handlers, STS, and table credential flows keep existing error mapping and ready-check fallback. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual IAM getter scan, Rust risk scan, and pre-commit passed for API-178. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-178 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - IAM getter scan: passed; production auth/admin/storage IAM reads now go
+    through the AppContext ready IAM resolver.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-176 current slice:
   - `cargo check --tests -p rustfs`: passed.

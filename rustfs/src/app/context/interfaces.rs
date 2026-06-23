@@ -23,6 +23,7 @@ use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
+use rustfs_iam::oidc::OidcSys;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::KmsServiceManager;
@@ -40,6 +41,11 @@ pub trait IamInterface: Send + Sync {
     #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
+}
+
+/// OIDC interface for admin and runtime consumers.
+pub trait OidcInterface: Send + Sync {
+    fn handle(&self) -> Option<Arc<OidcSys>>;
 }
 
 /// KMS interface for application-layer use-cases.

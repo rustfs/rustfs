@@ -58,7 +58,8 @@ impl Operation for IsAdminHandler {
             true
         } else {
             let empty_claims = HashMap::new();
-            let iam_store = rustfs_iam::get().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+            let iam_store =
+                crate::app::context::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
             let conditions = get_condition_values(&req.headers, &cred, None, None, None);
             iam_store
                 .is_allowed(&Args {

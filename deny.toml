@@ -19,10 +19,6 @@ no-default-features = false
 version = 2
 yanked = "deny"
 ignore = [
-    # `instant 0.1.13` — unmaintained. No direct dependency; pulled in
-    # transitively. Tracked for upgrade as part of broader dep refresh.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2024-0384", reason = "instant unmaintained; transitive only; tracked for upgrade" },
     # `paste 1.0.15` — unmaintained. No direct dependency.
     # owner: rustfs-maintainers  review: 2026-07
     { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; transitive only; tracked for upgrade" },
@@ -33,10 +29,6 @@ ignore = [
     # in-process RSA decryption oracles are removed.
     # owner: rustfs-maintainers  review: 2026-07
     { id = "RUSTSEC-2023-0071", reason = "rsa Marvin timing sidechannel; no fixed upstream version; tracked separately" },
-    # `proc-macro-error2 2.0.1` — unmaintained. No direct dependency; pulled
-    # transitively through `mysql_async` via `mysql-common-derive`.
-    # owner: rustfs-maintainers  review: 2026-07
-    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2 unmaintained; transitive only via mysql_async; tracked for dependency refresh" },
 ]
 
 [sources]

@@ -37,7 +37,8 @@ use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, Replica
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::oidc::OidcSys;
+use rustfs_iam::{error::Error as IamError, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::{KmsServiceManager, ObjectEncryptionService, init_global_kms_service_manager};
 use rustfs_lock::LockClient;
@@ -82,6 +83,16 @@ pub fn resolve_iam_ready() -> bool {
 /// Resolve IAM system handle using AppContext-first precedence.
 pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
+}
+
+/// Resolve OIDC handle using AppContext-first precedence.
+pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
+    resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
+}
+
+/// Resolve a ready IAM system handle using AppContext-first precedence.
+pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
@@ -288,6 +299,28 @@ fn resolve_iam_handle_with(
     fallback: impl FnOnce() -> Option<Arc<IamSys<ObjectStore>>>,
 ) -> Option<Arc<IamSys<ObjectStore>>> {
     context.map(|context| context.iam().handle()).or_else(fallback)
+}
+
+fn resolve_oidc_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<Arc<OidcSys>>,
+) -> Option<Arc<OidcSys>> {
+    context.and_then(|context| context.oidc().handle()).or_else(fallback)
+}
+
+fn resolve_ready_iam_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>>,
+) -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    if let Some(context) = context {
+        if context.iam().is_ready() {
+            return Ok(context.iam().handle());
+        }
+
+        return Err(IamError::IamSysNotInitialized);
+    }
+
+    fallback()
 }
 
 fn resolve_bucket_metadata_handle_with(
@@ -507,9 +540,9 @@ mod tests {
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface,
         EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
-        LockClientInterface, LockClientsInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
-        ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
-        StorageClassInterface, TierConfigInterface, TierStatsInterface,
+        LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
+        RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -538,6 +571,14 @@ mod tests {
 
         fn is_ready(&self) -> bool {
             self.ready
+        }
+    }
+
+    struct TestOidcInterface;
+
+    impl OidcInterface for TestOidcInterface {
+        fn handle(&self) -> Option<Arc<rustfs_iam::oidc::OidcSys>> {
+            None
         }
     }
 
@@ -949,6 +990,7 @@ mod tests {
             object_store.clone(),
             AppContextTestInterfaces {
                 iam: Arc::new(TestIamInterface { ready: true }),
+                oidc: Arc::new(TestOidcInterface),
                 kms: Arc::new(TestKmsInterface {
                     kms: context_kms.clone(),
                 }),
