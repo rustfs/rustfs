@@ -30,7 +30,6 @@ use super::EndpointServerPools;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
-#[cfg(test)]
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_kms::KmsServiceManager;
@@ -58,6 +57,13 @@ pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> 
     context.map(|context| context.object_store()).or_else(new_object_layer_fn)
 }
 
+/// Resolve notify interface using an explicit AppContext, falling back to the legacy global notifier.
+pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc<dyn NotifyInterface> {
+    context
+        .map(|context| context.notify())
+        .unwrap_or_else(default_notify_interface)
+}
+
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
@@ -71,6 +77,11 @@ pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
     resolve_server_config_with(get_global_app_context(), || default_server_config_interface().get())
+}
+
+/// Resolve buffer profile config using AppContext-first precedence.
+pub fn resolve_buffer_config() -> RustFSBufferConfig {
+    resolve_buffer_config_with(get_global_app_context(), || default_buffer_config_interface().get())
 }
 
 fn resolve_kms_runtime_service_manager_with(
@@ -117,7 +128,6 @@ fn resolve_server_config_with(context: Option<Arc<AppContext>>, fallback: impl F
     context.map_or_else(fallback, |context| context.server_config().get())
 }
 
-#[cfg(test)]
 fn resolve_buffer_config_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> RustFSBufferConfig,
