@@ -59,11 +59,33 @@ Run bounded smoke targets from the repository root:
 ./scripts/fuzz/run_ci_targets.sh
 ```
 
+Build-only (no fuzz run, useful for CI warm-up):
+
+```bash
+BUILD_ONLY=1 ./scripts/fuzz/run_ci_targets.sh
+```
+
+Run a single target (no build phase, assumes pre-built harness):
+
+```bash
+FUZZ_TARGET=path_containment ./scripts/fuzz/run_single_target.sh
+```
+
 Run a longer local/nightly-style pass:
 
 ```bash
 ./scripts/fuzz/run_nightly_targets.sh
 ```
+
+## CI Workflow
+
+The GitHub Actions workflow (`.github/workflows/fuzz.yml`) uses a **build/run separation** pattern:
+
+1. **`fuzz-build`** — compiles all fuzz targets once, uploads `fuzz/target/` as an artifact.
+2. **`pr-fuzz-smoke`** — matrix job that runs each target in parallel (60s each). Restores the build artifact so there is no recompilation.
+3. **`nightly-fuzz-corpus`** — matrix job that runs each target in parallel (300s each) on a daily schedule.
+
+This design avoids redundant compilation across targets and keeps wall-clock time low.
 
 ## Seed Corpus
 

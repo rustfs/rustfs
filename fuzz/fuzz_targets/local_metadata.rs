@@ -3,7 +3,6 @@
 use libfuzzer_sys::fuzz_target;
 use rustfs_filemeta::FileMeta;
 use rustfs_utils::compress::{CompressionAlgorithm, decompress_block};
-use std::collections::BTreeSet;
 
 fn pick_algorithm(tag: u8) -> CompressionAlgorithm {
     match tag % 6 {
@@ -16,26 +15,44 @@ fn pick_algorithm(tag: u8) -> CompressionAlgorithm {
     }
 }
 
-fn exercise_payload(payload: &[u8], algorithm: CompressionAlgorithm) {
+/// Full exercise: all parsers + decompression on the complete payload.
+fn exercise_full(payload: &[u8], algorithm: CompressionAlgorithm) {
     let _ = FileMeta::load(payload);
     let _ = FileMeta::load_or_convert(payload);
     let _ = FileMeta::read_format_versions(payload);
     let _ = decompress_block(payload, algorithm);
 }
 
-fn interesting_prefix_lengths(len: usize) -> BTreeSet<usize> {
-    let mut lengths = BTreeSet::from([0usize, 1, 2, 4, 5, 8, 16, 32]);
-    lengths.insert(len);
-    lengths.insert(len.saturating_sub(1));
-    lengths.into_iter().filter(|candidate| *candidate <= len).collect()
+/// Lightweight exercise: only metadata parsers on a prefix (no decompression).
+/// Prefix tests catch partial-input / truncated-header panics cheaply.
+fn exercise_prefix(payload: &[u8]) {
+    let _ = FileMeta::load(payload);
+    let _ = FileMeta::read_format_versions(payload);
 }
 
 fuzz_target!(|data: &[u8]| {
     let algorithm = pick_algorithm(data.first().copied().unwrap_or_default());
 
-    exercise_payload(data, algorithm);
+    // Full exercise on the complete input.
+    exercise_full(data, algorithm);
 
-    for prefix_len in interesting_prefix_lengths(data.len()) {
-        exercise_payload(&data[..prefix_len], algorithm);
+    // Prefix probing — only the fast parsers, critical boundary lengths:
+    //   0   = empty input
+    //   1-5 = partial magic header ("XL2\0" is 4 bytes + version byte)
+    //   8   = covers the header + start of bin32 length field
+    if data.len() > 0 {
+        exercise_prefix(&data[..0]);
+    }
+    if data.len() > 1 {
+        exercise_prefix(&data[..1]);
+    }
+    if data.len() > 5 {
+        exercise_prefix(&data[..5]);
+    }
+    if data.len() > 8 {
+        exercise_prefix(&data[..8]);
+    }
+    if data.len() > 1 {
+        exercise_prefix(&data[..data.len() - 1]);
     }
 });

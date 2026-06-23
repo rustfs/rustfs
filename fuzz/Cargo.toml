@@ -12,7 +12,6 @@ cargo-fuzz = true
 [dependencies]
 arbitrary = "1"
 libfuzzer-sys = "0.4"
-rustfs = { path = "../rustfs", default-features = false }
 rustfs-ecstore = { path = "../crates/ecstore" }
 rustfs-filemeta = { path = "../crates/filemeta" }
 rustfs-policy = { path = "../crates/policy" }

@@ -119,7 +119,7 @@ use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::collections::HashMap;
 use std::ops::Add;
-use std::path::{Component, Path};
+use std::path::Path;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
@@ -984,21 +984,13 @@ fn snowball_meta_flag(headers: &HeaderMap, exact_keys: &[&str], suffix_lower: &s
     snowball_meta_value(headers, exact_keys, suffix_lower).is_some_and(|value| value.eq_ignore_ascii_case("true"))
 }
 
-fn contains_parent_dir_component(path: &str) -> bool {
-    path.split(['/', '\\']).any(|component| component == "..")
-}
-
+/// Validates that an archive entry path does not escape the target bucket.
+///
+/// Delegates to [`rustfs_utils::path::validate_extract_relative_path`] and wraps
+/// the result as an S3 error on failure.
 pub fn validate_extract_relative_path(path: &str) -> S3Result<()> {
-    let path = Path::new(path);
-    if path
-        .components()
-        .any(|component| matches!(component, Component::Prefix(_) | Component::RootDir | Component::ParentDir))
-        || contains_parent_dir_component(path.to_string_lossy().as_ref())
-    {
-        return Err(s3_error!(InvalidArgument, "archive entry path must stay within the target bucket"));
-    }
-
-    Ok(())
+    rustfs_utils::path::validate_extract_relative_path(path)
+        .map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
@@ -1012,22 +1004,14 @@ fn normalize_snowball_prefix(prefix: &str) -> S3Result<Option<String>> {
     Ok(Some(normalized.to_string()))
 }
 
+/// Normalizes an archive entry key by applying a prefix, trimming slashes,
+/// and ensuring directory entries end with `/`.
+///
+/// Delegates to [`rustfs_utils::path::normalize_extract_entry_key`] and wraps
+/// the result as an S3 error on failure.
 pub fn normalize_extract_entry_key(path: &str, prefix: Option<&str>, is_dir: bool) -> S3Result<String> {
-    validate_extract_relative_path(path)?;
-    let path = path.trim_matches('/');
-    let mut key = match prefix {
-        Some(prefix) if !path.is_empty() => format!("{prefix}/{path}"),
-        Some(prefix) => prefix.to_string(),
-        None => path.to_string(),
-    };
-
-    if is_dir && !key.ends_with('/') {
-        key.push('/');
-    }
-
-    validate_extract_relative_path(&key)?;
-
-    Ok(key)
+    rustfs_utils::path::normalize_extract_entry_key(path, prefix, is_dir)
+        .map_err(|msg| s3_error!(InvalidArgument, "{msg}"))
 }
 
 fn map_extract_archive_error(err: impl std::fmt::Display) -> S3Error {
