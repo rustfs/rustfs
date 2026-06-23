@@ -566,6 +566,12 @@ pub(crate) mod storageclass {
     pub(crate) const STANDARD_IA: &str = super::ecstore_config::storageclass::STANDARD_IA;
 }
 
+pub(crate) type StorageClassConfig = crate::storage::ecstore_config::storageclass::Config;
+
+pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
+    crate::storage::ecstore_config::set_global_storage_class(cfg);
+}
+
 pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
     ecstore_capacity::get_total_usable_capacity(disks, info)
 }
