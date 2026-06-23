@@ -5,13 +5,13 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-rpc-iam-context-resolver`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157`.
-- Based on: `main` after API-157.
+- Branch: `overtrue/arch-admin-runtime-context-resolvers`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159`.
+- Based on: API-159 branch while PR #3772 is pending.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
-- Rust code changes: route RPC node IAM operation consumers through an
-  AppContext IAM handle resolver with legacy global fallback.
+- Rust code changes: route admin/server action credentials, region, and server
+  config consumers through AppContext resolvers with legacy global fallback.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -19,7 +19,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions.
-- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158 owner facade cleanup.
+- Docs changes: record the API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4285,6 +4285,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
     check, pre-commit, and three-expert review.
 
+- [x] `API-159` Route RPC node lock and identity reads through AppContext.
+  - Do: add lock-client and local-node-name AppContext interfaces, default
+    legacy adapters, resolver helpers, and use them in RPC node lock and health
+    handlers.
+  - Acceptance: RPC node lock operations and health metric node identity no
+    longer read legacy global state directly when AppContext owns the boundary.
+  - Must preserve: lock-client initialization error text, health metric node
+    labels, async local-node-name behavior, and legacy global fallback when
+    AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
+- [x] `API-160` Route admin runtime reads through AppContext resolvers.
+  - Do: add action-credential and region AppContext interfaces, resolver
+    helpers, default legacy adapters, and use them with the existing server
+    config resolver across admin/server read paths.
+  - Acceptance: admin handlers and router code no longer directly read action
+    credentials, region, or server config globals when an AppContext resolver
+    owns that boundary.
+  - Must preserve: admin auth decisions, object-ZIP token signing, object lambda
+    signing region fallback, OIDC restart detection, site replication metadata,
+    and legacy global fallback when AppContext is absent.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, formatting, diff hygiene, Rust risk scan, branch freshness
+    check, pre-commit, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4314,10 +4341,47 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-158 keeps RPC node IAM operations behind the AppContext-owned IAM handle resolver boundary. |
 | Migration preservation | pass | RPC IAM policy, user, group, and service-account operations keep validation, arguments, and legacy fallback behavior. |
 | Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-158. |
+| Quality/architecture | pass | API-159 keeps RPC node lock client and node identity reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | RPC lock initialization errors and health metric node-name inputs keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-159. |
+| Quality/architecture | pass | API-160 keeps admin runtime action credentials, region, and server config reads behind AppContext resolver boundaries. |
+| Migration preservation | pass | Admin authorization, object-ZIP token encryption, object-lambda signing, OIDC restart detection, and site replication metadata keep legacy fallback behavior. |
+| Testing/verification | pass | RustFS focused compile, targeted context tests, formatting, migration guard, diff hygiene, Rust risk scan, and pre-commit passed for API-160. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-160 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext admin runtime resolver scan: passed; direct admin action
+    credential, server config, and region global reads are isolated to
+    AppContext default adapters or tests.
+  - Rust risk scan: no new production panic/todo/unsafe/cast risks added; new
+    unwrap/expect hits are resolver fallback plumbing or test assertions.
+
+- Issue #660 API-159 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `make pre-commit`: passed.
+  - AppContext RPC node resolver scan: passed; direct RPC node lock-client and
+    local-node-name global reads are isolated to AppContext default adapters.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or
+    cast risks added.
 
 - Issue #660 API-158 current slice:
   - `cargo check --tests -p rustfs`: passed.

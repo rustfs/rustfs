@@ -15,17 +15,21 @@
 use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use super::super::{get_global_endpoints_opt, get_global_region, get_global_tier_config_mgr};
+use super::super::{get_global_endpoints_opt, get_global_lock_client, get_global_region, get_global_tier_config_mgr};
 use super::interfaces::{
-    BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface,
-    NotifyInterface, RegionInterface, ServerConfigInterface, TierConfigInterface,
+    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface,
+    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface, RegionInterface, ServerConfigInterface,
+    TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
+use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
 use rustfs_config::server_config::get_global_server_config;
+use rustfs_credentials::{Credentials, get_global_action_cred};
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
+use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_targets::{EventName, arn::TargetID};
 use std::sync::Arc;
@@ -125,6 +129,37 @@ impl EndpointsInterface for EndpointsHandle {
     }
 }
 
+/// Default lock client interface adapter.
+#[derive(Default)]
+pub struct LockClientHandle;
+
+impl LockClientInterface for LockClientHandle {
+    fn handle(&self) -> Option<Arc<dyn LockClient>> {
+        get_global_lock_client()
+    }
+}
+
+/// Default local node name interface adapter.
+#[derive(Default)]
+pub struct LocalNodeNameHandle;
+
+#[async_trait]
+impl LocalNodeNameInterface for LocalNodeNameHandle {
+    async fn get(&self) -> String {
+        get_global_local_node_name().await
+    }
+}
+
+/// Default action credentials interface adapter.
+#[derive(Default)]
+pub struct ActionCredentialHandle;
+
+impl ActionCredentialInterface for ActionCredentialHandle {
+    fn get(&self) -> Option<Credentials> {
+        get_global_action_cred()
+    }
+}
+
 /// Default region interface adapter.
 #[derive(Default)]
 pub struct RegionHandle;
@@ -179,6 +214,18 @@ pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
     Arc::new(EndpointsHandle)
+}
+
+pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {
+    Arc::new(LockClientHandle)
+}
+
+pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
+    Arc::new(LocalNodeNameHandle)
+}
+
+pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
+    Arc::new(ActionCredentialHandle)
 }
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {
