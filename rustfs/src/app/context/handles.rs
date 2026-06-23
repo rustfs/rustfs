@@ -15,11 +15,14 @@
 use super::super::EndpointServerPools;
 use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use super::super::{get_global_endpoints_opt, get_global_lock_client, get_global_region, get_global_tier_config_mgr};
+use super::super::{
+    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_region, get_global_tier_config_mgr,
+    global_rustfs_port,
+};
 use super::interfaces::{
-    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface, KmsInterface,
-    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface, RegionInterface, ServerConfigInterface,
-    TierConfigInterface,
+    ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
+    IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, NotifyInterface,
+    RegionInterface, RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -129,6 +132,26 @@ impl EndpointsInterface for EndpointsHandle {
     }
 }
 
+/// Default deployment identity interface adapter.
+#[derive(Default)]
+pub struct DeploymentIdHandle;
+
+impl DeploymentIdInterface for DeploymentIdHandle {
+    fn get(&self) -> Option<String> {
+        get_global_deployment_id()
+    }
+}
+
+/// Default runtime port interface adapter.
+#[derive(Default)]
+pub struct RuntimePortHandle;
+
+impl RuntimePortInterface for RuntimePortHandle {
+    fn get(&self) -> u16 {
+        global_rustfs_port()
+    }
+}
+
 /// Default lock client interface adapter.
 #[derive(Default)]
 pub struct LockClientHandle;
@@ -214,6 +237,14 @@ pub fn default_bucket_metadata_interface() -> Arc<dyn BucketMetadataInterface> {
 
 pub fn default_endpoints_interface() -> Arc<dyn EndpointsInterface> {
     Arc::new(EndpointsHandle)
+}
+
+pub fn default_deployment_id_interface() -> Arc<dyn DeploymentIdInterface> {
+    Arc::new(DeploymentIdHandle)
+}
+
+pub fn default_runtime_port_interface() -> Arc<dyn RuntimePortInterface> {
+    Arc::new(RuntimePortHandle)
 }
 
 pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {

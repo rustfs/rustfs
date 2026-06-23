@@ -25,7 +25,6 @@ use super::super::replication::{ResyncOpts, get_global_replication_pool};
 use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use super::super::{delete_admin_config, read_admin_config, save_admin_config};
-use super::super::{get_global_deployment_id, get_global_endpoints_opt, global_rustfs_port};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::site_replication_identity::{
@@ -33,7 +32,10 @@ use crate::admin::site_replication_identity::{
     site_identity_key,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
-use crate::app::context::{resolve_object_store_handle, resolve_region, resolve_server_config};
+use crate::app::context::{
+    resolve_deployment_id, resolve_endpoints_handle, resolve_object_store_handle, resolve_region, resolve_runtime_port,
+    resolve_server_config,
+};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -671,7 +673,7 @@ fn runtime_tls_enabled_with(endpoints: Option<&super::super::EndpointServerPools
 }
 
 fn runtime_tls_enabled() -> bool {
-    let endpoints = get_global_endpoints_opt();
+    let endpoints = resolve_endpoints_handle();
     runtime_tls_enabled_with(endpoints.as_ref())
 }
 
@@ -822,7 +824,7 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
         .map(str::to_string)
         .or_else(|| uri.authority().map(|value| value.as_str().to_string()))
         .or_else(|| {
-            get_global_endpoints_opt().and_then(|endpoints| {
+            resolve_endpoints_handle().and_then(|endpoints| {
                 endpoints
                     .as_ref()
                     .iter()
@@ -831,7 +833,7 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
                     .map(|endpoint| endpoint.host_port())
             })
         })
-        .unwrap_or_else(|| format!("127.0.0.1:{}", global_rustfs_port()));
+        .unwrap_or_else(|| format!("127.0.0.1:{}", resolve_runtime_port()));
 
     format!("{scheme}://{host}")
 }
@@ -859,7 +861,7 @@ fn site_replication_local_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
             if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                 return request_endpoint(&Uri::from_static("/"), &HeaderMap::new());
             }
-            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(global_rustfs_port())).is_ok() {
+            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(resolve_runtime_port())).is_ok() {
                 parsed.to_string().trim_end_matches('/').to_string()
             } else {
                 endpoint
@@ -899,7 +901,7 @@ fn non_negative_u64(value: i64) -> u64 {
 
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
     let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
-    let deployment_id = get_global_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
+    let deployment_id = resolve_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
 
     PeerInfo {
@@ -923,7 +925,7 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
 
 fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     let endpoint = current_local_runtime_endpoint();
-    let deployment_id = get_global_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
+    let deployment_id = resolve_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
 
     PeerInfo {
@@ -4287,7 +4289,7 @@ impl Operation for SiteReplicationEditHandler {
             };
 
             for target in current_state.peers.values() {
-                let local_target = get_global_deployment_id()
+                let local_target = resolve_deployment_id()
                     .as_ref()
                     .is_some_and(|deployment_id| deployment_id == &target.deployment_id);
                 if local_target {

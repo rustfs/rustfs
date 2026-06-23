@@ -84,6 +84,16 @@ pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
 }
 
+/// Resolve deployment identity using AppContext-first precedence.
+pub fn resolve_deployment_id() -> Option<String> {
+    resolve_deployment_id_with(get_global_app_context(), || default_deployment_id_interface().get())
+}
+
+/// Resolve runtime port using AppContext-first precedence.
+pub fn resolve_runtime_port() -> u16 {
+    resolve_runtime_port_with(get_global_app_context(), || default_runtime_port_interface().get())
+}
+
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
     resolve_lock_client_with(get_global_app_context(), || default_lock_client_interface().handle())
@@ -163,6 +173,14 @@ fn resolve_endpoints_handle_with(
     context.and_then(|context| context.endpoints().handle()).or_else(fallback)
 }
 
+fn resolve_deployment_id_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+    context.and_then(|context| context.deployment_id().get()).or_else(fallback)
+}
+
+fn resolve_runtime_port_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> u16) -> u16 {
+    context.map_or_else(fallback, |context| context.runtime_port().get())
+}
+
 fn resolve_lock_client_with(
     context: Option<Arc<AppContext>>,
     fallback: impl FnOnce() -> Option<Arc<dyn LockClient>>,
@@ -226,9 +244,9 @@ mod tests {
     use crate::app::context::global::AppContextTestInterfaces;
     use crate::app::context::handles::default_notify_interface;
     use crate::app::context::interfaces::{
-        ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, EndpointsInterface, IamInterface,
-        KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface, ServerConfigInterface,
-        TierConfigInterface,
+        ActionCredentialInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface, EndpointsInterface,
+        IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, RegionInterface,
+        RuntimePortInterface, ServerConfigInterface, TierConfigInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -289,6 +307,26 @@ mod tests {
     impl EndpointsInterface for TestEndpointsInterface {
         fn handle(&self) -> Option<EndpointServerPools> {
             self.endpoints.clone()
+        }
+    }
+
+    struct TestDeploymentIdInterface {
+        id: Option<String>,
+    }
+
+    impl DeploymentIdInterface for TestDeploymentIdInterface {
+        fn get(&self) -> Option<String> {
+            self.id.clone()
+        }
+    }
+
+    struct TestRuntimePortInterface {
+        port: u16,
+    }
+
+    impl RuntimePortInterface for TestRuntimePortInterface {
+        fn get(&self) -> u16 {
+            self.port
         }
     }
 
@@ -426,6 +464,10 @@ mod tests {
         let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let context_node_name = "context-node".to_string();
         let fallback_node_name = "fallback-node".to_string();
+        let context_deployment_id = "context-deployment".to_string();
+        let fallback_deployment_id = "fallback-deployment".to_string();
+        let context_runtime_port = 19000;
+        let fallback_runtime_port = 29000;
         let context_credentials = Credentials {
             access_key: "context-access-key".to_string(),
             ..Default::default()
@@ -453,6 +495,12 @@ mod tests {
                 }),
                 endpoints: Arc::new(TestEndpointsInterface {
                     endpoints: Some(endpoints.clone()),
+                }),
+                deployment_id: Arc::new(TestDeploymentIdInterface {
+                    id: Some(context_deployment_id.clone()),
+                }),
+                runtime_port: Arc::new(TestRuntimePortInterface {
+                    port: context_runtime_port,
                 }),
                 lock_client: Arc::new(TestLockClientInterface {
                     client: Some(context_lock_client.clone()),
@@ -496,6 +544,15 @@ mod tests {
                 .as_ref()[0]
                 .drives_per_set,
             endpoints.as_ref()[0].drives_per_set
+        );
+        assert_eq!(
+            resolve_deployment_id_with(Some(context.clone()), || Some(fallback_deployment_id.clone()))
+                .expect("context deployment id"),
+            context_deployment_id
+        );
+        assert_eq!(
+            resolve_runtime_port_with(Some(context.clone()), || fallback_runtime_port),
+            context_runtime_port
         );
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(Some(context.clone()), || None).expect("context lock client"),
@@ -549,6 +606,11 @@ mod tests {
                 .drives_per_set,
             endpoints.as_ref()[0].drives_per_set
         );
+        assert_eq!(
+            resolve_deployment_id_with(None, || Some(fallback_deployment_id.clone())).expect("fallback deployment id"),
+            fallback_deployment_id
+        );
+        assert_eq!(resolve_runtime_port_with(None, || fallback_runtime_port), fallback_runtime_port);
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).expect("fallback lock client"),
             &fallback_lock_client
