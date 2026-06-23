@@ -9227,6 +9227,8 @@ version = "1.0.0-beta.8"
 dependencies = [
  "rustfs-io-core",
  "rustfs-io-metrics",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",

@@ -20,9 +20,11 @@ use rustfs_storage_api::{
 };
 
 const NOT_WIRED_INTO_RUNTIME: &str = "not wired into runtime";
+const EBPF_LINUX_ONLY: &str = "eBPF support is only available on linux targets";
 const STORAGE_MEDIA_NOT_REPORTED: &str = "storage media not reported by endpoints";
 const FAILURE_DOMAIN_NOT_REPORTED: &str = "failure domain labels not reported by endpoints";
 const NUMA_NOT_WIRED: &str = "NUMA topology not wired into runtime";
+const NUMA_LINUX_ONLY: &str = "NUMA topology reporting currently targets linux runtimes";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustFsObservabilitySnapshotProvider;
@@ -49,13 +51,13 @@ pub fn runtime_observability_snapshot() -> ObservabilitySnapshot {
             cgroup: cgroup_memory_status(),
         },
         platform: PlatformSupport {
-            target_triple: option_env!("TARGET").map(str::to_owned),
+            target_triple: Some(compiled_target_triple()),
             os: Some(std::env::consts::OS.to_owned()),
             arch: Some(std::env::consts::ARCH.to_owned()),
             allocator: CapabilityStatus::supported()
                 .with_reason(format!("backend={}", crate::allocator_reclaim::allocator_backend())),
-            ebpf: CapabilityStatus::unknown().with_reason(NOT_WIRED_INTO_RUNTIME),
-            numa: CapabilityStatus::unsupported().with_reason(NUMA_NOT_WIRED),
+            ebpf: ebpf_status(),
+            numa: numa_status(),
         },
     }
 }
@@ -104,11 +106,63 @@ fn runtime_telemetry_status() -> CapabilityStatus {
     }
 }
 
+fn compiled_target_triple() -> String {
+    let arch = std::env::consts::ARCH;
+    let vendor = target_vendor_name();
+    let os = std::env::consts::OS;
+    let env = target_env_name();
+
+    match env {
+        Some(env) => format!("{arch}-{vendor}-{os}-{env}"),
+        None => format!("{arch}-{vendor}-{os}"),
+    }
+}
+
+fn target_vendor_name() -> &'static str {
+    if cfg!(target_vendor = "apple") {
+        "apple"
+    } else if cfg!(target_vendor = "pc") {
+        "pc"
+    } else {
+        "unknown"
+    }
+}
+
+fn target_env_name() -> Option<&'static str> {
+    if cfg!(target_env = "gnu") {
+        Some("gnu")
+    } else if cfg!(target_env = "musl") {
+        Some("musl")
+    } else if cfg!(target_env = "msvc") {
+        Some("msvc")
+    } else if cfg!(target_env = "sgx") {
+        Some("sgx")
+    } else {
+        None
+    }
+}
+
 fn cpu_profiling_status() -> CapabilityStatus {
     if cfg!(any(target_os = "linux", target_os = "macos")) {
         CapabilityStatus::supported()
     } else {
         CapabilityStatus::unsupported().with_reason("userspace CPU profiling supports linux and macos targets")
+    }
+}
+
+fn ebpf_status() -> CapabilityStatus {
+    if cfg!(target_os = "linux") {
+        CapabilityStatus::unknown().with_reason(NOT_WIRED_INTO_RUNTIME)
+    } else {
+        CapabilityStatus::unsupported().with_reason(EBPF_LINUX_ONLY)
+    }
+}
+
+fn numa_status() -> CapabilityStatus {
+    if cfg!(target_os = "linux") {
+        CapabilityStatus::unknown().with_reason(NUMA_NOT_WIRED)
+    } else {
+        CapabilityStatus::unsupported().with_reason(NUMA_LINUX_ONLY)
     }
 }
 
@@ -141,6 +195,7 @@ mod tests {
 
         assert_eq!(snapshot.platform.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(snapshot.platform.arch.as_deref(), Some(std::env::consts::ARCH));
+        assert_eq!(snapshot.platform.target_triple.as_deref(), Some(compiled_target_triple().as_str()));
         assert!(matches!(
             snapshot.runtime_telemetry.state,
             CapabilityState::Supported | CapabilityState::Disabled
@@ -154,6 +209,13 @@ mod tests {
                 .unwrap_or_default()
                 .contains("backend=")
         );
+        if cfg!(target_os = "linux") {
+            assert_eq!(snapshot.platform.ebpf.state, CapabilityState::Unknown);
+            assert_eq!(snapshot.platform.numa.state, CapabilityState::Unknown);
+        } else {
+            assert_eq!(snapshot.platform.ebpf.state, CapabilityState::Unsupported);
+            assert_eq!(snapshot.platform.numa.state, CapabilityState::Unsupported);
+        }
     }
 
     #[tokio::test]

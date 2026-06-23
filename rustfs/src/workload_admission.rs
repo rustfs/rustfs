@@ -21,8 +21,8 @@ use rustfs_concurrency::{
 use crate::storage::concurrency::get_concurrency_manager;
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
+const FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER: &str = "foreground write admission not yet exposed by RustFS runtime";
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";
-const NOT_EXPOSED_BY_PROVIDER: &str = "not exposed by RustFS workload admission provider";
 const REPLICATION_RUNTIME_NOT_INITIALIZED: &str = "replication runtime not initialized";
 const REPLICATION_QUEUE_STATS_UNAVAILABLE: &str = "replication queue stats unavailable";
 const SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED: &str = "scanner activity idle or not initialized";
@@ -48,18 +48,13 @@ fn storage_concurrency_workload_admission_snapshot() -> WorkloadAdmissionRegistr
 }
 
 fn runtime_owner_workload_admission_registry_snapshot() -> WorkloadAdmissionRegistrySnapshot {
-    let entries = WorkloadClass::REQUIRED
-        .iter()
-        .copied()
-        .filter_map(|class| match class {
-            WorkloadClass::ForegroundRead => None,
-            WorkloadClass::Metadata => Some(metadata_workload_admission_snapshot()),
-            WorkloadClass::Scanner => Some(scanner_workload_admission_snapshot()),
-            WorkloadClass::Repair => Some(repair_workload_admission_snapshot()),
-            WorkloadClass::Replication => Some(replication_workload_admission_snapshot()),
-            class => Some(WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown).with_reason(NOT_EXPOSED_BY_PROVIDER)),
-        })
-        .collect();
+    let entries = vec![
+        foreground_write_workload_admission_snapshot(),
+        metadata_workload_admission_snapshot(),
+        scanner_workload_admission_snapshot(),
+        repair_workload_admission_snapshot(),
+        replication_workload_admission_snapshot(),
+    ];
 
     WorkloadAdmissionRegistrySnapshot::new(entries)
 }
@@ -72,6 +67,11 @@ pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapsho
             WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, AdmissionState::Unknown)
                 .with_reason(STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_READ)
         })
+}
+
+pub fn foreground_write_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
+    WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Unknown)
+        .with_reason(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER)
 }
 
 pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
@@ -238,6 +238,15 @@ mod tests {
     }
 
     #[test]
+    fn foreground_write_snapshot_reports_explicit_gap_reason() {
+        let snapshot = foreground_write_workload_admission_snapshot();
+
+        assert_eq!(snapshot.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(snapshot.state, AdmissionState::Unknown);
+        assert_eq!(snapshot.reason.as_deref(), Some(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER));
+    }
+
+    #[test]
     fn scanner_snapshot_reports_active_work_units() {
         let snapshot = scanner_workload_admission_snapshot_from_activity(5);
 
@@ -350,7 +359,7 @@ mod tests {
             registry
                 .get(WorkloadClass::ForegroundWrite)
                 .and_then(|snapshot| snapshot.reason.as_deref()),
-            Some(NOT_EXPOSED_BY_PROVIDER)
+            Some(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER)
         );
     }
 }

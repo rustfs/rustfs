@@ -14,8 +14,11 @@
 
 //! Runtime workload admission contract types.
 
+use serde::{Deserialize, Serialize};
+
 /// Stable workload classes used by future runtime admission snapshots.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WorkloadClass {
     /// Foreground read requests.
     ForegroundRead,
@@ -62,7 +65,8 @@ impl std::fmt::Display for WorkloadClass {
 }
 
 /// Read-only admission state for a workload class.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum AdmissionState {
     /// Admission is open for this workload class.
     Open,
@@ -85,7 +89,8 @@ impl AdmissionState {
 }
 
 /// Read-only admission snapshot for one workload class.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadAdmissionSnapshot {
     /// Workload class described by this snapshot.
     pub class: WorkloadClass,
@@ -130,7 +135,8 @@ impl WorkloadAdmissionSnapshot {
 }
 
 /// Read-only admission registry snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WorkloadAdmissionRegistrySnapshot {
     entries: Vec<WorkloadAdmissionSnapshot>,
 }
@@ -175,6 +181,7 @@ pub trait WorkloadAdmissionSnapshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn workload_contract_covers_required_classes() {
@@ -248,5 +255,40 @@ mod tests {
             registry.get(WorkloadClass::Repair).map(|snapshot| snapshot.state),
             Some(AdmissionState::Open)
         );
+    }
+
+    #[test]
+    fn workload_admission_snapshot_round_trips_with_snake_case_enums() {
+        let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Disabled)
+            .with_counts(Some(0), Some(0), Some(0))
+            .with_reason("foreground write admission not exposed");
+        let encoded = serde_json::to_value(&snapshot).expect("serialize workload admission snapshot");
+
+        assert_eq!(encoded["class"], json!("foreground_write"));
+        assert_eq!(encoded["state"], json!("disabled"));
+
+        let decoded: WorkloadAdmissionSnapshot =
+            serde_json::from_value(encoded).expect("deserialize workload admission snapshot");
+        assert_eq!(decoded, snapshot);
+    }
+
+    #[test]
+    fn workload_admission_registry_rejects_unknown_fields() {
+        let raw = json!({
+            "entries": [{
+                "class": "foreground_read",
+                "state": "open",
+                "active": 1,
+                "queued": 0,
+                "limit": 8,
+                "reason": null,
+                "unexpected": true
+            }]
+        });
+
+        let err = serde_json::from_value::<WorkloadAdmissionRegistrySnapshot>(raw)
+            .expect_err("unknown workload admission fields must be rejected");
+
+        assert!(err.to_string().contains("unexpected"));
     }
 }
