@@ -52,7 +52,7 @@
 //! };
 //!
 //! if let Some(material) = sse_encryption(request).await? {
-//!     metadata.extend(encryption_material_to_metadata(&material));
+//!     metadata.extend(encryption_material_to_metadata(&material)?);
 //! }
 //!
 //! // Unified decryption API
@@ -250,9 +250,9 @@ async fn prepare_sse_configuration(
                 })
             })
         });
-        if effective_sse.is_none() {
+        let Some(effective_sse) = effective_sse else {
             return Ok(None);
-        }
+        };
 
         debug!(
             component = LOG_COMPONENT_STORAGE,
@@ -264,7 +264,7 @@ async fn prepare_sse_configuration(
             "Resolved effective SSE configuration"
         );
 
-        let effective_kms_key_id = resolve_effective_kms_key_id(effective_sse.as_ref(), ssekms_key_id, || {
+        let effective_kms_key_id = resolve_effective_kms_key_id(Some(&effective_sse), ssekms_key_id, || {
             bucket_sse_config.rules.first().and_then(|rule| {
                 rule.apply_server_side_encryption_by_default
                     .as_ref()
@@ -273,7 +273,7 @@ async fn prepare_sse_configuration(
         });
 
         Ok(Some(SseConfiguration {
-            effective_sse: effective_sse.unwrap(),
+            effective_sse,
             effective_kms_key_id,
         }))
     } else if let Err(e) = bucket_sse_config_result {
@@ -867,17 +867,18 @@ fn canonical_sse_path(bucket: &str, object: &str) -> String {
 }
 
 #[cfg(feature = "rio-v2")]
-fn derive_object_key(external_key: [u8; 32]) -> [u8; 32] {
+fn derive_object_key(external_key: [u8; 32]) -> Result<[u8; 32], ApiError> {
     let mut random = [0u8; 32];
     rand::rng().fill(&mut random);
 
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for object-key derivation: {err}"))))?;
     mac.update(OBJECT_KEY_DERIVATION_CONTEXT);
     mac.update(&random);
 
     let mut object_key = [0u8; 32];
     object_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    object_key
+    Ok(object_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -887,8 +888,9 @@ fn derive_sealing_key(
     domain: &str,
     bucket: &str,
     object: &str,
-) -> [u8; 32] {
-    let mut mac = HmacSha256::new_from_slice(&external_key).expect("32-byte HMAC key");
+) -> Result<[u8; 32], ApiError> {
+    let mut mac = HmacSha256::new_from_slice(&external_key)
+        .map_err(|err| ApiError::from(StorageError::other(format!("Invalid HMAC key for sealing-key derivation: {err}"))))?;
     mac.update(&iv);
     mac.update(domain.as_bytes());
     mac.update(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM.as_bytes());
@@ -896,7 +898,7 @@ fn derive_sealing_key(
 
     let mut sealing_key = [0u8; 32];
     sealing_key.copy_from_slice(mac.finalize().into_bytes().as_slice());
-    sealing_key
+    Ok(sealing_key)
 }
 
 #[cfg(feature = "rio-v2")]
@@ -909,7 +911,7 @@ fn seal_object_key(
 ) -> Result<ManagedSealedKey, ApiError> {
     let mut iv = [0u8; SEALED_KEY_IV_SIZE];
     rand::rng().fill(&mut iv);
-    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object);
+    let sealing_key = derive_sealing_key(external_key, iv, managed_sse_domain(sse_type), bucket, object)?;
 
     let mut header = [0u8; DARE_HEADER_SIZE];
     header[0] = DARE_VERSION_20;
@@ -957,7 +959,7 @@ fn unseal_object_key(
         return Err(ApiError::from(StorageError::other("Invalid sealed object-key payload header")));
     }
 
-    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object);
+    let sealing_key = derive_sealing_key(external_key, sealed.iv, managed_sse_domain(sse_type), bucket, object)?;
     let plaintext = decrypt_sealed_object_key_payload(sealing_key, header, &sealed.sealed_key)?;
 
     let object_key: [u8; 32] = plaintext
@@ -1017,7 +1019,7 @@ pub(crate) fn build_ssec_read_headers(
     headers
 }
 
-pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap<String, String> {
+pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> Result<HashMap<String, String>, ApiError> {
     let mut metadata = HashMap::new();
 
     match material.sse_type {
@@ -1054,7 +1056,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
             let encrypted_data_key = material
                 .encrypted_data_key
                 .as_deref()
-                .expect("managed SSE materials must carry an encrypted data key");
+                .ok_or_else(|| ApiError::from(StorageError::other("managed SSE materials must carry an encrypted data key")))?;
             metadata.insert(
                 "x-amz-server-side-encryption".to_string(),
                 material.server_side_encryption.as_str().to_string(),
@@ -1149,7 +1151,7 @@ pub fn encryption_material_to_metadata(material: &EncryptionMaterial) -> HashMap
         }
     }
 
-    metadata
+    Ok(metadata)
 }
 
 // ============================================================================
@@ -1374,7 +1376,7 @@ async fn apply_ssec_prepare_encryption_material(
             key: sse_key,
             key_md5: sse_key_md5.clone(),
         })?;
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     } else {
@@ -1421,7 +1423,7 @@ async fn apply_ssec_encryption_material(
 
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(validated.key_bytes);
+        let object_key = derive_object_key(validated.key_bytes)?;
         let sealed_key = seal_object_key(object_key, validated.key_bytes, SSEType::SseC, bucket, key)?;
         (object_key, [0; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
@@ -1557,7 +1559,7 @@ async fn apply_managed_encryption_material(
     let algorithm = server_side_encryption.as_str().to_string();
     #[cfg(feature = "rio-v2")]
     let (key_bytes, base_nonce, key_kind, managed_sealed_key) = {
-        let object_key = derive_object_key(data_key.plaintext_key);
+        let object_key = derive_object_key(data_key.plaintext_key)?;
         let sealed_key = seal_object_key(object_key, data_key.plaintext_key, encryption_type, bucket, key)?;
         (object_key, [0u8; 12], EncryptionKeyKind::Object, Some(sealed_key))
     };
@@ -2685,7 +2687,8 @@ mod tests {
             .await
             .expect("prepare should accept ssec headers");
         assert!(material.is_some());
-        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"));
+        let metadata = encryption_material_to_metadata(&material.expect("ssec metadata should be generated"))
+            .expect("ssec metadata should be generated");
         assert_eq!(metadata.get("x-amz-server-side-encryption").unwrap(), "AES256");
         assert_eq!(metadata.get("x-amz-server-side-encryption-customer-algorithm").unwrap(), "AES256");
     }
@@ -2716,7 +2719,7 @@ mod tests {
             .expect("ssec metadata should be generated");
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("ssec metadata should serialize");
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_IV_HEADER));
         assert!(metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER));
     }
@@ -2736,7 +2739,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("ssec original-size metadata should serialize");
 
         assert_eq!(metadata.get(SSEC_ORIGINAL_SIZE_HEADER).map(String::as_str), Some("1024"));
     }
@@ -2842,7 +2846,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("aws:kms"));
         assert_eq!(
@@ -2900,7 +2905,7 @@ mod tests {
             .await
             .expect("sse-kms encryption")
             .expect("managed sse-kms material");
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
         let encoded_context = metadata
             .get(MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER)
             .expect("minio kms context header should exist");
@@ -2963,7 +2968,8 @@ mod tests {
             key_kind: EncryptionKeyKind::Direct,
             managed_kms_context: None,
             managed_sealed_key: None,
-        });
+        })
+        .expect("managed SSE metadata should serialize");
 
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_IV_HEADER).map(String::as_str),
@@ -3011,7 +3017,7 @@ mod tests {
 
                 let material = sse_encryption(request).await.expect("sse-s3 encryption should succeed");
                 let material = material.expect("managed sse-s3 encryption should return material");
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE-S3 metadata should serialize");
 
                 assert_eq!(material.kms_key_id, None);
                 assert_eq!(metadata.get("x-amz-server-side-encryption").map(String::as_str), Some("AES256"));
@@ -3104,7 +3110,7 @@ mod tests {
                     .expect("managed sse material");
                 assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-                let metadata = encryption_material_to_metadata(&material);
+                let metadata = encryption_material_to_metadata(&material).expect("managed SSE metadata should serialize");
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER));
                 assert!(!metadata.contains_key(INTERNAL_ENCRYPTION_IV_HEADER));
 
@@ -3169,7 +3175,7 @@ mod tests {
 
         assert_eq!(material.key_kind, EncryptionKeyKind::Object);
 
-        let metadata = encryption_material_to_metadata(&material);
+        let metadata = encryption_material_to_metadata(&material).expect("sse-c metadata should serialize");
         assert_eq!(
             metadata.get(MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER).map(String::as_str),
             Some(MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM)
