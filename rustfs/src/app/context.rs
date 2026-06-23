@@ -38,10 +38,13 @@ use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
-use rustfs_kms::{KmsServiceManager, init_global_kms_service_manager};
+use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
+use rustfs_kms::{KmsServiceManager, ObjectEncryptionService, init_global_kms_service_manager};
 use rustfs_lock::LockClient;
+use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
-use std::{future::Future, sync::Arc, time::SystemTime};
+use s3s::dto::SelectObjectContentInput;
+use std::{collections::HashMap, future::Future, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
@@ -52,6 +55,11 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
     resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), init_global_kms_service_manager)
+}
+
+/// Resolve KMS encryption service using AppContext-first precedence.
+pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
+    resolve_encryption_service_with(get_global_app_context(), rustfs_kms::get_global_encryption_service).await
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
@@ -155,6 +163,32 @@ pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
     resolve_lock_client_with(get_global_app_context(), || default_lock_client_interface().handle())
 }
 
+/// Resolve lock clients using AppContext-first precedence.
+pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
+    resolve_lock_clients_handle_with(get_global_app_context(), || default_lock_clients_interface().handle())
+}
+
+/// Resolve performance metrics using AppContext-first precedence.
+pub fn resolve_performance_metrics() -> Arc<PerformanceMetrics> {
+    resolve_performance_metrics_with(get_global_app_context(), || default_performance_metrics_interface().handle())
+}
+
+/// Resolve internode metrics using AppContext-first precedence.
+pub fn resolve_internode_metrics() -> Arc<InternodeMetrics> {
+    resolve_internode_metrics_with(get_global_app_context(), || default_internode_metrics_interface().handle())
+}
+
+/// Resolve S3 Select database using AppContext-first precedence.
+pub async fn resolve_s3select_db(
+    input: SelectObjectContentInput,
+    enable_debug: bool,
+) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+    resolve_s3select_db_with(get_global_app_context(), input, enable_debug, |input, enable_debug| async move {
+        default_s3select_db_interface().get(input, enable_debug).await
+    })
+    .await
+}
+
 /// Resolve local node name using AppContext-first precedence.
 pub async fn resolve_local_node_name() -> String {
     resolve_local_node_name_with(get_global_app_context(), rustfs_common::get_global_local_node_name).await
@@ -213,6 +247,21 @@ fn resolve_or_init_kms_runtime_service_manager_with(
     context
         .and_then(|context| context.kms_runtime().service_manager())
         .unwrap_or_else(fallback)
+}
+
+async fn resolve_encryption_service_with<F, Fut>(
+    context: Option<Arc<AppContext>>,
+    fallback: F,
+) -> Option<Arc<ObjectEncryptionService>>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<Arc<ObjectEncryptionService>>>,
+{
+    if let Some(manager) = context.and_then(|context| context.kms_runtime().service_manager()) {
+        return manager.get_encryption_service().await;
+    }
+
+    fallback().await
 }
 
 fn resolve_outbound_tls_generation_with(
@@ -339,6 +388,44 @@ fn resolve_lock_client_with(
     context.and_then(|context| context.lock_client().handle()).or_else(fallback)
 }
 
+fn resolve_lock_clients_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
+) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+    context.and_then(|context| context.lock_clients().handle()).or_else(fallback)
+}
+
+fn resolve_performance_metrics_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<PerformanceMetrics>,
+) -> Arc<PerformanceMetrics> {
+    context.map_or_else(fallback, |context| context.performance_metrics().handle())
+}
+
+fn resolve_internode_metrics_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<InternodeMetrics>,
+) -> Arc<InternodeMetrics> {
+    context.map_or_else(fallback, |context| context.internode_metrics().handle())
+}
+
+async fn resolve_s3select_db_with<F, Fut>(
+    context: Option<Arc<AppContext>>,
+    input: SelectObjectContentInput,
+    enable_debug: bool,
+    fallback: F,
+) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>
+where
+    F: FnOnce(SelectObjectContentInput, bool) -> Fut,
+    Fut: Future<Output = QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>>,
+{
+    if let Some(context) = context {
+        return context.s3select_db().get(input, enable_debug).await;
+    }
+
+    fallback(input, enable_debug).await
+}
+
 async fn resolve_local_node_name_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> String
 where
     F: FnOnce() -> Fut,
@@ -419,14 +506,21 @@ mod tests {
     };
     use crate::app::context::interfaces::{
         ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BufferConfigInterface, DeploymentIdInterface,
-        EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface,
-        OutboundTlsRuntimeInterface, RegionInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
+        EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
+        LockClientInterface, LockClientsInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
+        ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
+        StorageClassInterface, TierConfigInterface, TierStatsInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
     use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+    use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
     use rustfs_lock::{LocalClient, LockClient};
+    use rustfs_s3select_api::{
+        QueryResult,
+        query::{Query, execution::QueryStateMachineRef, logical_planner::Plan},
+        server::dbms::{DatabaseManagerSystem, QueryHandle},
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::{Duration, SystemTime};
@@ -573,6 +667,76 @@ mod tests {
         }
     }
 
+    struct TestLockClientsInterface {
+        clients: Option<HashMap<String, Arc<dyn LockClient>>>,
+    }
+
+    impl LockClientsInterface for TestLockClientsInterface {
+        fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+            self.clients.clone()
+        }
+    }
+
+    struct TestPerformanceMetricsInterface {
+        metrics: Arc<PerformanceMetrics>,
+    }
+
+    impl PerformanceMetricsInterface for TestPerformanceMetricsInterface {
+        fn handle(&self) -> Arc<PerformanceMetrics> {
+            self.metrics.clone()
+        }
+    }
+
+    struct TestInternodeMetricsInterface {
+        metrics: Arc<InternodeMetrics>,
+    }
+
+    impl InternodeMetricsInterface for TestInternodeMetricsInterface {
+        fn handle(&self) -> Arc<InternodeMetrics> {
+            self.metrics.clone()
+        }
+    }
+
+    struct TestS3SelectDbInterface {
+        db: Arc<dyn DatabaseManagerSystem + Send + Sync>,
+    }
+
+    #[async_trait]
+    impl S3SelectDbInterface for TestS3SelectDbInterface {
+        async fn get(
+            &self,
+            _input: SelectObjectContentInput,
+            _enable_debug: bool,
+        ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+            Ok(self.db.clone())
+        }
+    }
+
+    struct TestS3SelectDb;
+
+    #[async_trait]
+    impl DatabaseManagerSystem for TestS3SelectDb {
+        async fn execute(&self, _query: &Query) -> QueryResult<QueryHandle> {
+            unreachable!("resolver tests only compare database handles")
+        }
+
+        async fn build_query_state_machine(&self, _query: Query) -> QueryResult<QueryStateMachineRef> {
+            unreachable!("resolver tests only compare database handles")
+        }
+
+        async fn build_logical_plan(&self, _query_state_machine: QueryStateMachineRef) -> QueryResult<Option<Plan>> {
+            unreachable!("resolver tests only compare database handles")
+        }
+
+        async fn execute_logical_plan(
+            &self,
+            _logical_plan: Plan,
+            _query_state_machine: QueryStateMachineRef,
+        ) -> QueryResult<QueryHandle> {
+            unreachable!("resolver tests only compare database handles")
+        }
+    }
+
     struct TestLocalNodeNameInterface {
         name: String,
     }
@@ -699,6 +863,25 @@ mod tests {
         (temp_dir, store, endpoint_pools)
     }
 
+    fn test_select_input() -> SelectObjectContentInput {
+        SelectObjectContentInput {
+            bucket: "test-bucket".to_string(),
+            expected_bucket_owner: None,
+            key: "test.csv".to_string(),
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            request: s3s::dto::SelectObjectContentRequest {
+                expression: "SELECT * FROM S3Object".to_string(),
+                expression_type: s3s::dto::ExpressionType::from_static("SQL"),
+                input_serialization: s3s::dto::InputSerialization::default(),
+                output_serialization: s3s::dto::OutputSerialization::default(),
+                request_progress: None,
+                scan_range: None,
+            },
+        }
+    }
+
     #[tokio::test]
     async fn resolver_helpers_are_context_first_and_fallback_when_context_is_absent() {
         let (_temp_dir, object_store, endpoints) = test_store().await;
@@ -736,6 +919,16 @@ mod tests {
         let fallback_deployment_id = "fallback-deployment".to_string();
         let context_runtime_port = 19000;
         let fallback_runtime_port = 29000;
+        let mut context_lock_clients = HashMap::new();
+        context_lock_clients.insert("context-node:9000".to_string(), context_lock_client.clone());
+        let mut fallback_lock_clients = HashMap::new();
+        fallback_lock_clients.insert("fallback-node:9000".to_string(), fallback_lock_client.clone());
+        let context_performance_metrics = Arc::new(PerformanceMetrics::new());
+        let fallback_performance_metrics = Arc::new(PerformanceMetrics::new());
+        let context_internode_metrics = Arc::new(InternodeMetrics::default());
+        let fallback_internode_metrics = Arc::new(InternodeMetrics::default());
+        let context_s3select_db: Arc<dyn DatabaseManagerSystem + Send + Sync> = Arc::new(TestS3SelectDb);
+        let fallback_s3select_db: Arc<dyn DatabaseManagerSystem + Send + Sync> = Arc::new(TestS3SelectDb);
         let context_outbound_tls_state = GlobalPublishedOutboundTlsState {
             generation: TlsGeneration(41),
             root_ca_pem: Some(b"context-root-ca".to_vec()),
@@ -795,6 +988,18 @@ mod tests {
                 }),
                 lock_client: Arc::new(TestLockClientInterface {
                     client: Some(context_lock_client.clone()),
+                }),
+                lock_clients: Arc::new(TestLockClientsInterface {
+                    clients: Some(context_lock_clients.clone()),
+                }),
+                performance_metrics: Arc::new(TestPerformanceMetricsInterface {
+                    metrics: context_performance_metrics.clone(),
+                }),
+                internode_metrics: Arc::new(TestInternodeMetricsInterface {
+                    metrics: context_internode_metrics.clone(),
+                }),
+                s3select_db: Arc::new(TestS3SelectDbInterface {
+                    db: context_s3select_db.clone(),
                 }),
                 local_node_name: Arc::new(TestLocalNodeNameInterface {
                     name: context_node_name.clone(),
@@ -881,6 +1086,29 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(Some(context.clone()), || None).expect("context lock client"),
             &context_lock_client
+        ));
+        assert!(Arc::ptr_eq(
+            resolve_lock_clients_handle_with(Some(context.clone()), || None)
+                .expect("context lock clients")
+                .get("context-node:9000")
+                .expect("context lock client entry"),
+            &context_lock_client
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_performance_metrics_with(Some(context.clone()), || fallback_performance_metrics.clone()),
+            &context_performance_metrics
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_internode_metrics_with(Some(context.clone()), || fallback_internode_metrics.clone()),
+            &context_internode_metrics
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_s3select_db_with(Some(context.clone()), test_select_input(), false, |_input, _enable_debug| async {
+                Ok(fallback_s3select_db.clone())
+            })
+            .await
+            .expect("context S3 Select DB"),
+            &context_s3select_db
         ));
         assert_eq!(
             resolve_local_node_name_with(Some(context.clone()), || async { fallback_node_name.clone() }).await,
@@ -971,6 +1199,29 @@ mod tests {
         assert!(Arc::ptr_eq(
             &resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).expect("fallback lock client"),
             &fallback_lock_client
+        ));
+        assert!(Arc::ptr_eq(
+            resolve_lock_clients_handle_with(None, || Some(fallback_lock_clients.clone()))
+                .expect("fallback lock clients")
+                .get("fallback-node:9000")
+                .expect("fallback lock client entry"),
+            &fallback_lock_client
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_performance_metrics_with(None, || fallback_performance_metrics.clone()),
+            &fallback_performance_metrics
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_internode_metrics_with(None, || fallback_internode_metrics.clone()),
+            &fallback_internode_metrics
+        ));
+        assert!(Arc::ptr_eq(
+            &resolve_s3select_db_with(None, test_select_input(), false, |_input, _enable_debug| async {
+                Ok(fallback_s3select_db.clone())
+            })
+            .await
+            .expect("fallback S3 Select DB"),
+            &fallback_s3select_db
         ));
         assert_eq!(
             resolve_local_node_name_with(None, || async { fallback_node_name.clone() }).await,
