@@ -6673,7 +6673,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_pool_meta_decommission_retry_preserves_completed_bucket_progress() {
+    fn test_pool_meta_failed_decommission_requires_clear_before_restart() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -6697,6 +6697,29 @@ mod pools_tests {
             ..Default::default()
         };
 
+        let err = meta
+            .decommission(
+                0,
+                PoolSpaceInfo {
+                    total: 200,
+                    free: 50,
+                    used: 150,
+                },
+            )
+            .expect_err("failed decommission should be blocked until cleared");
+        assert!(err.to_string().contains("target pool decommission is blocked"));
+        let blocked = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("blocked metadata should remain until clear");
+        assert!(blocked.failed);
+        assert_eq!(blocked.decommissioned_buckets, vec!["bucket-done".to_string()]);
+        assert_eq!(blocked.items_decommissioned, 7);
+        assert_eq!(blocked.bytes_done, 1024);
+
+        assert!(meta.clear_decommission(0).expect("failed decommission should clear"));
+        assert!(meta.pools[0].decommission.is_none());
+
         meta.decommission(
             0,
             PoolSpaceInfo {
@@ -6705,7 +6728,7 @@ mod pools_tests {
                 used: 150,
             },
         )
-        .expect("failed decommission should be restartable");
+        .expect("cleared decommission should be restartable");
         meta.queue_buckets(
             0,
             vec![
@@ -6727,11 +6750,11 @@ mod pools_tests {
         assert!(!info.failed);
         assert!(!info.canceled);
         assert!(!info.complete);
-        assert_eq!(info.decommissioned_buckets, vec!["bucket-done".to_string()]);
-        assert_eq!(info.queued_buckets, vec!["bucket-pending".to_string()]);
-        assert_eq!(info.items_decommissioned, 7);
+        assert!(info.decommissioned_buckets.is_empty());
+        assert_eq!(info.queued_buckets, vec!["bucket-done".to_string(), "bucket-pending".to_string()]);
+        assert_eq!(info.items_decommissioned, 0);
         assert_eq!(info.items_decommission_failed, 0);
-        assert_eq!(info.bytes_done, 1024);
+        assert_eq!(info.bytes_done, 0);
         assert_eq!(info.bytes_failed, 0);
         assert_eq!(info.items_since_last_progress_save(), 0);
         assert_eq!(info.start_size, 50);
@@ -6744,7 +6767,7 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_pool_meta_queued_decommission_retry_preserves_canceled_completed_buckets() {
+    fn test_pool_meta_canceled_queued_decommission_requires_clear_before_restart() {
         let mut meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
@@ -6761,6 +6784,29 @@ mod pools_tests {
             ..Default::default()
         };
 
+        let err = meta
+            .queue_decommission(
+                0,
+                PoolSpaceInfo {
+                    total: 100,
+                    free: 25,
+                    used: 75,
+                },
+            )
+            .expect_err("canceled queued decommission should be blocked until cleared");
+        assert!(err.to_string().contains("target pool decommission is blocked"));
+        let blocked = meta.pools[0]
+            .decommission
+            .as_ref()
+            .expect("blocked metadata should remain until clear");
+        assert!(blocked.canceled);
+        assert_eq!(blocked.decommissioned_buckets, vec!["bucket-done".to_string()]);
+        assert_eq!(blocked.items_decommissioned, 5);
+        assert_eq!(blocked.bytes_done, 512);
+
+        assert!(meta.clear_decommission(0).expect("canceled decommission should clear"));
+        assert!(meta.pools[0].decommission.is_none());
+
         meta.queue_decommission(
             0,
             PoolSpaceInfo {
@@ -6769,7 +6815,7 @@ mod pools_tests {
                 used: 75,
             },
         )
-        .expect("canceled queued decommission should be restartable");
+        .expect("cleared queued decommission should be restartable");
 
         let info = meta.pools[0]
             .decommission
@@ -6777,9 +6823,9 @@ mod pools_tests {
             .expect("decommission info should be rebuilt");
         assert!(info.queued);
         assert!(info.start_time.is_none());
-        assert_eq!(info.decommissioned_buckets, vec!["bucket-done".to_string()]);
-        assert_eq!(info.items_decommissioned, 5);
-        assert_eq!(info.bytes_done, 512);
+        assert!(info.decommissioned_buckets.is_empty());
+        assert_eq!(info.items_decommissioned, 0);
+        assert_eq!(info.bytes_done, 0);
     }
 
     #[test]
