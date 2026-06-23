@@ -6111,9 +6111,9 @@ dependencies = [
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -9326,7 +9326,7 @@ dependencies = [
  "lazy_static",
  "libc",
  "md-5 0.11.0",
- "memmap2 0.9.10",
+ "memmap2 0.9.11",
  "metrics",
  "num_cpus",
  "opentelemetry",
@@ -9513,7 +9513,7 @@ name = "rustfs-io-core"
 version = "1.0.0-beta.8"
 dependencies = [
  "bytes",
- "memmap2 0.9.10",
+ "memmap2 0.9.11",
  "rustfs-io-metrics",
  "thiserror 2.0.18",
  "tokio",
@@ -11374,7 +11374,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "332615d90111d8eeaf86a84dc9bbe9f65d0d8c5cf11b4caccedc37754eb0dcfd"
 dependencies = [
  "debugid",
- "memmap2 0.9.10",
+ "memmap2 0.9.11",
  "stable_deref_trait",
  "uuid",
 ]
