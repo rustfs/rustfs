@@ -16,7 +16,6 @@
 
 use super::ECStore;
 use super::StorageError;
-use super::get_global_notification_sys;
 use super::object_api_utils::to_s3s_etag;
 use super::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
 use super::{
@@ -40,7 +39,8 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::context::{
-    AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
+    AppContext, get_global_app_context, resolve_encryption_service, resolve_notification_system,
+    resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
@@ -207,7 +207,7 @@ fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
 ) {
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = get_global_notification_sys()
+        if let Some(notification_sys) = resolve_notification_system()
             && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
         {
             warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
@@ -1560,7 +1560,7 @@ impl DefaultBucketUsecase {
             && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
             && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
         {
-            let service = rustfs_kms::service_manager::get_global_encryption_service()
+            let service = resolve_encryption_service()
                 .await
                 .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
             let default_key = service

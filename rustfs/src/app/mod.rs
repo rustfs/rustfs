@@ -41,7 +41,7 @@ mod lifecycle_transition_api_test;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 mod ecstore_admin {
     pub(crate) use crate::storage::ecstore_admin::get_server_info;
@@ -94,10 +94,12 @@ pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DI
 
 pub(crate) type DiskError = crate::storage::DiskError;
 pub(crate) type DynReader = crate::storage::DynReader;
+pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
 pub(crate) type HashReader = crate::storage::HashReader;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
+pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
 pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
 pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
@@ -564,6 +566,12 @@ pub(crate) mod storageclass {
     pub(crate) const STANDARD_IA: &str = super::ecstore_config::storageclass::STANDARD_IA;
 }
 
+pub(crate) type StorageClassConfig = crate::storage::ecstore_config::storageclass::Config;
+
+pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
+    crate::storage::ecstore_config::set_global_storage_class(cfg);
+}
+
 pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
     ecstore_capacity::get_total_usable_capacity(disks, info)
 }
@@ -630,12 +638,24 @@ pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     crate::storage::get_global_endpoints_opt()
 }
 
+pub(crate) fn get_global_deployment_id() -> Option<String> {
+    crate::storage::get_global_deployment_id()
+}
+
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     crate::storage::get_global_lock_client()
 }
 
+pub(crate) fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+    crate::storage::get_global_lock_clients()
+}
+
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
     crate::storage::get_global_region()
+}
+
+pub(crate) fn global_rustfs_port() -> u16 {
+    crate::storage::global_rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
@@ -652,6 +672,36 @@ pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> b
 
 pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
     crate::storage::get_global_notification_sys()
+}
+
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    crate::storage::get_global_bucket_monitor()
+}
+
+pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+    crate::storage::get_global_replication_pool()
+}
+
+pub(crate) type ReplicationStats = crate::storage::ReplicationStats;
+
+pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    crate::storage::get_global_replication_stats()
+}
+
+pub(crate) type DailyAllTierStats = crate::storage::DailyAllTierStats;
+
+pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
+    crate::storage::get_global_boot_time()
+}
+
+pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
+    crate::storage::get_daily_all_tier_stats()
+}
+
+pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+
+pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
+    rustfs_common::metrics::global_metrics().report().await
 }
 
 #[cfg(test)]

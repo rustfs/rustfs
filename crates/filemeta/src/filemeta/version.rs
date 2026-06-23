@@ -2140,18 +2140,14 @@ impl MetaObject {
         [bytes[0], bytes[1], bytes[2], bytes[3]]
     }
 
-    pub fn init_free_version(&self, fi: &FileInfo) -> (FileMetaVersion, bool) {
+    pub fn init_free_version(&self, fi: &FileInfo) -> Result<(FileMetaVersion, bool)> {
         if fi.skip_tier_free_version() {
-            return (FileMetaVersion::default(), false);
+            return Ok((FileMetaVersion::default(), false));
         }
         if let Some(status) = get_bytes(&self.meta_sys, SUFFIX_TRANSITION_STATUS)
             && status == TRANSITION_COMPLETE.as_bytes().to_vec()
         {
-            let vid = Uuid::parse_str(&fi.tier_free_version_id());
-            if let Err(err) = vid {
-                panic!("Invalid Tier Object delete marker versionId {} {}", fi.tier_free_version_id(), err);
-            }
-            let vid = vid.unwrap();
+            let vid = Uuid::parse_str(&fi.tier_free_version_id())?;
             let mut free_entry = FileMetaVersion {
                 version_type: VersionType::Delete,
                 write_version: 0,
@@ -2176,9 +2172,9 @@ impl MetaObject {
                     insert_bytes(&mut delete_marker.meta_sys, suffix, v);
                 }
             }
-            return (free_entry, true);
+            return Ok((free_entry, true));
         }
-        (FileMetaVersion::default(), false)
+        Ok((FileMetaVersion::default(), false))
     }
 }
 
@@ -3390,5 +3386,21 @@ mod tests {
         }
         .into_fileinfo("b", "k", false);
         assert_eq!(fi.transition_version_id, Some(id));
+    }
+
+    #[test]
+    fn meta_object_init_free_version_rejects_invalid_tier_free_version_id() {
+        let mut sys = HashMap::new();
+        insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());
+
+        let obj = make_meta_object_with_sys(sys);
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.set_tier_free_version_id("not-a-uuid");
+
+        let err = obj
+            .init_free_version(&fi)
+            .expect_err("invalid free-version UUID should return an error instead of panicking");
+
+        assert!(matches!(err, Error::UuidParse(_)));
     }
 }

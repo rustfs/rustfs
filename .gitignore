@@ -69,3 +69,4 @@ tmp/
 crates/*/docs
 fuzz/target
 outputs
+worktrees/*

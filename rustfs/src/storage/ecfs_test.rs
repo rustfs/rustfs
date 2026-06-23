@@ -829,6 +829,7 @@ mod tests {
     #[test]
     fn test_parse_object_lock_retention() {
         use time::macros::datetime;
+        use time::{OffsetDateTime, UtcOffset};
         // [1] Normal case: No retention specified (empty metadata)
         assert!(parse_object_lock_retention(None).is_ok());
         assert!(parse_object_lock_retention(None).unwrap().is_empty());
@@ -894,6 +895,19 @@ mod tests {
         let err = parse_object_lock_retention(Some(past_date_retention)).unwrap_err();
         assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
         assert_eq!(err.message(), Some("The retain until date must be in the future"));
+
+        // [8] Error case: timestamps that cannot be serialized as RFC3339 should return InvalidArgument instead of panicking
+        let unsupported_rfc3339_date = datetime!(2030-01-01 00:00:00 UTC)
+            .to_offset(UtcOffset::from_hms(5, 30, 45).expect("offset with seconds should be constructible"));
+        assert!(unsupported_rfc3339_date > OffsetDateTime::now_utc());
+
+        let unsupported_date_retention = ObjectLockRetention {
+            mode: Some(ObjectLockRetentionMode::from_static(ObjectLockRetentionMode::COMPLIANCE)),
+            retain_until_date: Some(unsupported_rfc3339_date.into()),
+        };
+        let err = parse_object_lock_retention(Some(unsupported_date_retention)).unwrap_err();
+        assert_eq!(err.code().as_str(), S3ErrorCode::InvalidArgument.as_str());
+        assert_eq!(err.message(), Some("The retain until date is not a supported RFC3339 timestamp"));
     }
 
     #[test]

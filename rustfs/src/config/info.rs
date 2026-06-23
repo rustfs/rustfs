@@ -19,6 +19,7 @@
 //! configuration, and dependencies.
 
 use super::{InfoOpts, InfoType};
+use crate::app::context::resolve_buffer_config;
 use crate::version::build;
 use rustfs_credentials::Masked;
 use serde::Serialize;
@@ -543,9 +544,9 @@ fn collect_config_info_json() -> ConfigInfoJson {
 
     // Get workload profile info
     let workload_profile = {
-        use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+        use super::workload_profiles::is_buffer_profile_enabled;
         if is_buffer_profile_enabled() {
-            let config = get_global_buffer_config();
+            let config = resolve_buffer_config();
             let profile = config.workload_profile();
             let buffer_config = profile.config();
             Some(WorkloadProfileJson {
@@ -863,13 +864,13 @@ fn format_protocol_config_info() -> String {
 
 /// Get workload profile information from global buffer config
 fn get_workload_profile_info() -> String {
-    use super::workload_profiles::{get_global_buffer_config, is_buffer_profile_enabled};
+    use super::workload_profiles::is_buffer_profile_enabled;
 
     if !is_buffer_profile_enabled() {
         return "| Workload Profile | (disabled) |".to_string();
     }
 
-    let config = get_global_buffer_config();
+    let config = resolve_buffer_config();
     let profile = config.workload_profile();
     let name = config.workload_name();
     let buffer_config = profile.config();
