@@ -210,8 +210,10 @@ pub(crate) type BucketMetadata = ecstore_bucket::metadata::BucketMetadata;
 #[cfg(test)]
 pub(crate) type BucketMetadataSys = ecstore_bucket::metadata_sys::BucketMetadataSys;
 pub(crate) type BucketVersioningSys = ecstore_bucket::versioning_sys::BucketVersioningSys;
+pub(crate) type BucketBandwidthMonitor = ecstore_bucket::bandwidth::monitor::Monitor;
 pub(crate) type CheckPartsResp = ecstore_disk::CheckPartsResp;
 pub(crate) type CollectMetricsOpts = ecstore_metrics::CollectMetricsOpts;
+pub(crate) type DailyAllTierStats = ecstore_bucket::lifecycle::tier_last_day_stats::DailyAllTierStats;
 pub(crate) type DeleteOptions = ecstore_disk::DeleteOptions;
 pub(crate) type DiskError = ecstore_disk::error::DiskError;
 pub(crate) type DiskInfo = ecstore_disk::DiskInfo;
@@ -245,6 +247,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
+pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
@@ -297,6 +300,18 @@ pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     ecstore_bucket::replication::get_global_replication_pool()
+}
+
+pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().cloned()
+}
+
+pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
+    ecstore_global::GLOBAL_BOOT_TIME.get().cloned()
+}
+
+pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState.get_daily_all_tier_stats()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
@@ -807,6 +822,10 @@ pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::Lo
 pub(crate) fn get_global_lock_clients()
 -> Option<&'static std::collections::HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
     ecstore_global::get_global_lock_clients()
+}
+
+pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+    ecstore_global::get_global_bucket_monitor()
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {

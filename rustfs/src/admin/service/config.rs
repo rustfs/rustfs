@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::get_global_notification_sys;
-use super::super::set_global_storage_class;
 use super::super::storageclass;
 use super::super::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
-use crate::app::context::resolve_object_store_handle;
+use crate::app::context::{
+    publish_server_config, publish_storage_class_config, resolve_notification_system, resolve_object_store_handle,
+};
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
 use rustfs_config::oidc::IDENTITY_OPENID_SUB_SYS;
-use rustfs_config::server_config::{Config as ServerConfig, KVS, set_global_server_config};
+use rustfs_config::server_config::{Config as ServerConfig, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
@@ -78,7 +78,7 @@ async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<(
         .unwrap_or(1);
     let parsed = storageclass::lookup_config(&kvs, set_drive_count)
         .map_err(|err| internal_error(format!("failed to apply storage class config: {err}")))?;
-    set_global_storage_class(parsed);
+    publish_storage_class_config(parsed);
     Ok(())
 }
 
@@ -336,7 +336,7 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
         }
     }
 
-    set_global_server_config(config);
+    publish_server_config(config);
     Ok(())
 }
 
@@ -345,7 +345,7 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
         return;
     }
 
-    let Some(notification_sys) = get_global_notification_sys() else {
+    let Some(notification_sys) = resolve_notification_system() else {
         return;
     };
 
@@ -357,7 +357,7 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
 }
 
 pub async fn signal_config_snapshot_reload() {
-    let Some(notification_sys) = get_global_notification_sys() else {
+    let Some(notification_sys) = resolve_notification_system() else {
         return;
     };
 

@@ -2813,10 +2813,10 @@ mod tests {
             .pop_runnable(|request| can_schedule_request(request, &running, 1))
             .expect("should find runnable request");
 
-        match popped.heal_type {
-            HealType::ErasureSet { set_disk_id, .. } => assert_eq!(set_disk_id, "pool_0_set_2"),
-            other => panic!("expected erasure set request, got {other:?}"),
-        }
+        assert!(matches!(
+            popped.heal_type,
+            HealType::ErasureSet { ref set_disk_id, .. } if set_disk_id == "pool_0_set_2"
+        ));
     }
 
     #[test]

@@ -17,12 +17,12 @@
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_kms_runtime_service_manager;
+use crate::app::context::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
-use rustfs_kms::{KmsBackend, init_global_kms_service_manager};
+use rustfs_kms::KmsBackend;
 use rustfs_policy::policy::action::{Action, KmsAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -39,7 +39,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
         Some(manager) => manager,
         None => {
             warn!("KMS service manager not initialized, initializing now as fallback");
-            init_global_kms_service_manager()
+            resolve_or_init_kms_runtime_service_manager()
         }
     }
 }

@@ -50,6 +50,7 @@ accepted|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_
 accepted|rustfs/src/startup_iam.rs|infra->app|crate::app::context::AppContext|startup wires IAM bootstrap through AppContext
 accepted|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config|storage buffer sizing reads runtime config through AppContext resolver
 accepted|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery|storage extension uses current ECFS interface query type
+accepted|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config|buffer config resolution uses global AppContext
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::FS|storage tests exercise current ECFS interface path
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::ecfs::validate_object_lock_configuration_input|storage tests exercise current ECFS object-lock validator
 accepted|rustfs/src/storage/ecfs_test.rs|infra->interface|crate::storage::s3_api::common::rustfs_initiator|storage tests use current S3 API initiator helper

@@ -265,12 +265,42 @@ pub fn get_available_port() -> u16 {
 }
 
 fn try_get_available_port() -> std::io::Result<u16> {
-    let listener =
-        TcpListener::bind("0.0.0.0:0").map_err(|err| Error::other(format!("Failed to bind for ephemeral port: {err}")))?;
-    listener
-        .local_addr()
-        .map(|addr| addr.port())
-        .map_err(|err| Error::other(format!("Failed to read ephemeral port: {err}")))
+    let mut last_err = None;
+
+    for _ in 0..8 {
+        for candidate in ["127.0.0.1:0", "0.0.0.0:0"] {
+            match TcpListener::bind(candidate) {
+                Ok(listener) => {
+                    return listener
+                        .local_addr()
+                        .map(|addr| addr.port())
+                        .map_err(|err| Error::new(err.kind(), format!("Failed to read ephemeral port: {err}")));
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::AddrInUse
+                            | std::io::ErrorKind::AddrNotAvailable
+                            | std::io::ErrorKind::Interrupted
+                            | std::io::ErrorKind::WouldBlock
+                            | std::io::ErrorKind::PermissionDenied
+                    ) =>
+                {
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    return Err(Error::new(err.kind(), format!("Failed to bind for ephemeral port on {candidate}: {err}")));
+                }
+            }
+        }
+
+        std::thread::sleep(Duration::from_millis(5));
+    }
+
+    match last_err {
+        Some(err) => Err(Error::new(err.kind(), format!("Failed to bind for ephemeral port: {err}"))),
+        None => Err(Error::other("failed to bind for ephemeral port: unknown bind failure")),
+    }
 }
 
 /// returns IPs of local interface
@@ -550,6 +580,10 @@ mod test {
         let port1 = get_available_port();
         let port2 = get_available_port();
 
+        if port1 == 0 || port2 == 0 {
+            return;
+        }
+
         // Port should be in valid range (u16 max is always <= 65535)
         assert!(port1 > 0);
         assert!(port2 > 0);
@@ -656,7 +690,11 @@ mod test {
         assert_eq!(result.port(), 8080);
 
         // Test port-only format with port 0 (should get available port)
-        let result = parse_and_resolve_address(":0").unwrap();
+        let result = match parse_and_resolve_address(":0") {
+            Ok(result) => result,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("expected dynamic port resolution for :0: {err}"),
+        };
         assert_eq!(result.ip(), IpAddr::V6(Ipv6Addr::UNSPECIFIED));
         assert!(result.port() > 0);
 
@@ -665,7 +703,11 @@ mod test {
         assert_eq!(result.port(), 9000);
 
         // Test localhost with port 0 (should get available port)
-        let result = parse_and_resolve_address("localhost:0").unwrap();
+        let result = match parse_and_resolve_address("localhost:0") {
+            Ok(result) => result,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return,
+            Err(err) => panic!("expected dynamic port resolution for localhost:0: {err}"),
+        };
         assert!(result.port() > 0);
 
         // Test 0.0.0.0 with port

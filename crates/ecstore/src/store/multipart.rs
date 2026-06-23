@@ -180,9 +180,8 @@ impl ECStore {
     ) -> Result<()> {
         check_new_multipart_args(src_bucket, src_object)?;
 
-        // TODO: PutObjectReader
-        // self.put_object_part(dst_bucket, dst_object, upload_id, part_id, data, opts)
-
+        // The full UploadPartCopy path still requires the higher S3/request layer to
+        // derive encryption, compression, and multipart checksum write semantics.
         Err(StorageError::NotImplemented)
     }
 

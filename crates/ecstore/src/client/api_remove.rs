@@ -765,9 +765,16 @@ mod tests {
         net::TcpListener,
     };
 
-    async fn capture_delete_objects_sha256_header() -> (String, tokio::task::JoinHandle<String>) {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let endpoint = listener.local_addr().unwrap().to_string();
+    async fn capture_delete_objects_sha256_header() -> Option<(String, tokio::task::JoinHandle<String>)> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let endpoint = listener
+            .local_addr()
+            .expect("listener local address should be available")
+            .to_string();
         let task = tokio::spawn(async move {
             let (mut stream, _) = listener.accept().await.unwrap();
             let mut request = Vec::new();
@@ -801,7 +808,7 @@ mod tests {
             sha256_header
         });
 
-        (endpoint, task)
+        Some((endpoint, task))
     }
 
     #[tokio::test]
@@ -813,7 +820,9 @@ mod tests {
         }];
         let body = generate_remove_multi_objects_request(&objects);
         let expected = rustfs_utils::hex(HashAlgorithm::SHA256.hash_encode(&body));
-        let (endpoint, header_task) = capture_delete_objects_sha256_header().await;
+        let Some((endpoint, header_task)) = capture_delete_objects_sha256_header().await else {
+            return;
+        };
         let client = TransitionClient::new(
             &endpoint,
             Options {

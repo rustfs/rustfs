@@ -440,22 +440,62 @@ impl BucketOperations for Sets {
     type Error = Error;
 
     #[tracing::instrument(skip(self))]
-    async fn make_bucket(&self, _bucket: &str, _opts: &MakeBucketOptions) -> Result<()> {
-        unimplemented!()
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> Result<()> {
+        for set in &self.disk_set {
+            set.make_bucket(bucket, opts).await?;
+        }
+
+        Ok(())
     }
     #[tracing::instrument(skip(self))]
-    async fn get_bucket_info(&self, _bucket: &str, _opts: &BucketOptions) -> Result<BucketInfo> {
-        unimplemented!()
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> Result<BucketInfo> {
+        let mut first_err = None;
+        for set in &self.disk_set {
+            match set.get_bucket_info(bucket, opts).await {
+                Ok(info) => return Ok(info),
+                Err(err) if first_err.is_none() => first_err = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        Err(first_err.unwrap_or_else(|| StorageError::BucketNotFound(bucket.to_string())))
     }
 
     #[tracing::instrument(skip(self))]
-    async fn list_bucket(&self, _opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
-        unimplemented!()
+    async fn list_bucket(&self, opts: &BucketOptions) -> Result<Vec<BucketInfo>> {
+        let mut buckets = HashMap::new();
+        let mut first_err = None;
+
+        for set in &self.disk_set {
+            match set.list_bucket(opts).await {
+                Ok(set_buckets) => {
+                    for bucket in set_buckets {
+                        buckets.entry(bucket.name.clone()).or_insert(bucket);
+                    }
+                }
+                Err(err) if first_err.is_none() => first_err = Some(err),
+                Err(_) => {}
+            }
+        }
+
+        if buckets.is_empty()
+            && let Some(err) = first_err
+        {
+            return Err(err);
+        }
+
+        let mut buckets = buckets.into_values().collect::<Vec<_>>();
+        buckets.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(buckets)
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_bucket(&self, _bucket: &str, _opts: &DeleteBucketOptions) -> Result<()> {
-        unimplemented!()
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> Result<()> {
+        for set in &self.disk_set {
+            set.delete_bucket(bucket, opts).await?;
+        }
+
+        Ok(())
     }
 }
 
@@ -543,8 +583,10 @@ impl rustfs_storage_api::ObjectOperations for Sets {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, _force_del_marker: bool) -> Result<()> {
-        unimplemented!()
+    async fn delete_object_version(&self, bucket: &str, object: &str, fi: &FileInfo, force_del_marker: bool) -> Result<()> {
+        self.get_disks_by_key(object)
+            .delete_object_version(bucket, object, fi, force_del_marker)
+            .await
     }
 
     #[tracing::instrument(skip(self))]
@@ -678,40 +720,51 @@ impl rustfs_storage_api::ListOperations for Sets {
     #[tracing::instrument(skip(self))]
     async fn list_objects_v2(
         self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _continuation_token: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
-        _fetch_owner: bool,
-        _start_after: Option<String>,
-        _incl_deleted: bool,
+        bucket: &str,
+        prefix: &str,
+        continuation_token: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
+        fetch_owner: bool,
+        start_after: Option<String>,
+        incl_deleted: bool,
     ) -> Result<ListObjectsV2Info> {
-        unimplemented!()
+        self.inner_list_objects_v2(
+            bucket,
+            prefix,
+            continuation_token,
+            delimiter,
+            max_keys,
+            fetch_owner,
+            start_after,
+            incl_deleted,
+        )
+        .await
     }
 
     #[tracing::instrument(skip(self))]
     async fn list_object_versions(
         self: Arc<Self>,
-        _bucket: &str,
-        _prefix: &str,
-        _marker: Option<String>,
-        _version_marker: Option<String>,
-        _delimiter: Option<String>,
-        _max_keys: i32,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        version_marker: Option<String>,
+        delimiter: Option<String>,
+        max_keys: i32,
     ) -> Result<ListObjectVersionsInfo> {
-        unimplemented!()
+        self.inner_list_object_versions(bucket, prefix, marker, version_marker, delimiter, max_keys)
+            .await
     }
 
     async fn walk(
         self: Arc<Self>,
-        _rx: CancellationToken,
-        _bucket: &str,
-        _prefix: &str,
-        _result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
-        _opts: WalkOptions,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
     ) -> Result<()> {
-        unimplemented!()
+        self.walk_internal(rx, bucket, prefix, result, opts).await
     }
 }
 
@@ -762,7 +815,7 @@ impl rustfs_storage_api::MultipartOperations for Sets {
         _src_opts: &ObjectOptions,
         _dst_opts: &ObjectOptions,
     ) -> Result<()> {
-        unimplemented!()
+        Err(StorageError::NotImplemented)
     }
 
     #[tracing::instrument(skip(self))]
@@ -920,8 +973,22 @@ impl rustfs_storage_api::HealOperations for Sets {
         Ok((res, None))
     }
     #[tracing::instrument(skip(self))]
-    async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<HealResultItem> {
-        unimplemented!()
+    async fn heal_bucket(&self, bucket: &str, opts: &HealOpts) -> Result<HealResultItem> {
+        let mut result = HealResultItem {
+            heal_item_type: HealItemType::Bucket.to_string(),
+            bucket: bucket.to_string(),
+            set_count: self.set_count,
+            ..Default::default()
+        };
+
+        for set in &self.disk_set {
+            let mut set_result = set.heal_bucket(bucket, opts).await?;
+            result.disk_count += set_result.disk_count;
+            result.before.drives.append(&mut set_result.before.drives);
+            result.after.drives.append(&mut set_result.after.drives);
+        }
+
+        Ok(result)
     }
     #[tracing::instrument(skip(self))]
     async fn heal_object(
@@ -936,12 +1003,22 @@ impl rustfs_storage_api::HealOperations for Sets {
             .await
     }
     #[tracing::instrument(skip(self))]
-    async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
-        unimplemented!()
+    async fn get_pool_and_set(&self, id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+        for (set_idx, set) in self.format.erasure.sets.iter().enumerate() {
+            for (disk_idx, disk_id) in set.iter().enumerate() {
+                if disk_id.to_string() == id {
+                    return Ok((Some(self.pool_idx), Some(set_idx), Some(disk_idx)));
+                }
+            }
+        }
+
+        Err(Error::DiskNotFound)
     }
     #[tracing::instrument(skip(self))]
     async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
-        unimplemented!()
+        // Multipart orphan reconciliation is intentionally retained above the pool/set layers
+        // until there is a concrete caller and a stable lower-level contract to implement.
+        Err(StorageError::NotImplemented)
     }
 }
 
@@ -1021,6 +1098,9 @@ async fn init_storage_disks_with_errors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::layout::endpoint::Endpoint;
+    use rustfs_storage_api::HealOperations as _;
+    use rustfs_storage_api::ListOperations as _;
 
     #[test]
     fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {
@@ -1088,5 +1168,165 @@ mod tests {
             del_errs[2].as_ref().map(ToString::to_string),
             Some(Error::other("third failed").to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn sets_get_pool_and_set_returns_matching_coordinates() {
+        let format = FormatV3::new(2, 2);
+        let target = format.erasure.sets[1][0].to_string();
+
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9002/data2").expect("third endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9003/data3").expect("fourth endpoint should parse"),
+        ];
+
+        let sets = Sets {
+            id: format.id,
+            disk_set: Vec::new(),
+            pool_idx: 3,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 2,
+                drives_per_set: 2,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format,
+            parity_count: 1,
+            set_count: 2,
+            set_drive_count: 2,
+            default_parity_count: 1,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+        };
+
+        let result = sets
+            .get_pool_and_set(&target)
+            .await
+            .expect("disk id should resolve within the pool");
+
+        assert_eq!(result, (Some(3), Some(1), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn sets_list_objects_v2_lists_objects_within_the_pool() {
+        let format = FormatV3::new(1, 2);
+        let mut endpoints = Vec::new();
+        let mut disks = Vec::new();
+
+        for disk_idx in 0..2 {
+            let dir = tempfile::tempdir().expect("tempdir should be created");
+            let mut endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+            endpoint.set_pool_index(0);
+            endpoint.set_set_index(0);
+            endpoint.set_disk_index(disk_idx);
+
+            let disk = new_disk(
+                &endpoint,
+                &DiskOption {
+                    cleanup: false,
+                    health_check: false,
+                },
+            )
+            .await
+            .expect("disk should be created");
+
+            let mut disk_format = format.clone();
+            disk_format.erasure.this = format.erasure.sets[0][disk_idx];
+            save_format_file(&Some(disk.clone()), &Some(disk_format))
+                .await
+                .expect("format should be saved");
+
+            std::mem::forget(dir);
+            endpoints.push(endpoint);
+            disks.push(Some(disk));
+        }
+
+        let set_disks = SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            2,
+            1,
+            0,
+            0,
+            endpoints.clone(),
+            format.clone(),
+            Vec::new(),
+        )
+        .await;
+
+        let sets = Arc::new(Sets {
+            id: format.id,
+            disk_set: vec![set_disks],
+            pool_idx: 0,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 2,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format,
+            parity_count: 1,
+            set_count: 1,
+            set_drive_count: 2,
+            default_parity_count: 1,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+        });
+
+        sets.make_bucket("bucket", &MakeBucketOptions::default())
+            .await
+            .expect("bucket should be created");
+
+        let mut reader = PutObjReader::from_vec(b"hello".to_vec());
+        sets.put_object("bucket", "object", &mut reader, &ObjectOptions::default())
+            .await
+            .expect("object should be written");
+
+        let result = sets
+            .clone()
+            .list_objects_v2("bucket", "", None, None, 1000, false, None, false)
+            .await
+            .expect("pool-level listing should succeed");
+
+        assert_eq!(result.objects.len(), 1);
+        assert_eq!(result.objects[0].name, "object");
+    }
+
+    #[tokio::test]
+    async fn sets_check_abandoned_parts_returns_typed_not_implemented_error() {
+        let format = FormatV3::new(1, 1);
+        let sets = Sets {
+            id: format.id,
+            disk_set: Vec::new(),
+            pool_idx: 0,
+            endpoints: PoolEndpoints {
+                legacy: false,
+                set_count: 1,
+                drives_per_set: 1,
+                endpoints: Endpoints::from(Vec::new()),
+                cmd_line: String::new(),
+                platform: String::new(),
+            },
+            format,
+            parity_count: 0,
+            set_count: 1,
+            set_drive_count: 1,
+            default_parity_count: 0,
+            distribution_algo: DistributionAlgoVersion::V1,
+            exit_signal: None,
+        };
+
+        let err = sets
+            .check_abandoned_parts("bucket", "object", &HealOpts::default())
+            .await
+            .expect_err("abandoned-parts ownership should stay above the pool/set storage layers");
+        assert!(matches!(err, StorageError::NotImplemented));
     }
 }
