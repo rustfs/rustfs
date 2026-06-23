@@ -5,16 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-iam-global-read-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178`.
-- Based on: API-171 through API-177 prepared in PR #3785; this branch batches
-  the next IAM consumer migration on top of that branch.
+- Branch: `overtrue/arch-iam-credential-boundary`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181`.
+- Based on: API-180 prepared in PR #3791; this branch batches IAM root
+  credential boundary cleanup on top of that branch.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
-  internode RPC metrics, and IAM authorization/handler reads through
-  AppContext-first resolvers.
+  internode RPC metrics, IAM authorization/handler reads, notification
+  rules/event dispatch, admin OIDC/token-signing reads, and IAM root
+  credential consumers through AppContext-first or IAM-owned resolver
+  boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -23,7 +25,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-178 owner facade cleanup.
+- Docs changes: record the API-136 through API-181 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4571,6 +4573,52 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration guard, layer guard, formatting, diff hygiene, residual IAM getter
     scan, Rust risk scan, branch freshness check, and three-expert review.
 
+- [x] `API-179` Route notification dispatch through AppContext.
+  - Do: route startup notification rule registration, storage event
+    notifications, and ECStore event dispatch hooks through the AppContext
+    notify interface.
+  - Acceptance: production RustFS notification dispatch paths no longer call
+    the notify global directly, while the default adapter preserves the legacy
+    notifier fallback.
+  - Must preserve: bucket notification rule registration, operation helper
+    success-only event emission, replication-request suppression, ECStore event
+    conversion, and background spawn behavior.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual notify
+    dispatch scan, Rust risk scan, branch freshness check, and three-expert
+    review.
+
+- [x] `API-180` Route admin OIDC and token-signing reads through AppContext.
+  - Do: expose AppContext-first resolvers for the OIDC system and token
+    signing key, then route console config, OIDC handlers, STS credential
+    generation, table credential vending, and site-replication STS validation
+    through those resolvers.
+  - Acceptance: targeted RustFS admin OIDC/token-signing consumers no longer
+    read IAM globals directly, while default adapters preserve the existing
+    global OIDC and action-credential fallback.
+  - Must preserve: OIDC provider listing, authorize/callback/logout behavior,
+    STS web-identity verification, STS/table credential claims, session-policy
+    handling, and site-replication STS token validation.
+  - Verification: RustFS compile coverage, targeted context resolver tests,
+    migration guard, layer guard, formatting, diff hygiene, residual
+    admin/global IAM scan, Rust risk scan, branch freshness check, and
+    three-expert review.
+
+- [x] `API-181` Centralize IAM root credential reads behind IAM boundary.
+  - Do: add an IAM-owned root credential helper, route IAM store/sys/token
+    signing consumers through it, and make protocol gateway owner checks call an
+    IAM predicate instead of reading credentials directly.
+  - Acceptance: production IAM and protocol gateway paths no longer call the
+    action credential global directly outside the IAM boundary module, while
+    root user detection, legacy IAM decrypt fallback, and token-signing behavior
+    remain unchanged.
+  - Must preserve: root credential lookup, owner-policy bypass decisions,
+    legacy secret-key decrypt fallback, STS token signing key selection,
+    service-account/STSes authorization, and protocol gateway policy args.
+  - Verification: IAM/protocol compile coverage, IAM focused tests, formatting,
+    migration guard, layer guard, diff hygiene, residual direct credential scan,
+    Rust risk scan, branch freshness check, and three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4661,10 +4709,67 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-178 keeps ready IAM access behind an AppContext-first resolver without widening handler semantics. |
 | Migration preservation | pass | Auth, storage authorization, admin IAM handlers, STS, and table credential flows keep existing error mapping and ready-check fallback. |
 | Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual IAM getter scan, Rust risk scan, and pre-commit passed for API-178. |
+| Quality/architecture | pass | API-179 keeps notification rule registration and event dispatch behind the AppContext notify resolver. |
+| Migration preservation | pass | Startup rules, success-only storage events, replication suppression, ECStore hook conversion, and default notifier fallback are preserved. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting, migration/layer guards, diff hygiene, residual notify dispatch scan, Rust risk scan, and pre-commit passed for API-179. |
+| Quality/architecture | pass | API-180 keeps admin OIDC and token-signing reads behind IAM/AppContext resolver methods without widening handler behavior. |
+| Migration preservation | pass | OIDC provider discovery, STS credential generation, table credential vending, and site-replication STS validation keep existing error mapping and fallback semantics. |
+| Testing/verification | pass | RustFS focused compile, targeted context resolver test, formatting/migration/layer guards, diff hygiene, residual admin IAM scan, and Rust risk scan passed for API-180. |
+| Quality/architecture | pass | API-181 keeps IAM root credential reads centralized in an IAM-owned helper and exposes only a root access-key predicate to protocol code. |
+| Migration preservation | pass | Root owner checks, legacy IAM decrypt fallback, token signing, and gateway policy args preserve existing credential semantics. |
+| Testing/verification | pass | IAM/protocol compile, IAM unit tests, formatting, migration/layer guards, diff hygiene, residual credential scan, and Rust risk scan passed for API-181. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-181 current slice:
+  - `cargo check -p rustfs-iam -p rustfs-protocols --tests`: passed.
+  - `cargo test -p rustfs-iam --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - IAM/protocol credential scan: passed; production direct
+    `get_global_action_cred` calls are isolated to the IAM root credential
+    boundary.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-180 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin IAM/OIDC scan: passed; targeted admin OIDC and token-signing reads
+    now go through AppContext IAM resolvers.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-179 current slice:
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs resolver_helpers_are_context_first_and_fallback_when_context_is_absent --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Notify dispatch scan: passed; production startup, storage helper, and
+    ECStore event hook dispatch no longer call the notify global directly.
+  - Rust risk scan: no new production unwrap/expect, panic/todo/unsafe, or cast
+    risks added.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-178 current slice:
   - `cargo check --tests -p rustfs`: passed.
