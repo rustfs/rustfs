@@ -53,7 +53,6 @@ use crate::{
     error::{StorageError, to_object_err},
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
-    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
@@ -1767,7 +1766,7 @@ impl rustfs_storage_api::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if is_dist_erasure().await {
+        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
@@ -2250,7 +2249,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        let dist_erasure = is_dist_erasure().await;
+        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
         if dist_erasure {
