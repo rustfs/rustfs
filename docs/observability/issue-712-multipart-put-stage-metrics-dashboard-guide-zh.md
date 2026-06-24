@@ -136,6 +136,49 @@ sum by (path) (
 1. 当前 run 是否真的命中了 `multipart_write_pipeline_batched_large`
 2. batched gate 是否只是“代码存在”，还是“运行时实际生效”
 
+### 4.7 erasure encode 内部阶段均值
+
+```promql
+sum by (stage) (
+  increase(
+    rustfs_internal_stage_duration_ms_sum{
+      stage=~"erasure_encode.*"
+    }[$__rate_interval]
+  )
+)
+/
+sum by (stage) (
+  increase(
+    rustfs_internal_stage_duration_ms_count{
+      stage=~"erasure_encode.*"
+    }[$__rate_interval]
+  )
+)
+```
+
+用于回答：
+
+1. `multipart_set_disk_encode` 内部到底更偏 CPU encode，还是更偏 writer write
+2. producer / consumer 之间是 encoder 在等 writer，还是 writer 在等 encoder
+
+### 4.8 erasure encode 当前累计 counters
+
+当窗口查询容易受到 scrape 周期影响时，可以直接看当前累计值：
+
+```promql
+rustfs_internal_stage_duration_ms_count{
+  stage=~"erasure_encode.*"
+}
+```
+
+```promql
+rustfs_internal_stage_duration_ms_sum{
+  stage=~"erasure_encode.*"
+}
+```
+
+这在 focused 单 profile 验证里很有用，尤其适合“重启实例后只跑一轮”的场景。
+
 ## 5. 推荐看板顺序
 
 当你在看 `>1GiB multipart PUT` 时，建议按下面顺序看：
@@ -145,6 +188,7 @@ sum by (path) (
 3. `multipart_set_disk_encode`
 4. `multipart_complete_tail`
 5. `multipart_write_pipeline` vs `multipart_write_pipeline_batched_large`
+6. `erasure_encode_*` / `erasure_encode_batched_*`
 
 解释顺序：
 
@@ -153,6 +197,7 @@ sum by (path) (
 3. 如果 encode 高，先看 multipart 是否需要独立 encode strategy
 4. 如果 complete tail 高，优先看 `complete_multipart_upload()` 的 metadata / checksum / rename tail
 5. 如果 batched 预期已打开，但 path 仍然只有 `multipart_write_pipeline`，优先检查 size gate 是否真正被命中
+6. 如果 `erasure_encode_batched_send_wait` 很低、但 `erasure_encode_batched_recv_wait` 明显更高，优先怀疑当前 batch barrier 让 writer 侧在等下一批 encode 完成
 
 ## 6. 推荐结合看的辅助指标
 
