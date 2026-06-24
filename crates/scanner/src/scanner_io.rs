@@ -46,9 +46,9 @@ use crate::ScannerObjectInfo as ObjectInfo;
 use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_global_free_version,
-    get_lifecycle_config, get_object_lock_config, get_replication_config, list_global_tiers, resolve_scanner_object_store_handle,
-    storageclass,
+    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_runtime_free_version,
+    get_lifecycle_config, get_object_lock_config, get_replication_config, list_runtime_tiers,
+    resolve_scanner_object_store_handle, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -1350,7 +1350,7 @@ impl ScannerIODisk for Disk {
 
         let mut size_summary = SizeSummary::default();
 
-        let tiers = list_global_tiers().await;
+        let tiers = list_runtime_tiers().await;
 
         for tier in tiers.iter() {
             size_summary.tier_stats.insert(tier.name.clone(), TierStats::default());
@@ -1373,7 +1373,7 @@ impl ScannerIODisk for Disk {
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
-                enqueue_global_free_version(oi).await;
+                enqueue_runtime_free_version(oi).await;
             }
         }
 

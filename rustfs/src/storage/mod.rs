@@ -101,7 +101,7 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
-        record_bucket_object_write_memory,
+        record_bucket_object_write_memory, remove_bucket_usage_from_backend,
     };
 }
 
@@ -235,6 +235,7 @@ pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 pub(crate) type Endpoints = ecstore_layout::Endpoints;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
+pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
@@ -316,7 +317,11 @@ pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
 }
 
 pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-    ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState.get_daily_all_tier_stats()
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state().get_daily_all_tier_stats()
+}
+
+pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {

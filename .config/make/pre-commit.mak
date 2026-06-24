@@ -9,11 +9,11 @@ setup-hooks: ## Set up git hooks
 	@echo "✅ Git hooks setup complete!"
 
 .PHONY: pre-commit
-pre-commit: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check quick-check ## Run fast pre-commit checks
+pre-commit: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check quick-check ## Run fast pre-commit checks without clippy/full tests
 	@echo "✅ All pre-commit checks passed!"
 
 .PHONY: pre-pr
-pre-pr: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check clippy-check test ## Run full pre-PR checks
+pre-pr: fmt-check unsafe-code-check architecture-migration-check logging-guardrails-check clippy-check test ## Run full pre-PR checks with clippy and tests
 	@echo "✅ All pre-PR checks passed!"
 
 .PHONY: dev-check

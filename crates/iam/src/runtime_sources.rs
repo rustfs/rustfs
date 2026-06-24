@@ -12,20 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_credentials::Credentials;
+use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config};
+use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_ecstore::api::notification::{NotificationSys, get_global_notification_sys};
 
-pub(crate) fn credentials() -> Option<Credentials> {
-    crate::runtime_sources::action_credentials()
+pub(crate) fn action_credentials() -> Option<Credentials> {
+    get_global_action_cred()
 }
 
-pub(crate) fn credentials_or_default() -> Credentials {
-    credentials().unwrap_or_default()
+pub(crate) fn current_server_config() -> Option<ServerConfig> {
+    get_global_server_config()
 }
 
-pub(crate) fn token_signing_key() -> Option<String> {
-    credentials().map(|cred| cred.secret_key)
-}
-
-pub(crate) fn is_root_access_key(access_key: &str) -> bool {
-    credentials().is_some_and(|cred| cred.access_key == access_key)
+pub(crate) fn notification_sys() -> Option<&'static NotificationSys> {
+    get_global_notification_sys()
 }
