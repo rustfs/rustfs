@@ -168,11 +168,11 @@ impl ECStore {
         );
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
+            host = runtime_sources::rustfs_host().await
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
+            port = runtime_sources::rustfs_port().to_string()
         }
         debug!(
             event = EVENT_ECSTORE_INIT_STATUS,
@@ -351,7 +351,7 @@ impl ECStore {
             break;
         }
 
-        set_object_layer(ec.clone()).await;
+        runtime_sources::publish_object_store(ec.clone()).await;
 
         if let Some(monitor) = runtime_sources::bucket_monitor() {
             let _ = ec.bucket_monitor.set(monitor);

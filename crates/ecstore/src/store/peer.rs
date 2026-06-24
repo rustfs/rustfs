@@ -113,7 +113,7 @@ pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
 
             // Store the first LocalClient globally for use by other modules
             if !first_local_client_set {
-                if let Err(e) = crate::global::set_global_lock_client(local_client.clone()) {
+                if let Err(e) = runtime_sources::set_primary_lock_client(local_client.clone()) {
                     // If already set, ignore the error (another thread may have set it)
                     debug!(
                         event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
@@ -135,7 +135,7 @@ pub fn init_lock_clients(endpoint_pools: EndpointServerPools) {
     }
 
     // Store the lock clients map globally
-    if crate::global::set_global_lock_clients(clients).is_err() {
+    if runtime_sources::set_lock_clients(clients).is_err() {
         error!(
             event = EVENT_LOCK_CLIENT_INITIALIZATION_FAILED,
             component = LOG_COMPONENT_ECSTORE,
@@ -158,15 +158,15 @@ pub(super) async fn init_local_peer(endpoint_pools: &EndpointServerPools, host: 
 
     if peer_set.is_empty() {
         if !host.is_empty() {
-            *GLOBAL_LOCAL_NODE_NAME.write().await = format!("{host}:{port}");
+            runtime_sources::set_local_node_name(format!("{host}:{port}")).await;
             return;
         }
 
-        *GLOBAL_LOCAL_NODE_NAME.write().await = format!("127.0.0.1:{port}");
+        runtime_sources::set_local_node_name(format!("127.0.0.1:{port}")).await;
         return;
     }
 
-    *GLOBAL_LOCAL_NODE_NAME.write().await = peer_set[0].clone();
+    runtime_sources::set_local_node_name(peer_set[0].clone()).await;
 }
 
 pub async fn get_disk_infos(disks: &[Option<DiskStore>]) -> Vec<Option<DiskInfo>> {

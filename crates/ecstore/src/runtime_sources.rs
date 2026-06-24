@@ -18,8 +18,9 @@ use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_ExpiryState, GLOBAL_TransitionState, TransitionState},
+    bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
-    config::get_global_storage_class,
+    config::{get_global_storage_class, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     endpoints::EndpointServerPools,
     error::Result,
@@ -28,18 +29,21 @@ use crate::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, get_global_lock_clients, init_global_bucket_monitor, is_dist_erasure, is_erasure,
-        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id,
+        get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
+        init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle,
+        set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
     },
     notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
     tier::tier::TierConfigMgr,
 };
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR};
+use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
+use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
+use s3s::region::Region;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use uuid::Uuid;
@@ -95,8 +99,20 @@ pub(crate) async fn local_node_name() -> String {
     GLOBAL_LOCAL_NODE_NAME.read().await.clone()
 }
 
+pub(crate) async fn set_local_node_name(node_name: String) {
+    *GLOBAL_LOCAL_NODE_NAME.write().await = node_name;
+}
+
 pub(crate) fn default_local_node_name() -> String {
     GLOBAL_LocalNodeName.to_string()
+}
+
+pub(crate) fn rustfs_port() -> u16 {
+    global_rustfs_port()
+}
+
+pub(crate) async fn rustfs_host() -> String {
+    GLOBAL_RUSTFS_HOST.read().await.clone()
 }
 
 pub(crate) async fn rustfs_addr() -> String {
@@ -186,8 +202,50 @@ pub(crate) fn global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn L
     get_global_lock_clients()
 }
 
+pub(crate) fn set_primary_lock_client(client: Arc<dyn LockClient>) -> std::result::Result<(), Arc<dyn LockClient>> {
+    set_global_lock_client(client)
+}
+
+pub(crate) fn set_lock_clients(
+    clients: HashMap<String, Arc<dyn LockClient>>,
+) -> std::result::Result<(), HashMap<String, Arc<dyn LockClient>>> {
+    set_global_lock_clients(clients)
+}
+
+pub(crate) async fn publish_object_store(store: Arc<ECStore>) {
+    set_object_layer(store).await;
+}
+
 pub(crate) fn notification_sys() -> Option<&'static NotificationSys> {
     get_global_notification_sys()
+}
+
+pub(crate) fn bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
+    get_global_bucket_metadata_sys()
+}
+
+pub(crate) fn region() -> Option<Region> {
+    get_global_region()
+}
+
+pub(crate) fn server_config() -> Option<Config> {
+    get_global_server_config()
+}
+
+pub(crate) fn set_server_config(config: Config) {
+    set_global_server_config(config);
+}
+
+pub(crate) fn storage_class_config() -> Option<storageclass::Config> {
+    get_global_storage_class()
+}
+
+pub(crate) fn set_storage_class_config(config: storageclass::Config) {
+    set_global_storage_class(config);
+}
+
+pub(crate) fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
+    get_global_tier_config_mgr()
 }
 
 pub(crate) async fn bucket_lifecycle_config(bucket: &str) -> Option<BucketLifecycleConfiguration> {
