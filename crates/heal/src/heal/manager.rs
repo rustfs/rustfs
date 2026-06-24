@@ -1915,7 +1915,10 @@ impl HealManager {
                                     buckets: buckets.clone(),
                                     set_disk_id: set_disk_id.clone(),
                                 },
-                                HealOptions::default(),
+                                HealOptions {
+                                    timeout: None,
+                                    ..HealOptions::default()
+                                },
                                 HealPriority::Normal,
                             );
                             req.source = HealRequestSource::AutoHeal;
