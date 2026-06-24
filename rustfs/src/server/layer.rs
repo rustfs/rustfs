@@ -23,7 +23,6 @@ use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
     active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path, is_table_catalog_path,
-    liveness_dependency_readiness_report,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{
@@ -939,9 +938,10 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = match probe {
-        HealthProbe::Liveness => liveness_dependency_readiness_report(),
-        HealthProbe::Readiness => collect_dependency_readiness_report().await,
+    let readiness_report = if probe == HealthProbe::Readiness {
+        Some(collect_dependency_readiness_report().await)
+    } else {
+        None
     };
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
@@ -949,7 +949,8 @@ where
         None
     };
 
-    let response_parts = build_health_response_parts(method, probe, &readiness_report, "rustfs-endpoint", None, kms_ready);
+    let response_parts =
+        build_health_response_parts(method, probe, readiness_report.as_ref(), "rustfs-endpoint", None, kms_ready);
     let body = response_parts
         .payload
         .map(|payload| Bytes::from(serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec())))
@@ -1654,7 +1655,12 @@ mod tests {
             );
 
             let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
-            assert!(body.windows(br#""status":"#.len()).any(|window| window == br#""status":"#));
+            let payload: serde_json::Value =
+                serde_json::from_slice(&body).expect("public liveness health response should be valid JSON");
+            assert_eq!(payload["status"], "ok");
+            assert_eq!(payload["ready"], true);
+            assert!(payload.get("details").is_none());
+            assert!(payload.get("degradedReasons").is_none());
         })
         .await;
     }

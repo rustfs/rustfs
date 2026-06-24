@@ -19,7 +19,7 @@ use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION, liveness_dependency_readiness_report,
+    RequestContextLayer, VERSION,
 };
 use crate::storage::request_context::RequestContext;
 use crate::version::build;
@@ -597,16 +597,17 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = match probe {
-        HealthProbe::Liveness => liveness_dependency_readiness_report(),
-        HealthProbe::Readiness => collect_dependency_readiness().await,
+    let readiness_report = if probe == HealthProbe::Readiness {
+        Some(collect_dependency_readiness().await)
+    } else {
+        None
     };
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
     let response_parts =
-        build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-console", Some(uptime), None);
+        build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-console", Some(uptime), None);
 
     let builder = Response::builder()
         .status(response_parts.status_code)
