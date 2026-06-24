@@ -2220,7 +2220,7 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
-    use rustfs_common::GLOBAL_CONN_MAP;
+    use crate::runtime_sources;
     use serde_json::Value;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
@@ -2709,7 +2709,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_disk_recovery_requires_disk_rpc_readiness() {
         init_tracing(Level::ERROR);
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
 
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -2737,8 +2737,8 @@ mod tests {
         health.mark_failure(&endpoint, "test_failure");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
         let channel = TonicEndpoint::from_shared(base_addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(base_addr.clone(), channel);
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&base_addr));
+        runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&base_addr).await);
 
         temp_env::async_with_vars(
             [
@@ -2764,7 +2764,7 @@ mod tests {
                     "a plain TCP listener without disk_info RPC readiness must not restore the remote disk online"
                 );
                 assert!(
-                    !GLOBAL_CONN_MAP.read().await.contains_key(&base_addr),
+                    !runtime_sources::test_node_channel_is_cached(&base_addr).await,
                     "failed recovery probes should evict stale cached gRPC channels"
                 );
             },
@@ -3336,8 +3336,8 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
         let _ = remote_disk
             .execute_with_timeout(
@@ -3351,7 +3351,7 @@ mod tests {
             .expect_err("timeout should fail");
 
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "timeout should evict cached connection"
         );
     }
@@ -3380,7 +3380,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(
@@ -3407,7 +3407,7 @@ mod tests {
             "first timeout-like error should move the remote disk into suspect state"
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "timeout-like errors should evict cached connection"
         );
     }
@@ -3436,7 +3436,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(
@@ -3468,7 +3468,7 @@ mod tests {
             "first network-like error should move the remote disk into suspect state"
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "network-like errors should evict cached connection"
         );
     }
@@ -3497,7 +3497,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout_for_op_and_health_action(
@@ -3521,7 +3521,7 @@ mod tests {
             "ignored network-like error should not mark remote disk faulty"
         );
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            runtime_sources::test_node_channel_is_cached(&addr).await,
             "ignored network-like error should not evict cached connection"
         );
     }
@@ -3550,7 +3550,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
@@ -3560,7 +3560,7 @@ mod tests {
         assert_eq!(err, DiskError::FileNotFound);
         assert!(remote_disk.is_online().await, "business errors should not mark remote disk faulty");
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            runtime_sources::test_node_channel_is_cached(&addr).await,
             "business errors should not evict cached connection"
         );
     }
