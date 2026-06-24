@@ -12,14 +12,40 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::{self, DiskAPI as _, DiskStore, error::DiskError};
+use crate::disk::{self, DiskAPI as _, DiskStore, disk_store::get_object_disk_read_timeout, error::DiskError};
 use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
+use std::future::Future;
 use std::io::Cursor;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
+use tokio::time;
 use tracing::debug;
+
+async fn read_zero_copy_with_timeout<F>(timeout: Duration, read: F) -> disk::error::Result<Bytes>
+where
+    F: Future<Output = disk::error::Result<Bytes>>,
+{
+    if timeout.is_zero() {
+        return read.await;
+    }
+
+    match time::timeout(timeout, read).await {
+        Ok(result) => result,
+        Err(_) => Err(DiskError::Timeout),
+    }
+}
+
+async fn read_file_zero_copy_with_object_timeout(
+    disk: &DiskStore,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+) -> disk::error::Result<Bytes> {
+    read_zero_copy_with_timeout(get_object_disk_read_timeout(), disk.read_file_zero_copy(bucket, path, offset, length)).await
+}
 
 /// Create a BitrotReader from either inline data or disk file stream
 ///
@@ -67,7 +93,7 @@ pub async fn create_bitrot_reader(
         if use_zero_copy && disk.is_local() {
             // Try zero-copy read first (uses mmap on Unix)
             let start = Instant::now();
-            match disk.read_file_zero_copy(bucket, path, offset, length).await {
+            match read_file_zero_copy_with_object_timeout(disk, bucket, path, offset, length).await {
                 Ok(bytes) => {
                     let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -91,6 +117,16 @@ pub async fn create_bitrot_reader(
                         skip_verify,
                     );
                     Ok(Some(reader))
+                }
+                Err(DiskError::Timeout) => {
+                    rustfs_io_metrics::record_zero_copy_fallback("Timeout");
+                    debug!(
+                        path = %path,
+                        timeout_ms = get_object_disk_read_timeout().as_millis(),
+                        "zero_copy_read_timeout"
+                    );
+
+                    Err(DiskError::Timeout)
                 }
                 Err(e) => {
                     // Record zero-copy fallback
@@ -176,6 +212,13 @@ pub async fn create_bitrot_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn test_zero_copy_timeout_returns_disk_timeout() {
+        let result = read_zero_copy_with_timeout(Duration::from_secs(10), std::future::pending()).await;
+
+        assert_eq!(result.expect_err("pending read should time out"), DiskError::Timeout);
+    }
 
     #[tokio::test]
     async fn test_create_bitrot_reader_with_inline_data() {
