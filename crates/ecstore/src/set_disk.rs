@@ -149,6 +149,9 @@ const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
 const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
+const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
+const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
+static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -812,6 +815,7 @@ enum SmallWritePath {
     Inline,
     SingleBlockNonInline,
     Pipeline,
+    PipelineBatchedLarge,
 }
 
 impl SmallWritePath {
@@ -820,8 +824,15 @@ impl SmallWritePath {
             SmallWritePath::Inline => "write_inline",
             SmallWritePath::SingleBlockNonInline => "write_single_block_non_inline",
             SmallWritePath::Pipeline => "write_pipeline",
+            SmallWritePath::PipelineBatchedLarge => "write_pipeline_batched_large",
         }
     }
+}
+
+fn put_large_batch_min_size_bytes() -> usize {
+    *CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES, DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES)
+    })
 }
 
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
@@ -831,6 +842,20 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
         SmallWritePath::SingleBlockNonInline
     } else {
         SmallWritePath::Pipeline
+    }
+}
+
+fn classify_put_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
+        return SmallWritePath::Inline;
+    }
+    if should_use_single_block_non_inline_fast_path(is_inline_buffer, object_size, block_size) {
+        return SmallWritePath::SingleBlockNonInline;
+    }
+
+    match usize::try_from(object_size) {
+        Ok(size) if !is_inline_buffer && size >= put_large_batch_min_size_bytes() => SmallWritePath::PipelineBatchedLarge,
+        _ => SmallWritePath::Pipeline,
     }
 }
 
@@ -1154,7 +1179,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let write_path = classify_put_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
             let encode_stage_start = Instant::now();
@@ -1179,6 +1204,15 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                         return Err(e.into());
                     }
                 },
+                SmallWritePath::PipelineBatchedLarge => {
+                    match Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await {
+                        Ok((r, w)) => (r, w),
+                        Err(e) => {
+                            error!("encode_batched err {:?}", e);
+                            return Err(e.into());
+                        }
+                    }
+                }
                 SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
@@ -3421,7 +3455,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
                     .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                     .await?
             }
-            SmallWritePath::Inline | SmallWritePath::Pipeline => {
+            SmallWritePath::Inline | SmallWritePath::Pipeline | SmallWritePath::PipelineBatchedLarge => {
                 Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
             }
         }; // TODO: delete temporary directory on error
@@ -7428,6 +7462,22 @@ mod tests {
         assert!(!should_use_inline_small_fast_path(true, 8192, 4096));
         assert!(!should_use_single_block_non_inline_fast_path(false, 8192, 4096));
         assert!(matches!(classify_small_write_path(false, 8192, 4096), SmallWritePath::Pipeline));
+    }
+
+    #[test]
+    fn put_object_large_batch_path_only_applies_to_large_ordinary_puts() {
+        assert!(matches!(
+            classify_put_write_path(false, 64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::PipelineBatchedLarge
+        ));
+        assert!(matches!(
+            classify_put_write_path(false, 32 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_put_write_path(true, 64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
     }
 
     #[test]

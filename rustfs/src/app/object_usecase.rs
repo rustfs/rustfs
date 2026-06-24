@@ -53,7 +53,8 @@ use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
 use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_put_concurrency_aware_buffer_size,
 };
 use crate::storage::ecfs::*;
 use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
@@ -117,6 +118,8 @@ use rustfs_zip::{ArchiveLimits, CompressionFormat};
 use s3s::dto::*;
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+
+const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
@@ -1347,6 +1350,10 @@ pub struct DefaultObjectUsecase {
 }
 
 impl DefaultObjectUsecase {
+    fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
+        size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
+    }
+
     #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
@@ -2024,16 +2031,19 @@ impl DefaultObjectUsecase {
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
+        let mut put_request_guard = PutObjectGuard::new();
+        let concurrent_put_requests = PutObjectGuard::concurrent_requests();
+
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
-        // Concurrency-aware adjustment reduces buffer size under high concurrency to lower memory pressure.
-        // TODO: get_concurrency_aware_buffer_size reads ACTIVE_GET_REQUESTS (GET concurrency tracker),
-        // not PUT concurrency. Under pure PUT load the counter stays zero so buffers never shrink;
-        // unrelated GET load can shrink PUT buffers instead. Fix by adding ACTIVE_PUT_REQUESTS +
-        // PutObjectGuard and using PUT concurrency here. See PR #3514 review comment.
+        // Concurrency-aware adjustment reduces buffer size under high PUT concurrency to lower memory pressure.
         let base_buffer_size = get_buffer_size_opt_in(size);
-        let buffer_size = get_concurrency_aware_buffer_size(size, base_buffer_size);
+        let buffer_size = if Self::should_use_large_put_concurrency_tuning(size) {
+            get_put_concurrency_aware_buffer_size(size, base_buffer_size)
+        } else {
+            base_buffer_size
+        };
 
         // Detect zero-copy opportunity before encryption/compression decisions
         // Zero-copy is beneficial for large unencrypted, uncompressed objects
@@ -2377,6 +2387,7 @@ impl DefaultObjectUsecase {
                     "PutObject store write returned"
                 );
                 let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
+                put_request_guard.finish_err();
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -2461,6 +2472,19 @@ impl DefaultObjectUsecase {
                 enable_zero_copy, // Track if zero-copy was enabled
             );
         }
+
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            bucket = %bucket,
+            key = %key,
+            concurrent_put_requests,
+            buffer_size,
+            "PutObject request completed"
+        );
+
+        put_request_guard.finish_ok();
 
         result
     }

@@ -17,8 +17,11 @@
 use std::sync::atomic::Ordering;
 use std::time::Instant;
 
-use super::io_schedule::ACTIVE_GET_REQUESTS;
-use rustfs_io_metrics::{record_get_object_request_result, record_get_object_request_start};
+use super::io_schedule::{ACTIVE_GET_REQUESTS, ACTIVE_PUT_REQUESTS};
+use rustfs_io_metrics::{
+    record_get_object_request_result, record_get_object_request_start, record_put_object_request_result,
+    record_put_object_request_start,
+};
 
 /// RAII guard for tracking active GetObject requests.
 #[derive(Debug)]
@@ -108,6 +111,66 @@ impl Drop for GetObjectGuard {
     }
 }
 
+/// RAII guard for tracking active PutObject requests.
+#[derive(Debug)]
+pub struct PutObjectGuard {
+    start_time: Instant,
+    result: Option<&'static str>,
+}
+
+impl PutObjectGuard {
+    pub fn new() -> Self {
+        ACTIVE_PUT_REQUESTS.fetch_add(1, Ordering::Relaxed);
+        let concurrent = ACTIVE_PUT_REQUESTS.load(Ordering::Relaxed);
+        record_put_object_request_start(concurrent);
+
+        Self {
+            start_time: Instant::now(),
+            result: None,
+        }
+    }
+
+    pub fn finish_ok(&mut self) {
+        self.result = Some("ok");
+    }
+
+    pub fn finish_err(&mut self) {
+        self.result = Some("error");
+    }
+
+    pub fn concurrent_count() -> usize {
+        ACTIVE_PUT_REQUESTS.load(Ordering::Relaxed)
+    }
+
+    pub fn concurrent_requests() -> usize {
+        Self::concurrent_count()
+    }
+}
+
+impl Default for PutObjectGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for PutObjectGuard {
+    fn drop(&mut self) {
+        let duration_secs = self.start_time.elapsed().as_secs_f64();
+        let status = self.result.unwrap_or("unknown");
+        record_put_object_request_result(status, duration_secs);
+
+        if let Err(previous) =
+            ACTIVE_PUT_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+        {
+            debug_assert_eq!(
+                previous, 0,
+                "ACTIVE_PUT_REQUESTS underflow attempt in PutObjectGuard::drop; previous value = {}",
+                previous
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -127,5 +190,15 @@ mod tests {
         let guard = GetObjectGuard::new();
         std::thread::sleep(std::time::Duration::from_millis(10));
         assert!(guard.elapsed().as_millis() >= 10);
+    }
+
+    #[test]
+    fn test_put_guard_increments_counter() {
+        let initial = PutObjectGuard::concurrent_count();
+        {
+            let _guard = PutObjectGuard::new();
+            assert_eq!(PutObjectGuard::concurrent_count(), initial + 1);
+        }
+        assert_eq!(PutObjectGuard::concurrent_count(), initial);
     }
 }

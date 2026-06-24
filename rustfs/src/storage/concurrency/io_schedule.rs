@@ -39,6 +39,7 @@ use std::time::Duration;
 
 /// Global concurrent request counter for adaptive buffer sizing.
 pub(crate) static ACTIVE_GET_REQUESTS: AtomicUsize = AtomicUsize::new(0);
+pub(crate) static ACTIVE_PUT_REQUESTS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum IoLoadLevel {
@@ -1372,6 +1373,17 @@ pub fn get_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize
     {
         use metrics::gauge;
         gauge!("rustfs_concurrent_get_requests").set(concurrent_requests as f64);
+    }
+
+    compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, load_concurrency_thresholds())
+}
+
+pub fn get_put_concurrency_aware_buffer_size(file_size: i64, base_buffer_size: usize) -> usize {
+    let concurrent_requests = ACTIVE_PUT_REQUESTS.load(Ordering::Relaxed);
+
+    {
+        use metrics::gauge;
+        gauge!("rustfs_concurrent_put_requests").set(concurrent_requests as f64);
     }
 
     compute_concurrency_aware_buffer_size(file_size, base_buffer_size, concurrent_requests, load_concurrency_thresholds())

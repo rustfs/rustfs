@@ -225,6 +225,20 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
     histogram!("rustfs_io_get_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
 }
 
+/// Record PutObject request start.
+#[inline(always)]
+pub fn record_put_object_request_start(concurrent_requests: usize) {
+    counter!("rustfs_io_put_object_requests_total").increment(1);
+    gauge!("rustfs_io_put_object_concurrent_requests").set(concurrent_requests as f64);
+}
+
+/// Record PutObject request result.
+#[inline(always)]
+pub fn record_put_object_request_result(status: &str, duration_secs: f64) {
+    counter!("rustfs_io_put_object_request_results_total", "status" => status.to_string()).increment(1);
+    histogram!("rustfs_io_put_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
+}
+
 /// Record GetObject timeout for a specific stage.
 #[inline(always)]
 pub fn record_get_object_timeout(stage: Option<&str>, elapsed_secs: Option<f64>) {
@@ -875,6 +889,13 @@ mod tests {
     fn test_record_put_object() {
         record_put_object(200.0, 1024 * 1024, true);
         record_put_object(100.0, 512, false);
+    }
+
+    #[test]
+    fn test_record_put_object_request_metrics() {
+        record_put_object_request_start(3);
+        record_put_object_request_result("ok", 0.25);
+        record_put_object_request_result("error", 0.5);
     }
 
     #[test]

@@ -30,12 +30,15 @@ use tokio::sync::mpsc;
 use tracing::error;
 
 const ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: &str = "RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES";
+const ENV_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: &str = "RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS";
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS: usize = 32;
+const DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS: usize = 4;
 
 /// Cached value of `RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES` env var.
 /// Read once at first use via `OnceLock` to avoid per-encode syscall.
 static CACHED_MAX_INFLIGHT_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CACHED_BATCH_BLOCKS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usize) -> usize {
     if expanded_block_bytes == 0 {
@@ -47,6 +50,13 @@ fn encode_channel_capacity(expanded_block_bytes: usize, max_inflight_bytes: usiz
         .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
 }
 
+fn encode_batch_block_count() -> usize {
+    *CACHED_BATCH_BLOCKS.get_or_init(|| {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS, DEFAULT_RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS)
+            .clamp(1, DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS)
+    })
+}
+
 fn queued_block_bytes(block: &[Bytes]) -> usize {
     block.iter().map(Bytes::len).sum()
 }
@@ -54,6 +64,16 @@ fn queued_block_bytes(block: &[Bytes]) -> usize {
 async fn drain_queued_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Bytes>>) {
     while let Some(block) = rx.recv().await {
         rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_block_bytes(&block));
+    }
+}
+
+fn queued_batch_bytes(batch: &[Vec<Bytes>]) -> usize {
+    batch.iter().map(|block| queued_block_bytes(block)).sum()
+}
+
+async fn drain_queued_batched_inflight_bytes(rx: &mut mpsc::Receiver<Vec<Vec<Bytes>>>) {
+    while let Some(batch) = rx.recv().await {
+        rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
     }
 }
 
@@ -365,6 +385,121 @@ impl Erasure {
             task.abort();
             let _ = task.await;
             drain_queued_inflight_bytes(&mut rx).await;
+            if let Err(shutdown_err) = writers.shutdown().await {
+                error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
+            }
+            return Err(err);
+        }
+
+        let (reader, total) = task.await??;
+        writers.shutdown().await?;
+        Ok((reader, total))
+    }
+
+    pub async fn encode_batched<R>(
+        self: Arc<Self>,
+        mut reader: R,
+        writers: &mut [Option<BitrotWriterWrapper>],
+        quorum: usize,
+    ) -> std::io::Result<(R, usize)>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        if self.block_size == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "erasure block_size must be non-zero",
+            ));
+        }
+
+        let expanded_block_bytes = self.shard_size().saturating_mul(self.total_shard_count());
+        let max_inflight_bytes = *CACHED_MAX_INFLIGHT_BYTES.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+                DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BYTES,
+            )
+        });
+        let inflight_blocks = encode_channel_capacity(expanded_block_bytes, max_inflight_bytes);
+        let batch_blocks = encode_batch_block_count().min(inflight_blocks);
+        let channel_capacity = inflight_blocks.div_ceil(batch_blocks).max(1);
+        let (tx, mut rx) = mpsc::channel::<Vec<Vec<Bytes>>>(channel_capacity);
+
+        let task = tokio::spawn(async move {
+            let block_size = self.block_size;
+            let mut total = 0;
+            let mut buf = vec![0u8; block_size];
+            let mut pending_batch = Vec::with_capacity(batch_blocks);
+            let mut pending_batch_bytes = 0usize;
+            loop {
+                match rustfs_utils::read_full_or_eof(&mut reader, &mut buf).await {
+                    Ok(Some(n)) => {
+                        debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
+                        total += n;
+                        let encode_buf = std::mem::take(&mut buf);
+                        let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
+                        buf = returned_buf;
+                        let queued_bytes = queued_block_bytes(&res);
+                        pending_batch_bytes = pending_batch_bytes.saturating_add(queued_bytes);
+                        pending_batch.push(res);
+
+                        if pending_batch.len() >= batch_blocks {
+                            rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
+                            if let Err(err) = tx.send(pending_batch).await {
+                                rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                                return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                            }
+                            pending_batch = Vec::with_capacity(batch_blocks);
+                            pending_batch_bytes = 0;
+                        }
+                    }
+                    Ok(None) => {
+                        break;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        if let Some(inner) = e.get_ref()
+                            && rustfs_rio::is_checksum_mismatch(inner)
+                        {
+                            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()));
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => {
+                        return Err(e);
+                    }
+                }
+            }
+
+            if !pending_batch.is_empty() {
+                rustfs_io_metrics::add_ec_encode_inflight_bytes(pending_batch_bytes);
+                if let Err(err) = tx.send(pending_batch).await {
+                    rustfs_io_metrics::remove_ec_encode_inflight_bytes(pending_batch_bytes);
+                    return Err(std::io::Error::other(format!("Failed to send encoded data : {err}")));
+                }
+            }
+
+            Ok((reader, total))
+        });
+
+        let mut writers = MultiWriter::new(writers, quorum);
+        let mut write_err = None;
+
+        while let Some(batch) = rx.recv().await {
+            rustfs_io_metrics::remove_ec_encode_inflight_bytes(queued_batch_bytes(&batch));
+            for block in batch {
+                if let Err(err) = writers.write(block).await {
+                    write_err = Some(err);
+                    break;
+                }
+            }
+            if write_err.is_some() {
+                break;
+            }
+        }
+
+        if let Some(err) = write_err {
+            task.abort();
+            let _ = task.await;
+            drain_queued_batched_inflight_bytes(&mut rx).await;
             if let Err(shutdown_err) = writers.shutdown().await {
                 error!("failed to shutdown erasure writers after write error: {:?}", shutdown_err);
             }

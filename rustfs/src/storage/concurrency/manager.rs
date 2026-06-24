@@ -18,7 +18,7 @@ use super::io_schedule::{
     IoLoadLevel, IoLoadMetrics, IoPriority, IoPriorityQueue, IoPriorityQueueConfig, IoQueueStatus, IoSchedulerConfig, IoStrategy,
     get_advanced_buffer_size,
 };
-use super::request_guard::GetObjectGuard;
+use super::request_guard::{GetObjectGuard, PutObjectGuard};
 use crate::app::context::resolve_performance_metrics;
 use rustfs_concurrency::{
     AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
@@ -143,6 +143,10 @@ impl ConcurrencyManager {
     /// Track a GetObject request
     pub fn track_request() -> GetObjectGuard {
         GetObjectGuard::new()
+    }
+
+    pub fn track_put_request() -> PutObjectGuard {
+        PutObjectGuard::new()
     }
 
     /// Get the bytes pool for buffer allocation
