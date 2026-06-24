@@ -18,17 +18,17 @@ use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
     collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients,
+    get_global_deployment_id, get_global_endpoints_opt, get_global_expiry_state, get_global_lock_client, get_global_lock_clients,
     get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
     get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
-    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
-    OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
-    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
-    StorageClassInterface, TierConfigInterface, TierStatsInterface,
+    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
+    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
+    NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
+    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
+    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use async_trait::async_trait;
@@ -368,6 +368,16 @@ impl TierConfigInterface for TierConfigHandle {
     }
 }
 
+/// Default lifecycle expiry state interface adapter.
+#[derive(Default)]
+pub struct ExpiryStateHandle;
+
+impl ExpiryStateInterface for ExpiryStateHandle {
+    fn handle(&self) -> Arc<RwLock<super::super::ExpiryState>> {
+        get_global_expiry_state()
+    }
+}
+
 /// Default server config interface adapter.
 #[derive(Default)]
 pub struct ServerConfigHandle;
@@ -496,6 +506,10 @@ pub fn default_region_interface() -> Arc<dyn RegionInterface> {
 
 pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
     Arc::new(TierConfigHandle)
+}
+
+pub fn default_expiry_state_interface() -> Arc<dyn ExpiryStateInterface> {
+    Arc::new(ExpiryStateHandle)
 }
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {

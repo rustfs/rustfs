@@ -13,8 +13,7 @@
 // limitations under the License.
 
 use super::{
-    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
-    WarmBackendGetOpts,
+    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, TierConfig, TierType, WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
     object_api_utils::to_s3s_etag,
@@ -22,6 +21,7 @@ use super::{
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::context::resolve_tier_config_handle;
 use crate::storage::ecfs::FS;
 use crate::storage::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
@@ -337,7 +337,8 @@ impl AppWarmBackend for MockWarmBackend {
 
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     let backend = MockWarmBackend::default();
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr_handle = resolve_tier_config_handle();
+    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     tier_config_mgr.tiers.insert(
         tier_name.to_string(),
         TierConfig {

@@ -45,7 +45,8 @@ use super::{
     versioning_sys::BucketVersioningSys,
 };
 use crate::app::context::{
-    AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
+    AppContext, get_global_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
+    resolve_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -291,7 +292,8 @@ async fn enqueue_transitioned_delete_cleanup(
 
     super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = super::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState.write().await;
+    let expiry_state = resolve_expiry_state_handle();
+    let mut expiry_state = expiry_state.write().await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
         warn!(
             bucket,

@@ -80,11 +80,6 @@ mod ecstore_data_usage {
     };
 }
 
-#[cfg(test)]
-mod ecstore_global {
-    pub(crate) use crate::storage::ecstore_global::GLOBAL_TierConfigMgr;
-}
-
 #[allow(unused_imports)]
 mod ecstore_tier {
     pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
@@ -97,6 +92,7 @@ pub(crate) type DynReader = crate::storage::DynReader;
 pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
+pub(crate) type ExpiryState = crate::storage::ExpiryState;
 pub(crate) type HashReader = crate::storage::HashReader;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
 pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
@@ -208,26 +204,10 @@ pub(crate) mod lifecycle {
     }
 
     pub(crate) mod bucket_lifecycle_ops {
-        use std::ops::Deref;
         use std::sync::Arc;
 
         use super::ECStore;
         use super::bucket_lifecycle_audit::LcEventSrc;
-
-        pub(crate) type ExpiryState = super::super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
-
-        pub(crate) struct GlobalExpiryStateCompat;
-
-        #[allow(non_upper_case_globals)]
-        pub(crate) static GLOBAL_ExpiryState: GlobalExpiryStateCompat = GlobalExpiryStateCompat;
-
-        impl Deref for GlobalExpiryStateCompat {
-            type Target = Arc<tokio::sync::RwLock<ExpiryState>>;
-
-            fn deref(&self) -> &Self::Target {
-                &super::super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
-            }
-        }
 
         #[cfg(test)]
         pub(crate) async fn init_background_expiry(api: Arc<ECStore>) {
@@ -619,22 +599,6 @@ pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
     crate::storage::is_err_version_not_found(err)
 }
 
-#[cfg(test)]
-pub(crate) struct GlobalTierConfigMgrCompat;
-
-#[cfg(test)]
-#[allow(non_upper_case_globals)]
-pub(crate) static GLOBAL_TierConfigMgr: GlobalTierConfigMgrCompat = GlobalTierConfigMgrCompat;
-
-#[cfg(test)]
-impl std::ops::Deref for GlobalTierConfigMgrCompat {
-    type Target = Arc<tokio::sync::RwLock<TierConfigMgr>>;
-
-    fn deref(&self) -> &Self::Target {
-        &ecstore_global::GLOBAL_TierConfigMgr
-    }
-}
-
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
     crate::storage::get_global_endpoints_opt()
 }
@@ -661,6 +625,10 @@ pub(crate) fn global_rustfs_port() -> u16 {
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
     crate::storage::get_global_tier_config_mgr()
+}
+
+pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
+    crate::storage::get_global_expiry_state()
 }
 
 pub(crate) fn new_object_layer_fn() -> Option<Arc<ECStore>> {
