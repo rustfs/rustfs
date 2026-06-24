@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Large-object PUT stage-breakdown runner for issue #706.
+# Large-object PUT stage-breakdown runner for rustfs/backlog#706.
 # This wrapper standardizes:
 # - object sizes and concurrency matrix for 16MiB / 32MiB PUT runs
 # - output directory layout under target/bench/
@@ -41,7 +41,7 @@ TOPOLOGY_NETWORK=""
 TOPOLOGY_ENDPOINT_MODE=""
 TOPOLOGY_ERASURE_SET_DRIVE_COUNT=""
 CLIENT_HOST=""
-WORKLOAD_LABEL="issue-706-large-put-stage-breakdown"
+WORKLOAD_LABEL="backlog-706-large-put-stage-breakdown"
 
 usage() {
   cat <<'USAGE'

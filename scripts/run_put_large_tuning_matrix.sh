@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Issue #708 tuning matrix runner for large-object PUT.
+# rustfs/backlog#708 tuning matrix runner for large-object PUT.
 # This controller:
 # - defines high-priority tuning profiles for 16MiB / 32MiB PUT
 # - writes an env snapshot per profile

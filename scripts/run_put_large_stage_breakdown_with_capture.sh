@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# One-shot wrapper for issue #706:
+# One-shot wrapper for rustfs/backlog#706:
 # - runs the large PUT stage-breakdown benchmark matrix
 # - starts a parallel artifact collector that covers the benchmark window
 # - stores both outputs under the same run root
@@ -40,7 +40,7 @@ TOPOLOGY_NETWORK=""
 TOPOLOGY_ENDPOINT_MODE=""
 TOPOLOGY_ERASURE_SET_DRIVE_COUNT=""
 CLIENT_HOST=""
-WORKLOAD_LABEL="issue-706-large-put-stage-breakdown"
+WORKLOAD_LABEL="backlog-706-large-put-stage-breakdown"
 
 CAPTURE_LABEL="benchmark-window"
 CAPTURE_METRICS_ENDPOINTS=""
@@ -294,8 +294,7 @@ run_capture() {
   printf ' %q' "${cmd[@]}"
   printf '\n'
 
-  export RUSTFS_CAPTURE_SECRET_KEY="$SECRET_KEY"
-  "${cmd[@]}" &
+  RUSTFS_CAPTURE_SECRET_KEY="$SECRET_KEY" "${cmd[@]}" &
   CAPTURE_PID=$!
 }
 

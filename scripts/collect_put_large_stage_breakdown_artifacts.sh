@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Helper artifact collector for issue #706 large-object PUT stage-breakdown runs.
+# Helper artifact collector for rustfs/backlog#706 large-object PUT stage-breakdown runs.
 # Designed to pair with scripts/run_put_large_stage_breakdown.sh and store
 # supporting evidence under:
 #   <run-root>/captures/<label>/
