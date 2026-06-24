@@ -185,6 +185,7 @@ pub(crate) struct ParallelReader<R> {
     metrics_path: Option<&'static str>,
     read_costs: Vec<ShardReadCost>,
     read_timeout: Duration,
+    verify_reconstruction: bool,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -197,7 +198,15 @@ where
 {
     // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
-        Self::new_with_metrics_path(readers, e, offset, total_length, None)
+        Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            None,
+            get_object_disk_read_timeout(),
+            false,
+        )
     }
 
     pub fn new_with_metrics_path(
@@ -207,8 +216,15 @@ where
         total_length: usize,
         metrics_path: Option<&'static str>,
     ) -> Self {
-        let read_costs = vec![ShardReadCost::Unknown; readers.len()];
-        Self::new_with_metrics_path_and_read_costs(readers, e, offset, total_length, metrics_path, read_costs)
+        Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            get_object_disk_read_timeout(),
+            false,
+        )
     }
 
     pub fn new_with_metrics_path_and_read_costs(
@@ -219,7 +235,7 @@ where
         metrics_path: Option<&'static str>,
         read_costs: Vec<ShardReadCost>,
     ) -> Self {
-        Self::new_with_metrics_path_read_costs_and_read_timeout(
+        Self::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
             readers,
             e,
             offset,
@@ -227,6 +243,25 @@ where
             metrics_path,
             read_costs,
             get_object_disk_read_timeout(),
+            false,
+        )
+    }
+
+    fn new_for_decode(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+    ) -> Self {
+        Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            get_object_disk_read_timeout(),
+            true,
         )
     }
 
@@ -237,19 +272,40 @@ where
         total_length: usize,
         read_timeout: Duration,
     ) -> Self {
-        let read_costs = vec![ShardReadCost::Unknown; readers.len()];
-        Self::new_with_metrics_path_read_costs_and_read_timeout(
+        Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
             readers,
             e,
             offset,
             total_length,
             None,
-            read_costs,
             read_timeout,
+            false,
         )
     }
 
-    fn new_with_metrics_path_read_costs_and_read_timeout(
+    fn new_with_metrics_path_read_timeout_and_reconstruction_verification(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+        read_timeout: Duration,
+        verify_reconstruction: bool,
+    ) -> Self {
+        let read_costs = vec![ShardReadCost::Unknown; readers.len()];
+        Self::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            read_costs,
+            read_timeout,
+            verify_reconstruction,
+        )
+    }
+
+    fn new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
         offset: usize,
@@ -257,6 +313,7 @@ where
         metrics_path: Option<&'static str>,
         mut read_costs: Vec<ShardReadCost>,
         read_timeout: Duration,
+        verify_reconstruction: bool,
     ) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
@@ -277,6 +334,7 @@ where
             metrics_path,
             read_costs,
             read_timeout,
+            verify_reconstruction,
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
@@ -373,6 +431,12 @@ where
         self.buffers.ensure_slots(num_readers);
 
         let mut retire_readers = Vec::new();
+        let mut unavailable_data_sources = self
+            .readers
+            .iter()
+            .take(self.data_shards)
+            .map(|reader| reader.is_none())
+            .collect::<Vec<_>>();
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         if num_readers >= self.data_shards {
             let mut reader_iter = reader_iter.enumerate();
@@ -411,6 +475,8 @@ where
             let mut first_shard_recorded = false;
             let mut pending = sets.len();
             let mut scheduled_all = false;
+            let verification_success_target = self.total_shards.min(self.data_shards + 1);
+            let parity_shards = self.total_shards.saturating_sub(self.data_shards);
             loop {
                 let item = if !scheduled_all {
                     let hedge_sleep = tokio::time::sleep(shard_read_hedge_delay(self.read_timeout));
@@ -477,6 +543,9 @@ where
                     result,
                     should_retire,
                 );
+                if self.verify_reconstruction && i < self.data_shards && result_is_err {
+                    unavailable_data_sources[i] = true;
+                }
                 if result_is_err {
                     failed += 1;
                     if let Some((next_i, next_reader)) = reader_iter.next() {
@@ -505,11 +574,61 @@ where
                     }
                 }
 
-                if success >= self.data_shards {
+                let mut missing_data_sources = unavailable_data_sources.iter().filter(|missing| **missing).count();
+                if self.verify_reconstruction && success >= self.data_shards {
+                    for (idx, active) in active_readers.iter().take(self.data_shards).enumerate() {
+                        if *active && !unavailable_data_sources[idx] {
+                            missing_data_sources += 1;
+                        }
+                    }
+                }
+
+                let needs_reconstruction_verification = self.verify_reconstruction
+                    && verification_success_target > self.data_shards
+                    && missing_data_sources > 0
+                    && missing_data_sources < parity_shards;
+
+                let target_success = if needs_reconstruction_verification {
+                    verification_success_target
+                } else {
+                    self.data_shards
+                };
+
+                while success + pending < target_success {
+                    if let Some((next_i, next_reader)) = reader_iter.next() {
+                        let has_reader = next_reader.is_some();
+                        let recycled_buf = if has_reader {
+                            Some(self.buffers.take(next_i, shard_size))
+                        } else {
+                            None
+                        };
+                        scheduled += 1;
+                        active_readers[next_i] = has_reader;
+                        pending += 1;
+                        sets.push(read_shard(
+                            next_i,
+                            next_reader,
+                            recycled_buf,
+                            shard_size,
+                            self.data_shards,
+                            self.read_timeout,
+                            self.metrics_path,
+                        ));
+                    } else {
+                        scheduled_all = true;
+                        break;
+                    }
+                }
+
+                if success >= target_success {
                     break;
                 }
 
-                if success + pending < self.data_shards {
+                if success >= self.data_shards && (!needs_reconstruction_verification || success + pending < target_success) {
+                    break;
+                }
+
+                if success + pending < target_success {
                     break;
                 }
             }
@@ -591,6 +710,46 @@ where
         let (shards, errors) = ParallelReader::read(self).await;
         StripeReadState::from_parts_with_read_costs(shards, errors, &self.read_costs, read_quorum)
     }
+}
+
+fn decode_and_verify_reconstructed_shards(erasure: &Erasure, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+    let missing_data_source = shards.iter().take(erasure.data_shards).any(|shard| shard.is_none());
+    let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+    let source_parity = if missing_data_source && available_shards > erasure.data_shards {
+        shards
+            .iter()
+            .enumerate()
+            .skip(erasure.data_shards)
+            .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
+            .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
+
+    if source_parity.is_empty() {
+        return erasure.decode_data(shards);
+    }
+
+    erasure.decode_data_and_parity(shards)?;
+    for (index, source) in source_parity {
+        let Some(rebuilt) = shards[index].as_ref() else {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "missing rebuilt parity shard after read verification",
+            ));
+        };
+        if rebuilt != &source {
+            warn!(
+                shard_index = index,
+                data_shards = erasure.data_shards,
+                parity_shards = erasure.parity_shards,
+                "erasure decode rejected inconsistent read source shards"
+            );
+            return Err(io::Error::new(ErrorKind::InvalidData, "inconsistent read source shards"));
+        }
+    }
+
+    Ok(())
 }
 
 /// Get the total length of data blocks
@@ -795,22 +954,18 @@ impl Erasure {
         let mut written = 0;
 
         let mut reader = if let Some(read_costs) = read_costs {
-            ParallelReader::new_with_metrics_path_and_read_costs(
+            ParallelReader::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
                 readers,
                 self.clone(),
                 offset,
                 total_length,
                 Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
                 read_costs,
+                get_object_disk_read_timeout(),
+                true,
             )
         } else {
-            ParallelReader::new_with_metrics_path(
-                readers,
-                self.clone(),
-                offset,
-                total_length,
-                Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
-            )
+            ParallelReader::new_for_decode(readers, self.clone(), offset, total_length, Some(GET_OBJECT_PATH_LEGACY_DUPLEX))
         };
 
         let start = offset / self.block_size;
@@ -866,9 +1021,11 @@ impl Erasure {
                 break;
             }
 
-            // Decode the shards
+            // Decode the shards. If this stripe needed parity to reconstruct a
+            // missing data shard and an extra source shard was available, verify
+            // the reconstructed data against that source before streaming bytes.
             let reconstruct_stage_start = Instant::now();
-            if let Err(e) = self.decode_data(&mut shards) {
+            if let Err(e) = decode_and_verify_reconstructed_shards(self, &mut shards) {
                 rustfs_io_metrics::record_get_object_stage_duration(
                     "legacy_duplex",
                     "reconstruct",
@@ -1155,6 +1312,46 @@ mod tests {
             assert_eq!(written, total_len, "verify={verify}: short write");
             assert_eq!(output, total_data, "verify={verify}: reconstructed bytes mismatch");
         }
+    }
+
+    #[tokio::test]
+    async fn test_erasure_decode_rejects_inconsistent_reconstruction_sources() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let data: Vec<u8> = (0..BLOCK_SIZE as u8).collect();
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("encode should succeed");
+        let mut corrupt_parity = encoded[DATA_SHARDS].to_vec();
+
+        corrupt_parity[0] ^= 0x80;
+        let readers = vec![
+            None,
+            Some(BitrotReader::new(
+                Cursor::new(encoded[1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(Cursor::new(corrupt_parity), shard_size, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(
+                Cursor::new(encoded[DATA_SHARDS + 1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+
+        let mut output = Vec::new();
+        let (written, err) = erasure.decode(&mut output, readers, 0, data.len(), data.len()).await;
+
+        assert_eq!(written, 0);
+        let err = err.expect("inconsistent parity sources must fail the read");
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
+        assert!(output.is_empty());
     }
 
     #[cfg(feature = "rio-v2")]
