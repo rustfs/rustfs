@@ -348,6 +348,7 @@ impl PriorityHealQueue {
 
     fn make_dedup_key_for_type(heal_type: &HealType) -> String {
         match heal_type {
+            HealType::Cluster => "cluster".to_string(),
             HealType::Object {
                 bucket,
                 object,
@@ -482,6 +483,7 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
     }
 
     match heal_type {
+        HealType::Cluster => heal_path.is_empty(),
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
         | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
@@ -2270,6 +2272,7 @@ fn heal_request_set_key(request: &HealRequest) -> Option<String> {
 
 fn heal_request_type_label(request: &HealRequest) -> &'static str {
     match &request.heal_type {
+        HealType::Cluster => "cluster",
         HealType::Object { .. } => "object",
         HealType::Bucket { .. } => "bucket",
         HealType::Prefix { .. } => "prefix",

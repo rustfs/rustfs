@@ -266,6 +266,7 @@ fn encode_heal_task_status(
 fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     let root_erasure_set_target =
         hip.bucket.is_empty() && hip.obj_prefix.is_empty() && matches!((hip.hs.pool, hip.hs.set), (Some(_), Some(_)));
+    let root_cluster_target = hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.hs.pool.is_none() && hip.hs.set.is_none();
     let recursive = if (!hip.bucket.is_empty() && hip.obj_prefix.is_empty()) || root_erasure_set_target {
         true
     } else {
@@ -291,7 +292,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.remove_corrupted = Some(hip.hs.remove);
     heal_request.recreate_missing = Some(hip.hs.recreate);
     heal_request.update_parity = Some(hip.hs.update_parity);
-    heal_request.recursive = Some(recursive);
+    heal_request.recursive = Some(recursive || root_cluster_target);
     heal_request.dry_run = Some(hip.hs.dry_run);
     heal_request.source = HealRequestSource::Admin;
     heal_request
@@ -362,20 +363,16 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
             (Some(_), None) | (None, Some(_)) => {
                 Err(s3_error!(InvalidRequest, "root heal erasure-set target requires both pool and set"))
             }
-            (None, None) => Err(s3_error!(InvalidRequest, "starting heal without a bucket target is not supported")),
+            (None, None) if hip.hs.recursive => Ok(()),
+            (None, None) => Err(s3_error!(InvalidRequest, "root heal requires recursive=true or a bucket target")),
         };
     }
 
     Ok(())
 }
 
-fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
-    hip.bucket.is_empty()
-        && hip.obj_prefix.is_empty()
-        && hip.client_token.is_empty()
-        && !hip.force_stop
-        && hip.hs.pool.is_none()
-        && hip.hs.set.is_none()
+fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
+    false
 }
 
 fn map_root_heal_status(heal_err: Option<super::super::Error>) -> S3Result<()> {
@@ -919,6 +916,31 @@ mod tests {
     }
 
     #[test]
+    fn test_root_recursive_heal_channel_request_targets_cluster() {
+        let hip = HealInitParams {
+            hs: HealOpts {
+                recursive: true,
+                scan_mode: HealScanMode::Deep,
+                recreate: true,
+                ..Default::default()
+            },
+            force_start: true,
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "");
+        assert_eq!(request.disk, None);
+        assert_eq!(request.object_prefix, None);
+        assert_eq!(request.priority, HealChannelPriority::High);
+        assert_eq!(request.source, HealRequestSource::Admin);
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.recursive, Some(true));
+        assert_eq!(request.recreate_missing, Some(true));
+    }
+
+    #[test]
     fn test_bucket_heal_channel_request_defaults_to_recursive() {
         let hip = HealInitParams {
             bucket: "bucket".to_string(),
@@ -973,8 +995,20 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(
             err.to_string()
-                .contains("starting heal without a bucket target is not supported")
+                .contains("root heal requires recursive=true or a bucket target")
         );
+    }
+
+    #[test]
+    fn test_validate_heal_request_mode_allows_root_recursive_heal_start() {
+        validate_heal_request_mode(&HealInitParams {
+            hs: HealOpts {
+                recursive: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("root recursive heal should start tracked cluster heal");
     }
 
     #[test]
@@ -1009,9 +1043,9 @@ mod tests {
     }
 
     #[test]
-    fn test_should_handle_root_heal_directly_for_root_start_modes() {
-        assert!(should_handle_root_heal_directly(&HealInitParams::default()));
-        assert!(should_handle_root_heal_directly(&HealInitParams {
+    fn test_should_handle_root_heal_directly_is_disabled_for_root_start_modes() {
+        assert!(!should_handle_root_heal_directly(&HealInitParams::default()));
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
             force_start: true,
             ..Default::default()
         }));

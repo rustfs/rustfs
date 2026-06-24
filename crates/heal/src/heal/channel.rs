@@ -409,6 +409,8 @@ impl HealChannelProcessor {
                 buckets: vec![],
                 set_disk_id,
             }
+        } else if request.bucket.is_empty() {
+            HealType::Cluster
         } else if let Some(prefix) = &request.object_prefix {
             if !prefix.is_empty() {
                 if recursive {
@@ -639,6 +641,37 @@ mod tests {
         assert_eq!(heal_request.id, "test-id");
         assert!(matches!(heal_request.heal_type, HealType::Bucket { .. }));
         assert_eq!(heal_request.priority, HealPriority::Normal);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_cluster() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: String::new(),
+            object_prefix: None,
+            object_version_id: None,
+            disk: None,
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Normal),
+            remove_corrupted: Some(false),
+            recreate_missing: Some(true),
+            update_parity: Some(true),
+            recursive: Some(true),
+            dry_run: Some(false),
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+            source: HealRequestSource::Admin,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+        assert!(matches!(heal_request.heal_type, HealType::Cluster));
+        assert!(heal_request.options.recursive);
     }
 
     #[tokio::test]

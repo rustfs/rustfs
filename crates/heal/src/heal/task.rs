@@ -51,6 +51,8 @@ const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
 /// Heal type
 #[derive(Debug, Clone)]
 pub enum HealType {
+    /// Cluster heal
+    Cluster,
     /// Object heal
     Object {
         bucket: String,
@@ -78,6 +80,7 @@ pub enum HealType {
 impl HealType {
     fn log_kind(&self) -> &'static str {
         match self {
+            Self::Cluster => "cluster",
             Self::Object { .. } => "object",
             Self::Bucket { .. } => "bucket",
             Self::Prefix { .. } => "prefix",
@@ -307,6 +310,7 @@ impl HealTask {
 
     pub fn metric_type_label(&self) -> &'static str {
         match &self.heal_type {
+            HealType::Cluster => "cluster",
             HealType::Object { .. } => "object",
             HealType::Bucket { .. } => "bucket",
             HealType::Prefix { .. } => "prefix",
@@ -489,6 +493,7 @@ impl HealTask {
         );
 
         let result = match &self.heal_type {
+            HealType::Cluster => self.heal_cluster().await,
             HealType::Object {
                 bucket,
                 object,
@@ -1148,6 +1153,26 @@ impl HealTask {
                 })
             }
         }
+    }
+
+    async fn heal_cluster(&self) -> Result<()> {
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            stage = "cluster_recursive",
+            "Heal cluster started"
+        );
+
+        let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
+        for bucket_info in bucket_infos {
+            self.check_control_flags().await?;
+            self.heal_bucket(&bucket_info.name).await?;
+        }
+
+        Ok(())
     }
 
     async fn heal_prefix(&self, bucket: &str, prefix: &str) -> Result<()> {
@@ -2275,6 +2300,29 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 3);
         assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_cluster_heal_visits_bucket_objects() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute().await.expect("cluster heal should visit bucket objects");
+
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
     }
 
     #[tokio::test]
