@@ -14,6 +14,7 @@
 
 use crate::heal::{
     manager::{HealManager, HealTaskReport},
+    progress::HealProgress,
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
     utils,
 };
@@ -48,6 +49,8 @@ pub struct HealChannelProcessor {
 struct HealTaskStatusPayload {
     summary: String,
     items: Vec<HealResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<HealProgress>,
 }
 
 impl HealChannelProcessor {
@@ -268,38 +271,48 @@ impl HealChannelProcessor {
             self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await
         };
 
-        let (summary, detail, items) = match report {
+        let (summary, detail, items, progress) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
                 result_items,
-            }) => ("running".to_string(), None, result_items),
+                progress,
+            }) => ("running".to_string(), None, result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Retrying { error, retry_attempt },
                 result_items,
+                progress,
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
                 result_items,
+                progress,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Completed,
                 result_items,
-            }) => ("finished".to_string(), None, result_items),
+                progress,
+            }) => ("finished".to_string(), None, result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Cancelled,
                 result_items,
-            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items),
+                progress,
+            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Timeout,
                 result_items,
-            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items),
+                progress,
+            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Failed { error },
                 result_items,
-            }) => ("stopped".to_string(), Some(error), result_items),
-            Err(crate::Error::TaskNotFound { .. }) => {
-                ("notFound".to_string(), Some("heal task not found or expired".to_string()), Vec::new())
-            }
+                progress,
+            }) => ("stopped".to_string(), Some(error), result_items, progress),
+            Err(crate::Error::TaskNotFound { .. }) => (
+                "notFound".to_string(),
+                Some("heal task not found or expired".to_string()),
+                Vec::new(),
+                None,
+            ),
             Err(crate::Error::InvalidClientToken) => {
                 let response = HealChannelResponse {
                     request_id: client_token,
@@ -325,8 +338,12 @@ impl HealChannelProcessor {
             }
         };
 
-        let data = serde_json::to_vec(&HealTaskStatusPayload { summary, items })
-            .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
+        let data = serde_json::to_vec(&HealTaskStatusPayload {
+            summary,
+            items,
+            progress,
+        })
+        .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
 
         let response = HealChannelResponse {
             request_id: client_token,

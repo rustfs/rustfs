@@ -126,6 +126,7 @@ struct RetryingHeal {
 pub struct HealTaskReport {
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
+    pub progress: Option<HealProgress>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -1214,6 +1215,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    progress: Some(task.get_progress().await),
                 });
             }
         }
@@ -1224,6 +1226,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1237,6 +1240,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }
@@ -1247,6 +1251,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1257,6 +1262,7 @@ impl HealManager {
             return Ok(HealTaskReport {
                 status: completed.status.clone(),
                 result_items: completed.result_items.clone(),
+                progress: None,
             });
         }
 
@@ -1275,6 +1281,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    progress: Some(task.get_progress().await),
                 });
             }
         }
@@ -1287,6 +1294,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1301,6 +1309,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }
@@ -1311,6 +1320,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1324,6 +1334,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }

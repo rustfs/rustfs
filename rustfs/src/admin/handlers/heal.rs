@@ -194,6 +194,8 @@ struct HealTaskStatus {
     heal_settings: HealOpts,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +213,8 @@ struct HealTaskStatusPayload {
     summary: String,
     #[serde(default)]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    #[serde(default)]
+    progress: Option<serde_json::Value>,
 }
 
 fn map_heal_response(result: Option<HealResp>) -> S3Result<(StatusCode, Vec<u8>)> {
@@ -253,6 +257,7 @@ fn encode_heal_task_status(
     failure_detail: String,
     heal_settings: HealOpts,
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    progress: Option<serde_json::Value>,
 ) -> S3Result<Vec<u8>> {
     encode_json(&HealTaskStatus {
         summary,
@@ -260,6 +265,7 @@ fn encode_heal_task_status(
         start_time: current_rfc3339_time()?,
         heal_settings,
         items,
+        progress,
     })
 }
 
@@ -300,15 +306,15 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 
 fn heal_channel_response_status(
     response: &rustfs_common::heal_channel::HealChannelResponse,
-) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>) {
+) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, Option<serde_json::Value>) {
     let Some(data) = response.data.as_deref() else {
-        return ("running".to_string(), Vec::new());
+        return ("running".to_string(), Vec::new(), None);
     };
 
     if let Ok(payload) = serde_json::from_slice::<HealTaskStatusPayload>(data)
         && !payload.summary.is_empty()
     {
-        return (payload.summary, payload.items);
+        return (payload.summary, payload.items, payload.progress);
     }
 
     let summary = std::str::from_utf8(data)
@@ -316,7 +322,7 @@ fn heal_channel_response_status(
         .filter(|summary| !summary.is_empty())
         .unwrap_or("running")
         .to_string();
-    (summary, Vec::new())
+    (summary, Vec::new(), None)
 }
 
 #[cfg(test)]
@@ -329,6 +335,11 @@ fn heal_channel_response_items(
     response: &rustfs_common::heal_channel::HealChannelResponse,
 ) -> Vec<rustfs_madmin::heal_commands::HealResultItem> {
     heal_channel_response_status(response).1
+}
+
+#[cfg(test)]
+fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealChannelResponse) -> Option<serde_json::Value> {
+    heal_channel_response_status(response).2
 }
 
 fn encode_background_heal_status(
@@ -526,9 +537,14 @@ impl Operation for HealHandler {
             spawn_traced(async move {
                 match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
                     Ok(response) if response.success => {
-                        let (summary, items) = heal_channel_response_status(&response);
-                        let resp_bytes =
-                            encode_heal_task_status(summary, response.error.unwrap_or_default(), HealOpts::default(), items);
+                        let (summary, items, progress) = heal_channel_response_status(&response);
+                        let resp_bytes = encode_heal_task_status(
+                            summary,
+                            response.error.unwrap_or_default(),
+                            HealOpts::default(),
+                            items,
+                            progress,
+                        );
                         match resp_bytes {
                             Ok(resp_bytes) => {
                                 let _ = tx_clone
@@ -579,8 +595,8 @@ impl Operation for HealHandler {
                         let resp_bytes = if client_token.is_empty() {
                             encode_heal_start_success(response.request_id, client_address)
                         } else {
-                            let (summary, items) = heal_channel_response_status(&response);
-                            encode_heal_task_status(summary, response.error.unwrap_or_default(), heal_settings, items)
+                            let (summary, items, progress) = heal_channel_response_status(&response);
+                            encode_heal_task_status(summary, response.error.unwrap_or_default(), heal_settings, items, progress)
                         };
                         match resp_bytes {
                             Ok(resp_bytes) => {
@@ -731,8 +747,9 @@ mod tests {
     use super::extract_heal_init_params;
     use super::{
         HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
-        map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary,
+        json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode,
+        validate_heal_target,
     };
     use bytes::Bytes;
     use http::StatusCode;
@@ -1203,9 +1220,14 @@ mod tests {
 
     #[test]
     fn test_encode_heal_task_status_uses_client_wire_shape() {
-        let encoded =
-            encode_heal_task_status("Heal status query accepted".to_string(), String::new(), HealOpts::default(), Vec::new())
-                .expect("status response should serialize");
+        let encoded = encode_heal_task_status(
+            "Heal status query accepted".to_string(),
+            String::new(),
+            HealOpts::default(),
+            Vec::new(),
+            None,
+        )
+        .expect("status response should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["summary"], "Heal status query accepted");
@@ -1214,6 +1236,26 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_preserves_progress() {
+        let progress = json!({
+            "objectsScanned": 7,
+            "objectsHealed": 3,
+            "currentObject": "bucket-a/object-a"
+        });
+        let encoded = encode_heal_task_status(
+            "running".to_string(),
+            String::new(),
+            HealOpts::default(),
+            Vec::new(),
+            Some(progress.clone()),
+        )
+        .expect("status response should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
+
+        assert_eq!(json["progress"], progress);
     }
 
     #[test]
@@ -1296,6 +1338,29 @@ mod tests {
         assert_eq!(items[0].bucket, "bucket-a");
         assert_eq!(items[0].object, "object-a");
         assert_eq!(items[0].object_size, 1024);
+    }
+
+    #[test]
+    fn test_heal_channel_response_status_preserves_progress() {
+        let progress = serde_json::json!({
+            "objectsScanned": 4,
+            "objectsHealed": 2,
+            "currentObject": "bucket-a/object-a"
+        });
+        let payload = serde_json::json!({
+            "summary": "running",
+            "items": [],
+            "progress": progress
+        });
+        let response = rustfs_common::heal_channel::create_heal_response(
+            "token".to_string(),
+            true,
+            Some(serde_json::to_vec(&payload).expect("payload should serialize")),
+            None,
+        );
+
+        assert_eq!(heal_channel_response_summary(&response), "running");
+        assert_eq!(heal_channel_response_progress(&response), Some(progress));
     }
 
     #[test]
