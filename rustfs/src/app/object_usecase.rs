@@ -73,7 +73,9 @@ use super::storage_api::object_usecase::options::{
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
-use super::storage_api::object_usecase::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::storage_api::object_usecase::set_disk::{
+    get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
+};
 use super::storage_api::object_usecase::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
     encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
@@ -186,7 +188,9 @@ const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
+const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
+const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
 
 fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
@@ -514,6 +518,166 @@ where
 {
     fn remaining_length(&self) -> RemainingLength {
         RemainingLength::new_exact(self.remaining)
+    }
+}
+
+struct GetObjectStreamingReader<R> {
+    inner: R,
+    bucket: String,
+    key: String,
+    expected: usize,
+    emitted: usize,
+    timeout: Duration,
+    timer: Option<Pin<Box<tokio::time::Sleep>>>,
+    started: std::time::Instant,
+    first_byte_reported: bool,
+    completed: bool,
+}
+
+impl<R> GetObjectStreamingReader<R> {
+    fn new(inner: R, bucket: &str, key: &str, expected: usize, timeout: Duration) -> Self {
+        Self {
+            inner,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            expected,
+            emitted: 0,
+            timeout,
+            timer: None,
+            started: std::time::Instant::now(),
+            first_byte_reported: false,
+            completed: expected == 0,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                self.timer = None;
+                let produced = buf.filled().len().saturating_sub(filled_before);
+                if produced > 0 {
+                    self.emitted = self.emitted.saturating_add(produced);
+                    if !self.first_byte_reported {
+                        self.first_byte_reported = true;
+                        let elapsed = self.elapsed();
+                        if elapsed >= GET_OBJECT_STREAM_WARN_THRESHOLD {
+                            warn!(
+                                event = EVENT_GET_OBJECT_STREAM_BODY,
+                                component = LOG_COMPONENT_APP,
+                                subsystem = LOG_SUBSYSTEM_OBJECT,
+                                bucket = %self.bucket,
+                                object = %self.key,
+                                expected = self.expected,
+                                emitted = self.emitted,
+                                elapsed_ms = elapsed.as_millis(),
+                                state = "first_byte_slow",
+                                "GetObject streaming body first byte was slow"
+                            );
+                        }
+                    }
+                    if self.emitted >= self.expected {
+                        self.completed = true;
+                    }
+                } else if self.emitted < self.expected {
+                    warn!(
+                        event = EVENT_GET_OBJECT_STREAM_BODY,
+                        component = LOG_COMPONENT_APP,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        bucket = %self.bucket,
+                        object = %self.key,
+                        expected = self.expected,
+                        emitted = self.emitted,
+                        elapsed_ms = self.elapsed().as_millis(),
+                        state = "short_eof",
+                        "GetObject streaming body ended before expected length"
+                    );
+                } else {
+                    self.completed = true;
+                }
+
+                Poll::Ready(Ok(()))
+            }
+            Poll::Ready(Err(err)) => {
+                self.timer = None;
+                warn!(
+                    event = EVENT_GET_OBJECT_STREAM_BODY,
+                    component = LOG_COMPONENT_APP,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    bucket = %self.bucket,
+                    object = %self.key,
+                    expected = self.expected,
+                    emitted = self.emitted,
+                    elapsed_ms = self.elapsed().as_millis(),
+                    state = "read_failed",
+                    error = %err,
+                    "GetObject streaming body read failed"
+                );
+                Poll::Ready(Err(err))
+            }
+            Poll::Pending => {
+                if self.timeout.is_zero() {
+                    return Poll::Pending;
+                }
+
+                if self.timer.is_none() {
+                    self.timer = Some(Box::pin(tokio::time::sleep(self.timeout)));
+                }
+
+                if let Some(timer) = self.timer.as_mut()
+                    && std::future::Future::poll(timer.as_mut(), cx).is_ready()
+                {
+                    self.timer = None;
+                    warn!(
+                        event = EVENT_GET_OBJECT_STREAM_BODY,
+                        component = LOG_COMPONENT_APP,
+                        subsystem = LOG_SUBSYSTEM_OBJECT,
+                        bucket = %self.bucket,
+                        object = %self.key,
+                        expected = self.expected,
+                        emitted = self.emitted,
+                        elapsed_ms = self.elapsed().as_millis(),
+                        timeout_ms = self.timeout.as_millis(),
+                        state = "stall_timeout",
+                        "GetObject streaming body stalled"
+                    );
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "get object streaming body stall timeout",
+                    )));
+                }
+
+                Poll::Pending
+            }
+        }
+    }
+}
+
+impl<R> Drop for GetObjectStreamingReader<R> {
+    fn drop(&mut self) {
+        if self.expected == 0 || self.completed || self.emitted >= self.expected {
+            return;
+        }
+
+        warn!(
+            event = EVENT_GET_OBJECT_STREAM_BODY,
+            component = LOG_COMPONENT_APP,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            bucket = %self.bucket,
+            object = %self.key,
+            expected = self.expected,
+            emitted = self.emitted,
+            elapsed_ms = self.elapsed().as_millis(),
+            state = "dropped_incomplete",
+            "GetObject streaming body dropped before expected length"
+        );
     }
 }
 
@@ -1743,9 +1907,11 @@ impl DefaultObjectUsecase {
         response_content_length: i64,
         stream_buffer_size: usize,
         stream_strategy: GetObjectStreamStrategy,
+        bucket: &str,
+        key: &str,
     ) -> Option<StreamingBlob>
     where
-        R: AsyncRead + Send + Sync + 'static,
+        R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let (stream_buffer_size, buffer_source) =
@@ -1759,6 +1925,7 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
+        let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout());
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
@@ -2247,6 +2414,8 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
+        bucket: &str,
+        key: &str,
     ) -> S3Result<Option<StreamingBlob>>
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
@@ -2281,6 +2450,8 @@ impl DefaultObjectUsecase {
                 response_content_length,
                 stream_buffer_size,
                 stream_strategy,
+                bucket,
+                key,
             ));
         }
 
@@ -2314,6 +2485,8 @@ impl DefaultObjectUsecase {
             response_content_length,
             stream_buffer_size,
             stream_strategy,
+            bucket,
+            key,
         ))
     }
 
@@ -3033,6 +3206,8 @@ impl DefaultObjectUsecase {
             part_number,
             rs.is_some(),
             encryption_applied,
+            bucket,
+            key,
         )
         .await?;
 
@@ -5815,6 +5990,28 @@ mod tests {
         }
     }
 
+    struct PendingReader;
+
+    impl AsyncRead for PendingReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test]
+    async fn get_object_streaming_reader_times_out_when_body_stalls() {
+        let reader = GetObjectStreamingReader::new(PendingReader, "test-bucket", "stalled-object", 1, Duration::from_millis(1));
+        let mut stream = ReaderStream::with_capacity(reader, 1024);
+
+        let err = stream
+            .next()
+            .await
+            .expect("reader stream should yield timeout")
+            .expect_err("stalled reader should return an error");
+
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
     #[tokio::test]
     async fn build_get_object_body_keeps_large_objects_on_streaming_path_without_preread() {
         let reads = Arc::new(AtomicUsize::new(0));
@@ -5836,6 +6033,8 @@ mod tests {
             None,
             false,
             false,
+            "test-bucket",
+            "large-object",
         )
         .await
         .expect("build_get_object_body should succeed for streaming path");
@@ -5869,6 +6068,8 @@ mod tests {
             None,
             false,
             true,
+            "test-bucket",
+            "large-encrypted-object",
         )
         .await
         .expect("build_get_object_body should succeed for encrypted streaming path");

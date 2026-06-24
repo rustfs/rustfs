@@ -773,7 +773,9 @@ pub(crate) mod sse {
 }
 
 pub(crate) mod set_disk {
-    pub(crate) use crate::storage::storage_api::{get_lock_acquire_timeout, is_valid_storage_class};
+    pub(crate) use crate::storage::storage_api::{
+        get_lock_acquire_timeout, get_object_disk_read_timeout, is_valid_storage_class,
+    };
 }
 
 pub(crate) mod storage_class {

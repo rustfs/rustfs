@@ -21,7 +21,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
 use metrics::gauge;
-use rustfs_common::heal_channel::{HealOpts, HealScanMode};
+use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -44,6 +44,7 @@ pub struct ErasureSetHealer {
     cancel_token: tokio_util::sync::CancellationToken,
     disk: DiskStore,
     heal_opts: HealOpts,
+    source: HealRequestSource,
 }
 
 impl ErasureSetHealer {
@@ -78,6 +79,14 @@ impl ErasureSetHealer {
         }
     }
 
+    fn effective_heal_page_object_concurrency_for_source(source: HealRequestSource, scan_mode: HealScanMode) -> usize {
+        if matches!(source, HealRequestSource::AutoHeal) {
+            1
+        } else {
+            Self::effective_heal_page_object_concurrency_for_scan_mode(scan_mode)
+        }
+    }
+
     fn is_object_not_found_message(message: &str) -> bool {
         message.contains("File not found") || message.contains("not found")
     }
@@ -88,6 +97,7 @@ impl ErasureSetHealer {
         cancel_token: tokio_util::sync::CancellationToken,
         disk: DiskStore,
         heal_opts: HealOpts,
+        source: HealRequestSource,
     ) -> Self {
         Self {
             storage,
@@ -95,6 +105,7 @@ impl ErasureSetHealer {
             cancel_token,
             disk,
             heal_opts,
+            source,
         }
     }
 
@@ -447,7 +458,8 @@ impl ErasureSetHealer {
         // 2. process objects with pagination to avoid loading all objects into memory
         let mut continuation_token: Option<String> = None;
         let mut global_obj_idx = 0usize;
-        let page_concurrency_limit = Self::effective_heal_page_object_concurrency_for_scan_mode(self.heal_opts.scan_mode);
+        let page_concurrency_limit =
+            Self::effective_heal_page_object_concurrency_for_source(self.source, self.heal_opts.scan_mode);
         let in_flight = Arc::new(AtomicUsize::new(0));
 
         loop {
@@ -957,7 +969,7 @@ impl ErasureSetHealer {
 #[cfg(test)]
 mod tests {
     use super::ErasureSetHealer;
-    use rustfs_common::heal_channel::HealScanMode;
+    use rustfs_common::heal_channel::{HealRequestSource, HealScanMode};
 
     #[test]
     fn heal_page_object_concurrency_uses_default_when_env_is_unset() {
@@ -1003,5 +1015,43 @@ mod tests {
                 11
             );
         });
+    }
+
+    #[test]
+    fn auto_heal_page_object_concurrency_is_serial() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11")),
+            ],
+            || {
+                assert_eq!(
+                    ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                        HealRequestSource::AutoHeal,
+                        HealScanMode::Normal,
+                    ),
+                    1
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn non_auto_normal_scan_page_object_concurrency_uses_effective_limit() {
+        temp_env::with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("11")),
+            ],
+            || {
+                assert_eq!(
+                    ErasureSetHealer::effective_heal_page_object_concurrency_for_source(
+                        HealRequestSource::Admin,
+                        HealScanMode::Normal,
+                    ),
+                    11
+                );
+            },
+        );
     }
 }
