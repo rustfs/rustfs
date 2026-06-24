@@ -66,7 +66,8 @@ How to use me:
 		make fmt                                 # Format code
 		make clippy                              # Run clippy checks
 		make test                                # Run tests
-		make pre-commit                          # Run all pre-commit checks
+		make pre-commit                          # Run fast pre-commit checks
+		make pre-pr                              # Run full pre-PR checks
 
 	🚀 Quick Start:
 		make build                               # Build RustFS binary
@@ -78,4 +79,3 @@ endef
 export HEADER
 
 -include $(addsuffix /*.mak, $(shell find .config/make -type d))
-

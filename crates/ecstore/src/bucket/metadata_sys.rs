@@ -19,7 +19,7 @@ use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
-use crate::global::{GLOBAL_Endpoints, is_dist_erasure, is_erasure, resolve_object_store_handle};
+use crate::runtime_sources;
 use crate::store::ECStore;
 use futures::future::join_all;
 use lazy_static::lazy_static;
@@ -263,13 +263,9 @@ impl BucketMetadataSys {
         let _ = self.init_internal(buckets).await;
     }
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
-        let count = {
-            if let Some(endpoints) = GLOBAL_Endpoints.get() {
-                endpoints.es_count() * 10
-            } else {
-                return Err(Error::other("GLOBAL_Endpoints not init"));
-            }
-        };
+        let count = runtime_sources::endpoint_erasure_set_count()
+            .map(|count| count * 10)
+            .ok_or_else(|| Error::other("GLOBAL_Endpoints not init"))?;
 
         let mut failed_buckets: HashSet<String> = HashSet::new();
         let mut buckets = buckets.as_slice();
@@ -288,7 +284,7 @@ impl BucketMetadataSys {
         let mut initialized = self.initialized.write().await;
         *initialized = true;
 
-        if is_dist_erasure().await {
+        if runtime_sources::setup_is_dist_erasure().await {
             // TODO: refresh_buckets_metadata_loop
         }
 
@@ -406,7 +402,7 @@ impl BucketMetadataSys {
     }
 
     async fn update_and_parse(&mut self, bucket: &str, config_file: &str, data: Vec<u8>, parse: bool) -> Result<OffsetDateTime> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(Error::other("errServerNotInitialized"));
         };
 
@@ -417,7 +413,10 @@ impl BucketMetadataSys {
         let mut bm = match load_bucket_metadata_parse(store, bucket, parse).await {
             Ok(res) => res,
             Err(err) => {
-                if !is_erasure().await && !is_dist_erasure().await && is_err_bucket_not_found(&err) {
+                if !runtime_sources::setup_is_erasure().await
+                    && !runtime_sources::setup_is_dist_erasure().await
+                    && is_err_bucket_not_found(&err)
+                {
                     BucketMetadata::new(bucket)
                 } else {
                     error!("load bucket metadata failed: {}", err);
