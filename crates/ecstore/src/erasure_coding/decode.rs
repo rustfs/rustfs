@@ -35,7 +35,7 @@ use std::time::{Duration, Instant};
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
-use tracing::error;
+use tracing::{error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
@@ -310,6 +310,20 @@ fn record_shard_read_result(
     }
 }
 
+fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Vec<usize>, active_readers: &[bool]) {
+    for (i, active) in active_readers.iter().enumerate() {
+        if !*active {
+            continue;
+        }
+
+        if errs[i].is_none() {
+            errs[i] = Some(Error::from(io::Error::new(ErrorKind::TimedOut, "shard read abandoned after read quorum")));
+        }
+        retire_readers.push(i);
+        warn!(shard_index = i, "retiring in-flight shard reader after read quorum");
+    }
+}
+
 fn shard_read_hedge_delay(read_timeout: Duration) -> Duration {
     if read_timeout.is_zero() {
         Duration::ZERO
@@ -363,18 +377,21 @@ where
         if num_readers >= self.data_shards {
             let mut reader_iter = reader_iter.enumerate();
             let mut sets = FuturesUnordered::new();
+            let mut active_readers = vec![false; num_readers];
             let stripe_read_start = Instant::now();
             let mut scheduled = 0usize;
             for _ in 0..self.data_shards {
                 if let Some((i, reader)) = reader_iter.next() {
+                    let has_reader = reader.is_some();
                     // Only claim a request-scoped buffer when a shard will actually be read.
-                    let recycled_buf = if reader.is_some() {
+                    let recycled_buf = if has_reader {
                         Some(self.buffers.take(i, shard_size))
                     } else {
                         None
                     };
                     let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                     scheduled += 1;
+                    active_readers[i] = has_reader;
                     sets.push(read_shard(
                         i,
                         read_cost,
@@ -402,13 +419,15 @@ where
                         item = sets.next() => item,
                         _ = &mut hedge_sleep => {
                             for (next_i, next_reader) in reader_iter.by_ref() {
-                                let recycled_buf = if next_reader.is_some() {
+                                let has_reader = next_reader.is_some();
+                                let recycled_buf = if has_reader {
                                     Some(self.buffers.take(next_i, shard_size))
                                 } else {
                                     None
                                 };
                                 let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
                                 scheduled += 1;
+                                active_readers[next_i] = has_reader;
                                 pending += 1;
                                 sets.push(read_shard(
                                     next_i,
@@ -434,6 +453,7 @@ where
                 };
 
                 pending = pending.saturating_sub(1);
+                active_readers[i] = false;
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = self.metrics_path {
@@ -460,13 +480,15 @@ where
                 if result_is_err {
                     failed += 1;
                     if let Some((next_i, next_reader)) = reader_iter.next() {
-                        let recycled_buf = if next_reader.is_some() {
+                        let has_reader = next_reader.is_some();
+                        let recycled_buf = if has_reader {
                             Some(self.buffers.take(next_i, shard_size))
                         } else {
                             None
                         };
                         let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
                         scheduled += 1;
+                        active_readers[next_i] = has_reader;
                         pending += 1;
                         sets.push(read_shard(
                             next_i,
@@ -494,6 +516,7 @@ where
 
             if success >= self.data_shards {
                 while let Some(Some((i, read_cost, result, should_retire))) = sets.next().now_or_never() {
+                    active_readers[i] = false;
                     completed += 1;
                     if record_shard_read_result(
                         &mut shards,
@@ -509,6 +532,7 @@ where
                         failed += 1;
                     }
                 }
+                retire_abandoned_readers(&mut errs, &mut retire_readers, &active_readers);
             }
 
             if let Some(path) = self.metrics_path {
@@ -936,6 +960,7 @@ mod tests {
     enum TestShardReader {
         Ready(Cursor<Vec<u8>>),
         Pending,
+        PartialThenPending { data: Vec<u8>, emitted: bool },
         TimedOut,
     }
 
@@ -946,6 +971,17 @@ mod tests {
                 TestShardReader::Pending => {
                     cx.waker().wake_by_ref();
                     Poll::Pending
+                }
+                TestShardReader::PartialThenPending { data, emitted } => {
+                    if *emitted {
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+
+                    let len = data.len().min(buf.remaining());
+                    buf.put_slice(&data[..len]);
+                    *emitted = true;
+                    Poll::Ready(Ok(()))
                 }
                 TestShardReader::TimedOut => Poll::Ready(Err(io::Error::new(ErrorKind::TimedOut, "test shard read timed out"))),
             }
@@ -1359,12 +1395,71 @@ mod tests {
             .await
             .expect("parallel reader should use ready parity without waiting for pending data shard");
 
-        assert!(errs[0].is_none());
-        assert!(parallel_reader.readers[0].is_some());
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
         assert!(bufs[0].is_none());
         assert!(bufs[1].is_some());
         assert!(bufs[2].is_some());
         assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+    }
+
+    #[tokio::test]
+    async fn test_parallel_reader_retires_partially_read_shard_after_quorum() {
+        const NUM_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 1;
+        const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+        let hash_algo = HashAlgorithm::None;
+        let readers = vec![
+            Some(BitrotReader::new(
+                TestShardReader::PartialThenPending {
+                    data: vec![9_u8; SHARD_SIZE / 2],
+                    emitted: false,
+                },
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![1_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo.clone(),
+                false,
+            )),
+            Some(BitrotReader::new(
+                TestShardReader::Ready(Cursor::new(vec![2_u8; SHARD_SIZE * NUM_SHARDS])),
+                SHARD_SIZE,
+                hash_algo,
+                false,
+            )),
+        ];
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let mut parallel_reader =
+            ParallelReader::new_with_read_timeout(readers, erasure, 0, NUM_SHARDS * BLOCK_SIZE, Duration::from_secs(60));
+
+        let (bufs, errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("parallel reader should use parity without waiting for a partially read shard");
+
+        assert!(matches!(&errs[0], Some(DiskError::Io(err)) if err.kind() == ErrorKind::TimedOut));
+        assert!(parallel_reader.readers[0].is_none());
+        assert!(bufs[0].is_none());
+        assert!(bufs[1].is_some());
+        assert!(bufs[2].is_some());
+        assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+
+        let (next_bufs, next_errs) = tokio::time::timeout(Duration::from_millis(500), parallel_reader.read())
+            .await
+            .expect("retired partially read shard should not block the next stripe");
+
+        assert!(matches!(&next_errs[0], Some(DiskError::FileNotFound)));
+        assert!(next_bufs[0].is_none());
+        assert!(next_bufs[1].is_some());
+        assert!(next_bufs[2].is_some());
+        assert_eq!(DATA_SHARDS, next_bufs.iter().filter(|buf| buf.is_some()).count());
     }
 
     #[tokio::test]
