@@ -14,6 +14,7 @@
 
 use super::*;
 use crate::disk::health_state::DriveMembershipSnapshot;
+use crate::runtime_sources;
 
 impl SetDisks {
     pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
@@ -303,12 +304,14 @@ impl SetDisks {
         new_disk.enable_health_check();
 
         if new_disk.is_local() {
-            let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
+            let local_disk_map = runtime_sources::local_disk_map_handle();
+            let mut global_local_disk_map = local_disk_map.write().await;
             let path = new_disk.endpoint().to_string();
             global_local_disk_map.insert(path, Some(new_disk.clone()));
 
-            if is_dist_erasure().await {
-                let mut local_set_drives = GLOBAL_LOCAL_DISK_SET_DRIVES.write().await;
+            if runtime_sources::setup_is_dist_erasure().await {
+                let local_disk_set_drives = runtime_sources::local_disk_set_drives_handle();
+                let mut local_set_drives = local_disk_set_drives.write().await;
                 local_set_drives[self.pool_index][set_idx][disk_idx] = Some(new_disk.clone());
             }
         }

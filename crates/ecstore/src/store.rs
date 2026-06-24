@@ -44,13 +44,13 @@ use crate::error::{
 };
 use crate::event_notification::EventNotifier;
 use crate::global::{
-    DISK_RESERVE_FRACTION, GLOBAL_BOOT_TIME, TypeLocalDiskSetDrives, get_global_endpoints, get_global_region,
-    get_global_tier_config_mgr, set_object_layer,
+    DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives, get_global_region, get_global_tier_config_mgr, set_object_layer,
 };
 use crate::notification_sys::get_global_notification_sys;
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
+use crate::runtime_sources;
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
@@ -84,7 +84,6 @@ use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
 use std::process::exit;
-use std::time::SystemTime;
 use std::{
     collections::HashMap,
     sync::{Arc, OnceLock},
@@ -265,7 +264,7 @@ impl ECStore {
 
     /// Get the global endpoints
     pub fn endpoints(&self) -> EndpointServerPools {
-        get_global_endpoints()
+        runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into())
     }
 
     /// Get the global region
