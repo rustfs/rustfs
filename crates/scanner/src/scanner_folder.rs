@@ -54,8 +54,8 @@ use crate::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
     ReplicationConfig, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
-    enqueue_global_newer_noncurrent, is_erasure, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal_internal,
+    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    path2_bucket_object_with_base_path, queue_replication_heal_internal, scanner_is_erasure,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
@@ -910,7 +910,7 @@ impl ScannerItem {
             let action = event.action;
             let count = u64::try_from(to_delete_objs.len()).unwrap_or(u64::MAX);
             let done_ilm = Metrics::time_ilm(action);
-            let queued = enqueue_global_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
+            let queued = enqueue_runtime_newer_noncurrent(&self.bucket, to_delete_objs, event, &LcEventSrc::Scanner).await;
             if record_scanner_ilm_action_if_queued(global_metrics(), action, count, queued) {
                 done_ilm(count)();
                 remaining_versions = remaining_versions.saturating_sub(noncurrent_accounting.len());
@@ -1711,7 +1711,7 @@ impl FolderScanner {
                 return Err(ScannerError::Other("Operation cancelled".to_string()));
             }
 
-            if found_objects && is_erasure().await {
+            if found_objects && scanner_is_erasure().await {
                 // If we found an object in erasure mode, we skip subdirs (only datadirs)...
                 debug!(
                     target: "rustfs::scanner::folder",
@@ -2310,7 +2310,7 @@ pub async fn scan_data_folder(
     let (update_current_path, close_disk) = current_path_updater(&base_path, &cache.info.name);
 
     // Create skip_heal flag
-    let is_erasure_mode = is_erasure().await;
+    let is_erasure_mode = scanner_is_erasure().await;
     let skip_heal = Arc::new(std::sync::atomic::AtomicBool::new(!is_erasure_mode || cache.info.skip_healing));
 
     // Create heal_object_select flag
