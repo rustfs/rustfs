@@ -442,17 +442,6 @@ fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) ->
     }
 }
 
-pub(crate) fn liveness_dependency_readiness_report() -> DependencyReadinessReport {
-    DependencyReadinessReport {
-        readiness: DependencyReadiness {
-            storage_ready: true,
-            iam_ready: true,
-            lock_quorum_ready: true,
-        },
-        degraded_reasons: Vec::new(),
-    }
-}
-
 pub async fn collect_dependency_readiness() -> DependencyReadiness {
     collect_dependency_readiness_report().await.readiness
 }

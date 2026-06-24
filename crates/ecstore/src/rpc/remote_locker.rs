@@ -38,8 +38,6 @@ pub struct RemoteClient {
 }
 
 impl RemoteClient {
-    const RPC_TIMEOUT_GRACE: Duration = Duration::from_millis(500);
-
     pub fn new(endpoint: String) -> Self {
         Self { addr: endpoint }
     }
@@ -124,28 +122,21 @@ impl RemoteClient {
         resources.join(", ")
     }
 
-    fn rpc_timeout(lock_wait_budget: Duration) -> Duration {
-        let configured = Duration::from_millis(
+    fn rpc_timeout() -> Duration {
+        Duration::from_millis(
             rustfs_utils::get_env_u64(
                 rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS,
                 rustfs_config::DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS,
             )
             .max(1),
-        );
-        configured.max(lock_wait_budget.saturating_add(Self::RPC_TIMEOUT_GRACE))
+        )
     }
 
-    async fn execute_rpc<T, F>(
-        &self,
-        op: &'static str,
-        timeout_duration: Duration,
-        resource_summary: &str,
-        future: F,
-    ) -> std::result::Result<T, LockError>
+    async fn execute_rpc<T, F>(&self, op: &'static str, resource_summary: &str, future: F) -> std::result::Result<T, LockError>
     where
         F: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        let lock_timeout = Self::rpc_timeout(timeout_duration);
+        let lock_timeout = Self::rpc_timeout();
         match timeout(lock_timeout, future).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
@@ -221,14 +212,6 @@ impl RemoteClient {
             .collect()
     }
 
-    fn batch_rpc_timeout(requests: &[LockRequest]) -> Duration {
-        requests
-            .iter()
-            .map(|request| request.acquire_timeout)
-            .max()
-            .unwrap_or_else(|| Duration::from_millis(1))
-    }
-
     fn build_lock_info(request: &LockRequest, lock_info_json: Option<String>) -> LockInfo {
         if let Some(lock_info_json) = lock_info_json {
             match serde_json::from_str::<LockInfo>(&lock_info_json) {
@@ -279,10 +262,7 @@ impl LockClient for RemoteClient {
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
 
-        let resp = match self
-            .execute_rpc("lock", request.acquire_timeout, &resource_summary, client.lock(req))
-            .await
-        {
+        let resp = match self.execute_rpc("lock", &resource_summary, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
             Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_response(request, &err)),
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
@@ -321,7 +301,7 @@ impl LockClient for RemoteClient {
         });
 
         let resp = match self
-            .execute_rpc("lock_batch", Self::batch_rpc_timeout(requests), &resource_summary, client.lock_batch(req))
+            .execute_rpc("lock_batch", &resource_summary, client.lock_batch(req))
             .await
         {
             Ok(resp) => resp.into_inner(),
@@ -686,11 +666,18 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_remote_client_rpc_timeout_uses_configured_floor_and_grace() {
+    fn test_remote_client_rpc_timeout_honors_configured_deadline() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, None::<&str>, || {
+            assert_eq!(
+                RemoteClient::rpc_timeout(),
+                Duration::from_millis(rustfs_config::DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS)
+            );
+        });
         temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"), || {
-            assert_eq!(RemoteClient::rpc_timeout(Duration::ZERO), Duration::from_millis(500));
-            assert_eq!(RemoteClient::rpc_timeout(Duration::from_millis(25)), Duration::from_millis(525));
-            assert_eq!(RemoteClient::rpc_timeout(Duration::from_secs(1)), Duration::from_millis(1500));
+            assert_eq!(RemoteClient::rpc_timeout(), Duration::from_millis(50));
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("0"), || {
+            assert_eq!(RemoteClient::rpc_timeout(), Duration::from_millis(1));
         });
     }
 }
