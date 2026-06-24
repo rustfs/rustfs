@@ -48,8 +48,8 @@ use crate::tier::{
 use crate::{
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
-    global::is_first_cluster_node_local,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    runtime_sources,
     storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations},
     store::ECStore,
 };
@@ -1171,7 +1171,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 }
                 Err(legacy_err) if is_err_config_not_found(&legacy_err) => {
                     warn!("config not found, start to init");
-                    if is_first_cluster_node_local().await {
+                    if runtime_sources::first_cluster_node_is_local().await {
                         new_and_save_tiering_config(api).await.map_err(io::Error::other)
                     } else {
                         Ok(TierConfigMgr {

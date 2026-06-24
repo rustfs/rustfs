@@ -28,7 +28,6 @@ use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::event_notification::{EventArgs, send_event};
-use crate::global::resolve_object_store_handle;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
@@ -1758,7 +1757,7 @@ impl ObjectInfoExt for ObjectInfo {
 }
 
 pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-    if resolve_object_store_handle().is_none() {
+    if runtime_sources::object_store_handle().is_none() {
         return ReplicateDecision::default();
     }
 

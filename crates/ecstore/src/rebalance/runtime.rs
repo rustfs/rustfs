@@ -14,7 +14,7 @@ use super::{
     RebalanceBucketOutcome,
 };
 use crate::error::{Error, Result};
-use crate::global::get_global_endpoints;
+use crate::runtime_sources;
 use crate::store::ECStore;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -120,11 +120,7 @@ impl ECStore {
                 continue;
             }
 
-            if !get_global_endpoints()
-                .as_ref()
-                .get(idx)
-                .is_some_and(|v| v.endpoints.as_ref().first().is_some_and(|e| e.is_local))
-            {
+            if !runtime_sources::endpoint_pool_is_local(idx) {
                 debug!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,
