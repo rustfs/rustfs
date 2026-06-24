@@ -121,6 +121,21 @@ histogram_quantile(
 )
 ```
 
+### 4.6 multipart path 命中计数
+
+```promql
+sum by (path) (
+  rustfs_s3_put_object_path_total{
+    path=~"multipart_.*"
+  }
+)
+```
+
+用于回答：
+
+1. 当前 run 是否真的命中了 `multipart_write_pipeline_batched_large`
+2. batched gate 是否只是“代码存在”，还是“运行时实际生效”
+
 ## 5. 推荐看板顺序
 
 当你在看 `>1GiB multipart PUT` 时，建议按下面顺序看：
@@ -129,6 +144,7 @@ histogram_quantile(
 2. `multipart_set_disk_writer_setup`
 3. `multipart_set_disk_encode`
 4. `multipart_complete_tail`
+5. `multipart_write_pipeline` vs `multipart_write_pipeline_batched_large`
 
 解释顺序：
 
@@ -136,6 +152,7 @@ histogram_quantile(
 2. 如果 writer setup 高，先看 bitrot writer / disk availability / shard_file_size path
 3. 如果 encode 高，先看 multipart 是否需要独立 encode strategy
 4. 如果 complete tail 高，优先看 `complete_multipart_upload()` 的 metadata / checksum / rename tail
+5. 如果 batched 预期已打开，但 path 仍然只有 `multipart_write_pipeline`，优先检查 size gate 是否真正被命中
 
 ## 6. 推荐结合看的辅助指标
 

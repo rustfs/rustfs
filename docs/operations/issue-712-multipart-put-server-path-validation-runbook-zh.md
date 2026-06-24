@@ -96,6 +96,12 @@ target/bench/
 3. `multipart_set_disk_encode`
 4. `multipart_complete_tail`
 
+同时建议固定记录 multipart path 计数：
+
+1. `multipart_write_pipeline`
+2. `multipart_write_pipeline_batched_large`
+3. `multipart_write_single_block_non_inline`
+
 ## 8. 本轮的判断顺序
 
 先看：
@@ -154,3 +160,54 @@ target/bench/
 
 1. part ingress buffer 分层
 2. body read / HashReader 前的缓冲调整
+
+## 11. `multipart_*` 指标为空时的排查顺序
+
+如果本轮跑的是 multipart PUT，但 Prometheus 里查不到任何 `multipart_*` stage：
+
+1. 先不要直接判定“新打点无效”
+2. 先查当前 `rustfs_s3_put_object_stage_duration_ms` 里到底有哪些 stage
+3. 如果只看到了 ordinary PUT 的 `ingress_prepare` / `set_disk_writer_setup` / `set_disk_encode` / `set_disk_rename`，要优先怀疑当前 `127.0.0.1:9000` 上跑的不是预期的新二进制
+
+推荐先查：
+
+```promql
+topk(
+  40,
+  count by (__name__, stage) (
+    {__name__=~"rustfs_s3_put_object_stage_duration_ms.*"}
+  )
+)
+```
+
+如果结果里只有 ordinary stage，而没有：
+
+1. `multipart_ingress_prepare`
+2. `multipart_set_disk_writer_setup`
+3. `multipart_set_disk_encode`
+4. `multipart_complete_tail`
+
+则应优先检查：
+
+1. 本轮 RustFS 进程是否确实来自当前 worktree 的 `target/debug/rustfs`
+2. 重启脚本是否真的清掉了旧进程
+3. `RUSTFS_OBS_ENDPOINT` 是否仍然指向当前可查询 backend
+
+## 12. 已确认的假阴性根因样例
+
+在 `2026-06-24` 的第三批继续验证中，出现过一次典型假阴性：
+
+1. multipart benchmark 已经成功跑完
+2. Prometheus 里却只有 ordinary PUT stage，没有任何 `multipart_*`
+3. 根因并不是打点代码失效，而是 `127.0.0.1:9000` 上仍然挂着更早启动的旧 RustFS 进程
+
+纠偏方式：
+
+1. 用当前 worktree 的 `target/debug/rustfs` 前台直接拉起服务
+2. 再跑最小化 focused smoke
+3. 立刻查询 `multipart_*` stage
+
+这次纠偏后的前台复测已经确认：
+
+1. `multipart_*` 四个阶段可以正常上报
+2. 当前热点仍然稳定落在 `multipart_set_disk_encode`
