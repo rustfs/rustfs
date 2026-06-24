@@ -466,8 +466,12 @@ fn resolve_object_heal_entry(entries: &MetaCacheEntries, resolver: MetadataResol
         return Some(entry);
     }
 
-    let (entry, _) = entries.first_found();
-    entry.filter(|entry| !entry.name.ends_with(SLASH_SEPARATOR))
+    entries
+        .as_ref()
+        .iter()
+        .flatten()
+        .find(|entry| !entry.name.ends_with(SLASH_SEPARATOR))
+        .cloned()
 }
 
 fn heal_priority_label(priority: HealChannelPriority) -> &'static str {
@@ -3114,6 +3118,27 @@ mod tests {
             resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
             "unresolved trailing-slash fallback must not be submitted as an object heal"
         );
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_uses_plain_fallback_after_trailing_slash() {
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: vec![1, 2, 3],
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: vec![1, 2, 3],
+                ..Default::default()
+            }),
+        ]);
+
+        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
+            .expect("plain object fallback should remain eligible after a trailing-slash candidate");
+
+        assert_eq!(entry.name, "object");
     }
 
     #[test]
