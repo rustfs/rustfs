@@ -17,8 +17,8 @@ use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     endpoints::EndpointServerPools,
-    global::is_dist_erasure,
     metrics_realtime::{CollectMetricsOpts, MetricType},
+    runtime_sources,
 };
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_madmin::{
@@ -98,7 +98,7 @@ impl PeerRestClient {
         }
     }
     pub async fn new_clients(eps: EndpointServerPools) -> (Vec<Option<Self>>, Vec<Option<Self>>) {
-        if !is_dist_erasure().await {
+        if !runtime_sources::setup_is_dist_erasure().await {
             return (Vec::new(), Vec::new());
         }
 

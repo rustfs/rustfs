@@ -25,7 +25,6 @@ use crate::{
     },
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
-    global::{get_global_lock_clients, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
     runtime_sources,
     set_disk::SetDisks,
@@ -37,10 +36,7 @@ use futures::{
 };
 use http::HeaderMap;
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_common::{
-    GLOBAL_LOCAL_NODE_NAME,
-    heal_channel::{DriveState, HealItemType},
-};
+use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_lock::client::LockClient;
@@ -109,7 +105,7 @@ impl Sets {
         let mut disk_set = Vec::with_capacity(set_count);
 
         // Get lock clients from global storage
-        let lock_clients = get_global_lock_clients();
+        let lock_clients = runtime_sources::global_lock_clients();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
@@ -138,7 +134,7 @@ impl Sets {
                     continue;
                 }
 
-                if disk.as_ref().unwrap().is_local() && is_dist_erasure().await {
+                if disk.as_ref().unwrap().is_local() && runtime_sources::setup_is_dist_erasure().await {
                     let local_disk = runtime_sources::local_disk_set_drive(pool_idx, i, j).await;
 
                     if local_disk.is_none() {
@@ -172,7 +168,7 @@ impl Sets {
 
             let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
             let set_disks = SetDisks::new(
-                GLOBAL_LOCAL_NODE_NAME.read().await.to_string(),
+                runtime_sources::local_node_name().await,
                 Arc::new(RwLock::new(set_drive)),
                 set_drive_count,
                 parity_count,
