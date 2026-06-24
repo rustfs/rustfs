@@ -50,6 +50,9 @@ use tokio::sync::RwLock;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
+#[cfg(test)]
+const TEST_RPC_SECRET: &str = "test-rpc-secret";
+
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
     global_internode_metrics().record_erasure_write_quorum_failure(stage, dominant_error);
 }
@@ -163,6 +166,21 @@ pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
 
 pub(crate) async fn cached_node_channel(addr: &str) -> Option<Channel> {
     GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+}
+
+#[cfg(test)]
+pub(crate) async fn cache_test_node_channel(addr: String, channel: Channel) {
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+}
+
+#[cfg(test)]
+pub(crate) async fn test_node_channel_is_cached(addr: &str) -> bool {
+    GLOBAL_CONN_MAP.read().await.contains_key(addr)
+}
+
+#[cfg(test)]
+pub(crate) fn ensure_test_rpc_secret() {
+    let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set(TEST_RPC_SECRET.to_owned());
 }
 
 pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {

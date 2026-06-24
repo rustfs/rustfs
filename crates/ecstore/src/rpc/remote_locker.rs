@@ -552,7 +552,7 @@ impl LockClient for RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::GLOBAL_CONN_MAP;
+    use crate::runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -576,11 +576,11 @@ mod tests {
 
     async fn cache_lazy_channel(addr: &str) {
         let channel = TonicEndpoint::from_shared(addr.to_string()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
+        runtime_sources::cache_test_node_channel(addr.to_string(), channel).await;
     }
 
     fn ensure_test_rpc_secret() {
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
     }
 
     fn test_lock_request(timeout_duration: Duration) -> LockRequest {
@@ -596,7 +596,7 @@ mod tests {
             return;
         };
         cache_lazy_channel(&addr).await;
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
         let client = RemoteClient::new(addr.clone());
         let request = test_lock_request(Duration::from_millis(50));
@@ -618,7 +618,7 @@ mod tests {
             response.error
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "timeout should evict cached connection"
         );
 
@@ -632,7 +632,7 @@ mod tests {
             return;
         };
         cache_lazy_channel(&addr).await;
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
         let client = RemoteClient::new(addr.clone());
         let requests = vec![test_lock_request(Duration::from_millis(50))];
@@ -655,7 +655,7 @@ mod tests {
             responses[0].error
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "batch timeout should evict cached connection"
         );
 
