@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
-use crate::global::resolve_object_store_handle;
 use crate::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
@@ -1026,7 +1025,7 @@ impl TierConfigMgr {
 
     #[tracing::instrument(level = "debug", name = "tier_save", skip(self))]
     pub async fn save(&self) -> std::result::Result<(), std::io::Error> {
-        let Some(api) = resolve_object_store_handle() else {
+        let Some(api) = runtime_sources::object_store_handle() else {
             return Err(tier_config_not_initialized_error("save tiering config"));
         };
         //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;

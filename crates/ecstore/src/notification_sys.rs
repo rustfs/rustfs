@@ -15,10 +15,10 @@
 use crate::admin_server_info::get_commit_id;
 use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
-use crate::global::{GLOBAL_BOOT_TIME, get_global_endpoints, resolve_object_store_handle};
 use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
+use crate::runtime_sources;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};
@@ -289,7 +289,7 @@ impl NotificationSys {
         S: StorageAdminApi<BackendInfo = rustfs_madmin::BackendInfo, StorageInfo = rustfs_madmin::StorageInfo>,
     {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        let endpoints = get_global_endpoints();
+        let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
         let peer_timeout = Duration::from_secs(5);
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
@@ -334,7 +334,7 @@ impl NotificationSys {
 
     pub async fn server_info(&self) -> Vec<ServerProperties> {
         let mut futures = Vec::with_capacity(self.peer_clients.len());
-        let endpoints = get_global_endpoints();
+        let endpoints = runtime_sources::endpoint_pools().unwrap_or_else(|| Vec::new().into());
         let peer_timeout = Duration::from_secs(5);
 
         for (idx, client) in self.peer_clients.iter().enumerate() {
@@ -595,7 +595,7 @@ impl NotificationSys {
             state = "started",
             "notification peer propagation"
         );
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             error!(
                 event = EVENT_NOTIFICATION_PEER_PROPAGATION,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1107,11 +1107,7 @@ fn initializing_server_properties(host: &str) -> ServerProperties {
 
 fn offline_server_properties(host: &str, endpoints: &EndpointServerPools) -> ServerProperties {
     ServerProperties {
-        uptime: GLOBAL_BOOT_TIME
-            .get()
-            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
-            .unwrap_or_default()
-            .as_secs(),
+        uptime: runtime_sources::boot_uptime_secs(),
         version: get_commit_id(),
         endpoint: host.to_string(),
         state: ItemState::Offline.to_string().to_owned(),
