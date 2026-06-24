@@ -414,6 +414,43 @@ impl AsyncRead for PooledBufferReader {
     }
 }
 
+struct ChunkedBytesReader {
+    chunks: Vec<Bytes>,
+    chunk_index: usize,
+    chunk_offset: usize,
+}
+
+impl ChunkedBytesReader {
+    fn new(chunks: Vec<Bytes>) -> Self {
+        Self {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+        }
+    }
+}
+
+impl AsyncRead for ChunkedBytesReader {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        while self.chunk_index < self.chunks.len() {
+            let chunk = &self.chunks[self.chunk_index];
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+
+            let remaining = &chunk[self.chunk_offset..];
+            let to_read = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_read]);
+            self.chunk_offset += to_read;
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Determine if zero-copy write should be used for this PutObject operation.
 ///
 /// Zero-copy is beneficial for large objects without encryption or compression.
@@ -464,6 +501,34 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
                 return false;
             }
         }
+    }
+
+    true
+}
+
+fn should_use_zero_copy_eager_put_path(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> bool {
+    const ZERO_COPY_EAGER_PUT_MAX_SIZE: i64 = 32 * 1024 * 1024;
+
+    if is_extract || should_compress || server_side_encryption_requested {
+        return false;
+    }
+
+    if size <= 0 || size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
+        return false;
+    }
+
+    if !should_use_zero_copy(size, headers) {
+        return false;
+    }
+
+    if request_uses_aws_chunked(headers) && decoded_content_length_from_headers(headers).ok().flatten().is_none() {
+        return false;
     }
 
     true
@@ -566,6 +631,41 @@ where
     }
 
     Ok(std::io::Cursor::new(buf))
+}
+
+async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut chunks = Vec::new();
+    let mut filled = 0usize;
+
+    while filled < size {
+        let Some(chunk) = body.next().await else {
+            return Err(s3_error!(IncompleteBody));
+        };
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        if filled.saturating_add(chunk.len()) > size {
+            return Err(s3_error!(UnexpectedContent));
+        }
+
+        rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
+        filled += chunk.len();
+        chunks.push(chunk);
+    }
+
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if !chunk.is_empty() {
+            return Err(s3_error!(UnexpectedContent));
+        }
+    }
+
+    Ok(ChunkedBytesReader::new(chunks))
 }
 
 fn object_seek_support_threshold() -> usize {
@@ -2060,8 +2160,12 @@ impl DefaultObjectUsecase {
 
         let use_small_eager_put_path =
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_zero_copy_eager_put_path =
+            should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let put_path = if should_compress {
             "stream_compressed"
+        } else if use_zero_copy_eager_put_path {
+            "zero_copy_eager"
         } else if use_small_eager_put_path {
             "small_eager"
         } else {
@@ -2213,7 +2317,12 @@ impl DefaultObjectUsecase {
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            if use_small_eager_put_path {
+            if use_zero_copy_eager_put_path {
+                let zero_copy_start = std::time::Instant::now();
+                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
+                rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
+                HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            } else if use_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -5469,6 +5578,24 @@ mod tests {
         assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
+    #[test]
+    fn should_use_zero_copy_eager_put_path_allows_large_plain_objects_within_cap() {
+        let headers = HeaderMap::new();
+
+        assert!(should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, false));
+        assert!(should_use_zero_copy_eager_put_path(32 * 1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(32 * 1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[test]
+    fn should_use_zero_copy_eager_put_path_rejects_compression_sse_and_extract() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, true, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, true, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, true));
+    }
+
     #[tokio::test]
     async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
         let pool = get_concurrency_manager().bytes_pool();
@@ -5492,6 +5619,42 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_reads_chunked_body() {
+        use tokio::io::AsyncReadExt;
+
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello ")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"world")),
+        ]);
+
+        let mut reader = read_zero_copy_put_body_exact(body, 11)
+            .await
+            .expect("zero-copy eager body read should succeed");
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("chunked bytes reader should be readable");
+
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_rejects_extra_bytes() {
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"!")),
+        ]);
+
+        let err = match read_zero_copy_put_body_exact(body, 5).await {
+            Ok(_) => panic!("extra bytes should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
