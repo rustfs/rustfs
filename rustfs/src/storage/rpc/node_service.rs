@@ -199,7 +199,8 @@ pub fn make_server_for_context(context: Option<Arc<AppContext>>) -> NodeService 
 
 impl NodeService {
     fn resolve_object_store(&self) -> Option<Arc<crate::app::ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        let context = self.context.clone().or_else(get_global_app_context);
+        resolve_object_store_handle_for_context(context.as_deref())
     }
 
     async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {

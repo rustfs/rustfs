@@ -84,6 +84,7 @@ pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
 }
 
+/// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
     resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
 }
