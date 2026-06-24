@@ -15,7 +15,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
+use crate::batch_processor::AsyncBatchProcessor;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
@@ -5306,7 +5306,6 @@ mod tests {
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
-    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::object_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
@@ -5447,7 +5446,7 @@ mod tests {
     impl SetupTypeGuard {
         async fn switch_to(next: SetupType) -> Self {
             let previous = current_setup_type().await;
-            update_erasure_type(next).await;
+            runtime_sources::set_setup_type(next).await;
             Self { previous }
         }
     }
@@ -5458,22 +5457,14 @@ mod tests {
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
-                    update_erasure_type(previous).await;
+                    runtime_sources::set_setup_type(previous).await;
                 });
             });
         }
     }
 
     async fn current_setup_type() -> SetupType {
-        if is_dist_erasure().await {
-            SetupType::DistErasure
-        } else if is_erasure_sd().await {
-            SetupType::ErasureSD
-        } else if is_erasure().await {
-            SetupType::Erasure
-        } else {
-            SetupType::Unknown
-        }
+        runtime_sources::current_setup_type().await
     }
 
     async fn make_formatted_local_disk_for_info_test(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {

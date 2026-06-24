@@ -166,7 +166,7 @@ impl SetDisks {
                 });
             }
 
-            let processor = get_global_processors().metadata_processor();
+            let processor = runtime_sources::batch_processors().metadata_processor();
             let results = processor.execute_batch(futures).await;
 
             for (submitted_idx, result) in results.into_iter().enumerate() {

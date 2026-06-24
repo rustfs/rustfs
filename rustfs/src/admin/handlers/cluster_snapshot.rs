@@ -14,6 +14,11 @@
 
 use crate::admin::{
     auth::validate_admin_request,
+    ecstore_cluster::{
+        ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
+        ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
+        ClusterPoolStateSnapshot,
+    },
     router::{AdminOperation, Operation, S3Router},
     system,
 };
@@ -28,11 +33,6 @@ use hyper::Method;
 use matchit::Params;
 use rustfs_concurrency::AdmissionState as WorkloadAdmissionState;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
-use rustfs_ecstore::api::cluster::{
-    ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
-    ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
-    ClusterPoolStateSnapshot,
-};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_storage_api::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use s3s::header::CONTENT_TYPE;
@@ -590,14 +590,14 @@ fn summarize_named_capability_statuses<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
-    use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
-    use crate::server::{DependencyReadiness, ReadinessDegradedReason};
-    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
-    use rustfs_ecstore::api::cluster::{
+    use crate::admin::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     };
+    use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
+    use crate::server::{DependencyReadiness, ReadinessDegradedReason};
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
     use rustfs_storage_api::CapabilityState;
     use rustfs_storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 
