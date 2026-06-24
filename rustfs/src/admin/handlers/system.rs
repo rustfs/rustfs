@@ -25,7 +25,7 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
-use rustfs_madmin::InfoMessage;
+use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_storage_api::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -166,6 +166,12 @@ struct ServerInfoResponse {
     admin_discovery: SystemAdminDiscovery,
 }
 
+#[derive(Serialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+    admin_discovery: SystemAdminDiscovery,
+}
+
 fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery {
     SystemAdminDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
@@ -256,8 +262,12 @@ impl Operation for StorageInfoHandler {
 
         let usecase = DefaultAdminUsecase::from_global();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
+        let response = StorageInfoResponse {
+            info,
+            admin_discovery: system_admin_discovery(&usecase),
+        };
 
-        let data = serde_json::to_vec(&info).map_err(|e| {
+        let data = serde_json::to_vec(&response).map_err(|e| {
             log_system_request_failed!("query_storage_info", "serialize_storage_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info")
         })?;
@@ -507,7 +517,7 @@ mod tests {
     };
     use crate::app::admin_usecase::DefaultAdminUsecase;
     use rustfs_concurrency::{AdmissionState, WorkloadClass};
-    use rustfs_madmin::InfoMessage;
+    use rustfs_madmin::{InfoMessage, StorageInfo};
     use rustfs_storage_api::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
@@ -569,6 +579,20 @@ mod tests {
         };
 
         let value = serde_json::to_value(response).expect("server info response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+    }
+
+    #[test]
+    fn storage_info_response_exposes_admin_discovery_paths() {
+        let usecase = DefaultAdminUsecase::without_context();
+        let response = super::StorageInfoResponse {
+            info: StorageInfo::default(),
+            admin_discovery: system_admin_discovery(&usecase),
+        };
+
+        let value = serde_json::to_value(response).expect("storage info response should serialize");
         assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
         assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
         assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
