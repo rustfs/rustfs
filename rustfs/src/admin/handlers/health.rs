@@ -16,7 +16,7 @@ use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report,
+    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report, liveness_dependency_readiness_report,
 };
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -77,17 +77,6 @@ pub(crate) struct HealthPayloadContext<'a> {
 
 pub(crate) async fn collect_dependency_readiness() -> crate::server::DependencyReadinessReport {
     collect_runtime_dependency_readiness_report().await
-}
-
-pub(crate) fn liveness_dependency_readiness_report() -> crate::server::DependencyReadinessReport {
-    crate::server::DependencyReadinessReport {
-        readiness: crate::server::DependencyReadiness {
-            storage_ready: true,
-            iam_ready: true,
-            lock_quorum_ready: true,
-        },
-        degraded_reasons: Vec::new(),
-    }
 }
 
 pub(crate) fn health_check_state(
