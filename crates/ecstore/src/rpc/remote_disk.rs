@@ -751,6 +751,12 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serializer.into_inner())
 }
 
+fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    value.serialize(&mut serializer)?;
+    Ok(serializer.into_inner())
+}
+
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
@@ -1524,6 +1530,7 @@ impl DiskAPI for RemoteDisk {
             "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
+                let file_info_bin = encode_msgpack_named(&fi)?;
                 let mut client = self
                     .get_client()
                     .await
@@ -1535,6 +1542,7 @@ impl DiskAPI for RemoteDisk {
                     file_info,
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
+                    file_info_bin: file_info_bin.into(),
                 });
 
                 let response = client.rename_data(request).await?.into_inner();
@@ -1543,7 +1551,8 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+                let rename_data_resp =
+                    decode_msgpack_or_json::<RenameDataResp>(&response.rename_data_resp_bin, &response.rename_data_resp)?;
 
                 Ok(rename_data_resp)
             },

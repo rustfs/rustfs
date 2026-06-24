@@ -349,6 +349,8 @@ pub struct RenameDataRequest {
     pub dst_volume: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub dst_path: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "7")]
+    pub file_info_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RenameDataResponse {
@@ -358,6 +360,8 @@ pub struct RenameDataResponse {
     pub rename_data_resp: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "3")]
     pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", tag = "4")]
+    pub rename_data_resp_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct MakeVolumesRequest {
