@@ -24,6 +24,7 @@ use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::runtime_sources;
 use aws_credential_types::Credentials as SdkCredentials;
 use aws_sdk_s3::config::Region as SdkRegion;
+use aws_sdk_s3::config::SharedHttpClient;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::error::SdkError;
 use aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput;
@@ -37,11 +38,20 @@ use aws_sdk_s3::types::{
 use aws_sdk_s3::{Client as S3Client, Config as S3Config, operation::head_object::HeadObjectOutput};
 use aws_sdk_s3::{config::SharedCredentialsProvider, types::BucketVersioningStatus};
 use aws_smithy_http_client::{Builder as SmithyHttpClientBuilder, tls as smithy_tls};
-use http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
+use aws_smithy_runtime_api::box_error::BoxError;
+use aws_smithy_runtime_api::client::http::{
+    HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
+};
+use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
+use aws_smithy_runtime_api::client::result::ConnectorError;
+use aws_smithy_types::body::SdkBody;
+use http::{HeaderMap, HeaderName, HeaderValue, StatusCode, Uri};
+use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::rt::{TokioExecutor, TokioTimer};
 use reqwest::Client as HttpClient;
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
 use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
-use rustfs_utils::egress::validate_outbound_url;
+use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
     AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_STORAGE_CLASS, AMZ_WEBSITE_REDIRECT_LOCATION, is_amz_header, is_minio_header,
@@ -63,6 +73,7 @@ use std::time::{Duration, Instant};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::Mutex;
 use tokio::sync::RwLock;
+use tower::Service;
 use tracing::error;
 use tracing::warn;
 use url::Url;
@@ -652,7 +663,7 @@ impl BucketTargetSys {
             access_key: credentials.access_key.clone(),
             error: format!("invalid target endpoint: {err}"),
         })?;
-        validate_outbound_url(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+        validate_replication_target_endpoint(&parsed_endpoint).map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
             bucket: target.target_bucket.clone(),
             access_key: credentials.access_key.clone(),
             error: format!("target endpoint is not allowed: {err}"),
@@ -668,8 +679,14 @@ impl BucketTargetSys {
             config_builder = config_builder.force_path_style(true);
         }
 
-        if target.secure
-            && let Some(http_client) = build_aws_s3_http_client_from_tls_path().await
+        if let Some(http_client) =
+            build_aws_s3_http_client_for_target(target)
+                .await
+                .map_err(|err| BucketTargetError::RemoteTargetConnectionErr {
+                    bucket: target.target_bucket.clone(),
+                    access_key: credentials.access_key.clone(),
+                    error: err.to_string(),
+                })?
         {
             config_builder = config_builder.http_client(http_client);
         }
@@ -819,6 +836,147 @@ impl BucketTargetSys {
         let arn = generate_arn(target, depl_id);
         (arn, false)
     }
+}
+
+#[derive(Debug)]
+struct AcceptAnyServerCertVerifier;
+
+impl rustls::client::danger::ServerCertVerifier for AcceptAnyServerCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls_pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls_pki_types::CertificateDer<'_>],
+        _server_name: &rustls_pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls_pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls_pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::aws_lc_rs::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+#[derive(Clone)]
+struct TargetHyperHttpConnector<C> {
+    client: HyperClient<C, SdkBody>,
+}
+
+impl<C> fmt::Debug for TargetHyperHttpConnector<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TargetHyperHttpConnector")
+            .field("client", &"** hyper client **")
+            .finish()
+    }
+}
+
+impl<C> SmithyHttpConnector for TargetHyperHttpConnector<C>
+where
+    C: Clone + Send + Sync + 'static,
+    C: Service<Uri>,
+    C::Response:
+        hyper::rt::Read + hyper::rt::Write + hyper_util::client::legacy::connect::Connection + Send + Sync + Unpin + 'static,
+    C::Future: Unpin + Send + 'static,
+    C::Error: Into<BoxError>,
+{
+    fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+        let request = match request.try_into_http1x() {
+            Ok(request) => request,
+            Err(err) => return HttpConnectorFuture::ready(Err(ConnectorError::user(err.into()))),
+        };
+
+        let mut client = self.client.clone();
+        let fut = client.call(request);
+        HttpConnectorFuture::new(async move {
+            let response = fut
+                .await
+                .map_err(|err| ConnectorError::io(err.into()))?
+                .map(SdkBody::from_body_1_x);
+            HttpResponse::try_from(response).map_err(|err| ConnectorError::other(err.into(), None))
+        })
+    }
+}
+
+fn ensure_rustls_crypto_provider() {
+    if rustls::crypto::CryptoProvider::get_default().is_none() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    }
+}
+
+fn has_custom_ca_pem(target: &BucketTarget) -> bool {
+    !target.ca_cert_pem.trim().is_empty()
+}
+
+fn validate_replication_target_endpoint(url: &Url) -> Result<(), OutboundUrlError> {
+    match validate_outbound_url(url) {
+        Ok(()) => Ok(()),
+        Err(OutboundUrlError::ForbiddenHost {
+            reason: "private address",
+            ..
+        }) => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
+    ensure_rustls_crypto_provider();
+
+    let tls_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AcceptAnyServerCertVerifier))
+        .with_no_client_auth();
+
+    let https = hyper_rustls::HttpsConnectorBuilder::new()
+        .with_tls_config(tls_config)
+        .https_or_http()
+        .enable_http1()
+        .enable_http2()
+        .build();
+    let mut client_builder = HyperClient::builder(TokioExecutor::new());
+    client_builder.pool_timer(TokioTimer::new());
+    let client = client_builder.build(https);
+    let connector = SharedHttpConnector::new(TargetHyperHttpConnector { client });
+
+    http_client_fn(move |_settings, _components| connector.clone())
+}
+
+async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
+    if !target.secure {
+        return Ok(None);
+    }
+
+    if target.skip_tls_verify {
+        return Ok(Some(build_insecure_aws_s3_http_client()));
+    }
+
+    if has_custom_ca_pem(target) {
+        return Err(BucketTargetError::Io(std::io::Error::other(
+            "custom target CA PEM support is not implemented yet",
+        )));
+    }
+
+    Ok(build_aws_s3_http_client_from_tls_path().await)
 }
 
 async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::SharedHttpClient> {
@@ -1673,5 +1831,28 @@ mod tests {
             .expect_err("loopback endpoint should be rejected");
 
         assert!(err.to_string().contains("not allowed"));
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_allows_private_ip_endpoint() {
+        let sys = BucketTargetSys::default();
+        let client = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("private IP endpoints should be allowed for replication targets");
+
+        assert_eq!(client.endpoint, "https://192.168.1.10:9000");
     }
 }
