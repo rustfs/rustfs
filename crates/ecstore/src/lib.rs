@@ -29,6 +29,7 @@ mod data_usage;
 mod disk;
 mod disks_layout;
 mod endpoints;
+mod erasure_codec;
 mod erasure_coding;
 mod error;
 mod get_diagnostics;

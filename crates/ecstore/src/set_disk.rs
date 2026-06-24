@@ -289,6 +289,7 @@ mod metadata;
 mod multipart;
 mod read;
 mod replication;
+mod shard_source;
 mod write;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
