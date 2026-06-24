@@ -891,7 +891,7 @@ impl TransitionState {
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
-            let Some(api) = crate::global::resolve_object_store_handle() else {
+            let Some(api) = runtime_sources::object_store_handle() else {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
@@ -1919,7 +1919,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     let Some(lifecycle) = runtime_sources::bucket_lifecycle_config(&oi.bucket).await else {
         return;
     };
-    let Some(api) = crate::global::resolve_object_store_handle() else {
+    let Some(api) = runtime_sources::object_store_handle() else {
         return;
     };
 
