@@ -38,7 +38,6 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
-use crate::global::resolve_object_store_handle;
 use crate::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
@@ -48,8 +47,8 @@ use crate::tier::{
 use crate::{
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
-    global::is_first_cluster_node_local,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
+    runtime_sources,
     storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations},
     store::ECStore,
 };
@@ -1026,7 +1025,7 @@ impl TierConfigMgr {
 
     #[tracing::instrument(level = "debug", name = "tier_save", skip(self))]
     pub async fn save(&self) -> std::result::Result<(), std::io::Error> {
-        let Some(api) = resolve_object_store_handle() else {
+        let Some(api) = runtime_sources::object_store_handle() else {
             return Err(tier_config_not_initialized_error("save tiering config"));
         };
         //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;
@@ -1171,7 +1170,7 @@ async fn load_tier_config(api: Arc<ECStore>) -> std::result::Result<TierConfigMg
                 }
                 Err(legacy_err) if is_err_config_not_found(&legacy_err) => {
                     warn!("config not found, start to init");
-                    if is_first_cluster_node_local().await {
+                    if runtime_sources::first_cluster_node_is_local().await {
                         new_and_save_tiering_config(api).await.map_err(io::Error::other)
                     } else {
                         Ok(TierConfigMgr {

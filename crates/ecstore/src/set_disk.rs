@@ -15,7 +15,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
+use crate::batch_processor::AsyncBatchProcessor;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
@@ -35,7 +35,6 @@ use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
 use crate::runtime_sources;
@@ -54,7 +53,6 @@ use crate::{
     error::{StorageError, to_object_err},
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
-    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
@@ -1768,7 +1766,7 @@ impl rustfs_storage_api::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if is_dist_erasure().await {
+        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
@@ -2251,7 +2249,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        let dist_erasure = is_dist_erasure().await;
+        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
         if dist_erasure {
@@ -2731,7 +2729,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+        let mut tier_config_mgr = tier_config_mgr.write().await;
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
@@ -2893,7 +2892,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 bucket_name: bucket.to_string(),
                 object: obj_info,
                 user_agent: "Internal: [ILM-Transition]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
         }
@@ -2951,7 +2950,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                         bucket_name: bucket.to_string(),
                         object: restored_info,
                         user_agent: "Internal: [Restore-Completed]".to_string(),
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         ..Default::default()
                     });
                     Ok(())
@@ -3062,7 +3061,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             bucket_name: bucket.to_string(),
             object: restored_info,
             user_agent: "Internal: [Restore-Completed]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
+            host: runtime_sources::default_local_node_name(),
             ..Default::default()
         });
         Ok(())
@@ -5307,7 +5306,6 @@ mod tests {
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
-    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::object_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
@@ -5448,7 +5446,7 @@ mod tests {
     impl SetupTypeGuard {
         async fn switch_to(next: SetupType) -> Self {
             let previous = current_setup_type().await;
-            update_erasure_type(next).await;
+            runtime_sources::set_setup_type(next).await;
             Self { previous }
         }
     }
@@ -5459,22 +5457,14 @@ mod tests {
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
-                    update_erasure_type(previous).await;
+                    runtime_sources::set_setup_type(previous).await;
                 });
             });
         }
     }
 
     async fn current_setup_type() -> SetupType {
-        if is_dist_erasure().await {
-            SetupType::DistErasure
-        } else if is_erasure_sd().await {
-            SetupType::ErasureSD
-        } else if is_erasure().await {
-            SetupType::Erasure
-        } else {
-            SetupType::Unknown
-        }
+        runtime_sources::current_setup_type().await
     }
 
     async fn make_formatted_local_disk_for_info_test(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {

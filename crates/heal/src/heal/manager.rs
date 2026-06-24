@@ -22,7 +22,7 @@ use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -126,6 +126,7 @@ struct RetryingHeal {
 pub struct HealTaskReport {
     pub status: HealTaskStatus,
     pub result_items: Vec<HealResultItem>,
+    pub progress: Option<HealProgress>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
@@ -348,6 +349,7 @@ impl PriorityHealQueue {
 
     fn make_dedup_key_for_type(heal_type: &HealType) -> String {
         match heal_type {
+            HealType::Cluster => "cluster".to_string(),
             HealType::Object {
                 bucket,
                 object,
@@ -357,6 +359,9 @@ impl PriorityHealQueue {
             }
             HealType::Bucket { bucket } => {
                 format!("bucket:{bucket}")
+            }
+            HealType::Prefix { bucket, prefix } => {
+                format!("prefix:{bucket}/{prefix}")
             }
             HealType::ErasureSet { set_disk_id, .. } => {
                 format!("erasure_set:{set_disk_id}")
@@ -475,14 +480,16 @@ impl RetryingHeal {
 fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
     let heal_path = heal_path.trim_matches('/');
     if heal_path.is_empty() {
-        return false;
+        return matches!(heal_type, HealType::Cluster);
     }
 
     match heal_type {
+        HealType::Cluster => false,
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
         | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
         HealType::Bucket { bucket } => heal_path == bucket,
+        HealType::Prefix { bucket, prefix } => heal_path == bucket || heal_path == format!("{bucket}/{prefix}"),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
         HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
@@ -1208,6 +1215,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    progress: Some(task.get_progress().await),
                 });
             }
         }
@@ -1218,6 +1226,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1231,6 +1240,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }
@@ -1241,6 +1251,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1251,6 +1262,7 @@ impl HealManager {
             return Ok(HealTaskReport {
                 status: completed.status.clone(),
                 result_items: completed.result_items.clone(),
+                progress: None,
             });
         }
 
@@ -1269,6 +1281,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: task.get_status().await,
                     result_items: task.get_result_items().await,
+                    progress: Some(task.get_progress().await),
                 });
             }
         }
@@ -1281,6 +1294,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: retrying.status(),
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1295,6 +1309,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }
@@ -1305,6 +1320,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: HealTaskStatus::Pending,
                     result_items: Vec::new(),
+                    progress: None,
                 });
             }
         }
@@ -1318,6 +1334,7 @@ impl HealManager {
                 return Ok(HealTaskReport {
                     status: completed.status.clone(),
                     result_items: completed.result_items.clone(),
+                    progress: None,
                 });
             }
         }
@@ -1762,8 +1779,14 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = Vec::new();
+                        let mut seen_returning_sets = HashSet::new();
                         for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
                             if let Some(disk) = disk_opt {
+                                let endpoint = disk.endpoint();
+                                let runtime_state = disk.runtime_state();
+                                let set_disk_id =
+                                    crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
+
                                 // detect unformatted disk via get_disk_id()
                                 match disk.get_disk_id().await {
                                     Err(DiskError::UnformattedDisk) => {
@@ -1773,11 +1796,11 @@ impl HealManager {
                                             event = EVENT_HEAL_AUTO_SCAN_DISK,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                            endpoint = %disk.endpoint(),
+                                            endpoint = %endpoint,
                                             disk_state = "unformatted",
                                             "Heal auto-scan candidate detected"
                                         );
-                                        endpoints.push(disk.endpoint());
+                                        endpoints.push(endpoint);
                                     }
                                     Err(e) => {
                                         warn!(
@@ -1785,14 +1808,30 @@ impl HealManager {
                                             event = EVENT_HEAL_AUTO_SCAN_DISK,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                            endpoint = %disk.endpoint(),
+                                            endpoint = %endpoint,
                                             disk_state = "check_failed",
                                             error = ?e,
                                             "Heal auto-scan disk inspection failed"
                                         );
                                     }
                                     Ok(_) => {
-                                        // Disk is formatted, no action needed
+                                        if runtime_state.as_str() == "returning"
+                                            && let Some(set_disk_id) = set_disk_id
+                                            && seen_returning_sets.insert(set_disk_id.clone())
+                                        {
+                                            candidate_count += 1;
+                                            debug!(
+                                                target: "rustfs::heal::manager",
+                                                event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                                component = LOG_COMPONENT_HEAL,
+                                                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                                endpoint = %endpoint,
+                                                set_disk_id,
+                                                disk_state = "returning",
+                                                "Heal auto-scan returning disk candidate detected"
+                                            );
+                                            endpoints.push(endpoint);
+                                        }
                                     }
                                 }
                             }
@@ -1887,7 +1926,10 @@ impl HealManager {
                                     buckets: buckets.clone(),
                                     set_disk_id: set_disk_id.clone(),
                                 },
-                                HealOptions::default(),
+                                HealOptions {
+                                    timeout: None,
+                                    ..HealOptions::default()
+                                },
                                 HealPriority::Normal,
                             );
                             req.source = HealRequestSource::AutoHeal;
@@ -2266,8 +2308,10 @@ fn heal_request_set_key(request: &HealRequest) -> Option<String> {
 
 fn heal_request_type_label(request: &HealRequest) -> &'static str {
     match &request.heal_type {
+        HealType::Cluster => "cluster",
         HealType::Object { .. } => "object",
         HealType::Bucket { .. } => "bucket",
+        HealType::Prefix { .. } => "prefix",
         HealType::ErasureSet { .. } => "erasure_set",
         HealType::Metadata { .. } => "metadata",
         HealType::MRF { .. } => "mrf",
@@ -3070,6 +3114,104 @@ mod tests {
         assert!(cancel_token.is_cancelled());
         assert!(manager.retrying_heals.lock().await.get(&task_id).is_none());
         assert!(matches!(manager.get_task_status(&task_id).await, Err(Error::TaskNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_queued_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_request_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+
+        manager
+            .submit_heal_request(cluster_request)
+            .await
+            .expect("cluster request should be accepted");
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel queued cluster task"),
+            1
+        );
+        assert!(matches!(
+            manager.get_task_status(&cluster_request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            manager
+                .get_task_status(&bucket_request_id)
+                .await
+                .expect("bucket request should not match root path"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_active_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage.clone(), None);
+
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_request_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+
+        manager.active_heals.lock().await.insert(
+            cluster_request_id.clone(),
+            Arc::new(HealTask::from_request(cluster_request, storage.clone())),
+        );
+        manager
+            .active_heals
+            .lock()
+            .await
+            .insert(bucket_request_id.clone(), Arc::new(HealTask::from_request(bucket_request, storage)));
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel active cluster task"),
+            1
+        );
+        assert!(manager.active_heals.lock().await.get(&cluster_request_id).is_none());
+        assert!(manager.active_heals.lock().await.get(&bucket_request_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_retrying_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let mut cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        cluster_request.retry_attempts = 1;
+        let cluster_request_id = cluster_request.id.clone();
+        let cluster_cancel_token = insert_retrying_request(&manager, cluster_request).await;
+
+        let mut bucket_request = HealRequest::bucket("bucket".to_string());
+        bucket_request.retry_attempts = 1;
+        let bucket_request_id = bucket_request.id.clone();
+        let bucket_cancel_token = insert_retrying_request(&manager, bucket_request).await;
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel retrying cluster task"),
+            1
+        );
+        assert!(cluster_cancel_token.is_cancelled());
+        assert!(!bucket_cancel_token.is_cancelled());
+        assert!(manager.retrying_heals.lock().await.get(&cluster_request_id).is_none());
+        assert!(manager.retrying_heals.lock().await.get(&bucket_request_id).is_some());
     }
 
     #[tokio::test]

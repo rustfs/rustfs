@@ -15,14 +15,10 @@
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
-use crate::{
-    disk::endpoint::Endpoint,
-    global::{GLOBAL_BOOT_TIME, GLOBAL_Endpoints, get_global_deployment_id, resolve_object_store_handle},
-    notification_sys::get_global_notification_sys,
-};
+use crate::{disk::endpoint::Endpoint, runtime_sources};
 
 use crate::data_usage::load_data_usage_cache;
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, heal_channel::DriveState};
+use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
 };
@@ -33,7 +29,7 @@ use rustfs_protos::{
 use rustfs_storage_api::StorageAdminApi;
 use std::{
     collections::{HashMap, HashSet},
-    time::{Duration, SystemTime},
+    time::Duration,
 };
 use time::OffsetDateTime;
 use tokio::time::timeout;
@@ -127,11 +123,11 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
 }
 
 pub async fn get_local_server_property() -> ServerProperties {
-    let addr = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+    let addr = runtime_sources::local_node_name().await;
     let mut pool_numbers = HashSet::new();
     let mut network = HashMap::new();
 
-    let endpoints = match GLOBAL_Endpoints.get() {
+    let endpoints = match runtime_sources::endpoint_pools() {
         Some(eps) => eps,
         None => return ServerProperties::default(),
     };
@@ -161,11 +157,7 @@ pub async fn get_local_server_property() -> ServerProperties {
 
     let mut props = ServerProperties {
         endpoint: addr,
-        uptime: GLOBAL_BOOT_TIME
-            .get()
-            .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
-            .unwrap_or_default()
-            .as_secs(),
+        uptime: runtime_sources::boot_uptime_secs(),
         network,
         version: get_commit_id(),
         ..Default::default()
@@ -184,7 +176,7 @@ pub async fn get_local_server_property() -> ServerProperties {
     // let mut sensitive = HashSet::new();
     // sensitive.insert(rustfs_config::ENV_RUSTFS_ACCESS_KEY.to_string());
     // sensitive.insert(rustfs_config::ENV_RUSTFS_SECRET_KEY.to_string());
-    if let Some(store) = resolve_object_store_handle() {
+    if let Some(store) = runtime_sources::object_store_handle() {
         let storage_info = StorageAdminApi::local_storage_info(store.as_ref()).await;
         props.state = ITEM_ONLINE.to_string();
         props.disks = storage_info.disks;
@@ -207,7 +199,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     warn!("get_local_server_property end {:?}", after1 - nowt);
 
     let mut servers = {
-        if let Some(sys) = get_global_notification_sys() {
+        if let Some(sys) = runtime_sources::notification_sys() {
             sys.server_info().await
         } else {
             vec![]
@@ -228,7 +220,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
     let mut backend = rustfs_madmin::ErasureBackend::default();
     let mut pools: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
 
-    if let Some(store) = resolve_object_store_handle() {
+    if let Some(store) = runtime_sources::object_store_handle() {
         mode = ITEM_ONLINE;
         match load_data_usage_from_backend(store.clone()).await {
             Ok(res) => {
@@ -290,7 +282,7 @@ pub async fn get_server_info(get_pools: bool) -> InfoMessage {
         domain: None,
         region: None,
         sqs_arn: None,
-        deployment_id: get_global_deployment_id(),
+        deployment_id: runtime_sources::deployment_id(),
         buckets: Some(buckets),
         objects: Some(objects),
         versions: Some(versions),
@@ -346,7 +338,7 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
 }
 
 async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = runtime_sources::object_store_handle() else {
         return Err(Error::other("ServerNotInitialized"));
     };
 
@@ -397,14 +389,14 @@ pub fn get_commit_id() -> String {
 mod tests {
     use serial_test::serial;
 
-    use crate::global::get_global_deployment_id;
+    use crate::runtime_sources;
 
     use super::get_server_info;
 
     #[serial]
     #[tokio::test]
     async fn server_info_includes_global_deployment_id() {
-        let expected_deployment_id = get_global_deployment_id();
+        let expected_deployment_id = runtime_sources::deployment_id();
         let info = get_server_info(false).await;
 
         assert_eq!(info.deployment_id, expected_deployment_id);

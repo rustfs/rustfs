@@ -18,11 +18,11 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
-use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryOp, GLOBAL_ExpiryState};
+use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
-use crate::global::GLOBAL_TierConfigMgr;
+use crate::runtime_sources;
 use crate::store::ECStore;
 use rustfs_storage_api::TransitionedObject;
 use rustfs_utils::get_env_usize;
@@ -256,20 +256,21 @@ impl ObjSweeper {
         let Some(je) = self.should_remove_remote_object() else {
             return;
         };
+        let expiry_state = runtime_sources::expiry_state_handle();
         if persist_tier_delete_journal_entry(api, &je).await.is_err() {
-            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
             return;
         }
         let hash = je.op_hash();
         // Grab the sender under a short read lock, then release the lock so we
         // don't hold it across the async send.
-        let wrkr = GLOBAL_ExpiryState.read().await.get_worker_ch(hash);
+        let wrkr = expiry_state.read().await.get_worker_ch(hash);
         let Some(wrkr) = wrkr else {
-            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
             return;
         };
         if wrkr.send(Some(Box::new(je))).await.is_err() {
-            GLOBAL_ExpiryState.write().await.increment_missed_tier_journal_tasks();
+            expiry_state.write().await.increment_missed_tier_journal_tasks();
         }
     }
 }
@@ -322,7 +323,8 @@ async fn delete_object_from_remote_tier_raw(obj_name: &str, rv_id: &str, tier_na
         .map_err(|_| std::io::Error::other(ERR_REMOTE_DELETE_LIMITER_CLOSED))?;
     let _inflight = RemoteDeleteInflightGuard::new();
 
-    let mut config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+    let mut config_mgr = tier_config_mgr.write().await;
     let w = match config_mgr.get_driver(tier_name).await {
         Ok(w) => w,
         Err(e) => return Err(std::io::Error::other(e)),
