@@ -45,8 +45,8 @@ where
 {
     if let Some(reader) = reader {
         Box::pin(async move {
-            let mut buf = recycled_buf.unwrap_or_default();
-            buf.resize(shard_size, 0);
+            let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
+            debug_assert_eq!(buf.len(), shard_size);
             match reader.read(&mut buf).await {
                 Ok(n) => {
                     buf.truncate(n);
@@ -172,7 +172,6 @@ where
     }
 
     pub fn recycle_shards(&mut self, shards: &mut [Option<Vec<u8>>]) {
-        self.buffers.ensure_slots(self.readers.len());
         for (i, reader) in self.readers.iter().enumerate() {
             if reader.is_some()
                 && let Some(buf) = shards.get_mut(i).and_then(Option::take)

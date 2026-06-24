@@ -18,18 +18,22 @@ pub(crate) struct ShardBufferPool {
 }
 
 impl ShardBufferPool {
+    #[inline]
     pub(crate) fn new(slot_count: usize) -> Self {
         let mut buffers = Vec::with_capacity(slot_count);
         buffers.resize_with(slot_count, || None);
         Self { buffers }
     }
 
+    #[inline]
     pub(crate) fn ensure_slots(&mut self, slot_count: usize) {
         if self.buffers.len() < slot_count {
             self.buffers.resize_with(slot_count, || None);
         }
     }
 
+    // Returned bytes may contain stale scratch data and must be overwritten before use.
+    #[inline]
     pub(crate) fn take(&mut self, index: usize, len: usize) -> Vec<u8> {
         self.ensure_slots(index + 1);
         let mut buf = self.buffers[index].take().unwrap_or_else(|| Vec::with_capacity(len));
@@ -40,9 +44,9 @@ impl ShardBufferPool {
         buf
     }
 
-    pub(crate) fn put(&mut self, index: usize, mut buf: Vec<u8>) {
+    #[inline]
+    pub(crate) fn put(&mut self, index: usize, buf: Vec<u8>) {
         self.ensure_slots(index + 1);
-        buf.clear();
         self.buffers[index] = Some(buf);
     }
 
@@ -57,7 +61,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn shard_buffer_pool_reuses_slot_capacity() {
+    fn shard_buffer_pool_reuses_slot_without_clearing() {
         let mut pool = ShardBufferPool::new(2);
         let mut buf = pool.take(1, 16);
         assert_eq!(buf.len(), 16);
@@ -70,7 +74,7 @@ mod tests {
         let reused = pool.take(1, 8);
         assert_eq!(reused.len(), 8);
         assert!(reused.capacity() >= capacity);
-        assert!(reused.iter().all(|byte| *byte == 0));
+        assert_eq!(reused[0], 42);
     }
 
     #[test]
