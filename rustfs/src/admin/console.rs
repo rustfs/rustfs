@@ -12,7 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
+use crate::admin::handlers::health::{
+    HealthProbe, build_health_response_parts, collect_dependency_readiness, liveness_dependency_readiness_report,
+};
 use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::app::context::resolve_oidc_handle;
 use crate::license::has_valid_license;
@@ -597,7 +599,10 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = collect_dependency_readiness().await;
+    let readiness_report = match probe {
+        HealthProbe::Liveness => liveness_dependency_readiness_report(),
+        HealthProbe::Readiness => collect_dependency_readiness().await,
+    };
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

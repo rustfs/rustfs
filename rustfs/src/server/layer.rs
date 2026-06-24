@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, liveness_dependency_readiness_report};
 use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
@@ -938,7 +938,10 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_dependency_readiness_report().await;
+    let readiness_report = match probe {
+        HealthProbe::Liveness => liveness_dependency_readiness_report(),
+        HealthProbe::Readiness => collect_dependency_readiness_report().await,
+    };
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
