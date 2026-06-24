@@ -19,7 +19,9 @@ use super::EndpointServerPools;
 use super::get_server_info;
 use super::{PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use super::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
-use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
+use crate::app::context::{
+    AppContext, get_global_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
+};
 use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{ClusterReadOnlySnapshot, collect_cluster_read_only_snapshot};
 use crate::error::ApiError;
@@ -530,7 +532,8 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
-        collect_cluster_read_only_snapshot().await
+        let endpoint_pools = resolve_endpoints_handle()?;
+        collect_cluster_read_only_snapshot(&endpoint_pools).await
     }
 
     pub fn cluster_snapshot_route(&self) -> &'static str {

@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::resolve_endpoints_handle;
 use crate::runtime_capabilities::runtime_observability_snapshot;
 use crate::server::{
     DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
@@ -100,10 +99,9 @@ pub fn cluster_read_only_snapshot_from_control_plane(
     }
 }
 
-pub async fn collect_cluster_read_only_snapshot() -> Option<ClusterReadOnlySnapshot> {
-    let endpoint_pools = resolve_endpoints_handle()?;
+pub async fn collect_cluster_read_only_snapshot(endpoint_pools: &EndpointServerPools) -> Option<ClusterReadOnlySnapshot> {
     let runtime_status = ClusterRuntimeStatusSnapshot::from_readiness_report(snapshot_dependency_readiness_report().await);
-    Some(cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status))
+    Some(cluster_read_only_snapshot_from_endpoint_pools(endpoint_pools, runtime_status))
 }
 
 pub fn cluster_has_actionable_pressure(snapshot: &ClusterReadOnlySnapshot) -> bool {
