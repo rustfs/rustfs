@@ -270,7 +270,7 @@ impl SetDisks {
         let mut errs = Vec::with_capacity(disks.len());
 
         // Use improved simple batch processor instead of join_all for better performance
-        let processor = get_global_processors().write_processor();
+        let processor = runtime_sources::batch_processors().write_processor();
 
         let tasks: Vec<_> = disks
             .iter()

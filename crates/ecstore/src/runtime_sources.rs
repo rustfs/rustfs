@@ -17,12 +17,14 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
+    batch_processor::{GlobalBatchProcessors, get_global_processors},
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_ExpiryState, GLOBAL_TransitionState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
     config::{get_global_storage_class, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     endpoints::EndpointServerPools,
+    endpoints::SetupType,
     error::Result,
     event_notification::EventNotifier,
     global::{
@@ -31,7 +33,7 @@ use crate::{
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
         get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
         init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle,
-        set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
+        set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
     },
     notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
@@ -93,6 +95,22 @@ pub(crate) async fn setup_is_dist_erasure() -> bool {
 
 pub(crate) async fn setup_is_erasure_sd() -> bool {
     *GLOBAL_IsErasureSD.read().await
+}
+
+pub(crate) async fn current_setup_type() -> SetupType {
+    if setup_is_dist_erasure().await {
+        SetupType::DistErasure
+    } else if setup_is_erasure_sd().await {
+        SetupType::ErasureSD
+    } else if setup_is_erasure().await {
+        SetupType::Erasure
+    } else {
+        SetupType::Unknown
+    }
+}
+
+pub(crate) async fn set_setup_type(setup_type: SetupType) {
+    update_erasure_type(setup_type).await;
 }
 
 pub(crate) async fn local_node_name() -> String {
@@ -242,6 +260,10 @@ pub(crate) fn storage_class_config() -> Option<storageclass::Config> {
 
 pub(crate) fn set_storage_class_config(config: storageclass::Config) {
     set_global_storage_class(config);
+}
+
+pub(crate) fn batch_processors() -> &'static GlobalBatchProcessors {
+    get_global_processors()
 }
 
 pub(crate) fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
