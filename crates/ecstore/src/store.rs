@@ -19,7 +19,6 @@ use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
 };
-use crate::bucket::metadata_sys::get_global_bucket_metadata_sys;
 use crate::bucket::metadata_sys::{self, set_bucket_metadata};
 use crate::bucket::utils::check_abort_multipart_args;
 use crate::bucket::utils::check_complete_multipart_args;
@@ -33,7 +32,6 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
-use crate::config::get_global_storage_class;
 use crate::config::storageclass;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
@@ -43,10 +41,7 @@ use crate::error::{
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
 use crate::event_notification::EventNotifier;
-use crate::global::{
-    DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives, get_global_region, get_global_tier_config_mgr, set_object_layer,
-};
-use crate::notification_sys::get_global_notification_sys;
+use crate::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
@@ -67,8 +62,7 @@ use http::HeaderMap;
 use lazy_static::lazy_static;
 use rand::RngExt as _;
 use rustfs_common::heal_channel::{HealItemType, HealOpts};
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST, GLOBAL_RUSTFS_PORT};
-use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
+use rustfs_config::server_config::Config;
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
@@ -229,22 +223,22 @@ impl std::fmt::Debug for ECStore {
 impl ECStore {
     /// Get server configuration (delegates to global)
     pub fn get_server_config(&self) -> Option<Config> {
-        get_global_server_config()
+        runtime_sources::server_config()
     }
 
     /// Set server configuration (delegates to global)
     pub fn set_server_config(&self, cfg: Config) {
-        set_global_server_config(cfg);
+        runtime_sources::set_server_config(cfg);
     }
 
     /// Get storage class configuration (delegates to global)
     pub fn get_storage_class(&self) -> Option<crate::config::storageclass::Config> {
-        crate::config::get_global_storage_class()
+        runtime_sources::storage_class_config()
     }
 
     /// Set storage class configuration (delegates to global)
     pub fn set_storage_class(&self, cfg: crate::config::storageclass::Config) {
-        crate::config::set_global_storage_class(cfg);
+        runtime_sources::set_storage_class_config(cfg);
     }
 }
 
@@ -254,12 +248,12 @@ impl ECStore {
 impl ECStore {
     /// Get the notification system
     pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
-        get_global_notification_sys()
+        runtime_sources::notification_sys()
     }
 
     /// Get the bucket metadata system
     pub fn bucket_metadata_sys(&self) -> Option<Arc<tokio::sync::RwLock<crate::bucket::metadata_sys::BucketMetadataSys>>> {
-        get_global_bucket_metadata_sys()
+        runtime_sources::bucket_metadata_sys()
     }
 
     /// Get the global endpoints
@@ -269,22 +263,22 @@ impl ECStore {
 
     /// Get the global region
     pub fn region(&self) -> Option<s3s::region::Region> {
-        get_global_region()
+        runtime_sources::region()
     }
 
     /// Get the tier config manager
     pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
-        get_global_tier_config_mgr()
+        runtime_sources::global_tier_config_mgr()
     }
 
     /// Get the server configuration
     pub fn server_config(&self) -> Option<Config> {
-        get_global_server_config()
+        runtime_sources::server_config()
     }
 
     /// Get the storage class configuration
     pub fn storage_class(&self) -> Option<crate::config::storageclass::Config> {
-        get_global_storage_class()
+        runtime_sources::storage_class_config()
     }
 }
 
@@ -294,17 +288,17 @@ impl ECStore {
 impl ECStore {
     /// Get the server port
     pub fn port(&self) -> u16 {
-        crate::global::global_rustfs_port()
+        runtime_sources::rustfs_port()
     }
 
     /// Get the server host
     pub async fn host(&self) -> String {
-        GLOBAL_RUSTFS_HOST.read().await.clone()
+        runtime_sources::rustfs_host().await
     }
 
     /// Get the server address (host:port)
     pub async fn addr(&self) -> String {
-        GLOBAL_RUSTFS_ADDR.read().await.clone()
+        runtime_sources::rustfs_addr().await
     }
 }
 
