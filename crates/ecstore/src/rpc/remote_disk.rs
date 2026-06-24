@@ -568,7 +568,7 @@ impl RemoteDisk {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!(
+            debug!(
                 event = EVENT_REMOTE_DISK_HEALTH,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REMOTE_DISK,

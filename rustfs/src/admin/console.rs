@@ -19,7 +19,7 @@ use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION,
+    RequestContextLayer, VERSION, liveness_dependency_readiness_report,
 };
 use crate::storage::request_context::RequestContext;
 use crate::version::build;
@@ -597,7 +597,10 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = collect_dependency_readiness().await;
+    let readiness_report = match probe {
+        HealthProbe::Liveness => liveness_dependency_readiness_report(),
+        HealthProbe::Readiness => collect_dependency_readiness().await,
+    };
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
