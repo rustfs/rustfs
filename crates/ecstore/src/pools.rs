@@ -277,6 +277,9 @@ fn first_resumable_decommission_queue_indices(meta: &PoolMeta) -> Vec<usize> {
     let mut indices = Vec::new();
     for (idx, pool) in meta.pools.iter().enumerate() {
         if let Some(decommission) = &pool.decommission {
+            if !decommission.has_decommission_state() {
+                continue;
+            }
             if decommission.complete {
                 continue;
             }
@@ -398,14 +401,14 @@ fn is_decommission_active(complete: bool, failed: bool, canceled: bool) -> bool 
 
 pub(crate) fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
     meta.pools.iter().any(|pool| {
-        pool.decommission
-            .as_ref()
-            .is_some_and(|info| is_decommission_active(info.complete, info.failed, info.canceled))
+        pool.decommission.as_ref().is_some_and(|info| {
+            info.has_decommission_state() && is_decommission_active(info.complete, info.failed, info.canceled)
+        })
     })
 }
 
 fn is_decommission_suspended(info: &PoolDecommissionInfo) -> bool {
-    !info.queued
+    info.has_decommission_state() && !info.queued
 }
 
 fn validate_decommission_terminal_state(complete: bool, failed: bool, canceled: bool) -> Result<()> {
@@ -438,6 +441,9 @@ fn decommission_start_pool_state(pool: Option<&PoolStatus>) -> DecommissionStart
     let Some(info) = pool.decommission.as_ref() else {
         return DecommissionStartPoolState::Active;
     };
+    if !info.has_decommission_state() {
+        return DecommissionStartPoolState::Active;
+    }
 
     if info.complete {
         DecommissionStartPoolState::Decommissioned
@@ -1540,7 +1546,7 @@ impl PoolMeta {
         let (decommission_present, complete, failed, canceled) = pool
             .decommission
             .as_ref()
-            .map(|info| (true, info.complete, info.failed, info.canceled))
+            .map(|info| (info.has_decommission_state(), info.complete, info.failed, info.canceled))
             .unwrap_or((false, false, false, false));
 
         ensure_decommission_clear_allowed(true, decommission_present, complete, failed, canceled)?;
@@ -1806,6 +1812,9 @@ impl PoolMeta {
         let mut new_pools = Vec::new();
         for pool in &self.pools {
             if let Some(decommission) = &pool.decommission {
+                if !decommission.has_decommission_state() {
+                    continue;
+                }
                 if decommission.complete || decommission.failed || decommission.canceled {
                     // Recovery is not required when:
                     // - Decommissioning completed
@@ -1878,6 +1887,27 @@ pub struct PoolDecommissionInfo {
 }
 
 impl PoolDecommissionInfo {
+    pub fn has_decommission_state(&self) -> bool {
+        self.complete
+            || self.failed
+            || self.canceled
+            || self.queued
+            || self.start_time.is_some()
+            || self.start_size > 0
+            || !self.queued_buckets.is_empty()
+            || !self.decommissioned_buckets.is_empty()
+            || !self.bucket.is_empty()
+            || !self.prefix.is_empty()
+            || !self.object.is_empty()
+            || !self.stage.is_empty()
+            || self.items_decommissioned > 0
+            || self.items_decommission_failed > 0
+            || self.bytes_done > 0
+            || self.bytes_failed > 0
+            || self.terminal_reload_attempt_at.is_some()
+            || !self.terminal_reload_failures.is_empty()
+    }
+
     fn counted_items(&self) -> usize {
         self.items_decommissioned.saturating_add(self.items_decommission_failed)
     }
@@ -2215,7 +2245,11 @@ impl ECStore {
             let (pool_present, decommission_present, terminal) = if let Some(pool) = lock.pools.get(idx) {
                 if let Some(info) = pool.decommission.as_ref() {
                     already_canceled = info.canceled;
-                    (true, true, should_reject_decommission_cancel_as_terminal(info.complete, info.failed))
+                    (
+                        true,
+                        info.has_decommission_state(),
+                        should_reject_decommission_cancel_as_terminal(info.complete, info.failed),
+                    )
                 } else {
                     (true, false, false)
                 }
@@ -2339,6 +2373,7 @@ impl ECStore {
         let pool_meta = self.pool_meta.read().await;
         for pool in pool_meta.pools.iter() {
             if let Some(ref info) = pool.decommission
+                && info.has_decommission_state()
                 && !info.complete
                 && !info.failed
                 && !info.canceled
@@ -5101,7 +5136,10 @@ mod pools_tests {
             ..Default::default()
         };
         let mut active = previous.clone();
-        active.pools[0].decommission = Some(PoolDecommissionInfo::default());
+        active.pools[0].decommission = Some(PoolDecommissionInfo {
+            start_time: Some(OffsetDateTime::UNIX_EPOCH),
+            ..Default::default()
+        });
 
         assert!(active.is_suspended(0));
         assert_eq!(
@@ -6033,13 +6071,16 @@ mod pools_tests {
     }
 
     #[test]
-    fn test_pool_meta_has_active_decommission_counts_active_and_queued_states() {
+    fn test_pool_meta_has_active_decommission_counts_running_and_queued_states() {
         let active_meta = PoolMeta {
             pools: vec![PoolStatus {
                 id: 0,
                 cmd_line: "pool-0".to_string(),
                 last_update: OffsetDateTime::UNIX_EPOCH,
-                decommission: Some(PoolDecommissionInfo::default()),
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(OffsetDateTime::UNIX_EPOCH),
+                    ..Default::default()
+                }),
             }],
             ..Default::default()
         };
@@ -6058,6 +6099,27 @@ mod pools_tests {
 
         assert!(pool_meta_has_active_decommission(&active_meta));
         assert!(pool_meta_has_active_decommission(&queued_meta));
+    }
+
+    #[test]
+    fn test_pool_meta_has_active_decommission_ignores_capacity_placeholder() {
+        let meta = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    total_size: 100,
+                    current_size: 75,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        assert!(!pool_meta_has_active_decommission(&meta));
+        assert!(!meta.is_suspended(0));
+        assert_eq!(decommission_start_pool_state(meta.pools.first()), DecommissionStartPoolState::Active);
     }
 
     #[test]
@@ -6158,6 +6220,7 @@ mod pools_tests {
             cmd_line: "pool-0".to_string(),
             last_update: OffsetDateTime::UNIX_EPOCH,
             decommission: Some(PoolDecommissionInfo {
+                start_time: Some(OffsetDateTime::UNIX_EPOCH),
                 complete: false,
                 failed: false,
                 canceled: false,

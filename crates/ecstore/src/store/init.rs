@@ -60,7 +60,7 @@ fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
     meta.pools.iter().any(|pool| {
         pool.decommission
             .as_ref()
-            .is_some_and(|info| !info.complete && !info.failed && !info.canceled)
+            .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
     })
 }
 
