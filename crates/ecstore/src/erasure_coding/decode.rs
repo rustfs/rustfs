@@ -15,6 +15,10 @@
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_coding::{BitrotReader, Erasure};
+use crate::get_diagnostics::{
+    GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GetObjectFailureReason, classify_io_error,
+    record_get_object_pipeline_failure,
+};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::io;
@@ -24,15 +28,6 @@ use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
-
-fn classify_get_object_io_failure(err: &io::Error) -> &'static str {
-    match err.kind() {
-        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => "downstream_closed",
-        ErrorKind::TimedOut => "timeout",
-        ErrorKind::UnexpectedEof => "short_read",
-        _ => "io",
-    }
-}
 
 pin_project! {
 pub(crate) struct ParallelReader<R> {
@@ -192,6 +187,15 @@ where
     W: tokio::io::AsyncWrite + Send + Sync + Unpin,
 {
     if en_blocks.len() < data_blocks {
+        let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+        record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+        error!(
+            data_blocks,
+            available_shards = en_blocks.len(),
+            stage = GET_STAGE_RANGE,
+            reason = reason.as_str(),
+            "Write data blocks received fewer shards than data blocks"
+        );
         return Err(io::Error::new(ErrorKind::InvalidInput, "data block count exceeds available shards"));
     }
 
@@ -200,12 +204,31 @@ where
     }
 
     let Some(required_len) = offset.checked_add(length) else {
-        rustfs_io_metrics::record_get_object_pipeline_failure("emit", "unknown");
+        let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+        record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+        error!(
+            offset,
+            length,
+            stage = GET_STAGE_RANGE,
+            reason = reason.as_str(),
+            "Write data blocks offset and length overflow"
+        );
         return Err(io::Error::new(ErrorKind::InvalidInput, "offset + length overflows"));
     };
-    if get_data_block_len(en_blocks, data_blocks) < required_len {
-        error!("write_data_blocks not enough data after offset");
-        rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
+    let data_len = get_data_block_len(en_blocks, data_blocks);
+    if data_len < required_len {
+        let reason = GetObjectFailureReason::ShortRead;
+        error!(
+            data_blocks,
+            data_len,
+            required_len,
+            offset,
+            length,
+            stage = GET_STAGE_EMIT,
+            reason = reason.as_str(),
+            "Write data blocks had insufficient data after offset"
+        );
+        record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
     }
 
@@ -214,8 +237,16 @@ where
 
     for block_op in &en_blocks[..data_blocks] {
         let Some(block) = block_op else {
-            error!("write_data_blocks block_op.is_none()");
-            rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
+            let reason = GetObjectFailureReason::ShortRead;
+            error!(
+                data_blocks,
+                offset,
+                length,
+                stage = GET_STAGE_EMIT,
+                reason = reason.as_str(),
+                "Write data blocks found a missing data shard"
+            );
+            record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
         };
 
@@ -231,8 +262,17 @@ where
         let write_stage_start = Instant::now();
         if let Err(e) = writer.write_all(&block_slice[..write_len]).await {
             rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
-            rustfs_io_metrics::record_get_object_pipeline_failure("emit", classify_get_object_io_failure(&e));
-            error!("write_data_blocks write_all err: {}", e);
+            let reason = classify_io_error(&e);
+            record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
+            error!(
+                write_len,
+                total_written,
+                write_left,
+                stage = GET_STAGE_EMIT,
+                reason = reason.as_str(),
+                error = ?e,
+                "Write data blocks failed to emit bytes"
+            );
             return Err(e);
         }
         rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
@@ -245,8 +285,16 @@ where
         }
     }
 
-    error!("write_data_blocks loop exhausted with write_left>0");
-    rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
+    let reason = GetObjectFailureReason::ShortRead;
+    error!(
+        total_written,
+        write_left,
+        length,
+        stage = GET_STAGE_EMIT,
+        reason = reason.as_str(),
+        "Write data blocks exhausted data before completing requested length"
+    );
+    record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
     Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"))
 }
 
@@ -264,13 +312,16 @@ impl Erasure {
         R: AsyncRead + Unpin + Send + Sync,
     {
         if readers.len() != self.data_shards + self.parity_shards {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));
         }
 
         let Some(end_offset) = offset.checked_add(length) else {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
         };
         if end_offset > total_length {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));
         }
 
@@ -320,8 +371,19 @@ impl Erasure {
             }
 
             if !reader.can_decode(&shards) {
-                error!("erasure decode can_decode errs: {:?}", &errs);
-                rustfs_io_metrics::record_get_object_pipeline_failure("stripe_read", "read_quorum");
+                let reason = GetObjectFailureReason::ReadQuorum;
+                error!(
+                    data_shards = self.data_shards,
+                    total_shards = self.data_shards + self.parity_shards,
+                    available_shards = shards.iter().filter(|shard| shard.is_some()).count(),
+                    block_offset,
+                    block_length,
+                    stage = GET_STAGE_STRIPE_READ,
+                    reason = reason.as_str(),
+                    errors = ?errs,
+                    "Erasure decode could not gather enough shards"
+                );
+                record_get_object_pipeline_failure(GET_STAGE_STRIPE_READ, reason);
                 ret_err = Some(Error::ErasureReadQuorum.into());
                 break;
             }
@@ -334,8 +396,18 @@ impl Erasure {
                     "reconstruct",
                     reconstruct_stage_start.elapsed().as_secs_f64(),
                 );
-                error!("erasure decode decode_data err: {:?}", e);
-                rustfs_io_metrics::record_get_object_pipeline_failure("reconstruct", "decode_error");
+                let reason = GetObjectFailureReason::DecodeError;
+                error!(
+                    data_shards = self.data_shards,
+                    total_shards = self.data_shards + self.parity_shards,
+                    block_offset,
+                    block_length,
+                    stage = GET_STAGE_RECONSTRUCT,
+                    reason = reason.as_str(),
+                    error = ?e,
+                    "Erasure shard reconstruction failed"
+                );
+                record_get_object_pipeline_failure(GET_STAGE_RECONSTRUCT, reason);
                 ret_err = Some(e);
                 break;
             }
@@ -361,7 +433,15 @@ impl Erasure {
                         "emit",
                         emit_stage_start.elapsed().as_secs_f64(),
                     );
-                    error!("erasure decode write_data_blocks err: {:?}", e);
+                    error!(
+                        block_offset,
+                        block_length,
+                        bytes_written = written,
+                        stage = GET_STAGE_EMIT,
+                        reason = classify_io_error(&e).as_str(),
+                        error = ?e,
+                        "Erasure decode failed to emit reconstructed data"
+                    );
                     ret_err = Some(e);
                     break;
                 }

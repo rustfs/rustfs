@@ -13,25 +13,13 @@
 // limitations under the License.
 
 use super::*;
+use crate::get_diagnostics::{
+    GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error,
+    record_get_object_pipeline_failure,
+};
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::future::Future;
 use tokio::task::JoinSet;
-
-fn classify_get_object_disk_failure(err: &DiskError) -> &'static str {
-    match err {
-        DiskError::ErasureReadQuorum => "read_quorum",
-        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt => "bitrot_mismatch",
-        DiskError::LessData => "short_read",
-        DiskError::Timeout => "timeout",
-        DiskError::Io(io_err) => match io_err.kind() {
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => "downstream_closed",
-            std::io::ErrorKind::TimedOut => "timeout",
-            std::io::ErrorKind::UnexpectedEof => "short_read",
-            _ => "io",
-        },
-        _ => "unknown",
-    }
-}
 
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
@@ -749,19 +737,56 @@ impl SetDisks {
         let total_size = fi.size as usize;
 
         if offset > total_size {
-            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation failed"
+            );
             return Err(Error::other("offset out of range"));
         }
 
         let length = if length < 0 { total_size - offset } else { length as usize };
 
         let Some(end_offset_exclusive) = offset.checked_add(length) else {
-            error!("get_object_with_fileinfo offset overflow: {}, length: {}", offset, length);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation overflow"
+            );
             return Err(Error::other("offset out of range"));
         };
 
         if end_offset_exclusive > total_size {
-            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                end_offset_exclusive,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation failed"
+            );
             return Err(Error::other("offset out of range"));
         }
 
@@ -878,15 +903,46 @@ impl SetDisks {
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
-                    error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
-                    rustfs_io_metrics::record_get_object_pipeline_failure(
-                        "reader_setup",
-                        classify_get_object_disk_failure(&read_err),
+                    let reason = classify_disk_error(&read_err);
+                    error!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        part_number,
+                        part_offset,
+                        part_length,
+                        read_offset,
+                        till_offset,
+                        total_shards = erasure.data_shards + erasure.parity_shards,
+                        available_shards = nil_count,
+                        data_shards = erasure.data_shards,
+                        stage = GET_STAGE_READER_SETUP,
+                        reason = reason.as_str(),
+                        errors = ?errors,
+                        "Create bitrot reader failed read quorum"
                     );
+                    record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
-                error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
-                rustfs_io_metrics::record_get_object_pipeline_failure("reader_setup", "read_quorum");
+                let reason = GetObjectFailureReason::ReadQuorum;
+                error!(
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_offset,
+                    part_length,
+                    read_offset,
+                    till_offset,
+                    total_shards = erasure.data_shards + erasure.parity_shards,
+                    available_shards = nil_count,
+                    data_shards = erasure.data_shards,
+                    stage = GET_STAGE_READER_SETUP,
+                    reason = reason.as_str(),
+                    errors = ?errors,
+                    "Create bitrot reader did not have enough disks"
+                );
+                record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
                 return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
@@ -993,8 +1049,21 @@ impl SetDisks {
                 }
 
                 if has_err {
-                    error!("erasure.decode err {} {:?}", written, &de_err);
-                    rustfs_io_metrics::record_get_object_pipeline_failure("decode", classify_get_object_disk_failure(&de_err));
+                    let reason = classify_disk_error(&de_err);
+                    error!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        part_number,
+                        part_offset,
+                        part_length,
+                        bytes_written = written,
+                        stage = GET_STAGE_DECODE,
+                        reason = reason.as_str(),
+                        error = ?de_err,
+                        "Erasure decode failed during GetObject"
+                    );
+                    record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
             }

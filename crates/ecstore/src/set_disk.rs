@@ -35,6 +35,7 @@ use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
+use crate::get_diagnostics::{GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
@@ -837,20 +838,6 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
     }
 }
 
-fn classify_get_object_pipeline_failure(err: &Error) -> &'static str {
-    match err {
-        Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => "read_quorum",
-        Error::FileCorrupt => "bitrot_mismatch",
-        Error::Io(io_err) => match io_err.kind() {
-            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => "downstream_closed",
-            std::io::ErrorKind::TimedOut => "timeout",
-            std::io::ErrorKind::UnexpectedEof => "short_read",
-            _ => "io",
-        },
-        _ => "unknown",
-    }
-}
-
 #[async_trait::async_trait]
 impl rustfs_storage_api::ObjectIO for SetDisks {
     type Error = Error;
@@ -910,7 +897,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             }
             Err(err) => {
                 rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
-                rustfs_io_metrics::record_get_object_pipeline_failure("metadata", classify_get_object_pipeline_failure(&err));
+                record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
                 return Err(to_object_err(err, vec![bucket, object]));
             }
         };
@@ -1009,14 +996,22 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             )
             .await
             {
-                rustfs_io_metrics::record_get_object_pipeline_failure("emit", classify_get_object_pipeline_failure(&e));
+                let reason = classify_storage_error(&e);
+                record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
                 error!(
                     event = EVENT_SET_DISK_WRITE,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_SET_DISK,
                     bucket,
                     object,
+                    pool_index,
+                    set_index,
+                    offset,
+                    requested_length = length,
+                    skip_verify_bitrot = skip_verify,
                     state = "read_pipeline_failed",
+                    stage = GET_STAGE_EMIT,
+                    reason = reason.as_str(),
                     error = ?e,
                     "Set disk object read pipeline failed"
                 );

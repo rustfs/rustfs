@@ -31,6 +31,7 @@ mod disks_layout;
 mod endpoints;
 mod erasure_coding;
 mod error;
+mod get_diagnostics;
 mod global;
 pub(crate) mod layout;
 mod metrics_realtime;
