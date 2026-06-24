@@ -2382,6 +2382,64 @@ mod tests {
         }
     }
 
+    fn sample_rename_data_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            data_dir: Some(Uuid::new_v4()),
+            size: 64 * 1024,
+            mod_time: Some(::time::OffsetDateTime::UNIX_EPOCH + ::time::Duration::seconds(1)),
+            metadata: [
+                ("etag".to_string(), "etag-value".to_string()),
+                ("content-type".to_string(), "application/octet-stream".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            erasure: rustfs_filemeta::ErasureInfo {
+                algorithm: rustfs_filemeta::ERASURE_ALGORITHM.to_string(),
+                data_blocks: 4,
+                parity_blocks: 2,
+                block_size: 1024 * 1024,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_data_file_info_named_msgpack_is_smaller_than_json() {
+        let file_info = sample_rename_data_file_info();
+        let json = serde_json::to_vec(&file_info).expect("file info json should encode");
+        let named_msgpack = encode_msgpack_named(&file_info).expect("file info named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn rename_data_resp_named_msgpack_is_smaller_than_json() {
+        let response = RenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![1_u8; 32]),
+        };
+        let json = serde_json::to_vec(&response).expect("rename data response json should encode");
+        let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
+    }
+
     #[derive(Debug, Default)]
     struct SinkTestWriter;
 
