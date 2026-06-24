@@ -89,7 +89,6 @@ const INTERNAL_CATALOG_ROOT: &str = BUCKET_TABLE_CATALOG_META_PREFIX;
 const TABLE_BUCKET_ROOT: &str = BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX;
 const COMMIT_LOG_ROOT: &str = "commits";
 const COMMIT_IDEMPOTENCY_ROOT: &str = "commit-idempotency";
-const STRONG_CATALOG_BACKING_ROOT: &str = "strong-kv-wal://table-catalog";
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";
@@ -951,7 +950,6 @@ pub(crate) enum TableCatalogBackingMigrationStatus {
     ReadyToSnapshot,
     RecoveryRequired,
     ManualReviewRequired,
-    CutOverComplete,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -1660,95 +1658,14 @@ fn table_catalog_backing_manifest(
     }
 }
 
-fn strong_catalog_pointer_path(table_bucket: &str, namespace: &Namespace, table: &IdentifierSegment) -> String {
-    format!(
-        "{STRONG_CATALOG_BACKING_ROOT}/table-buckets/{}/namespaces/{}/tables/{}",
-        table_catalog_path_hash(table_bucket),
-        namespace.storage_id(),
-        table.as_str()
-    )
-}
-
-fn strong_catalog_commit_prefix(table_bucket: &str, table_id: &str) -> String {
-    format!(
-        "{STRONG_CATALOG_BACKING_ROOT}/table-buckets/{}/commits/{}/",
-        table_catalog_path_hash(table_bucket),
-        table_catalog_path_hash(table_id)
-    )
-}
-
-fn strong_catalog_idempotency_prefix(table_bucket: &str, table_id: &str) -> String {
-    format!(
-        "{STRONG_CATALOG_BACKING_ROOT}/table-buckets/{}/commit-idempotency/{}/",
-        table_catalog_path_hash(table_bucket),
-        table_catalog_path_hash(table_id)
-    )
-}
-
-fn strong_table_catalog_backing_manifest(
-    namespace: &Namespace,
-    table: &IdentifierSegment,
-    entry: &TableEntry,
-    commit_recovery: &TableCommitRecoveryReport,
-) -> TableCatalogBackingManifest {
-    TableCatalogBackingManifest {
-        version: TABLE_CATALOG_BACKING_MANIFEST_VERSION,
-        current: TableCatalogBackingProfile {
-            kind: TableCatalogBackingKind::StrongKvWal,
-            authority: TableCatalogAuthority::LinearizableMetadataKv,
-            consistency: TableCatalogConsistencyMode::LinearizableCas,
-            durability: TableCatalogDurabilityMode::WalBeforeStateMachineApply,
-            current_pointer_path: strong_catalog_pointer_path(&entry.table_bucket, namespace, table),
-            wal: TableCatalogWalState {
-                status: TableCatalogWalStatus::Recoverable,
-                commit_log_prefix: strong_catalog_commit_prefix(&entry.table_bucket, &entry.table_id),
-                idempotency_index_prefix: strong_catalog_idempotency_prefix(&entry.table_bucket, &entry.table_id),
-                committed_generation: entry.generation,
-                staged_before_table_update_count: commit_recovery.staged_before_table_update_count,
-                finalization_required_count: commit_recovery.finalization_required_count,
-                idempotency_repair_required_count: commit_recovery.idempotency_repair_required_count,
-                manual_review_count: commit_recovery.manual_review_count,
-            },
-            snapshot: TableCatalogSnapshotState {
-                export_api: "GET /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export".to_string(),
-                includes_table_bucket: true,
-                includes_namespace: true,
-                includes_table_pointer: true,
-                includes_backing_manifest: true,
-            },
-        },
-        migration: TableCatalogBackingMigrationPlan {
-            source_kind: TableCatalogBackingKind::StrongKvWal,
-            target_kind: TableCatalogBackingKind::StrongKvWal,
-            status: TableCatalogBackingMigrationStatus::CutOverComplete,
-            required_steps: Vec::new(),
-            blockers: Vec::new(),
-        },
-        ha: TableCatalogHaPolicy {
-            writer_region_model: TableCatalogHaWriterModel::SingleActiveWriterRegion,
-            read_replica_strategy: TableCatalogReadReplicaStrategy::ReadOnlyReplicasForListAndLoad,
-            commit_read_requirement: TableCatalogCommitReadRequirement::LinearizableLeaderRead,
-            active_active_supported: false,
-            failover_requires_operator_promotion: true,
-        },
-        scale_validation: TableCatalogScaleValidation {
-            status: TableCatalogScaleValidationStatus::MatrixPublished,
-            benchmark_required: true,
-            required_scenarios: vec![
-                TableCatalogScaleValidationScenario::ConcurrentCommitCas,
-                TableCatalogScaleValidationScenario::CommitLogRecoveryReplay,
-                TableCatalogScaleValidationScenario::MigrationSnapshotReplay,
-                TableCatalogScaleValidationScenario::ReadReplicaStaleReadGuard,
-                TableCatalogScaleValidationScenario::ClientConformanceMatrix,
-            ],
-        },
-    }
-}
-
+#[cfg(test)]
 type StrongNamespaceKey = (String, String);
+#[cfg(test)]
 type StrongResourceKey = (String, String, String);
+#[cfg(test)]
 type StrongCommitKey = (String, String, String);
 
+#[cfg(test)]
 #[derive(Default)]
 struct StrongTableCatalogState {
     table_buckets: BTreeMap<String, TableBucketEntry>,
@@ -1759,12 +1676,14 @@ struct StrongTableCatalogState {
     idempotency: BTreeMap<StrongCommitKey, CommitLogEntry>,
 }
 
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct StrongTableCatalogStore<B> {
     object_backend: B,
     state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
 }
 
+#[cfg(test)]
 impl<B> StrongTableCatalogStore<B>
 where
     B: TableCatalogObjectBackend,
@@ -2019,48 +1938,9 @@ where
         };
         Ok(Self::table_commit_recovery_report_for_entry_locked(&state, entry))
     }
-
-    pub(crate) async fn export_table_catalog_entry(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
-    ) -> TableCatalogStoreResult<TableCatalogExport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let namespace_key = Self::namespace_key(table_bucket, &namespace);
-        let table_key = Self::table_key(table_bucket, &namespace, &table);
-        let state = self.state.lock().await;
-        let Some(table_bucket_entry) = state.table_buckets.get(table_bucket).cloned() else {
-            return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
-        };
-        let Some(namespace_entry) = state.namespaces.get(&namespace_key).cloned() else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                table_bucket,
-                namespace.public_name()
-            )));
-        };
-        let Some(table_entry) = state.tables.get(&table_key).cloned() else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        let commit_recovery = Self::table_commit_recovery_report_for_entry_locked(&state, &table_entry);
-        let backing_manifest = strong_table_catalog_backing_manifest(&namespace, &table, &table_entry, &commit_recovery);
-
-        Ok(TableCatalogExport {
-            table_bucket: table_bucket_entry,
-            namespace: namespace_entry,
-            table: table_entry,
-            backing_manifest,
-        })
-    }
 }
 
+#[cfg(test)]
 #[async_trait::async_trait]
 impl<B> TableCatalogStore for StrongTableCatalogStore<B>
 where
@@ -2157,6 +2037,7 @@ where
         validate_catalog_entry_version("table", entry.version)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
+        table_warehouse_object_prefix(&entry)?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &table);
         let mut state = self.state.lock().await;
         Self::require_table_bucket_in_state(&state, &entry.table_bucket)?;
@@ -11465,45 +11346,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn strong_catalog_backing_manifest_reports_linearizable_kv() {
-        let backend = TestCatalogObjectBackend::default();
-        let store = StrongTableCatalogStore::new(backend);
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
-        store
-            .create_namespace(test_namespace_entry(bucket, &namespace))
-            .await
-            .unwrap();
-        store
-            .create_table(test_table_entry(bucket, &namespace, &table, current))
-            .await
-            .unwrap();
-
-        let export = store.export_table_catalog_entry(bucket, "sales", "orders").await.unwrap();
-
-        assert_eq!(export.backing_manifest.current.kind, TableCatalogBackingKind::StrongKvWal);
-        assert_eq!(export.backing_manifest.current.authority, TableCatalogAuthority::LinearizableMetadataKv);
-        assert_eq!(export.backing_manifest.current.consistency, TableCatalogConsistencyMode::LinearizableCas);
-        assert_eq!(
-            export.backing_manifest.current.durability,
-            TableCatalogDurabilityMode::WalBeforeStateMachineApply
-        );
-        assert_eq!(export.backing_manifest.current.wal.status, TableCatalogWalStatus::Recoverable);
-        assert_eq!(export.backing_manifest.current.wal.committed_generation, 1);
-        assert_eq!(export.backing_manifest.current.wal.finalization_required_count, 0);
-        assert_eq!(
-            export.backing_manifest.migration.status,
-            TableCatalogBackingMigrationStatus::CutOverComplete
-        );
-        assert!(export.backing_manifest.migration.required_steps.is_empty());
-        assert!(export.backing_manifest.migration.blockers.is_empty());
-    }
-
-    #[tokio::test]
     async fn strong_catalog_backing_commit_is_atomic_with_wal_and_idempotency() {
         let backend = TestCatalogObjectBackend::default();
         let store = StrongTableCatalogStore::new(backend.clone());
@@ -11630,6 +11472,29 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn strong_catalog_backing_rejects_invalid_table_warehouse_location() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = StrongTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        let mut entry = test_table_entry(bucket, &namespace, &table, current_metadata);
+        entry.warehouse_location = "s3://other-bucket/tables/table-id".to_string();
+
+        let err = store.create_table(entry).await.unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Invalid(_));
+        assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
     }
 
     #[tokio::test]
