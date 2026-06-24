@@ -19,6 +19,7 @@ use crate::{
     config::com::read_config,
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
+    runtime_sources,
     store::ECStore,
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
@@ -529,7 +530,7 @@ async fn update_usage_cache_if_needed() {
         let cache_clone = (*memory_cache()).clone();
         let updating_clone = (*cache_updating()).clone();
         tokio::spawn(async move {
-            if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+            if let Some(store) = runtime_sources::object_store_handle()
                 && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
             {
                 let mut cache = cache_clone.write().await;
@@ -560,7 +561,7 @@ async fn update_usage_cache_if_needed() {
     *updating = true;
     drop(updating);
 
-    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get()
+    if let Some(store) = runtime_sources::object_store_handle()
         && let Ok(data_usage_info) = load_data_usage_from_backend(store.clone()).await
     {
         let mut cache = memory_cache().write().await;
@@ -629,7 +630,7 @@ pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageIn
 
 /// Sync memory cache with backend data (called by scanner)
 pub async fn sync_memory_cache_with_backend() -> Result<(), Error> {
-    if let Some(store) = crate::global::GLOBAL_OBJECT_API.get() {
+    if let Some(store) = runtime_sources::object_store_handle() {
         match load_data_usage_from_backend(store.clone()).await {
             Ok(data_usage_info) => {
                 replace_bucket_usage_memory_from_info(&data_usage_info).await;
@@ -789,10 +790,9 @@ pub async fn load_data_usage_cache(store: &crate::set_disk::SetDisks, name: &str
 pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate::error::Result<()> {
     use crate::config::com::save_config;
     use crate::disk::BUCKET_META_PREFIX;
-    use crate::global::resolve_object_store_handle;
     use std::path::Path;
 
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = runtime_sources::object_store_handle() else {
         return Err(Error::other("errServerNotInitialized"));
     };
     let buf = cache.marshal_msg().map_err(Error::other)?;
