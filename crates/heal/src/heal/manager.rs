@@ -480,11 +480,11 @@ impl RetryingHeal {
 fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
     let heal_path = heal_path.trim_matches('/');
     if heal_path.is_empty() {
-        return false;
+        return matches!(heal_type, HealType::Cluster);
     }
 
     match heal_type {
-        HealType::Cluster => heal_path.is_empty(),
+        HealType::Cluster => false,
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
         | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
@@ -1758,7 +1758,6 @@ impl HealManager {
 
         tokio::spawn(async move {
             let mut interval = interval(duration);
-            let mut seen_returning_sets = HashSet::new();
 
             loop {
                 let mut candidate_count = 0usize;
@@ -1780,6 +1779,7 @@ impl HealManager {
                     _ = interval.tick() => {
                         // Build list of endpoints that need healing
                         let mut endpoints = Vec::new();
+                        let mut seen_returning_sets = HashSet::new();
                         for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
                             if let Some(disk) = disk_opt {
                                 let endpoint = disk.endpoint();
@@ -3114,6 +3114,104 @@ mod tests {
         assert!(cancel_token.is_cancelled());
         assert!(manager.retrying_heals.lock().await.get(&task_id).is_none());
         assert!(matches!(manager.get_task_status(&task_id).await, Err(Error::TaskNotFound { .. })));
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_queued_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_request_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+
+        manager
+            .submit_heal_request(cluster_request)
+            .await
+            .expect("cluster request should be accepted");
+        manager
+            .submit_heal_request(bucket_request)
+            .await
+            .expect("bucket request should be accepted");
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel queued cluster task"),
+            1
+        );
+        assert!(matches!(
+            manager.get_task_status(&cluster_request_id).await,
+            Err(Error::TaskNotFound { .. })
+        ));
+        assert_eq!(
+            manager
+                .get_task_status(&bucket_request_id)
+                .await
+                .expect("bucket request should not match root path"),
+            HealTaskStatus::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_active_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage.clone(), None);
+
+        let cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        let cluster_request_id = cluster_request.id.clone();
+        let bucket_request = HealRequest::bucket("bucket".to_string());
+        let bucket_request_id = bucket_request.id.clone();
+
+        manager.active_heals.lock().await.insert(
+            cluster_request_id.clone(),
+            Arc::new(HealTask::from_request(cluster_request, storage.clone())),
+        );
+        manager
+            .active_heals
+            .lock()
+            .await
+            .insert(bucket_request_id.clone(), Arc::new(HealTask::from_request(bucket_request, storage)));
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel active cluster task"),
+            1
+        );
+        assert!(manager.active_heals.lock().await.get(&cluster_request_id).is_none());
+        assert!(manager.active_heals.lock().await.get(&bucket_request_id).is_some());
+    }
+
+    #[tokio::test]
+    async fn test_cancel_tasks_for_empty_path_cancels_retrying_cluster_only() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let mut cluster_request = HealRequest::new(HealType::Cluster, HealOptions::default(), HealPriority::High);
+        cluster_request.retry_attempts = 1;
+        let cluster_request_id = cluster_request.id.clone();
+        let cluster_cancel_token = insert_retrying_request(&manager, cluster_request).await;
+
+        let mut bucket_request = HealRequest::bucket("bucket".to_string());
+        bucket_request.retry_attempts = 1;
+        let bucket_request_id = bucket_request.id.clone();
+        let bucket_cancel_token = insert_retrying_request(&manager, bucket_request).await;
+
+        assert_eq!(
+            manager
+                .cancel_tasks_for_path("")
+                .await
+                .expect("root path should cancel retrying cluster task"),
+            1
+        );
+        assert!(cluster_cancel_token.is_cancelled());
+        assert!(!bucket_cancel_token.is_cancelled());
+        assert!(manager.retrying_heals.lock().await.get(&cluster_request_id).is_none());
+        assert!(manager.retrying_heals.lock().await.get(&bucket_request_id).is_some());
     }
 
     #[tokio::test]
