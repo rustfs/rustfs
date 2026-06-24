@@ -28,8 +28,8 @@ use crate::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, init_global_bucket_monitor, is_first_cluster_node_local, resolve_object_store_handle,
-        set_global_deployment_id,
+        get_global_endpoints_opt, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local,
+        resolve_object_store_handle, set_global_deployment_id,
     },
     notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
@@ -59,6 +59,10 @@ pub(crate) fn endpoint_pools() -> Option<EndpointServerPools> {
     get_global_endpoints_opt()
 }
 
+pub(crate) fn endpoint_erasure_set_count() -> Option<usize> {
+    endpoint_pools().map(|endpoints| endpoints.es_count())
+}
+
 pub(crate) fn endpoint_pool_is_local(pool_index: usize) -> bool {
     get_global_endpoints()
         .as_ref()
@@ -68,6 +72,14 @@ pub(crate) fn endpoint_pool_is_local(pool_index: usize) -> bool {
 
 pub(crate) async fn first_cluster_node_is_local() -> bool {
     is_first_cluster_node_local().await
+}
+
+pub(crate) async fn setup_is_erasure() -> bool {
+    is_erasure().await
+}
+
+pub(crate) async fn setup_is_dist_erasure() -> bool {
+    is_dist_erasure().await
 }
 
 pub(crate) async fn local_node_name() -> String {
