@@ -190,6 +190,16 @@ fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), 
     Ok((access_key, secret_key, session_token))
 }
 
+struct ReplicationTargetOptions<'a> {
+    endpoint: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    target_bucket: &'a str,
+    secure: bool,
+    skip_tls_verify: bool,
+    ca_cert_pem: Option<&'a str>,
+}
+
 async fn set_replication_target(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
@@ -199,12 +209,15 @@ async fn set_replication_target(
     set_replication_target_with_options(
         source_env,
         source_bucket,
-        &target_env.address,
-        &target_env.access_key,
-        &target_env.secret_key,
-        target_bucket,
-        false,
-        false,
+        ReplicationTargetOptions {
+            endpoint: &target_env.address,
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
     )
     .await
 }
@@ -212,50 +225,20 @@ async fn set_replication_target(
 async fn set_replication_target_with_options(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
-    target_endpoint: &str,
-    target_access_key: &str,
-    target_secret_key: &str,
-    target_bucket: &str,
-    secure: bool,
-    skip_tls_verify: bool,
-) -> Result<String, Box<dyn Error + Send + Sync>> {
-    set_replication_target_with_tls_options(
-        source_env,
-        source_bucket,
-        target_endpoint,
-        target_access_key,
-        target_secret_key,
-        target_bucket,
-        secure,
-        skip_tls_verify,
-        None,
-    )
-    .await
-}
-
-async fn set_replication_target_with_tls_options(
-    source_env: &RustFSTestEnvironment,
-    source_bucket: &str,
-    target_endpoint: &str,
-    target_access_key: &str,
-    target_secret_key: &str,
-    target_bucket: &str,
-    secure: bool,
-    skip_tls_verify: bool,
-    ca_cert_pem: Option<&str>,
+    options: ReplicationTargetOptions<'_>,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
     let mut body = serde_json::json!({
-        "endpoint": target_endpoint,
+        "endpoint": options.endpoint,
         "credentials": {
-            "accessKey": target_access_key,
-            "secretKey": target_secret_key
+            "accessKey": options.access_key,
+            "secretKey": options.secret_key
         },
-        "targetbucket": target_bucket,
-        "secure": secure,
-        "skipTlsVerify": skip_tls_verify,
+        "targetbucket": options.target_bucket,
+        "secure": options.secure,
+        "skipTlsVerify": options.skip_tls_verify,
         "type": "replication"
     });
-    if let Some(ca_cert_pem) = ca_cert_pem {
+    if let Some(ca_cert_pem) = options.ca_cert_pem {
         body["caCertPem"] = serde_json::Value::String(ca_cert_pem.to_string());
     }
     let url = format!(
@@ -1798,12 +1781,15 @@ async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tl
     let err = set_replication_target_with_options(
         &source_env,
         source_bucket,
-        &target_env.url.trim_start_matches("https://").to_string(),
-        &target_env.access_key,
-        &target_env.secret_key,
-        target_bucket,
-        true,
-        false,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
     )
     .await
     .expect_err("self-signed HTTPS target should fail without skipTlsVerify");
@@ -1882,12 +1868,15 @@ async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_ve
     let target_arn = set_replication_target_with_options(
         &source_env,
         source_bucket,
-        &target_env.url.trim_start_matches("https://").to_string(),
-        &target_env.access_key,
-        &target_env.secret_key,
-        target_bucket,
-        true,
-        true,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: true,
+            ca_cert_pem: None,
+        },
     )
     .await?;
     put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
@@ -1969,12 +1958,15 @@ async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_
     let err = set_replication_target_with_options(
         &source_env,
         source_bucket,
-        &target_env.url.trim_start_matches("https://").to_string(),
-        &target_env.access_key,
-        &target_env.secret_key,
-        target_bucket,
-        true,
-        false,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
     )
     .await
     .expect_err("private CA HTTPS target should fail without caCertPem");
@@ -2049,16 +2041,18 @@ async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem(
         .await
         .map_err(|err| std::io::Error::other(format!("enable target HTTPS bucket versioning failed: {err}")))?;
 
-    let target_arn = set_replication_target_with_tls_options(
+    let target_arn = set_replication_target_with_options(
         &source_env,
         source_bucket,
-        &target_env.url.trim_start_matches("https://").to_string(),
-        &target_env.access_key,
-        &target_env.secret_key,
-        target_bucket,
-        true,
-        false,
-        Some(&ca_cert_pem),
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: Some(&ca_cert_pem),
+        },
     )
     .await?;
     put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
