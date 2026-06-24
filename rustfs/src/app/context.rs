@@ -84,14 +84,14 @@ pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
 }
 
-/// Resolve a ready IAM system handle using AppContext-first precedence.
-pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
-}
-
 /// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
     resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
+}
+
+/// Resolve a ready IAM system handle using AppContext-first precedence.
+pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
 }
 
 /// Resolve token signing key using AppContext-first precedence.
@@ -1254,6 +1254,8 @@ mod tests {
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
+        // OIDC fallback path: both context absent and fallback return None.
+        assert!(resolve_oidc_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
