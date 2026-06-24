@@ -28,8 +28,8 @@ use crate::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local,
-        resolve_object_store_handle, set_global_deployment_id,
+        get_global_endpoints_opt, get_global_lock_clients, init_global_bucket_monitor, is_dist_erasure, is_erasure,
+        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id,
     },
     notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
@@ -38,6 +38,7 @@ use crate::{
 use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
+use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use tokio::sync::RwLock;
 use tonic::transport::Channel;
@@ -57,6 +58,10 @@ pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
 
 pub(crate) fn endpoint_pools() -> Option<EndpointServerPools> {
     get_global_endpoints_opt()
+}
+
+pub(crate) fn endpoint_pools_or_default() -> EndpointServerPools {
+    get_global_endpoints()
 }
 
 pub(crate) fn endpoint_erasure_set_count() -> Option<usize> {
@@ -82,6 +87,10 @@ pub(crate) async fn setup_is_dist_erasure() -> bool {
     is_dist_erasure().await
 }
 
+pub(crate) async fn setup_is_erasure_sd() -> bool {
+    *GLOBAL_IsErasureSD.read().await
+}
+
 pub(crate) async fn local_node_name() -> String {
     GLOBAL_LOCAL_NODE_NAME.read().await.clone()
 }
@@ -100,6 +109,10 @@ pub(crate) fn boot_uptime_secs() -> u64 {
         .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
         .unwrap_or_default()
         .as_secs()
+}
+
+pub(crate) async fn ensure_boot_time() {
+    GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
 }
 
 pub(crate) async fn scanner_init_time() -> Option<chrono::DateTime<chrono::Utc>> {
@@ -167,6 +180,10 @@ pub(crate) fn ensure_deployment_id(deployment_id: Uuid) {
 
 pub(crate) fn global_lock_manager() -> Arc<rustfs_lock::GlobalLockManager> {
     rustfs_lock::get_global_lock_manager()
+}
+
+pub(crate) fn global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+    get_global_lock_clients()
 }
 
 pub(crate) fn notification_sys() -> Option<&'static NotificationSys> {

@@ -824,6 +824,12 @@ impl DataUsageCache {
         }
     }
 
+    fn should_retry_save_error(err: &StorageError) -> bool {
+        // Usage-cache files are best-effort scanner checkpoints. Retrying namespace
+        // lock failures immediately only adds more lock traffic to the same hot object.
+        !matches!(err, StorageError::Lock(_) | StorageError::NamespaceLockQuorumUnavailable { .. })
+    }
+
     async fn retry_save_op<F, Fut>(
         path_type: &'static str,
         timeout_duration: Duration,
@@ -851,8 +857,12 @@ impl DataUsageCache {
                     last_err = Some(StorageError::other(format!("{e} after {timeout_duration:?}")));
                 }
                 Ok(Err(e)) => {
-                    Self::record_save_attempt(path_type, "error", duration);
+                    let should_retry = Self::should_retry_save_error(&e);
+                    Self::record_save_attempt(path_type, if should_retry { "error" } else { "lock_error" }, duration);
                     last_err = Some(e);
+                    if !should_retry {
+                        break;
+                    }
                 }
             }
 
@@ -1301,6 +1311,31 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn test_retry_save_op_does_not_retry_namespace_lock_errors() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let attempts_clone = attempts.clone();
+
+        let result =
+            DataUsageCache::retry_save_op("main", Duration::from_millis(200), DATA_USAGE_CACHE_SAVE_RETRIES, move || {
+                let attempts = attempts_clone.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    Err(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "write",
+                        bucket: RUSTFS_META_BUCKET.to_string(),
+                        object: "buckets/.usage-cache.bin".to_string(),
+                        required: 2,
+                        achieved: 1,
+                    })
+                }
+            })
+            .await;
+
+        assert!(matches!(result, Err(StorageError::NamespaceLockQuorumUnavailable { .. })));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     // --- Tests for `add` function (bug #1: logic inversion) ---

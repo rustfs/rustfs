@@ -17,7 +17,8 @@ use std::slice::Iter;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::DiskInfo;
 use crate::error::{Error, Result};
-use crate::global::{DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES, is_erasure_sd};
+use crate::global::{DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES};
+use crate::runtime_sources;
 
 #[derive(Debug, Default, Clone)]
 pub struct PoolAvailableSpace {
@@ -97,7 +98,7 @@ pub async fn has_space_for(dis: &[Option<DiskInfo>], size: i64) -> Result<bool> 
     let per_disk = size / disks_num as u64;
 
     for disk in dis.iter().flatten() {
-        if !is_erasure_sd().await && disk.free_inodes < DISK_MIN_INODES && disk.used_inodes > 0 {
+        if !runtime_sources::setup_is_erasure_sd().await && disk.free_inodes < DISK_MIN_INODES && disk.used_inodes > 0 {
             return Ok(false);
         }
 
