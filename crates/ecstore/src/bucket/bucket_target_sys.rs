@@ -1864,7 +1864,8 @@ mod tests {
         let client = sys
             .get_remote_target_client_internal(&BucketTarget {
                 endpoint: "192.168.1.10:9000".to_string(),
-                secure: false,
+                secure: true,
+                skip_tls_verify: true,
                 target_bucket: "bucket".to_string(),
                 region: "us-east-1".to_string(),
                 credentials: Some(Credentials {
@@ -1878,7 +1879,7 @@ mod tests {
             .await
             .expect("private IP endpoints should be allowed for replication targets");
 
-        assert_eq!(client.endpoint, "http://192.168.1.10:9000");
+        assert_eq!(client.endpoint, "https://192.168.1.10:9000");
     }
 
     #[tokio::test]
