@@ -347,6 +347,52 @@ impl SetDisks {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
     }
 
+    fn update_file_info_quorum_hash(hasher: &mut Sha256, meta: &FileInfo) {
+        hasher.update(meta.size.to_le_bytes());
+        hasher.update([meta.deleted as u8, meta.mark_deleted as u8]);
+
+        if let Some(version_id) = meta.version_id {
+            hasher.update(version_id.as_bytes());
+        }
+
+        if let Some(data_dir) = meta.data_dir {
+            hasher.update(data_dir.as_bytes());
+        }
+
+        if let Some(checksum) = &meta.checksum {
+            hasher.update(checksum);
+        }
+
+        for part in meta.parts.iter() {
+            hasher.update(format!("part.{}", part.number).as_bytes());
+            hasher.update(format!("part.{}", part.size).as_bytes());
+            hasher.update(part.actual_size.to_le_bytes());
+            hasher.update(part.etag.as_bytes());
+
+            if let Some(mod_time) = part.mod_time {
+                hasher.update(mod_time.unix_timestamp_nanos().to_le_bytes());
+            }
+
+            if let Some(index) = &part.index {
+                hasher.update(index);
+            }
+
+            if let Some(checksums) = &part.checksums {
+                let mut checksum_entries = checksums.iter().collect::<Vec<_>>();
+                checksum_entries.sort_by(|left, right| left.0.cmp(right.0));
+                for (name, value) in checksum_entries {
+                    hasher.update(name.as_bytes());
+                    hasher.update(value.as_bytes());
+                }
+            }
+        }
+
+        if !meta.deleted && meta.size != 0 {
+            hasher.update(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes());
+            hasher.update(format!("{:?}", meta.erasure.distribution).as_bytes());
+        }
+    }
+
     pub(super) fn find_file_info_in_quorum(
         metas: &[FileInfo],
         mod_time: &Option<OffsetDateTime>,
@@ -387,15 +433,7 @@ impl SetDisks {
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
-                for part in meta.parts.iter() {
-                    hasher.update(format!("part.{}", part.number).as_bytes());
-                    hasher.update(format!("part.{}", part.size).as_bytes());
-                }
-
-                if !meta.deleted && meta.size != 0 {
-                    hasher.update(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes());
-                    hasher.update(format!("{:?}", meta.erasure.distribution).as_bytes());
-                }
+                Self::update_file_info_quorum_hash(&mut hasher, meta);
 
                 if meta.is_remote() {
                     // TODO:
@@ -435,7 +473,13 @@ impl SetDisks {
         }
 
         if max_count < quorum {
-            warn!("find_file_info_in_quorum: max_count < quorum, max_val={:?}", max_val);
+            warn!(
+                quorum,
+                max_count,
+                max_val = ?max_val,
+                count_map = ?count_map,
+                "find_file_info_in_quorum: fileinfo content identity did not reach quorum"
+            );
             return Err(DiskError::ErasureReadQuorum);
         }
 

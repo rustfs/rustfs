@@ -6717,6 +6717,70 @@ mod tests {
         assert_eq!(etags[0], Some("test-etag".to_string()));
     }
 
+    fn quorum_test_fileinfo(mod_time: OffsetDateTime, data_dir: Uuid, part_etag: &str, erasure_index: usize) -> FileInfo {
+        let mut metadata = HashMap::new();
+        metadata.insert("etag".to_string(), "object-etag".to_string());
+
+        FileInfo {
+            name: "bucket/object".to_string(),
+            size: 8 * 1024 * 1024,
+            mod_time: Some(mod_time),
+            data_dir: Some(data_dir),
+            metadata,
+            parts: vec![ObjectPartInfo {
+                etag: part_etag.to_string(),
+                number: 1,
+                size: 8 * 1024 * 1024,
+                actual_size: 8 * 1024 * 1024,
+                mod_time: Some(mod_time),
+                ..Default::default()
+            }],
+            erasure: ErasureInfo {
+                data_blocks: 2,
+                parity_blocks: 2,
+                block_size: 4 * 1024 * 1024,
+                index: erasure_index,
+                distribution: vec![1, 2, 3, 4],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_find_file_info_in_quorum_uses_part_identity() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let metas = vec![
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 3),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 4),
+        ];
+
+        let fi = SetDisks::find_file_info_in_quorum(&metas, &Some(mod_time), &None, 3)
+            .expect("three matching part identities should reach quorum");
+
+        assert_eq!(fi.parts[0].etag, "part-etag-a");
+    }
+
+    #[test]
+    fn test_find_file_info_in_quorum_rejects_split_part_identity() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let metas = vec![
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 3),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 4),
+        ];
+
+        let err = SetDisks::find_file_info_in_quorum(&metas, &Some(mod_time), &None, 3)
+            .expect_err("split part identities must not reach write quorum");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
     #[test]
     fn test_list_object_parities() {
         // Test extracting parity counts from file info
