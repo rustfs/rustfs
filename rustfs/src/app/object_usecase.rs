@@ -1580,7 +1580,13 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead<'a>> {
         let h = req.headers.clone();
         let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
+        let store_lookup_start = std::time::Instant::now();
         let store = get_validated_store(bucket).await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "store_lookup",
+            store_lookup_start.elapsed().as_secs_f64(),
+        );
 
         let read_start = std::time::Instant::now();
         let read_setup =
@@ -1606,6 +1612,11 @@ impl DefaultObjectUsecase {
             .get_object_reader(bucket, key, rs.clone(), h, opts)
             .await
             .map_err(map_get_object_reader_error)?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "store_reader_setup",
+            read_start.elapsed().as_secs_f64(),
+        );
 
         let info = reader.object_info;
 
@@ -2702,7 +2713,13 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
+        let request_context_start = std::time::Instant::now();
         let request_context = Self::prepare_get_object_request_context(&req).await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "request_context",
+            request_context_start.elapsed().as_secs_f64(),
+        );
         let GetObjectRequestContext {
             bucket,
             key,
@@ -2747,7 +2764,14 @@ impl DefaultObjectUsecase {
             encryption_applied,
         } = read_setup;
 
+        let versioning_start = std::time::Instant::now();
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "versioning_lookup",
+            versioning_start.elapsed().as_secs_f64(),
+        );
+        let output_build_start = std::time::Instant::now();
         let output_context = self
             .build_get_object_output_context(
                 &req,
@@ -2775,6 +2799,11 @@ impl DefaultObjectUsecase {
                 versioned,
             )
             .await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "output_build",
+            output_build_start.elapsed().as_secs_f64(),
+        );
         let GetObjectOutputContext {
             output,
             event_info,

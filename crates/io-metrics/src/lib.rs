@@ -277,6 +277,43 @@ pub fn record_get_object_io_state(
     counter!("rustfs_io_strategy_selected_total", "level" => load_level.to_string()).increment(1);
 }
 
+/// Record GetObject phase duration for the current read path.
+#[inline(always)]
+pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str, duration_secs: f64) {
+    histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
+}
+
+/// Record GetObject metadata resolution duration.
+#[inline(always)]
+pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "metadata", duration_secs);
+}
+
+/// Record GetObject shard reader setup duration.
+#[inline(always)]
+pub fn record_get_object_shard_reader_setup_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "reader_setup", duration_secs);
+}
+
+/// Record GetObject erasure decode duration.
+#[inline(always)]
+pub fn record_get_object_decode_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "decode", duration_secs);
+}
+
+/// Record GetObject downstream write wait while emitting decoded data.
+#[inline(always)]
+pub fn record_get_object_duplex_backpressure_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "duplex_backpressure", duration_secs);
+}
+
+/// Record GetObject read pipeline failures using bounded labels.
+#[inline(always)]
+pub fn record_get_object_pipeline_failure(stage: &'static str, reason: &'static str) {
+    counter!("rustfs_io_get_object_pipeline_failures_total", "path" => "legacy_duplex", "stage" => stage, "reason" => reason)
+        .increment(1);
+}
+
 /// Record a zero-copy read operation.
 ///
 /// # Arguments
@@ -869,6 +906,18 @@ mod tests {
     fn test_record_get_object() {
         record_get_object(100.0, 1024 * 1024);
         record_get_object(50.0, 2048);
+    }
+
+    #[test]
+    fn test_record_get_object_stage_metrics() {
+        record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_metadata_phase_duration(0.002);
+        record_get_object_shard_reader_setup_duration(0.003);
+        record_get_object_decode_duration(0.004);
+        record_get_object_duplex_backpressure_duration(0.005);
+        record_get_object_pipeline_failure("decode", "read_quorum");
+
+        assert!(0.005_f64.is_sign_positive());
     }
 
     #[test]
