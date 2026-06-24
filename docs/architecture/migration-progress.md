@@ -5,9 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-replication-runtime-sources`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189`.
-- Based on: stacked on API-188 branch while PR #3799 is pending.
+- Branch: `overtrue/arch-ecstore-bucket-runtime-sources-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191`.
+- Based on: latest default branch after merge 3805.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -21,6 +21,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   plus ECStore observability/status object-store, endpoint, node-name,
   boot-time, init-time, root-disk threshold, and cached RPC channel reads,
   plus ECStore replication pool, replication stats, and event-host reads,
+  plus ECStore lifecycle queue state, tier config, lifecycle config, deployment
+  id, event-host reads, bucket monitor reads, and replication worker pool reads,
   through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
@@ -30,7 +32,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions; accept the reviewed AppContext resolver
   reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-189 owner facade cleanup.
+- Docs changes: record the API-136 through API-191 owner facade cleanup.
 
 ## Phase 0 Tasks
 
@@ -4747,6 +4749,36 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration/layer guards, PR-before-push pre-commit quality gate, and
     three-expert review.
 
+- [x] `API-190` Centralize ECStore lifecycle runtime source reads.
+  - Do: route lifecycle queue state handles, tier config manager reads,
+    lifecycle config reads, deployment-id reads, and lifecycle event-host reads
+    through the ECStore-owned runtime-source module.
+  - Acceptance: lifecycle ops, tier sweeper, rebalance config loading, and
+    set-disk transition/restore event paths no longer read those runtime
+    globals directly outside the owner runtime-source boundary.
+  - Must preserve: lifecycle worker sizing, expiry and transition queueing,
+    tier delete journal accounting, rebalance lifecycle config snapshots,
+    transitioned-object reader driver lookup, and emitted lifecycle transition,
+    restore, and expiry event host values.
+  - Verification: ECStore compile coverage, focused lifecycle worker test,
+    formatting, diff hygiene, residual lifecycle runtime-source scan, Rust risk
+    scan, migration/layer guards, PR-before-push pre-commit quality gate, and
+    three-expert review.
+
+- [x] `API-191` Centralize ECStore bucket runtime source reads.
+  - Do: route bucket monitor reads and replication worker pool reads through the
+    ECStore-owned runtime-source module.
+  - Acceptance: bucket target bandwidth updates, replication resync bandwidth
+    wrappers, and replication state stats no longer read those runtime globals
+    directly outside the owner runtime-source boundary.
+  - Must preserve: bandwidth limit updates, uninitialized-monitor warnings,
+    monitored resync readers, active worker statistics, and bucket replication
+    bandwidth reports.
+  - Verification: ECStore compile coverage, focused replication-state test,
+    formatting, diff hygiene, residual bucket runtime-source scan, Rust risk
+    scan, migration/layer guards, PR-before-push pre-commit quality gate, and
+    three-expert review.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4755,6 +4787,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-191 keeps bucket monitor and replication worker pool reads behind the ECStore runtime-source boundary without adding new public APIs. |
+| Migration preservation | pass | Bandwidth limit updates, monitored resync readers, active worker statistics, and bucket replication bandwidth reports keep existing fallback behavior. |
+| Testing/verification | pass | ECStore compile, focused replication-state test, formatting, migration/layer guards, residual scan, Rust risk scan, and pre-commit planned before PR. |
 | Quality/architecture | pass | API-152 removes thin test/fuzz ECStore bridge files and keeps direct imports in owner test/fuzz files. |
 | Migration preservation | pass | E2E, heal, scanner, and fuzz consumers keep the same ECStore API symbols and call paths. |
 | Testing/verification | pass | Focused test/fuzz compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-152. |
@@ -4870,6 +4905,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-189 keeps ECStore replication runtime pool/stats/host reads behind the ECStore runtime-source boundary without adding public APIs. |
 | Migration preservation | pass | Replication initialization, queueing, delete stats, proxy stats, resync status updates, and emitted event host values keep existing semantics. |
 | Testing/verification | pass | ECStore compile/focused test, formatting, migration/layer guards, diff hygiene, residual scan, diff-only Rust risk scan, and pre-commit passed for API-189. |
+| Quality/architecture | pass | API-190 keeps ECStore lifecycle, tier, rebalance, and set-disk runtime reads behind the ECStore runtime-source boundary without adding public APIs. |
+| Migration preservation | pass | Lifecycle worker state, expiry/transition queueing, tier driver lookups, rebalance lifecycle snapshots, and emitted event host values keep existing semantics. |
+| Testing/verification | pass | ECStore compile/focused lifecycle test, formatting, migration/layer guards, diff hygiene, residual scan, diff-only Rust risk scan, and pre-commit passed for API-190. |
 
 ## Verification Notes
 
@@ -4923,6 +4961,18 @@ Passed before push:
   - Diff-only Rust risk scan: passed.
   - `make pre-commit`: passed, including 6552 nextest tests passed and
     doctests passed; the existing OPA policy test took 603s.
+- Issue #660 API-190 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib transition_worker_resize_cancels_removed_workers_directly -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Lifecycle runtime-source scan: passed for API-190 targets.
+  - Diff-only Rust risk scan: passed.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-186 current slice:
   - `cargo check -p rustfs-ecstore --tests`: passed.

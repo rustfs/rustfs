@@ -17,6 +17,7 @@ use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
+    bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_ExpiryState, GLOBAL_TransitionState, TransitionState},
     bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
     config::get_global_storage_class,
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
@@ -181,6 +182,14 @@ pub(crate) fn local_disk_set_drives_handle() -> Arc<RwLock<TypeLocalDiskSetDrive
 
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     GLOBAL_TierConfigMgr.clone()
+}
+
+pub(crate) fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
+    GLOBAL_ExpiryState.clone()
+}
+
+pub(crate) fn transition_state_handle() -> Arc<TransitionState> {
+    GLOBAL_TransitionState.clone()
 }
 
 pub(crate) fn event_notifier_handle() -> Arc<RwLock<EventNotifier>> {

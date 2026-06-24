@@ -28,7 +28,6 @@ use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::event_notification::{EventArgs, send_event};
-use crate::global::get_global_bucket_monitor;
 use crate::global::resolve_object_store_handle;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::runtime_sources;
@@ -3698,7 +3697,7 @@ fn wrap_with_bandwidth_monitor_with_header(
     arn: &str,
     header_size: usize,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
-    if let Some(monitor) = get_global_bucket_monitor() {
+    if let Some(monitor) = runtime_sources::bucket_monitor() {
         Box::new(MonitoredReader::new(
             monitor,
             stream,

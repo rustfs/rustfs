@@ -173,6 +173,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/metrics"),
         admin_route(Method::GET, "/v3/pools/list"),
         admin_route(Method::GET, "/v3/pools/status"),
+        admin_route(Method::GET, "/v3/decommission/status"),
         admin_route(Method::POST, "/v3/pools/decommission"),
         admin_route(Method::POST, "/v3/pools/cancel"),
         admin_route(Method::POST, "/v3/pools/clear"),
@@ -1036,6 +1037,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/rebalance/start"));
     assert_route(&router, Method::GET, &admin_path("/v3/rebalance/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/"));
