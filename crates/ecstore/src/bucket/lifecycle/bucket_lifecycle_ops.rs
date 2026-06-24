@@ -123,6 +123,14 @@ lazy_static! {
     pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
 }
 
+pub fn get_global_expiry_state() -> Arc<RwLock<ExpiryState>> {
+    GLOBAL_ExpiryState.clone()
+}
+
+pub fn get_global_transition_state() -> Arc<TransitionState> {
+    GLOBAL_TransitionState.clone()
+}
+
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
     let fallback = std::cmp::min(num_cpus::get() as i64, DEFAULT_TRANSITION_WORKERS_CAP);
     let configured = env::var(ENV_TRANSITION_WORKERS)
