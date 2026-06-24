@@ -500,6 +500,8 @@ impl SetDisks {
             return Ok(());
         }
 
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         let mut futures = Vec::with_capacity(disks.len());
 
         let mut errs = Vec::with_capacity(disks.len());
@@ -530,6 +532,8 @@ impl SetDisks {
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, fi.write_quorum(self.default_write_quorum())) {
             return Err(err);
         }
+
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         Ok(())
     }

@@ -102,6 +102,55 @@ where
 }
 
 impl SetDisks {
+    async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
+        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !is_dist_erasure().await
+    }
+
+    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+        let key = GetObjectMetadataCacheKey::new(bucket, object);
+        let cache = self.get_object_metadata_cache.read().await;
+        cache
+            .get(&key)
+            .filter(|entry| {
+                entry.is_fresh() && entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum
+            })
+            .cloned()
+    }
+
+    async fn cache_get_object_fileinfo(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        parts_metadata: &[FileInfo],
+        online_disks: &[Option<DiskStore>],
+        read_quorum: usize,
+    ) {
+        if fi.deleted || !fi.is_valid() {
+            return;
+        }
+
+        let key = GetObjectMetadataCacheKey::new(bucket, object);
+        let mut cache = self.get_object_metadata_cache.write().await;
+        if cache.len() >= GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+            cache.retain(|_, entry| entry.is_fresh());
+            if cache.len() >= GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+
+        cache.insert(
+            key,
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                fi: fi.clone(),
+                parts_metadata: parts_metadata.to_vec(),
+                online_disks: online_disks.to_vec(),
+                read_quorum,
+            },
+        );
+    }
+
     pub(super) async fn read_parts(
         disks: &[Option<DiskStore>],
         bucket: &str,
@@ -621,6 +670,11 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
+        if use_metadata_cache && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await {
+            return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+        }
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -663,6 +717,9 @@ impl SetDisks {
                     Some(self.pool_index),             // pool_index
                     Some(self.set_index),              // set_index
                 ))
+                .await;
+        } else if use_metadata_cache {
+            self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum as usize)
                 .await;
         }
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
@@ -1079,6 +1136,87 @@ impl SetDisks {
         debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
 
         Ok(())
+    }
+}
+
+fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
+    read_data
+        && !opts.no_lock
+        && opts.version_id.is_none()
+        && !opts.versioned
+        && !opts.version_suspended
+        && !opts.incl_free_versions
+        && !opts.delete_marker
+        && opts.part_number.is_none()
+        && !opts.data_movement
+        && !opts.raw_data_movement_read
+        && !bucket.starts_with(RUSTFS_META_BUCKET)
+}
+
+#[cfg(test)]
+mod metadata_cache_tests {
+    use super::*;
+
+    #[test]
+    fn get_object_metadata_cache_request_eligibility_is_conservative() {
+        let opts = ObjectOptions::default();
+        assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, false));
+        assert!(!is_get_object_metadata_cache_request_eligible(RUSTFS_META_BUCKET, &opts, true));
+
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            version_id: Some("version".to_string()),
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            incl_free_versions: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            part_number: Some(1),
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
     }
 }
 

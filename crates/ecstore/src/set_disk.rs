@@ -278,6 +278,8 @@ pub fn get_duplex_buffer_size() -> usize {
 }
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
+const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
+const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -436,8 +438,39 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
+    get_object_metadata_cache: Arc<RwLock<HashMap<GetObjectMetadataCacheKey, GetObjectMetadataCacheEntry>>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GetObjectMetadataCacheKey {
+    bucket: String,
+    object: String,
+}
+
+impl GetObjectMetadataCacheKey {
+    fn new(bucket: &str, object: &str) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct GetObjectMetadataCacheEntry {
+    created_at: Instant,
+    fi: FileInfo,
+    parts_metadata: Vec<FileInfo>,
+    online_disks: Vec<Option<DiskStore>>,
+    read_quorum: usize,
+}
+
+impl GetObjectMetadataCacheEntry {
+    fn is_fresh(&self) -> bool {
+        self.created_at.elapsed() <= GET_OBJECT_METADATA_CACHE_TTL
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -457,6 +490,13 @@ impl DiskHealthEntry {
 }
 
 impl SetDisks {
+    async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
+        self.get_object_metadata_cache
+            .write()
+            .await
+            .remove(&GetObjectMetadataCacheKey::new(bucket, object));
+    }
+
     async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.new_ns_lock(bucket, object).await?;
@@ -562,6 +602,7 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
+            get_object_metadata_cache: Arc::new(RwLock::new(HashMap::new())),
             lockers,
             local_lock_manager: rustfs_lock::get_global_lock_manager(),
         })
@@ -1023,6 +1064,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
 
     #[tracing::instrument(skip(self, data,))]
     async fn put_object(&self, bucket: &str, object: &str, data: &mut PutObjReader, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         let disks = self.get_disks_internal().await;
 
         let mut object_lock_guard = None;
@@ -1465,6 +1508,10 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 error = %err,
                 "SetDisk put_object stage summary"
             );
+        }
+
+        if result.is_ok() {
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
         }
 
         if issue3031_diag_enabled() {
@@ -2093,6 +2140,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             )
         };
 
+        self.invalidate_get_object_metadata_cache(dst_bucket, dst_object).await;
+
         if dst_opts.http_preconditions.is_some()
             && let Some(err) = self.check_write_precondition(dst_bucket, dst_object, dst_opts).await
         {
@@ -2205,6 +2254,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             .map_err(|e| to_object_err(e.into(), vec![src_bucket, src_object]))?;
         }
 
+        self.invalidate_get_object_metadata_cache(src_bucket, src_object).await;
+
         Ok(ObjectInfo::from_file_info(
             &fi,
             src_bucket,
@@ -2258,6 +2309,10 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>) {
+        for object in &objects {
+            self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
+        }
+
         // Default return value
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
 
@@ -2491,11 +2546,19 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
         }
 
+        for (object, err) in objects.iter().zip(del_errs.iter()) {
+            if err.is_none() {
+                self.invalidate_get_object_metadata_cache(bucket, &object.object_name).await;
+            }
+        }
+
         (del_objects, del_errs)
     }
 
     #[tracing::instrument(skip(self))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
             Some(self.acquire_write_lock_diag("delete_object", bucket, object).await?)
@@ -2507,6 +2570,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
+            self.get_object_metadata_cache.write().await.clear();
             return Ok(ObjectInfo::default());
         }
 
@@ -2595,6 +2659,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
             let mut oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
             oi.replication_decision = goi.replication_decision;
+            self.invalidate_get_object_metadata_cache(bucket, object).await;
             return Ok(oi);
         }
 
@@ -2624,6 +2689,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
         let mut obj_info = ObjectInfo::from_file_info(&dfi, bucket, object, opts.versioned || opts.version_suspended);
         obj_info.size = goi.size;
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
         Ok(obj_info)
     }
 
@@ -2675,6 +2741,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn put_object_metadata(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<ObjectInfo> {
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         // TODO: nslock
 
         // Guard lock for metadata update
@@ -2749,6 +2817,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         self.update_object_meta(bucket, object, fi.clone(), &online_disks)
             .await
             .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
+
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
@@ -3983,6 +4053,8 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
+
         let mut object_lock_guard = None;
 
         if opts.http_preconditions.is_some() {
@@ -4393,6 +4465,8 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
         fi.is_latest = true;
+
+        self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         Ok(ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended))
     }
