@@ -22,7 +22,7 @@ use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
-    collections::{BinaryHeap, HashMap},
+    collections::{BinaryHeap, HashMap, HashSet},
     sync::Arc,
     time::{Duration, SystemTime},
 };
@@ -1747,6 +1747,7 @@ impl HealManager {
 
         tokio::spawn(async move {
             let mut interval = interval(duration);
+            let mut seen_returning_sets = HashSet::new();
 
             loop {
                 let mut candidate_count = 0usize;
@@ -1770,6 +1771,11 @@ impl HealManager {
                         let mut endpoints = Vec::new();
                         for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
                             if let Some(disk) = disk_opt {
+                                let endpoint = disk.endpoint();
+                                let runtime_state = disk.runtime_state();
+                                let set_disk_id =
+                                    crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
+
                                 // detect unformatted disk via get_disk_id()
                                 match disk.get_disk_id().await {
                                     Err(DiskError::UnformattedDisk) => {
@@ -1779,11 +1785,11 @@ impl HealManager {
                                             event = EVENT_HEAL_AUTO_SCAN_DISK,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                            endpoint = %disk.endpoint(),
+                                            endpoint = %endpoint,
                                             disk_state = "unformatted",
                                             "Heal auto-scan candidate detected"
                                         );
-                                        endpoints.push(disk.endpoint());
+                                        endpoints.push(endpoint);
                                     }
                                     Err(e) => {
                                         warn!(
@@ -1791,14 +1797,30 @@ impl HealManager {
                                             event = EVENT_HEAL_AUTO_SCAN_DISK,
                                             component = LOG_COMPONENT_HEAL,
                                             subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
-                                            endpoint = %disk.endpoint(),
+                                            endpoint = %endpoint,
                                             disk_state = "check_failed",
                                             error = ?e,
                                             "Heal auto-scan disk inspection failed"
                                         );
                                     }
                                     Ok(_) => {
-                                        // Disk is formatted, no action needed
+                                        if runtime_state.as_str() == "returning"
+                                            && let Some(set_disk_id) = set_disk_id
+                                            && seen_returning_sets.insert(set_disk_id.clone())
+                                        {
+                                            candidate_count += 1;
+                                            debug!(
+                                                target: "rustfs::heal::manager",
+                                                event = EVENT_HEAL_AUTO_SCAN_DISK,
+                                                component = LOG_COMPONENT_HEAL,
+                                                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                                endpoint = %endpoint,
+                                                set_disk_id,
+                                                disk_state = "returning",
+                                                "Heal auto-scan returning disk candidate detected"
+                                            );
+                                            endpoints.push(endpoint);
+                                        }
                                     }
                                 }
                             }
