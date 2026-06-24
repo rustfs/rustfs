@@ -14,6 +14,7 @@
 
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
+use crate::erasure_codec::workspace::ShardBufferPool;
 use crate::erasure_coding::{BitrotReader, Erasure};
 use crate::get_diagnostics::{
     GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GetObjectFailureReason, classify_io_error,
@@ -68,9 +69,9 @@ pub(crate) struct ParallelReader<R> {
     shard_file_size: usize,
     data_shards: usize,
     total_shards: usize,
-    // Shard buffers handed back by the caller to be reused by the next `read`,
-    // avoiding a per-stripe allocation + zero-fill on the object read hot path.
-    recycled: Vec<Option<Vec<u8>>>,
+    // Request-scoped shard buffers keyed by shard index. Keeping ownership in
+    // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
+    buffers: ShardBufferPool,
 }
 }
 
@@ -94,7 +95,7 @@ where
             shard_file_size,
             data_shards: e.data_shards,
             total_shards: e.data_shards + e.parity_shards,
-            recycled: Vec::new(),
+            buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
 }
@@ -122,12 +123,7 @@ where
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
 
-        // Reuse the previous stripe's shard buffers instead of allocating and
-        // zero-filling a fresh `vec![0u8; shard_size]` per shard every stripe.
-        // `BitrotReader::read` overwrites `buf[..n]` and the caller truncates to
-        // `n`, so leftover bytes from the prior stripe are never observed.
-        let mut recycled = std::mem::take(&mut self.recycled);
-        recycled.resize_with(num_readers, || None);
+        self.buffers.ensure_slots(num_readers);
 
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         if num_readers >= self.data_shards {
@@ -135,9 +131,12 @@ where
             let mut sets = FuturesUnordered::new();
             for _ in 0..self.data_shards {
                 if let Some((i, reader)) = reader_iter.next() {
-                    // Only claim a recycled buffer when a shard will actually
-                    // be read; missing shards are reconstructed by `decode_data`.
-                    let recycled_buf = reader.is_some().then(|| recycled[i].take()).flatten();
+                    // Only claim a request-scoped buffer when a shard will actually be read.
+                    let recycled_buf = if reader.is_some() {
+                        Some(self.buffers.take(i, shard_size))
+                    } else {
+                        None
+                    };
                     sets.push(read_shard(i, reader, recycled_buf, shard_size));
                 }
             }
@@ -153,7 +152,11 @@ where
                         errs[i] = Some(e);
 
                         if let Some((next_i, next_reader)) = reader_iter.next() {
-                            let recycled_buf = next_reader.is_some().then(|| recycled[next_i].take()).flatten();
+                            let recycled_buf = if next_reader.is_some() {
+                                Some(self.buffers.take(next_i, shard_size))
+                            } else {
+                                None
+                            };
                             sets.push(read_shard(next_i, next_reader, recycled_buf, shard_size));
                         }
                     }
@@ -166,6 +169,17 @@ where
         }
 
         (shards, errs)
+    }
+
+    pub fn recycle_shards(&mut self, shards: &mut [Option<Vec<u8>>]) {
+        self.buffers.ensure_slots(self.readers.len());
+        for (i, reader) in self.readers.iter().enumerate() {
+            if reader.is_some()
+                && let Some(buf) = shards.get_mut(i).and_then(Option::take)
+            {
+                self.buffers.put(i, buf);
+            }
+        }
     }
 
     pub fn can_decode(&self, shards: &[Option<Vec<u8>>]) -> bool {
@@ -457,16 +471,9 @@ impl Erasure {
 
             written += n;
 
-            // Hand this stripe's buffers back so the next `read` reuses them.
-            // Only retain slots with an active reader; missing shards are always
-            // re-allocated by `decode_data`, so retaining their buffers here would
-            // hold memory that `read` can never reuse.
-            for (i, r) in reader.readers.iter().enumerate() {
-                if r.is_none() {
-                    shards[i] = None;
-                }
-            }
-            reader.recycled = shards;
+            // Hand active-reader buffers back so the next stripe can reuse them
+            // without retaining offline shard data that cannot be read again.
+            reader.recycle_shards(&mut shards);
         }
 
         if ret_err.is_some() {
