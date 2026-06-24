@@ -24,6 +24,7 @@ DURATION="120s"
 ROUNDS=3
 RETRY_PER_ROUND=1
 RETRY_SLEEP_SECS=2
+COOLDOWN_SECS=0
 WARP_BIN="${WARP_BIN:-warp}"
 OUT_DIR=""
 BASELINE_ROOT=""
@@ -62,6 +63,7 @@ Core options:
   --rounds <n>                        Rounds per size (default: 3)
   --retry-per-round <n>               Retries per failed round (default: 1)
   --retry-sleep-secs <n>              Sleep between retries (default: 2)
+  --cooldown-secs <n>                 Sleep between rounds/sizes (default: 0)
   --out-dir <dir>                     Output root (default: target/bench/put-large-stage-breakdown-<timestamp>)
   --baseline-root <dir>               Existing root from a previous run of this script
   --extra-args "<args>"               Extra args passed to run_object_batch_bench_enhanced.sh
@@ -129,6 +131,7 @@ parse_args() {
       --rounds) ROUNDS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-sleep-secs) RETRY_SLEEP_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --baseline-root) BASELINE_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -159,6 +162,22 @@ is_positive_int() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_nonnegative_int() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+cooldown_sleep() {
+  local secs="$1"
+  if (( secs <= 0 )); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY-RUN] sleep ${secs}"
+  else
+    sleep "$secs"
+  fi
+}
+
 validate_args() {
   if [[ -z "$ENDPOINT" || -z "$ACCESS_KEY" || -z "$SECRET_KEY" ]]; then
     echo "ERROR: --endpoint, --access-key, and --secret-key are required" >&2
@@ -168,8 +187,8 @@ validate_args() {
     echo "ERROR: only warp is supported by this wrapper" >&2
     exit 1
   fi
-  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$RETRY_PER_ROUND" || ! is_positive_int "$RETRY_SLEEP_SECS"; then
-    echo "ERROR: --rounds, --retry-per-round, and --retry-sleep-secs must be positive integers" >&2
+  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$RETRY_PER_ROUND" || ! is_positive_int "$RETRY_SLEEP_SECS" || ! is_nonnegative_int "$COOLDOWN_SECS"; then
+    echo "ERROR: --rounds, --retry-per-round, and --retry-sleep-secs must be positive integers; --cooldown-secs must be a nonnegative integer" >&2
     exit 1
   fi
   if [[ -n "$BASELINE_ROOT" && ! -d "$BASELINE_ROOT" ]]; then
@@ -229,6 +248,7 @@ write_manifest() {
     echo "rounds=${ROUNDS}"
     echo "retry_per_round=${RETRY_PER_ROUND}"
     echo "retry_sleep_secs=${RETRY_SLEEP_SECS}"
+    echo "cooldown_secs=${COOLDOWN_SECS}"
     echo "insecure=$(join_bool "$INSECURE")"
     echo "dry_run=$(join_bool "$DRY_RUN")"
     echo "baseline_root=${BASELINE_ROOT:-N/A}"
@@ -350,6 +370,7 @@ run_concurrency() {
     --rounds "$ROUNDS"
     --retry-per-round "$RETRY_PER_ROUND"
     --retry-sleep-secs "$RETRY_SLEEP_SECS"
+    --cooldown-secs "$COOLDOWN_SECS"
     --out-dir "$run_dir"
   )
 
@@ -411,9 +432,18 @@ main() {
   echo "Sizes: $SIZES"
   echo "Duration: $DURATION"
   echo "Rounds: $ROUNDS"
+  echo "Cooldown secs: $COOLDOWN_SECS"
 
+  local conc_count conc_index
+  conc_count="$(csv_to_lines "$CONCURRENCIES" | awk 'END{print NR+0}')"
+  conc_index=0
   while IFS= read -r concurrency; do
+    conc_index=$(( conc_index + 1 ))
     run_concurrency "$concurrency"
+    if (( COOLDOWN_SECS > 0 && conc_index < conc_count )); then
+      echo "Cooldown after concurrency=${concurrency}: ${COOLDOWN_SECS}s"
+      cooldown_sleep "$COOLDOWN_SECS"
+    fi
   done < <(csv_to_lines "$CONCURRENCIES")
 
   echo

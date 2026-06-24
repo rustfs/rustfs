@@ -22,6 +22,7 @@ DURATION="120s"
 ROUNDS=3
 RETRY_PER_ROUND=1
 RETRY_SLEEP_SECS=2
+COOLDOWN_SECS=0
 OUT_DIR=""
 BASELINE_ROOT=""
 EXTRA_ARGS=""
@@ -68,6 +69,7 @@ Benchmark options:
   --rounds <n>                        Default: 3
   --retry-per-round <n>               Default: 1
   --retry-sleep-secs <n>              Default: 2
+  --cooldown-secs <n>                 Sleep between rounds/sizes (default: 0)
   --out-dir <dir>                     Default: target/bench/put-large-stage-breakdown-<timestamp>
   --baseline-root <dir>
   --extra-args "<args>"
@@ -135,6 +137,7 @@ parse_args() {
       --rounds) ROUNDS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-sleep-secs) RETRY_SLEEP_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --baseline-root) BASELINE_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -173,6 +176,10 @@ is_positive_int() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_nonnegative_int() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
 count_csv_items() {
   local csv="$1"
   local count=0 raw item
@@ -205,8 +212,8 @@ validate_args() {
     echo "ERROR: --endpoint, --access-key, and --secret-key are required" >&2
     exit 1
   fi
-  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$RETRY_PER_ROUND" || ! is_positive_int "$RETRY_SLEEP_SECS"; then
-    echo "ERROR: --rounds, --retry-per-round, and --retry-sleep-secs must be positive integers" >&2
+  if ! is_positive_int "$ROUNDS" || ! is_positive_int "$RETRY_PER_ROUND" || ! is_positive_int "$RETRY_SLEEP_SECS" || ! is_nonnegative_int "$COOLDOWN_SECS"; then
+    echo "ERROR: --rounds, --retry-per-round, and --retry-sleep-secs must be positive integers; --cooldown-secs must be a nonnegative integer" >&2
     exit 1
   fi
   if ! is_positive_int "$CAPTURE_INTERVAL_SECS"; then
@@ -241,14 +248,15 @@ derive_capture_duration() {
     return
   fi
 
-  local sizes_count conc_count duration_secs nominal bench_secs retry_slack fixed_slack
+  local sizes_count conc_count duration_secs nominal bench_secs retry_slack cooldown_slack fixed_slack
   sizes_count="$(count_csv_items "$SIZES")"
   conc_count="$(count_csv_items "$CONCURRENCIES")"
   duration_secs="$(duration_to_seconds "$DURATION")"
   bench_secs=$(( sizes_count * conc_count * ROUNDS * duration_secs ))
   retry_slack=$(( conc_count * RETRY_PER_ROUND * RETRY_SLEEP_SECS + conc_count * 30 ))
+  cooldown_slack=$(( (conc_count * (sizes_count * (ROUNDS - 1) + (sizes_count - 1)) + (conc_count - 1)) * COOLDOWN_SECS ))
   fixed_slack=120
-  nominal=$(( bench_secs + retry_slack + fixed_slack ))
+  nominal=$(( bench_secs + retry_slack + cooldown_slack + fixed_slack ))
   echo "$nominal"
 }
 
@@ -305,6 +313,7 @@ run_benchmark() {
     --rounds "$ROUNDS"
     --retry-per-round "$RETRY_PER_ROUND"
     --retry-sleep-secs "$RETRY_SLEEP_SECS"
+    --cooldown-secs "$COOLDOWN_SECS"
     --out-dir "$OUT_DIR"
     --warp-bin "$WARP_BIN"
     --workload-label "$WORKLOAD_LABEL"
