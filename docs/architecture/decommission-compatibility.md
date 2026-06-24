@@ -33,6 +33,11 @@ being moved while still allowing a request to contain later targets whose leader
 are different nodes. Later queued targets are recovered or promoted by the
 leader that owns that target.
 
+Admin start, cancel, and clear requests may arrive on any cluster node. When the
+target pool first endpoint is remote, RustFS forwards the operation over the
+authenticated internode RPC channel to that first endpoint. The receiving node
+still enforces the local-leader rule before mutating decommission state.
+
 ### Persisted Metadata Shape
 
 The queue is persisted in pool metadata and decoded with the rest of
@@ -155,6 +160,7 @@ The queued multi-pool contract is guarded by:
 - `test_contextualized_decommission_start_request_allows_multiple_target_pools`
 - `test_decommission_start_local_leader_allows_remote_queued_pool`
 - `test_local_decommission_queue_prefix_stops_at_remote_leader`
+- `test_decommission_peer_target_returns_none_for_local_first_endpoint`
 - `test_pool_meta_queued_decommission_is_not_suspended_until_promoted`
 - `test_pool_meta_promoted_queued_decommission_can_be_canceled`
 - `test_first_resumable_decommission_queue_indices_stops_at_failed_or_canceled_state`

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin_server_info::get_local_server_property;
-use crate::global::resolve_object_store_handle;
+use crate::runtime_sources;
 use chrono::Utc;
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
+use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
@@ -364,7 +364,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         return real_time_metrics;
     }
 
-    let mut by_host_name = GLOBAL_RUSTFS_ADDR.read().await.clone();
+    let mut by_host_name = runtime_sources::rustfs_addr().await;
     if !opts.hosts.is_empty() {
         let server = get_local_server_property().await;
         if opts.hosts.contains(&server.endpoint) {
@@ -373,7 +373,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
             return real_time_metrics;
         }
     }
-    let local_node_name = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+    let local_node_name = runtime_sources::local_node_name().await;
     if by_host_name.starts_with(":") && !local_node_name.starts_with(":") {
         by_host_name = local_node_name;
     }
@@ -395,7 +395,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
         let mut metrics = global_metrics().report().await;
-        if let Some(init_time) = rustfs_common::get_global_init_time().await {
+        if let Some(init_time) = runtime_sources::scanner_init_time().await {
             metrics.current_started = init_time;
         }
         real_time_metrics.aggregated.scanner = Some(to_madmin_scanner_metrics(metrics));
@@ -461,7 +461,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 }
 
 async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String, DiskMetric> {
-    let store = match resolve_object_store_handle() {
+    let store = match runtime_sources::object_store_handle() {
         Some(store) => store,
         None => return HashMap::new(),
     };
