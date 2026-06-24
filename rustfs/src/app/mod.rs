@@ -41,7 +41,7 @@ mod lifecycle_transition_api_test;
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 mod ecstore_admin {
     pub(crate) use crate::storage::ecstore_admin::get_server_info;
@@ -105,6 +105,7 @@ pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub(crate) type PoolDecommissionInfo = ecstore_capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = ecstore_capacity::PoolStatus;
+pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
 pub(crate) type StorageError = crate::storage::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
@@ -648,6 +649,10 @@ pub(crate) fn get_global_deployment_id() -> Option<String> {
 
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
     crate::storage::get_global_lock_client()
+}
+
+pub(crate) fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+    crate::storage::get_global_lock_clients()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {

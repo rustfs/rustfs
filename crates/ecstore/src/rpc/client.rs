@@ -14,8 +14,8 @@
 
 use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
+use crate::runtime_sources;
 use http::Method;
-use rustfs_common::GLOBAL_CONN_MAP;
 use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
 use std::{error::Error, io::ErrorKind};
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
@@ -30,7 +30,7 @@ pub async fn node_service_time_out_client(
     interceptor: TonicInterceptor,
 ) -> Result<NodeServiceClient<InterceptedService<Channel, TonicInterceptor>>, Box<dyn Error>> {
     // Try to get cached channel
-    let cached_channel = { GLOBAL_CONN_MAP.read().await.get(addr).cloned() };
+    let cached_channel = runtime_sources::cached_node_channel(addr).await;
 
     let channel = match cached_channel {
         Some(channel) => {

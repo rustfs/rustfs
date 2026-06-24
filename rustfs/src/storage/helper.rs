@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::context::{resolve_action_credentials, resolve_notify_interface};
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
@@ -23,7 +24,7 @@ use rustfs_audit::{
     global::AuditLogger,
 };
 use rustfs_io_metrics::record_s3_op;
-use rustfs_notify::{EventArgsBuilder, notifier_global};
+use rustfs_notify::EventArgsBuilder;
 use rustfs_s3_ops::{S3Operation, operation_matches_event_name};
 use rustfs_s3_types::EventName;
 use rustfs_targets::{
@@ -311,8 +312,8 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(sk) = rustfs_credentials::get_global_access_key_opt() {
-                final_builder = final_builder.access_key(&sk);
+            if let Some(cred) = resolve_action_credentials() {
+                final_builder = final_builder.access_key(&cred.access_key);
             }
 
             // Inject OpenTelemetry trace context into audit tags for distributed tracing correlation
@@ -382,7 +383,7 @@ impl Drop for OperationHelper {
             if !event_args.is_replication_request() {
                 let ctx = state.request_context.clone();
                 spawn_background_with_context(ctx, async move {
-                    notifier_global::notify(event_args).await;
+                    resolve_notify_interface().notify(event_args).await;
                 });
             }
         }

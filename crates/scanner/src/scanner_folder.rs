@@ -461,6 +461,19 @@ fn build_object_heal_request(
     }
 }
 
+fn resolve_object_heal_entry(entries: &MetaCacheEntries, resolver: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+    if let Some(entry) = entries.resolve(resolver) {
+        return Some(entry);
+    }
+
+    entries
+        .as_ref()
+        .iter()
+        .flatten()
+        .find(|entry| !entry.name.ends_with(SLASH_SEPARATOR))
+        .cloned()
+}
+
 fn heal_priority_label(priority: HealChannelPriority) -> &'static str {
     match priority {
         HealChannelPriority::Low => "low",
@@ -2072,44 +2085,49 @@ impl FolderScanner {
                                 break;
                             }
 
-                         let entry_option =  match entries.resolve(resolver.clone()){
-                            Some(entry) => {
-                                Some(entry)
+                            let Some(entry) = resolve_object_heal_entry(&entries, resolver.clone()) else {
+                                continue;
+                            };
+
+                            (self.update_current_path)(&entry.name).await;
+
+                            if entry.is_dir() {
+                                continue;
                             }
-                            None => {
-                               let (entry,_) = entries.first_found();
-                               entry
-                            }
-                           };
 
+                            let fivs = match entry.file_info_versions(&bucket) {
+                                Ok(fivs) => fivs,
+                                Err(e) => {
+                                    error!(
+                                        target: "rustfs::scanner::folder",
+                                        event = EVENT_SCANNER_FOLDER_STATE,
+                                        component = LOG_COMPONENT_SCANNER,
+                                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                                        bucket = %bucket,
+                                        entry = %entry.name,
+                                        state = "file_info_versions_failed",
+                                        error = %e,
+                                        "Scanner list_path_raw failed to resolve file versions"
+                                    );
+                                    send_required_scanner_heal_request(
+                                        "object",
+                                        &bucket,
+                                        Some(&entry.name),
+                                        build_object_heal_request(
+                                            bucket.clone(),
+                                            entry.name.clone(),
+                                            None,
+                                            self.scan_mode,
+                                            HealChannelPriority::High,
+                                        ),
+                                    )
+                                    .await?;
+                                    found_objects = true;
+                                    continue;
+                                }
+                            };
 
-                           let Some(entry) = entry_option else {
-                            break;
-                           };
-
-                           (self.update_current_path)(&entry.name).await;
-
-                           if entry.is_dir() {
-                            continue;
-                           }
-
-
-
-
-                           let fivs = match entry.file_info_versions(&bucket) {
-                            Ok(fivs) => fivs,
-                            Err(e) => {
-                                error!(
-                                    target: "rustfs::scanner::folder",
-                                    event = EVENT_SCANNER_FOLDER_STATE,
-                                    component = LOG_COMPONENT_SCANNER,
-                                    subsystem = LOG_SUBSYSTEM_FOLDER,
-                                    bucket = %bucket,
-                                    entry = %entry.name,
-                                    state = "file_info_versions_failed",
-                                    error = %e,
-                                    "Scanner list_path_raw failed to resolve file versions"
-                                );
+                            for fiv in fivs.versions {
                                 send_required_scanner_heal_request(
                                     "object",
                                     &bucket,
@@ -2117,34 +2135,14 @@ impl FolderScanner {
                                     build_object_heal_request(
                                         bucket.clone(),
                                         entry.name.clone(),
-                                        None,
+                                        fiv.version_id.and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
                                         self.scan_mode,
                                         HealChannelPriority::High,
                                     ),
                                 )
                                 .await?;
                                 found_objects = true;
-                                continue;
                             }
-                           };
-
-                           for fiv in fivs.versions {
-
-                            send_required_scanner_heal_request(
-                                "object",
-                                &bucket,
-                                Some(&entry.name),
-                                build_object_heal_request(
-                                    bucket.clone(),
-                                    entry.name.clone(),
-                                    fiv.version_id.and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                ),
-                            )
-                            .await?;
-                            found_objects = true;
-                           }
 
 
                         }
@@ -2421,7 +2419,9 @@ mod tests {
 
     use super::*;
     use crate::{DiskOption, Endpoint, new_disk};
-    use rustfs_filemeta::{ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType};
+    use rustfs_filemeta::{
+        FileInfo, FileMeta, ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
+    };
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -2643,6 +2643,8 @@ mod tests {
             .iter()
             .find(|repair| repair.source == ScannerWorkSource::BucketReplication.as_str() && repair.kind == "object")
             .expect("bucket object repair work should be visible");
+        assert_eq!(object_repair.scanner_role, "repair_admission");
+        assert_eq!(object_repair.execution_owner, "bucket_replication_queue");
         assert_eq!(object_repair.skipped, 1);
         assert_eq!(object_repair.queued, 1);
         assert_eq!(object_repair.missed, 1);
@@ -3067,6 +3069,99 @@ mod tests {
         assert_eq!(request.priority, HealChannelPriority::Low);
         assert_eq!(request.source, HealRequestSource::Scanner);
         assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
+    }
+
+    fn metadata_for_object(bucket: &str, object: &str) -> Vec<u8> {
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: bucket.to_string(),
+            name: object.to_string(),
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        })
+        .expect("test metadata version should be accepted");
+        meta.marshal_msg().expect("test metadata should marshal")
+    }
+
+    fn test_metadata_resolver(bucket: &str) -> MetadataResolutionParams {
+        MetadataResolutionParams {
+            bucket: bucket.to_string(),
+            dir_quorum: 2,
+            obj_quorum: 2,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_allows_plain_unresolved_fallback() {
+        let entries = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: vec![1, 2, 3],
+            ..Default::default()
+        })]);
+
+        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
+            .expect("plain object fallback should be eligible for heal");
+
+        assert_eq!(entry.name, "object");
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_skips_unresolved_trailing_slash_fallback() {
+        let entries = MetaCacheEntries(vec![Some(MetaCacheEntry {
+            name: "object/".to_string(),
+            metadata: vec![1, 2, 3],
+            ..Default::default()
+        })]);
+
+        assert!(
+            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
+            "unresolved trailing-slash fallback must not be submitted as an object heal"
+        );
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_uses_plain_fallback_after_trailing_slash() {
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: vec![1, 2, 3],
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: vec![1, 2, 3],
+                ..Default::default()
+            }),
+        ]);
+
+        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
+            .expect("plain object fallback should remain eligible after a trailing-slash candidate");
+
+        assert_eq!(entry.name, "object");
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_preserves_resolved_trailing_slash_object() {
+        let metadata = metadata_for_object("bucket", "object/");
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: metadata.clone(),
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata,
+                ..Default::default()
+            }),
+        ]);
+
+        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
+            .expect("resolved trailing-slash object should remain eligible");
+
+        assert_eq!(entry.name, "object/");
+        assert!(entry.is_object_dir());
     }
 
     #[test]

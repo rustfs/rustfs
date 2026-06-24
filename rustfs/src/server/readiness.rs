@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_endpoints_handle, resolve_iam_ready};
+use crate::app::context::{
+    resolve_endpoints_handle, resolve_iam_ready, resolve_lock_clients_handle, resolve_object_store_handle,
+};
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage::{Endpoint, EndpointServerPools, get_global_lock_clients, is_dist_erasure, resolve_object_store_handle};
+use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
 use crate::storage::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
@@ -433,6 +435,24 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
     }
 }
 
+fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready),
+        readiness,
+    }
+}
+
+pub(crate) fn liveness_dependency_readiness_report() -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        readiness: DependencyReadiness {
+            storage_ready: true,
+            iam_ready: true,
+            lock_quorum_ready: true,
+        },
+        degraded_reasons: Vec::new(),
+    }
+}
+
 pub async fn collect_dependency_readiness() -> DependencyReadiness {
     collect_dependency_readiness_report().await.readiness
 }
@@ -453,12 +473,19 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
     };
-    let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
-        readiness,
-    };
+    let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
     report
+}
+
+pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
+    let readiness = DependencyReadiness {
+        storage_ready: collect_storage_readiness_uncached().await,
+        iam_ready: resolve_iam_ready(),
+        lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
+    };
+
+    dependency_readiness_report_from_readiness(readiness)
 }
 
 async fn collect_lock_quorum_status() -> LockQuorumStatus {
@@ -481,10 +508,7 @@ async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
     };
-    let report = DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, iam_ready_raw, readiness.lock_quorum_ready),
-        readiness,
-    };
+    let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
     report.readiness
 }
@@ -584,7 +608,7 @@ async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
     let Some(pool_endpoints) = resolve_endpoints_handle() else {
         return LockQuorumStatus::default();
     };
-    let Some(lock_clients) = get_global_lock_clients() else {
+    let Some(lock_clients) = resolve_lock_clients_handle() else {
         return LockQuorumStatus::default();
     };
 

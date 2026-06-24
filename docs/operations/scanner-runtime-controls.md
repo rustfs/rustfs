@@ -188,6 +188,8 @@ and `missed` counters used by `source_work`, plus:
 |---|---|
 | `source` | `bucket_replication` for bucket replication repair, or `site_replication` for site replication boundary signals. |
 | `kind` | Bucket repair kinds are `object`, `delete_marker`, `version_purge`, and `existing_object`. Site replication boundary kinds are `passive_requeue` and `active_resync`. |
+| `scanner_role` | `repair_admission` means scanner found work and attempted to admit it to a worker queue. `boundary_signal` means scanner is reporting state owned by another runtime. |
+| `execution_owner` | `bucket_replication_queue` for bucket replication repair execution, or `site_replication_runtime` for site replication resync execution. |
 
 For bucket replication, `queued` means scanner-discovered repair was admitted
 to the replication queue, `missed` means the queue or worker path could not
@@ -196,6 +198,20 @@ accept it, and `skipped` means the object did not require a new repair task.
 The site replication kinds keep passive scanner discovery separate from active
 resync. Scanner status may report site replication boundary counters, but the
 scanner should not be treated as the active site replication resync controller.
+
+Use this boundary when interpreting replication pressure:
+
+| Scenario | Scanner source | Repair kind | Scanner role | Execution owner | Operational meaning |
+|---|---|---|---|---|---|
+| Bucket object, delete-marker, version-purge, or existing-object repair found during a scan | `bucket_replication` | `object`, `delete_marker`, `version_purge`, `existing_object` | `repair_admission` | `bucket_replication_queue` | Scanner found bucket replication repair work and attempted to admit it to the replication queue. |
+| Peer-originated or passive site replication work is observed while scanning | `site_replication` | `passive_requeue` | `boundary_signal` | `site_replication_runtime` | Scanner is reporting a passive site-replication boundary signal; it is not taking ownership of active site resync. |
+| Admin-triggered or runtime-owned site resync activity is visible in scanner metrics | `site_replication` | `active_resync` | `boundary_signal` | `site_replication_runtime` | Treat this as a boundary/status signal owned by the site replication runtime, not as scanner-controlled repair execution. |
+
+If `site_replication` counters grow while bucket replication counters stay
+flat, investigate site replication status and resync state before tuning
+scanner pacing. If `bucket_replication` `missed` grows, investigate the bucket
+replication worker queue or target health before changing scanner cycle
+settings.
 
 ## Reading Maintenance Control
 

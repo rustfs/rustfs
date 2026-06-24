@@ -51,7 +51,6 @@ use md5::Md5;
 use rand::{Rng, RngExt};
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
 use rustfs_rio::HashReader;
-use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_generation};
 use rustfs_utils::HashAlgorithm;
 use rustfs_utils::{
     net::get_endpoint_url,
@@ -192,8 +191,8 @@ where
 async fn build_tls_config() -> Result<rustls::ClientConfig, std::io::Error> {
     with_rustls_init_guard(|| Ok(()))?;
 
-    let outbound_tls = load_global_outbound_tls_state().await;
-    record_tls_generation("ecstore_transition_client", outbound_tls.generation.0);
+    let outbound_tls = crate::client::runtime_sources::transition_client_outbound_tls_state().await;
+    crate::client::runtime_sources::record_transition_client_tls_generation(outbound_tls.generation.0);
     let builder = if let Some(root_ca_pem) = outbound_tls.root_ca_pem.as_ref() {
         let mut reader = std::io::BufReader::new(root_ca_pem.as_slice());
         let certs_der = rustls_pki_types::CertificateDer::pem_reader_iter(&mut reader)

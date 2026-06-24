@@ -16,11 +16,10 @@
 // scoped to that module so generated internals do not relax lints elsewhere.
 #[allow(unsafe_code)]
 mod generated;
+mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
 use rustfs_common::{GLOBAL_CONN_MAP, evict_connection_with_log_level};
-use rustfs_io_metrics::internode_metrics::global_internode_metrics;
-use rustfs_tls_runtime::{load_global_outbound_tls_state, record_tls_consumer_stale_generation};
 use std::{
     collections::HashMap,
     error::Error,
@@ -134,7 +133,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         // Overall timeout for any RPC - fail fast on unresponsive peers
         .timeout(rpc_timeout);
 
-    let outbound_tls = load_global_outbound_tls_state().await;
+    let outbound_tls = runtime_sources::outbound_tls_state().await;
     let generation = outbound_tls.generation.0;
     let mut stale_generation = false;
     {
@@ -180,11 +179,11 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
 
     let channel = match connector.connect().await {
         Ok(channel) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), true);
+            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), true);
             channel
         }
         Err(err) => {
-            global_internode_metrics().record_dial_result(dial_started_at.elapsed(), false);
+            runtime_sources::record_grpc_dial_result(dial_started_at.elapsed(), false);
             return Err(err.into());
         }
     };
@@ -199,7 +198,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         generation_cache.insert(addr.to_string(), generation);
     }
     if stale_generation {
-        record_tls_consumer_stale_generation("protos_grpc_channel");
+        runtime_sources::record_stale_grpc_channel_tls_generation();
     }
 
     debug!("Successfully created and cached gRPC channel to: {}", addr);

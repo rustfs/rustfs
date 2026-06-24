@@ -109,6 +109,7 @@ pub use writer::*;
 
 mod http_reader;
 pub use http_reader::*;
+mod http_runtime_sources;
 
 pub use compress_index::{Index, TryGetIndex};
 

@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use crate::admin_server_info::get_local_server_property;
-use crate::global::resolve_object_store_handle;
+use crate::runtime_sources;
 use chrono::Utc;
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, heal_channel::DriveState, metrics::global_metrics};
+use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_madmin::metrics::{
     DiskIOStats, DiskMetric, LastMinute as MadminLastMinute, NetDevLine, NetMetrics, RPCMetrics, RealtimeMetrics,
@@ -294,6 +294,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -308,6 +310,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -322,6 +326,8 @@ fn to_madmin_scanner_metrics(metrics: rustfs_common::metrics::ScannerMetricsRepo
             .map(|repair| MadminScannerReplicationRepairSnapshot {
                 source: repair.source,
                 kind: repair.kind,
+                scanner_role: repair.scanner_role,
+                execution_owner: repair.execution_owner,
                 checked: repair.checked,
                 queued: repair.queued,
                 executed: repair.executed,
@@ -358,7 +364,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
         return real_time_metrics;
     }
 
-    let mut by_host_name = GLOBAL_RUSTFS_ADDR.read().await.clone();
+    let mut by_host_name = runtime_sources::rustfs_addr().await;
     if !opts.hosts.is_empty() {
         let server = get_local_server_property().await;
         if opts.hosts.contains(&server.endpoint) {
@@ -367,7 +373,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
             return real_time_metrics;
         }
     }
-    let local_node_name = GLOBAL_LOCAL_NODE_NAME.read().await.clone();
+    let local_node_name = runtime_sources::local_node_name().await;
     if by_host_name.starts_with(":") && !local_node_name.starts_with(":") {
         by_host_name = local_node_name;
     }
@@ -389,7 +395,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
     if types.contains(&MetricType::SCANNER) {
         debug!("start get scanner metrics");
         let mut metrics = global_metrics().report().await;
-        if let Some(init_time) = rustfs_common::get_global_init_time().await {
+        if let Some(init_time) = runtime_sources::scanner_init_time().await {
             metrics.current_started = init_time;
         }
         real_time_metrics.aggregated.scanner = Some(to_madmin_scanner_metrics(metrics));
@@ -455,7 +461,7 @@ pub async fn collect_local_metrics(types: MetricType, opts: &CollectMetricsOpts)
 }
 
 async fn collect_local_disks_metrics(disks: &HashSet<String>) -> HashMap<String, DiskMetric> {
-    let store = match resolve_object_store_handle() {
+    let store = match runtime_sources::object_store_handle() {
         Some(store) => store,
         None => return HashMap::new(),
     };
@@ -844,6 +850,8 @@ mod test {
             replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "object".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 checked: 62,
                 queued: 63,
                 executed: 64,
@@ -854,6 +862,8 @@ mod test {
             current_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "bucket_replication".to_string(),
                 kind: "delete_marker".to_string(),
+                scanner_role: "repair_admission".to_string(),
+                execution_owner: "bucket_replication_queue".to_string(),
                 checked: 68,
                 queued: 69,
                 executed: 70,
@@ -864,6 +874,8 @@ mod test {
             last_cycle_replication_repair: vec![rustfs_common::metrics::ScannerReplicationRepairSnapshot {
                 source: "site_replication".to_string(),
                 kind: "active_resync".to_string(),
+                scanner_role: "boundary_signal".to_string(),
+                execution_owner: "site_replication_runtime".to_string(),
                 checked: 74,
                 queued: 75,
                 executed: 76,
@@ -943,11 +955,17 @@ mod test {
         assert_eq!(scanner.last_cycle_source_work[0].skipped, 60);
         assert_eq!(scanner.replication_repair[0].source, "bucket_replication");
         assert_eq!(scanner.replication_repair[0].kind, "object");
+        assert_eq!(scanner.replication_repair[0].scanner_role, "repair_admission");
+        assert_eq!(scanner.replication_repair[0].execution_owner, "bucket_replication_queue");
         assert_eq!(scanner.replication_repair[0].missed, 67);
         assert_eq!(scanner.current_cycle_replication_repair[0].kind, "delete_marker");
+        assert_eq!(scanner.current_cycle_replication_repair[0].scanner_role, "repair_admission");
+        assert_eq!(scanner.current_cycle_replication_repair[0].execution_owner, "bucket_replication_queue");
         assert_eq!(scanner.current_cycle_replication_repair[0].queued, 69);
         assert_eq!(scanner.last_cycle_replication_repair[0].source, "site_replication");
         assert_eq!(scanner.last_cycle_replication_repair[0].kind, "active_resync");
+        assert_eq!(scanner.last_cycle_replication_repair[0].scanner_role, "boundary_signal");
+        assert_eq!(scanner.last_cycle_replication_repair[0].execution_owner, "site_replication_runtime");
         assert_eq!(scanner.last_cycle_replication_repair[0].skipped, 78);
         assert_eq!(scanner.partial_cycles, 80);
     }

@@ -68,6 +68,13 @@ Convert changes into independently verifiable outcomes. Prefer focused tests for
 For code changes, run and pass the following before opening a PR:
 
 ```bash
+make pre-pr
+```
+
+Before committing code changes, prefer focused verification for the touched
+surface and use the faster local gate when a broad smoke check is needed:
+
+```bash
 make pre-commit
 ```
 

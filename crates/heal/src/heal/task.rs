@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
+use crate::heal::{
+    ErasureSetHealer,
+    progress::HealProgress,
+    storage::{HealStorageAPI, next_heal_listing_token},
+};
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
@@ -51,6 +55,8 @@ const EVENT_HEAL_ERASURE_SET_RESULT: &str = "heal_erasure_set_result";
 /// Heal type
 #[derive(Debug, Clone)]
 pub enum HealType {
+    /// Cluster heal
+    Cluster,
     /// Object heal
     Object {
         bucket: String,
@@ -59,6 +65,8 @@ pub enum HealType {
     },
     /// Bucket heal
     Bucket { bucket: String },
+    /// Prefix heal
+    Prefix { bucket: String, prefix: String },
     /// Erasure Set heal (includes disk format repair)
     ErasureSet { buckets: Vec<String>, set_disk_id: String },
     /// Metadata heal
@@ -76,8 +84,10 @@ pub enum HealType {
 impl HealType {
     fn log_kind(&self) -> &'static str {
         match self {
+            Self::Cluster => "cluster",
             Self::Object { .. } => "object",
             Self::Bucket { .. } => "bucket",
+            Self::Prefix { .. } => "prefix",
             Self::ErasureSet { .. } => "erasure_set",
             Self::Metadata { .. } => "metadata",
             Self::MRF { .. } => "mrf",
@@ -304,8 +314,10 @@ impl HealTask {
 
     pub fn metric_type_label(&self) -> &'static str {
         match &self.heal_type {
+            HealType::Cluster => "cluster",
             HealType::Object { .. } => "object",
             HealType::Bucket { .. } => "bucket",
+            HealType::Prefix { .. } => "prefix",
             HealType::ErasureSet { .. } => "erasure_set",
             HealType::Metadata { .. } => "metadata",
             HealType::MRF { .. } => "mrf",
@@ -413,6 +425,13 @@ impl HealTask {
         Self::is_data_usage_cache_object(bucket, object) && Self::is_transient_lock_or_timeout_error(err)
     }
 
+    fn is_no_heal_required_error(err: &Error) -> bool {
+        match err {
+            Error::Other(message) => matches!(message.as_str(), "No heal required" | "No healing is required"),
+            _ => matches!(err.to_string().as_str(), "No heal required" | "No healing is required"),
+        }
+    }
+
     async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
             return false;
@@ -478,12 +497,14 @@ impl HealTask {
         );
 
         let result = match &self.heal_type {
+            HealType::Cluster => self.heal_cluster().await,
             HealType::Object {
                 bucket,
                 object,
                 version_id,
             } => self.heal_object(bucket, object, version_id.as_deref()).await,
             HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
+            HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
 
             HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
             HealType::MRF { meta_path } => self.heal_mrf(meta_path).await,
@@ -1104,7 +1125,7 @@ impl HealTask {
                 self.record_result_item(result).await;
 
                 if self.options.recursive {
-                    self.heal_bucket_objects(bucket).await?;
+                    self.heal_bucket_objects(bucket, "").await?;
                 }
 
                 if !self.options.recursive {
@@ -1138,7 +1159,43 @@ impl HealTask {
         }
     }
 
-    async fn heal_bucket_objects(&self, bucket: &str) -> Result<()> {
+    async fn heal_cluster(&self) -> Result<()> {
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            stage = "cluster_recursive",
+            "Heal cluster started"
+        );
+
+        let bucket_infos = self.await_with_control(self.storage.list_buckets()).await?;
+        for bucket_info in bucket_infos {
+            self.check_control_flags().await?;
+            self.heal_bucket(&bucket_info.name).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn heal_prefix(&self, bucket: &str, prefix: &str) -> Result<()> {
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            prefix,
+            stage = "prefix_recursive",
+            "Heal prefix started"
+        );
+
+        self.heal_bucket_objects(bucket, prefix).await
+    }
+
+    async fn heal_bucket_objects(&self, bucket: &str, prefix: &str) -> Result<()> {
         let mut continuation_token: Option<String> = None;
         let mut scanned = 0u64;
         let mut healed = 0u64;
@@ -1162,7 +1219,7 @@ impl HealTask {
             let (objects, next_token, is_truncated) = self
                 .await_with_control(
                     self.storage
-                        .list_objects_for_heal_page(bucket, "", continuation_token.as_deref()),
+                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref()),
                 )
                 .await?;
 
@@ -1276,20 +1333,7 @@ impl HealTask {
                 break;
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                warn!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_BUCKET_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    bucket,
-                    result = "missing_continuation_token",
-                    "Heal bucket listing truncated without continuation token"
-                );
-                break;
-            }
+            continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
         }
 
         if failed > 0 {
@@ -1305,6 +1349,7 @@ impl HealTask {
             subsystem = LOG_SUBSYSTEM_TASK,
             task_id = %self.id,
             bucket,
+            prefix,
             scanned,
             healed,
             failed,
@@ -1823,37 +1868,50 @@ impl HealTask {
         match format_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!(
+                    if Self::is_no_heal_required_error(&e) {
+                        debug!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_ERASURE_SET_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_TASK,
+                            task_id = %self.id,
+                            set_disk_id,
+                            result = "format_noop",
+                            "Heal erasure set format repair skipped because no format heal was required"
+                        );
+                    } else {
+                        error!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_ERASURE_SET_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_TASK,
+                            task_id = %self.id,
+                            set_disk_id,
+                            result = "format_failed",
+                            error = %e,
+                            "Heal erasure set failed"
+                        );
+                        {
+                            let mut progress = self.progress.write().await;
+                            progress.update_progress(4, 4, 0, 0);
+                        }
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
+                        });
+                    }
+                } else {
+                    debug!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_ERASURE_SET_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_TASK,
                         task_id = %self.id,
                         set_disk_id,
-                        result = "format_failed",
-                        error = %e,
-                        "Heal erasure set failed"
+                        drives_healed = result.after.drives.len(),
+                        result = "format_ok",
+                        "Heal erasure set format repaired"
                     );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(4, 4, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
-                    });
                 }
-
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_ERASURE_SET_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    set_disk_id,
-                    drives_healed = result.after.drives.len(),
-                    result = "format_ok",
-                    "Heal erasure set format repaired"
-                );
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
@@ -2060,6 +2118,9 @@ mod tests {
         healed_objects: Mutex<Vec<String>>,
         bucket_heal_opts: Mutex<Vec<HealOpts>>,
         object_heal_opts: Mutex<Vec<HealOpts>>,
+        format_no_heal_required: Mutex<bool>,
+        listed_prefixes: Mutex<Vec<String>>,
+        truncate_without_token: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -2108,7 +2169,10 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
-            Ok(Vec::new())
+            Ok(vec![BucketInfo {
+                name: "bucket-a".to_string(),
+                ..Default::default()
+            }])
         }
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
@@ -2155,7 +2219,12 @@ mod tests {
         }
 
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-            Ok((HealResultItem::default(), None))
+            let no_heal_required = *self.format_no_heal_required.lock().unwrap();
+            if no_heal_required {
+                Ok((HealResultItem::default(), Some(Error::other("No heal required"))))
+            } else {
+                Ok((HealResultItem::default(), None))
+            }
         }
 
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
@@ -2165,9 +2234,14 @@ mod tests {
         async fn list_objects_for_heal_page(
             &self,
             bucket: &str,
-            _prefix: &str,
+            prefix: &str,
             continuation_token: Option<&str>,
         ) -> Result<(Vec<String>, Option<String>, bool)> {
+            self.listed_prefixes.lock().unwrap().push(prefix.to_string());
+            if *self.truncate_without_token.lock().unwrap() {
+                return Ok((vec!["object-a".to_string()], None, true));
+            }
+
             let mut listed = self.listed.lock().unwrap();
             if continuation_token.is_none() && !*listed {
                 *listed = true;
@@ -2176,6 +2250,8 @@ mod tests {
                         format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}"),
                         format!("{BUCKET_META_PREFIX}/bucket-metadata.bin"),
                     ]
+                } else if prefix == "logs/" {
+                    vec!["logs/object-a".to_string(), "logs/object-b".to_string()]
                 } else {
                     vec!["object-a".to_string(), "object-b".to_string()]
                 };
@@ -2223,6 +2299,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_recursive_bucket_heal_fails_when_listing_lacks_continuation_token() {
+        let storage = Arc::new(MockStorage {
+            truncate_without_token: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .heal_bucket("bucket-a")
+            .await
+            .expect_err("recursive bucket heal must fail on incomplete pagination state");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(err.to_string().contains("truncated without continuation token"));
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string()],
+            "the already returned page may be processed, but the task must not report success"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cluster_heal_visits_bucket_objects() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Cluster,
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute().await.expect("cluster heal should visit bucket objects");
+
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    }
+
+    #[tokio::test]
     async fn test_recursive_bucket_heal_does_not_remove_bucket_metadata() {
         let storage = Arc::new(MockStorage::default());
         let request = HealRequest::new(
@@ -2256,6 +2388,34 @@ mod tests {
         assert!(object_opts.iter().all(|opts| opts.remove));
         assert!(object_opts.iter().all(|opts| opts.recreate));
         assert!(object_opts.iter().all(|opts| opts.scan_mode == HealScanMode::Deep));
+    }
+
+    #[tokio::test]
+    async fn test_prefix_heal_lists_and_repairs_objects_under_prefix() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Prefix {
+                bucket: "bucket-a".to_string(),
+                prefix: "logs/".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("prefix heal should scan and repair objects under the prefix");
+
+        assert_eq!(storage.listed_prefixes.lock().unwrap().as_slice(), ["logs/".to_string()]);
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["logs/object-a".to_string(), "logs/object-b".to_string()]
+        );
     }
 
     #[tokio::test]
@@ -2307,5 +2467,33 @@ mod tests {
         let progress = task.get_progress().await;
         assert_eq!(progress.objects_scanned, 2);
         assert_eq!(progress.objects_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_erasure_set_heal_continues_after_format_no_heal_required() {
+        let storage = Arc::new(MockStorage::default());
+        *storage.format_no_heal_required.lock().unwrap() = true;
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: Vec::new(),
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        let err = task
+            .heal_erasure_set(Vec::new(), "pool_0_set_0".to_string())
+            .await
+            .expect_err("test mock should fail after format when resolving resume disk");
+
+        assert!(
+            err.to_string().contains("not implemented in tests"),
+            "erasure-set heal should continue past NoHealRequired format result, got: {err}"
+        );
     }
 }

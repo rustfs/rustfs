@@ -18,15 +18,16 @@ use super::super::TierConfigMgr;
 use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
 use super::super::{
     collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_notification_sys, get_global_region,
-    get_global_replication_pool, get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port,
-    set_global_storage_class,
+    get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients,
+    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
+    get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, IamInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
-    LockClientInterface, NotificationSystemInterface, NotifyInterface, OutboundTlsRuntimeInterface, RegionInterface,
-    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, ScannerMetricsInterface, ServerConfigInterface,
+    DeploymentIdInterface, EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
+    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
+    OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
+    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
     StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
@@ -35,15 +36,22 @@ use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
 use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{get_oidc, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_io_metrics::{
+    PerformanceMetrics,
+    global_metrics::get_global_metrics,
+    internode_metrics::{InternodeMetrics, global_internode_metrics},
+};
 use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{
     GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
 };
-use std::{sync::Arc, time::SystemTime};
+use s3s::dto::SelectObjectContentInput;
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
@@ -65,6 +73,24 @@ impl IamInterface for IamHandle {
 
     fn is_ready(&self) -> bool {
         rustfs_iam::get().is_ok()
+    }
+
+    fn oidc(&self) -> Option<Arc<OidcSys>> {
+        rustfs_iam::get_oidc()
+    }
+
+    fn token_signing_key(&self) -> Option<String> {
+        rustfs_iam::manager::get_token_signing_key()
+    }
+}
+
+/// Default OIDC interface adapter.
+#[derive(Default)]
+pub struct OidcHandle;
+
+impl OidcInterface for OidcHandle {
+    fn handle(&self) -> Option<Arc<OidcSys>> {
+        get_oidc()
     }
 }
 
@@ -256,6 +282,51 @@ impl LockClientInterface for LockClientHandle {
     }
 }
 
+/// Default lock clients interface adapter.
+#[derive(Default)]
+pub struct LockClientsHandle;
+
+impl LockClientsInterface for LockClientsHandle {
+    fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+        get_global_lock_clients().cloned()
+    }
+}
+
+/// Default performance metrics interface adapter.
+#[derive(Default)]
+pub struct PerformanceMetricsHandle;
+
+impl PerformanceMetricsInterface for PerformanceMetricsHandle {
+    fn handle(&self) -> Arc<PerformanceMetrics> {
+        get_global_metrics()
+    }
+}
+
+/// Default internode metrics interface adapter.
+#[derive(Default)]
+pub struct InternodeMetricsHandle;
+
+impl InternodeMetricsInterface for InternodeMetricsHandle {
+    fn handle(&self) -> Arc<InternodeMetrics> {
+        global_internode_metrics().clone()
+    }
+}
+
+/// Default S3 Select database interface adapter.
+#[derive(Default)]
+pub struct S3SelectDbHandle;
+
+#[async_trait]
+impl S3SelectDbInterface for S3SelectDbHandle {
+    async fn get(
+        &self,
+        input: SelectObjectContentInput,
+        enable_debug: bool,
+    ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+        rustfs_s3select_query::get_global_db(input, enable_debug).await
+    }
+}
+
 /// Default local node name interface adapter.
 #[derive(Default)]
 pub struct LocalNodeNameHandle;
@@ -391,12 +462,32 @@ pub fn default_lock_client_interface() -> Arc<dyn LockClientInterface> {
     Arc::new(LockClientHandle)
 }
 
+pub fn default_lock_clients_interface() -> Arc<dyn LockClientsInterface> {
+    Arc::new(LockClientsHandle)
+}
+
+pub fn default_performance_metrics_interface() -> Arc<dyn PerformanceMetricsInterface> {
+    Arc::new(PerformanceMetricsHandle)
+}
+
+pub fn default_internode_metrics_interface() -> Arc<dyn InternodeMetricsInterface> {
+    Arc::new(InternodeMetricsHandle)
+}
+
+pub fn default_s3select_db_interface() -> Arc<dyn S3SelectDbInterface> {
+    Arc::new(S3SelectDbHandle)
+}
+
 pub fn default_local_node_name_interface() -> Arc<dyn LocalNodeNameInterface> {
     Arc::new(LocalNodeNameHandle)
 }
 
 pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterface> {
     Arc::new(ActionCredentialHandle)
+}
+
+pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
+    Arc::new(OidcHandle)
 }
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {

@@ -14,7 +14,7 @@
 
 use crate::admin::{
     auth::validate_admin_request,
-    handlers::plugins_instances,
+    handlers::{cluster_snapshot, plugins_instances, system},
     plugin_contract::{
         PluginContractDomain, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
         PluginInstanceSource, PluginOperationalStateContract,
@@ -31,6 +31,7 @@ use rustfs_extension_schema::{
     OPS_PROFILER_CAPABILITY, OpsDiagnosticsContract, OpsProfilerContract,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
+use rustfs_storage_api::CapabilityStatus;
 use rustfs_targets::{
     OpsDiagnosticsRegistry, OpsProfilerRegistry, TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus,
     builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
@@ -61,6 +62,7 @@ pub fn register_extension_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 pub(crate) struct ExtensionCatalogResponse {
     pub extensions: Vec<ExtensionSchema>,
     pub runtime_capabilities: ExtensionRuntimeCapabilitiesResponse,
+    pub cluster_snapshot: cluster_snapshot::ClusterSnapshotDiscoveryResponse,
     pub external_plugin_flow: TargetPluginExternalFlowGateStatus,
 }
 
@@ -80,6 +82,10 @@ where
     pub runtime: ExtensionRuntimeContract,
     pub disabled_by_default: bool,
     pub startup_fatal: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_capability_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub runtime_capability_summary: Option<CapabilityStatus>,
     pub contract: T,
 }
 
@@ -112,20 +118,25 @@ pub(crate) struct ExtensionInstancesResponse {
     pub next_marker: Option<String>,
 }
 
-fn build_extension_catalog_response() -> ExtensionCatalogResponse {
+async fn build_extension_catalog_response() -> Result<ExtensionCatalogResponse, rustfs_storage_api::CapabilitySnapshotError> {
     let mut extensions = builtin_extension_schemas();
     let example = example_external_webhook_plugin();
     extensions.push(target_marketplace_extension_schema(&example.manifest));
     extensions.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
+    let runtime_capabilities = system::build_runtime_capabilities_response().await?;
+    let cluster_snapshot = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
 
-    ExtensionCatalogResponse {
+    Ok(ExtensionCatalogResponse {
         extensions,
-        runtime_capabilities: build_extension_runtime_capabilities_response(),
+        runtime_capabilities: build_extension_runtime_capabilities_response(&runtime_capabilities),
+        cluster_snapshot,
         external_plugin_flow: TargetPluginExternalFlowGate::default().status(),
-    }
+    })
 }
 
-fn build_extension_runtime_capabilities_response() -> ExtensionRuntimeCapabilitiesResponse {
+fn build_extension_runtime_capabilities_response(
+    runtime_capabilities: &system::RuntimeCapabilitiesResponse,
+) -> ExtensionRuntimeCapabilitiesResponse {
     let ops_diagnostics_schema = builtin_ops_diagnostics_extension_schema();
     let ops_diagnostics_contract = builtin_ops_diagnostics_contract();
     let mut ops_diagnostics_registry = OpsDiagnosticsRegistry::new();
@@ -143,6 +154,7 @@ fn build_extension_runtime_capabilities_response() -> ExtensionRuntimeCapabiliti
             .register_schema(&ops_profiler_schema, &ops_profiler_contract)
             .is_ok()
     );
+    let runtime_capability_path = Some(format!("{}{}", ADMIN_PREFIX, system::RUNTIME_CAPABILITIES_ROUTE_SUFFIX));
 
     ExtensionRuntimeCapabilitiesResponse {
         ops_diagnostics: ExtensionRuntimeCapabilityResponse {
@@ -151,6 +163,8 @@ fn build_extension_runtime_capabilities_response() -> ExtensionRuntimeCapabiliti
             runtime: ops_diagnostics_schema.runtime,
             disabled_by_default: ops_diagnostics_schema.disabled_by_default,
             startup_fatal: false,
+            runtime_capability_path: runtime_capability_path.clone(),
+            runtime_capability_summary: Some(runtime_capabilities.summary.observability.clone()),
             contract: ops_diagnostics_contract,
         },
         ops_profiler: ExtensionRuntimeCapabilityResponse {
@@ -159,6 +173,8 @@ fn build_extension_runtime_capabilities_response() -> ExtensionRuntimeCapabiliti
             runtime: ops_profiler_schema.runtime,
             disabled_by_default: ops_profiler_schema.disabled_by_default,
             startup_fatal: false,
+            runtime_capability_path,
+            runtime_capability_summary: Some(runtime_capabilities.summary.userspace_profiling.clone()),
             contract: ops_profiler_contract,
         },
     }
@@ -240,7 +256,10 @@ pub struct GetExtensionCatalogHandler {}
 impl Operation for GetExtensionCatalogHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_extension_catalog_request(&req).await?;
-        build_json_response(StatusCode::OK, &build_extension_catalog_response(), req.headers.get("x-request-id"))
+        let response = build_extension_catalog_response()
+            .await
+            .map_err(|err| s3_error!(InternalError, "failed to build extension catalog response: {}", err))?;
+        build_json_response(StatusCode::OK, &response, req.headers.get("x-request-id"))
     }
 }
 
@@ -267,10 +286,12 @@ impl Operation for ListExtensionInstancesHandler {
 #[cfg(test)]
 mod tests {
     use super::{build_extension_catalog_response, map_extension_instance};
+    use crate::admin::handlers::system::{self, RUNTIME_CAPABILITIES_ROUTE_SUFFIX};
     use crate::admin::plugin_contract::{
         PluginContractDomain, PluginEnableState, PluginInstallState, PluginInstanceEntry, PluginInstanceSource,
         PluginOperationalRuntimeState, PluginOperationalStateContract,
     };
+    use crate::server::ADMIN_PREFIX;
     use rustfs_extension_schema::{
         ExtensionKind, ExtensionRuntimeBoundary, OPS_DIAGNOSTICS_CAPABILITY, OPS_PROFILER_CAPABILITY, validate_extension_schemas,
         validate_ops_diagnostics_contract, validate_ops_profiler_contract,
@@ -314,9 +335,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn extension_catalog_exposes_valid_extension_schemas() {
-        let response = build_extension_catalog_response();
+    #[tokio::test]
+    async fn extension_catalog_exposes_valid_extension_schemas() {
+        let response = build_extension_catalog_response()
+            .await
+            .expect("extension catalog response should build");
         let webhook = response
             .extensions
             .iter()
@@ -373,9 +396,14 @@ mod tests {
         assert!(validate_extension_schemas(&response.extensions).is_ok());
     }
 
-    #[test]
-    fn extension_catalog_exposes_read_only_runtime_capability_snapshots() {
-        let response = build_extension_catalog_response();
+    #[tokio::test]
+    async fn extension_catalog_exposes_read_only_runtime_capability_snapshots() {
+        let runtime_capabilities = system::build_runtime_capabilities_response()
+            .await
+            .expect("runtime capabilities response should build");
+        let response = build_extension_catalog_response()
+            .await
+            .expect("extension catalog response should build");
 
         assert_eq!(response.runtime_capabilities.ops_diagnostics.extension_id, "builtin:ops-diagnostics");
         assert_eq!(
@@ -388,6 +416,22 @@ mod tests {
         );
         assert!(!response.runtime_capabilities.ops_diagnostics.disabled_by_default);
         assert!(!response.runtime_capabilities.ops_diagnostics.startup_fatal);
+        assert_eq!(
+            response
+                .runtime_capabilities
+                .ops_diagnostics
+                .runtime_capability_path
+                .as_deref(),
+            Some(format!("{}{}", ADMIN_PREFIX, RUNTIME_CAPABILITIES_ROUTE_SUFFIX).as_str())
+        );
+        assert_eq!(
+            response
+                .runtime_capabilities
+                .ops_diagnostics
+                .runtime_capability_summary
+                .as_ref(),
+            Some(&runtime_capabilities.summary.observability)
+        );
         assert!(response.runtime_capabilities.ops_diagnostics.contract.requires_admin_action);
         assert!(!response.runtime_capabilities.ops_diagnostics.contract.mutates_object_data);
         assert!(validate_ops_diagnostics_contract(&response.runtime_capabilities.ops_diagnostics.contract).is_ok());
@@ -400,7 +444,17 @@ mod tests {
         );
         assert!(!response.runtime_capabilities.ops_profiler.disabled_by_default);
         assert!(!response.runtime_capabilities.ops_profiler.startup_fatal);
+        assert_eq!(
+            response.runtime_capabilities.ops_profiler.runtime_capability_path.as_deref(),
+            Some(format!("{}{}", ADMIN_PREFIX, RUNTIME_CAPABILITIES_ROUTE_SUFFIX).as_str())
+        );
+        assert_eq!(
+            response.runtime_capabilities.ops_profiler.runtime_capability_summary.as_ref(),
+            Some(&runtime_capabilities.summary.userspace_profiling)
+        );
         assert!(validate_ops_profiler_contract(&response.runtime_capabilities.ops_profiler.contract).is_ok());
+
+        assert_eq!(response.cluster_snapshot.path, format!("{}{}", ADMIN_PREFIX, "/v4/cluster/snapshot"));
     }
 
     #[test]

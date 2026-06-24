@@ -215,7 +215,7 @@ impl NodeService {
         &self,
         _request: Request<LocalStorageInfoRequest>,
     ) -> Result<Response<LocalStorageInfoResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LocalStorageInfoResponse {
                 success: false,
                 storage_info: Bytes::new(),
