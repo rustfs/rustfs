@@ -62,6 +62,7 @@ pub(crate) use readiness::ReadinessGateLayer;
 pub(crate) use readiness::collect_dependency_readiness;
 pub(crate) use readiness::collect_dependency_readiness_report;
 pub use readiness::publish_ready_when_runtime_ready;
+pub(crate) use readiness::snapshot_dependency_readiness_report;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteAddr(pub std::net::SocketAddr);

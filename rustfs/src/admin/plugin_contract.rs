@@ -300,6 +300,17 @@ pub(crate) struct PluginCatalogEntry {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginCatalogResponse {
     pub plugins: Vec<PluginCatalogEntry>,
+    pub admin_discovery: PluginCatalogAdminDiscovery,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct PluginCatalogAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    pub runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    pub cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    pub extensions_catalog: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -366,10 +377,10 @@ pub(crate) struct PluginInstancesResponse {
 #[cfg(test)]
 mod tests {
     use super::{
-        PluginArtifactContract, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
-        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginInstanceDetail,
-        PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
-        PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
+        PluginArtifactContract, PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse,
+        PluginContractDomain, PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract,
+        PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount,
+        PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
     use serde_json::json;
     use std::collections::HashMap;
@@ -400,6 +411,11 @@ mod tests {
                 }],
                 installation: None,
             }],
+            admin_discovery: PluginCatalogAdminDiscovery {
+                runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+                cluster_snapshot: "/rustfs/admin/v4/cluster/snapshot".to_string(),
+                extensions_catalog: "/rustfs/admin/v4/extensions/catalog".to_string(),
+            },
         };
 
         let value = serde_json::to_value(response).expect("catalog response should serialize");
@@ -427,7 +443,12 @@ mod tests {
                         "subsystem": "notify_webhook",
                         "valid_fields": ["endpoint", "auth_token"]
                     }]
-                }]
+                }],
+                "admin_discovery": {
+                    "runtimeCapabilities": "/rustfs/admin/v4/runtime/capabilities",
+                    "clusterSnapshot": "/rustfs/admin/v4/cluster/snapshot",
+                    "extensionsCatalog": "/rustfs/admin/v4/extensions/catalog"
+                }
             })
         );
     }
