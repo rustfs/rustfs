@@ -212,3 +212,73 @@ profile 固定：
 1. `RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS=2` 仍然保留为 multipart batched 路径的强候选配置
 2. 它已经具备“方向明确、组均值更优”的证据
 3. 但由于单轮波动仍在，当前更合适的动作仍然是继续以 env 方式复测，而不是直接改代码默认值
+
+## 14. 第四轮补齐后的更新判断
+
+继续按同一矩阵补到 `8` 轮之后，新增结果为：
+
+1. `b4-r4`: `296.34 MiB/s`, `6977.8ms`
+2. `b2-r4`: `248.68 MiB/s`, `8310.8ms`
+
+这样 `8` 轮完整结果为：
+
+1. `b4-r1`: `317.20 MiB/s`, `6515.2ms`
+2. `b2-r1`: `300.38 MiB/s`, `6842.8ms`
+3. `b4-r2`: `334.58 MiB/s`, `5966.5ms`
+4. `b2-r2`: `358.77 MiB/s`, `5748.2ms`
+5. `b4-r3`: `323.35 MiB/s`, `6412.4ms`
+6. `b2-r3`: `350.87 MiB/s`, `5827.6ms`
+7. `b4-r4`: `296.34 MiB/s`, `6977.8ms`
+8. `b2-r4`: `248.68 MiB/s`, `8310.8ms`
+
+按组重新汇总：
+
+### `batch_blocks=4`
+
+1. Avg throughput: `317.87 MiB/s`
+2. Median throughput: `320.27 MiB/s`
+3. Avg latency: `6468.0ms`
+4. Median latency: `6463.8ms`
+
+### `batch_blocks=2`
+
+1. Avg throughput: `314.68 MiB/s`
+2. Median throughput: `325.62 MiB/s`
+3. Avg latency: `6682.4ms`
+4. Median latency: `6335.2ms`
+
+## 15. 第四轮后的结论修正
+
+补齐到 `8` 轮之后，需要把结论进一步收紧：
+
+1. `batch_blocks=2` 仍然能稳定改善 `erasure_encode_batched_recv_wait`
+2. 但吞吐/延迟层面的总收益并没有收敛成稳定优势
+3. `b2-r4` 明显把组均值重新拉回，说明它目前还只是“有潜力的候选配置”，不是“已经证实优于 4 的配置”
+
+从 `b4-r4` 与 `b2-r4` 的 raw sum / count 看：
+
+### `b4-r4`
+
+1. `erasure_encode_batched_recv_wait`: `~131.18ms`
+2. `erasure_encode_batched_write`: `~82.04ms`
+3. `erasure_encode_cpu`: `~3.95ms`
+
+### `b2-r4`
+
+1. `erasure_encode_batched_recv_wait`: `~81.49ms`
+2. `erasure_encode_batched_write`: `~45.22ms`
+3. `erasure_encode_cpu`: `~5.38ms`
+
+这说明：
+
+1. `batch_blocks=2` 对 wait/write 的改善方向依旧成立
+2. 但这次同时伴随更差的整体 throughput/latency
+3. 当前还不能把局部内部阶段改善直接视为端到端收益
+
+## 16. 当前最稳妥的建议
+
+到这一步，最稳妥的建议是：
+
+1. `RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS=2` 继续保留为 env-only 候选配置
+2. 当前不要改代码默认值
+3. 后续如果继续验证，应优先排查为什么 `b2-r4` 会出现这种明显反向波动，而不是继续机械追加更多轮次
