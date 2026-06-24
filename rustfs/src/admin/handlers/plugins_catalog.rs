@@ -15,11 +15,12 @@
 use crate::admin::{
     auth::validate_admin_request,
     plugin_contract::{
-        PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain, PluginContractEntrypointKind,
-        PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
+        PluginCatalogAdminDiscovery, PluginCatalogDomainEntry, PluginCatalogEntry, PluginCatalogResponse, PluginContractDomain,
+        PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
     },
     router::{AdminOperation, Operation, S3Router},
 };
+use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -57,6 +58,7 @@ fn target_domain_name_from_subsystem(subsystem: &str) -> PluginContractDomain {
 }
 
 fn build_catalog_response() -> PluginCatalogResponse {
+    let usecase = DefaultAdminUsecase::from_global();
     let mut plugins: HashMap<&'static str, PluginCatalogEntry> = HashMap::new();
 
     for descriptor in builtin_notify_target_admin_descriptors()
@@ -74,7 +76,14 @@ fn build_catalog_response() -> PluginCatalogResponse {
         plugin.domain_configs.sort_by_key(|a| a.domain);
     }
 
-    PluginCatalogResponse { plugins }
+    PluginCatalogResponse {
+        plugins,
+        admin_discovery: PluginCatalogAdminDiscovery {
+            runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+            cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+            extensions_catalog: usecase.extensions_catalog_route().to_string(),
+        },
+    }
 }
 
 fn example_external_webhook_plugin_entry() -> PluginCatalogEntry {
@@ -199,6 +208,10 @@ mod tests {
     #[test]
     fn plugin_catalog_contains_representative_builtin_targets() {
         let response = build_catalog_response();
+
+        assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
 
         let webhook = response
             .plugins
