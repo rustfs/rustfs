@@ -17,6 +17,7 @@ use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
+use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::app::context::{resolve_object_store_handle, resolve_token_signing_key};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
@@ -190,6 +191,17 @@ struct CatalogConfigResponse {
     defaults: BTreeMap<&'static str, &'static str>,
     overrides: BTreeMap<&'static str, &'static str>,
     endpoints: Vec<&'static str>,
+    admin_discovery: CatalogAdminDiscovery,
+}
+
+#[derive(Debug, Serialize)]
+struct CatalogAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: &'static str,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: &'static str,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: &'static str,
 }
 
 #[derive(Debug, Deserialize)]
@@ -975,6 +987,7 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
 }
 
 fn catalog_config_response() -> CatalogConfigResponse {
+    let usecase = DefaultAdminUsecase::from_global();
     CatalogConfigResponse {
         defaults: BTreeMap::from([
             (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
@@ -983,6 +996,11 @@ fn catalog_config_response() -> CatalogConfigResponse {
         ]),
         overrides: BTreeMap::new(),
         endpoints: TABLE_CATALOG_ENDPOINTS.to_vec(),
+        admin_discovery: CatalogAdminDiscovery {
+            runtime_capabilities: usecase.runtime_capabilities_route(),
+            cluster_snapshot: usecase.cluster_snapshot_route(),
+            extensions_catalog: usecase.extensions_catalog_route(),
+        },
     }
 }
 
@@ -5345,6 +5363,9 @@ mod tests {
             Some(&TABLE_CATALOG_COMPAT_PREFIX)
         );
         assert!(response.overrides.is_empty());
+        assert_eq!(response.admin_discovery.runtime_capabilities, "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(response.admin_discovery.cluster_snapshot, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.admin_discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
         assert!(response.endpoints.contains(&"GET /v1/{prefix}/namespaces"));
         assert!(response.endpoints.contains(&"HEAD /v1/{prefix}/namespaces/{namespace}"));
         assert!(
