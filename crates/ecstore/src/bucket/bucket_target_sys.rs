@@ -973,7 +973,7 @@ fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<Shar
         )));
     }
 
-    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut trust_store = smithy_tls::TrustStore::empty();
     trust_store.add_pem_certificate(ca_cert_pem.as_bytes());
 
     let tls_context = smithy_tls::TlsContext::builder()
@@ -1010,7 +1010,7 @@ async fn build_aws_s3_http_client_from_tls_path() -> Option<aws_sdk_s3::config::
     }
 
     let tls_dir = Path::new(&tls_path);
-    let mut trust_store = smithy_tls::TrustStore::default();
+    let mut trust_store = smithy_tls::TrustStore::empty();
     let mut has_custom_certs = false;
 
     let ca_path = tls_dir.join(RUSTFS_CA_CERT);
