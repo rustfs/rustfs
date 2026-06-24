@@ -87,7 +87,8 @@ pub(crate) mod ecstore_cluster {
     pub(crate) use rustfs_ecstore::api::cluster::{
         ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage,
         ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth,
-        ClusterPeerHealthSnapshot, ClusterPoolState, ClusterPoolStateSnapshot, topology_snapshot_from_endpoint_pools_with_capabilities,
+        ClusterPeerHealthSnapshot, ClusterPoolState, ClusterPoolStateSnapshot,
+        topology_snapshot_from_endpoint_pools_with_capabilities,
     };
 }
 
