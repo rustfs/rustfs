@@ -47,6 +47,7 @@ dep|rustfs/src/init.rs|infra->interface|crate::admin
 dep|rustfs/src/protocols/client.rs|infra->app|crate::app::context::resolve_action_credentials
 dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
 dep|rustfs/src/server/audit.rs|infra->app|crate::app::context::resolve_server_config
+dep|rustfs/src/server/module_switch.rs|infra->app|crate::app::context::resolve_object_store_handle
 dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_notify_interface
 dep|rustfs/src/server/event.rs|infra->app|crate::app::context::resolve_server_config
 dep|rustfs/src/server/http.rs|infra->interface|crate::admin
@@ -57,6 +58,7 @@ dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::handlers::health::
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_endpoints_handle
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_iam_ready
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_lock_clients_handle
+dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_object_store_handle
 dep|rustfs/src/server/tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
 dep|rustfs/src/startup_bucket_metadata.rs|infra->app|crate::app::context::resolve_replication_pool_handle
 dep|rustfs/src/startup_tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
@@ -75,8 +77,11 @@ dep|rustfs/src/storage/helper.rs|infra->app|crate::app::context::resolve_notify_
 dep|rustfs/src/storage/rpc/disk.rs|infra->app|crate::app::context::resolve_internode_metrics
 dep|rustfs/src/storage/rpc/health.rs|infra->app|crate::app::context::resolve_local_node_name
 dep|rustfs/src/storage/rpc/http_service.rs|infra->app|crate::app::context::resolve_internode_metrics
+dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::AppContext
+dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::get_global_app_context
 dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_iam_handle
 dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_lock_client
+dep|rustfs/src/storage/rpc/node_service.rs|infra->app|crate::app::context::resolve_object_store_handle_for_context
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_dynamic_config_runtime_state
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
