@@ -17,12 +17,12 @@ use crate::server::{
     DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
 };
 use crate::storage::EndpointServerPools;
-use crate::workload_admission::workload_admission_registry_snapshot;
-use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
-use rustfs_ecstore::api::cluster::{
+use crate::storage::ecstore_cluster::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
 };
+use crate::workload_admission::workload_admission_registry_snapshot;
+use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
 use rustfs_storage_api::{ObservabilitySnapshot, TopologySnapshot};
 
 #[derive(Debug, Clone, PartialEq, Eq)]

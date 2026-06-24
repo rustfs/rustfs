@@ -119,6 +119,14 @@ mod ecstore_client {
     pub(crate) use crate::storage::ecstore_client::admin_handler_utils;
 }
 
+mod ecstore_cluster {
+    pub(crate) use crate::storage::ecstore_cluster::{
+        ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
+        ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
+        ClusterPoolStateSnapshot,
+    };
+}
+
 mod ecstore_config {
     pub(crate) use crate::storage::ecstore_config::{com, init, storageclass};
 }
