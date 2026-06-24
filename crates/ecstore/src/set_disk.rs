@@ -3392,6 +3392,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
@@ -3433,6 +3434,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             }
         }
 
+        if let Some(stage_start) = writer_setup_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_writer_setup",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
             if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
@@ -3448,6 +3456,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         );
 
         let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
+        let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let (reader, w_size) = match write_path {
             SmallWritePath::SingleBlockNonInline => {
@@ -3459,6 +3468,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
                 Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
             }
         }; // TODO: delete temporary directory on error
+
+        if let Some(stage_start) = encode_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_encode",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -4337,6 +4353,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             );
         }
 
+        let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
         self.cleanup_multipart_path(&parts).await;
 
         let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
@@ -4353,6 +4370,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
+        }
+
+        if let Some(stage_start) = complete_tail_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_complete_tail",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         drop(object_lock_guard); // drop object lock guard to release the lock

@@ -794,6 +794,7 @@ impl DefaultMultipartUsecase {
             .map_err(ApiError::from)?;
 
         let mut size = size.ok_or_else(|| s3_error!(UnexpectedContent))?;
+        let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
         // Apply adaptive buffer sizing based on part size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
@@ -924,6 +925,13 @@ impl DefaultMultipartUsecase {
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
 
         let mut reader = PutObjReader::new(reader);
+
+        if let Some(stage_start) = ingress_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_ingress_prepare",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let info = store
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
