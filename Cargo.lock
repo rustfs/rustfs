@@ -9342,6 +9342,7 @@ dependencies = [
  "quick-xml 0.40.1",
  "rand 0.10.1",
  "ratelimit",
+ "rcgen",
  "reed-solomon-simd",
  "regex",
  "reqwest",

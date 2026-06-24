@@ -61,6 +61,7 @@ use rustfs_utils::http::{
     SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_ETAG, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_CHECK,
     SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, insert_header,
 };
+use rustls_pki_types::pem::PemObject;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::error::Error;
@@ -961,6 +962,31 @@ fn build_insecure_aws_s3_http_client() -> SharedHttpClient {
     http_client_fn(move |_settings, _components| connector.clone())
 }
 
+fn build_aws_s3_http_client_from_target_ca_pem(ca_cert_pem: &str) -> Result<SharedHttpClient, BucketTargetError> {
+    let certs = rustls_pki_types::CertificateDer::pem_slice_iter(ca_cert_pem.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
+
+    if certs.is_empty() {
+        return Err(BucketTargetError::Io(std::io::Error::other(
+            "invalid target CA PEM: no certificates found",
+        )));
+    }
+
+    let mut trust_store = smithy_tls::TrustStore::default();
+    trust_store.add_pem_certificate(ca_cert_pem.as_bytes());
+
+    let tls_context = smithy_tls::TlsContext::builder()
+        .with_trust_store(trust_store)
+        .build()
+        .map_err(|err| BucketTargetError::Io(std::io::Error::other(format!("invalid target CA PEM: {err}"))))?;
+
+    Ok(SmithyHttpClientBuilder::new()
+        .tls_provider(smithy_tls::Provider::rustls(smithy_tls::rustls_provider::CryptoMode::AwsLc))
+        .tls_context(tls_context)
+        .build_https())
+}
+
 async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Option<SharedHttpClient>, BucketTargetError> {
     if !target.secure {
         return Ok(None);
@@ -971,9 +997,7 @@ async fn build_aws_s3_http_client_for_target(target: &BucketTarget) -> Result<Op
     }
 
     if has_custom_ca_pem(target) {
-        return Err(BucketTargetError::Io(std::io::Error::other(
-            "custom target CA PEM support is not implemented yet",
-        )));
+        return build_aws_s3_http_client_from_target_ca_pem(&target.ca_cert_pem).map(Some);
     }
 
     Ok(build_aws_s3_http_client_from_tls_path().await)
@@ -1764,6 +1788,7 @@ impl Error for BucketTargetError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rcgen::generate_simple_self_signed;
 
     #[test]
     fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
@@ -1854,5 +1879,54 @@ mod tests {
             .expect("private IP endpoints should be allowed for replication targets");
 
         assert_eq!(client.endpoint, "https://192.168.1.10:9000");
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_allows_custom_ca_pem() {
+        let sys = BucketTargetSys::default();
+        let cert = generate_simple_self_signed(vec!["192.168.1.10".to_string()]).expect("certificate should generate");
+        let client = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                ca_cert_pem: cert.cert.pem(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect("custom CA PEM should build a target client");
+
+        assert_eq!(client.endpoint, "https://192.168.1.10:9000");
+    }
+
+    #[tokio::test]
+    async fn get_remote_target_client_internal_rejects_invalid_custom_ca_pem() {
+        let sys = BucketTargetSys::default();
+        let err = sys
+            .get_remote_target_client_internal(&BucketTarget {
+                endpoint: "192.168.1.10:9000".to_string(),
+                secure: true,
+                target_bucket: "bucket".to_string(),
+                region: "us-east-1".to_string(),
+                ca_cert_pem: "not a pem".to_string(),
+                credentials: Some(Credentials {
+                    access_key: "access".to_string(),
+                    secret_key: "secret".to_string(),
+                    session_token: None,
+                    expiration: None,
+                }),
+                ..Default::default()
+            })
+            .await
+            .expect_err("invalid custom CA PEM should be rejected");
+
+        assert!(err.to_string().contains("invalid target CA PEM"));
     }
 }
