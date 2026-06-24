@@ -143,7 +143,7 @@ mod tests {
     use tracing_subscriber::{Registry, layer::SubscriberExt};
 
     fn ensure_test_rpc_secret() {
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
     }
 
     fn with_trace_parent<F>(trace_id_hex: &str, f: F)
