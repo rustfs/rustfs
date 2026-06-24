@@ -1157,6 +1157,31 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 mod metadata_cache_tests {
     use super::*;
 
+    async fn new_metadata_cache_test_set() -> Arc<SetDisks> {
+        SetDisks::new(
+            "metadata-cache-test".to_string(),
+            Arc::new(RwLock::new(Vec::new())),
+            4,
+            2,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(1, 4),
+            Vec::new(),
+        )
+        .await
+    }
+
+    fn valid_test_fileinfo(object: &str) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi
+    }
+
     #[test]
     fn get_object_metadata_cache_request_eligibility_is_conservative() {
         let opts = ObjectOptions::default();
@@ -1217,6 +1242,137 @@ mod metadata_cache_tests {
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_hit_returns_stored_metadata() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let parts_metadata = vec![fi.clone()];
+        let online_disks = Vec::new();
+
+        set.cache_get_object_fileinfo("bucket", "object", &fi, &parts_metadata, &online_disks, 0)
+            .await;
+
+        let cached = set
+            .cached_get_object_fileinfo("bucket", "object")
+            .await
+            .expect("fresh cache entry should be returned");
+        assert_eq!(cached.fi.name, "object");
+        assert_eq!(cached.parts_metadata.len(), 1);
+        assert_eq!(cached.online_disks.len(), 0);
+        assert_eq!(cached.read_quorum, 0);
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
+        let set = new_metadata_cache_test_set().await;
+
+        let mut deleted = valid_test_fileinfo("deleted-object");
+        deleted.deleted = true;
+        set.cache_get_object_fileinfo("bucket", "deleted-object", &deleted, &[deleted.clone()], &[], 0)
+            .await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "deleted-object").await.is_none(),
+            "deleted metadata must not be cached"
+        );
+
+        let invalid = FileInfo::default();
+        set.cache_get_object_fileinfo("bucket", "invalid-object", &invalid, std::slice::from_ref(&invalid), &[], 0)
+            .await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "invalid-object").await.is_none(),
+            "invalid metadata must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_requires_cached_read_quorum() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.get_object_metadata_cache.write().await.insert(
+            GetObjectMetadataCacheKey::new("bucket", "object"),
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                fi: fi.clone(),
+                parts_metadata: vec![fi],
+                online_disks: vec![None],
+                read_quorum: 1,
+            },
+        );
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "cache hit must be rejected when cached online disks cannot satisfy read quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_rejects_stale_entries() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.get_object_metadata_cache.write().await.insert(
+            GetObjectMetadataCacheKey::new("bucket", "object"),
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now() - GET_OBJECT_METADATA_CACHE_TTL - Duration::from_millis(1),
+                fi: fi.clone(),
+                parts_metadata: vec![fi],
+                online_disks: Vec::new(),
+                read_quorum: 0,
+            },
+        );
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "stale cache entry must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_invalidation_removes_object_entry() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.cache_get_object_fileinfo("bucket", "object", &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "explicit invalidation must remove the cached object metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_prunes_when_capacity_is_reached() {
+        let set = new_metadata_cache_test_set().await;
+        let stale_fi = valid_test_fileinfo("stale-object");
+        let fresh_fi = valid_test_fileinfo("fresh-object");
+        {
+            let mut cache = set.get_object_metadata_cache.write().await;
+            for idx in 0..GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+                cache.insert(
+                    GetObjectMetadataCacheKey::new("bucket", &format!("stale-object-{idx}")),
+                    GetObjectMetadataCacheEntry {
+                        created_at: Instant::now() - GET_OBJECT_METADATA_CACHE_TTL - Duration::from_millis(1),
+                        fi: stale_fi.clone(),
+                        parts_metadata: vec![stale_fi.clone()],
+                        online_disks: Vec::new(),
+                        read_quorum: 0,
+                    },
+                );
+            }
+        }
+
+        set.cache_get_object_fileinfo("bucket", "fresh-object", &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
+            .await;
+
+        let cache = set.get_object_metadata_cache.read().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&GetObjectMetadataCacheKey::new("bucket", "fresh-object")));
     }
 }
 
