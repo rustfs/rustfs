@@ -21,13 +21,43 @@ use crate::get_diagnostics::{
 };
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
+use std::pin::Pin;
 use std::time::Instant;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
+
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, Error>)> + Send + 'a>>;
+
+fn read_shard<'a, R>(
+    index: usize,
+    reader: &'a mut Option<BitrotReader<R>>,
+    recycled_buf: Option<Vec<u8>>,
+    shard_size: usize,
+) -> ShardReadFuture<'a>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'a,
+{
+    if let Some(reader) = reader {
+        Box::pin(async move {
+            let mut buf = recycled_buf.unwrap_or_default();
+            buf.resize(shard_size, 0);
+            match reader.read(&mut buf).await {
+                Ok(n) => {
+                    buf.truncate(n);
+                    (index, Ok(buf))
+                }
+                Err(e) => (index, Err(Error::from(e))),
+            }
+        })
+    } else {
+        Box::pin(async move { (index, Err(Error::FileNotFound)) })
+    }
+}
 
 pin_project! {
 pub(crate) struct ParallelReader<R> {
@@ -99,39 +129,16 @@ where
         let mut recycled = std::mem::take(&mut self.recycled);
         recycled.resize_with(num_readers, || None);
 
-        let mut futures = Vec::with_capacity(self.total_shards);
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
-        for (i, reader) in reader_iter.enumerate() {
-            let future = if let Some(reader) = reader {
-                // Only claim a recycled buffer when a shard will actually be read
-                // into it; missing shards are reconstructed by `decode_data`.
-                let recycled_buf = recycled[i].take();
-                Box::pin(async move {
-                    let mut buf = recycled_buf.unwrap_or_default();
-                    buf.resize(shard_size, 0);
-                    match reader.read(&mut buf).await {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            (i, Ok(buf))
-                        }
-                        Err(e) => (i, Err(Error::from(e))),
-                    }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            } else {
-                // Return FileNotFound error when reader is None
-                Box::pin(async move { (i, Err(Error::FileNotFound)) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            };
-
-            futures.push(future);
-        }
-
-        if futures.len() >= self.data_shards {
-            let mut fut_iter = futures.into_iter();
+        if num_readers >= self.data_shards {
+            let mut reader_iter = reader_iter.enumerate();
             let mut sets = FuturesUnordered::new();
             for _ in 0..self.data_shards {
-                if let Some(future) = fut_iter.next() {
-                    sets.push(future);
+                if let Some((i, reader)) = reader_iter.next() {
+                    // Only claim a recycled buffer when a shard will actually
+                    // be read; missing shards are reconstructed by `decode_data`.
+                    let recycled_buf = reader.is_some().then(|| recycled[i].take()).flatten();
+                    sets.push(read_shard(i, reader, recycled_buf, shard_size));
                 }
             }
 
@@ -145,8 +152,9 @@ where
                     Err(e) => {
                         errs[i] = Some(e);
 
-                        if let Some(future) = fut_iter.next() {
-                            sets.push(future);
+                        if let Some((next_i, next_reader)) = reader_iter.next() {
+                            let recycled_buf = next_reader.is_some().then(|| recycled[next_i].take()).flatten();
+                            sets.push(read_shard(next_i, next_reader, recycled_buf, shard_size));
                         }
                     }
                 }
