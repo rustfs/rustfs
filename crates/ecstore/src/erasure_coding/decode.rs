@@ -19,10 +19,20 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::io;
 use std::io::ErrorKind;
+use std::time::Instant;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
+
+fn classify_get_object_io_failure(err: &io::Error) -> &'static str {
+    match err.kind() {
+        ErrorKind::BrokenPipe | ErrorKind::ConnectionReset => "downstream_closed",
+        ErrorKind::TimedOut => "timeout",
+        ErrorKind::UnexpectedEof => "short_read",
+        _ => "io",
+    }
+}
 
 pin_project! {
 pub(crate) struct ParallelReader<R> {
@@ -190,10 +200,12 @@ where
     }
 
     let Some(required_len) = offset.checked_add(length) else {
+        rustfs_io_metrics::record_get_object_pipeline_failure("emit", "unknown");
         return Err(io::Error::new(ErrorKind::InvalidInput, "offset + length overflows"));
     };
     if get_data_block_len(en_blocks, data_blocks) < required_len {
         error!("write_data_blocks not enough data after offset");
+        rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"));
     }
 
@@ -203,6 +215,7 @@ where
     for block_op in &en_blocks[..data_blocks] {
         let Some(block) = block_op else {
             error!("write_data_blocks block_op.is_none()");
+            rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "Missing data block"));
         };
 
@@ -215,10 +228,14 @@ where
         offset = 0;
 
         let write_len = write_left.min(block_slice.len());
-        writer.write_all(&block_slice[..write_len]).await.map_err(|e| {
+        let write_stage_start = Instant::now();
+        if let Err(e) = writer.write_all(&block_slice[..write_len]).await {
+            rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+            rustfs_io_metrics::record_get_object_pipeline_failure("emit", classify_get_object_io_failure(&e));
             error!("write_data_blocks write_all err: {}", e);
-            e
-        })?;
+            return Err(e);
+        }
+        rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
 
         total_written += write_len;
         write_left -= write_len;
@@ -229,6 +246,7 @@ where
     }
 
     error!("write_data_blocks loop exhausted with write_left>0");
+    rustfs_io_metrics::record_get_object_pipeline_failure("emit", "short_read");
     Err(io::Error::new(ErrorKind::UnexpectedEof, "Not enough data blocks to write"))
 }
 
@@ -286,7 +304,13 @@ impl Erasure {
                 break;
             }
 
+            let stripe_read_stage_start = Instant::now();
             let (mut shards, errs) = reader.read().await;
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "legacy_duplex",
+                "stripe_read",
+                stripe_read_stage_start.elapsed().as_secs_f64(),
+            );
 
             if ret_err.is_none()
                 && let (_, Some(err)) = reduce_errs(&errs, &[])
@@ -297,20 +321,46 @@ impl Erasure {
 
             if !reader.can_decode(&shards) {
                 error!("erasure decode can_decode errs: {:?}", &errs);
+                rustfs_io_metrics::record_get_object_pipeline_failure("stripe_read", "read_quorum");
                 ret_err = Some(Error::ErasureReadQuorum.into());
                 break;
             }
 
             // Decode the shards
+            let reconstruct_stage_start = Instant::now();
             if let Err(e) = self.decode_data(&mut shards) {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    "legacy_duplex",
+                    "reconstruct",
+                    reconstruct_stage_start.elapsed().as_secs_f64(),
+                );
                 error!("erasure decode decode_data err: {:?}", e);
+                rustfs_io_metrics::record_get_object_pipeline_failure("reconstruct", "decode_error");
                 ret_err = Some(e);
                 break;
             }
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "legacy_duplex",
+                "reconstruct",
+                reconstruct_stage_start.elapsed().as_secs_f64(),
+            );
 
+            let emit_stage_start = Instant::now();
             let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
-                Ok(n) => n,
+                Ok(n) => {
+                    rustfs_io_metrics::record_get_object_stage_duration(
+                        "legacy_duplex",
+                        "emit",
+                        emit_stage_start.elapsed().as_secs_f64(),
+                    );
+                    n
+                }
                 Err(e) => {
+                    rustfs_io_metrics::record_get_object_stage_duration(
+                        "legacy_duplex",
+                        "emit",
+                        emit_stage_start.elapsed().as_secs_f64(),
+                    );
                     error!("erasure decode write_data_blocks err: {:?}", e);
                     ret_err = Some(e);
                     break;

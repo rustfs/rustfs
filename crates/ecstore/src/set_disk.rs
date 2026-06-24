@@ -837,6 +837,20 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
     }
 }
 
+fn classify_get_object_pipeline_failure(err: &Error) -> &'static str {
+    match err {
+        Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => "read_quorum",
+        Error::FileCorrupt => "bitrot_mismatch",
+        Error::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => "downstream_closed",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::UnexpectedEof => "short_read",
+            _ => "io",
+        },
+        _ => "unknown",
+    }
+}
+
 #[async_trait::async_trait]
 impl rustfs_storage_api::ObjectIO for SetDisks {
     type Error = Error;
@@ -888,10 +902,18 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             None
         };
 
-        let (fi, files, disks) = self
-            .get_object_fileinfo(bucket, object, opts, true)
-            .await
-            .map_err(|err| to_object_err(err, vec![bucket, object]))?;
+        let metadata_stage_start = Instant::now();
+        let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true).await {
+            Ok(result) => {
+                rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                result
+            }
+            Err(err) => {
+                rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
+                rustfs_io_metrics::record_get_object_pipeline_failure("metadata", classify_get_object_pipeline_failure(&err));
+                return Err(to_object_err(err, vec![bucket, object]));
+            }
+        };
         let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
 
         if object_info.delete_marker {
@@ -987,6 +1009,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             )
             .await
             {
+                rustfs_io_metrics::record_get_object_pipeline_failure("emit", classify_get_object_pipeline_failure(&e));
                 error!(
                     event = EVENT_SET_DISK_WRITE,
                     component = LOG_COMPONENT_ECSTORE,

@@ -17,6 +17,22 @@ use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE
 use std::future::Future;
 use tokio::task::JoinSet;
 
+fn classify_get_object_disk_failure(err: &DiskError) -> &'static str {
+    match err {
+        DiskError::ErasureReadQuorum => "read_quorum",
+        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt => "bitrot_mismatch",
+        DiskError::LessData => "short_read",
+        DiskError::Timeout => "timeout",
+        DiskError::Io(io_err) => match io_err.kind() {
+            std::io::ErrorKind::BrokenPipe | std::io::ErrorKind::ConnectionReset => "downstream_closed",
+            std::io::ErrorKind::TimedOut => "timeout",
+            std::io::ErrorKind::UnexpectedEof => "short_read",
+            _ => "io",
+        },
+        _ => "unknown",
+    }
+}
+
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -825,6 +841,7 @@ impl SetDisks {
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
+            let reader_setup_stage_start = Instant::now();
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -856,14 +873,20 @@ impl SetDisks {
                     }
                 }
             }
+            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_stage_start.elapsed().as_secs_f64());
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                     error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
+                    rustfs_io_metrics::record_get_object_pipeline_failure(
+                        "reader_setup",
+                        classify_get_object_disk_failure(&read_err),
+                    );
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
                 error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
+                rustfs_io_metrics::record_get_object_pipeline_failure("reader_setup", "read_quorum");
                 return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
@@ -924,7 +947,9 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
+            let decode_stage_start = Instant::now();
             let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
             debug!(
                 bucket,
                 object,
@@ -969,6 +994,7 @@ impl SetDisks {
 
                 if has_err {
                     error!("erasure.decode err {} {:?}", written, &de_err);
+                    rustfs_io_metrics::record_get_object_pipeline_failure("decode", classify_get_object_disk_failure(&de_err));
                     return Err(de_err.into());
                 }
             }
