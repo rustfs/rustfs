@@ -216,11 +216,7 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
-    async fn encode_block(
-        self: Arc<Self>,
-        encode_buf: Vec<u8>,
-        len: usize,
-    ) -> std::io::Result<(Vec<Bytes>, Vec<u8>)> {
+    async fn encode_block(self: Arc<Self>, encode_buf: Vec<u8>, len: usize) -> std::io::Result<(Vec<Bytes>, Vec<u8>)> {
         let encode_once = move || {
             let res = self.encode_data(&encode_buf[..len]);
             (res, encode_buf)
