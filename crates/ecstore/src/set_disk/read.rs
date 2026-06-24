@@ -38,6 +38,8 @@ use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
+const EVENT_SET_DISK_READ: &str = "set_disk_read";
+const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
 const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
 
@@ -1585,6 +1587,7 @@ impl SetDisks {
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
+        let pipeline_started = Instant::now();
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
@@ -1715,12 +1718,13 @@ impl SetDisks {
                 } else {
                     checksum_info.algorithm
                 };
+            let read_length = till_offset.saturating_sub(read_offset);
 
             // Read zero-copy configuration from environment variable
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
-            let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+            let reader_setup_stage_start = Instant::now();
             let mut readers = Vec::with_capacity(disks.len());
             let mut read_costs = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
@@ -1754,17 +1758,38 @@ impl SetDisks {
                     }
                 }
             }
-            if let Some(reader_setup_stage_start) = reader_setup_stage_start {
-                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(
-                    reader_setup_stage_start.elapsed().as_secs_f64(),
-                );
-            }
+            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
+            if reader_setup_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
+                warn!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    read_offset,
+                    read_length,
+                    available_shards = nil_count,
+                    total_shards = errors.len(),
+                    data_shards = erasure.data_shards,
+                    parity_shards = erasure.parity_shards,
+                    elapsed_ms = reader_setup_elapsed.as_millis(),
+                    errors = ?errors,
+                    state = "reader_setup_slow",
+                    "Set disk object reader setup is slow"
+                );
+            }
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                     let reason = classify_disk_error(&read_err);
                     error!(
+                        event = EVENT_SET_DISK_READ,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
                         bucket,
                         object,
                         part_index = current_part,
@@ -1779,6 +1804,7 @@ impl SetDisks {
                         stage = GET_STAGE_READER_SETUP,
                         reason = reason.as_str(),
                         errors = ?errors,
+                        state = "read_quorum_unavailable",
                         "Create bitrot reader failed read quorum"
                     );
                     record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
@@ -1786,6 +1812,9 @@ impl SetDisks {
                 }
                 let reason = GetObjectFailureReason::ReadQuorum;
                 error!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
                     bucket,
                     object,
                     part_index = current_part,
@@ -1800,6 +1829,7 @@ impl SetDisks {
                     stage = GET_STAGE_READER_SETUP,
                     reason = reason.as_str(),
                     errors = ?errors,
+                    state = "not_enough_readers",
                     "Create bitrot reader did not have enough disks"
                 );
                 record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
@@ -1853,12 +1883,32 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
-            let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+            let decode_stage_start = Instant::now();
             let (written, err) = erasure
                 .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
                 .await;
-            if let Some(decode_stage_start) = decode_stage_start {
-                rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
+            let decode_elapsed = decode_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
+                warn!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_offset,
+                    part_size,
+                    part_length,
+                    bytes_written = written,
+                    available_shards,
+                    missing_shards,
+                    elapsed_ms = decode_elapsed.as_millis(),
+                    error = ?err,
+                    state = if err.is_some() { "decode_failed_or_slow" } else { "decode_slow" },
+                    "Set disk object decode stage is slow or failed"
+                );
             }
             debug!(
                 bucket,
@@ -1928,6 +1978,22 @@ impl SetDisks {
         // debug!("read end");
 
         debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
+        let pipeline_elapsed = pipeline_started.elapsed();
+        if pipeline_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
+            warn!(
+                event = EVENT_SET_DISK_READ,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                offset,
+                total_read,
+                expected_length = length,
+                elapsed_ms = pipeline_elapsed.as_millis(),
+                state = "pipeline_slow",
+                "Set disk object read pipeline is slow"
+            );
+        }
 
         Ok(())
     }
