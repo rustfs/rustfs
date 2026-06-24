@@ -101,6 +101,10 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
         return Ok(());
     }
 
+    save_data_usage_in_backend(data_usage_info, store).await
+}
+
+async fn save_data_usage_in_backend(data_usage_info: DataUsageInfo, store: Arc<ECStore>) -> Result<(), Error> {
     let data =
         serde_json::to_vec(&data_usage_info).map_err(|e| Error::other(format!("Failed to serialize data usage info: {e}")))?;
 
@@ -130,8 +134,20 @@ fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &s
 
     set_buckets_count_from_usage(data_usage_info);
     data_usage_info.calculate_totals();
-    data_usage_info.last_update = Some(SystemTime::now());
     true
+}
+
+fn merge_bucket_usage_removal(candidate: DataUsageInfo, existing: Option<DataUsageInfo>, bucket: &str) -> Option<DataUsageInfo> {
+    let mut data_usage_info = match existing {
+        Some(existing) if data_usage_info_updated_at(&existing) >= data_usage_info_updated_at(&candidate) => existing,
+        _ => candidate,
+    };
+
+    if remove_bucket_usage_from_info(&mut data_usage_info, bucket) {
+        Some(data_usage_info)
+    } else {
+        None
+    }
 }
 
 async fn clear_bucket_usage_memory(bucket: &str) {
@@ -145,9 +161,11 @@ async fn clear_bucket_usage_memory(bucket: &str) {
 pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     clear_bucket_usage_memory(bucket).await;
 
-    let mut data_usage_info = load_data_usage_from_backend(store.clone()).await?;
-    if remove_bucket_usage_from_info(&mut data_usage_info, bucket) {
-        store_data_usage_in_backend(data_usage_info, store).await?;
+    let data_usage_info = load_data_usage_from_backend(store.clone()).await?;
+    let existing = load_data_usage_from_backend(store.clone()).await.ok();
+
+    if let Some(data_usage_info) = merge_bucket_usage_removal(data_usage_info, existing, bucket) {
+        save_data_usage_in_backend(data_usage_info, store).await?;
     }
 
     Ok(())
@@ -992,7 +1010,8 @@ mod tests {
 
     #[test]
     fn remove_bucket_usage_from_info_drops_bucket_and_recomputes_totals() {
-        let mut info = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        let last_update = SystemTime::now();
+        let mut info = data_usage_info_for_test("bucket-a", 2, 84, last_update);
         info.buckets_usage.insert(
             "bucket-b".to_string(),
             BucketUsageInfo {
@@ -1011,6 +1030,7 @@ mod tests {
         assert_eq!(info.buckets_count, 1);
         assert_eq!(info.objects_total_count, 3);
         assert_eq!(info.objects_total_size, 126);
+        assert_eq!(info.last_update, Some(last_update));
         assert!(!info.buckets_usage.contains_key("bucket-a"));
         assert!(!info.bucket_sizes.contains_key("bucket-a"));
         assert_eq!(
@@ -1018,6 +1038,41 @@ mod tests {
                 .get("bucket-b")
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((3, 126))
+        );
+    }
+
+    #[test]
+    fn merge_bucket_usage_removal_preserves_current_snapshot() {
+        let now = SystemTime::now();
+        let candidate = data_usage_info_for_test("bucket-a", 2, 84, now - Duration::from_secs(10));
+        let mut existing = data_usage_info_for_test("bucket-a", 4, 168, now);
+        existing.buckets_usage.insert(
+            "bucket-c".to_string(),
+            BucketUsageInfo {
+                objects_count: 5,
+                versions_count: 5,
+                size: 210,
+                ..Default::default()
+            },
+        );
+        existing.bucket_sizes.insert("bucket-c".to_string(), 210);
+        existing.buckets_count = 2;
+        existing.calculate_totals();
+
+        let merged = merge_bucket_usage_removal(candidate, Some(existing), "bucket-a")
+            .expect("bucket-a should be removed from the current snapshot");
+
+        assert_eq!(merged.last_update, Some(now));
+        assert_eq!(merged.buckets_count, 1);
+        assert_eq!(merged.objects_total_count, 5);
+        assert_eq!(merged.objects_total_size, 210);
+        assert!(!merged.buckets_usage.contains_key("bucket-a"));
+        assert_eq!(
+            merged
+                .buckets_usage
+                .get("bucket-c")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((5, 210))
         );
     }
 
