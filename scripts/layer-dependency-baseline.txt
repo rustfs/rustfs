@@ -86,4 +86,3 @@ dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::servic
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::config::reload_runtime_config_snapshot
 dep|rustfs/src/storage/rpc/node_service.rs|infra->interface|crate::admin::service::site_replication::reload_site_replication_runtime_state
 dep|rustfs/src/workload_admission.rs|infra->app|crate::app::context::resolve_replication_pool_handle
-dep|rustfs/src/cluster_snapshot.rs|infra->app|crate::app::context::resolve_endpoints_handle
