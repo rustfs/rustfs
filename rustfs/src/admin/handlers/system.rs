@@ -25,6 +25,7 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
+use rustfs_madmin::InfoMessage;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_storage_api::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -149,6 +150,30 @@ impl Operation for ServiceHandle {
 
 pub struct ServerInfoHandler {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SystemAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+}
+
+#[derive(Serialize)]
+struct ServerInfoResponse {
+    info: InfoMessage,
+    admin_discovery: SystemAdminDiscovery,
+}
+
+fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery {
+    SystemAdminDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -177,8 +202,12 @@ impl Operation for ServerInfoHandler {
             .await
             .map_err(S3Error::from)?
             .info;
+        let response = ServerInfoResponse {
+            info,
+            admin_discovery: system_admin_discovery(&usecase),
+        };
 
-        let data = serde_json::to_vec(&info).map_err(|e| {
+        let data = serde_json::to_vec(&response).map_err(|e| {
             log_system_request_failed!("query_server_info", "serialize_server_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed")
         })?;
@@ -473,10 +502,12 @@ impl Operation for DataUsageInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBSERVABILITY_SUMMARY_RESOLVED, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
-        build_runtime_capabilities_response, build_runtime_capabilities_summary,
+        OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
+        build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
+    use crate::app::admin_usecase::DefaultAdminUsecase;
     use rustfs_concurrency::{AdmissionState, WorkloadClass};
+    use rustfs_madmin::InfoMessage;
     use rustfs_storage_api::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
@@ -512,6 +543,35 @@ mod tests {
             Some(AdmissionState::Disabled)
         );
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
+    }
+
+    #[test]
+    fn server_info_response_exposes_admin_discovery_paths() {
+        let usecase = DefaultAdminUsecase::without_context();
+        let response = ServerInfoResponse {
+            info: InfoMessage {
+                mode: None,
+                domain: None,
+                region: None,
+                sqs_arn: None,
+                deployment_id: None,
+                buckets: None,
+                objects: None,
+                versions: None,
+                delete_markers: None,
+                usage: None,
+                services: None,
+                backend: None,
+                servers: None,
+                pools: None,
+            },
+            admin_discovery: system_admin_discovery(&usecase),
+        };
+
+        let value = serde_json::to_value(response).expect("server info response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]
