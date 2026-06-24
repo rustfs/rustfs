@@ -165,6 +165,7 @@ impl DefaultAdminUsecase {
     const POOL_STATE_BLOCKED: &'static str = "blocked";
     const POOL_STATE_DECOMMISSIONED: &'static str = "decommissioned";
     const POOL_STATE_DECOMMISSIONING: &'static str = "decommissioning";
+    const POOL_STATE_REBALANCING: &'static str = "rebalancing";
     const REBALANCE_STATUS_COMPLETED: &'static str = "completed";
     const REBALANCE_STATUS_FAILED: &'static str = "failed";
     const REBALANCE_STATUS_NONE: &'static str = "none";
@@ -367,13 +368,16 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_list_decommission_status(&self) -> AdminUsecaseResult<AdminDecommissionStatus> {
+        let Some(store) = self.object_store() else {
+            return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
+        };
         let pool_statuses = self.execute_list_pool_statuses().await?;
-        Ok(AdminDecommissionStatus {
-            pools: pool_statuses
-                .into_iter()
-                .map(Self::decommission_pool_status_from_status)
-                .collect(),
-        })
+        let mut pools = Vec::with_capacity(pool_statuses.len());
+        for status in pool_statuses {
+            let rebalance_status = store.pool_rebalance_status(status.id).await;
+            pools.push(Self::decommission_pool_status_from_status(status, rebalance_status));
+        }
+        Ok(AdminDecommissionStatus { pools })
     }
 
     pub async fn execute_query_decommission_status(
@@ -395,7 +399,8 @@ impl DefaultAdminUsecase {
         };
 
         let status = store.status(idx).await.map_err(ApiError::from)?;
-        Ok(Self::decommission_pool_status_from_status(status))
+        let rebalance_status = store.pool_rebalance_status(idx).await;
+        Ok(Self::decommission_pool_status_from_status(status, rebalance_status))
     }
 
     fn pool_list_item_from_status(status: PoolStatus, rebalance_status: (RebalStatus, bool)) -> AdminPoolListItem {
@@ -408,7 +413,10 @@ impl DefaultAdminUsecase {
         let total_size = decommission.as_ref().map(|info| info.total_size).unwrap_or_default();
         let current_size = decommission.as_ref().map(|info| info.current_size).unwrap_or_default();
         let used_size = total_size.saturating_sub(current_size);
-        let pool_state = Self::pool_lifecycle_state(decommission.as_ref());
+        let decommission = decommission.filter(PoolDecommissionInfo::has_decommission_state);
+        let decommission_status = Self::pool_decommission_status(decommission.as_ref());
+        let rebalance_status = Self::pool_rebalance_status(rebalance_status);
+        let pool_state = Self::pool_lifecycle_state(decommission.as_ref(), rebalance_status);
 
         AdminPoolStatus {
             id,
@@ -419,17 +427,22 @@ impl DefaultAdminUsecase {
             used_size,
             used: Self::used_ratio(total_size, used_size),
             status: pool_state.to_string(),
-            decommission_status: Self::pool_decommission_status(decommission.as_ref()).to_string(),
-            rebalance_status: Self::pool_rebalance_status(rebalance_status).to_string(),
+            decommission_status: decommission_status.to_string(),
+            rebalance_status: rebalance_status.to_string(),
             decommission: decommission.map(Self::admin_decommission_info_from_pool),
         }
     }
 
-    fn pool_lifecycle_state(decommission: Option<&PoolDecommissionInfo>) -> &'static str {
+    fn pool_lifecycle_state(decommission: Option<&PoolDecommissionInfo>, rebalance_status: &'static str) -> &'static str {
         match decommission {
             Some(info) if info.complete => Self::POOL_STATE_DECOMMISSIONED,
             Some(info) if info.failed || info.canceled => Self::POOL_STATE_BLOCKED,
+            Some(info) if !info.has_decommission_state() && Self::rebalance_status_is_active(rebalance_status) => {
+                Self::POOL_STATE_REBALANCING
+            }
+            Some(info) if !info.has_decommission_state() => Self::POOL_STATE_ACTIVE,
             Some(_) => Self::POOL_STATE_DECOMMISSIONING,
+            None if Self::rebalance_status_is_active(rebalance_status) => Self::POOL_STATE_REBALANCING,
             None => Self::POOL_STATE_ACTIVE,
         }
     }
@@ -441,9 +454,14 @@ impl DefaultAdminUsecase {
             Some(info) if info.canceled => Self::POOL_STATUS_CANCELED,
             Some(info) if info.queued => Self::POOL_STATUS_QUEUED,
             Some(info) if info.start_time.is_some() => Self::POOL_STATUS_RUNNING,
+            Some(info) if !info.has_decommission_state() => Self::REBALANCE_STATUS_NONE,
             Some(_) => Self::POOL_STATUS_UNKNOWN,
             None => Self::REBALANCE_STATUS_NONE,
         }
+    }
+
+    fn rebalance_status_is_active(status: &'static str) -> bool {
+        matches!(status, Self::REBALANCE_STATUS_STARTED | Self::REBALANCE_STATUS_STOPPING)
     }
 
     fn pool_rebalance_status((status, stopping): (RebalStatus, bool)) -> &'static str {
@@ -460,15 +478,20 @@ impl DefaultAdminUsecase {
         }
     }
 
-    fn decommission_pool_status_from_status(status: PoolStatus) -> AdminDecommissionPoolStatus {
+    fn decommission_pool_status_from_status(
+        status: PoolStatus,
+        rebalance_status: (RebalStatus, bool),
+    ) -> AdminDecommissionPoolStatus {
         let PoolStatus {
             id,
             cmd_line,
             decommission,
             ..
         } = status;
-        let pool_status = Self::pool_lifecycle_state(decommission.as_ref()).to_string();
+        let decommission = decommission.filter(PoolDecommissionInfo::has_decommission_state);
         let status = Self::pool_decommission_status(decommission.as_ref()).to_string();
+        let rebalance_status = Self::pool_rebalance_status(rebalance_status);
+        let pool_status = Self::pool_lifecycle_state(decommission.as_ref(), rebalance_status).to_string();
 
         AdminDecommissionPoolStatus {
             id,
@@ -505,7 +528,7 @@ impl DefaultAdminUsecase {
     }
 
     fn decommission_waiting_reason(info: &PoolDecommissionInfo) -> Option<&'static str> {
-        if info.complete || info.failed || info.canceled || info.start_time.is_some() {
+        if !info.has_decommission_state() || info.complete || info.failed || info.canceled || info.start_time.is_some() {
             return None;
         }
         if info.queued {
@@ -614,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn admin_pool_list_item_maps_capacity_and_unknown_decommission_status() {
+    fn admin_pool_list_item_maps_capacity_without_decommission_state_as_active() {
         let now = OffsetDateTime::UNIX_EPOCH;
         let pool = PoolStatus {
             id: 2,
@@ -634,9 +657,32 @@ mod tests {
         assert_eq!(item.current_size, 250);
         assert_eq!(item.used_size, 750);
         assert!((item.used - 0.75).abs() < f64::EPSILON);
+        assert_eq!(item.status, "active");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "none");
+        assert!(item.decommission.is_none());
+    }
+
+    #[test]
+    fn admin_pool_list_item_maps_inconsistent_decommission_progress_as_unknown() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 2,
+                cmd_line: "http://node{1...4}/disk{1...4}".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    total_size: 1_000,
+                    current_size: 250,
+                    items_decommissioned: 1,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::None, false),
+        );
+
         assert_eq!(item.status, "decommissioning");
         assert_eq!(item.decommission_status, "unknown");
-        assert_eq!(item.rebalance_status, "none");
+        assert!(item.decommission.is_some());
     }
 
     #[test]
@@ -710,6 +756,26 @@ mod tests {
 
         assert_eq!(item.status, "decommissioning");
         assert_eq!(item.decommission_status, "running");
+        assert_eq!(item.rebalance_status, "started");
+    }
+
+    #[test]
+    fn admin_pool_list_item_keeps_decommission_state_ahead_of_rebalance_state() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::Started, false),
+        );
+
+        assert_eq!(item.status, "blocked");
+        assert_eq!(item.decommission_status, "failed");
         assert_eq!(item.rebalance_status, "started");
     }
 
@@ -803,6 +869,23 @@ mod tests {
     }
 
     #[test]
+    fn admin_pool_list_item_maps_started_rebalance_to_pool_rebalancing() {
+        let item = DefaultAdminUsecase::pool_list_item_from_status(
+            PoolStatus {
+                id: 1,
+                cmd_line: "pool-1".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: None,
+            },
+            (RebalStatus::Started, false),
+        );
+
+        assert_eq!(item.status, "rebalancing");
+        assert_eq!(item.decommission_status, "none");
+        assert_eq!(item.rebalance_status, "started");
+    }
+
+    #[test]
     fn admin_pool_list_item_maps_stopping_rebalance_status() {
         let item = DefaultAdminUsecase::pool_list_item_from_status(
             PoolStatus {
@@ -814,42 +897,56 @@ mod tests {
             (RebalStatus::Started, true),
         );
 
-        assert_eq!(item.status, "active");
+        assert_eq!(item.status, "rebalancing");
         assert_eq!(item.decommission_status, "none");
         assert_eq!(item.rebalance_status, "stopping");
     }
 
     #[test]
     fn admin_pool_lifecycle_state_distinguishes_decommission_terminal_states() {
-        let complete = DefaultAdminUsecase::pool_lifecycle_state(Some(&PoolDecommissionInfo {
-            complete: true,
-            ..Default::default()
-        }));
-        let failed = DefaultAdminUsecase::pool_lifecycle_state(Some(&PoolDecommissionInfo {
-            failed: true,
-            ..Default::default()
-        }));
-        let canceled = DefaultAdminUsecase::pool_lifecycle_state(Some(&PoolDecommissionInfo {
-            canceled: true,
-            ..Default::default()
-        }));
+        let complete = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                complete: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let failed = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                failed: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let canceled = DefaultAdminUsecase::pool_lifecycle_state(
+            Some(&PoolDecommissionInfo {
+                canceled: true,
+                ..Default::default()
+            }),
+            DefaultAdminUsecase::REBALANCE_STATUS_NONE,
+        );
+        let rebalancing = DefaultAdminUsecase::pool_lifecycle_state(None, DefaultAdminUsecase::REBALANCE_STATUS_STARTED);
 
         assert_eq!(complete, "decommissioned");
         assert_eq!(failed, "blocked");
         assert_eq!(canceled, "blocked");
+        assert_eq!(rebalancing, "rebalancing");
     }
 
     #[test]
     fn admin_decommission_status_serializes_task_status_and_pool_status() {
-        let item = DefaultAdminUsecase::decommission_pool_status_from_status(PoolStatus {
-            id: 3,
-            cmd_line: "pool-3".to_string(),
-            last_update: OffsetDateTime::UNIX_EPOCH,
-            decommission: Some(PoolDecommissionInfo {
-                failed: true,
-                ..Default::default()
-            }),
-        });
+        let item = DefaultAdminUsecase::decommission_pool_status_from_status(
+            PoolStatus {
+                id: 3,
+                cmd_line: "pool-3".to_string(),
+                last_update: OffsetDateTime::UNIX_EPOCH,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            },
+            (RebalStatus::Started, false),
+        );
 
         let value = serde_json::to_value(item).expect("decommission status should serialize");
 

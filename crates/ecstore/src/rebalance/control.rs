@@ -39,6 +39,13 @@ pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) ->
     Ok(())
 }
 
+fn pool_rebalance_status_from_meta(meta: Option<&RebalanceMeta>, pool_index: usize) -> (RebalStatus, bool) {
+    meta.and_then(|meta| meta.pool_stats.get(pool_index))
+        .filter(|pool_stat| pool_stat.participating)
+        .map(|pool_stat| (pool_stat.info.status, pool_stat.info.stopping))
+        .unwrap_or_default()
+}
+
 impl ECStore {
     pub(super) async fn save_rebalance_meta_with_merge<S>(
         &self,
@@ -442,11 +449,7 @@ impl ECStore {
 
     pub async fn pool_rebalance_status(&self, pool_index: usize) -> (RebalStatus, bool) {
         let rebalance_meta = self.rebalance_meta.read().await;
-        rebalance_meta
-            .as_ref()
-            .and_then(|meta| meta.pool_stats.get(pool_index))
-            .map(|pool_stat| (pool_stat.info.status, pool_stat.info.stopping))
-            .unwrap_or_default()
+        pool_rebalance_status_from_meta(rebalance_meta.as_ref(), pool_index)
     }
 
     pub async fn current_rebalance_id(&self) -> Option<String> {
@@ -528,5 +531,40 @@ impl ECStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_rebalance_status_ignores_non_participating_pool_state() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: false,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        stopping: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 0), (RebalStatus::None, false));
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 1), (RebalStatus::Started, false));
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 2), (RebalStatus::None, false));
     }
 }
