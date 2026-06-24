@@ -226,7 +226,6 @@ impl RemoteClient {
             .iter()
             .map(|request| request.acquire_timeout)
             .max()
-            .map(Self::rpc_timeout)
             .unwrap_or_else(|| Duration::from_millis(1))
     }
 
