@@ -1104,6 +1104,42 @@ pub struct LoadRebalanceMetaResponse {
     #[prost(string, optional, tag = "2")]
     pub error_info: ::core::option::Option<::prost::alloc::string::String>,
 }
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartDecommissionRequest {
+    #[prost(uint32, repeated, tag = "1")]
+    pub pool_indices: ::prost::alloc::vec::Vec<u32>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct StartDecommissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelDecommissionRequest {
+    #[prost(uint32, tag = "1")]
+    pub pool_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct CancelDecommissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearDecommissionRequest {
+    #[prost(uint32, tag = "1")]
+    pub pool_index: u32,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ClearDecommissionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, optional, tag = "2")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LoadTransitionTierConfigRequest {}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
@@ -2356,6 +2392,51 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "LoadRebalanceMeta"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn start_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StartDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/StartDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "StartDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn cancel_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::CancelDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CancelDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/CancelDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "CancelDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
+        pub async fn clear_decommission(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ClearDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClearDecommissionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/ClearDecommission");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "ClearDecommission"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn load_transition_tier_config(
             &mut self,
             request: impl tonic::IntoRequest<super::LoadTransitionTierConfigRequest>,
@@ -2715,6 +2796,18 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::LoadRebalanceMetaRequest>,
         ) -> std::result::Result<tonic::Response<super::LoadRebalanceMetaResponse>, tonic::Status>;
+        async fn start_decommission(
+            &self,
+            request: tonic::Request<super::StartDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::StartDecommissionResponse>, tonic::Status>;
+        async fn cancel_decommission(
+            &self,
+            request: tonic::Request<super::CancelDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::CancelDecommissionResponse>, tonic::Status>;
+        async fn clear_decommission(
+            &self,
+            request: tonic::Request<super::ClearDecommissionRequest>,
+        ) -> std::result::Result<tonic::Response<super::ClearDecommissionResponse>, tonic::Status>;
         async fn load_transition_tier_config(
             &self,
             request: tonic::Request<super::LoadTransitionTierConfigRequest>,
@@ -4918,6 +5011,90 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = LoadRebalanceMetaSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/StartDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct StartDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::StartDecommissionRequest> for StartDecommissionSvc<T> {
+                        type Response = super::StartDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::StartDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::start_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StartDecommissionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/CancelDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct CancelDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::CancelDecommissionRequest> for CancelDecommissionSvc<T> {
+                        type Response = super::CancelDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::CancelDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::cancel_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = CancelDecommissionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/ClearDecommission" => {
+                    #[allow(non_camel_case_types)]
+                    struct ClearDecommissionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::ClearDecommissionRequest> for ClearDecommissionSvc<T> {
+                        type Response = super::ClearDecommissionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::ClearDecommissionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::clear_decommission(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ClearDecommissionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

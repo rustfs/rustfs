@@ -33,9 +33,8 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::event_notification::{EventArgs, send_event};
-use crate::global::GLOBAL_LocalNodeName;
-use crate::global::{GLOBAL_LifecycleSys, GLOBAL_TierConfigMgr, get_global_deployment_id};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::runtime_sources;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::store::ECStore;
 use crate::tier::warm_backend::WarmBackendGetOpts;
@@ -577,11 +576,12 @@ impl ExpiryState {
     }
 
     pub async fn resize_workers(n: usize, api: Arc<ECStore>) {
-        if n == GLOBAL_ExpiryState.read().await.tasks_tx.len() || n < 1 {
+        let expiry_state = runtime_sources::expiry_state_handle();
+        if n == expiry_state.read().await.tasks_tx.len() || n < 1 {
             return;
         }
 
-        let mut state = GLOBAL_ExpiryState.write().await;
+        let mut state = expiry_state.write().await;
 
         while state.tasks_tx.len() < n {
             let (tx, rx) = mpsc::channel(EXPIRY_WORKER_QUEUE_CAPACITY);
@@ -593,7 +593,7 @@ impl ExpiryState {
             state.stats.increment_workers();
             tokio::spawn(async move {
                 let mut rx = rx.lock().await;
-                //let mut expiry_state = GLOBAL_ExpiryState.read().await;
+                //let mut expiry_state = runtime_sources::expiry_state_handle().read().await;
                 ExpiryState::worker(&mut rx, api, stats).await;
             });
         }
@@ -789,7 +789,8 @@ async fn enqueue_recovered_free_version_with_state(state: &Arc<RwLock<ExpiryStat
 }
 
 pub async fn enqueue_recovered_free_version(oi: ObjectInfo) -> bool {
-    enqueue_recovered_free_version_with_state(&GLOBAL_ExpiryState, oi).await
+    let expiry_state = runtime_sources::expiry_state_handle();
+    enqueue_recovered_free_version_with_state(&expiry_state, oi).await
 }
 
 struct TransitionTask {
@@ -890,7 +891,7 @@ impl TransitionState {
         tokio::spawn(async move {
             Self::inc_counter(&state.compensation_running_tasks);
             state.record_scanner_transition_state();
-            let Some(api) = crate::global::resolve_object_store_handle() else {
+            let Some(api) = runtime_sources::object_store_handle() else {
                 scheduled.lock().unwrap().remove(&bucket);
                 Self::add_counter(&state.compensation_running_tasks, -1);
                 state.record_scanner_transition_state();
@@ -1114,6 +1115,7 @@ impl TransitionState {
 
     pub async fn init(api: Arc<ECStore>) {
         let (configured, absolute_max, n) = resolve_transition_worker_count();
+        let transition_state = runtime_sources::transition_state_handle();
         debug!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
             component = LOG_COMPONENT_ECSTORE,
@@ -1121,8 +1123,8 @@ impl TransitionState {
             configured_transition_workers = configured,
             absolute_max_workers = absolute_max,
             effective_transition_workers = n,
-            transition_queue_capacity = GLOBAL_TransitionState.transition_queue_capacity,
-            transition_queue_send_timeout_ms = GLOBAL_TransitionState.transition_queue_send_timeout.as_millis() as u64,
+            transition_queue_capacity = transition_state.transition_queue_capacity,
+            transition_queue_send_timeout_ms = transition_state.transition_queue_send_timeout.as_millis() as u64,
             state = "configured",
             "Lifecycle worker configuration resolved"
         );
@@ -1133,9 +1135,8 @@ impl TransitionState {
     }
 
     pub fn pending_tasks(&self) -> usize {
-        //let transition_rx = GLOBAL_TransitionState.transition_rx.lock().unwrap();
-        let transition_rx = &GLOBAL_TransitionState.transition_rx;
-        transition_rx.len()
+        //let transition_rx = runtime_sources::transition_state_handle().transition_rx.lock().unwrap();
+        self.transition_rx.len()
     }
 
     pub fn active_tasks(&self) -> i64 {
@@ -1170,6 +1171,7 @@ impl TransitionState {
     }
 
     async fn worker_with_cancel(api: Arc<ECStore>, cancel_token: CancellationToken) {
+        let transition_state = runtime_sources::transition_state_handle();
         loop {
             select! {
                 biased;
@@ -1177,7 +1179,7 @@ impl TransitionState {
                 _ = cancel_token.cancelled() => {
                     return;
                 }
-                task = GLOBAL_TransitionState.transition_rx.recv() => {
+                task = transition_state.transition_rx.recv() => {
                     if task.is_err() {
                         break;
                     }
@@ -1191,8 +1193,8 @@ impl TransitionState {
                     if task.as_any().is::<TransitionTask>() {
                         let task = task.as_any().downcast_ref::<TransitionTask>().expect("TransitionTask downcast failed");
 
-                        TransitionState::inc_counter(&GLOBAL_TransitionState.active_tasks);
-                        GLOBAL_TransitionState.record_scanner_transition_state();
+                        TransitionState::inc_counter(&transition_state.active_tasks);
+                        transition_state.record_scanner_transition_state();
 
                         let obj_info_for_event = ObjectInfo {
                             bucket: task.obj_info.bucket.clone(),
@@ -1224,7 +1226,7 @@ impl TransitionState {
                                 bucket_name: obj_info_for_event.bucket.clone(),
                                 object: obj_info_for_event,
                                 user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: GLOBAL_LocalNodeName.to_string(),
+                                host: runtime_sources::default_local_node_name(),
                                 ..Default::default()
                             });
                         } else {
@@ -1237,7 +1239,7 @@ impl TransitionState {
                             if task.obj_info.is_latest {
                                 ts.num_objects = 1;
                             }
-                            GLOBAL_TransitionState.add_lastday_stats(&task.event.storage_class, ts);
+                            transition_state.add_lastday_stats(&task.event.storage_class, ts);
 
                             // Send s3:ObjectTransition:Complete event
                             send_event(EventArgs {
@@ -1245,12 +1247,12 @@ impl TransitionState {
                                 bucket_name: obj_info_for_event.bucket.clone(),
                                 object: obj_info_for_event,
                                 user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: GLOBAL_LocalNodeName.to_string(),
+                                host: runtime_sources::default_local_node_name(),
                                 ..Default::default()
                             });
                         }
-                        TransitionState::add_counter(&GLOBAL_TransitionState.active_tasks, -1);
-                        GLOBAL_TransitionState.record_scanner_transition_state();
+                        TransitionState::add_counter(&transition_state.active_tasks, -1);
+                        transition_state.record_scanner_transition_state();
                     }
                 }
                 else => ()
@@ -1295,7 +1297,8 @@ impl TransitionState {
 
     fn resize_workers_to(api: Arc<ECStore>, n: i64, requested: i64, absolute_max: i64) {
         let target = n as usize;
-        let mut workers = GLOBAL_TransitionState.workers.lock().unwrap();
+        let transition_state = runtime_sources::transition_state_handle();
+        let mut workers = transition_state.workers.lock().unwrap();
         let tracked_workers = workers.len();
         workers.retain(|worker| !worker.handle.is_finished());
         let pruned_finished_workers = tracked_workers.saturating_sub(workers.len());
@@ -1318,8 +1321,8 @@ impl TransitionState {
         }
 
         let current_workers = workers.len() as i64;
-        GLOBAL_TransitionState.num_workers.store(current_workers, Ordering::SeqCst);
-        GLOBAL_TransitionState.record_scanner_transition_state();
+        transition_state.num_workers.store(current_workers, Ordering::SeqCst);
+        transition_state.record_scanner_transition_state();
 
         debug!(
             event = EVENT_LIFECYCLE_WORKER_STATE,
@@ -1388,7 +1391,8 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
                     bucket_marker = stats.next_bucket_marker;
                     object_marker = stats.next_object_marker;
                     let (pending_tasks, active_tasks) = {
-                        let state = GLOBAL_ExpiryState.read().await;
+                        let expiry_state = runtime_sources::expiry_state_handle();
+                        let state = expiry_state.read().await;
                         (state.pending_tasks(), state.stats.active_tasks())
                     };
                     debug!(
@@ -1468,7 +1472,7 @@ fn stale_uploads_cleanup_interval() -> StdDuration {
 
 fn encode_stale_upload_id(upload_uuid: &str) -> String {
     base64_simd::URL_SAFE_NO_PAD
-        .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes())
+        .encode_to_string(format!("{}.{}", runtime_sources::deployment_id().unwrap_or_default(), upload_uuid).as_bytes())
 }
 
 fn initiated_from_upload_dir(upload_dir: &str, fallback: Option<OffsetDateTime>) -> OffsetDateTime {
@@ -1859,7 +1863,10 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
                 if let Some(storage_class) = &transition.storage_class
                     && storage_class.as_str() != ""
                 {
-                    let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
+                    let valid = runtime_sources::tier_config_mgr_handle()
+                        .read()
+                        .await
+                        .is_tier_valid(storage_class.as_str());
                     if !valid {
                         return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
                     }
@@ -1871,7 +1878,10 @@ pub async fn validate_transition_tier(lc: &BucketLifecycleConfiguration) -> Resu
                 if let Some(storage_class) = &noncurrent_version_transition.storage_class
                     && storage_class.as_str() != ""
                 {
-                    let valid = GLOBAL_TierConfigMgr.read().await.is_tier_valid(storage_class.as_str());
+                    let valid = runtime_sources::tier_config_mgr_handle()
+                        .read()
+                        .await
+                        .is_tier_valid(storage_class.as_str());
                     if !valid {
                         return Err(std::io::Error::other(ERR_INVALID_STORAGECLASS));
                     }
@@ -1900,16 +1910,16 @@ fn transitioned_cleanup_tuple(oi: &ObjectInfo) -> Result<(&str, &str, &str), std
 }
 
 pub async fn enqueue_transition_immediate(oi: &ObjectInfo, src: LcEventSrc) {
-    if let Some(lc) = GLOBAL_LifecycleSys.get(&oi.bucket).await {
+    if let Some(lc) = runtime_sources::bucket_lifecycle_config(&oi.bucket).await {
         enqueue_transition_with_lifecycle(oi, &lc, &src).await;
     }
 }
 
 pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
-    let Some(lifecycle) = GLOBAL_LifecycleSys.get(&oi.bucket).await else {
+    let Some(lifecycle) = runtime_sources::bucket_lifecycle_config(&oi.bucket).await else {
         return;
     };
-    let Some(api) = crate::global::resolve_object_store_handle() else {
+    let Some(api) = runtime_sources::object_store_handle() else {
         return;
     };
 
@@ -1995,7 +2005,8 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
     if !to_delete_objs.is_empty()
         && let Some(event) = noncurrent_event
     {
-        GLOBAL_ExpiryState
+        let expiry_state = runtime_sources::expiry_state_handle();
+        expiry_state
             .write()
             .await
             .enqueue_by_newer_noncurrent(&oi.bucket, to_delete_objs, event, &src)
@@ -2004,7 +2015,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
 }
 
 pub async fn enqueue_transition_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    let Some(lc) = GLOBAL_LifecycleSys.get(bucket).await else {
+    let Some(lc) = runtime_sources::bucket_lifecycle_config(bucket).await else {
         return Ok(());
     };
     let mut marker = None;
@@ -2117,7 +2128,9 @@ async fn enqueue_transition_with_lifecycle(oi: &ObjectInfo, lc: &BucketLifecycle
             if oi.delete_marker || oi.is_dir {
                 return;
             }
-            GLOBAL_TransitionState.queue_transition_task(oi, &event, src).await;
+            runtime_sources::transition_state_handle()
+                .queue_transition_task(oi, &event, src)
+                .await;
         }
         _ => (),
     }
@@ -2198,7 +2211,7 @@ pub async fn expire_transitioned_object(
         bucket_name: obj_info.bucket.clone(),
         object: obj_info,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: GLOBAL_LocalNodeName.to_string(),
+        host: runtime_sources::default_local_node_name(),
         ..Default::default()
     });
     /*let system = match notification_system() {
@@ -2218,7 +2231,7 @@ pub async fn expire_transitioned_object(
 pub fn gen_transition_objname(bucket: &str) -> Result<String, Error> {
     let us = Uuid::new_v4().to_string();
     let mut hasher = Sha256::new();
-    hasher.update(format!("{}/{}", get_global_deployment_id().unwrap_or_default(), bucket).as_bytes());
+    hasher.update(format!("{}/{}", runtime_sources::deployment_id().unwrap_or_default(), bucket).as_bytes());
     let hash = rustfs_utils::crypto::hex(hasher.finalize().as_slice());
     let obj = format!("{}/{}/{}/{}", &hash[0..16], &us[0..2], &us[2..4], &us);
     Ok(obj)
@@ -2275,7 +2288,8 @@ pub async fn get_transitioned_object_reader(
     oi: &ObjectInfo,
     opts: &ObjectOptions,
 ) -> Result<GetObjectReader, std::io::Error> {
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+    let mut tier_config_mgr = tier_config_mgr.write().await;
     let tgt_client = match tier_config_mgr.get_driver(&oi.transitioned_object.tier).await {
         Ok(d) => d,
         Err(err) => return Err(std::io::Error::other(err)),
@@ -2587,7 +2601,9 @@ pub async fn apply_transition_rule(event: &lifecycle::Event, src: &LcEventSrc, o
     if oi.delete_marker || oi.is_dir {
         return false;
     }
-    GLOBAL_TransitionState.queue_transition_task(oi, event, src).await
+    runtime_sources::transition_state_handle()
+        .queue_transition_task(oi, event, src)
+        .await
 }
 
 pub async fn apply_expiry_on_transitioned_object(
@@ -2668,7 +2684,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
         bucket_name: dobj.bucket.clone(),
         object: dobj,
         user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: GLOBAL_LocalNodeName.to_string(),
+        host: runtime_sources::default_local_node_name(),
         ..Default::default()
     });
 
@@ -2684,7 +2700,8 @@ pub async fn apply_expiry_on_non_transitioned_objects(
 }
 
 pub async fn apply_expiry_rule(event: &lifecycle::Event, src: &LcEventSrc, oi: &ObjectInfo) -> bool {
-    let mut expiry_state = GLOBAL_ExpiryState.write().await;
+    let expiry_state = runtime_sources::expiry_state_handle();
+    let mut expiry_state = expiry_state.write().await;
     expiry_state.enqueue_by_days(oi, event, src).await
 }
 
@@ -2846,8 +2863,8 @@ pub async fn apply_lifecycle_action(event: &lifecycle::Event, src: &LcEventSrc, 
 mod tests {
     use super::{
         DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS, DEFAULT_TRANSITION_QUEUE_CAPACITY, DEFAULT_TRANSITION_WORKERS_ABSOLUTE_MAX,
-        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, GLOBAL_TransitionState, StaleMultipartUploadCandidate, TransitionState,
-        TransitionedObject, cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
+        DEFAULT_TRANSITION_WORKERS_CAP, ExpiryState, StaleMultipartUploadCandidate, TransitionState, TransitionedObject,
+        cleanup_empty_multipart_sha_dirs_on_local_disks, cleanup_stale_multipart_uploads_once_at,
         enqueue_recovered_free_version_with_state, lifecycle_deleted_object, lifecycle_rule_has_date_expiration,
         lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
         merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
@@ -2864,6 +2881,7 @@ mod tests {
     use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::is_err_invalid_upload_id;
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::store::ECStore;
     use futures::FutureExt;
@@ -3520,10 +3538,11 @@ mod tests {
     #[serial]
     async fn transition_state_init_honors_runtime_configured_worker_count() {
         let (_paths, ecstore) = setup_test_env().await;
-        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let transition_state = runtime_sources::transition_state_handle();
+        let original_workers = transition_state.num_workers.load(Ordering::SeqCst);
         with_transition_worker_env_async(Some("3"), Some("8"), || async {
             TransitionState::update_workers(ecstore.clone(), 0).await;
-            assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 3);
+            assert_eq!(transition_state.num_workers.load(Ordering::SeqCst), 3);
         })
         .await;
 
@@ -3535,26 +3554,27 @@ mod tests {
     #[serial]
     async fn transition_worker_resize_cancels_removed_workers_directly() {
         let (_paths, ecstore) = setup_test_env().await;
-        let original_workers = GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst);
+        let transition_state = runtime_sources::transition_state_handle();
+        let original_workers = transition_state.num_workers.load(Ordering::SeqCst);
         let absolute_max = resolve_transition_workers_absolute_max();
 
         TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
-        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+        assert_eq!(transition_state.num_workers.load(Ordering::SeqCst), 0);
 
         TransitionState::resize_workers_to(ecstore.clone(), 2, 2, absolute_max);
         let worker_tokens = {
-            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            let workers = transition_state.workers.lock().unwrap();
             assert_eq!(workers.len(), 2);
             workers.iter().map(|worker| worker.cancel.clone()).collect::<Vec<_>>()
         };
 
         TransitionState::resize_workers_to(ecstore.clone(), 1, 1, absolute_max);
 
-        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 1);
+        assert_eq!(transition_state.num_workers.load(Ordering::SeqCst), 1);
         assert_eq!(worker_tokens.iter().filter(|token| token.is_cancelled()).count(), 1);
 
         let remaining_token = {
-            let workers = GLOBAL_TransitionState.workers.lock().unwrap();
+            let workers = transition_state.workers.lock().unwrap();
             assert_eq!(workers.len(), 1);
             let token = workers[0].cancel.clone();
             assert!(!token.is_cancelled());
@@ -3562,7 +3582,7 @@ mod tests {
         };
 
         TransitionState::resize_workers_to(ecstore.clone(), 0, 0, absolute_max);
-        assert_eq!(GLOBAL_TransitionState.num_workers.load(Ordering::SeqCst), 0);
+        assert_eq!(transition_state.num_workers.load(Ordering::SeqCst), 0);
         assert!(remaining_token.is_cancelled());
 
         TransitionState::resize_workers_to(ecstore, original_workers, original_workers, absolute_max);

@@ -782,6 +782,33 @@ message LoadRebalanceMetaResponse {
   optional string error_info = 2;
 }
 
+message StartDecommissionRequest {
+  repeated uint32 pool_indices = 1;
+}
+
+message StartDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message CancelDecommissionRequest {
+  uint32 pool_index = 1;
+}
+
+message CancelDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
+message ClearDecommissionRequest {
+  uint32 pool_index = 1;
+}
+
+message ClearDecommissionResponse {
+  bool success = 1;
+  optional string error_info = 2;
+}
+
 message LoadTransitionTierConfigRequest {}
 
 message LoadTransitionTierConfigResponse {
@@ -895,6 +922,9 @@ service NodeService {
   rpc ReloadPoolMeta(ReloadPoolMetaRequest) returns (ReloadPoolMetaResponse) {};
   rpc StopRebalance(StopRebalanceRequest) returns (StopRebalanceResponse) {};
   rpc LoadRebalanceMeta(LoadRebalanceMetaRequest) returns (LoadRebalanceMetaResponse) {};
+  rpc StartDecommission(StartDecommissionRequest) returns (StartDecommissionResponse) {};
+  rpc CancelDecommission(CancelDecommissionRequest) returns (CancelDecommissionResponse) {};
+  rpc ClearDecommission(ClearDecommissionRequest) returns (ClearDecommissionResponse) {};
   rpc LoadTransitionTierConfig(LoadTransitionTierConfigRequest) returns (LoadTransitionTierConfigResponse) {};
   rpc GetLiveEvents(GetLiveEventsRequest) returns (GetLiveEventsResponse) {};
 }

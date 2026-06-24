@@ -1,10 +1,10 @@
 use super::meta::{
-    clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index,
-    invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done,
-    merge_rebalance_meta, percent_free_ratio, rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
-    record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket, rollback_rebalance_start_meta_snapshot_for_id,
-    should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot_for_id,
-    validate_init_rebalance_state,
+    RebalanceMetaMergeOutcome, clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue,
+    ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission,
+    mark_rebalance_bucket_done, merge_rebalance_meta, percent_free_ratio, rebalance_metadata_not_initialized_error,
+    record_rebalance_cleanup_warning_in_meta, record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket,
+    rollback_rebalance_start_meta_snapshot_for_id, should_accept_rebalance_stats_update, should_pool_participate,
+    stop_rebalance_meta_snapshot_for_id, validate_init_rebalance_state,
 };
 use super::worker::{
     rebalance_meta_lock_error, resolve_load_rebalance_stats_update_result, resolve_rebalance_meta_load_result,
@@ -26,6 +26,18 @@ use std::sync::Arc;
 use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
+
+pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) -> Result<()> {
+    for (idx, disk_stat) in disk_stats.iter().enumerate() {
+        if disk_stat.total_space == 0 {
+            return Err(Error::other(format!(
+                "rebalance storage info is incomplete: pool {idx} has no reported capacity"
+            )));
+        }
+    }
+
+    Ok(())
+}
 
 impl ECStore {
     pub(super) async fn save_rebalance_meta_with_merge<S>(
@@ -50,7 +62,9 @@ impl ECStore {
         let mut merged = RebalanceMeta::new();
         match merged.load_with_opts(pool.clone(), opts.clone()).await {
             Ok(()) => {
-                merge_rebalance_meta(&mut merged, local_snapshot);
+                if merge_rebalance_meta(&mut merged, local_snapshot) == RebalanceMetaMergeOutcome::RejectedActiveConflict {
+                    return Err(Error::RebalanceAlreadyRunning);
+                }
             }
             Err(Error::ConfigNotFound) => {
                 merged = local_snapshot.clone();
@@ -90,6 +104,10 @@ impl ECStore {
                 "Loaded rebalance metadata"
             );
         } else {
+            {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                *rebalance_meta = None;
+            }
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -191,6 +209,7 @@ impl ECStore {
         }
 
         let percent_free_goal = percent_free_ratio(total_free, total_cap);
+        validate_rebalance_disk_stats_coverage(&disk_stats)?;
 
         let mut pool_stats = Vec::with_capacity(self.pools.len());
 
@@ -419,6 +438,15 @@ impl ECStore {
         }
 
         false
+    }
+
+    pub async fn pool_rebalance_status(&self, pool_index: usize) -> (RebalStatus, bool) {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        rebalance_meta
+            .as_ref()
+            .and_then(|meta| meta.pool_stats.get(pool_index))
+            .map(|pool_stat| (pool_stat.info.status, pool_stat.info.stopping))
+            .unwrap_or_default()
     }
 
     pub async fn current_rebalance_id(&self) -> Option<String> {

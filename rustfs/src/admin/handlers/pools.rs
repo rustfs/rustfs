@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use http::{HeaderMap, StatusCode, Uri};
+use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_utils::{
@@ -26,11 +26,12 @@ use tracing::{error, info, warn};
 
 use crate::{
     admin::{
+        EndpointServerPools, PeerRestClient,
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::{resolve_endpoints_handle, resolve_object_store_handle},
+    app::context::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
@@ -213,6 +214,84 @@ fn validate_start_decommission_guards(decommission_running: bool, rebalance_runn
     Ok(())
 }
 
+#[cfg(test)]
+fn validate_pool_mutation_leader(
+    endpoints: &EndpointServerPools,
+    idx: usize,
+    operation: &str,
+    audit: PoolAuditContext<'_>,
+) -> s3s::S3Result<()> {
+    let endpoint = endpoints
+        .as_ref()
+        .get(idx)
+        .and_then(|pool| pool.endpoints.as_ref().first())
+        .ok_or_else(|| pool_admin_pool_index_error_with_audit(operation, idx, endpoints.as_ref().len(), audit))?;
+
+    if !endpoint.is_local {
+        log_pool_request_rejected_with_index_audit(
+            operation_to_event(operation),
+            "not_pool_leader",
+            idx,
+            endpoints.as_ref().len(),
+            audit,
+        );
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            format!("Failed to {operation}: pool {idx} must be handled by its first endpoint {endpoint}"),
+        ));
+    }
+
+    Ok(())
+}
+
+fn decommission_peer_target(
+    endpoints: &EndpointServerPools,
+    idx: usize,
+    operation: &str,
+    audit: PoolAuditContext<'_>,
+) -> s3s::S3Result<Option<PeerRestClient>> {
+    let endpoint = endpoints
+        .as_ref()
+        .get(idx)
+        .and_then(|pool| pool.endpoints.as_ref().first())
+        .ok_or_else(|| pool_admin_pool_index_error_with_audit(operation, idx, endpoints.as_ref().len(), audit))?;
+
+    if endpoint.is_local {
+        return Ok(None);
+    }
+
+    let grid_host = endpoint.grid_host();
+    let Some(notification_sys) = resolve_notification_system() else {
+        log_pool_request_rejected_with_index_audit(
+            operation_to_event(operation),
+            "notification_sys_not_initialized",
+            idx,
+            endpoints.as_ref().len(),
+            audit,
+        );
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            format!("Failed to {operation}: target pool first endpoint is not reachable"),
+        ));
+    };
+
+    let Some(client) = notification_sys.peer_client_for_grid_host(&grid_host) else {
+        log_pool_request_rejected_with_index_audit(
+            operation_to_event(operation),
+            "target_peer_not_found",
+            idx,
+            endpoints.as_ref().len(),
+            audit,
+        );
+        return Err(S3Error::with_message(
+            S3ErrorCode::OperationAborted,
+            format!("Failed to {operation}: target pool first endpoint is not reachable"),
+        ));
+    };
+
+    Ok(Some(client))
+}
+
 fn contextualize_admin_pool_api_error(
     err: crate::error::ApiError,
     operation: &str,
@@ -304,6 +383,7 @@ fn operation_to_event(operation: &str) -> &'static str {
     match operation {
         "list pools" => "list_pools",
         "load pool status" => "query_pool_status",
+        "load decommission status" => "query_decommission_status",
         "start decommission" => "start_decommission",
         "cancel decommission" => "cancel_decommission",
         "clear decommission" => "clear_decommission",
@@ -337,6 +417,12 @@ pub fn register_pool_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<
         Method::GET,
         format!("{}{}", ADMIN_PREFIX, "/v3/pools/status").as_str(),
         AdminOperation(&StatusPool {}),
+    )?;
+
+    r.insert(
+        Method::GET,
+        format!("{}{}", ADMIN_PREFIX, "/v3/decommission/status").as_str(),
+        AdminOperation(&StatusDecommission {}),
     )?;
 
     r.insert(
@@ -508,6 +594,62 @@ impl Operation for StatusPool {
     }
 }
 
+pub struct StatusDecommission {}
+
+#[async_trait::async_trait]
+impl Operation for StatusDecommission {
+    // GET <endpoint>/<admin-API>/decommission/status[?pool=http://server{1...4}/disk{1...4}]
+    #[tracing::instrument(skip_all)]
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let Some(input_cred) = req.credentials else {
+            return Err(pool_admin_missing_credentials_error("load decommission status"));
+        };
+
+        let (cred, owner) =
+            check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
+
+        validate_admin_request(
+            &req.headers,
+            &cred,
+            owner,
+            false,
+            vec![
+                Action::AdminAction(AdminAction::ServerInfoAdminAction),
+                Action::AdminAction(AdminAction::DecommissionAdminAction),
+            ],
+            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        )
+        .await?;
+
+        let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load decommission status"))?;
+
+        let usecase = DefaultAdminUsecase::from_global();
+        let data = if query.pool.is_empty() {
+            let status = usecase.execute_list_decommission_status().await.map_err(S3Error::from)?;
+            serde_json::to_vec(&status)
+        } else {
+            let status = usecase
+                .execute_query_decommission_status(QueryPoolStatusRequest {
+                    pool: query.pool,
+                    by_id: query.by_id.as_str() == "true",
+                })
+                .await
+                .map_err(S3Error::from)?;
+            serde_json::to_vec(&status)
+        }
+        .map_err(|e| {
+            log_pool_request_failed!("query_decommission_status", "serialize_decommission_status_failed", e);
+            S3Error::with_message(S3ErrorCode::InternalError, "serialize decommission status failed")
+        })?;
+
+        let mut header = HeaderMap::new();
+        header.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        log_pool_response_emitted!("query_decommission_status");
+
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
+    }
+}
+
 pub struct StartDecommission {}
 
 #[async_trait::async_trait]
@@ -572,27 +714,6 @@ impl Operation for StartDecommission {
             return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
-        let decommission_running = store.is_decommission_running().await;
-        let rebalance_running = store.is_rebalance_started().await;
-        if decommission_running {
-            log_pool_request_rejected_with_context(
-                "start_decommission",
-                "decommission_already_running",
-                &request_id,
-                &actor,
-                &remote_addr,
-            );
-        } else if rebalance_running {
-            log_pool_request_rejected_with_context(
-                "start_decommission",
-                "rebalance_in_progress",
-                &request_id,
-                &actor,
-                &remote_addr,
-            );
-        }
-        validate_start_decommission_guards(decommission_running, rebalance_running)?;
-
         let query = parse_mutation_pool_query(&req.uri)
             .map_err(|_| pool_admin_query_parse_error_with_audit("start decommission", audit))?;
         let is_byid = query.by_id.as_str() == "true";
@@ -631,13 +752,49 @@ impl Operation for StartDecommission {
         }
         let pools_indices = parsed_indices;
 
-        if !pools_indices.is_empty() {
+        if let Some(first_idx) = pools_indices.first().copied()
+            && let Some(client) = decommission_peer_target(&endpoints, first_idx, "start decommission", audit)?
+        {
             let pool_context = format!("pools {:?}", &pools_indices);
-            store
-                .decommission(ctx.clone(), pools_indices.clone())
+            client
+                .start_decommission(pools_indices.clone())
                 .await
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
+        } else {
+            store
+                .load_rebalance_meta()
+                .await
+                .map_err(|e| s3_error!(InternalError, "failed to refresh rebalance metadata before decommission start: {}", e))?;
+            let decommission_running = store.is_decommission_running().await;
+            let rebalance_running = store.is_rebalance_started().await;
+            if decommission_running {
+                log_pool_request_rejected_with_context(
+                    "start_decommission",
+                    "decommission_already_running",
+                    &request_id,
+                    &actor,
+                    &remote_addr,
+                );
+            } else if rebalance_running {
+                log_pool_request_rejected_with_context(
+                    "start_decommission",
+                    "rebalance_in_progress",
+                    &request_id,
+                    &actor,
+                    &remote_addr,
+                );
+            }
+            validate_start_decommission_guards(decommission_running, rebalance_running)?;
+
+            if !pools_indices.is_empty() {
+                let pool_context = format!("pools {:?}", &pools_indices);
+                store
+                    .decommission(ctx.clone(), pools_indices.clone())
+                    .await
+                    .map_err(ApiError::from)
+                    .map_err(|err| contextualize_admin_pool_api_error(err, "start decommission", &pool_context))?;
+            }
         }
 
         info!(
@@ -734,15 +891,23 @@ impl Operation for CancelDecommission {
             return Err(pool_admin_pool_not_found_error_with_audit("cancel decommission", &query.pool, audit));
         };
 
-        let Some(store) = resolve_object_store_handle() else {
-            return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
-        };
+        if let Some(client) = decommission_peer_target(&endpoints, idx, "cancel decommission", audit)? {
+            client
+                .decommission_cancel(idx)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
+        } else {
+            let Some(store) = resolve_object_store_handle() else {
+                return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
+            };
 
-        store
-            .decommission_cancel(idx)
-            .await
-            .map_err(ApiError::from)
-            .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
+            store
+                .decommission_cancel(idx)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
+        }
 
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -839,15 +1004,23 @@ impl Operation for ClearDecommission {
             return Err(pool_admin_pool_not_found_error_with_audit("clear decommission", &query.pool, audit));
         };
 
-        let Some(store) = resolve_object_store_handle() else {
-            return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
-        };
+        if let Some(client) = decommission_peer_target(&endpoints, idx, "clear decommission", audit)? {
+            client
+                .clear_decommission(idx)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
+        } else {
+            let Some(store) = resolve_object_store_handle() else {
+                return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
+            };
 
-        store
-            .clear_decommission(idx)
-            .await
-            .map_err(ApiError::from)
-            .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
+            store
+                .clear_decommission(idx)
+                .await
+                .map_err(ApiError::from)
+                .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
+        }
 
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
@@ -870,12 +1043,26 @@ impl Operation for ClearDecommission {
 mod pools_handler_tests {
     use super::{
         PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
-        has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query,
-        pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
+        decommission_peer_target, has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id,
+        parse_status_pool_query, pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
         pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
-        validate_start_decommission_guards,
+        validate_pool_mutation_leader, validate_start_decommission_guards,
     };
+    use crate::admin::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+
+    fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
+        let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");
+        endpoint.is_local = is_local;
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 1,
+            cmd_line: "http://127.0.0.1:9000/disk".to_string(),
+            endpoints: Endpoints::from(vec![endpoint]),
+            platform: String::new(),
+        }])
+    }
 
     #[test]
     fn test_parse_pool_idx_by_id_rejects_non_numeric() {
@@ -967,6 +1154,41 @@ mod pools_handler_tests {
     #[test]
     fn test_validate_start_decommission_guards_allows_when_idle() {
         assert!(validate_start_decommission_guards(false, false).is_ok());
+    }
+
+    #[test]
+    fn test_validate_pool_mutation_leader_allows_local_first_endpoint() {
+        let endpoints = test_pool_endpoints(true);
+        let audit = PoolAuditContext::new("request", "actor", "remote");
+
+        assert!(validate_pool_mutation_leader(&endpoints, 0, "cancel decommission", audit).is_ok());
+    }
+
+    #[test]
+    fn test_decommission_peer_target_returns_none_for_local_first_endpoint() {
+        let endpoints = test_pool_endpoints(true);
+        let audit = PoolAuditContext::new("request", "actor", "remote");
+
+        let target = decommission_peer_target(&endpoints, 0, "start decommission", audit)
+            .expect("local first endpoint should resolve without peer lookup");
+
+        assert!(target.is_none());
+    }
+
+    #[test]
+    fn test_validate_pool_mutation_leader_rejects_remote_first_endpoint() {
+        let endpoints = test_pool_endpoints(false);
+        let audit = PoolAuditContext::new("request", "actor", "remote");
+
+        let err = validate_pool_mutation_leader(&endpoints, 0, "cancel decommission", audit)
+            .expect_err("remote first endpoint should reject mutation");
+
+        assert_eq!(err.code(), &s3s::S3ErrorCode::OperationAborted);
+        assert!(
+            err.message()
+                .expect("rejection should include message")
+                .contains("must be handled by its first endpoint")
+        );
     }
 
     #[test]
