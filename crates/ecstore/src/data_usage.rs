@@ -111,6 +111,47 @@ pub async fn store_data_usage_in_backend(data_usage_info: DataUsageInfo, store: 
     Ok(())
 }
 
+fn set_buckets_count_from_usage(data_usage_info: &mut DataUsageInfo) {
+    data_usage_info.buckets_count = u64::try_from(data_usage_info.buckets_usage.len()).unwrap_or(u64::MAX);
+}
+
+fn remove_bucket_usage_from_info(data_usage_info: &mut DataUsageInfo, bucket: &str) -> bool {
+    if bucket.is_empty() {
+        return false;
+    }
+
+    let removed_usage = data_usage_info.buckets_usage.remove(bucket).is_some();
+    let removed_size = data_usage_info.bucket_sizes.remove(bucket).is_some();
+
+    if !removed_usage && !removed_size {
+        return false;
+    }
+
+    set_buckets_count_from_usage(data_usage_info);
+    data_usage_info.calculate_totals();
+    data_usage_info.last_update = Some(SystemTime::now());
+    true
+}
+
+async fn clear_bucket_usage_memory(bucket: &str) {
+    if bucket.is_empty() {
+        return;
+    }
+
+    memory_cache().write().await.remove(bucket);
+}
+
+pub async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
+    clear_bucket_usage_memory(bucket).await;
+
+    let mut data_usage_info = load_data_usage_from_backend(store.clone()).await?;
+    if remove_bucket_usage_from_info(&mut data_usage_info, bucket) {
+        store_data_usage_in_backend(data_usage_info, store).await?;
+    }
+
+    Ok(())
+}
+
 /// Load data usage info from backend storage
 #[instrument(skip(store))]
 pub async fn load_data_usage_from_backend(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
@@ -947,6 +988,59 @@ mod tests {
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((0, 0))
         );
+    }
+
+    #[test]
+    fn remove_bucket_usage_from_info_drops_bucket_and_recomputes_totals() {
+        let mut info = data_usage_info_for_test("bucket-a", 2, 84, SystemTime::now());
+        info.buckets_usage.insert(
+            "bucket-b".to_string(),
+            BucketUsageInfo {
+                objects_count: 3,
+                versions_count: 3,
+                size: 126,
+                ..Default::default()
+            },
+        );
+        info.bucket_sizes.insert("bucket-b".to_string(), 126);
+        info.buckets_count = 2;
+        info.calculate_totals();
+
+        assert!(remove_bucket_usage_from_info(&mut info, "bucket-a"));
+
+        assert_eq!(info.buckets_count, 1);
+        assert_eq!(info.objects_total_count, 3);
+        assert_eq!(info.objects_total_size, 126);
+        assert!(!info.buckets_usage.contains_key("bucket-a"));
+        assert!(!info.bucket_sizes.contains_key("bucket-a"));
+        assert_eq!(
+            info.buckets_usage
+                .get("bucket-b")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((3, 126))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn clear_bucket_usage_memory_prevents_deleted_bucket_overlay() {
+        clear_usage_memory_cache_for_test().await;
+
+        let persisted = data_usage_info_for_test("bucket-a", 1, 42, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&persisted).await;
+        record_bucket_object_delete_memory("bucket-a", 42, true).await;
+        clear_bucket_usage_memory("bucket-a").await;
+
+        let mut response = DataUsageInfo {
+            last_update: Some(SystemTime::now()),
+            ..Default::default()
+        };
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.buckets_count, 0);
+        assert_eq!(response.objects_total_count, 0);
+        assert!(!response.buckets_usage.contains_key("bucket-a"));
+        assert!(!response.bucket_sizes.contains_key("bucket-a"));
     }
 
     #[tokio::test]

@@ -76,7 +76,7 @@ mod ecstore_config {
 mod ecstore_data_usage {
     pub(crate) use crate::storage::ecstore_data_usage::{
         apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
-        record_bucket_object_write_memory,
+        record_bucket_object_write_memory, remove_bucket_usage_from_backend,
     };
 }
 
@@ -600,6 +600,10 @@ pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_siz
 
 pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
     ecstore_data_usage::record_bucket_object_write_memory(bucket, previous_current_size, new_size).await;
+}
+
+pub(crate) async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> std::result::Result<(), Error> {
+    ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
 }
 
 pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
