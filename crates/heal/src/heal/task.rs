@@ -413,6 +413,13 @@ impl HealTask {
         Self::is_data_usage_cache_object(bucket, object) && Self::is_transient_lock_or_timeout_error(err)
     }
 
+    fn is_no_heal_required_error(err: &Error) -> bool {
+        match err {
+            Error::Other(message) => matches!(message.as_str(), "No heal required" | "No healing is required"),
+            _ => matches!(err.to_string().as_str(), "No heal required" | "No healing is required"),
+        }
+    }
+
     async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
             return false;
@@ -1823,37 +1830,50 @@ impl HealTask {
         match format_result {
             Ok((result, error)) => {
                 if let Some(e) = error {
-                    error!(
+                    if Self::is_no_heal_required_error(&e) {
+                        debug!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_ERASURE_SET_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_TASK,
+                            task_id = %self.id,
+                            set_disk_id,
+                            result = "format_noop",
+                            "Heal erasure set format repair skipped because no format heal was required"
+                        );
+                    } else {
+                        error!(
+                            target: "rustfs::heal::task",
+                            event = EVENT_HEAL_ERASURE_SET_RESULT,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_TASK,
+                            task_id = %self.id,
+                            set_disk_id,
+                            result = "format_failed",
+                            error = %e,
+                            "Heal erasure set failed"
+                        );
+                        {
+                            let mut progress = self.progress.write().await;
+                            progress.update_progress(4, 4, 0, 0);
+                        }
+                        return Err(Error::TaskExecutionFailed {
+                            message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
+                        });
+                    }
+                } else {
+                    debug!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_ERASURE_SET_RESULT,
                         component = LOG_COMPONENT_HEAL,
                         subsystem = LOG_SUBSYSTEM_TASK,
                         task_id = %self.id,
                         set_disk_id,
-                        result = "format_failed",
-                        error = %e,
-                        "Heal erasure set failed"
+                        drives_healed = result.after.drives.len(),
+                        result = "format_ok",
+                        "Heal erasure set format repaired"
                     );
-                    {
-                        let mut progress = self.progress.write().await;
-                        progress.update_progress(4, 4, 0, 0);
-                    }
-                    return Err(Error::TaskExecutionFailed {
-                        message: format!("Failed to heal disk format for {set_disk_id}: {e}"),
-                    });
                 }
-
-                debug!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_ERASURE_SET_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    set_disk_id,
-                    drives_healed = result.after.drives.len(),
-                    result = "format_ok",
-                    "Heal erasure set format repaired"
-                );
             }
             Err(Error::TaskCancelled) => return Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => return Err(Error::TaskTimeout),
@@ -2060,6 +2080,7 @@ mod tests {
         healed_objects: Mutex<Vec<String>>,
         bucket_heal_opts: Mutex<Vec<HealOpts>>,
         object_heal_opts: Mutex<Vec<HealOpts>>,
+        format_no_heal_required: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -2108,7 +2129,10 @@ mod tests {
         }
 
         async fn list_buckets(&self) -> Result<Vec<BucketInfo>> {
-            Ok(Vec::new())
+            Ok(vec![BucketInfo {
+                name: "bucket-a".to_string(),
+                ..Default::default()
+            }])
         }
 
         async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
@@ -2155,7 +2179,12 @@ mod tests {
         }
 
         async fn heal_format(&self, _dry_run: bool) -> Result<(HealResultItem, Option<Error>)> {
-            Ok((HealResultItem::default(), None))
+            let no_heal_required = *self.format_no_heal_required.lock().unwrap();
+            if no_heal_required {
+                Ok((HealResultItem::default(), Some(Error::other("No heal required"))))
+            } else {
+                Ok((HealResultItem::default(), None))
+            }
         }
 
         async fn list_objects_for_heal(&self, _bucket: &str, _prefix: &str) -> Result<Vec<String>> {
@@ -2307,5 +2336,33 @@ mod tests {
         let progress = task.get_progress().await;
         assert_eq!(progress.objects_scanned, 2);
         assert_eq!(progress.objects_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_erasure_set_heal_continues_after_format_no_heal_required() {
+        let storage = Arc::new(MockStorage::default());
+        *storage.format_no_heal_required.lock().unwrap() = true;
+        let request = HealRequest::new(
+            HealType::ErasureSet {
+                buckets: Vec::new(),
+                set_disk_id: "pool_0_set_0".to_string(),
+            },
+            HealOptions {
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage);
+
+        let err = task
+            .heal_erasure_set(Vec::new(), "pool_0_set_0".to_string())
+            .await
+            .expect_err("test mock should fail after format when resolving resume disk");
+
+        assert!(
+            err.to_string().contains("not implemented in tests"),
+            "erasure-set heal should continue past NoHealRequired format result, got: {err}"
+        );
     }
 }
