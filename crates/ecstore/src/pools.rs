@@ -35,7 +35,6 @@ use crate::error::{Error, Result};
 use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
-use crate::global::resolve_object_store_handle;
 use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::runtime_sources;
@@ -2420,7 +2419,7 @@ impl ECStore {
 
         self.ensure_decommission_rebalance_idle_after_refresh().await?;
 
-        let store = require_decommission_store(resolve_object_store_handle(), "start decommission")?;
+        let store = require_decommission_store(runtime_sources::object_store_handle(), "start decommission")?;
         let local_indices = local_decommission_queue_prefix(&self.endpoints(), &indices)?;
 
         self.start_decommission(indices.clone()).await?;
