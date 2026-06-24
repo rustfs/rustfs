@@ -358,6 +358,9 @@ impl PriorityHealQueue {
             HealType::Bucket { bucket } => {
                 format!("bucket:{bucket}")
             }
+            HealType::Prefix { bucket, prefix } => {
+                format!("prefix:{bucket}/{prefix}")
+            }
             HealType::ErasureSet { set_disk_id, .. } => {
                 format!("erasure_set:{set_disk_id}")
             }
@@ -483,6 +486,7 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
         | HealType::Metadata { bucket, object }
         | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
         HealType::Bucket { bucket } => heal_path == bucket,
+        HealType::Prefix { bucket, prefix } => heal_path == bucket || heal_path == format!("{bucket}/{prefix}"),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
         HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
@@ -2268,6 +2272,7 @@ fn heal_request_type_label(request: &HealRequest) -> &'static str {
     match &request.heal_type {
         HealType::Object { .. } => "object",
         HealType::Bucket { .. } => "bucket",
+        HealType::Prefix { .. } => "prefix",
         HealType::ErasureSet { .. } => "erasure_set",
         HealType::Metadata { .. } => "metadata",
         HealType::MRF { .. } => "mrf",

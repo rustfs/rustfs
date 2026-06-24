@@ -59,6 +59,8 @@ pub enum HealType {
     },
     /// Bucket heal
     Bucket { bucket: String },
+    /// Prefix heal
+    Prefix { bucket: String, prefix: String },
     /// Erasure Set heal (includes disk format repair)
     ErasureSet { buckets: Vec<String>, set_disk_id: String },
     /// Metadata heal
@@ -78,6 +80,7 @@ impl HealType {
         match self {
             Self::Object { .. } => "object",
             Self::Bucket { .. } => "bucket",
+            Self::Prefix { .. } => "prefix",
             Self::ErasureSet { .. } => "erasure_set",
             Self::Metadata { .. } => "metadata",
             Self::MRF { .. } => "mrf",
@@ -306,6 +309,7 @@ impl HealTask {
         match &self.heal_type {
             HealType::Object { .. } => "object",
             HealType::Bucket { .. } => "bucket",
+            HealType::Prefix { .. } => "prefix",
             HealType::ErasureSet { .. } => "erasure_set",
             HealType::Metadata { .. } => "metadata",
             HealType::MRF { .. } => "mrf",
@@ -491,6 +495,7 @@ impl HealTask {
                 version_id,
             } => self.heal_object(bucket, object, version_id.as_deref()).await,
             HealType::Bucket { bucket } => self.heal_bucket(bucket).await,
+            HealType::Prefix { bucket, prefix } => self.heal_prefix(bucket, prefix).await,
 
             HealType::Metadata { bucket, object } => self.heal_metadata(bucket, object).await,
             HealType::MRF { meta_path } => self.heal_mrf(meta_path).await,
@@ -1111,7 +1116,7 @@ impl HealTask {
                 self.record_result_item(result).await;
 
                 if self.options.recursive {
-                    self.heal_bucket_objects(bucket).await?;
+                    self.heal_bucket_objects(bucket, "").await?;
                 }
 
                 if !self.options.recursive {
@@ -1145,7 +1150,23 @@ impl HealTask {
         }
     }
 
-    async fn heal_bucket_objects(&self, bucket: &str) -> Result<()> {
+    async fn heal_prefix(&self, bucket: &str, prefix: &str) -> Result<()> {
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_BUCKET_STAGE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_TASK,
+            task_id = %self.id,
+            bucket,
+            prefix,
+            stage = "prefix_recursive",
+            "Heal prefix started"
+        );
+
+        self.heal_bucket_objects(bucket, prefix).await
+    }
+
+    async fn heal_bucket_objects(&self, bucket: &str, prefix: &str) -> Result<()> {
         let mut continuation_token: Option<String> = None;
         let mut scanned = 0u64;
         let mut healed = 0u64;
@@ -1169,7 +1190,7 @@ impl HealTask {
             let (objects, next_token, is_truncated) = self
                 .await_with_control(
                     self.storage
-                        .list_objects_for_heal_page(bucket, "", continuation_token.as_deref()),
+                        .list_objects_for_heal_page(bucket, prefix, continuation_token.as_deref()),
                 )
                 .await?;
 
@@ -1312,6 +1333,7 @@ impl HealTask {
             subsystem = LOG_SUBSYSTEM_TASK,
             task_id = %self.id,
             bucket,
+            prefix,
             scanned,
             healed,
             failed,
@@ -2081,6 +2103,7 @@ mod tests {
         bucket_heal_opts: Mutex<Vec<HealOpts>>,
         object_heal_opts: Mutex<Vec<HealOpts>>,
         format_no_heal_required: Mutex<bool>,
+        listed_prefixes: Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2194,9 +2217,10 @@ mod tests {
         async fn list_objects_for_heal_page(
             &self,
             bucket: &str,
-            _prefix: &str,
+            prefix: &str,
             continuation_token: Option<&str>,
         ) -> Result<(Vec<String>, Option<String>, bool)> {
+            self.listed_prefixes.lock().unwrap().push(prefix.to_string());
             let mut listed = self.listed.lock().unwrap();
             if continuation_token.is_none() && !*listed {
                 *listed = true;
@@ -2205,6 +2229,8 @@ mod tests {
                         format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}"),
                         format!("{BUCKET_META_PREFIX}/bucket-metadata.bin"),
                     ]
+                } else if prefix == "logs/" {
+                    vec!["logs/object-a".to_string(), "logs/object-b".to_string()]
                 } else {
                     vec!["object-a".to_string(), "object-b".to_string()]
                 };
@@ -2285,6 +2311,34 @@ mod tests {
         assert!(object_opts.iter().all(|opts| opts.remove));
         assert!(object_opts.iter().all(|opts| opts.recreate));
         assert!(object_opts.iter().all(|opts| opts.scan_mode == HealScanMode::Deep));
+    }
+
+    #[tokio::test]
+    async fn test_prefix_heal_lists_and_repairs_objects_under_prefix() {
+        let storage = Arc::new(MockStorage::default());
+        let request = HealRequest::new(
+            HealType::Prefix {
+                bucket: "bucket-a".to_string(),
+                prefix: "logs/".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("prefix heal should scan and repair objects under the prefix");
+
+        assert_eq!(storage.listed_prefixes.lock().unwrap().as_slice(), ["logs/".to_string()]);
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["logs/object-a".to_string(), "logs/object-b".to_string()]
+        );
     }
 
     #[tokio::test]
