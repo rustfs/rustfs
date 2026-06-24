@@ -150,3 +150,65 @@ profile 固定：
 2. 它对 `erasure_encode_batched_recv_wait` 的改善方向是清晰的
 3. 但吞吐/延迟收益还不够稳定，当前不建议直接改默认值
 4. 下一步更适合继续以环境变量方式复测，而不是马上把默认值写死到代码里
+
+## 11. 第三轮补齐后的小结
+
+按低噪声矩阵继续补到 `6` 轮之后，结果如下：
+
+1. `b4-r1`: `317.20 MiB/s`, `6515.2ms`
+2. `b2-r1`: `300.38 MiB/s`, `6842.8ms`
+3. `b4-r2`: `334.58 MiB/s`, `5966.5ms`
+4. `b2-r2`: `358.77 MiB/s`, `5748.2ms`
+5. `b4-r3`: `323.35 MiB/s`, `6412.4ms`
+6. `b2-r3`: `350.87 MiB/s`, `5827.6ms`
+
+按组汇总：
+
+### `batch_blocks=4`
+
+1. Avg throughput: `325.04 MiB/s`
+2. Median throughput: `323.35 MiB/s`
+3. Avg latency: `6298.0ms`
+4. Median latency: `6412.4ms`
+
+### `batch_blocks=2`
+
+1. Avg throughput: `336.67 MiB/s`
+2. Median throughput: `350.87 MiB/s`
+3. Avg latency: `6139.5ms`
+4. Median latency: `5827.6ms`
+
+这说明：
+
+1. `batch_blocks=2` 经过 `6` 轮汇总后，组均值已经优于 `4`
+2. 但单轮结果仍然存在明显波动，因此还不能把它视为“完全稳定结论”
+
+## 12. 第三轮内部阶段补充
+
+从 `b4-r3` 与 `b2-r3` 的 raw sum / count 看：
+
+### `b4-r3`
+
+1. `erasure_encode_batched_recv_wait`: `~115.55ms`
+2. `erasure_encode_batched_write`: `~80.15ms`
+3. `erasure_encode_cpu`: `~3.55ms`
+
+### `b2-r3`
+
+1. `erasure_encode_batched_recv_wait`: `~52.46ms`
+2. `erasure_encode_batched_write`: `~37.99ms`
+3. `erasure_encode_cpu`: `~3.12ms`
+
+这与前一组 `b4-r2` / `b2-r2` 的方向一致，说明：
+
+1. `batch_blocks=2` 主要还是在改善 batch barrier
+2. 下降最明显的仍然是 consumer 侧等待时间
+3. `cpu` 本体没有决定性变化
+
+## 13. 当前更新后的建议
+
+到这一步，建议可以进一步收敛为：
+
+1. `RUSTFS_ERASURE_ENCODE_BATCH_BLOCKS=2` 仍然保留为 multipart batched 路径的强候选配置
+2. 它已经具备“方向明确、组均值更优”的证据
+3. 但由于单轮波动仍在，当前更合适的动作仍然是继续以 env 方式复测，而不是直接改代码默认值
