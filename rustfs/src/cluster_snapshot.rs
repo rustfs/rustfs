@@ -171,7 +171,11 @@ mod tests {
             vec![ReadinessDegradedReason::StorageAndLockUnavailable]
         );
         assert_eq!(snapshot.peer_health.peers[0].status.state, CapabilityState::Unknown);
-        assert_eq!(snapshot.observability.platform.numa.state, CapabilityState::Unsupported);
+        if cfg!(target_os = "linux") {
+            assert_eq!(snapshot.observability.platform.numa.state, CapabilityState::Unknown);
+        } else {
+            assert_eq!(snapshot.observability.platform.numa.state, CapabilityState::Unsupported);
+        }
         assert!(
             snapshot
                 .workload_admission
