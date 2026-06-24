@@ -33,7 +33,7 @@ use super::StorageClassConfig;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
 use super::new_object_layer_fn;
-use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
+use super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
@@ -65,6 +65,11 @@ pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>
 /// Resolve outbound TLS generation using AppContext-first precedence.
 pub fn resolve_outbound_tls_generation() -> TlsGeneration {
     resolve_outbound_tls_generation_with(get_global_app_context(), || default_outbound_tls_runtime_interface().generation())
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
+    rustfs_common::set_global_outbound_tls_generation(generation);
 }
 
 /// Resolve outbound TLS state using AppContext-first precedence.
@@ -228,6 +233,11 @@ pub fn resolve_region() -> Option<s3s::region::Region> {
 /// Resolve tier config handle using AppContext-first precedence.
 pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
     resolve_tier_config_handle_with(get_global_app_context(), || default_tier_config_interface().handle())
+}
+
+/// Resolve lifecycle expiry state using AppContext-first precedence.
+pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
+    resolve_expiry_state_handle_with(get_global_app_context(), || default_expiry_state_interface().handle())
 }
 
 /// Resolve server config using AppContext-first precedence.
@@ -508,6 +518,15 @@ fn resolve_tier_config_handle_with(
     fallback: impl FnOnce() -> Arc<RwLock<TierConfigMgr>>,
 ) -> Arc<RwLock<TierConfigMgr>> {
     context.map(|context| context.tier_config().handle()).unwrap_or_else(fallback)
+}
+
+fn resolve_expiry_state_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<RwLock<ExpiryState>>,
+) -> Arc<RwLock<ExpiryState>> {
+    context
+        .map(|context| context.expiry_state().handle())
+        .unwrap_or_else(fallback)
 }
 
 fn resolve_server_config_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<Config>) -> Option<Config> {
@@ -847,6 +866,16 @@ mod tests {
         }
     }
 
+    struct TestExpiryStateInterface {
+        expiry_state: Arc<RwLock<ExpiryState>>,
+    }
+
+    impl ExpiryStateInterface for TestExpiryStateInterface {
+        fn handle(&self) -> Arc<RwLock<ExpiryState>> {
+            self.expiry_state.clone()
+        }
+    }
+
     struct TestServerConfigInterface {
         config: Option<Config>,
         published: Arc<AtomicUsize>,
@@ -974,6 +1003,8 @@ mod tests {
             ..Default::default()
         };
         let tier_config = TierConfigMgr::new();
+        let context_expiry_state = ExpiryState::new();
+        let fallback_expiry_state = ExpiryState::new();
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let fallback_server_config_published = Arc::new(AtomicUsize::new(0));
@@ -1101,6 +1132,9 @@ mod tests {
                 tier_config: Arc::new(TestTierConfigInterface {
                     tier_config: tier_config.clone(),
                 }),
+                expiry_state: Arc::new(TestExpiryStateInterface {
+                    expiry_state: context_expiry_state.clone(),
+                }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
                     published: context_server_config_published.clone(),
@@ -1222,6 +1256,10 @@ mod tests {
             &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
             &tier_config
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_expiry_state_handle_with(Some(context.clone()), || fallback_expiry_state.clone()),
+            &context_expiry_state
+        ));
         assert_eq!(
             resolve_server_config_with(Some(context.clone()), || None).expect("context server config"),
             server_config
@@ -1334,6 +1372,10 @@ mod tests {
             fallback_region
         );
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
+        assert!(Arc::ptr_eq(
+            &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
+            &fallback_expiry_state
+        ));
         assert_eq!(
             resolve_server_config_with(None, || Some(server_config.clone())).expect("fallback server config"),
             server_config

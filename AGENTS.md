@@ -78,6 +78,10 @@ surface and use the faster local gate when a broad smoke check is needed:
 make pre-commit
 ```
 
+For migration batches, do not run the full `make pre-pr` gate before every
+intermediate commit. Use focused tests and `make pre-commit` during
+development, then reserve `make pre-pr` for the final PR-ready branch.
+
 Before pushing code changes, make sure formatting is clean:
 
 - Run `cargo fmt --all`.

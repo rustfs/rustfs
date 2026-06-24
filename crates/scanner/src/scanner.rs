@@ -47,7 +47,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
+    scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -419,7 +420,7 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
 }
 
 async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
         set_scanner_default_speed(single_disk_default_speed());
@@ -568,7 +569,7 @@ pub struct BackgroundHealInfo {
 /// Read background healing information from storage
 pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHealInfo {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return BackgroundHealInfo::default();
     }
 
@@ -610,7 +611,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 #[instrument(skip(storeapi))]
 pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundHealInfo) {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return;
     }
 

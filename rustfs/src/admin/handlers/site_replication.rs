@@ -4603,8 +4603,8 @@ mod tests {
     use super::super::super::Endpoint;
     use super::super::super::{EndpointServerPools, Endpoints, PoolEndpoints};
     use super::*;
+    use crate::app::context::{resolve_outbound_tls_generation, set_test_outbound_tls_generation};
     use http::{HeaderMap, HeaderValue, Uri};
-    use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;
     use serial_test::serial;
     use temp_env::with_var;
@@ -5864,7 +5864,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
-        let previous_generation = get_global_outbound_tls_generation();
+        let previous_generation = resolve_outbound_tls_generation().0;
         let previous_cache = {
             let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
             let snapshot = cache.clone();
@@ -5872,7 +5872,7 @@ mod tests {
             snapshot
         };
 
-        set_global_outbound_tls_generation(101);
+        set_test_outbound_tls_generation(101);
         site_replication_peer_client()
             .await
             .expect("initial client build should succeed");
@@ -5882,7 +5882,7 @@ mod tests {
         assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
         drop(cache);
 
-        set_global_outbound_tls_generation(102);
+        set_test_outbound_tls_generation(102);
         site_replication_peer_client()
             .await
             .expect("new generation should rebuild client");
@@ -5892,7 +5892,7 @@ mod tests {
         assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
 
         drop(cache);
-        set_global_outbound_tls_generation(previous_generation);
+        set_test_outbound_tls_generation(previous_generation);
         let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
         *cache = previous_cache;
     }
