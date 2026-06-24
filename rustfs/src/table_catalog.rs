@@ -1196,6 +1196,10 @@ fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_loc
     normalize_warehouse_object_prefix(object_prefix)
 }
 
+pub(crate) fn validate_table_warehouse_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<()> {
+    table_warehouse_object_prefix_from_location(table_bucket, warehouse_location).map(|_| ())
+}
+
 pub(crate) fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
     table_warehouse_object_prefix_from_location(&entry.table_bucket, &entry.warehouse_location)
 }
@@ -2588,6 +2592,7 @@ where
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
+        validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
@@ -2604,6 +2609,7 @@ where
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let view = parse_table_for_store(&entry.view)?;
+        validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
@@ -7776,9 +7782,14 @@ pub fn validate_object_mutation(table_bucket_enabled: bool, object_key: &str) ->
 }
 
 pub(crate) async fn validate_bucket_object_mutation(bucket: &str, object_key: &str) -> Result<(), TableObjectMutationError> {
+    if !is_reserved_table_object_key(object_key) {
+        return Ok(());
+    }
+
     let table_bucket_enabled = get_bucket_metadata(bucket)
         .await
-        .is_ok_and(|metadata| metadata.table_bucket_enabled());
+        .map(|metadata| metadata.table_bucket_enabled())
+        .unwrap_or(true);
 
     validate_object_mutation(table_bucket_enabled, object_key)
 }
@@ -7854,9 +7865,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn bucket_object_mutation_guard_allows_when_bucket_metadata_is_unavailable() {
-        assert!(
+    async fn bucket_object_mutation_guard_fails_closed_for_reserved_prefix_when_bucket_metadata_is_unavailable() {
+        assert_eq!(
             validate_bucket_object_mutation("missing-bucket", ".rustfs-table/current.json")
+                .await
+                .unwrap_err(),
+            TableObjectMutationError::ReservedCatalogObject
+        );
+        assert!(
+            validate_bucket_object_mutation("missing-bucket", "ordinary/current.json")
                 .await
                 .is_ok()
         );
@@ -8830,6 +8847,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn object_table_catalog_store_rejects_invalid_table_warehouse_location() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut entry = test_table_entry(bucket, &namespace, &table, current);
+        entry.warehouse_location = format!("s3://{bucket}/tables/../table-id");
+
+        let error = store.create_table(entry).await.unwrap_err();
+        assert!(matches!(
+            error,
+            TableCatalogStoreError::Invalid(message) if message.contains("invalid path segment")
+        ));
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_rejects_invalid_view_warehouse_location() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let view = IdentifierSegment::parse("recent_orders").unwrap();
+        let current = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut entry = test_view_entry(bucket, &namespace, &view, current);
+        entry.warehouse_location = format!("s3://{bucket}/views/../view-id");
+
+        let error = store.create_view(entry).await.unwrap_err();
+        assert!(matches!(
+            error,
+            TableCatalogStoreError::Invalid(message) if message.contains("invalid path segment")
+        ));
+    }
+
+    #[tokio::test]
     async fn table_data_plane_resource_skips_invalid_warehouse_locations() {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend);
@@ -8848,7 +8915,16 @@ mod tests {
         let mut invalid_entry = test_table_entry(bucket, &namespace, &invalid_table, current.clone());
         invalid_entry.table_id = "bad-table-id".to_string();
         invalid_entry.warehouse_location = format!("s3://{bucket}/");
-        store.create_table(invalid_entry).await.unwrap();
+        let invalid_path = store.paths.table_entry_path(bucket, &namespace, &invalid_table);
+        store
+            .write_entry(
+                store.catalog_bucket(),
+                &invalid_path,
+                &invalid_entry,
+                TableCatalogPutPrecondition::IfAbsent,
+            )
+            .await
+            .unwrap();
         store
             .create_table(test_table_entry(bucket, &namespace, &valid_table, current))
             .await

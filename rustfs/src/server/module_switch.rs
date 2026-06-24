@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{Error as StorageError, read_config, resolve_object_store_handle, save_config};
+use crate::app::context::resolve_object_store_handle;
+use crate::storage::{Error as StorageError, read_config, save_config};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 

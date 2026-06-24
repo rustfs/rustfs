@@ -40,6 +40,22 @@ use hyper::Method;
 
 use std::collections::HashSet;
 
+#[derive(Debug, Clone, serde::Serialize)]
+struct PoolAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+struct PoolStatusResponse {
+    pool: crate::app::admin_usecase::AdminPoolStatus,
+    admin_discovery: PoolAdminDiscovery,
+}
+
 const LOG_COMPONENT_ADMIN_API: &str = "admin_api";
 const LOG_SUBSYSTEM_POOL_ADMIN: &str = "pool_admin";
 const EVENT_ADMIN_REQUEST_STATE: &str = "admin_request_state";
@@ -396,6 +412,15 @@ fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
     (idx < endpoint_count).then_some(idx)
 }
 
+fn pool_admin_discovery() -> PoolAdminDiscovery {
+    let usecase = DefaultAdminUsecase::from_global();
+    PoolAdminDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
+}
+
 fn has_duplicate_indices(indices: &[usize]) -> bool {
     let mut seen = HashSet::with_capacity(indices.len());
     for idx in indices {
@@ -580,8 +605,12 @@ impl Operation for StatusPool {
             })
             .await
             .map_err(S3Error::from)?;
+        let response = PoolStatusResponse {
+            pool: pools_status,
+            admin_discovery: pool_admin_discovery(),
+        };
 
-        let data = serde_json::to_vec(&pools_status).map_err(|e| {
+        let data = serde_json::to_vec(&response).map_err(|e| {
             log_pool_request_failed!("query_pool_status", "serialize_pool_status_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse accountInfo failed")
         })?;
@@ -1319,5 +1348,34 @@ mod pools_handler_tests {
         let empty: Vec<usize> = Vec::new();
         assert!(!has_duplicate_indices(&empty));
         assert!(!has_duplicate_indices(&[0, 2, 1, 3]));
+    }
+
+    #[test]
+    fn test_pool_status_response_exposes_admin_discovery_paths() {
+        let response = super::PoolStatusResponse {
+            pool: crate::app::admin_usecase::AdminPoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: time::OffsetDateTime::UNIX_EPOCH,
+                total_size: 0,
+                current_size: 0,
+                used_size: 0,
+                used: 0.0,
+                status: "active".to_string(),
+                decommission_status: "none".to_string(),
+                rebalance_status: "none".to_string(),
+                decommission: None,
+            },
+            admin_discovery: super::PoolAdminDiscovery {
+                runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities".to_string(),
+                cluster_snapshot: "/rustfs/admin/v4/cluster/snapshot".to_string(),
+                extensions_catalog: "/rustfs/admin/v4/extensions/catalog".to_string(),
+            },
+        };
+
+        let value = serde_json::to_value(response).expect("pool status response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 }

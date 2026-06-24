@@ -19,8 +19,11 @@ use super::EndpointServerPools;
 use super::get_server_info;
 use super::{PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free};
 use super::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
-use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
+use crate::app::context::{
+    AppContext, get_global_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
+};
 use crate::capacity::resolve_admin_used_capacity;
+use crate::cluster_snapshot::{ClusterReadOnlySnapshot, collect_cluster_read_only_snapshot};
 use crate::error::ApiError;
 use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
 use rustfs_data_usage::DataUsageInfo;
@@ -31,6 +34,9 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 pub type AdminUsecaseResult<T> = Result<T, ApiError>;
+pub const ADMIN_CLUSTER_SNAPSHOT_ROUTE: &str = "/rustfs/admin/v4/cluster/snapshot";
+pub const ADMIN_EXTENSIONS_CATALOG_ROUTE: &str = "/rustfs/admin/v4/extensions/catalog";
+pub const ADMIN_RUNTIME_CAPABILITIES_ROUTE: &str = "/rustfs/admin/v4/runtime/capabilities";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct QueryServerInfoRequest {
@@ -524,6 +530,23 @@ impl DefaultAdminUsecase {
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
         collect_runtime_dependency_readiness().await
     }
+
+    pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
+        let endpoint_pools = resolve_endpoints_handle()?;
+        collect_cluster_read_only_snapshot(&endpoint_pools).await
+    }
+
+    pub fn cluster_snapshot_route(&self) -> &'static str {
+        ADMIN_CLUSTER_SNAPSHOT_ROUTE
+    }
+
+    pub fn runtime_capabilities_route(&self) -> &'static str {
+        ADMIN_RUNTIME_CAPABILITIES_ROUTE
+    }
+
+    pub fn extensions_catalog_route(&self) -> &'static str {
+        ADMIN_EXTENSIONS_CATALOG_ROUTE
+    }
 }
 
 #[cfg(test)]
@@ -555,6 +578,24 @@ mod tests {
         let readiness = usecase.execute_collect_dependency_readiness().await;
         let _ = readiness.storage_ready;
         let _ = readiness.iam_ready;
+    }
+
+    #[tokio::test]
+    async fn execute_collect_cluster_read_only_snapshot_returns_none_without_context() {
+        let usecase = DefaultAdminUsecase::without_context();
+
+        let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
+
+        assert!(snapshot.is_none());
+    }
+
+    #[test]
+    fn admin_usecase_exposes_stable_discovery_routes() {
+        let usecase = DefaultAdminUsecase::without_context();
+
+        assert_eq!(usecase.cluster_snapshot_route(), "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(usecase.runtime_capabilities_route(), "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(usecase.extensions_catalog_route(), "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]
