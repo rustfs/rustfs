@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::heal::{ErasureSetHealer, progress::HealProgress, storage::HealStorageAPI};
+use crate::heal::{
+    ErasureSetHealer,
+    progress::HealProgress,
+    storage::{HealStorageAPI, next_heal_listing_token},
+};
 use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
@@ -1329,20 +1333,7 @@ impl HealTask {
                 break;
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                warn!(
-                    target: "rustfs::heal::task",
-                    event = EVENT_HEAL_BUCKET_RESULT,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_TASK,
-                    task_id = %self.id,
-                    bucket,
-                    result = "missing_continuation_token",
-                    "Heal bucket listing truncated without continuation token"
-                );
-                break;
-            }
+            continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
         }
 
         if failed > 0 {
@@ -2129,6 +2120,7 @@ mod tests {
         object_heal_opts: Mutex<Vec<HealOpts>>,
         format_no_heal_required: Mutex<bool>,
         listed_prefixes: Mutex<Vec<String>>,
+        truncate_without_token: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -2246,6 +2238,10 @@ mod tests {
             continuation_token: Option<&str>,
         ) -> Result<(Vec<String>, Option<String>, bool)> {
             self.listed_prefixes.lock().unwrap().push(prefix.to_string());
+            if *self.truncate_without_token.lock().unwrap() {
+                return Ok((vec!["object-a".to_string()], None, true));
+            }
+
             let mut listed = self.listed.lock().unwrap();
             if continuation_token.is_none() && !*listed {
                 *listed = true;
@@ -2300,6 +2296,39 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 3);
         assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_bucket_heal_fails_when_listing_lacks_continuation_token() {
+        let storage = Arc::new(MockStorage {
+            truncate_without_token: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .heal_bucket("bucket-a")
+            .await
+            .expect_err("recursive bucket heal must fail on incomplete pagination state");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(err.to_string().contains("truncated without continuation token"));
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string()],
+            "the already returned page may be processed, but the task must not report success"
+        );
     }
 
     #[tokio::test]

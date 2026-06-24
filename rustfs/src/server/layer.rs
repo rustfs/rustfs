@@ -23,6 +23,7 @@ use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
     MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
     active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path, is_table_catalog_path,
+    liveness_dependency_readiness_report,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{
@@ -938,7 +939,10 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = collect_dependency_readiness_report().await;
+    let readiness_report = match probe {
+        HealthProbe::Liveness => liveness_dependency_readiness_report(),
+        HealthProbe::Readiness => collect_dependency_readiness_report().await,
+    };
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {

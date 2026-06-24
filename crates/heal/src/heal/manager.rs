@@ -487,12 +487,16 @@ fn heal_type_matches_path(heal_type: &HealType, heal_path: &str) -> bool {
         HealType::Cluster => false,
         HealType::Object { bucket, object, .. }
         | HealType::Metadata { bucket, object }
-        | HealType::ECDecode { bucket, object, .. } => heal_path == bucket || heal_path == format!("{bucket}/{object}"),
+        | HealType::ECDecode { bucket, object, .. } => heal_path_matches_bucket_child(heal_path, bucket, object),
         HealType::Bucket { bucket } => heal_path == bucket,
-        HealType::Prefix { bucket, prefix } => heal_path == bucket || heal_path == format!("{bucket}/{prefix}"),
+        HealType::Prefix { bucket, prefix } => heal_path_matches_bucket_child(heal_path, bucket, prefix),
         HealType::ErasureSet { set_disk_id, .. } => heal_path == set_disk_id,
         HealType::MRF { meta_path } => heal_path == meta_path.trim_matches('/'),
     }
+}
+
+fn heal_path_matches_bucket_child(heal_path: &str, bucket: &str, child: &str) -> bool {
+    heal_path == bucket || heal_path == format!("{bucket}/{child}").trim_matches('/')
 }
 
 fn publish_active_heal_count(active_heals: &HashMap<String, Arc<HealTask>>) {
@@ -3039,6 +3043,30 @@ mod tests {
         });
 
         assert!(retry_request_for_result(&task, &result).is_none());
+    }
+
+    #[test]
+    fn test_heal_type_matches_path_normalizes_prefix_trailing_slash() {
+        let heal_type = HealType::Prefix {
+            bucket: "bucket".to_string(),
+            prefix: "logs/".to_string(),
+        };
+
+        assert!(heal_type_matches_path(&heal_type, "bucket"));
+        assert!(heal_type_matches_path(&heal_type, "bucket/logs"));
+        assert!(heal_type_matches_path(&heal_type, "bucket/logs/"));
+    }
+
+    #[test]
+    fn test_heal_type_matches_path_normalizes_object_trailing_slash() {
+        let heal_type = HealType::Object {
+            bucket: "bucket".to_string(),
+            object: "object/".to_string(),
+            version_id: None,
+        };
+
+        assert!(heal_type_matches_path(&heal_type, "bucket/object"));
+        assert!(heal_type_matches_path(&heal_type, "bucket/object/"));
     }
 
     async fn insert_retrying_request(manager: &HealManager, request: HealRequest) -> CancellationToken {

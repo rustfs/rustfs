@@ -16,7 +16,7 @@ use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report,
+    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report, liveness_dependency_readiness_report,
 };
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -245,7 +245,10 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let readiness_report = collect_dependency_readiness().await;
+        let readiness_report = match probe {
+            HealthProbe::Liveness => liveness_dependency_readiness_report(),
+            HealthProbe::Readiness => collect_dependency_readiness().await,
+        };
 
         let response_parts = build_health_response_parts(method.clone(), probe, &readiness_report, "rustfs-endpoint", None, None);
 
@@ -290,6 +293,15 @@ mod tests {
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
+    }
+
+    #[test]
+    fn test_liveness_dependency_readiness_report_is_lightweight_ready() {
+        let report = liveness_dependency_readiness_report();
+        assert!(report.readiness.storage_ready);
+        assert!(report.readiness.iam_ready);
+        assert!(report.readiness.lock_quorum_ready);
+        assert!(report.degraded_reasons.is_empty());
     }
 
     #[test]
