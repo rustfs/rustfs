@@ -25,6 +25,7 @@ use futures::stream::FuturesUnordered;
 use std::sync::Arc;
 use std::vec;
 use tokio::io::AsyncRead;
+use tokio::runtime::RuntimeFlavor;
 use tokio::sync::mpsc;
 use tracing::error;
 
@@ -215,6 +216,29 @@ impl<'a> MultiWriter<'a> {
 }
 
 impl Erasure {
+    async fn encode_block(
+        self: Arc<Self>,
+        encode_buf: Vec<u8>,
+        len: usize,
+    ) -> std::io::Result<(Vec<Bytes>, Vec<u8>)> {
+        let encode_once = move || {
+            let res = self.encode_data(&encode_buf[..len]);
+            (res, encode_buf)
+        };
+
+        let (res, returned_buf) = match tokio::runtime::Handle::current().runtime_flavor() {
+            RuntimeFlavor::MultiThread => tokio::task::block_in_place(encode_once),
+            RuntimeFlavor::CurrentThread => tokio::task::spawn_blocking(encode_once)
+                .await
+                .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?,
+            _ => tokio::task::spawn_blocking(encode_once)
+                .await
+                .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?,
+        };
+
+        Ok((res?, returned_buf))
+    }
+
     async fn encode_small_direct<R>(
         self: Arc<Self>,
         mut reader: R,
@@ -294,16 +318,9 @@ impl Erasure {
                     Ok(Some(n)) => {
                         debug_assert!(n > 0, "non-zero block_size prevents zero-length reads");
                         total += n;
-                        let erasure = self.clone();
                         let encode_buf = std::mem::take(&mut buf);
-                        let (res, returned_buf) = tokio::task::spawn_blocking(move || {
-                            let res = erasure.encode_data(&encode_buf[..n]);
-                            (res, encode_buf)
-                        })
-                        .await
-                        .map_err(|err| std::io::Error::other(format!("EC encode task failed: {err}")))?;
+                        let (res, returned_buf) = self.clone().encode_block(encode_buf, n).await?;
                         buf = returned_buf;
-                        let res = res?;
                         let queued_bytes = queued_block_bytes(&res);
                         rustfs_io_metrics::add_ec_encode_inflight_bytes(queued_bytes);
                         if let Err(err) = tx.send(res).await {
@@ -495,6 +512,23 @@ mod tests {
 
         assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
         assert!(err.to_string().contains("block_size"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn encode_works_on_current_thread_runtime() {
+        let committed = Arc::new(Mutex::new(Vec::new()));
+        let writer = DeferredCommitWriter::new(committed);
+        let mut writers = vec![Some(BitrotWriterWrapper::new(
+            CustomWriter::new_tokio_writer(writer),
+            16,
+            HashAlgorithm::HighwayHash256S,
+        ))];
+
+        let erasure = Arc::new(Erasure::new(1, 0, 16));
+        let reader = tokio::io::BufReader::new(Cursor::new(b"current-thread payload".to_vec()));
+        let (_reader, written) = erasure.encode(reader, &mut writers, 1).await.unwrap();
+
+        assert_eq!(written, b"current-thread payload".len());
     }
 
     /// encode_inline_small: empty reader returns (reader, 0) without writing to any shard.
