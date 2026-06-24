@@ -14,7 +14,6 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
-use crate::global::{is_dist_erasure, is_first_cluster_node_local};
 use crate::pools::local_decommission_queue_prefix;
 use crate::runtime_sources;
 use tracing::{debug, error, info, warn};
@@ -299,7 +298,7 @@ impl ECStore {
         }
 
         // Replace the local disk
-        if !is_dist_erasure().await {
+        if !runtime_sources::setup_is_dist_erasure().await {
             runtime_sources::record_local_disks(local_disks).await;
         }
 
@@ -363,7 +362,7 @@ impl ECStore {
 
     #[instrument(level = "debug", skip(self, rx))]
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
-        GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
+        runtime_sources::ensure_boot_time().await;
 
         let mut meta = PoolMeta::default();
         resolve_store_init_stage_result(
@@ -378,8 +377,8 @@ impl ECStore {
             "load_pool_meta",
         )?;
         let update = meta.validate(self.pools.clone())?;
-        let endpoints = get_global_endpoints();
-        let should_persist_pool_meta = is_first_cluster_node_local().await;
+        let endpoints = runtime_sources::endpoint_pools_or_default();
+        let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
 
         let installed_pool_meta = if !update {
             meta.clone()
