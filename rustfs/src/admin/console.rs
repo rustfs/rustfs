@@ -822,6 +822,30 @@ mod tests {
         assert_eq!(cfg.api.discovery.extensions_catalog, "/rustfs/admin/v4/extensions/catalog");
     }
 
+    #[tokio::test]
+    async fn console_config_handler_serializes_admin_discovery_paths() {
+        init_console_cfg(IpAddr::V4(Ipv4Addr::LOCALHOST), 9001);
+
+        let response = config_handler(
+            Uri::from_static("http://127.0.0.1:9001/rustfs/console/api/v1/config"),
+            HeaderMap::new(),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response.into_body();
+        let bytes = body.collect().await.expect("collect console config body").to_bytes();
+        let value: serde_json::Value = serde_json::from_slice(&bytes).expect("console config JSON should deserialize");
+
+        assert_eq!(
+            value["api"]["discovery"]["runtimeCapabilities"],
+            "/rustfs/admin/v4/runtime/capabilities"
+        );
+        assert_eq!(value["api"]["discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["api"]["discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+    }
+
     #[test]
     fn external_admin_paths_are_not_console_paths() {
         assert!(is_console_path("/rustfs/console/"));
