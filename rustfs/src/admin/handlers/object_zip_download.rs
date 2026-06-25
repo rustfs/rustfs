@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;

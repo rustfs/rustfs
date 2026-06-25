@@ -17,11 +17,11 @@ use super::super::{
     StorageError, decode_rebalance_stop_propagation_record,
 };
 use crate::{
+    admin::runtime_sources::{resolve_notification_system, resolve_object_store_handle},
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };

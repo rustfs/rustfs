@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::runtime_sources;
 use crate::admin::console::is_console_path;
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
-use crate::app::context::resolve_kms_runtime_service_manager;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX,
-    active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path, is_table_catalog_path,
+    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX,
+    RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path,
+    is_table_catalog_path,
 };
 use crate::storage::apply_cors_headers;
 use crate::storage::request_context::{
@@ -885,7 +886,7 @@ fn resolve_public_health_probe(method: &Method, path: &str) -> Option<HealthProb
 
     match path {
         HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH | MINIO_HEALTH_LIVE_PATH => Some(HealthProbe::Liveness),
-        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH | MINIO_HEALTH_CLUSTER_PATH => Some(HealthProbe::Readiness),
         _ => None,
     }
 }
@@ -904,7 +905,7 @@ fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
 }
 
 async fn health_kms_ready() -> bool {
-    let Some(service_manager) = resolve_kms_runtime_service_manager() else {
+    let Some(service_manager) = runtime_sources::kms_runtime_service_manager() else {
         return true;
     };
 
@@ -1291,6 +1292,7 @@ impl ConditionalCorsLayer {
         "/health/ready",
         "/minio/health/live",
         "/minio/health/ready",
+        "/minio/health/cluster",
         "/profile/cpu",
         "/profile/memory",
     ];
@@ -1921,6 +1923,31 @@ mod tests {
 
             let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
             assert!(body.is_empty());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_cluster_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_CLUSTER_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
         })
         .await;
     }

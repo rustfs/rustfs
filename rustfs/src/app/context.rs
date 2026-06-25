@@ -19,6 +19,7 @@
 mod global;
 mod handles;
 mod interfaces;
+mod runtime_sources;
 mod startup;
 
 pub use global::*;
@@ -32,14 +33,13 @@ use super::ScannerMetricsReport;
 use super::StorageClassConfig;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
-use super::new_object_layer_fn;
 use super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Error as IamError, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
-use rustfs_kms::{KmsServiceManager, ObjectEncryptionService, init_global_kms_service_manager};
+use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
 use rustfs_lock::LockClient;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
@@ -54,12 +54,12 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
 
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
-    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), init_global_kms_service_manager)
+    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), runtime_sources::init_kms_service_manager)
 }
 
 /// Resolve KMS encryption service using AppContext-first precedence.
 pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    resolve_encryption_service_with(get_global_app_context(), rustfs_kms::get_global_encryption_service).await
+    resolve_encryption_service_with(get_global_app_context(), runtime_sources::encryption_service).await
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
@@ -69,7 +69,7 @@ pub fn resolve_outbound_tls_generation() -> TlsGeneration {
 
 #[cfg(test)]
 pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
-    rustfs_common::set_global_outbound_tls_generation(generation);
+    runtime_sources::set_outbound_tls_generation(generation);
 }
 
 /// Resolve outbound TLS state using AppContext-first precedence.
@@ -79,29 +79,27 @@ pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
 
 /// Resolve IAM readiness using AppContext-first precedence.
 pub fn resolve_iam_ready() -> bool {
-    resolve_iam_ready_with(get_global_app_context(), || {
-        rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
-    })
+    resolve_iam_ready_with(get_global_app_context(), runtime_sources::iam_is_ready)
 }
 
 /// Resolve IAM system handle using AppContext-first precedence.
 pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
+    resolve_iam_handle_with(get_global_app_context(), runtime_sources::iam_handle)
 }
 
 /// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
-    resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
+    resolve_oidc_handle_with(get_global_app_context(), runtime_sources::oidc_handle)
 }
 
 /// Resolve a ready IAM system handle using AppContext-first precedence.
 pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
+    resolve_ready_iam_handle_with(get_global_app_context(), runtime_sources::ready_iam_handle)
 }
 
 /// Resolve token signing key using AppContext-first precedence.
 pub fn resolve_token_signing_key() -> Option<String> {
-    resolve_token_signing_key_with(get_global_app_context(), rustfs_iam::manager::get_token_signing_key)
+    resolve_token_signing_key_with(get_global_app_context(), runtime_sources::token_signing_key)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
@@ -117,7 +115,9 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
 
 /// Resolve object store handle using an explicit AppContext, falling back to the legacy global object layer.
 pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
-    context.map(|context| context.object_store()).or_else(new_object_layer_fn)
+    context
+        .map(|context| context.object_store())
+        .or_else(runtime_sources::object_store)
 }
 
 /// Resolve notify interface using AppContext-first precedence.
@@ -217,7 +217,7 @@ pub async fn resolve_s3select_db(
 
 /// Resolve local node name using AppContext-first precedence.
 pub async fn resolve_local_node_name() -> String {
-    resolve_local_node_name_with(get_global_app_context(), rustfs_common::get_global_local_node_name).await
+    resolve_local_node_name_with(get_global_app_context(), runtime_sources::local_node_name).await
 }
 
 /// Resolve action credentials using AppContext-first precedence.
@@ -564,7 +564,6 @@ fn resolve_buffer_config_with(
 mod tests {
     use super::super::Endpoint;
     use super::super::init_local_disks;
-    use super::super::new_object_layer_fn;
     use super::super::{Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
@@ -912,7 +911,7 @@ mod tests {
     }
 
     async fn test_store() -> (TempDir, Arc<ECStore>, EndpointServerPools) {
-        if let Some(store) = new_object_layer_fn() {
+        if let Some(store) = runtime_sources::object_store() {
             let endpoints = EndpointServerPools(store.pools.iter().map(|pool| pool.endpoints.clone()).collect());
             return (tempfile::tempdir().expect("compat test temp dir"), store, endpoints);
         }
@@ -945,7 +944,7 @@ mod tests {
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-        if let Some(store) = new_object_layer_fn() {
+        if let Some(store) = runtime_sources::object_store() {
             return (temp_dir, store, endpoint_pools);
         }
 

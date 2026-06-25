@@ -16,6 +16,7 @@ use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils},
     storage::{HealStorageAPI, next_heal_listing_token},
+    task::is_missing_object_dir_heal_result,
 };
 use crate::{Error, Result};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
@@ -562,6 +563,7 @@ impl ErasureSetHealer {
                         } else {
                             match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                                 Ok((_result, None)) => Ok(true),
+                                Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
                                 Ok((_, Some(err))) => Err(Error::other(err)),
                                 Err(err) => Err(err),
                             }
