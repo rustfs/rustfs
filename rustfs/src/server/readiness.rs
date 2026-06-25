@@ -15,7 +15,7 @@
 use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
+use crate::storage_api::{Endpoint, EndpointServerPools, StorageAdminApi, is_dist_erasure};
 #[cfg(test)]
 use crate::storage_api::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
@@ -26,7 +26,6 @@ use hyper::body::Incoming;
 use metrics::{counter, gauge};
 use rustfs_common::GlobalReadiness;
 use rustfs_madmin::{Disk, StorageInfo};
-use rustfs_storage_api::StorageAdminApi;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;

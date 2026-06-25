@@ -29,8 +29,11 @@ use std::{
 
 use crate::storage_api::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-    BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata,
-    get_lock_acquire_timeout, table_catalog_path_hash,
+    BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, HTTPPreconditions, HTTPRangeSpec,
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+    ListOperations as StorageListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations as StorageObjectOperations, RUSTFS_META_BUCKET, StorageError,
+    WalkOptions as StorageWalkOptions, get_bucket_metadata, get_lock_acquire_timeout, table_catalog_path_hash,
 };
 use bytes::Bytes;
 use datafusion::{
@@ -40,12 +43,6 @@ use datafusion::{
 use http::HeaderMap;
 use metrics::{counter, histogram};
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{
-    HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as StorageListOperations,
-    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
-    ObjectOperations as StorageObjectOperations, WalkOptions as StorageWalkOptions,
-};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;

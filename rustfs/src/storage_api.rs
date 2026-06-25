@@ -29,9 +29,18 @@ pub(crate) use crate::storage::{
     topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
     try_migrate_server_config, update_erasure_type, verify_rpc_signature,
 };
+pub(crate) use rustfs_storage_api::{
+    BucketOperations, BucketOptions, CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, HTTPPreconditions,
+    HTTPRangeError, HTTPRangeSpec, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, MemorySamplingState,
+    NamespaceLocking, ObjectIO, ObjectInfoOrErr, ObjectOperations, ObservabilitySnapshot, ObservabilitySnapshotProvider,
+    PlatformSupport, StorageAdminApi, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
+    UserspaceProfilingCapability, WalkOptions,
+};
 
 #[cfg(test)]
 pub(crate) use crate::storage::{DisksLayout, Endpoints, PoolEndpoints};
+#[cfg(test)]
+pub(crate) use rustfs_storage_api::{CapabilityState, TransitionedObject};
 
 pub(crate) mod access {
     pub(crate) use crate::storage::access::ReqInfo;

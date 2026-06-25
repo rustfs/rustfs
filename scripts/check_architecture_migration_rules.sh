@@ -167,6 +167,7 @@ RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s
 RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_admin_storage_api_bypass_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_root_facade_hits.txt"
 RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_bypass_hits.txt"
+RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_contract_bypass_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
@@ -1533,6 +1534,21 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS root/server/startup storage facades must stay behind rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^use rustfs_storage_api|rustfs_storage_api::' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!rustfs/src/admin/**' \
+    --glob '!rustfs/src/app/**' \
+    --glob '!rustfs/src/storage/**' \
+    --glob '!rustfs/src/storage_api.rs' || true
+) >"$RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS root/server/startup storage contracts must stay behind rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE")"
 fi
 
 (
