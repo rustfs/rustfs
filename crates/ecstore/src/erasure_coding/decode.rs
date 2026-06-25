@@ -17,7 +17,9 @@ use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_codec::workspace::ShardBufferPool;
 use crate::erasure_coding::{BitrotReader, Erasure};
 use crate::get_diagnostics::{
-    GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GetObjectFailureReason, classify_io_error,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_OUTCOME_ERROR, GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS,
+    GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ,
+    GET_STAGE_STRIPE_READ_FIRST_SHARD, GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error,
     record_get_object_pipeline_failure,
 };
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
@@ -35,29 +37,66 @@ use tracing::error;
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, Error>)> + Send + 'a>>;
 
+fn shard_role(index: usize, data_shards: usize) -> &'static str {
+    if index < data_shards {
+        GET_SHARD_ROLE_DATA
+    } else {
+        GET_SHARD_ROLE_PARITY
+    }
+}
+
 fn read_shard<'a, R>(
     index: usize,
     reader: &'a mut Option<BitrotReader<R>>,
     recycled_buf: Option<Vec<u8>>,
     shard_size: usize,
+    data_shards: usize,
+    metrics_path: Option<&'static str>,
 ) -> ShardReadFuture<'a>
 where
     R: AsyncRead + Unpin + Send + Sync + 'a,
 {
+    let role = shard_role(index, data_shards);
     if let Some(reader) = reader {
         Box::pin(async move {
             let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
             debug_assert_eq!(buf.len(), shard_size);
+            let read_start = Instant::now();
             match reader.read(&mut buf).await {
                 Ok(n) => {
                     buf.truncate(n);
+                    if let Some(path) = metrics_path {
+                        rustfs_io_metrics::record_get_object_shard_read(
+                            path,
+                            role,
+                            GET_SHARD_READ_OUTCOME_SUCCESS,
+                            n,
+                            read_start.elapsed().as_secs_f64(),
+                        );
+                    }
                     (index, Ok(buf))
                 }
-                Err(e) => (index, Err(Error::from(e))),
+                Err(e) => {
+                    if let Some(path) = metrics_path {
+                        rustfs_io_metrics::record_get_object_shard_read(
+                            path,
+                            role,
+                            GET_SHARD_READ_OUTCOME_ERROR,
+                            0,
+                            read_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    (index, Err(Error::from(e)))
+                }
             }
         })
     } else {
-        Box::pin(async move { (index, Err(Error::FileNotFound)) })
+        Box::pin(async move {
+            if let Some(path) = metrics_path {
+                rustfs_io_metrics::record_get_object_shard_read(path, role, GET_SHARD_READ_OUTCOME_MISSING, 0, 0.0);
+            }
+            (index, Err(Error::FileNotFound))
+        })
     }
 }
 
@@ -70,6 +109,7 @@ pub(crate) struct ParallelReader<R> {
     shard_file_size: usize,
     data_shards: usize,
     total_shards: usize,
+    metrics_path: Option<&'static str>,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -82,6 +122,16 @@ where
 {
     // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
+        Self::new_with_metrics_path(readers, e, offset, total_length, None)
+    }
+
+    pub fn new_with_metrics_path(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+    ) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
@@ -96,6 +146,7 @@ where
             shard_file_size,
             data_shards: e.data_shards,
             total_shards: e.data_shards + e.parity_shards,
+            metrics_path,
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
@@ -130,6 +181,8 @@ where
         if num_readers >= self.data_shards {
             let mut reader_iter = reader_iter.enumerate();
             let mut sets = FuturesUnordered::new();
+            let stripe_read_start = Instant::now();
+            let mut scheduled = 0usize;
             for _ in 0..self.data_shards {
                 if let Some((i, reader)) = reader_iter.next() {
                     // Only claim a request-scoped buffer when a shard will actually be read.
@@ -138,18 +191,36 @@ where
                     } else {
                         None
                     };
-                    sets.push(read_shard(i, reader, recycled_buf, shard_size));
+                    scheduled += 1;
+                    sets.push(read_shard(i, reader, recycled_buf, shard_size, self.data_shards, self.metrics_path));
                 }
             }
 
             let mut success = 0;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            let mut first_shard_recorded = false;
+            let mut quorum_recorded = false;
             while let Some((i, result)) = sets.next().await {
+                completed += 1;
+                if !first_shard_recorded {
+                    if let Some(path) = self.metrics_path {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            path,
+                            GET_STAGE_STRIPE_READ_FIRST_SHARD,
+                            stripe_read_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    first_shard_recorded = true;
+                }
+
                 match result {
                     Ok(v) => {
                         shards[i] = Some(v);
                         success += 1;
                     }
                     Err(e) => {
+                        failed += 1;
                         errs[i] = Some(e);
 
                         if let Some((next_i, next_reader)) = reader_iter.next() {
@@ -158,14 +229,40 @@ where
                             } else {
                                 None
                             };
-                            sets.push(read_shard(next_i, next_reader, recycled_buf, shard_size));
+                            scheduled += 1;
+                            sets.push(read_shard(
+                                next_i,
+                                next_reader,
+                                recycled_buf,
+                                shard_size,
+                                self.data_shards,
+                                self.metrics_path,
+                            ));
                         }
                     }
                 }
 
                 if success >= self.data_shards {
+                    if let Some(path) = self.metrics_path {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            path,
+                            GET_STAGE_STRIPE_READ_QUORUM,
+                            stripe_read_start.elapsed().as_secs_f64(),
+                        );
+                        rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
+                    }
+                    quorum_recorded = true;
                     break;
                 }
+            }
+
+            if !quorum_recorded && let Some(path) = self.metrics_path {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    path,
+                    GET_STAGE_STRIPE_READ_QUORUM,
+                    stripe_read_start.elapsed().as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
             }
         }
 
@@ -367,7 +464,13 @@ impl Erasure {
 
         let mut written = 0;
 
-        let mut reader = ParallelReader::new(readers, self.clone(), offset, total_length);
+        let mut reader = ParallelReader::new_with_metrics_path(
+            readers,
+            self.clone(),
+            offset,
+            total_length,
+            Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+        );
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;

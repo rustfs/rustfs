@@ -25,11 +25,11 @@ use super::super::{
     target::BucketTargets,
 };
 use crate::{
+    admin::runtime_sources::resolve_object_store_handle,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::resolve_object_store_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };

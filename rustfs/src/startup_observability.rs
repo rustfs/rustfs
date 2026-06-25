@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::init::{init_auto_tuner, init_update_check, print_server_info};
-use rustfs_obs::init_metrics_runtime;
+use crate::startup_runtime_sources;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn init_observability_runtime(ctx: CancellationToken) {
@@ -21,9 +21,9 @@ pub(crate) async fn init_observability_runtime(ctx: CancellationToken) {
     init_update_check();
     crate::allocator_reclaim::init_allocator_reclaim(ctx.clone());
 
-    if rustfs_obs::observability_metric_enabled() {
-        rustfs_io_metrics::set_put_stage_metrics_enabled(true);
-        init_metrics_runtime(ctx.clone());
+    if startup_runtime_sources::observability_metric_enabled() {
+        startup_runtime_sources::set_put_stage_metrics_enabled(true);
+        startup_runtime_sources::init_metrics_runtime(ctx.clone());
         crate::memory_observability::init_memory_observability(ctx.clone());
         init_auto_tuner(ctx).await;
     }

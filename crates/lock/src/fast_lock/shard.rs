@@ -416,9 +416,10 @@ impl LockShard {
         let adaptive_timeout_secs =
             (base_timeout.as_secs_f64() * total_multiplier).min(crate::fast_lock::MAX_ACQUIRE_TIMEOUT.as_secs_f64());
 
-        // Ensure minimum reasonable timeout even for low priority
+        // Keep the caller-provided and global acquire timeouts as hard deadlines.
         let min_timeout_secs = base_timeout.as_secs_f64() * 0.8;
-        Duration::from_secs_f64(adaptive_timeout_secs.max(min_timeout_secs))
+        let adaptive_timeout = Duration::from_secs_f64(adaptive_timeout_secs.max(min_timeout_secs));
+        adaptive_timeout.min(base_timeout.min(crate::fast_lock::MAX_ACQUIRE_TIMEOUT))
     }
 
     /// Batch acquire locks with ordering to prevent deadlocks
@@ -753,6 +754,50 @@ mod tests {
 
         // Release first lock
         assert!(shard.release_lock(&key, &owner1, LockMode::Exclusive));
+    }
+
+    #[test]
+    fn test_adaptive_timeout_does_not_exceed_request_acquire_timeout() {
+        let shard = LockShard::new(0);
+        let key = ObjectKey::new("bucket", "object");
+        let owner: Arc<str> = Arc::from("owner");
+        let acquire_timeout = Duration::from_millis(500);
+
+        for priority in [LockPriority::Normal, LockPriority::High, LockPriority::Critical] {
+            let request = ObjectLockRequest {
+                key: key.clone(),
+                mode: LockMode::Exclusive,
+                owner: owner.clone(),
+                acquire_timeout,
+                lock_timeout: Duration::from_secs(30),
+                priority,
+            };
+
+            assert_eq!(
+                shard.calculate_adaptive_timeout(&request),
+                acquire_timeout,
+                "adaptive timeout must not extend the requested acquire timeout for {priority:?} priority"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_timeout_does_not_exceed_global_max_acquire_timeout() {
+        let shard = LockShard::new(0);
+        let request = ObjectLockRequest {
+            key: ObjectKey::new("bucket", "object"),
+            mode: LockMode::Exclusive,
+            owner: Arc::from("owner"),
+            acquire_timeout: crate::fast_lock::MAX_ACQUIRE_TIMEOUT + Duration::from_secs(60),
+            lock_timeout: Duration::from_secs(30),
+            priority: LockPriority::Critical,
+        };
+
+        assert_eq!(
+            shard.calculate_adaptive_timeout(&request),
+            crate::fast_lock::MAX_ACQUIRE_TIMEOUT,
+            "adaptive timeout must not extend the global max acquire timeout"
+        );
     }
 
     #[tokio::test]

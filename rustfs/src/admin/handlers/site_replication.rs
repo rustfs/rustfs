@@ -26,16 +26,16 @@ use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _
 use super::super::{delete_admin_config, read_admin_config, save_admin_config};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::{
+    resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle, resolve_oidc_handle,
+    resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
+    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config, resolve_token_signing_key,
+};
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
-use crate::app::context::{
-    resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_object_store_handle, resolve_oidc_handle,
-    resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region, resolve_replication_pool_handle,
-    resolve_replication_stats_handle, resolve_runtime_port, resolve_server_config, resolve_token_signing_key,
-};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
 use crate::error::ApiError;
@@ -4603,8 +4603,8 @@ mod tests {
     use super::super::super::Endpoint;
     use super::super::super::{EndpointServerPools, Endpoints, PoolEndpoints};
     use super::*;
+    use crate::admin::runtime_sources::{resolve_outbound_tls_generation, set_test_outbound_tls_generation};
     use http::{HeaderMap, HeaderValue, Uri};
-    use rustfs_common::{get_global_outbound_tls_generation, set_global_outbound_tls_generation};
     use rustfs_policy::policy::action::S3Action;
     use serial_test::serial;
     use temp_env::with_var;
@@ -5864,7 +5864,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
-        let previous_generation = get_global_outbound_tls_generation();
+        let previous_generation = resolve_outbound_tls_generation().0;
         let previous_cache = {
             let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
             let snapshot = cache.clone();
@@ -5872,7 +5872,7 @@ mod tests {
             snapshot
         };
 
-        set_global_outbound_tls_generation(101);
+        set_test_outbound_tls_generation(101);
         site_replication_peer_client()
             .await
             .expect("initial client build should succeed");
@@ -5882,7 +5882,7 @@ mod tests {
         assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
         drop(cache);
 
-        set_global_outbound_tls_generation(102);
+        set_test_outbound_tls_generation(102);
         site_replication_peer_client()
             .await
             .expect("new generation should rebuild client");
@@ -5892,7 +5892,7 @@ mod tests {
         assert!(matches!(cached.entry, SiteReplicationPeerClientCacheEntry::Ready(_)));
 
         drop(cache);
-        set_global_outbound_tls_generation(previous_generation);
+        set_test_outbound_tls_generation(previous_generation);
         let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
         *cache = previous_cache;
     }

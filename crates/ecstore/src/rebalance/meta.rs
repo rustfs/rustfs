@@ -457,7 +457,10 @@ pub(super) fn complete_rebalance_pools_at_goal(meta: &mut RebalanceMeta, now: Of
     let mut changed = false;
 
     for pool_stat in meta.pool_stats.iter_mut() {
-        if !is_rebalance_pool_started(pool_stat) || has_deferred_rebalance_error(pool_stat) {
+        if !is_rebalance_pool_started(pool_stat)
+            || has_deferred_rebalance_error(pool_stat)
+            || has_rebalance_cleanup_warnings(pool_stat)
+        {
             continue;
         }
 
@@ -481,7 +484,7 @@ pub(super) fn complete_rebalance_pools_with_empty_queue(meta: &mut RebalanceMeta
     let mut changed = false;
 
     for pool_stat in meta.pool_stats.iter_mut() {
-        if !is_rebalance_pool_started(pool_stat) || !pool_stat.buckets.is_empty() {
+        if !is_rebalance_pool_started(pool_stat) || !pool_stat.buckets.is_empty() || has_rebalance_cleanup_warnings(pool_stat) {
             continue;
         }
 
@@ -501,6 +504,11 @@ pub(super) fn has_deferred_rebalance_error(pool_stat: &RebalanceStats) -> bool {
         .as_deref()
         .is_some_and(|last_error| last_error.starts_with(REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX))
 }
+
+pub(super) fn has_rebalance_cleanup_warnings(pool_stat: &RebalanceStats) -> bool {
+    pool_stat.cleanup_warnings.count > 0
+}
+
 pub(super) fn clone_first_arc<T>(values: &[Arc<T>], err_msg: &str) -> Result<Arc<T>> {
     values.first().cloned().ok_or_else(|| Error::other(err_msg))
 }
@@ -608,7 +616,7 @@ pub(super) fn validate_init_rebalance_state(decommission_running: bool, current_
     if !ensure_rebalance_not_decommissioning(decommission_running) {
         return Err(Error::DecommissionAlreadyRunning);
     }
-    if current_meta.is_some_and(is_rebalance_in_progress) {
+    if current_meta.is_some_and(|meta| !is_rebalance_meta_replaceable_for_new_id(meta)) {
         return Err(Error::RebalanceAlreadyRunning);
     }
 
@@ -812,14 +820,29 @@ pub(super) fn merge_rebalance_pool_stats(remote: &mut RebalanceStats, local: &Re
     }
 }
 
-pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &RebalanceMeta) {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RebalanceMetaMergeOutcome {
+    Merged,
+    Replaced,
+    RejectedActiveConflict,
+}
+
+pub(super) fn is_rebalance_meta_replaceable_for_new_id(meta: &RebalanceMeta) -> bool {
+    meta.stopped_at.is_some() || !is_rebalance_in_progress(meta)
+}
+
+pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &RebalanceMeta) -> RebalanceMetaMergeOutcome {
     if remote.id.is_empty() {
         *remote = local.clone();
-        return;
+        return RebalanceMetaMergeOutcome::Replaced;
     }
 
     if !local.id.is_empty() && remote.id != local.id {
-        return;
+        if is_rebalance_meta_replaceable_for_new_id(remote) {
+            *remote = local.clone();
+            return RebalanceMetaMergeOutcome::Replaced;
+        }
+        return RebalanceMetaMergeOutcome::RejectedActiveConflict;
     }
 
     remote.percent_free_goal = local.percent_free_goal;
@@ -837,6 +860,8 @@ pub(super) fn merge_rebalance_meta(remote: &mut RebalanceMeta, local: &Rebalance
             merge_rebalance_pool_stats(remote_pool_stat, local_pool_stat);
         }
     }
+
+    RebalanceMetaMergeOutcome::Merged
 }
 
 pub(super) fn mark_started_rebalance_pools_stopped(meta: &mut RebalanceMeta, stop_time: OffsetDateTime) {
