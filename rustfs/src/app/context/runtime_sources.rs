@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::metadata_sys::BucketMetadataSys;
-use super::super::{
-    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ECStore, EndpointServerPools, ExpiryState, NotificationSys,
-    ReplicationStats, ScannerMetricsReport, StorageClassConfig, TierConfigMgr, collect_scanner_metrics_report,
-    get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor, get_global_deployment_id,
-    get_global_endpoints_opt, get_global_expiry_state, get_global_lock_client, get_global_lock_clients,
-    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
-    get_global_tier_config_mgr, global_rustfs_port, new_object_layer_fn, set_global_storage_class,
+use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, collect_scanner_metrics_report, get_daily_all_tier_stats,
+    get_global_boot_time, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_expiry_state,
+    get_global_lock_client, get_global_lock_clients, get_global_notification_sys, get_global_region, get_global_replication_pool,
+    get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port, new_object_layer_fn, set_global_storage_class,
 };
+use super::super::storage_api::{ECStore, EndpointServerPools};
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
@@ -108,7 +108,7 @@ pub fn notification_system() -> Option<&'static NotificationSys> {
 }
 
 pub fn bucket_metadata() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    super::super::metadata_sys::get_global_bucket_metadata_sys()
+    super::super::storage_api::bucket::metadata_sys::get_global_bucket_metadata_sys()
 }
 
 pub fn bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {

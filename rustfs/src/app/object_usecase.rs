@@ -14,23 +14,50 @@
 
 //! Object application use-case contracts.
 
-use super::object_api_utils::to_s3s_etag;
-use super::quota::checker::QuotaChecker;
-use super::storageclass;
 // Performance metrics recording (with zero-copy-metrics integration)
-use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::ECStore;
 use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::bucket::quota::checker::QuotaChecker;
+use super::storage_api::bucket::{
+    ReplicationConfigExt as _, VersioningConfigExt as _,
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
+        tier_delete_journal, tier_sweeper,
+    },
+    metadata_sys,
+    object_lock::{
+        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
+        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
+    },
+    predict_lifecycle_expiration,
+    quota::QuotaOperation,
+    replication::{
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
+        must_replicate, schedule_replication, schedule_replication_delete,
+    },
+    tagging::decode_tags,
+    validate_restore_request,
+    versioning_sys::BucketVersioningSys,
+};
 use super::storage_api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
 };
+use super::storage_api::data_usage::{record_bucket_object_delete_memory, record_bucket_object_write_memory};
 use super::storage_api::deadlock_detector;
 use super::storage_api::ecfs::FS;
+use super::storage_api::error::{
+    DiskError, Error as EcstoreError, StorageError, is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found,
+    is_err_version_not_found,
+};
 use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::object_utils::to_s3s_etag;
 use super::storage_api::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
@@ -42,34 +69,13 @@ use super::storage_api::sse::{
     encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
     extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
 };
+use super::storage_api::storage_class as storageclass;
 use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 use super::storage_api::{
     RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
     strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
-};
-use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
-use super::{DiskError, is_all_buckets_not_found};
-use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use super::{
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
-    },
-    metadata_sys,
-    object_lock::{
-        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
-    },
-    quota::QuotaOperation,
-    replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
-        must_replicate, schedule_replication, schedule_replication_delete,
-    },
-    tagging::decode_tags,
-    versioning_sys::BucketVersioningSys,
 };
 use crate::app::runtime_sources::{
     AppContext, get_global_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
@@ -316,10 +322,10 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        super::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        super::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -330,7 +336,7 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
+    tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let expiry_state = resolve_expiry_state_handle();
     let mut expiry_state = expiry_state.write().await;
@@ -2591,7 +2597,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -3558,7 +3564,7 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            super::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3835,7 +3841,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                super::record_bucket_object_delete_memory(
+                record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -4072,7 +4078,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
+        record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {

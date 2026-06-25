@@ -14,23 +14,18 @@
 
 //! Bucket application use-case contracts.
 
-use super::ECStore;
-use super::StorageError;
-use super::object_api_utils::to_s3s_etag;
 use super::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     rustfs_owner,
 };
+use super::storage_api::ECStore;
 use super::storage_api::StorageObjectInfo as ObjectInfo;
 use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
-use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::{
-    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    request_context, validate_list_object_unordered_with_delimiter,
-};
-use super::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
-use super::{
+#[cfg(test)]
+use super::storage_api::bucket::target::BucketTarget;
+use super::storage_api::bucket::{
+    ObjectLockConfigExt as _, VersioningConfigExt as _,
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
         enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
@@ -46,6 +41,14 @@ use super::{
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
     versioning_sys::BucketVersioningSys,
+};
+use super::storage_api::data_usage::remove_bucket_usage_from_backend;
+use super::storage_api::error::StorageError;
+use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_utils::to_s3s_etag;
+use super::storage_api::{
+    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    request_context, validate_list_object_unordered_with_delimiter,
 };
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
@@ -865,7 +868,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
-        if let Err(err) = super::remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
+        if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
         }
 
@@ -2315,7 +2318,7 @@ mod tests {
         BucketTargets {
             targets: arns
                 .iter()
-                .map(|arn| super::super::target::BucketTarget {
+                .map(|arn| BucketTarget {
                     arn: (*arn).to_string(),
                     target_type: BucketTargetType::ReplicationService,
                     ..Default::default()

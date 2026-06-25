@@ -196,7 +196,7 @@ pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>
 }
 
 impl NodeService {
-    fn resolve_object_store(&self) -> Option<Arc<crate::app::ECStore>> {
+    fn resolve_object_store(&self) -> Option<Arc<crate::app::storage_api::ECStore>> {
         let context = self.context.clone().or_else(runtime_sources::get_global_app_context);
         runtime_sources::object_store_handle_for_context(context.as_deref())
     }

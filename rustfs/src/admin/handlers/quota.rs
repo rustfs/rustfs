@@ -175,7 +175,7 @@ async fn current_usage_from_context(bucket: &str) -> u64 {
         return 0;
     };
 
-    match super::super::load_data_usage_from_backend(store).await {
+    match super::super::storage_api::data_usage::load_data_usage_from_backend(store).await {
         Ok(data_usage_info) => data_usage_info
             .buckets_usage
             .get(bucket)
