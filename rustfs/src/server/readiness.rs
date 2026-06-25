@@ -139,6 +139,7 @@ fn is_probe_path(path: &str) -> bool {
             | crate::server::HEALTH_READY_PATH
             | crate::server::MINIO_HEALTH_LIVE_PATH
             | crate::server::MINIO_HEALTH_READY_PATH
+            | crate::server::MINIO_HEALTH_CLUSTER_PATH
             | crate::server::FAVICON_PATH
     );
 
