@@ -159,6 +159,7 @@ RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtim
 RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
 RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
+RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_wildcard_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
@@ -1406,6 +1407,15 @@ fi
 
 if [[ -s "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app usecase runtime source reads must stay behind rustfs/src/app/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' || true
+) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase consumers must import storage owner APIs explicitly instead of crate::storage::*: $(paste -sd '; ' "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE")"
 fi
 
 (
