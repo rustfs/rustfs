@@ -50,6 +50,10 @@ struct CachedBucketUsage {
     usage: BucketUsageInfo,
     refreshed_at: SystemTime,
     usage_updated_at: SystemTime,
+    // Set by request-path mutations until a scanner snapshot catches up to the same core counts.
+    dirty: bool,
+    // Set when a newer scanner snapshot was observed but did not include the dirty counts yet.
+    stale_snapshot_pending: bool,
 }
 
 type UsageMemoryCache = Arc<RwLock<HashMap<String, CachedBucketUsage>>>;
@@ -481,6 +485,8 @@ fn cached_bucket_usage_from_backend(usage: BucketUsageInfo, updated_at: SystemTi
         usage,
         refreshed_at: SystemTime::now(),
         usage_updated_at: updated_at,
+        dirty: false,
+        stale_snapshot_pending: false,
     }
 }
 
@@ -490,11 +496,20 @@ fn cached_bucket_usage_now(usage: BucketUsageInfo) -> CachedBucketUsage {
         usage,
         refreshed_at: now,
         usage_updated_at: now,
+        dirty: false,
+        stale_snapshot_pending: false,
     }
 }
 
 fn data_usage_info_updated_at(data_usage_info: &DataUsageInfo) -> SystemTime {
     data_usage_info.last_update.unwrap_or(SystemTime::UNIX_EPOCH)
+}
+
+fn bucket_usage_counts_match(left: &BucketUsageInfo, right: &BucketUsageInfo) -> bool {
+    left.size == right.size
+        && left.objects_count == right.objects_count
+        && left.versions_count == right.versions_count
+        && left.delete_markers_count == right.delete_markers_count
 }
 
 /// Fast in-memory update for immediate quota and admin usage consistency.
@@ -520,6 +535,8 @@ pub async fn record_bucket_object_write_memory(bucket: &str, previous_current_si
     let now = SystemTime::now();
     entry.refreshed_at = now;
     entry.usage_updated_at = now;
+    entry.dirty = true;
+    entry.stale_snapshot_pending = false;
 }
 
 /// Fast in-memory increment for immediate quota consistency.
@@ -545,6 +562,8 @@ pub async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64,
     let now = SystemTime::now();
     entry.refreshed_at = now;
     entry.usage_updated_at = now;
+    entry.dirty = true;
+    entry.stale_snapshot_pending = false;
 }
 
 /// Fast in-memory decrement for immediate quota consistency
@@ -643,19 +662,36 @@ pub async fn replace_bucket_usage_memory_from_info(data_usage_info: &DataUsageIn
     let mut next_cache = HashMap::new();
 
     for (bucket, bucket_usage) in data_usage_info.buckets_usage.iter() {
-        if let Some(existing) = cache.get(bucket)
-            && existing.usage_updated_at > usage_updated_at
-        {
-            next_cache.insert(bucket.clone(), existing.clone());
-            continue;
+        if let Some(existing) = cache.get(bucket) {
+            if existing.usage_updated_at > usage_updated_at {
+                next_cache.insert(bucket.clone(), existing.clone());
+                continue;
+            }
+
+            if existing.dirty && !bucket_usage_counts_match(&existing.usage, bucket_usage) {
+                // A scanner snapshot can be saved after newer writes but still miss them if it listed the bucket earlier.
+                let mut preserved = existing.clone();
+                preserved.stale_snapshot_pending = true;
+                next_cache.insert(bucket.clone(), preserved);
+                continue;
+            }
         }
 
         next_cache.insert(bucket.clone(), cached_bucket_usage_from_backend(bucket_usage.clone(), usage_updated_at));
     }
 
     for (bucket, existing) in cache.iter() {
-        if !data_usage_info.buckets_usage.contains_key(bucket) && existing.usage_updated_at > usage_updated_at {
-            next_cache.insert(bucket.clone(), existing.clone());
+        if !data_usage_info.buckets_usage.contains_key(bucket) {
+            if existing.usage_updated_at > usage_updated_at {
+                next_cache.insert(bucket.clone(), existing.clone());
+                continue;
+            }
+
+            if existing.dirty {
+                let mut preserved = existing.clone();
+                preserved.stale_snapshot_pending = true;
+                next_cache.insert(bucket.clone(), preserved);
+            }
         }
     }
 
@@ -672,7 +708,7 @@ pub async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut DataUsageIn
     let mut changed = false;
 
     for (bucket, cached) in cache.iter() {
-        if persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted) {
+        if !cached.stale_snapshot_pending && persisted_update.is_some_and(|persisted| cached.usage_updated_at <= persisted) {
             continue;
         }
 
@@ -1169,6 +1205,36 @@ mod tests {
                 .get("bucket-a")
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((0, 0))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn scanner_sync_preserves_dirty_memory_update_with_later_partial_snapshot() {
+        clear_usage_memory_cache_for_test().await;
+
+        let now = SystemTime::now();
+        let old_persisted = data_usage_info_for_test("bucket-a", 900, 9_000, now - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&old_persisted).await;
+
+        for _ in 0..100 {
+            record_bucket_object_write_memory("bucket-a", None, 10).await;
+        }
+
+        let scanner_partial = data_usage_info_for_test("bucket-a", 950, 9_500, now + Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&scanner_partial).await;
+
+        let mut response = scanner_partial.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1000);
+        assert_eq!(response.objects_total_size, 10_000);
+        assert_eq!(
+            response
+                .buckets_usage
+                .get("bucket-a")
+                .map(|usage| (usage.objects_count, usage.size)),
+            Some((1000, 10_000))
         );
     }
 }
