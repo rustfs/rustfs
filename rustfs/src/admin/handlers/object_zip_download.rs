@@ -14,6 +14,7 @@
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::storage_api::{BucketOperations, BucketOptions, ListOperations as _, ObjectIO as _, ObjectOperations as _};
 use crate::admin::storage_api::{ReqInfo, StorageObjectOptions as ObjectOptions, authorize_request};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -31,7 +32,6 @@ use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_storage_api::{BucketOperations, ListOperations as _, ObjectIO as _, ObjectOperations as _, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::admin::storage_api::ecstore_utils::{deserialize, serialize};
+use crate::admin::storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use crate::admin::storage_api::{
     StorageError,
     metadata::{
@@ -41,7 +42,6 @@ use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,

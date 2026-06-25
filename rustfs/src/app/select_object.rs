@@ -1,3 +1,4 @@
+use super::storage_api::ObjectOperations as _;
 use super::storage_api::options::get_opts;
 use super::storage_api::request_context::spawn_traced;
 use super::storage_api::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
@@ -16,7 +17,6 @@ use rustfs_s3select_api::{
     object_store::{INVALID_SCAN_RANGE_MESSAGE, validate_scan_range_bounds},
     query::{Context, Query},
 };
-use rustfs_storage_api::ObjectOperations as _;
 use s3s::dto::{
     CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
     JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,

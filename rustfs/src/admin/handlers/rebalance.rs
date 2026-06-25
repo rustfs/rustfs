@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use crate::admin::storage_api::{
     DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
     StorageError, decode_rebalance_stop_propagation_record,
@@ -29,7 +30,6 @@ use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},

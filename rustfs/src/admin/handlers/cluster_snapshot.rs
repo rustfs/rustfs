@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_api::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use crate::admin::{
     auth::validate_admin_request,
     router::{AdminOperation, Operation, S3Router},
@@ -34,7 +35,6 @@ use matchit::Params;
 use rustfs_concurrency::AdmissionState as WorkloadAdmissionState;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -590,16 +590,16 @@ fn summarize_named_capability_statuses<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
+    use crate::admin::storage_api::CapabilityState;
     use crate::admin::storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     };
+    use crate::admin::storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
     use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
     use crate::server::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
-    use rustfs_storage_api::CapabilityState;
-    use rustfs_storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 
     #[test]
     fn cluster_snapshot_handler_requires_server_info_admin_permission() {
