@@ -40,6 +40,9 @@ pub(crate) const MINIO_HEALTH_LIVE_PATH: &str = "/minio/health/live";
 /// MinIO-compatible health readiness probe alias path.
 pub(crate) const MINIO_HEALTH_READY_PATH: &str = "/minio/health/ready";
 
+/// MinIO-compatible cluster health probe alias path.
+pub(crate) const MINIO_HEALTH_CLUSTER_PATH: &str = "/minio/health/cluster";
+
 /// Predefined administrative prefix for RustFS server routes.
 /// This prefix is used for endpoints that handle administrative tasks
 /// such as configuration, monitoring, and management.

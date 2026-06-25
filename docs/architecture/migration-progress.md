@@ -5,11 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-network-client-runtime-sources`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185`.
-- Based on: latest `origin/main` after PR #3795 merged API-184; this branch
-  batches network client runtime source boundary cleanup on top of that
-  baseline.
+- Branch: `overtrue/arch-app-storage-io-helper-boundary`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213`.
+- Based on: stacked on API-212 after PR #3854 merged.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -18,17 +16,49 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
   consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
   runtime source reads, RIO HTTP reader TLS/metrics runtime source reads, and
-  gRPC/transition network client TLS/metrics runtime source reads through
-  AppContext-first or owner-crate resolver boundaries.
+  gRPC/transition network client TLS/metrics runtime source reads, plus ECStore
+  data-plane KMS/storage-class/deployment-id/lock-manager/erasure metric reads,
+  plus ECStore observability/status object-store, endpoint, node-name,
+  boot-time, init-time, root-disk threshold, and cached RPC channel reads,
+  plus ECStore replication pool, replication stats, and event-host reads,
+  plus ECStore lifecycle queue state, tier config, lifecycle config, deployment
+  id, event-host reads, bucket monitor reads, replication worker pool reads,
+  config/tier first-node checks, rebalance endpoint-locality checks, bucket
+  metadata object-store reads, metadata endpoint/setup reads, lifecycle
+  object-store reads, replication object-store readiness checks, and ECStore
+  pools/tier/notification owner-root runtime source reads, plus ECStore setup
+  state, boot-time, endpoint snapshot, local node, local disk map, and lock
+  client reads in store initialization, sets, set-disk, pool-space, and peer
+  client paths, plus ECStore facade server-config, storage-class,
+  notification, bucket-metadata, endpoint, region, tier-config, server-address,
+  object-store publication, lock-client publication, and local-node publication
+  paths, plus ECStore batch processor, dynamic storage-class publication,
+  RustFS cluster snapshot facade alias paths, ECStore RPC test runtime global
+  helpers, ECStore lifecycle queue and transition state handle facades, RustFS
+  AppContext lifecycle expiry-state resolver paths, RustFS app/admin test
+  runtime-source helpers, scanner lifecycle/tier runtime source reads, and the
+  stale RustFS tier-config and expiry-state test compat shims, plus scanner
+  runtime config, erasure-mode, lifecycle queue, and tier runtime source helper
+  names, plus IAM root-credential, server-config, and notification runtime
+  source helpers, plus AppContext fallback KMS/IAM/ECStore/config/metrics/TLS
+  runtime source helpers, plus startup/root KMS, credentials, region,
+  readiness-time, observability, metrics, buffer, and TLS runtime source
+  helpers, plus server readiness/audit/event/module-switch runtime source
+  helpers, storage request/RPC/SSE runtime source helpers, and admin
+  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports, app-local S3 API response helper imports for bucket/object/multipart usecases, app-local storage helper boundary imports for select/bucket/object/multipart usecases, admin/app test storage helper boundary imports for request context, authorization, object options, and ECFS test harness consumers, and app storage IO/compression/set-disk helper boundary imports for object and multipart usecases,
+  through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
   regressions, plus external runtime, test, fuzz, and storage-owner module
   ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
   and storage owner thin bridge regressions, plus app context and notify
-  event-bridge thin module regressions; accept the reviewed AppContext resolver
-  reverse dependencies in the layer baseline.
-- Docs changes: record the API-136 through API-185 owner facade cleanup.
+  event-bridge thin module regressions, plus IAM runtime-source bypasses;
+  accept the reviewed AppContext resolver reverse dependencies in the layer
+  baseline, and block direct admin AppContext resolver consumers outside the
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, and reject app usecase bypasses for migrated storage IO/compression/set-disk helpers.
+- Docs changes: record the API-136 through API-213 owner facade and lifecycle
+  runtime-source cleanup.
 
 ## Phase 0 Tasks
 
@@ -4685,14 +4715,422 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     client runtime source scan, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `API-186` Centralize ECStore data-plane runtime source reads.
+  - Do: add an ECStore runtime-source boundary for erasure quorum failure
+    metrics, object-read managed KMS service lookup, storage-class parity and
+    inline decisions, deployment-prefixed multipart upload ids, and the local
+    lock-manager handle.
+  - Acceptance: ECStore data-plane write/read/multipart paths no longer import
+    those global runtime sources directly outside the owner runtime-source
+    module.
+  - Must preserve: erasure quorum metric stage/error labels, managed-KMS
+    decrypt fallback behavior, storage-class parity and inline decisions,
+    multipart upload id encoding, and local lock-manager initialization.
+  - Verification: ECStore compile coverage, focused unit tests, formatting,
+    migration guard, layer guard, diff hygiene, residual data-plane runtime
+    source scan, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `API-187` Centralize ECStore runtime owner source reads.
+  - Do: expand the ECStore runtime-source boundary across rebalance storage
+    class and notification reads, bucket monitor cleanup, lifecycle config
+    lookups, local disk id/path/set-drive maps, peer disk discovery, and store
+    init runtime handles.
+  - Acceptance: ECStore data-plane, rebalance, lifecycle, bucket, peer, and
+    startup paths route those runtime globals through the ECStore-owned runtime
+    source module instead of importing them directly.
+  - Must preserve: rebalance parity selection and notifications, lifecycle
+    config lookup semantics, bucket monitor deletion, local disk id backfill,
+    endpoint disk lookup fallback, local disk map initialization, deployment id
+    publication, and tier config initialization.
+  - Verification: ECStore compile coverage, focused store/pools/set-disk tests,
+    formatting, migration guard, layer guard, diff hygiene, residual runtime
+    source scan, Rust risk scan, branch freshness check, pre-commit quality
+    gate, and three-expert review.
+
+- [x] `API-188` Centralize ECStore observability runtime source reads.
+  - Do: route ECStore server-info, realtime metrics, data-usage cache,
+    local-disk root detection, and RPC cached-channel runtime reads through the
+    ECStore-owned runtime-source module.
+  - Acceptance: ECStore observability/status paths no longer import those
+    runtime globals directly outside the owner runtime-source boundary.
+  - Must preserve: server info endpoint/uptime/deployment-id fields, storage
+    info and backend summary collection, realtime metrics host fallback,
+    scanner init-time override, data-usage cache refresh behavior, root-disk
+    threshold checks, and cached gRPC channel reuse.
+  - Verification: ECStore compile coverage, formatting, diff hygiene, residual
+    runtime source scan, Rust risk scan, focused tests, migration/layer guards,
+    PR-before-push pre-commit quality gate, and three-expert review.
+
+- [x] `API-189` Centralize ECStore replication runtime source reads.
+  - Do: route replication pool, replication stats, and replication event-host
+    runtime reads through the ECStore-owned runtime-source module.
+  - Acceptance: replication pool/resyncer code no longer reads those runtime
+    globals directly outside the owner runtime-source boundary.
+  - Must preserve: background replication initialization, async/sync queueing,
+    delete-task stats updates, proxy request stats, resync status updates, and
+    emitted replication event host values.
+  - Verification: ECStore compile coverage, formatting, diff hygiene, residual
+    replication runtime-source scan, Rust risk scan, focused tests,
+    migration/layer guards, PR-before-push pre-commit quality gate, and
+    three-expert review.
+
+- [x] `API-190` Centralize ECStore lifecycle runtime source reads.
+  - Do: route lifecycle queue state handles, tier config manager reads,
+    lifecycle config reads, deployment-id reads, and lifecycle event-host reads
+    through the ECStore-owned runtime-source module.
+  - Acceptance: lifecycle ops, tier sweeper, rebalance config loading, and
+    set-disk transition/restore event paths no longer read those runtime
+    globals directly outside the owner runtime-source boundary.
+  - Must preserve: lifecycle worker sizing, expiry and transition queueing,
+    tier delete journal accounting, rebalance lifecycle config snapshots,
+    transitioned-object reader driver lookup, and emitted lifecycle transition,
+    restore, and expiry event host values.
+  - Verification: ECStore compile coverage, focused lifecycle worker test,
+    formatting, diff hygiene, residual lifecycle runtime-source scan, Rust risk
+    scan, migration/layer guards, PR-before-push pre-commit quality gate, and
+    three-expert review.
+
+- [x] `API-191` Centralize ECStore bucket runtime source reads.
+  - Do: route bucket monitor reads and replication worker pool reads through the
+    ECStore-owned runtime-source module.
+  - Acceptance: bucket target bandwidth updates, replication resync bandwidth
+    wrappers, and replication state stats no longer read those runtime globals
+    directly outside the owner runtime-source boundary.
+  - Must preserve: bandwidth limit updates, uninitialized-monitor warnings,
+    monitored resync readers, active worker statistics, and bucket replication
+    bandwidth reports.
+  - Verification: ECStore compile coverage, focused replication-state test,
+    formatting, diff hygiene, residual bucket runtime-source scan, Rust risk
+    scan, migration/layer guards, PR-before-push pre-commit quality gate, and
+    three-expert review.
+
+- [x] `API-192` Centralize ECStore locality runtime source reads.
+  - Do: route rebalance endpoint-locality checks plus config and tier
+    first-cluster-node checks through the ECStore-owned runtime-source module.
+  - Acceptance: rebalance, config initialization, and tier config loading no
+    longer import global locality readers directly outside the runtime-source
+    boundary.
+  - Must preserve: rebalance local-pool worker selection, server-config
+    initialization ownership, non-first-node config lookup behavior, and tier
+    config initialization behavior.
+  - Verification: ECStore compile coverage, focused config/tier/rebalance
+    tests, formatting, diff hygiene, residual locality runtime-source scan,
+    Rust risk scan, migration/layer guards, PR-before-push pre-commit quality
+    gate, and three-expert review.
+
+- [x] `API-193` Centralize remaining ECStore bucket runtime source reads.
+  - Do: route bucket metadata save/update, metadata system endpoint/setup
+    checks, lifecycle object-store lookups, and replication object-store
+    readiness checks through the ECStore-owned runtime-source module.
+  - Acceptance: bucket metadata, metadata system, lifecycle, and replication
+    resync code no longer import these runtime globals directly outside the
+    runtime-source boundary.
+  - Must preserve: metadata initialization fan-out, standalone bucket metadata
+    fallback, lifecycle compensation and immediate expiry behavior, and
+    replication readiness defaults.
+  - Verification: ECStore compile coverage, focused bucket/lifecycle scans,
+    formatting, diff hygiene, residual runtime-source scan, Rust risk scan,
+    migration/layer guards, PR-before-push quality gate, and three-expert
+    review.
+
+- [x] `API-194` Centralize ECStore owner-root runtime source reads.
+  - Do: route ECStore decommission object-store lookups, tier config save
+    object-store lookups, notification rebalance object-store lookups,
+    notification peer endpoint snapshots, and offline uptime reads through the
+    ECStore-owned runtime-source module.
+  - Acceptance: `pools`, `tier`, and `notification_sys` no longer import these
+    runtime globals directly outside the runtime-source boundary.
+  - Must preserve: decommission start validation and rollback behavior, tier
+    save initialization errors, notification stop-rebalance errors, peer
+    storage/server fallback behavior, and offline server uptime reporting.
+  - Verification: ECStore compile coverage, focused owner-root tests,
+    formatting, diff hygiene, residual runtime-source scan, Rust risk scan,
+    migration/layer guards, PR-before-push quality gate, and three-expert
+    review.
+
+- [x] `API-195` Centralize ECStore setup runtime source reads.
+  - Do: route ECStore setup-state checks, boot-time initialization, endpoint
+    snapshots, local node names, lock-client lookup, local disk map updates,
+    and local disk set-drive updates through the ECStore-owned runtime-source
+    module.
+  - Acceptance: store initialization, sets, set-disk, pool-space, and peer REST
+    client code no longer import those runtime globals directly outside the
+    runtime-source boundary.
+  - Must preserve: store boot-time initialization, local disk registration,
+    distributed lock selection, delete-object batch locking, recovered-disk
+    local map updates, pool-space inode checks, peer-client creation, and
+    pool-meta persistence behavior.
+  - Verification: ECStore compile coverage, focused setup/set-disk lock tests,
+    formatting, diff hygiene, residual runtime-source scan, Rust risk scan,
+    migration/layer guards, PR-before-push quality gate, and three-expert
+    review.
+
+- [x] `API-196` Centralize ECStore accessor runtime source reads.
+  - Do: route ECStore server-config, storage-class, notification system,
+    bucket metadata system, endpoint, region, tier-config, host/address/port,
+    object-store publication, lock-client publication, and local-node
+    publication paths through the ECStore-owned runtime-source module.
+  - Acceptance: `store`, `store/init`, and `store/peer` no longer import or
+    call those process-global accessors directly outside the runtime-source
+    boundary.
+  - Must preserve: ECStore facade method signatures, default endpoint fallback,
+    object-layer publication, lock-client duplicate handling, local-node name
+    fallback construction, and server address reads.
+  - Verification: ECStore compile coverage, focused store init/accessor tests,
+    formatting, diff hygiene, residual runtime-source scan, migration/layer
+    guards, PR-before-push quality gate, and three-expert review.
+
+- [x] `API-197` Centralize ECStore batch/config runtime sources and cluster aliases.
+  - Do: route set-disk batch processor selection and dynamic storage-class
+    publication through the ECStore-owned runtime-source module, and keep
+    RustFS cluster snapshot ECStore facade imports behind local ecstore aliases.
+  - Acceptance: set-disk read/write/metadata paths, dynamic config
+    application, and cluster snapshot consumers no longer import or call those
+    ECStore process-global or facade paths directly outside owner boundaries.
+  - Must preserve: read/write/metadata batch concurrency levels, dynamic
+    storage-class lookup by drive count, first-set publication behavior, and
+    config error handling.
+  - Verification: ECStore compile coverage, focused set-disk/config checks,
+    formatting, diff hygiene, residual runtime-source scan, migration/layer
+    guards, PR-before-push quality gate, and three-expert review.
+
+- [x] `API-198` Centralize ECStore RPC test runtime globals.
+  - Do: route RPC test connection-cache seeding, connection-cache assertions,
+    and test RPC secret initialization through the ECStore runtime-source
+    boundary.
+  - Acceptance: RPC client, HTTP auth, remote locker, and remote disk tests no
+    longer import or mutate `GLOBAL_CONN_MAP` or `GLOBAL_RUSTFS_RPC_SECRET`
+    directly.
+  - Must preserve: cached-channel eviction assertions, timeout behavior,
+    signature generation behavior, and test-only secret initialization.
+  - Verification: focused RPC tests, formatting, diff hygiene, residual runtime
+    global scan, migration/layer guards, fast PR gate, and full PR gate before
+    PR.
+
+- [x] `API-199` Centralize RustFS test runtime-source helpers.
+  - Do: route lifecycle transition tier-config test mutation and site
+    replication outbound TLS generation test mutation through AppContext-owned
+    runtime-source helpers, then retire the stale RustFS tier-config test compat
+    shim.
+  - Acceptance: lifecycle transition and site replication tests no longer
+    import or mutate the ECStore tier-config global or outbound TLS generation
+    global directly, and no app-level tier-config test global alias remains.
+  - Must preserve: transition tier registration, peer-client cache rebuild on
+    TLS generation changes, cache restore behavior, and AppContext-first
+    resolver precedence.
+  - Verification: focused RustFS tests, formatting, diff hygiene, residual test
+    global scan, migration/layer guards, fast PR gate, and full PR gate before
+    PR.
+
+- [x] `API-204` Centralize server and storage runtime source readers.
+  - Do: route server audit/event/module-switch/readiness/KMS health reads,
+    startup bucket replication-pool reads, and storage request/RPC/SSE runtime
+    reads through owner runtime-source boundaries.
+  - Acceptance: the migrated server/startup/storage files no longer import
+    AppContext resolvers directly, and migration rules reject reintroducing
+    those direct resolver reads outside the owner runtime-source modules.
+  - Must preserve: audit/notify module switch behavior, public health KMS
+    readiness behavior, dependency readiness cache behavior, bucket metadata
+    replication resync startup, buffer profile lookup, object-store lookup,
+    internode metrics recording, local-node naming, request credential/notify
+    dispatch, performance metrics, encryption service lookup, region lookup,
+    and IAM authorization behavior.
+  - Verification: focused RustFS storage/server compile and tests, formatting,
+    migration/layer guards, diff hygiene, residual direct AppContext scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-205` Centralize admin runtime source readers.
+  - Do: route admin handler, router, auth, console, and service runtime
+    AppContext resolver consumers through the admin runtime-source boundary.
+  - Acceptance: admin consumers no longer import AppContext resolvers directly,
+    and migration rules reject new direct admin AppContext resolver consumers
+    outside `rustfs/src/admin/runtime_sources.rs`.
+  - Must preserve: admin auth/authorization, IAM readiness errors, KMS manager
+    fallback, OIDC console behavior, replication status, site replication peer
+    TLS behavior, dynamic config publication, object-store reads, region
+    rendering, scanner reports, and bucket metadata/admin storage behavior.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-206` Centralize root, app, and storage RPC runtime source readers.
+  - Do: route root auth/init/config/protocol/workload consumers, app usecase
+    consumers, and storage node-service runtime resolver consumers through
+    root, app, or storage runtime-source boundaries.
+  - Acceptance: migrated root/app/storage consumers no longer import AppContext
+    resolvers directly, and migration rules reject reintroducing those direct
+    resolver reads outside the owner runtime-source modules.
+  - Must preserve: request credential lookup, IAM readiness checks, update and
+    notification startup behavior, runtime region and buffer config lookup,
+    workload admission replication status, S3 Select DB lookup, app-context
+    object-store/notification resolution, and node-service IAM/lock behavior.
+  - Verification: focused RustFS compile/tests, formatting, migration and layer
+    guards, diff hygiene, residual direct AppContext scan, Rust risk scan, fast
+    PR gate, and full PR gate before PR.
+
+- [x] `API-207` Close remaining admin grouped AppContext imports.
+  - Do: route grouped admin handler AppContext resolver imports through the
+    admin runtime-source boundary and extend migration rules to catch grouped
+    `app::context` imports.
+  - Acceptance: admin handlers no longer import AppContext resolvers directly,
+    including grouped `crate::{ app::context::... }` imports, and migration
+    rules reject reintroducing them.
+  - Must preserve: admin credential checks, STS OIDC/token-signing lookups,
+    pool/rebalance notification and object-store behavior, tier stats/config
+    behavior, and bucket metadata object-store access.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-208` Remove app usecase storage wildcard imports.
+  - Do: replace broad `crate::storage::*` imports in bucket, object, and
+    multipart app usecases with explicit storage owner imports.
+  - Acceptance: app usecases no longer import storage owner APIs through a
+    wildcard, and migration rules reject reintroducing storage wildcard imports
+    in app usecase files.
+  - Must preserve: bucket listing and notification behavior, object
+    precondition/SSE/object-lock/CORS behavior, multipart SSE and object-lock
+    behavior, and existing storage owner call sites.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual wildcard scan, Rust risk scan, fast PR
+    gate, and full PR gate before PR.
+
+- [x] `API-209` Remove app DTO and ECFS wildcard imports.
+  - Do: replace broad `s3s::dto::*` imports in app select, bucket, object, and
+    multipart usecases, replace the object usecase ECFS wildcard with the
+    explicit owner type, and narrow the matching layer baseline entry.
+  - Acceptance: app consumers no longer import S3 DTOs or ECFS owner APIs
+    through wildcards, and migration rules reject reintroducing those wildcard
+    imports in app-layer files.
+  - Must preserve: select-object request validation and event streaming, bucket
+    DTO mapping/list output behavior, object CRUD/copy/delete/restore DTO
+    mapping, multipart upload/copy checksum behavior, and existing ECFS FS test
+    harness usage.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual wildcard scan, Rust risk scan, fast PR
+    gate, and full PR gate before PR.
+
+- [x] `API-210` Route app S3 API helper imports through app boundary.
+  - Do: add an app-local S3 API helper boundary and route bucket, object, and
+    multipart usecases through it instead of direct `crate::storage::s3_api`
+    imports.
+  - Acceptance: app usecase files no longer import storage S3 API helpers
+    directly, layer baseline records the reviewed app boundary, and migration
+    rules reject direct usecase bypasses.
+  - Must preserve: bucket list response mapping, multipart list/part-number
+    parsing, object list-parts parameter parsing, owner/initiator response
+    metadata, and existing storage S3 API helper behavior.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct S3 API scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-211` Route app storage helper imports through app boundary.
+  - Do: add an app-local storage helper boundary and route select, bucket,
+    object, and multipart usecases through it instead of direct storage helper
+    imports for access, helper, options, SSE, request-context, concurrency,
+    prefix, timeout, and storage object helper types.
+  - Acceptance: app select/usecase files no longer import the migrated storage
+    helper APIs directly, layer baseline records the reviewed app boundary, and
+    migration rules reject direct storage helper bypasses.
+  - Must preserve: select-object preflight and traced execution, bucket request
+    authorization/background metadata updates, multipart SSE/options parsing,
+    object SSE/concurrency/prefix/timeout behavior, and existing storage helper
+    implementations.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct storage helper scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-212` Route app/admin storage helper imports through local boundaries.
+  - Do: add an admin-local storage helper boundary, route admin router,
+    console, heal, metrics, and object-zip handlers through it, and route app
+    integration tests through the existing app storage boundary.
+  - Acceptance: the completed app/admin consumers no longer import migrated
+    storage helper APIs directly, and migration rules reject direct bypasses.
+  - Must preserve: admin authorization and request tracing, console request
+    context propagation, admin object zip storage options, and app lifecycle and
+    capacity dirty-scope test harness behavior.
+  - Verification: focused RustFS admin/app compile/tests, formatting, migration
+    and layer guards, diff hygiene, residual direct storage helper scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-213` Route app storage IO helper imports through app boundary.
+  - Do: extend the app-local storage helper boundary for compression, reader,
+    write-plan, and set-disk helpers, then route object and multipart usecases
+    through it instead of app-level compatibility aliases.
+  - Acceptance: app object and multipart usecases no longer consume the
+    migrated storage IO/compression/set-disk helpers through `super::` aliases,
+    the app root no longer re-exports those helpers, and migration rules reject
+    reintroducing the completed bypasses.
+  - Must preserve: object compression metadata, hash-reader checksum handling,
+    multipart SSE-C/SSE-S3 write-encryption planning, valid-storage-class
+    checks, lock-acquire timeout reads, and test-only reader wrappers.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated helper scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
+1. `consumer-migration`: batch remaining app/admin/storage helper boundary and owner facade cleanup.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-213 removes app root IO/compression/set-disk compatibility aliases and routes object/multipart usecases through the app storage_api boundary. |
+| Migration preservation | pass | Object compression metadata, hash-reader checksum handling, multipart write-encryption planning, storage-class checks, lock timeouts, and test reader wrappers keep the same storage implementations. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual migrated helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-212 routes completed app/admin storage helper consumers through local storage_api boundaries and adds a direct-bypass guard. |
+| Migration preservation | pass | Admin authorization/tracing, console request context propagation, object-zip storage options, and app lifecycle/capacity test harness behavior keep the same storage implementations. |
+| Testing/verification | pass | Focused admin/app compile/tests, formatting, migration/layer guards, residual direct storage helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-211 routes app select/usecase storage helper imports through an app-local storage_api boundary and adds a direct-bypass guard. |
+| Migration preservation | pass | Select preflight, bucket authorization/background work, multipart SSE/options parsing, and object SSE/concurrency/prefix/timeout paths keep the same storage helper implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual direct storage helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-210 routes app usecase S3 API helper imports through an app-local boundary and adds a direct-bypass guard. |
+| Migration preservation | pass | Bucket list response mapping, multipart list/part-number parsing, object list-parts parsing, and S3 owner metadata keep the same storage helper implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual direct S3 API scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-209 removes app-layer S3 DTO and ECFS wildcard imports and adds a regression guard for the completed boundary. |
+| Migration preservation | pass | Select-object streaming, bucket DTO mapping, object CRUD/copy/delete/restore DTO handling, multipart checksum/copy behavior, and ECFS FS test harness usage keep the same call paths. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual wildcard scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-208 removes broad storage wildcard imports from app bucket, object, and multipart usecases and adds a regression guard. |
+| Migration preservation | pass | Bucket listing/notification, object precondition/SSE/object-lock/CORS, and multipart SSE/object-lock behavior keep the same storage owner call sites. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual wildcard scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-207 closes the remaining grouped admin AppContext imports behind the admin runtime-source boundary and tightens guard coverage. |
+| Migration preservation | pass | Admin credentials, STS, pool/rebalance, tier, and bucket metadata resolver behavior preserve existing AppContext fallback semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-206 keeps root, app usecase, and storage node-service AppContext resolver consumers behind owner runtime-source boundaries and adds regression guards. |
+| Migration preservation | pass | Request credentials, IAM readiness, startup notify/region, buffer config, workload admission, S3 Select, app-context object-store/notify, and node-service IAM/lock behavior preserve existing semantics. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-205 keeps direct admin AppContext resolver consumers behind the admin runtime-source boundary and adds a guard against regressions. |
+| Migration preservation | pass | Admin auth, IAM readiness, KMS manager fallback, site replication TLS, config publication, and object-store resolver behavior preserve existing semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-199 keeps RustFS test tier-config and TLS-generation mutation behind AppContext-owned runtime-source helpers and retires the stale tier-config test compat shim. |
+| Migration preservation | pass | Lifecycle transition tier registration and site replication peer-client generation-cache behavior preserve existing semantics. |
+| Testing/verification | pass | Focused RustFS tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-198 keeps RPC test connection-cache and RPC-secret globals behind the ECStore runtime-source test boundary. |
+| Migration preservation | pass | Cached-channel eviction assertions, timeout behavior, signature generation behavior, and test-only secret initialization preserve existing semantics. |
+| Testing/verification | pass | Focused RPC tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-197 keeps set-disk batch processor lookup, dynamic storage-class publication, and RustFS cluster snapshot facade imports behind owner boundaries. |
+| Migration preservation | pass | Batch concurrency defaults, storage-class lookup by drive count, first-set publication, config error handling, and cluster snapshot response shape preserve existing behavior. |
+| Testing/verification | pass | ECStore compile, focused set-disk/config checks, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-196 keeps ECStore facade, object-layer, lock-client, local-node, and server-address runtime access behind the runtime-source boundary. |
+| Migration preservation | pass | Facade signatures, endpoint fallback, object-store publication, lock-client duplicate handling, and local-node fallback behavior preserve existing semantics. |
+| Testing/verification | pass | ECStore compile and focused store-init/accessor tests have passed; formatting, migration/layer guards, residual scan, and PR gate are planned before PR. |
+| Quality/architecture | pass | API-195 keeps setup-state, boot-time, endpoint, local-node, local-disk, and lock-client reads behind the ECStore runtime-source boundary. |
+| Migration preservation | pass | Store init, local disk registration, distributed lock selection, recovered-disk map updates, pool-space inode checks, peer-client creation, and pool-meta persistence preserve existing behavior. |
+| Testing/verification | pass | ECStore compile, focused setup/set-disk tests, formatting, migration/layer guards, residual scan, Rust risk scan, and PR gate are planned for API-195. |
+| Quality/architecture | pass | API-194 keeps pools, tier, and notification owner-root runtime reads behind the ECStore runtime-source boundary. |
+| Migration preservation | pass | Decommission, tier-save, notification rebalance, peer fallback, and offline uptime behavior preserve existing error/fallback semantics. |
+| Testing/verification | pass | ECStore compile, focused owner-root tests, formatting, migration/layer guards, residual scan, Rust risk scan, and PR gate are planned for API-194. |
+| Quality/architecture | pass | API-193 keeps remaining ECStore bucket metadata, lifecycle, and replication runtime reads behind the runtime-source boundary. |
+| Migration preservation | pass | Metadata fan-out, standalone fallback, lifecycle compensation/expiry, and replication readiness defaults preserve existing behavior. |
+| Testing/verification | pass | ECStore compile, focused scans, formatting, migration/layer guards, residual scan, Rust risk scan, and PR gate are planned for API-193. |
+| Quality/architecture | pass | API-192 keeps ECStore locality reads behind the runtime-source boundary without adding new public APIs. |
+| Migration preservation | pass | Rebalance local-pool selection plus config and tier first-node behavior preserve existing fallback semantics. |
+| Testing/verification | pass | ECStore compile, focused config/tier/rebalance tests, formatting, migration/layer guards, residual scan, Rust risk scan, and pre-commit planned before PR. |
+| Quality/architecture | pass | API-191 keeps bucket monitor and replication worker pool reads behind the ECStore runtime-source boundary without adding new public APIs. |
+| Migration preservation | pass | Bandwidth limit updates, monitored resync readers, active worker statistics, and bucket replication bandwidth reports keep existing fallback behavior. |
+| Testing/verification | pass | ECStore compile, focused replication-state test, formatting, migration/layer guards, residual scan, Rust risk scan, and pre-commit planned before PR. |
 | Quality/architecture | pass | API-152 removes thin test/fuzz ECStore bridge files and keeps direct imports in owner test/fuzz files. |
 | Migration preservation | pass | E2E, heal, scanner, and fuzz consumers keep the same ECStore API symbols and call paths. |
 | Testing/verification | pass | Focused test/fuzz compile, formatting, migration guard, shell syntax, diff hygiene, Rust risk scan, and pre-commit passed for API-152. |
@@ -4796,10 +5234,108 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 | Quality/architecture | pass | API-185 keeps protos and ECStore network client TLS/metrics globals behind owner runtime-source modules without widening public APIs. |
 | Migration preservation | pass | gRPC TLS cache invalidation, transition-client TLS generation reporting, dial metrics, retry metrics, and read/write byte/error counters keep existing behavior. |
 | Testing/verification | pass | Protos/ECStore compile/tests, formatting, residual network client runtime source scan, targeted guard checks, and pre-commit passed for API-185. |
+| Quality/architecture | pass | API-186 keeps ECStore data-plane runtime globals behind an ECStore-owned runtime-source module without widening public APIs. |
+| Migration preservation | pass | Erasure quorum metric labels, managed-KMS fallback, storage-class decisions, multipart upload id encoding, and lock-manager initialization keep existing behavior. |
+| Testing/verification | pass | ECStore compile/focused tests, formatting, residual data-plane runtime source scan, targeted guard checks, and pre-commit passed for API-186. |
+| Quality/architecture | pass | API-187 expands the ECStore runtime-source owner boundary across rebalance, lifecycle, local disk maps, peer lookup, and store init handles without adding public APIs. |
+| Migration preservation | pass | Rebalance notifications, lifecycle config reads, bucket monitor cleanup, local disk id/path/set-drive lookups, store init map publication, and deployment id publication keep existing semantics. |
+| Testing/verification | pass | ECStore compile/focused tests, formatting, migration/layer guards, diff-only Rust risk scan, and pre-commit passed for API-187. |
+| Quality/architecture | pass | API-188 keeps ECStore observability/status runtime reads behind the ECStore runtime-source boundary without adding public APIs. |
+| Migration preservation | pass | Server info fields, metrics host fallback, data-usage cache refresh, root-disk checks, and cached RPC channel reuse keep existing semantics. |
+| Testing/verification | pass | ECStore compile/focused tests, formatting, migration/layer guards, residual scan, diff-only Rust risk scan, and pre-commit passed for API-188. |
+| Quality/architecture | pass | API-189 keeps ECStore replication runtime pool/stats/host reads behind the ECStore runtime-source boundary without adding public APIs. |
+| Migration preservation | pass | Replication initialization, queueing, delete stats, proxy stats, resync status updates, and emitted event host values keep existing semantics. |
+| Testing/verification | pass | ECStore compile/focused test, formatting, migration/layer guards, diff hygiene, residual scan, diff-only Rust risk scan, and pre-commit passed for API-189. |
+| Quality/architecture | pass | API-190 keeps ECStore lifecycle, tier, rebalance, and set-disk runtime reads behind the ECStore runtime-source boundary without adding public APIs. |
+| Migration preservation | pass | Lifecycle worker state, expiry/transition queueing, tier driver lookups, rebalance lifecycle snapshots, and emitted event host values keep existing semantics. |
+| Testing/verification | pass | ECStore compile/focused lifecycle test, formatting, migration/layer guards, diff hygiene, residual scan, diff-only Rust risk scan, and pre-commit passed for API-190. |
 
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-187 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib test_find_local_disk_by_ref_backfills_uuid_map -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib should_resume_local_decommission -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib resolve_store_init_stage_result -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib test_find_local_disk -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECStore runtime source scan: passed for API-187 targets; remaining
+    `set_disk` tier/local-node/global-map matches are legacy owner boundaries
+    intentionally left for a later focused slice.
+  - Rust risk scan: passed; diff adds no new `unwrap`, `expect`, `panic`,
+    `todo`, `unimplemented`, `unsafe`, production print, boxed public error,
+    string public error, relaxed ordering, or silent integer cast.
+  - Branch freshness check: rebased onto latest `origin/main` after PR #3797
+    merged API-186.
+  - `make pre-commit`: passed.
+- Issue #660 API-188 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib server_info_includes_global_deployment_id -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECStore runtime source scan: passed for API-188 targets.
+  - Rust risk scan: passed.
+  - `make pre-commit`: passed.
+- Issue #660 API-189 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib replication_queue_admission_combines_target_results -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Replication runtime-source scan: passed for API-189 targets.
+  - Diff-only Rust risk scan: passed.
+  - `make pre-commit`: passed, including 6552 nextest tests passed and
+    doctests passed; the existing OPA policy test took 603s.
+- Issue #660 API-190 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib transition_worker_resize_cancels_removed_workers_directly -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Lifecycle runtime-source scan: passed for API-190 targets.
+  - Diff-only Rust risk scan: passed.
+  - `make pre-commit`: passed.
+
+- Issue #660 API-186 current slice:
+  - `cargo check -p rustfs-ecstore --tests`: passed.
+  - `cargo test -p rustfs-ecstore --lib erasure_coding -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib set_disk -- --test-threads=1`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib readers -- --test-threads=1`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECStore data-plane runtime source scan: passed; direct storage-class,
+    deployment id, KMS encryption service, lock-manager, and erasure internode
+    metric global reads are isolated to the ECStore runtime source module.
+  - Rust risk scan: passed; diff adds no new `expect`, `panic`, `todo`,
+    `unimplemented`, or `unsafe`.
+  - Branch freshness check: rebased onto latest `origin/main` after PR #3796
+    merged API-185.
+  - `make pre-commit`: passed.
 
 - Issue #660 API-185 current slice:
   - `cargo check -p rustfs-protos -p rustfs-ecstore --tests`: passed.
@@ -4819,6 +5355,38 @@ Passed before push:
   - Branch freshness check: based on latest `origin/main` after PR #3795
     merged API-184.
   - `make pre-commit`: passed.
+
+- Issue #660 API-203 current slice:
+  - Do: centralize startup/root runtime global publication and initialization
+    behind `rustfs/src/startup_runtime_sources.rs`, including action
+    credentials, runtime region/port/address, init time, KMS manager,
+    observability guard, metrics runtime, buffer profile, and outbound TLS
+    generation/state metrics.
+  - Must preserve: startup ordering, embedded startup semantics, KMS
+    configuration behavior, observability guard error classification, buffer
+    profile fallback behavior, TLS startup publish behavior, and TLS reload
+    loop behavior.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - `cargo check --tests -p rustfs`: passed.
+  - `cargo test -p rustfs startup --lib -- --nocapture`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new production unwrap/expect, unchecked narrow
+    casts, stringly errors, or ad-hoc stdout/stderr.
+  - `make pre-pr`: passed after rebasing onto current `origin/main`.
+  - Verification: focused checks and full `make pre-pr` passed before PR.
+
+- Issue #660 API-202 prior slice:
+  - `cargo test -p rustfs app::context --lib -- --nocapture`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext fallback runtime source scan: passed; direct fallback global
+    reads should be isolated to `rustfs/src/app/context/runtime_sources.rs`.
+  - Verification: focused checks and full `make pre-pr` passed before PR.
 
 - Issue #660 API-184 current slice:
   - `cargo check -p rustfs-rio --tests`: passed.

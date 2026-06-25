@@ -22,6 +22,7 @@ CONCURRENCY=32
 DURATION="15s"
 ROUNDS=3
 RETRY_PER_ROUND=1
+ROUND_COOLDOWN_SECS=0
 MODE="both"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
@@ -52,6 +53,7 @@ Core options:
   --duration <duration>          warp duration per round (default: 15s)
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
+  --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 0)
   --out-dir <path>               output directory (default: target/bench/get-codec-streaming-<timestamp>)
 
 Binary/options:
@@ -102,6 +104,14 @@ validate_positive_int() {
   fi
 }
 
+validate_non_negative_int() {
+  local value="$1"
+  local name="$2"
+  if ! [[ "$value" =~ ^[0-9]+$ ]]; then
+    die "$name must be a non-negative integer, got: $value"
+  fi
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -113,6 +123,7 @@ parse_args() {
       --duration) DURATION="$2"; shift 2 ;;
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
+      --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
       --out-dir) OUT_DIR="$2"; shift 2 ;;
       --rustfs-bin) RUSTFS_BIN="$2"; shift 2 ;;
       --warp-bin) WARP_BIN="$2"; shift 2 ;;
@@ -145,6 +156,7 @@ validate_args() {
   validate_positive_int "$CONCURRENCY" "--concurrency"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
+  validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
 
@@ -219,6 +231,7 @@ concurrency=${CONCURRENCY}
 duration=${DURATION}
 rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
+round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 rust_log=${RUST_LOG}
@@ -330,6 +343,7 @@ run_bench() {
     --duration "$DURATION"
     --rounds "$ROUNDS"
     --retry-per-round "$RETRY_PER_ROUND"
+    --round-cooldown-secs "$ROUND_COOLDOWN_SECS"
     --out-dir "$bench_dir"
   )
 

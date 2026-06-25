@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::*;
-use crate::config::get_global_storage_class;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
+use crate::runtime_sources;
 use rustfs_storage_api::{NamespaceLocking as _, ObjectOperations as _, StorageAdminApi};
 pub(in crate::store) mod support;
 use support::{
@@ -509,19 +509,8 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_backend_info(&self) -> rustfs_madmin::BackendInfo {
-        let (standard_sc_parity, rr_sc_parity) = {
-            if let Some(sc) = get_global_storage_class() {
-                let sc_parity = sc
-                    .get_parity_for_sc(storageclass::CLASS_STANDARD)
-                    .or(Some(self.pools[0].default_parity_count));
-
-                let rrs_sc_parity = sc.get_parity_for_sc(storageclass::RRS);
-
-                (sc_parity, rrs_sc_parity)
-            } else {
-                (Some(self.pools[0].default_parity_count), None)
-            }
-        };
+        let (standard_sc_parity, rr_sc_parity) =
+            runtime_sources::backend_storage_class_parities(self.pools[0].default_parity_count);
 
         let mut standard_sc_data = Vec::new();
         let mut rr_sc_data = Vec::new();
@@ -555,7 +544,7 @@ impl ECStore {
 
     #[instrument(skip(self))]
     pub(super) async fn handle_storage_info(&self) -> rustfs_madmin::StorageInfo {
-        let Some(notification_sy) = get_global_notification_sys() else {
+        let Some(notification_sy) = runtime_sources::notification_sys() else {
             return rustfs_madmin::StorageInfo::default();
         };
 

@@ -17,7 +17,7 @@ use crate::bucket::{
     metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
-use crate::global::get_global_bucket_monitor;
+use crate::runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
 use rustfs_storage_api::NamespaceLocking as _;
 
@@ -258,9 +258,7 @@ impl ECStore {
         for prefix in bucket_delete_metadata_cleanup_prefixes(bucket) {
             self.delete_all(RUSTFS_META_BUCKET, prefix.as_str()).await?;
         }
-        if let Some(monitor) = get_global_bucket_monitor() {
-            monitor.delete_bucket(bucket);
-        }
+        runtime_sources::delete_bucket_monitor_entry(bucket);
         Ok(())
     }
 }

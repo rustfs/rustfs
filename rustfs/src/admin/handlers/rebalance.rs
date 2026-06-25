@@ -17,11 +17,11 @@ use super::super::{
     StorageError, decode_rebalance_stop_propagation_record,
 };
 use crate::{
+    admin::runtime_sources::{resolve_notification_system, resolve_object_store_handle},
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -323,8 +323,8 @@ fn rebalance_used_pct(total: u64, available: u64) -> f64 {
     (total - bounded_available) as f64 / total as f64
 }
 
-fn rebalance_remaining_buckets(buckets: usize, rebalanced_buckets: usize) -> usize {
-    buckets.saturating_sub(rebalanced_buckets)
+fn rebalance_remaining_buckets(buckets: usize, _rebalanced_buckets: usize) -> usize {
+    buckets
 }
 
 fn rebalance_pool_used(disk_stats: &[DiskStat], idx: usize) -> f64 {
@@ -1090,7 +1090,7 @@ mod rebalance_handler_tests {
         assert_eq!(progress.num_objects, 3);
         assert_eq!(progress.num_versions, 5);
         assert_eq!(progress.bytes, 100);
-        assert_eq!(progress.remaining_buckets, 2);
+        assert_eq!(progress.remaining_buckets, 3);
         assert_eq!(progress.bucket, "bucket-b");
         assert_eq!(progress.object, "obj-1");
         assert_eq!(progress.elapsed, 50);
@@ -1157,9 +1157,9 @@ mod rebalance_handler_tests {
     }
 
     #[test]
-    fn test_rebalance_remaining_buckets_is_saturating_sub() {
-        assert_eq!(rebalance_remaining_buckets(10, 7), 3);
-        assert_eq!(rebalance_remaining_buckets(3, 10), 0);
+    fn test_rebalance_remaining_buckets_uses_pending_queue_len() {
+        assert_eq!(rebalance_remaining_buckets(10, 7), 10);
+        assert_eq!(rebalance_remaining_buckets(3, 10), 3);
     }
 
     #[test]
@@ -1227,7 +1227,7 @@ mod rebalance_handler_tests {
         assert_eq!(active.used, 0.5);
         assert_eq!(active.progress.as_ref().unwrap().bucket, "bucket-b");
         assert_eq!(active.progress.as_ref().unwrap().object, "obj-2");
-        assert_eq!(active.progress.as_ref().unwrap().remaining_buckets, 1);
+        assert_eq!(active.progress.as_ref().unwrap().remaining_buckets, 2);
 
         let inactive = &statuses[1];
         assert_eq!(inactive.id, 1);

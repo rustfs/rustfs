@@ -16,6 +16,7 @@ use crate::storage::ECStore;
 use crate::{
     server::{ServiceStateManager, ShutdownHandle, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
+    startup_runtime_sources,
     startup_services::StartupServiceRuntime,
     startup_shutdown::run_startup_shutdown_sequence,
 };
@@ -122,7 +123,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         "RustFS server ready"
     );
     publish_ready_for_iam_bootstrap(iam_bootstrap, readiness.as_ref(), Some(state_manager.as_ref())).await?;
-    rustfs_common::set_global_init_time_now().await;
+    startup_runtime_sources::publish_init_time_now().await;
 
     if enable_scanner {
         init_data_scanner(shutdown_token.clone(), store).await;
@@ -156,7 +157,7 @@ pub(crate) async fn publish_embedded_startup_ready(
     readiness: &GlobalReadiness,
 ) -> Result<()> {
     publish_ready_for_iam_bootstrap(iam_bootstrap, readiness, None).await?;
-    rustfs_common::set_global_init_time_now().await;
+    startup_runtime_sources::publish_init_time_now().await;
     Ok(())
 }
 
