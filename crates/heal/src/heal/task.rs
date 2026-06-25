@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
-    ErasureSetHealer,
+    DiskError, ErasureSetHealer,
     progress::HealProgress,
     storage::{HealStorageAPI, next_heal_listing_token},
 };
@@ -21,6 +21,7 @@ use crate::{Error, Result};
 use metrics::{counter, histogram};
 use rustfs_common::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
+use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::{
     future::Future,
@@ -94,6 +95,10 @@ impl HealType {
             Self::ECDecode { .. } => "ec_decode",
         }
     }
+}
+
+pub(crate) fn is_missing_object_dir_heal_result(object: &str, err: &Error) -> bool {
+    object.ends_with(SLASH_SEPARATOR) && matches!(err, Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound))
 }
 
 /// Heal priority
@@ -1246,6 +1251,21 @@ impl HealTask {
                             self.record_result_item(result).await;
                         }
                         Ok((_, Some(err))) => {
+                            if is_missing_object_dir_heal_result(&object, &err) {
+                                healed += 1;
+                                debug!(
+                                    target: "rustfs::heal::task",
+                                    event = EVENT_HEAL_BUCKET_RESULT,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_TASK,
+                                    task_id = %self.id,
+                                    bucket,
+                                    object = %object,
+                                    result = "object_dir_not_found_skipped",
+                                    "Heal bucket object-dir candidate skipped after not-found result"
+                                );
+                                continue;
+                            }
                             if Self::should_skip_data_usage_cache_heal_error(bucket, &object, &err) {
                                 warn!(
                                     target: "rustfs::heal::task",
@@ -2121,6 +2141,7 @@ mod tests {
         format_no_heal_required: Mutex<bool>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
+        include_object_dir_candidate: Mutex<bool>,
     }
 
     #[async_trait::async_trait]
@@ -2194,8 +2215,6 @@ mod tests {
             _version_id: Option<&str>,
             opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
-            self.healed_objects.lock().unwrap().push(object.to_string());
-            self.object_heal_opts.lock().unwrap().push(*opts);
             if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
                 return Ok((
                     HealResultItem::default(),
@@ -2204,6 +2223,11 @@ mod tests {
                     )),
                 ));
             }
+            if object == "object-dir/" {
+                return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
+            }
+            self.healed_objects.lock().unwrap().push(object.to_string());
+            self.object_heal_opts.lock().unwrap().push(*opts);
             Ok((
                 HealResultItem {
                     object_size: 1,
@@ -2252,6 +2276,8 @@ mod tests {
                     ]
                 } else if prefix == "logs/" {
                     vec!["logs/object-a".to_string(), "logs/object-b".to_string()]
+                } else if *self.include_object_dir_candidate.lock().unwrap() {
+                    vec!["object-a".to_string(), "object-dir/".to_string(), "object-b".to_string()]
                 } else {
                     vec!["object-a".to_string(), "object-b".to_string()]
                 };
@@ -2296,6 +2322,39 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 3);
         assert_eq!(result_items.iter().filter(|item| item.object_size == 1).count(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_recursive_bucket_heal_skips_object_dir_candidates() {
+        let storage = Arc::new(MockStorage {
+            include_object_dir_candidate: Mutex::new(true),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions {
+                recursive: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.heal_bucket("bucket-a")
+            .await
+            .expect("recursive bucket heal should skip object-dir candidates");
+
+        assert_eq!(
+            storage.healed_objects.lock().unwrap().as_slice(),
+            ["object-a".to_string(), "object-b".to_string()]
+        );
+        let progress = task.get_progress().await;
+        assert_eq!(progress.objects_scanned, 3);
+        assert_eq!(progress.objects_healed, 3);
+        assert_eq!(progress.objects_failed, 0);
     }
 
     #[tokio::test]
