@@ -9190,9 +9190,13 @@ mod tests {
 
     #[derive(Clone, Default)]
     struct TestCatalogObjectBackend {
-        state: std::sync::Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
-        locks: std::sync::Arc<tokio::sync::Mutex<BTreeMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>>>,
+        state: Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
+        locks: TestCatalogObjectLocks,
     }
+
+    type TestCatalogObjectLockKey = (String, String);
+    type TestCatalogObjectLock = Arc<tokio::sync::Mutex<()>>;
+    type TestCatalogObjectLocks = Arc<tokio::sync::Mutex<BTreeMap<TestCatalogObjectLockKey, TestCatalogObjectLock>>>;
 
     #[derive(Default)]
     struct TestCatalogObjectState {

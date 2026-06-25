@@ -160,6 +160,7 @@ RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_so
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
 RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_wildcard_hits.txt"
+RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
@@ -1416,6 +1417,15 @@ fi
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
   report_failure "RustFS app usecase consumers must import storage owner APIs explicitly instead of crate::storage::*: $(paste -sd '; ' "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use (s3s::dto|crate::storage::ecfs)::\*;' rustfs/src/app --glob '*.rs' || true
+) >"$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE" ]]; then
+  report_failure "RustFS app consumers must import S3 DTO and ECFS owner APIs explicitly instead of wildcard imports: $(paste -sd '; ' "$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE")"
 fi
 
 (

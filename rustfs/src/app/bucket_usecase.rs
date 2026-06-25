@@ -79,7 +79,30 @@ use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, get_header};
 use rustfs_utils::obj::extract_user_defined_metadata;
 use rustfs_utils::string::parse_bool;
-use s3s::dto::*;
+use s3s::dto::{
+    BucketLifecycleConfiguration, BucketLocationConstraint, CommonPrefix, CreateBucketInput, CreateBucketOutput,
+    DeleteBucketCorsInput, DeleteBucketCorsOutput, DeleteBucketEncryptionInput, DeleteBucketEncryptionOutput, DeleteBucketInput,
+    DeleteBucketLifecycleInput, DeleteBucketLifecycleOutput, DeleteBucketOutput, DeleteBucketPolicyInput,
+    DeleteBucketPolicyOutput, DeleteBucketReplicationInput, DeleteBucketReplicationOutput, DeleteBucketTaggingInput,
+    DeleteBucketTaggingOutput, DeleteMarkerM, DeletePublicAccessBlockInput, DeletePublicAccessBlockOutput, EncodingType,
+    ExpirationStatus, GetBucketCorsInput, GetBucketCorsOutput, GetBucketEncryptionInput, GetBucketEncryptionOutput,
+    GetBucketLifecycleConfigurationInput, GetBucketLifecycleConfigurationOutput, GetBucketLocationInput, GetBucketLocationOutput,
+    GetBucketNotificationConfigurationInput, GetBucketNotificationConfigurationOutput, GetBucketPolicyInput,
+    GetBucketPolicyOutput, GetBucketPolicyStatusInput, GetBucketPolicyStatusOutput, GetBucketReplicationInput,
+    GetBucketReplicationOutput, GetBucketTaggingInput, GetBucketTaggingOutput, GetBucketVersioningInput,
+    GetBucketVersioningOutput, GetPublicAccessBlockInput, GetPublicAccessBlockOutput, HeadBucketInput, HeadBucketOutput,
+    LifecycleRule, ListBucketsInput, ListBucketsOutput, ListObjectVersionMEntry, ListObjectVersionsInput,
+    ListObjectVersionsMOutput, ListObjectVersionsOutput, ListObjectsInput, ListObjectsOutput, ListObjectsV2Input,
+    ListObjectsV2MOutput, ListObjectsV2Output, NotificationConfiguration, NotificationConfigurationFilter, ObjectInternalInfo,
+    ObjectLockConfiguration, ObjectM, ObjectStorageClass, ObjectVersionM, ObjectVersionStorageClass, PolicyStatus,
+    PutBucketCorsInput, PutBucketCorsOutput, PutBucketEncryptionInput, PutBucketEncryptionOutput,
+    PutBucketLifecycleConfigurationInput, PutBucketLifecycleConfigurationOutput, PutBucketNotificationConfigurationInput,
+    PutBucketNotificationConfigurationOutput, PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
+    PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput, PutBucketVersioningInput,
+    PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput, ReplicationConfiguration,
+    ReplicationRuleStatus, ServerSideEncryption, Tagging, Timestamp, UserMetadataCollection, UserMetadataEntry,
+    VersioningConfiguration,
+};
 use s3s::region::Region;
 use s3s::xml;
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
@@ -2186,6 +2209,11 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use s3s::dto::{
+        BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
+        NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
+        ServerSideEncryptionConfiguration, Tag, Transition, TransitionStorageClass,
+    };
     use std::sync::Arc;
 
     fn build_request<T>(input: T, method: Method) -> S3Request<T> {
