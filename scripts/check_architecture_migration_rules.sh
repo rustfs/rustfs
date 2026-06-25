@@ -153,6 +153,7 @@ ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff
 RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
 IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/iam_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_runtime_source_bypass_hits.txt"
+RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -1318,6 +1319,21 @@ fi
 
 if [[ -s "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS AppContext fallback runtime globals must stay behind rustfs/src/app/context/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(?:init_global_action_credentials|set_global_region|set_global_rustfs_port|set_global_addr|set_global_init_time_now|init_global_kms_service_manager|init_global_buffer_config|set_buffer_profile_enabled)\b|rustfs_obs::(?:\{[^}]*\b(?:init_obs|set_global_guard)\b|(?:init_obs|set_global_guard|observability_metric_enabled|init_metrics_runtime)\b)|rustfs_io_metrics::set_put_stage_metrics_enabled\b|\b(?:publish_global_outbound_tls_state|record_tls_generation|record_tls_reload_result|record_tls_reload_skipped|init_tls_metrics)\b' \
+    rustfs/src/init.rs \
+    rustfs/src/startup_*.rs \
+    rustfs/src/server/tls_material.rs \
+    --glob '*.rs' |
+    rg -v 'startup_runtime_sources::' |
+    rg -v '^rustfs/src/startup_runtime_sources\.rs:' || true
+) >"$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS startup runtime globals must stay behind rustfs/src/startup_runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
 fi
 
 (
