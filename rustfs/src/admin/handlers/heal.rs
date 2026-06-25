@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::ecstore_utils::is_valid_object_prefix;
-use super::super::is_reserved_or_invalid_bucket;
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::resolve_object_store_handle;
+use crate::admin::storage_api::ecstore_utils::is_valid_object_prefix;
+use crate::admin::storage_api::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::spawn_traced;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
@@ -386,10 +386,10 @@ fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
     false
 }
 
-fn map_root_heal_status(heal_err: Option<super::super::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<crate::admin::storage_api::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(super::super::StorageError::NoHealRequired) => {
+        Some(crate::admin::storage_api::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -743,7 +743,6 @@ impl Operation for BackgroundHealStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::StorageError;
     use super::extract_heal_init_params;
     use super::{
         HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
@@ -751,6 +750,7 @@ mod tests {
         json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode,
         validate_heal_target,
     };
+    use crate::admin::storage_api::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;
