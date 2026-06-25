@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::replication::get_global_replication_pool;
 use crate::error::Error;
-use crate::global::get_global_bucket_monitor;
+use crate::runtime_sources;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
@@ -887,7 +886,7 @@ impl ReplicationStats {
             let mut interval = interval(Duration::from_secs(2));
             loop {
                 interval.tick().await;
-                let current = get_global_replication_pool()
+                let current = runtime_sources::replication_pool()
                     .map(|pool| pool.active_workers() + pool.active_lrg_workers() + pool.active_mrf_workers())
                     .unwrap_or(0);
                 let mut workers = workers_clone.lock().await;
@@ -1246,7 +1245,7 @@ impl ReplicationStats {
         };
         drop(cache);
 
-        if let Some(monitor) = get_global_bucket_monitor() {
+        if let Some(monitor) = runtime_sources::bucket_monitor() {
             let bw_report = monitor.get_report(|name| name == bucket);
             for (opts, bw) in bw_report.bucket_stats {
                 let stat = replication_stats

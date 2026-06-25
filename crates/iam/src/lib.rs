@@ -26,9 +26,7 @@ use rustfs_ecstore::api::error::{
     classify_system_path_failure_reason as ecstore_classify_system_path_failure_reason,
 };
 use rustfs_ecstore::api::global::is_first_cluster_node_local as ecstore_is_first_cluster_node_local;
-use rustfs_ecstore::api::notification::{
-    NotificationPeerErr as EcstoreNotificationPeerErr, get_global_notification_sys as ecstore_get_global_notification_sys,
-};
+use rustfs_ecstore::api::notification::NotificationPeerErr as EcstoreNotificationPeerErr;
 use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 use std::sync::{Arc, OnceLock};
 use store::object::ObjectStore;
@@ -48,6 +46,7 @@ pub mod manager;
 pub mod oidc;
 pub mod oidc_state;
 mod root_credentials;
+mod runtime_sources;
 mod server_config;
 pub mod store;
 pub mod sys;
@@ -114,7 +113,7 @@ impl From<EcstoreNotificationPeerErr> for IamNotificationPeerErr {
 }
 
 pub(crate) async fn notify_iam_delete_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_policy(policy_name)
             .await
@@ -126,7 +125,7 @@ pub(crate) async fn notify_iam_delete_policy(policy_name: &str) -> Vec<IamNotifi
 }
 
 pub(crate) async fn notify_iam_load_policy(policy_name: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_policy(policy_name)
             .await
@@ -138,7 +137,7 @@ pub(crate) async fn notify_iam_load_policy(policy_name: &str) -> Vec<IamNotifica
 }
 
 pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_user(access_key)
             .await
@@ -150,7 +149,7 @@ pub(crate) async fn notify_iam_delete_user(access_key: &str) -> Vec<IamNotificat
 }
 
 pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_user(access_key, temp)
             .await
@@ -162,7 +161,7 @@ pub(crate) async fn notify_iam_load_user(access_key: &str, temp: bool) -> Vec<Ia
 }
 
 pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_service_account(access_key)
             .await
@@ -174,7 +173,7 @@ pub(crate) async fn notify_iam_load_service_account(access_key: &str) -> Vec<Iam
 }
 
 pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .delete_service_account(access_key)
             .await
@@ -186,7 +185,7 @@ pub(crate) async fn notify_iam_delete_service_account(access_key: &str) -> Vec<I
 }
 
 pub(crate) async fn notify_iam_load_group(group: &str) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys.load_group(group).await.into_iter().map(Into::into).collect(),
         None => Vec::new(),
     }
@@ -197,7 +196,7 @@ pub(crate) async fn notify_iam_load_policy_mapping(
     user_type: u64,
     is_group: bool,
 ) -> Vec<IamNotificationPeerErr> {
-    match ecstore_get_global_notification_sys() {
+    match runtime_sources::notification_sys() {
         Some(notification_sys) => notification_sys
             .load_policy_mapping(user_or_group, user_type, is_group)
             .await

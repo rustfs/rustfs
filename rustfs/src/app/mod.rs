@@ -20,7 +20,10 @@ pub mod bucket_usecase;
 pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;
+pub(crate) mod runtime_sources;
+pub(crate) mod s3_api;
 mod select_object;
+pub(crate) mod storage_api;
 
 #[cfg(test)]
 mod capacity_dirty_scope_test;
@@ -65,10 +68,6 @@ mod ecstore_client {
     pub(crate) use crate::storage::ecstore_client::{object_api_utils, transition_api};
 }
 
-mod ecstore_compression {
-    pub(crate) use crate::storage::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-}
-
 mod ecstore_config {
     pub(crate) use crate::storage::ecstore_config::storageclass;
 }
@@ -76,13 +75,8 @@ mod ecstore_config {
 mod ecstore_data_usage {
     pub(crate) use crate::storage::ecstore_data_usage::{
         apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
-        record_bucket_object_write_memory,
+        record_bucket_object_write_memory, remove_bucket_usage_from_backend,
     };
-}
-
-#[cfg(test)]
-mod ecstore_global {
-    pub(crate) use crate::storage::ecstore_global::GLOBAL_TierConfigMgr;
 }
 
 #[allow(unused_imports)]
@@ -90,14 +84,11 @@ mod ecstore_tier {
     pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
 }
 
-pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DISK_COMPRESSIBLE_SIZE;
-
 pub(crate) type DiskError = crate::storage::DiskError;
-pub(crate) type DynReader = crate::storage::DynReader;
 pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
-pub(crate) type HashReader = crate::storage::HashReader;
+pub(crate) type ExpiryState = crate::storage::ExpiryState;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
 pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
 pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
@@ -105,22 +96,15 @@ pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::
 pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
 pub(crate) type PoolDecommissionInfo = ecstore_capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = ecstore_capacity::PoolStatus;
+pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
 pub(crate) type StorageError = crate::storage::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
-pub(crate) type WriteEncryption = crate::storage::WriteEncryption;
-pub(crate) type WritePlan = crate::storage::WritePlan;
 
-#[cfg(test)]
-pub(crate) type DecryptReader<R> = crate::storage::DecryptReader<R>;
-#[cfg(test)]
-pub(crate) type EncryptReader<R> = crate::storage::EncryptReader<R>;
 #[cfg(test)]
 pub(crate) type Endpoint = crate::storage::Endpoint;
 #[cfg(test)]
 pub(crate) type Endpoints = crate::storage::Endpoints;
-#[cfg(test)]
-pub(crate) type HardLimitReader<R> = crate::storage::HardLimitReader<R>;
 #[cfg(test)]
 pub(crate) type PoolEndpoints = crate::storage::PoolEndpoints;
 #[cfg(test)]
@@ -207,26 +191,10 @@ pub(crate) mod lifecycle {
     }
 
     pub(crate) mod bucket_lifecycle_ops {
-        use std::ops::Deref;
         use std::sync::Arc;
 
         use super::ECStore;
         use super::bucket_lifecycle_audit::LcEventSrc;
-
-        pub(crate) type ExpiryState = super::super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
-
-        pub(crate) struct GlobalExpiryStateCompat;
-
-        #[allow(non_upper_case_globals)]
-        pub(crate) static GLOBAL_ExpiryState: GlobalExpiryStateCompat = GlobalExpiryStateCompat;
-
-        impl Deref for GlobalExpiryStateCompat {
-            type Target = Arc<tokio::sync::RwLock<ExpiryState>>;
-
-            fn deref(&self) -> &Self::Target {
-                &super::super::ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState
-            }
-        }
 
         #[cfg(test)]
         pub(crate) async fn init_background_expiry(api: Arc<ECStore>) {
@@ -580,10 +548,6 @@ pub(crate) fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info
     ecstore_capacity::get_total_usable_capacity_free(disks, info)
 }
 
-pub(crate) fn is_disk_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
-    ecstore_compression::is_disk_compressible(headers, object_name)
-}
-
 pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
     ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
 }
@@ -602,6 +566,10 @@ pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_cur
     ecstore_data_usage::record_bucket_object_write_memory(bucket, previous_current_size, new_size).await;
 }
 
+pub(crate) async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> std::result::Result<(), Error> {
+    ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
+}
+
 pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
     crate::storage::is_all_buckets_not_found(errs)
 }
@@ -616,22 +584,6 @@ pub(crate) fn is_err_object_not_found(err: &Error) -> bool {
 
 pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
     crate::storage::is_err_version_not_found(err)
-}
-
-#[cfg(test)]
-pub(crate) struct GlobalTierConfigMgrCompat;
-
-#[cfg(test)]
-#[allow(non_upper_case_globals)]
-pub(crate) static GLOBAL_TierConfigMgr: GlobalTierConfigMgrCompat = GlobalTierConfigMgrCompat;
-
-#[cfg(test)]
-impl std::ops::Deref for GlobalTierConfigMgrCompat {
-    type Target = Arc<tokio::sync::RwLock<TierConfigMgr>>;
-
-    fn deref(&self) -> &Self::Target {
-        &ecstore_global::GLOBAL_TierConfigMgr
-    }
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
@@ -660,6 +612,10 @@ pub(crate) fn global_rustfs_port() -> u16 {
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
     crate::storage::get_global_tier_config_mgr()
+}
+
+pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
+    crate::storage::get_global_expiry_state()
 }
 
 pub(crate) fn new_object_layer_fn() -> Option<Arc<ECStore>> {
@@ -702,33 +658,6 @@ pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsRep
 
 pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
     rustfs_common::metrics::global_metrics().report().await
-}
-
-#[cfg(test)]
-pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
-where
-    R: crate::storage::ecstore_rio::Reader + 'static,
-{
-    crate::storage::boxed_reader(reader)
-}
-
-pub(crate) fn compression_metadata_value(algorithm: rustfs_utils::CompressionAlgorithm) -> String {
-    crate::storage::compression_metadata_value(algorithm)
-}
-
-pub(crate) fn wrap_reader<R>(reader: R) -> DynReader
-where
-    R: crate::storage::ecstore_rio::ReadStream + 'static,
-{
-    crate::storage::wrap_reader(reader)
-}
-
-pub(crate) fn get_lock_acquire_timeout() -> tokio::time::Duration {
-    crate::storage::get_lock_acquire_timeout()
-}
-
-pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
-    crate::storage::is_valid_storage_class(storage_class)
 }
 
 #[cfg(test)]

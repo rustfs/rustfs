@@ -23,11 +23,33 @@ pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
 
 pub(crate) const GET_STAGE_DECODE: &str = "decode";
 pub(crate) const GET_STAGE_EMIT: &str = "emit";
+pub(crate) const GET_STAGE_FILL: &str = "fill";
 pub(crate) const GET_STAGE_METADATA: &str = "metadata";
+pub(crate) const GET_STAGE_OUTPUT_LOCK_WAIT: &str = "output_lock_wait";
+pub(crate) const GET_STAGE_OUTPUT_POLL: &str = "output_poll";
 pub(crate) const GET_STAGE_RANGE: &str = "range";
 pub(crate) const GET_STAGE_READER_SETUP: &str = "reader_setup";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
 pub(crate) const GET_STAGE_STRIPE_READ: &str = "stripe_read";
+pub(crate) const GET_STAGE_STRIPE_READ_FIRST_SHARD: &str = "stripe_read_first_shard";
+pub(crate) const GET_STAGE_STRIPE_READ_QUORUM: &str = "stripe_read_quorum";
+
+pub(crate) const GET_READER_BUFFER_OUTPUT: &str = "output";
+pub(crate) const GET_READER_BUFFER_PREFETCH: &str = "prefetch";
+pub(crate) const GET_READER_PREFETCH_DIRECT: &str = "direct";
+pub(crate) const GET_READER_PREFETCH_EOF: &str = "eof";
+pub(crate) const GET_READER_PREFETCH_ERROR_DEFERRED: &str = "error_deferred";
+pub(crate) const GET_READER_PREFETCH_ERROR_IMMEDIATE: &str = "error_immediate";
+pub(crate) const GET_READER_PREFETCH_STORED: &str = "stored";
+pub(crate) const GET_READER_POLL_PENDING: &str = "pending";
+pub(crate) const GET_READER_POLL_READY_DATA: &str = "ready_data";
+pub(crate) const GET_READER_POLL_READY_EMPTY: &str = "ready_empty";
+pub(crate) const GET_READER_POLL_READY_ERROR: &str = "ready_error";
+pub(crate) const GET_SHARD_READ_OUTCOME_ERROR: &str = "error";
+pub(crate) const GET_SHARD_READ_OUTCOME_MISSING: &str = "missing";
+pub(crate) const GET_SHARD_READ_OUTCOME_SUCCESS: &str = "success";
+pub(crate) const GET_SHARD_ROLE_DATA: &str = "data";
+pub(crate) const GET_SHARD_ROLE_PARITY: &str = "parity";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GetObjectFailureReason {
@@ -159,5 +181,33 @@ mod tests {
         assert_eq!(GetObjectFailureReason::DownstreamClosed.as_str(), "downstream_closed");
         assert_eq!(GetObjectFailureReason::BitrotMismatch.as_str(), "bitrot_mismatch");
         assert_eq!(GetObjectFailureReason::DecodeError.as_str(), "decode_error");
+        assert_eq!(GET_READER_BUFFER_OUTPUT, "output");
+        assert_eq!(GET_READER_BUFFER_PREFETCH, "prefetch");
+        assert_eq!(GET_READER_PREFETCH_DIRECT, "direct");
+        assert_eq!(GET_READER_PREFETCH_STORED, "stored");
+        assert_eq!(GET_READER_PREFETCH_EOF, "eof");
+        assert_eq!(GET_READER_PREFETCH_ERROR_DEFERRED, "error_deferred");
+        assert_eq!(GET_READER_PREFETCH_ERROR_IMMEDIATE, "error_immediate");
+        assert_eq!(GET_READER_POLL_PENDING, "pending");
+        assert_eq!(GET_READER_POLL_READY_DATA, "ready_data");
+        assert_eq!(GET_READER_POLL_READY_EMPTY, "ready_empty");
+        assert_eq!(GET_READER_POLL_READY_ERROR, "ready_error");
+        assert_eq!(GET_STAGE_DECODE, "decode");
+        assert_eq!(GET_STAGE_EMIT, "emit");
+        assert_eq!(GET_STAGE_FILL, "fill");
+        assert_eq!(GET_STAGE_METADATA, "metadata");
+        assert_eq!(GET_STAGE_OUTPUT_LOCK_WAIT, "output_lock_wait");
+        assert_eq!(GET_STAGE_OUTPUT_POLL, "output_poll");
+        assert_eq!(GET_STAGE_RANGE, "range");
+        assert_eq!(GET_STAGE_READER_SETUP, "reader_setup");
+        assert_eq!(GET_STAGE_RECONSTRUCT, "reconstruct");
+        assert_eq!(GET_STAGE_STRIPE_READ, "stripe_read");
+        assert_eq!(GET_STAGE_STRIPE_READ_FIRST_SHARD, "stripe_read_first_shard");
+        assert_eq!(GET_STAGE_STRIPE_READ_QUORUM, "stripe_read_quorum");
+        assert_eq!(GET_SHARD_READ_OUTCOME_ERROR, "error");
+        assert_eq!(GET_SHARD_READ_OUTCOME_MISSING, "missing");
+        assert_eq!(GET_SHARD_READ_OUTCOME_SUCCESS, "success");
+        assert_eq!(GET_SHARD_ROLE_DATA, "data");
+        assert_eq!(GET_SHARD_ROLE_PARITY, "parity");
     }
 }

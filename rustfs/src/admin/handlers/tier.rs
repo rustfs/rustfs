@@ -19,12 +19,12 @@ use super::super::{
     ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType, storageclass,
 };
 use crate::{
+    admin::runtime_sources::{
+        resolve_daily_tier_stats, resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle,
+    },
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
-    },
-    app::context::{
-        resolve_daily_tier_stats, resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle,
     },
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},

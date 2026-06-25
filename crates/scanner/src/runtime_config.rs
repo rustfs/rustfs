@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::resolve_scanner_server_config;
 use crate::scanner_budget::ScannerCycleBudgetConfig;
 use crate::sleeper::{SCANNER_SLEEPER, scanner_default_speed};
 use rustfs_config::{
@@ -674,7 +675,7 @@ fn apply_resolved_runtime_config(config: ScannerRuntimeConfig) {
 }
 
 fn current_server_config() -> Option<ServerConfig> {
-    rustfs_config::server_config::get_global_server_config()
+    resolve_scanner_server_config()
 }
 
 pub(crate) fn resolve_scanner_runtime_config_from_global() -> ScannerRuntimeConfig {
