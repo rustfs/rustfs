@@ -15,13 +15,13 @@
 use super::iam_error::iam_error_to_s3_error;
 use super::{account_info, group, service_account, user_iam, user_lifecycle, user_policy_binding};
 use crate::{
+    admin::runtime_sources::resolve_action_credentials,
     admin::{
         auth::validate_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
-    app::context::resolve_action_credentials,
     auth::{check_key_valid, constant_time_eq, get_session_token},
     server::RemoteAddr,
 };

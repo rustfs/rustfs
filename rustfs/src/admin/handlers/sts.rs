@@ -15,11 +15,11 @@
 use super::super::ecstore_utils::serialize;
 use super::is_admin::IsAdminHandler;
 use crate::{
+    admin::runtime_sources::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,

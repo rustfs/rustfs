@@ -1378,7 +1378,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src/admin \
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/admin \
     | rg -v '^rustfs/src/admin/runtime_sources\.rs:' || true
 ) >"$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE"
 
@@ -1388,7 +1388,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src --glob '*.rs' |
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src --glob '*.rs' |
     rg -v '^rustfs/src/app/context' |
     rg -v '(^rustfs/src/[^/]*runtime_sources\.rs:|/runtime_sources\.rs:)' || true
 ) >"$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE"
@@ -1399,7 +1399,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src/app --glob '*.rs' |
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/app --glob '*.rs' |
     rg -v '^rustfs/src/app/context' |
     rg -v '^rustfs/src/app/runtime_sources\.rs:' || true
 ) >"$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
@@ -1410,7 +1410,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src/storage --glob '*.rs' |
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/storage --glob '*.rs' |
     rg -v '^rustfs/src/storage/runtime_sources\.rs:' || true
 ) >"$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE"
 
