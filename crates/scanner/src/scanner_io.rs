@@ -366,6 +366,10 @@ fn scanner_concurrency_limit(configured: usize, available: usize) -> usize {
         return 0;
     }
 
+    if crate::current_foreground_read_activity() > 0 {
+        return 1;
+    }
+
     if configured == 0 {
         available
     } else {
@@ -1666,13 +1670,24 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn scanner_concurrency_limit_never_exceeds_available_work() {
         assert_eq!(scanner_concurrency_limit(8, 4), 4);
     }
 
     #[test]
+    #[serial]
     fn scanner_concurrency_limit_handles_no_available_work() {
         assert_eq!(scanner_concurrency_limit(2, 0), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_concurrency_limit_yields_to_foreground_reads() {
+        crate::set_foreground_read_activity(8);
+        assert_eq!(scanner_concurrency_limit(0, 4), 1);
+        assert_eq!(scanner_concurrency_limit(3, 4), 1);
+        crate::set_foreground_read_activity(0);
     }
 
     #[test]

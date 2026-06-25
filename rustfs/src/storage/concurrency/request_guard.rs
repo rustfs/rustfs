@@ -40,6 +40,7 @@ impl GetObjectGuard {
         // concurrent request count AFTER increment to reflect the current
         // active requests.
         let concurrent = ACTIVE_GET_REQUESTS.load(Ordering::Relaxed);
+        rustfs_scanner::set_foreground_read_activity(concurrent);
         record_get_object_request_start(concurrent);
 
         Self {
@@ -99,14 +100,16 @@ impl Drop for GetObjectGuard {
         let status = self.result.unwrap_or("unknown");
         record_get_object_request_result(status, duration_secs);
 
-        if let Err(previous) =
-            ACTIVE_GET_REQUESTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
-        {
-            debug_assert_eq!(
-                previous, 0,
-                "ACTIVE_GET_REQUESTS underflow attempt in GetObjectGuard::drop; previous value = {}",
-                previous
-            );
+        match ACTIVE_GET_REQUESTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1)) {
+            Ok(previous) => rustfs_scanner::set_foreground_read_activity(previous.saturating_sub(1)),
+            Err(previous) => {
+                rustfs_scanner::set_foreground_read_activity(previous);
+                debug_assert_eq!(
+                    previous, 0,
+                    "ACTIVE_GET_REQUESTS underflow attempt in GetObjectGuard::drop; previous value = {}",
+                    previous
+                );
+            }
         }
     }
 }

@@ -63,9 +63,18 @@ pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
+static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
 
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
+}
+
+pub fn set_foreground_read_activity(active: usize) {
+    SCANNER_FOREGROUND_READ_ACTIVITY.store(active as u64, Ordering::Relaxed);
+}
+
+pub fn current_foreground_read_activity() -> u64 {
+    SCANNER_FOREGROUND_READ_ACTIVITY.load(Ordering::Relaxed)
 }
 
 pub(crate) struct ScannerActivityGuard;

@@ -29,6 +29,8 @@ const SCANNER_SPEED_FAST: u8 = 1;
 const SCANNER_SPEED_DEFAULT: u8 = 2;
 const SCANNER_SPEED_SLOW: u8 = 3;
 const SCANNER_SPEED_SLOWEST: u8 = 4;
+const FOREGROUND_READ_BACKOFF_PER_REQUEST_MS: u64 = 10;
+const FOREGROUND_READ_BACKOFF_MAX_MS: u64 = 250;
 
 static SCANNER_DEFAULT_SPEED_PRESET: AtomicU8 = AtomicU8::new(SCANNER_SPEED_DEFAULT);
 
@@ -74,6 +76,18 @@ fn scanner_env_config() -> (ScannerSpeed, bool) {
 
 pub(crate) fn scanner_yield_every_n_objects() -> u64 {
     rustfs_utils::get_env_u64(ENV_SCANNER_YIELD_EVERY_N_OBJECTS, DEFAULT_SCANNER_YIELD_EVERY_N_OBJECTS)
+}
+
+fn foreground_read_backoff_duration(active_reads: u64) -> Duration {
+    if active_reads == 0 {
+        return Duration::ZERO;
+    }
+
+    Duration::from_millis(
+        active_reads
+            .saturating_mul(FOREGROUND_READ_BACKOFF_PER_REQUEST_MS)
+            .min(FOREGROUND_READ_BACKOFF_MAX_MS),
+    )
 }
 
 /// When `true` (default), the scanner throttles itself between operations.
@@ -133,9 +147,17 @@ impl DynamicSleeper {
         }
         let (factor, max_sleep) = self.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
+            let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+            if !foreground_sleep.is_zero() {
+                tokio::time::sleep(foreground_sleep).await;
+                global_metrics().record_scanner_throttle_sleep(foreground_sleep);
+            }
             return;
         }
-        let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor).min(max_sleep);
+        let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+        let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor)
+            .min(max_sleep)
+            .max(foreground_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
             global_metrics().record_scanner_throttle_sleep(sleep_dur);
@@ -213,12 +235,19 @@ impl SleepTimer {
         }
         let (factor, max_sleep) = self.sleeper.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
+            let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
+            if !foreground_sleep.is_zero() {
+                tokio::time::sleep(foreground_sleep).await;
+                global_metrics().record_scanner_throttle_sleep(foreground_sleep);
+            }
             return;
         }
         let elapsed = self.start.elapsed();
+        let foreground_sleep = foreground_read_backoff_duration(crate::current_foreground_read_activity());
         let sleep_dur = Duration::from_secs_f64(elapsed.as_secs_f64() * factor)
             .max(MIN_SLEEP)
-            .min(max_sleep);
+            .min(max_sleep)
+            .max(foreground_sleep);
         if !sleep_dur.is_zero() {
             tokio::time::sleep(sleep_dur).await;
             global_metrics().record_scanner_throttle_sleep(sleep_dur);
@@ -272,6 +301,13 @@ mod tests {
         let (factor, max_sleep) = s.read_params();
         assert_eq!(factor, 10.0);
         assert_eq!(max_sleep, Duration::from_secs(15));
+    }
+
+    #[test]
+    fn foreground_read_backoff_is_capped() {
+        assert_eq!(foreground_read_backoff_duration(0), Duration::ZERO);
+        assert_eq!(foreground_read_backoff_duration(1), Duration::from_millis(10));
+        assert_eq!(foreground_read_backoff_duration(80), Duration::from_millis(250));
     }
 
     #[test]
