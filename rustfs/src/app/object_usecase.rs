@@ -308,6 +308,27 @@ impl GetObjectStreamStrategy {
 const LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES: i64 = 1024 * 1024 * 1024;
 const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
+const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
+const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
+const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
+
+fn get_reader_stream_buffer_size_override() -> Option<usize> {
+    static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *GET_READER_STREAM_BUFFER_SIZE_OVERRIDE.get_or_init(|| {
+        std::env::var(ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+fn resolve_reader_stream_buffer_size(selected_size: usize, override_size: Option<usize>) -> (usize, &'static str) {
+    if let Some(override_size) = override_size.filter(|value| *value > 0) {
+        return (override_size, GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE);
+    }
+
+    (selected_size.max(1), GET_READER_STREAM_BUFFER_SOURCE_SELECTED)
+}
 
 async fn enqueue_transitioned_delete_cleanup(
     store: Arc<ECStore>,
@@ -1583,12 +1604,15 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + 'static,
     {
-        let expected = response_content_length.max(0) as usize;
+        let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let (stream_buffer_size, buffer_source) =
+            resolve_reader_stream_buffer_size(stream_buffer_size, get_reader_stream_buffer_size_override());
         rustfs_io_metrics::record_get_object_stream_strategy(
             stream_strategy.as_str(),
             stream_buffer_size,
             response_content_length,
         );
+        let handoff_start = std::time::Instant::now();
         #[cfg(feature = "tracing-chunk-debug")]
         let stream = {
             let mut emitted = 0usize;
@@ -1609,7 +1633,15 @@ impl DefaultObjectUsecase {
         };
         #[cfg(not(feature = "tracing-chunk-debug"))]
         let stream = ReaderStream::with_capacity(reader, stream_buffer_size);
-        Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
+        let blob = StreamingBlob::wrap(bytes_stream(stream, expected));
+        rustfs_io_metrics::record_get_object_response_handoff(
+            stream_strategy.as_str(),
+            buffer_source,
+            stream_buffer_size,
+            response_content_length,
+            handoff_start.elapsed().as_secs_f64(),
+        );
+        Some(blob)
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -1759,7 +1791,13 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead<'a>> {
         let h = req.headers.clone();
         let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
+        let store_lookup_start = std::time::Instant::now();
         let store = get_validated_store(bucket).await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "store_lookup",
+            store_lookup_start.elapsed().as_secs_f64(),
+        );
 
         let read_start = std::time::Instant::now();
         let read_setup =
@@ -1785,6 +1823,11 @@ impl DefaultObjectUsecase {
             .get_object_reader(bucket, key, rs.clone(), h, opts)
             .await
             .map_err(map_get_object_reader_error)?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "store_reader_setup",
+            read_start.elapsed().as_secs_f64(),
+        );
 
         let info = reader.object_info;
 
@@ -2929,7 +2972,13 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
+        let request_context_start = std::time::Instant::now();
         let request_context = Self::prepare_get_object_request_context(&req).await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "request_context",
+            request_context_start.elapsed().as_secs_f64(),
+        );
         let GetObjectRequestContext {
             bucket,
             key,
@@ -2974,7 +3023,14 @@ impl DefaultObjectUsecase {
             encryption_applied,
         } = read_setup;
 
+        let versioning_start = std::time::Instant::now();
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "versioning_lookup",
+            versioning_start.elapsed().as_secs_f64(),
+        );
+        let output_build_start = std::time::Instant::now();
         let output_context = self
             .build_get_object_output_context(
                 &req,
@@ -3002,6 +3058,11 @@ impl DefaultObjectUsecase {
                 versioned,
             )
             .await?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            "s3_handler",
+            "output_build",
+            output_build_start.elapsed().as_secs_f64(),
+        );
         let GetObjectOutputContext {
             output,
             event_info,
@@ -5631,6 +5692,30 @@ mod tests {
             DefaultObjectUsecase::select_stream_buffer_strategy(64 * 1024 * 1024, 512 * 1024, true, false);
         assert_eq!(small_strategy, GetObjectStreamStrategy::Standard);
         assert_eq!(small_buffer_size, 512 * 1024);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_keeps_selected_default() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, None);
+
+        assert_eq!(buffer_size, 128 * 1024);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_applies_positive_override() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, Some(MI_B));
+
+        assert_eq!(buffer_size, MI_B);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_ignores_zero_override() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, Some(0));
+
+        assert_eq!(buffer_size, 128 * 1024);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
     }
 
     #[test]
