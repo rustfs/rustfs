@@ -57,12 +57,13 @@ use rustfs_iam::sys::{
     NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts, get_claims_from_token_with_secret,
 };
 use rustfs_madmin::{
-    BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
-    OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
-    ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary,
-    SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError,
-    SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSiteSummary,
-    SRStateEditReq, SRStateInfo, SRStatusInfo, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    AddOrUpdateUserReq, BucketBandwidth, GroupAddRemove, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric,
+    LDAPConfigSettings, LDAPSettings, OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus,
+    ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SRBucketInfo, SRBucketMeta,
+    SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric,
+    SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq,
+    SRResyncOpStatus, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRUserStatsSummary, SiteReplicationInfo,
+    SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -269,6 +270,14 @@ struct SiteReplicationAddPreflightInfo {
     bucket_count: usize,
     peer_deployment_ids: BTreeSet<String>,
     idp_settings: serde_json::Value,
+}
+
+#[derive(Debug, Default)]
+struct SiteReplicationBootstrapPlan {
+    iam_items: Vec<SRIAMItem>,
+    bucket_make_ops: Vec<String>,
+    bucket_items: Vec<SRBucketMeta>,
+    bucket_configure_ops: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -1202,6 +1211,254 @@ fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], lo
     Ok(())
 }
 
+fn bootstrap_bucket_op_path(bucket: &str, operation: &str) -> String {
+    format!(
+        "/rustfs/admin/v3/site-replication/peer/bucket-ops?{}",
+        form_urlencoded::Serializer::new(String::new())
+            .append_pair("bucket", bucket)
+            .append_pair("operation", operation)
+            .finish()
+    )
+}
+
+fn bootstrap_bucket_make_op_path(bucket: &SRBucketInfo) -> String {
+    let mut query = form_urlencoded::Serializer::new(String::new());
+    query.append_pair("bucket", &bucket.bucket);
+    query.append_pair("operation", "make-with-versioning");
+    if let Some(created_at) = bucket
+        .created_at
+        .and_then(|value| value.format(&time::format_description::well_known::Rfc3339).ok())
+    {
+        query.append_pair("createdAt", &created_at);
+    }
+    if bucket.object_lock_config.is_some() {
+        query.append_pair("lockEnabled", "true");
+    }
+    format!("/rustfs/admin/v3/site-replication/peer/bucket-ops?{}", query.finish())
+}
+
+fn bootstrap_bucket_meta_item(bucket: &SRBucketInfo, item_type: &str, updated_at: Option<OffsetDateTime>) -> SRBucketMeta {
+    SRBucketMeta {
+        bucket: bucket.bucket.clone(),
+        r#type: item_type.to_string(),
+        updated_at,
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        ..Default::default()
+    }
+}
+
+fn bootstrap_bucket_quota_value(bucket: &str, raw: &str) -> S3Result<Value> {
+    serde_json::from_slice(&decode_bucket_meta_wire_value(raw))
+        .map_err(|e| s3_error!(InvalidRequest, "invalid quota metadata for bootstrap bucket `{bucket}`: {e}"))
+}
+
+fn append_bootstrap_bucket_item(
+    items: &mut Vec<SRBucketMeta>,
+    bucket: &SRBucketInfo,
+    item_type: &str,
+    value: Option<String>,
+    updated_at: Option<OffsetDateTime>,
+    apply: impl FnOnce(&mut SRBucketMeta, String) -> S3Result<()>,
+) -> S3Result<()> {
+    if let Some(value) = value {
+        let mut item = bootstrap_bucket_meta_item(bucket, item_type, updated_at);
+        apply(&mut item, value)?;
+        items.push(item);
+    }
+    Ok(())
+}
+
+fn append_bootstrap_bucket_items(plan: &mut SiteReplicationBootstrapPlan, bucket: &SRBucketInfo) -> S3Result<()> {
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "policy",
+        bucket.policy.clone().map(|value| value.to_string()),
+        bucket.policy_updated_at,
+        |item, value| {
+            item.policy =
+                Some(serde_json::from_str(&value).map_err(|e| {
+                    s3_error!(InvalidRequest, "invalid bucket policy for bootstrap bucket `{}`: {e}", item.bucket)
+                })?);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "version-config",
+        bucket.versioning.clone(),
+        bucket.versioning_config_updated_at,
+        |item, value| {
+            item.versioning = Some(value);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "tags",
+        bucket.tags.clone(),
+        bucket.tag_config_updated_at,
+        |item, value| {
+            item.tags = Some(value);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "object-lock-config",
+        bucket.object_lock_config.clone(),
+        bucket.object_lock_config_updated_at,
+        |item, value| {
+            item.object_lock_config = Some(value);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "sse-config",
+        bucket.sse_config.clone(),
+        bucket.sse_config_updated_at,
+        |item, value| {
+            item.sse_config = Some(value);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "replication-config",
+        bucket.replication_config.clone(),
+        bucket.replication_config_updated_at,
+        |item, value| {
+            item.replication_config = Some(value);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "quota-config",
+        bucket.quota_config.clone(),
+        bucket.quota_config_updated_at,
+        |item, value| {
+            item.quota = Some(bootstrap_bucket_quota_value(&item.bucket, &value)?);
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "lc-config",
+        bucket.expiry_lc_config.clone(),
+        bucket.expiry_lc_config_updated_at,
+        |item, value| {
+            item.expiry_lc_config = Some(value);
+            item.expiry_updated_at = item.updated_at;
+            Ok(())
+        },
+    )?;
+    append_bootstrap_bucket_item(
+        &mut plan.bucket_items,
+        bucket,
+        "cors-config",
+        bucket.cors_config.clone(),
+        bucket.cors_config_updated_at,
+        |item, value| {
+            item.cors = Some(value);
+            Ok(())
+        },
+    )
+}
+
+fn group_status_from_desc(status: &str) -> GroupStatus {
+    if status.eq_ignore_ascii_case("disabled") {
+        GroupStatus::Disabled
+    } else {
+        GroupStatus::Enabled
+    }
+}
+
+fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBootstrapPlan> {
+    let mut plan = SiteReplicationBootstrapPlan::default();
+
+    for (name, policy) in &info.policies {
+        plan.iam_items.push(SRIAMItem {
+            r#type: "policy".to_string(),
+            name: name.clone(),
+            policy: policy.policy.clone(),
+            updated_at: policy.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        });
+    }
+
+    for (access_key, user) in &info.user_info_map {
+        if let Some(secret_key) = &user.secret_key {
+            plan.iam_items.push(SRIAMItem {
+                r#type: "iam-user".to_string(),
+                iam_user: Some(rustfs_madmin::SRIAMUser {
+                    access_key: access_key.clone(),
+                    is_delete_req: false,
+                    user_req: Some(AddOrUpdateUserReq {
+                        secret_key: secret_key.clone(),
+                        policy: user.policy_name.clone(),
+                        status: user.status.clone(),
+                    }),
+                    api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                }),
+                updated_at: user.updated_at,
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            });
+        }
+    }
+
+    for (name, desc) in &info.group_desc_map {
+        plan.iam_items.push(SRIAMItem {
+            r#type: "group-info".to_string(),
+            group_info: Some(SRGroupInfo {
+                update_req: GroupAddRemove {
+                    group: if desc.name.is_empty() {
+                        name.clone()
+                    } else {
+                        desc.name.clone()
+                    },
+                    members: desc.members.clone(),
+                    status: group_status_from_desc(&desc.status),
+                    is_remove: false,
+                },
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            }),
+            updated_at: desc.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        });
+    }
+
+    for mapping in info.user_policies.values().chain(info.group_policies.values()) {
+        plan.iam_items.push(SRIAMItem {
+            r#type: "policy-mapping".to_string(),
+            policy_mapping: Some(mapping.clone()),
+            updated_at: mapping.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        });
+    }
+
+    for bucket in info.buckets.values() {
+        plan.bucket_make_ops.push(bootstrap_bucket_make_op_path(bucket));
+        append_bootstrap_bucket_items(&mut plan, bucket)?;
+        plan.bucket_configure_ops
+            .push(bootstrap_bucket_op_path(&bucket.bucket, "configure-replication"));
+    }
+
+    Ok(plan)
+}
+
 fn build_join_peers(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
@@ -1632,6 +1889,95 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
     }
 
     Ok(())
+}
+
+async fn send_site_replication_bootstrap_plan(
+    peer: &PeerInfo,
+    service_account_access_key: &str,
+    service_account_secret_key: &str,
+    plan: &SiteReplicationBootstrapPlan,
+) -> S3Result<()> {
+    for item in &plan.iam_items {
+        send_peer_admin_request(
+            &peer.endpoint,
+            "/rustfs/admin/v3/site-replication/peer/iam-item",
+            service_account_access_key,
+            service_account_secret_key,
+            item,
+        )
+        .await?;
+    }
+
+    let empty = serde_json::json!({});
+    for path in &plan.bucket_make_ops {
+        send_peer_admin_request(&peer.endpoint, path, service_account_access_key, service_account_secret_key, &empty).await?;
+    }
+
+    for item in &plan.bucket_items {
+        send_peer_admin_request(
+            &peer.endpoint,
+            "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+            service_account_access_key,
+            service_account_secret_key,
+            item,
+        )
+        .await?;
+    }
+
+    for path in &plan.bucket_configure_ops {
+        send_peer_admin_request(&peer.endpoint, path, service_account_access_key, service_account_secret_key, &empty).await?;
+    }
+
+    Ok(())
+}
+
+async fn bootstrap_existing_metadata_after_add(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    service_account_secret_key: &str,
+) -> Vec<String> {
+    let info = match build_sr_info(state, local_peer).await {
+        Ok(info) => info,
+        Err(err) => {
+            return vec![format!(
+                "local snapshot failed: {}",
+                summarize_peer_error_detail(&err.to_string())
+            )];
+        }
+    };
+    let plan = match site_replication_bootstrap_plan(&info) {
+        Ok(plan) => plan,
+        Err(err) => {
+            return vec![format!(
+                "bootstrap plan failed: {}",
+                summarize_peer_error_detail(&err.to_string())
+            )];
+        }
+    };
+
+    let mut errors = Vec::new();
+    for peer in state.peers.values() {
+        if peer.deployment_id == local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
+            continue;
+        }
+
+        if let Err(err) =
+            send_site_replication_bootstrap_plan(peer, &state.service_account_access_key, service_account_secret_key, &plan).await
+        {
+            let detail = summarize_peer_error_detail(&err.to_string());
+            warn!(
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                peer = %peer.endpoint,
+                error = %detail,
+                "site replication bootstrap metadata sync failed"
+            );
+            errors.push(format!("{}: {detail}", peer.endpoint));
+        }
+    }
+
+    errors
 }
 
 pub async fn site_replication_make_bucket_hook(bucket: &str, lock_enabled: bool) -> S3Result<()> {
@@ -4297,6 +4643,7 @@ impl Operation for SiteReplicationAddHandler {
         }
 
         persist_site_replication_state(&state).await?;
+        let bootstrap_errors = bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await;
 
         // Fix 1: back-fill pre-existing buckets so objects created before `replicate add`
         // are not silently left out of replication. Failures are logged but do not abort
@@ -4306,6 +4653,7 @@ impl Operation for SiteReplicationAddHandler {
         json_response(&ReplicateAddStatus {
             success: true,
             status: SITE_REPL_ADD_SUCCESS.to_string(),
+            initial_sync_error_message: bootstrap_errors.join("; "),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         })
@@ -5486,6 +5834,95 @@ mod tests {
         let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("peer set mismatch should fail");
 
         assert!(err.to_string().contains("different site replication peer set"));
+    }
+
+    #[test]
+    fn test_site_replication_bootstrap_plan_includes_replayable_snapshot_items() {
+        let mut info = SRInfo::default();
+        info.policies.insert(
+            "readwrite".to_string(),
+            SRIAMPolicy {
+                policy: Some(serde_json::json!({"Version": "2012-10-17", "Statement": []})),
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            },
+        );
+        info.user_info_map.insert(
+            "alice".to_string(),
+            rustfs_madmin::UserInfo {
+                secret_key: Some("alice-secret".to_string()),
+                policy_name: Some("readwrite".to_string()),
+                status: rustfs_madmin::AccountStatus::Enabled,
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+        );
+        info.user_info_map.insert(
+            "external".to_string(),
+            rustfs_madmin::UserInfo {
+                secret_key: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+                ..Default::default()
+            },
+        );
+        info.group_desc_map.insert(
+            "devs".to_string(),
+            rustfs_madmin::GroupDesc {
+                name: "devs".to_string(),
+                status: "enabled".to_string(),
+                members: vec!["alice".to_string()],
+                policy: String::new(),
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+            },
+        );
+        info.user_policies.insert(
+            "alice".to_string(),
+            SRPolicyMapping {
+                user_or_group: "alice".to_string(),
+                user_type: UserType::Reg.to_u64(),
+                policy: "readwrite".to_string(),
+                updated_at: Some(OffsetDateTime::UNIX_EPOCH),
+                ..Default::default()
+            },
+        );
+        info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                policy: Some(serde_json::json!({"Statement": []})),
+                versioning: Some(BASE64_STANDARD.encode("<VersioningConfiguration/>")),
+                quota_config: Some(BASE64_STANDARD.encode(r#"{"quota":1024}"#)),
+                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
+                object_lock_config: Some(BASE64_STANDARD.encode("<ObjectLockConfiguration/>")),
+                created_at: Some(OffsetDateTime::UNIX_EPOCH),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+
+        assert_eq!(plan.iam_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>(), {
+            vec!["policy", "iam-user", "group-info", "policy-mapping"]
+        });
+        assert_eq!(plan.bucket_make_ops.len(), 1);
+        assert!(plan.bucket_make_ops[0].contains("operation=make-with-versioning"));
+        assert!(plan.bucket_make_ops[0].contains("lockEnabled=true"));
+        assert_eq!(plan.bucket_configure_ops.len(), 1);
+        assert!(plan.bucket_configure_ops[0].contains("operation=configure-replication"));
+
+        let bucket_types = plan.bucket_items.iter().map(|item| item.r#type.as_str()).collect::<Vec<_>>();
+        assert_eq!(
+            bucket_types,
+            vec!["policy", "version-config", "object-lock-config", "quota-config", "lc-config"]
+        );
+        let quota = plan
+            .bucket_items
+            .iter()
+            .find(|item| item.r#type == "quota-config")
+            .and_then(|item| item.quota.as_ref())
+            .expect("quota item should exist");
+        assert_eq!(quota["quota"], 1024);
     }
 
     #[test]

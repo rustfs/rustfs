@@ -32,6 +32,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 8. `fix: validate site replication add topology`
    - Purpose: preflight add requests with remote metainfo and IDP settings before creating service accounts, joining peers, or persisting state.
    - Reason: MinIO rejects unsafe add topologies up front; RustFS now rejects duplicate deployment IDs, missing local deployment, IDP mismatch, multiple non-empty initial sites, and peers already configured with a different site-replication set.
+9. `feat: bootstrap site replication metadata on add`
+   - Purpose: replay the local site replication snapshot to joined peers during add, before object backfill starts.
+   - Reason: existing hooks only replicate changes after site replication is enabled; existing policies, users, groups, bucket metadata, and buckets must be bootstrapped so a newly joined site does not start with an incomplete control-plane snapshot.
 
 ## Verification
 
@@ -45,6 +48,8 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
+- Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs site_replication --lib`
 
@@ -71,3 +76,5 @@ The expanded single-PR scope also includes MinIO wire-contract bootstrap validat
 The peer path compatibility step maps outbound peer requests to `/minio/admin/v3/site-replication/...`. Peer join uses the encrypted MinIO payload contract, while internal peer metadata/IAM/remove/edit requests remain plain JSON to match MinIO handlers.
 
 The add preflight step performs remote reads before state mutation, so add fails earlier when a peer cannot report metainfo or IDP settings.
+
+The bootstrap step replays IAM policies, built-in users with stored secret material, group membership/status, policy mappings, bucket creation, and bucket metadata through the existing peer replication handlers. It does not synthesize ordinary service-account secrets when the snapshot does not contain them; the site-replicator service account remains distributed through the join flow.

@@ -264,15 +264,15 @@ git commit -m "fix: validate site replication add topology"
 - Modify: `rustfs/src/admin/handlers/site_replication.rs`
 - Modify: `docs/architecture/site-replication-hardening-pr.md`
 
-- [ ] **Step 1: Add snapshot bootstrap after add/join**
+- [x] **Step 1: Add snapshot bootstrap after add/join**
 
 Use `build_sr_info` as the canonical local snapshot and sync IAM and bucket metadata to peers after add, before object resync.
 
-- [ ] **Step 2: Add focused tests**
+- [x] **Step 2: Add focused tests**
 
 Cover bootstrap task planning order and item counts without requiring live peers.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
