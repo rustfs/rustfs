@@ -252,6 +252,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::POST, "/v3/site-replication/devnull"),
         admin_route(Method::POST, "/v3/site-replication/netperf"),
         admin_route(Method::POST, "/v3/site-replication/rotate-svc-acct"),
+        admin_route(Method::PUT, "/v3/site-replication/join"),
         admin_route(Method::PUT, "/v3/site-replication/peer/join"),
         admin_route(Method::PUT, "/v3/site-replication/peer/bucket-ops"),
         admin_route(Method::PUT, "/v3/site-replication/peer/iam-item"),
@@ -262,6 +263,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::PUT, "/v3/site-replication/peer/remove"),
         admin_route(Method::PUT, "/v3/site-replication/resync/op"),
         admin_route(Method::PUT, "/v3/site-replication/state/edit"),
+        admin_route(Method::PUT, "/v3/site-replication/repair"),
         admin_route(Method::GET, "/debug/pprof/profile"),
         admin_route(Method::GET, "/debug/pprof/status"),
         admin_route(Method::GET, "/debug/tls/status"),
@@ -1069,6 +1071,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/devnull"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/netperf"));
     assert_route(&router, Method::POST, &admin_path("/v3/site-replication/rotate-svc-acct"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/join"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/bucket-ops"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/iam-item"));
@@ -1079,6 +1082,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/peer/remove"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/resync/op"));
     assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/state/edit"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/site-replication/repair"));
     assert_route(&router, Method::GET, &admin_path("/debug/pprof/profile"));
     assert_route(&router, Method::GET, &admin_path("/debug/tls/status"));
 

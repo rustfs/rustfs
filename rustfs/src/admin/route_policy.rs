@@ -530,6 +530,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/repair",
+        SITE_REPLICATION_OPERATION,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/profile", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/pprof/status", PROFILING, RouteRiskLevel::High),
     admin(HttpMethod::Get, "/rustfs/admin/debug/tls/status", PROFILING, RouteRiskLevel::High),
@@ -1543,6 +1549,11 @@ mod tests {
     #[test]
     fn route_policy_accepts_minio_style_site_replication_join_alias() {
         assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/join", SITE_REPLICATION_ADD);
+    }
+
+    #[test]
+    fn route_policy_requires_operation_for_site_replication_repair() {
+        assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/repair", SITE_REPLICATION_OPERATION);
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

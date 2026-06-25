@@ -308,19 +308,19 @@ git commit -m "fix: align lifecycle replication with minio semantics"
 - Modify: `rustfs/src/admin/handlers/site_replication.rs`
 - Modify: `docs/architecture/site-replication-hardening-pr.md`
 
-- [ ] **Step 1: Add minimal persistent retry queue**
+- [x] **Step 1: Add minimal persistent retry queue**
 
 Record failed bucket/IAM/state replication events with peer, path, payload, retry count, and last error; expose pending/failed counts in status.
 
-- [ ] **Step 2: Add repair once operation**
+- [x] **Step 2: Add repair once operation**
 
 Provide an operation-level admin path that compares local snapshot to peer metainfo and replays missing metadata.
 
-- [ ] **Step 3: Add focused tests**
+- [x] **Step 3: Add focused tests**
 
 Cover queue serialization, retry status summaries, and repair task generation.
 
-- [ ] **Step 4: Commit**
+- [x] **Step 4: Commit**
 
 ```bash
 git add crates/madmin/src/site_replication.rs rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md

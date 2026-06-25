@@ -38,6 +38,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 10. `fix: align lifecycle replication with minio semantics`
    - Purpose: replicate bucket lifecycle metadata only when site replication has `replicate-ilm-expiry` enabled.
    - Reason: MinIO keeps lifecycle expiry replication opt-in; RustFS should not replicate lifecycle metadata by default during live bucket metadata hooks or add-time bootstrap.
+11. `feat: add site replication retry and repair MVP`
+   - Purpose: persist failed peer replication attempts as retry metadata, expose retry counts in status, and add an operation-level repair endpoint that replays the current local snapshot.
+   - Reason: transient peer failures were previously only visible through logs and required manual reconstruction; a durable, secret-safe queue plus repair replay gives operators a concrete recovery path without persisting sensitive request payloads.
 
 ## Verification
 
@@ -52,6 +55,11 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
 - Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p rustfs-madmin site_replication --lib`
+- Passed: `cargo test -p rustfs route_policy --lib`
+- Passed: `cargo test -p rustfs route_registration_test --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs site_replication --lib`
@@ -85,3 +93,5 @@ The add preflight step performs remote reads before state mutation, so add fails
 The bootstrap step replays IAM policies, built-in users with stored secret material, group membership/status, policy mappings, bucket creation, and bucket metadata through the existing peer replication handlers. It does not synthesize ordinary service-account secrets when the snapshot does not contain them; the site-replicator service account remains distributed through the join flow.
 
 Lifecycle metadata is now skipped by default in site replication hooks and bootstrap snapshots unless the site replication peer state enables `replicate-ilm-expiry`.
+
+The retry MVP intentionally stores peer/path/error/count metadata only. Repair regenerates payloads from the current local snapshot, avoiding persistent storage of user secrets, service-account secrets, or bucket target credentials in the retry queue.

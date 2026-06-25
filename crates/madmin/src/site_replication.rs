@@ -1010,6 +1010,18 @@ pub struct SRPendingOperation {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SRRetryStats {
+    #[serde(default)]
+    pub pending: usize,
+    #[serde(default)]
+    pub failed: usize,
+    #[serde(rename = "lastError", default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRStatusInfo {
     #[serde(default)]
     pub enabled: bool,
@@ -1041,6 +1053,8 @@ pub struct SRStatusInfo {
     pub peer_errors: BTreeMap<String, SRPeerError>,
     #[serde(rename = "PendingOperation", default, skip_serializing_if = "Option::is_none")]
     pub pending_operation: Option<SRPendingOperation>,
+    #[serde(rename = "RetryStats", default, skip_serializing_if = "Option::is_none")]
+    pub retry_stats: Option<SRRetryStats>,
     #[serde(rename = "Metrics", default)]
     pub metrics: SRMetricsSummary,
     #[serde(rename = "ILMExpiryStats", default, skip_serializing_if = "BTreeMap::is_empty")]

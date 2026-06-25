@@ -62,8 +62,8 @@ use rustfs_madmin::{
     ReplicateEditStatus, ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SRBucketInfo, SRBucketMeta,
     SRBucketStatsSummary, SRGroupInfo, SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric,
     SRMetricsSummary, SRPeerError, SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq,
-    SRResyncOpStatus, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRUserStatsSummary, SiteReplicationInfo,
-    SyncStatus, WorkerStat,
+    SRResyncOpStatus, SRRetryStats, SRSiteSummary, SRStateEditReq, SRStateInfo, SRStatusInfo, SRUserStatsSummary,
+    SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -111,6 +111,8 @@ const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
+const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
+const SITE_REPLICATION_RETRY_FAILED_AFTER: u32 = 3;
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
@@ -222,6 +224,21 @@ struct SiteReplicationState {
     pending_rotation: Option<PendingRotation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pending_remove: Option<PendingRemove>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    retry_queue: Vec<SiteReplicationRetryEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct SiteReplicationRetryEvent {
+    id: String,
+    peer_deployment_id: String,
+    peer_endpoint: String,
+    path: String,
+    retry_count: u32,
+    failed: bool,
+    last_error: String,
+    #[serde(default, with = "time::serde::rfc3339::option", skip_serializing_if = "Option::is_none")]
+    updated_at: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -408,6 +425,11 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
             AdminOperation(&SiteReplicationResyncOpHandler {}),
         ),
         (Method::PUT, "/v3/site-replication/state/edit", AdminOperation(&SRStateEditHandler {})),
+        (
+            Method::PUT,
+            "/v3/site-replication/repair",
+            AdminOperation(&SiteReplicationRepairHandler {}),
+        ),
         (
             Method::POST,
             "/v3/site-replication/rotate-svc-acct",
@@ -1901,8 +1923,8 @@ async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
             continue;
         }
 
-        send_peer_admin_request(
-            &peer.endpoint,
+        send_peer_admin_request_with_retry_event(
+            peer,
             path,
             &state.service_account_access_key,
             &runtime.service_account_secret_key,
@@ -1914,6 +1936,22 @@ async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
     Ok(())
 }
 
+async fn send_peer_admin_request_with_retry_event<T: Serialize>(
+    peer: &PeerInfo,
+    path: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: &T,
+) -> S3Result<Vec<u8>> {
+    match send_peer_admin_request(&peer.endpoint, path, access_key, secret_key, body).await {
+        Ok(body) => Ok(body),
+        Err(err) => {
+            enqueue_site_replication_retry_event(peer, path, &err).await;
+            Err(err)
+        }
+    }
+}
+
 async fn send_site_replication_bootstrap_plan(
     peer: &PeerInfo,
     service_account_access_key: &str,
@@ -1921,8 +1959,8 @@ async fn send_site_replication_bootstrap_plan(
     plan: &SiteReplicationBootstrapPlan,
 ) -> S3Result<()> {
     for item in &plan.iam_items {
-        send_peer_admin_request(
-            &peer.endpoint,
+        send_peer_admin_request_with_retry_event(
+            peer,
             "/rustfs/admin/v3/site-replication/peer/iam-item",
             service_account_access_key,
             service_account_secret_key,
@@ -1933,12 +1971,13 @@ async fn send_site_replication_bootstrap_plan(
 
     let empty = serde_json::json!({});
     for path in &plan.bucket_make_ops {
-        send_peer_admin_request(&peer.endpoint, path, service_account_access_key, service_account_secret_key, &empty).await?;
+        send_peer_admin_request_with_retry_event(peer, path, service_account_access_key, service_account_secret_key, &empty)
+            .await?;
     }
 
     for item in &plan.bucket_items {
-        send_peer_admin_request(
-            &peer.endpoint,
+        send_peer_admin_request_with_retry_event(
+            peer,
             "/rustfs/admin/v3/site-replication/peer/bucket-meta",
             service_account_access_key,
             service_account_secret_key,
@@ -1948,7 +1987,8 @@ async fn send_site_replication_bootstrap_plan(
     }
 
     for path in &plan.bucket_configure_ops {
-        send_peer_admin_request(&peer.endpoint, path, service_account_access_key, service_account_secret_key, &empty).await?;
+        send_peer_admin_request_with_retry_event(peer, path, service_account_access_key, service_account_secret_key, &empty)
+            .await?;
     }
 
     Ok(())
@@ -2926,6 +2966,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
         sites: state.peers.clone(),
         peer_errors,
         pending_operation: pending_operation_for_state(state, local_peer),
+        retry_stats: retry_stats_for_state(state),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
     };
@@ -3050,6 +3091,7 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     if req.remove_all {
         state.peers.clear();
         state.resync_status.clear();
+        state.retry_queue.clear();
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
     }
@@ -3058,20 +3100,26 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     if names.contains(&state.name) {
         state.peers.clear();
         state.resync_status.clear();
+        state.retry_queue.clear();
         state.updated_at = Some(OffsetDateTime::now_utc());
         return state;
     }
 
-    let removed_deployment_ids: Vec<String> = state
+    let removed_peers: Vec<(String, String)> = state
         .peers
         .iter()
         .filter(|(_, peer)| names.contains(&peer.name))
-        .map(|(deployment_id, _)| deployment_id.clone())
+        .map(|(deployment_id, peer)| (deployment_id.clone(), peer.endpoint.clone()))
         .collect();
-    for deployment_id in removed_deployment_ids {
-        state.peers.remove(&deployment_id);
-        state.resync_status.remove(&deployment_id);
+    for (deployment_id, _) in &removed_peers {
+        state.peers.remove(deployment_id);
+        state.resync_status.remove(deployment_id);
     }
+    state.retry_queue.retain(|event| {
+        !removed_peers
+            .iter()
+            .any(|(deployment_id, endpoint)| &event.peer_deployment_id == deployment_id || &event.peer_endpoint == endpoint)
+    });
     state
         .resync_status
         .retain(|deployment_id, _| state.peers.contains_key(deployment_id));
@@ -3128,6 +3176,76 @@ fn summarize_peer_error_detail(detail: &str) -> String {
     let mut summary: String = detail.chars().take(take_chars).collect();
     summary.push_str(suffix);
     summary
+}
+
+fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
+    (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
+}
+
+fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str, error: &str) {
+    let now = OffsetDateTime::now_utc();
+    let detail = summarize_peer_error_detail(error);
+    if let Some(event) = queue.iter_mut().find(|event| retry_event_matches(event, peer, path)) {
+        event.retry_count = event.retry_count.saturating_add(1);
+        event.failed = event.retry_count >= SITE_REPLICATION_RETRY_FAILED_AFTER;
+        event.last_error = detail;
+        event.updated_at = Some(now);
+        return;
+    }
+
+    queue.push(SiteReplicationRetryEvent {
+        id: Uuid::new_v4().to_string(),
+        peer_deployment_id: peer.deployment_id.clone(),
+        peer_endpoint: peer.endpoint.clone(),
+        path: path.to_string(),
+        retry_count: 1,
+        failed: false,
+        last_error: detail,
+        updated_at: Some(now),
+    });
+    if queue.len() > SITE_REPLICATION_RETRY_QUEUE_LIMIT {
+        let overflow = queue.len() - SITE_REPLICATION_RETRY_QUEUE_LIMIT;
+        queue.drain(0..overflow);
+    }
+}
+
+fn retry_stats_for_state(state: &SiteReplicationState) -> Option<SRRetryStats> {
+    if state.retry_queue.is_empty() {
+        return None;
+    }
+
+    Some(SRRetryStats {
+        pending: state.retry_queue.iter().filter(|event| !event.failed).count(),
+        failed: state.retry_queue.iter().filter(|event| event.failed).count(),
+        last_error: state
+            .retry_queue
+            .iter()
+            .rev()
+            .find_map(|event| (!event.last_error.is_empty()).then(|| event.last_error.clone()))
+            .unwrap_or_default(),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+    })
+}
+
+async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error: &S3Error) {
+    let result = async {
+        let mut state = load_site_replication_state().await?;
+        upsert_site_replication_retry_event(&mut state.retry_queue, peer, path, &error.to_string());
+        persist_site_replication_state(&state).await
+    }
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = %peer.endpoint,
+            path,
+            error = ?err,
+            "failed to persist site replication retry event"
+        );
+    }
 }
 
 fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStatus {
@@ -5172,8 +5290,8 @@ impl Operation for SiteReplicationEditHandler {
                 }
 
                 for peer in &peers_to_send {
-                    send_peer_admin_request(
-                        &target.endpoint,
+                    send_peer_admin_request_with_retry_event(
+                        target,
                         SITE_REPLICATION_PEER_EDIT_PATH,
                         &current_state.service_account_access_key,
                         &service_account_secret_key,
@@ -5333,6 +5451,45 @@ impl Operation for SRStateEditHandler {
         let state = apply_state_edit_req(load_site_replication_state().await?, body);
         save_site_replication_state(&state).await?;
         Ok(empty_response(StatusCode::OK))
+    }
+}
+
+pub struct SiteReplicationRepairHandler {}
+
+#[async_trait::async_trait]
+impl Operation for SiteReplicationRepairHandler {
+    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let cred = validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        reject_site_replicator_on_public_admin(&cred)?;
+        let (state, local_peer, service_account_secret_key) = {
+            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let state = load_site_replication_state().await?;
+            if !state.enabled() || state.service_account_access_key.is_empty() {
+                return Err(s3_error!(InvalidRequest, "site replication is not configured"));
+            }
+            let service_account_secret_key = site_replicator_service_account_secret(&state.service_account_access_key).await?;
+            let local_peer = current_local_peer(&req, &state);
+            (state, local_peer, service_account_secret_key)
+        };
+
+        let repair_errors = bootstrap_existing_metadata_after_add(&state, &local_peer, &service_account_secret_key).await;
+        if repair_errors.is_empty() {
+            let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+            let mut latest = load_site_replication_state().await?;
+            latest.retry_queue.clear();
+            persist_site_replication_state(&latest).await?;
+        }
+
+        json_response(&ReplicateEditStatus {
+            success: repair_errors.is_empty(),
+            status: if repair_errors.is_empty() {
+                "Success".to_string()
+            } else {
+                "Partial".to_string()
+            },
+            err_detail: repair_errors.join("; "),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        })
     }
 }
 
@@ -5995,6 +6152,78 @@ mod tests {
         );
 
         assert!(site_replication_state_replicates_ilm_expiry(&state));
+    }
+
+    #[test]
+    fn test_retry_event_upsert_marks_repeated_failures() {
+        let peer = PeerInfo {
+            deployment_id: "remote-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let mut queue = Vec::new();
+
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "first");
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "second");
+        upsert_site_replication_retry_event(&mut queue, &peer, "/rustfs/admin/v3/site-replication/peer/iam-item", "third");
+
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].retry_count, SITE_REPLICATION_RETRY_FAILED_AFTER);
+        assert!(queue[0].failed);
+        assert_eq!(queue[0].last_error, "third");
+    }
+
+    #[test]
+    fn test_retry_stats_for_state_counts_pending_and_failed() {
+        let mut state = SiteReplicationState::default();
+        state.retry_queue = vec![
+            SiteReplicationRetryEvent {
+                failed: false,
+                last_error: "pending".to_string(),
+                ..Default::default()
+            },
+            SiteReplicationRetryEvent {
+                failed: true,
+                last_error: "failed".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let stats = retry_stats_for_state(&state).expect("retry stats should be present");
+
+        assert_eq!(stats.pending, 1);
+        assert_eq!(stats.failed, 1);
+        assert_eq!(stats.last_error, "failed");
+    }
+
+    #[test]
+    fn test_remove_sites_prunes_retry_queue_for_removed_peer() {
+        let mut state = SiteReplicationState::default();
+        state.name = "local".to_string();
+        state.peers.insert(
+            "remote-dep".to_string(),
+            PeerInfo {
+                deployment_id: "remote-dep".to_string(),
+                name: "remote".to_string(),
+                endpoint: "https://remote.example.com".to_string(),
+                ..Default::default()
+            },
+        );
+        state.retry_queue.push(SiteReplicationRetryEvent {
+            peer_deployment_id: "remote-dep".to_string(),
+            peer_endpoint: "https://remote.example.com".to_string(),
+            path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
+            ..Default::default()
+        });
+
+        let state = remove_sites(
+            state,
+            SRRemoveReq {
+                site_names: vec!["remote".to_string()],
+                ..Default::default()
+            },
+        );
+
+        assert!(state.retry_queue.is_empty());
     }
 
     #[test]
