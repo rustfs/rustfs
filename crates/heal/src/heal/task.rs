@@ -3176,7 +3176,7 @@ mod tests {
 
         assert!(matches!(err, Error::TaskExecutionFailed { .. }));
         assert!(storage.deleted_objects.lock().unwrap().is_empty());
-        assert_eq!(storage.object_heal_opts.lock().unwrap()[0].remove, true);
+        assert!(storage.object_heal_opts.lock().unwrap()[0].remove);
     }
 
     #[tokio::test]
