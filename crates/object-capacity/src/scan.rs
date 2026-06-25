@@ -25,7 +25,8 @@ use rustfs_io_metrics::capacity_metrics::{
     record_capacity_stall_detected, record_capacity_symlink, record_capacity_timeout_fallback,
 };
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::ffi::OsStr;
+use std::path::{Component, Path, PathBuf};
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 use walkdir::WalkDir;
@@ -48,6 +49,9 @@ const EVENT_CAPACITY_SCAN_TRAVERSAL_FAILED: &str = "capacity_scan_traversal_fail
 const EVENT_CAPACITY_SCAN_METADATA_FAILED: &str = "capacity_scan_metadata_failed";
 const EVENT_CAPACITY_SCAN_SAMPLING_APPLIED: &str = "capacity_scan_sampling_applied";
 const EVENT_CAPACITY_SCAN_EXACT_COMPLETED: &str = "capacity_scan_exact_completed";
+const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
+const RUSTFS_META_TMP_DIR: &str = "tmp";
+const RUSTFS_META_TMP_TRASH_DIR: &str = ".trash";
 
 #[derive(Debug)]
 struct DiskScanOutcome {
@@ -111,6 +115,27 @@ fn disk_scope_key(disk: &CapacityDiskRef) -> CapacityScopeDisk {
         endpoint: disk.endpoint.clone(),
         drive_path: disk.drive_path.clone(),
     }
+}
+
+fn normal_component_eq(component: Option<Component<'_>>, expected: &str) -> bool {
+    matches!(component, Some(Component::Normal(value)) if value == OsStr::new(expected))
+}
+
+fn is_tmp_trash_metadata_not_found(scan_root: &Path, entry_path: &Path, error_kind: Option<std::io::ErrorKind>) -> bool {
+    if error_kind != Some(std::io::ErrorKind::NotFound) {
+        return false;
+    }
+
+    let Ok(relative_path) = entry_path.strip_prefix(scan_root) else {
+        return false;
+    };
+
+    let mut components = relative_path.components();
+    normal_component_eq(components.next(), RUSTFS_META_BUCKET)
+        && normal_component_eq(components.next(), RUSTFS_META_TMP_DIR)
+        && normal_component_eq(components.next(), RUSTFS_META_TMP_TRASH_DIR)
+        && matches!(components.next(), Some(Component::Normal(_)))
+        && components.all(|component| matches!(component, Component::Normal(_)))
 }
 
 async fn scan_disk_used_capacity(disk: CapacityDiskRef) -> DiskScanOutcome {
@@ -585,6 +610,20 @@ async fn get_dir_size_async(path: &Path) -> Result<CapacityScanResult, std::io::
             let metadata = match entry.metadata() {
                 Ok(meta) => meta,
                 Err(err) => {
+                    if is_tmp_trash_metadata_not_found(&path, entry.path(), err.io_error().map(|err| err.kind())) {
+                        debug!(
+                            event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
+                            component = LOG_COMPONENT_CAPACITY,
+                            subsystem = LOG_SUBSYSTEM_SCAN,
+                            result = "ignored",
+                            reason = "tmp_trash_not_found",
+                            entry_path = ?entry.path(),
+                            file_count,
+                            "capacity scan ignored tmp trash metadata race"
+                        );
+                        continue;
+                    }
+
                     warn!(
                         event = EVENT_CAPACITY_SCAN_METADATA_FAILED,
                         component = LOG_COMPONENT_CAPACITY,
@@ -900,6 +939,67 @@ mod tests {
     async fn test_get_dir_size_async_nonexistent_directory() {
         let result = get_dir_size_async(Path::new("/nonexistent/path")).await;
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_tmp_trash_metadata_not_found_predicate_accepts_trash_not_found() {
+        let scan_root = Path::new("/disk");
+        let entry_path = scan_root
+            .join(RUSTFS_META_BUCKET)
+            .join(RUSTFS_META_TMP_DIR)
+            .join(RUSTFS_META_TMP_TRASH_DIR)
+            .join("cleanup-id")
+            .join("part.1");
+
+        assert!(is_tmp_trash_metadata_not_found(
+            scan_root,
+            &entry_path,
+            Some(std::io::ErrorKind::NotFound)
+        ));
+    }
+
+    #[test]
+    fn test_tmp_trash_metadata_not_found_predicate_rejects_non_trash_cases() {
+        let scan_root = Path::new("/disk");
+        let ordinary_object = scan_root.join("bucket").join("object").join("part.1");
+        let tmp_non_trash = scan_root
+            .join(RUSTFS_META_BUCKET)
+            .join(RUSTFS_META_TMP_DIR)
+            .join("upload-id")
+            .join("part.1");
+        let outside_scan_root = Path::new("/outside")
+            .join(RUSTFS_META_BUCKET)
+            .join(RUSTFS_META_TMP_DIR)
+            .join(RUSTFS_META_TMP_TRASH_DIR)
+            .join("cleanup-id")
+            .join("part.1");
+        let trash_permission_denied = scan_root
+            .join(RUSTFS_META_BUCKET)
+            .join(RUSTFS_META_TMP_DIR)
+            .join(RUSTFS_META_TMP_TRASH_DIR)
+            .join("cleanup-id")
+            .join("part.1");
+
+        assert!(!is_tmp_trash_metadata_not_found(
+            scan_root,
+            &ordinary_object,
+            Some(std::io::ErrorKind::NotFound)
+        ));
+        assert!(!is_tmp_trash_metadata_not_found(
+            scan_root,
+            &tmp_non_trash,
+            Some(std::io::ErrorKind::NotFound)
+        ));
+        assert!(!is_tmp_trash_metadata_not_found(
+            scan_root,
+            &outside_scan_root,
+            Some(std::io::ErrorKind::NotFound)
+        ));
+        assert!(!is_tmp_trash_metadata_not_found(
+            scan_root,
+            &trash_permission_denied,
+            Some(std::io::ErrorKind::PermissionDenied)
+        ));
     }
 
     #[tokio::test]

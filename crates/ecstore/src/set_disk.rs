@@ -15,7 +15,7 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::batch_processor::{AsyncBatchProcessor, get_global_processors};
+use crate::batch_processor::AsyncBatchProcessor;
 use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
@@ -35,17 +35,20 @@ use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::get_diagnostics::{GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure};
-use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
+use crate::get_diagnostics::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
+    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
+use crate::runtime_sources;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
     },
     cache_value::metacache_set::{ListPathRawOptions, list_path_raw},
-    config::{get_global_storage_class, storageclass},
+    config::storageclass,
     disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskOption, DiskStore, FileInfoVersions,
         RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
@@ -54,7 +57,6 @@ use crate::{
     error::{StorageError, to_object_err},
     // event::name::EventName,
     event_notification::{EventArgs, send_event},
-    global::{GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, get_global_deployment_id, is_dist_erasure},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
@@ -151,6 +153,12 @@ const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
 const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage_summary";
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
+const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
+const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
+static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
+const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
+static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -280,6 +288,10 @@ const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
 const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
+const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -289,6 +301,7 @@ mod metadata;
 mod multipart;
 mod read;
 mod replication;
+pub(crate) mod shard_source;
 mod write;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
@@ -342,6 +355,87 @@ pub fn is_deadlock_detection_enabled() -> bool {
         rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
         rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
     )
+}
+
+fn is_get_codec_streaming_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+}
+
+fn get_codec_streaming_min_size() -> usize {
+    rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingDecision {
+    Use,
+    Fallback(GetCodecStreamingFallbackReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingFallbackReason {
+    Disabled,
+    LockOptimizationDisabled,
+    Range,
+    BelowMinSize,
+    Encrypted,
+    Compressed,
+    Remote,
+    Multipart,
+    InvalidMinSize,
+}
+
+impl GetCodecStreamingFallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::LockOptimizationDisabled => "lock_optimization_disabled",
+            Self::Range => "range",
+            Self::BelowMinSize => "below_min_size",
+            Self::Encrypted => "encrypted",
+            Self::Compressed => "compressed",
+            Self::Remote => "remote",
+            Self::Multipart => "multipart",
+            Self::InvalidMinSize => "invalid_min_size",
+        }
+    }
+}
+
+fn get_codec_streaming_reader_decision(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    lock_optimization_enabled: bool,
+) -> GetCodecStreamingDecision {
+    if !is_get_codec_streaming_enabled() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled);
+    }
+    if !lock_optimization_enabled {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled);
+    }
+    if range.is_some() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range);
+    }
+
+    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize);
+    };
+    if object_info.size < min_size {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize);
+    }
+    if object_info.is_encrypted() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted);
+    }
+    if object_info.is_compressed() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed);
+    }
+    if object_info.is_remote() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote);
+    }
+    if fi.parts.len() != 1 {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart);
+    }
+
+    GetCodecStreamingDecision::Use
 }
 
 /// Record a lock acquisition for deadlock detection.
@@ -399,9 +493,7 @@ fn build_tiered_decommission_file_info(
     default_parity_count: usize,
     storage_class: Option<&str>,
 ) -> (FileInfo, usize) {
-    let parity_drives = get_global_storage_class()
-        .and_then(|sc| sc.get_parity_for_sc(storage_class.unwrap_or_default()))
-        .unwrap_or(default_parity_count);
+    let parity_drives = runtime_sources::storage_class_parity(storage_class).unwrap_or(default_parity_count);
     let data_drives = disk_count - parity_drives;
     let mut write_quorum = data_drives;
     if data_drives == parity_drives {
@@ -604,7 +696,7 @@ impl SetDisks {
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             get_object_metadata_cache: Arc::new(RwLock::new(HashMap::new())),
             lockers,
-            local_lock_manager: rustfs_lock::get_global_lock_manager(),
+            local_lock_manager: runtime_sources::global_lock_manager(),
         })
     }
 
@@ -857,6 +949,7 @@ enum SmallWritePath {
     Inline,
     SingleBlockNonInline,
     Pipeline,
+    PipelineBatchedLarge,
 }
 
 impl SmallWritePath {
@@ -865,8 +958,33 @@ impl SmallWritePath {
             SmallWritePath::Inline => "write_inline",
             SmallWritePath::SingleBlockNonInline => "write_single_block_non_inline",
             SmallWritePath::Pipeline => "write_pipeline",
+            SmallWritePath::PipelineBatchedLarge => "write_pipeline_batched_large",
         }
     }
+
+    fn multipart_metric_label(&self) -> &'static str {
+        match self {
+            SmallWritePath::Inline => "multipart_write_inline",
+            SmallWritePath::SingleBlockNonInline => "multipart_write_single_block_non_inline",
+            SmallWritePath::Pipeline => "multipart_write_pipeline",
+            SmallWritePath::PipelineBatchedLarge => "multipart_write_pipeline_batched_large",
+        }
+    }
+}
+
+fn put_large_batch_min_size_bytes() -> usize {
+    *CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_usize(ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES, DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES)
+    })
+}
+
+fn multipart_put_large_batch_min_size_bytes() -> usize {
+    *CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES,
+            DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES,
+        )
+    })
 }
 
 fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
@@ -876,6 +994,31 @@ fn classify_small_write_path(is_inline_buffer: bool, object_size: i64, block_siz
         SmallWritePath::SingleBlockNonInline
     } else {
         SmallWritePath::Pipeline
+    }
+}
+
+fn classify_put_write_path(is_inline_buffer: bool, object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_inline_small_fast_path(is_inline_buffer, object_size, block_size) {
+        return SmallWritePath::Inline;
+    }
+    if should_use_single_block_non_inline_fast_path(is_inline_buffer, object_size, block_size) {
+        return SmallWritePath::SingleBlockNonInline;
+    }
+
+    match usize::try_from(object_size) {
+        Ok(size) if !is_inline_buffer && size >= put_large_batch_min_size_bytes() => SmallWritePath::PipelineBatchedLarge,
+        _ => SmallWritePath::Pipeline,
+    }
+}
+
+fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_single_block_non_inline_fast_path(false, object_size, block_size) {
+        return SmallWritePath::SingleBlockNonInline;
+    }
+
+    match usize::try_from(object_size) {
+        Ok(size) if size >= multipart_put_large_batch_min_size_bytes() => SmallWritePath::PipelineBatchedLarge,
+        _ => SmallWritePath::Pipeline,
     }
 }
 
@@ -961,6 +1104,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         // }
 
         if object_info.size == 0 {
+            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_EMPTY);
             // if let Some(rs) = range {
             //     let _ = rs.get_offset_length(object_info.size)?;
             // }
@@ -972,7 +1116,13 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        let codec_streaming_decision = get_codec_streaming_reader_decision(&range, &object_info, &fi, lock_optimization_enabled);
+
         if object_info.is_remote() {
+            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_decision {
+                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+            }
+            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_REMOTE_TRANSITION);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
                 opts.part_number = Some(1);
@@ -999,6 +1149,30 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         } else {
             read_lock_guard
         };
+
+        match codec_streaming_decision {
+            GetCodecStreamingDecision::Use => {
+                rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_CODEC_STREAMING);
+                let stream = Self::get_object_decode_reader_with_fileinfo(
+                    bucket,
+                    object,
+                    fi,
+                    files,
+                    &disks,
+                    self.set_index,
+                    self.pool_index,
+                    opts.skip_verify_bitrot,
+                )
+                .await?;
+                let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                return Ok(reader);
+            }
+            GetCodecStreamingDecision::Fallback(reason) => {
+                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+            }
+        }
+
+        rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_LEGACY_DUPLEX);
 
         let duplex_buffer_size = get_duplex_buffer_size();
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
@@ -1089,13 +1263,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 user_defined.insert(key.clone(), value.clone());
             }
         }
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -1143,13 +1311,8 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-            let is_inline_buffer = {
-                if let Some(sc) = get_global_storage_class() {
-                    sc.should_inline(erasure.shard_file_size(data.size()), opts.versioned)
-                } else {
-                    false
-                }
-            };
+            let is_inline_buffer =
+                runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
 
             let shard_file_size = erasure.shard_file_size(data.size());
             let shard_size = erasure.shard_size();
@@ -1229,7 +1392,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_small_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let write_path = classify_put_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
             let encode_stage_start = Instant::now();
@@ -1254,6 +1417,15 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
                         return Err(e.into());
                     }
                 },
+                SmallWritePath::PipelineBatchedLarge => {
+                    match Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await {
+                        Ok((r, w)) => (r, w),
+                        Err(e) => {
+                            error!("encode_batched err {:?}", e);
+                            return Err(e.into());
+                        }
+                    }
+                }
                 SmallWritePath::Pipeline => match Arc::new(erasure).encode(stream, &mut writers, write_quorum).await {
                     Ok((r, w)) => (r, w),
                     Err(e) => {
@@ -1845,7 +2017,7 @@ impl rustfs_storage_api::NamespaceLocking for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn new_ns_lock(&self, bucket: &str, object: &str) -> Result<NamespaceLockWrapper> {
-        let set_lock = if is_dist_erasure().await {
+        let set_lock = if runtime_sources::setup_is_dist_erasure().await {
             // Calculate quorum based on lockers count (majority)
             let lockers_count = self.lockers.len();
             let write_quorum = if lockers_count > 1 { (lockers_count / 2) + 1 } else { 1 };
@@ -2336,7 +2508,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
         let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
-        let dist_erasure = is_dist_erasure().await;
+        let dist_erasure = runtime_sources::setup_is_dist_erasure().await;
         let mut dist_batch_lock_ids = vec![Vec::new(); self.lockers.len()];
 
         if dist_erasure {
@@ -2831,7 +3003,8 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
     #[tracing::instrument(level = "debug", skip(self))]
     async fn transition_object(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+        let tier_config_mgr = runtime_sources::tier_config_mgr_handle();
+        let mut tier_config_mgr = tier_config_mgr.write().await;
         let tgt_client = match tier_config_mgr.get_driver(&opts.transition.tier).await {
             Ok(client) => client,
             Err(err) => {
@@ -2993,7 +3166,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                 bucket_name: bucket.to_string(),
                 object: obj_info,
                 user_agent: "Internal: [ILM-Transition]".to_string(),
-                host: GLOBAL_LocalNodeName.to_string(),
+                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
         }
@@ -3051,7 +3224,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
                         bucket_name: bucket.to_string(),
                         object: restored_info,
                         user_agent: "Internal: [Restore-Completed]".to_string(),
-                        host: GLOBAL_LocalNodeName.to_string(),
+                        host: runtime_sources::default_local_node_name(),
                         ..Default::default()
                     });
                     Ok(())
@@ -3162,7 +3335,7 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
             bucket_name: bucket.to_string(),
             object: restored_info,
             user_agent: "Internal: [Restore-Completed]".to_string(),
-            host: GLOBAL_LocalNodeName.to_string(),
+            host: runtime_sources::default_local_node_name(),
             ..Default::default()
         });
         Ok(())
@@ -3459,6 +3632,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
@@ -3500,6 +3674,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             }
         }
 
+        if let Some(stage_start) = writer_setup_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_writer_setup",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
             if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
@@ -3509,12 +3690,16 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
+        // Capture the original part size before swapping the stream out for encoding.
+        let multipart_part_size = data.size();
         let stream = mem::replace(
             &mut data.stream,
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
+        let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);
+        rustfs_io_metrics::record_put_object_path(write_path.multipart_metric_label());
+        let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let (reader, w_size) = match write_path {
             SmallWritePath::SingleBlockNonInline => {
@@ -3522,10 +3707,18 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
                     .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                     .await?
             }
+            SmallWritePath::PipelineBatchedLarge => Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await?,
             SmallWritePath::Inline | SmallWritePath::Pipeline => {
                 Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
             }
         }; // TODO: delete temporary directory on error
+
+        if let Some(stage_start) = encode_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_encode",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -3817,8 +4010,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             uploads.push(MultipartInfo {
                 bucket: bucket.to_owned(),
                 object: object.to_owned(),
-                upload_id: base64_simd::URL_SAFE_NO_PAD
-                    .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes()),
+                upload_id: runtime_sources::deployment_upload_id(&upload_id),
                 initiated: Some(start_time),
                 ..Default::default()
             });
@@ -3908,13 +4100,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             let _ = user_defined.remove(AMZ_STORAGE_CLASS);
         }
 
-        let sc_parity_drives = {
-            if let Some(sc) = get_global_storage_class() {
-                sc.get_parity_for_sc(user_defined.get(AMZ_STORAGE_CLASS).cloned().unwrap_or_default().as_str())
-            } else {
-                None
-            }
-        };
+        let sc_parity_drives = runtime_sources::storage_class_parity(user_defined.get(AMZ_STORAGE_CLASS).map(String::as_str));
 
         let mut parity_drives = sc_parity_drives.unwrap_or(self.default_parity_count);
         if opts.max_parity {
@@ -3985,8 +4171,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
 
         let upload_uuid = format!("{}x{}", Uuid::new_v4(), mod_time.unix_timestamp_nanos());
 
-        let upload_id = base64_simd::URL_SAFE_NO_PAD
-            .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_uuid).as_bytes());
+        let upload_id = runtime_sources::deployment_upload_id(&upload_uuid);
 
         let upload_path = Self::get_upload_id_dir(bucket, object, upload_uuid.as_str());
 
@@ -4414,6 +4599,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             );
         }
 
+        let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
         self.cleanup_multipart_path(&parts).await;
 
         let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
@@ -4430,6 +4616,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
+        }
+
+        if let Some(stage_start) = complete_tail_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_complete_tail",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         drop(object_lock_guard); // drop object lock guard to release the lock
@@ -5419,7 +5612,6 @@ mod tests {
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
-    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::object_api::ObjectInfo;
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
@@ -5560,7 +5752,7 @@ mod tests {
     impl SetupTypeGuard {
         async fn switch_to(next: SetupType) -> Self {
             let previous = current_setup_type().await;
-            update_erasure_type(next).await;
+            runtime_sources::set_setup_type(next).await;
             Self { previous }
         }
     }
@@ -5571,22 +5763,14 @@ mod tests {
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
-                    update_erasure_type(previous).await;
+                    runtime_sources::set_setup_type(previous).await;
                 });
             });
         }
     }
 
     async fn current_setup_type() -> SetupType {
-        if is_dist_erasure().await {
-            SetupType::DistErasure
-        } else if is_erasure_sd().await {
-            SetupType::ErasureSD
-        } else if is_erasure().await {
-            SetupType::Erasure
-        } else {
-            SetupType::Unknown
-        }
+        runtime_sources::current_setup_type().await
     }
 
     async fn make_formatted_local_disk_for_info_test(disk_idx: usize, format: &FormatV3) -> (TempDir, Endpoint, DiskStore) {
@@ -7553,6 +7737,22 @@ mod tests {
     }
 
     #[test]
+    fn put_object_large_batch_path_only_applies_to_large_ordinary_puts() {
+        assert!(matches!(
+            classify_put_write_path(false, 64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::PipelineBatchedLarge
+        ));
+        assert!(matches!(
+            classify_put_write_path(false, 32 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_put_write_path(true, 64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+    }
+
+    #[test]
     fn put_object_part_fast_path_selection_matches_single_block_non_inline_rules() {
         assert!(should_use_single_block_non_inline_fast_path(false, 4096, 4096));
         assert!(should_use_single_block_non_inline_fast_path(false, 2048, 4096));
@@ -7562,6 +7762,35 @@ mod tests {
             classify_small_write_path(false, 4096, 4096),
             SmallWritePath::SingleBlockNonInline
         ));
+    }
+
+    #[test]
+    fn multipart_put_large_batch_path_only_applies_at_128m_and_above() {
+        assert!(matches!(
+            classify_multipart_part_write_path(128 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::PipelineBatchedLarge
+        ));
+        assert!(matches!(
+            classify_multipart_part_write_path(64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_multipart_part_write_path(1024 * 1024, 1024 * 1024),
+            SmallWritePath::SingleBlockNonInline
+        ));
+    }
+
+    #[test]
+    fn multipart_write_paths_use_distinct_metric_labels() {
+        assert_eq!(SmallWritePath::Pipeline.multipart_metric_label(), "multipart_write_pipeline");
+        assert_eq!(
+            SmallWritePath::PipelineBatchedLarge.multipart_metric_label(),
+            "multipart_write_pipeline_batched_large"
+        );
+        assert_eq!(
+            SmallWritePath::SingleBlockNonInline.multipart_metric_label(),
+            "multipart_write_single_block_non_inline"
+        );
     }
 
     #[test]

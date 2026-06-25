@@ -17,10 +17,10 @@ use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
-use crate::global::GLOBAL_LOCAL_DISK_MAP;
 use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
+use crate::runtime_sources;
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -1092,7 +1092,7 @@ pub(crate) async fn heal_bucket_local_on_disks(
 }
 
 async fn clone_drives() -> Vec<Option<DiskStore>> {
-    GLOBAL_LOCAL_DISK_MAP.read().await.values().cloned().collect::<Vec<_>>()
+    runtime_sources::local_disk_entries().await
 }
 
 #[cfg(test)]
