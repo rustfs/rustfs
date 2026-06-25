@@ -474,6 +474,21 @@ fn resolve_object_heal_entry(entries: &MetaCacheEntries, resolver: MetadataResol
         .cloned()
 }
 
+fn is_missing_path_disk_error(err: &DiskError) -> bool {
+    matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+}
+
+fn disk_errors_are_only_missing_paths(errs: &[Option<DiskError>]) -> bool {
+    let mut saw_missing_path = false;
+    for err in errs.iter().flatten() {
+        if !is_missing_path_disk_error(err) {
+            return false;
+        }
+        saw_missing_path = true;
+    }
+    saw_missing_path
+}
+
 fn heal_priority_label(priority: HealChannelPriority) -> &'static str {
     match priority {
         HealChannelPriority::Low => "low",
@@ -995,13 +1010,18 @@ impl ScannerItem {
 
     async fn enqueue_heal(&mut self, oi: &ObjectInfo) {
         let done_heal = Metrics::time(Metric::HealAbandonedObject);
+        let object = if oi.name.is_empty() {
+            self.object_path()
+        } else {
+            oi.name.clone()
+        };
         debug!(
             target: "rustfs::scanner::folder",
             event = EVENT_SCANNER_HEAL_ADMISSION,
             component = LOG_COMPONENT_SCANNER,
             subsystem = LOG_SUBSYSTEM_HEAL,
             bucket = %self.bucket,
-            object = %self.object_path(),
+            object = %object,
             version_id = %oi.version_id.unwrap_or_default(),
             state = "request_started",
             "Scanner heal admission started"
@@ -1021,7 +1041,7 @@ impl ScannerItem {
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_HEAL,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object,
                 version_id = %oi.version_id.unwrap_or_default(),
                 object_age_secs = age_secs.unwrap_or_default(),
                 cooldown_secs = cooldown.as_secs(),
@@ -1036,7 +1056,7 @@ impl ScannerItem {
             "object",
             build_object_heal_request(
                 self.bucket.clone(),
-                self.object_path(),
+                object.clone(),
                 oi.version_id
                     .and_then(|v| if v.is_nil() { None } else { Some(v.to_string()) }),
                 scan_mode,
@@ -1056,7 +1076,7 @@ impl ScannerItem {
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_HEAL,
                     bucket = %self.bucket,
-                    object = %self.object_path(),
+                    object = %object,
                     admission = %describe_heal_admission(result),
                     state = "not_admitted",
                     "Scanner heal admission rejected low-priority request"
@@ -1068,7 +1088,7 @@ impl ScannerItem {
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_HEAL,
                 bucket = %self.bucket,
-                object = %self.object_path(),
+                object = %object,
                 state = "submit_failed",
                 error = %e,
                 "Scanner heal admission submission failed"
@@ -1438,7 +1458,7 @@ impl FolderScanner {
             let mut dir_reader = match tokio::fs::read_dir(&dir_path).await {
                 Ok(dir_reader) => dir_reader,
                 Err(e) if e.kind() == ErrorKind::NotFound => {
-                    warn!(
+                    debug!(
                         target: "rustfs::scanner::folder",
                         event = EVENT_SCANNER_FOLDER_STATE,
                         component = LOG_COMPONENT_SCANNER,
@@ -1458,7 +1478,7 @@ impl FolderScanner {
                     Ok(Some(entry)) => entry,
                     Ok(None) => break,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        warn!(
+                        debug!(
                             target: "rustfs::scanner::folder",
                             event = EVENT_SCANNER_FOLDER_STATE,
                             component = LOG_COMPONENT_SCANNER,
@@ -1505,7 +1525,7 @@ impl FolderScanner {
                 let mut entry_type = match entry.file_type().await {
                     Ok(entry_type) => entry_type,
                     Err(e) if e.kind() == ErrorKind::NotFound => {
-                        warn!(
+                        debug!(
                             target: "rustfs::scanner::folder",
                             event = EVENT_SCANNER_FOLDER_STATE,
                             component = LOG_COMPONENT_SCANNER,
@@ -1537,7 +1557,7 @@ impl FolderScanner {
                     let metadata = match tokio::fs::metadata(&file_path).await {
                         Ok(metadata) => metadata,
                         Err(e) if e.kind() == ErrorKind::NotFound => {
-                            warn!(
+                            debug!(
                                 target: "rustfs::scanner::folder",
                                 event = EVENT_SCANNER_FOLDER_STATE,
                                 component = LOG_COMPONENT_SCANNER,
@@ -2043,17 +2063,31 @@ impl FolderScanner {
                     )
                     .await
                     {
-                        error!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            bucket = %bucket_clone,
-                            prefix = %prefix_clone,
-                            state = "list_path_failed",
-                            error = %e,
-                            "Scanner list_path_raw failed"
-                        );
+                        if is_missing_path_disk_error(&e) {
+                            debug!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                bucket = %bucket_clone,
+                                prefix = %prefix_clone,
+                                state = "list_path_missing",
+                                error = %e,
+                                "Scanner list_path_raw missing path skipped"
+                            );
+                        } else {
+                            error!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                bucket = %bucket_clone,
+                                prefix = %prefix_clone,
+                                state = "list_path_failed",
+                                error = %e,
+                                "Scanner list_path_raw failed"
+                            );
+                        }
                     }
                 });
 
@@ -2151,15 +2185,27 @@ impl FolderScanner {
                                 finished_closed = true;
                                 continue;
                             };
-                            error!(
-                                target: "rustfs::scanner::folder",
-                                event = EVENT_SCANNER_FOLDER_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_FOLDER,
-                                state = "list_path_finished_with_errors",
-                                errors = ?errs,
-                                "Scanner list_path_raw finished with disk errors"
-                            );
+                            if disk_errors_are_only_missing_paths(&errs) {
+                                debug!(
+                                    target: "rustfs::scanner::folder",
+                                    event = EVENT_SCANNER_FOLDER_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                                    state = "list_path_finished_missing_paths",
+                                    errors = ?errs,
+                                    "Scanner list_path_raw finished with missing paths"
+                                );
+                            } else {
+                                error!(
+                                    target: "rustfs::scanner::folder",
+                                    event = EVENT_SCANNER_FOLDER_STATE,
+                                    component = LOG_COMPONENT_SCANNER,
+                                    subsystem = LOG_SUBSYSTEM_FOLDER,
+                                    state = "list_path_finished_with_errors",
+                                    errors = ?errs,
+                                    "Scanner list_path_raw finished with disk errors"
+                                );
+                            }
                             child_ctx.cancel();
                         }
                         _ = child_ctx.cancelled() => {
@@ -3225,6 +3271,27 @@ mod tests {
 
         assert_eq!(entry.name, "object/");
         assert!(entry.is_object_dir());
+    }
+
+    #[test]
+    fn test_disk_errors_are_only_missing_paths_accepts_missing_mix() {
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            None,
+            Some(DiskError::FileVersionNotFound),
+            Some(DiskError::VolumeNotFound),
+        ];
+
+        assert!(disk_errors_are_only_missing_paths(&errs));
+    }
+
+    #[test]
+    fn test_disk_errors_are_only_missing_paths_rejects_empty_or_actionable_errors() {
+        assert!(!disk_errors_are_only_missing_paths(&[None, None]));
+        assert!(!disk_errors_are_only_missing_paths(&[
+            Some(DiskError::FileNotFound),
+            Some(DiskError::Timeout),
+        ]));
     }
 
     #[test]
