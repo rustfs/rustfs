@@ -92,9 +92,7 @@ fn parse_object_specs(raw: &str) -> Result<Vec<ObjectSpec>> {
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
         .map(|entry| {
-            let (label, key) = entry
-                .split_once('=')
-                .ok_or_else(|| anyhow!("invalid object spec: {entry}"))?;
+            let (label, key) = entry.split_once('=').ok_or_else(|| anyhow!("invalid object spec: {entry}"))?;
             Ok(ObjectSpec {
                 label: label.trim().to_string(),
                 key: key.trim().to_string(),
@@ -109,7 +107,11 @@ fn parse_csv_usize(raw: &str, field: &str) -> Result<Vec<usize>> {
         .split(',')
         .map(str::trim)
         .filter(|entry| !entry.is_empty())
-        .map(|entry| entry.parse::<usize>().with_context(|| format!("invalid {field} value: {entry}")))
+        .map(|entry| {
+            entry
+                .parse::<usize>()
+                .with_context(|| format!("invalid {field} value: {entry}"))
+        })
         .collect::<Result<Vec<_>>>()?;
     if values.is_empty() {
         return Err(anyhow!("{field} cannot be empty"));
@@ -147,8 +149,14 @@ impl ToolSettings {
             .unwrap_or_else(|_| PathBuf::from(format!("target/bench/gt1g-get-tool-{}", chrono_like_timestamp())));
         let objects = parse_object_specs(&env::var("GT1G_GET_OBJECTS").context("missing GT1G_GET_OBJECTS")?)?;
         let modes = parse_modes(&env::var("GT1G_GET_MODES").unwrap_or_else(|_| "sequential,ranged_parallel".to_string()))?;
-        let concurrencies = parse_csv_usize(&env::var("GT1G_GET_CONCURRENCIES").unwrap_or_else(|_| "1,4,8".to_string()), "GT1G_GET_CONCURRENCIES")?;
-        let range_workers = parse_csv_usize(&env::var("GT1G_GET_RANGE_WORKERS").unwrap_or_else(|_| "4".to_string()), "GT1G_GET_RANGE_WORKERS")?;
+        let concurrencies = parse_csv_usize(
+            &env::var("GT1G_GET_CONCURRENCIES").unwrap_or_else(|_| "1,4,8".to_string()),
+            "GT1G_GET_CONCURRENCIES",
+        )?;
+        let range_workers = parse_csv_usize(
+            &env::var("GT1G_GET_RANGE_WORKERS").unwrap_or_else(|_| "4".to_string()),
+            "GT1G_GET_RANGE_WORKERS",
+        )?;
         let rounds = env::var("GT1G_GET_ROUNDS")
             .unwrap_or_else(|_| "3".to_string())
             .parse::<usize>()
@@ -183,10 +191,7 @@ impl ToolSettings {
 
 fn chrono_like_timestamp() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     now.to_string()
 }
 
@@ -292,13 +297,7 @@ async fn run_sequential_task(client: Client, bucket: String, key: String, expect
 
 async fn run_range_worker(client: Client, bucket: String, key: String, start: i64, end: i64) -> Result<u64> {
     let range = format!("bytes={start}-{end}");
-    let output = client
-        .get_object()
-        .bucket(bucket)
-        .key(key)
-        .range(range)
-        .send()
-        .await?;
+    let output = client.get_object().bucket(bucket).key(key).range(range).send().await?;
     let bytes = drain_body(output.body).await?;
     Ok(bytes)
 }
