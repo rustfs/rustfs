@@ -2227,10 +2227,10 @@ mod tests {
     use super::*;
     use crate::heal::storage::{DiskStatus, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
-    use rustfs_storage_api::BucketInfo;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use super::super::storage_api::BucketInfo;
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
