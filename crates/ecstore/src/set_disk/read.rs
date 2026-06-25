@@ -1187,7 +1187,7 @@ impl SetDisks {
                 files[idx].data.as_deref(),
                 disk_op.as_ref(),
                 bucket,
-                &format!("{}/{}/part.{}", object, files[idx].data_dir.clone().unwrap_or_default(), part_number),
+                &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
                 0,
                 till_offset,
                 erasure.shard_size(),
@@ -1234,8 +1234,8 @@ impl SetDisks {
 
         let total_shards = erasure.data_shards + erasure.parity_shards;
         let missing_shards = total_shards.saturating_sub(available_shards);
-        if missing_shards > 0 {
-            if let Err(e) =
+        if missing_shards > 0
+            && let Err(e) =
                 rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
                     bucket.to_string(),
                     Some(object.to_string()),
@@ -1245,15 +1245,14 @@ impl SetDisks {
                     Some(set_index),
                 ))
                 .await
-            {
-                warn!(
-                    bucket,
-                    object,
-                    part_number,
-                    error = %e,
-                    "Failed to enqueue heal request for missing shards"
-                );
-            }
+        {
+            warn!(
+                bucket,
+                object,
+                part_number,
+                error = %e,
+                "Failed to enqueue heal request for missing shards"
+            );
         }
 
         let source = erasure_coding::decode::ParallelReader::new(readers, erasure.clone(), 0, part_size);
@@ -1597,7 +1596,7 @@ mod tests {
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
                 );
 
-                let mut remote_fi = fi.clone();
+                let mut remote_fi = fi;
                 remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
                 let remote = codec_streaming_test_object_info(&remote_fi);
                 assert_eq!(
