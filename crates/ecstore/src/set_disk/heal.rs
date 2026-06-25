@@ -215,13 +215,14 @@ impl SetDisks {
                             let required_data = total_disks.saturating_sub(latest_meta.erasure.parity_blocks);
 
                             error!(
-                                "Data corruption detected for {}/{}: Insufficient healthy shards. Need at least {} data shards, but found only {} healthy disks. (Missing/Corrupt: {}, Parity: {})",
                                 bucket,
                                 object,
-                                required_data,
-                                healthy_count,
-                                disks_to_heal_count,
-                                latest_meta.erasure.parity_blocks
+                                version_id,
+                                required_data_shards = required_data,
+                                healthy_shards = healthy_count,
+                                missing_or_corrupt_shards = disks_to_heal_count,
+                                parity_shards = latest_meta.erasure.parity_blocks,
+                                "Heal object cannot reconstruct with available shards"
                             );
 
                             // Allow for dangling deletes, on versions that have DataDir missing etc.
@@ -253,16 +254,23 @@ impl SetDisks {
                                     Ok((self.default_heal_result(m, &t_errs, bucket, object, version_id).await, Some(derr)))
                                 }
                                 Err(err) => {
-                                    // t_errs = vec![Some(err.clone()]; errs.len());
+                                    error!(
+                                        bucket,
+                                        object,
+                                        version_id,
+                                        error = %err,
+                                        "Heal object dangling cleanup could not prove object deletion"
+                                    );
+                                    let quorum_err = DiskError::ErasureReadQuorum;
                                     let mut t_errs = Vec::with_capacity(errs.len());
                                     for _ in 0..errs.len() {
-                                        t_errs.push(Some(err.clone()));
+                                        t_errs.push(Some(quorum_err.clone()));
                                     }
 
                                     Ok((
                                         self.default_heal_result(FileInfo::default(), &t_errs, bucket, object, version_id)
                                             .await,
-                                        Some(err),
+                                        Some(quorum_err),
                                     ))
                                 }
                             };
