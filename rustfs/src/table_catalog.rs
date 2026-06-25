@@ -3243,8 +3243,6 @@ where
                 entry.metadata_location
             )));
         }
-        validate_unpartitioned_compaction_table(&current_metadata)?;
-
         let mut report =
             table_compaction_planning_report(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata, config)
                 .await?;
@@ -3253,26 +3251,37 @@ where
         }
         let current_data_files =
             compaction_current_data_files(&self.backend, table_bucket, &namespace, &table, &entry, &current_metadata).await?;
+        let current_data_files_by_key = current_data_files
+            .iter()
+            .map(|file| (file.object_key.as_str(), file))
+            .collect::<BTreeMap<_, _>>();
         let rewritten_inputs = report
             .rewrite_groups
             .iter()
             .flat_map(|group| group.input_file_locations.iter().cloned())
             .collect::<BTreeSet<_>>();
         let mut manifest_data_files = current_data_files
-            .into_iter()
+            .iter()
             .filter(|file| !rewritten_inputs.contains(&file.object_key))
+            .cloned()
             .collect::<Vec<_>>();
 
         let now = OffsetDateTime::now_utc();
         let snapshot_id = compaction_snapshot_id(&current_metadata, &entry, now);
         let sequence_number = next_compaction_sequence_number(&current_metadata);
         let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
-        let data_dir = table_warehouse_data_dir_path(&entry)?;
+        let warehouse_object_prefix = table_warehouse_object_prefix(&entry)?;
         let compaction_id = Uuid::new_v4().to_string();
         let mut compacted_files = Vec::with_capacity(report.rewrite_groups.len());
         for rewrite_group in &mut report.rewrite_groups {
-            let output_file = format!("{data_dir}/compaction-{compaction_id}-{}.parquet", rewrite_group.group_id);
+            let output_prefix = rewrite_group
+                .input_file_locations
+                .first()
+                .and_then(|input| compaction_data_file_rewrite_prefix(&namespace, &table, Some(&warehouse_object_prefix), input))
+                .ok_or_else(|| TableCatalogStoreError::Invalid("compaction rewrite group has no input files".to_string()))?;
+            let output_file = format!("{output_prefix}/compaction-{compaction_id}-{}.parquet", rewrite_group.group_id);
             let output_file_path = table_object_s3_location(table_bucket, &output_file);
+            let (partition_spec_id, partition) = compaction_rewrite_group_partition(&current_data_files_by_key, rewrite_group)?;
             let mut input_files = Vec::with_capacity(rewrite_group.input_file_locations.len());
             for input_file in &rewrite_group.input_file_locations {
                 let Some(input_object) = self.backend.read_object(table_bucket, input_file).await? else {
@@ -3292,6 +3301,8 @@ where
                 file_path: output_file_path,
                 file_size_bytes: output_bytes,
                 record_count: compacted_file.record_count,
+                partition_spec_id,
+                partition,
                 status: 1,
                 snapshot_id,
                 sequence_number,
@@ -3321,6 +3332,7 @@ where
         let manifest_list_data = compacted_manifest_list_avro_bytes(CompactionManifestListSummary {
             manifest_path: &new_manifest,
             manifest_length,
+            partition_spec_id: compaction_manifest_partition_spec_id(&manifest_data_files)?,
             snapshot_id,
             sequence_number,
             added_files_count,
@@ -5152,6 +5164,7 @@ pub(crate) fn manifest_list_references_from_manifest_list_avro(
             .ok_or_else(|| TableCatalogStoreError::Invalid("manifest list entry missing manifest_path".to_string()))?;
         manifest_paths.push(ManifestListReference {
             manifest_path: manifest_path.to_string(),
+            partition_spec_id: avro_record_field(&value, "partition_spec_id").and_then(avro_i32_value),
             sequence_number: avro_record_field(&value, "sequence_number").and_then(avro_i64_value),
             added_snapshot_id: avro_record_field(&value, "added_snapshot_id").and_then(avro_i64_value),
         });
@@ -5198,6 +5211,9 @@ pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatal
             file_size_bytes: avro_record_field(data_file, "file_size_in_bytes")
                 .and_then(avro_i64_value)
                 .and_then(|value| u64::try_from(value).ok()),
+            partition: avro_record_field(data_file, "partition")
+                .and_then(avro_record_value_fields)
+                .unwrap_or_default(),
         });
     }
     Ok(files)
@@ -5211,6 +5227,19 @@ fn avro_record_field<'a>(value: &'a apache_avro::types::Value, name: &str) -> Op
     fields
         .iter()
         .find_map(|(field_name, field_value)| (field_name == name).then_some(avro_non_union_value(field_value)))
+}
+
+fn avro_record_value_fields(value: &apache_avro::types::Value) -> Option<Vec<(String, apache_avro::types::Value)>> {
+    let value = avro_non_union_value(value);
+    let apache_avro::types::Value::Record(fields) = value else {
+        return None;
+    };
+    Some(
+        fields
+            .iter()
+            .map(|(field_name, field_value)| (field_name.clone(), avro_non_union_value(field_value).clone()))
+            .collect(),
+    )
 }
 
 fn avro_non_union_value(value: &apache_avro::types::Value) -> &apache_avro::types::Value {
@@ -5793,6 +5822,7 @@ fn table_snapshot_expiration_report(
 struct TableCompactionDataFileCandidate {
     location: String,
     size_bytes: u64,
+    rewrite_prefix: String,
 }
 
 struct CompactedParquetFile {
@@ -5806,13 +5836,15 @@ struct CompactedDataFile {
     file_path: String,
     file_size_bytes: u64,
     record_count: u64,
+    partition_spec_id: i32,
+    partition: Vec<(String, apache_avro::types::Value)>,
     status: i32,
     snapshot_id: i64,
     sequence_number: i64,
     file_sequence_number: i64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ManifestDataFileReference {
     pub location: String,
     pub object_kind: TableMetadataMaintenanceObjectKind,
@@ -5822,11 +5854,13 @@ pub(crate) struct ManifestDataFileReference {
     pub file_sequence_number: Option<i64>,
     pub record_count: Option<u64>,
     pub file_size_bytes: Option<u64>,
+    pub partition: Vec<(String, apache_avro::types::Value)>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ManifestListReference {
     pub manifest_path: String,
+    pub partition_spec_id: Option<i32>,
     pub sequence_number: Option<i64>,
     pub added_snapshot_id: Option<i64>,
 }
@@ -5834,6 +5868,7 @@ pub(crate) struct ManifestListReference {
 struct CompactionManifestListSummary<'a> {
     manifest_path: &'a str,
     manifest_length: u64,
+    partition_spec_id: i32,
     snapshot_id: i64,
     sequence_number: i64,
     added_files_count: usize,
@@ -6053,6 +6088,8 @@ where
             let size_bytes = u64::try_from(data_object.data.len()).unwrap_or(u64::MAX);
             if size_bytes <= config.small_file_threshold_bytes {
                 candidates.push(TableCompactionDataFileCandidate {
+                    rewrite_prefix: compaction_data_file_rewrite_prefix(namespace, table, warehouse_object_prefix, &data_key)
+                        .unwrap_or_else(|| data_key.clone()),
                     location: data_key,
                     size_bytes,
                 });
@@ -6178,6 +6215,8 @@ where
                     Some(record_count) => record_count,
                     None => parquet_record_count(&data_object.data)?,
                 },
+                partition_spec_id: manifest_reference.partition_spec_id.unwrap_or(0),
+                partition: reference.partition,
                 status: 0,
                 snapshot_id,
                 sequence_number,
@@ -6194,18 +6233,65 @@ fn compaction_rewrite_groups(
     config: &TableCompactionPlanningConfig,
 ) -> Vec<TableCompactionRewriteGroup> {
     let mut groups = Vec::new();
+    let mut candidates_by_prefix = BTreeMap::<&str, Vec<&TableCompactionDataFileCandidate>>::new();
+    for candidate in candidates {
+        candidates_by_prefix
+            .entry(candidate.rewrite_prefix.as_str())
+            .or_default()
+            .push(candidate);
+    }
+
+    for prefix_candidates in candidates_by_prefix.values() {
+        push_compaction_rewrite_groups_for_prefix(&mut groups, prefix_candidates, config);
+    }
+    groups
+}
+
+fn push_compaction_rewrite_groups_for_prefix(
+    groups: &mut Vec<TableCompactionRewriteGroup>,
+    candidates: &[&TableCompactionDataFileCandidate],
+    config: &TableCompactionPlanningConfig,
+) {
     let mut current_locations = Vec::new();
     let mut current_bytes = 0_u64;
     for candidate in candidates {
         let next_bytes = current_bytes.saturating_add(candidate.size_bytes);
         if !current_locations.is_empty() && next_bytes > config.max_rewrite_bytes_per_job {
-            push_compaction_rewrite_group(&mut groups, &mut current_locations, &mut current_bytes, config);
+            push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, config);
         }
         current_locations.push(candidate.location.clone());
         current_bytes = current_bytes.saturating_add(candidate.size_bytes);
     }
-    push_compaction_rewrite_group(&mut groups, &mut current_locations, &mut current_bytes, config);
-    groups
+    push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, config);
+}
+
+fn compaction_data_file_rewrite_prefix(
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    warehouse_object_prefix: Option<&str>,
+    location: &str,
+) -> Option<String> {
+    let warehouse_data_prefix = warehouse_object_prefix
+        .map(|prefix| format!("{prefix}{DATA_DIR}"))
+        .unwrap_or_else(|| default_table_data_dir_path(namespace, table));
+    let default_data_prefix = format!("{}/", default_table_data_dir_path(namespace, table));
+    if let Some(relative_path) = location.strip_prefix(&default_data_prefix) {
+        return Some(compaction_data_file_output_prefix(&warehouse_data_prefix, relative_path));
+    }
+    if let Some(warehouse_object_prefix) = warehouse_object_prefix {
+        let warehouse_input_prefix = format!("{warehouse_object_prefix}{DATA_DIR}/");
+        if let Some(relative_path) = location.strip_prefix(&warehouse_input_prefix) {
+            return Some(compaction_data_file_output_prefix(&warehouse_data_prefix, relative_path));
+        }
+    }
+    None
+}
+
+fn compaction_data_file_output_prefix(output_data_prefix: &str, relative_path: &str) -> String {
+    relative_path
+        .rsplit_once('/')
+        .map(|(partition_path, _)| format!("{output_data_prefix}/{partition_path}"))
+        .unwrap_or_else(|| output_data_prefix.to_string())
 }
 
 fn push_compaction_rewrite_group(
@@ -6228,6 +6314,51 @@ fn push_compaction_rewrite_group(
         current_locations.clear();
     }
     *current_bytes = 0;
+}
+
+fn compaction_rewrite_group_partition(
+    data_files_by_key: &BTreeMap<&str, &CompactedDataFile>,
+    rewrite_group: &TableCompactionRewriteGroup,
+) -> TableCatalogStoreResult<(i32, Vec<(String, apache_avro::types::Value)>)> {
+    let mut partition_spec_id = None;
+    let mut partition = None;
+    for input in &rewrite_group.input_file_locations {
+        let Some(data_file) = data_files_by_key.get(input.as_str()) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction rewrite input is missing from current manifest".to_string(),
+            ));
+        };
+        match (partition_spec_id, partition.as_ref()) {
+            (None, None) => {
+                partition_spec_id = Some(data_file.partition_spec_id);
+                partition = Some(data_file.partition.clone());
+            }
+            (Some(expected_spec_id), Some(expected_partition))
+                if expected_spec_id == data_file.partition_spec_id && expected_partition == &data_file.partition => {}
+            _ => {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction rewrite group must contain a single partition tuple".to_string(),
+                ));
+            }
+        }
+    }
+    Ok((partition_spec_id.unwrap_or(0), partition.unwrap_or_default()))
+}
+
+fn compaction_manifest_partition_spec_id(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<i32> {
+    let Some(first) = data_files.first() else {
+        return Ok(0);
+    };
+    let partition_spec_id = first.partition_spec_id;
+    if data_files
+        .iter()
+        .any(|data_file| data_file.partition_spec_id != partition_spec_id)
+    {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction manifest cannot mix partition spec ids".to_string(),
+        ));
+    }
+    Ok(partition_spec_id)
 }
 
 fn compact_parquet_data_files(input_files: &[(String, Vec<u8>)]) -> TableCatalogStoreResult<CompactedParquetFile> {
@@ -6302,35 +6433,6 @@ fn parquet_record_count(data: &[u8]) -> TableCatalogStoreResult<u64> {
         .map_err(|_| TableCatalogStoreError::Invalid("compaction parquet record count must not be negative".to_string()))
 }
 
-fn validate_unpartitioned_compaction_table(current_metadata: &serde_json::Value) -> TableCatalogStoreResult<()> {
-    let default_spec_id = current_metadata
-        .get("default-spec-id")
-        .and_then(serde_json::Value::as_i64)
-        .unwrap_or(0);
-    let Some(partition_specs) = current_metadata.get("partition-specs").and_then(serde_json::Value::as_array) else {
-        return Ok(());
-    };
-    let Some(default_spec) = partition_specs.iter().find(|spec| {
-        spec.get("spec-id")
-            .and_then(serde_json::Value::as_i64)
-            .is_some_and(|spec_id| spec_id == default_spec_id)
-    }) else {
-        return Err(TableCatalogStoreError::Invalid(
-            "compaction requires default partition spec metadata".to_string(),
-        ));
-    };
-    if default_spec
-        .get("fields")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|fields| !fields.is_empty())
-    {
-        return Err(TableCatalogStoreError::Invalid(
-            "compaction currently supports unpartitioned tables only".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 fn compacted_manifest_list_avro_bytes(summary: CompactionManifestListSummary<'_>) -> TableCatalogStoreResult<Vec<u8>> {
     let schema = apache_avro::Schema::parse_str(
         r#"
@@ -6372,7 +6474,7 @@ fn compacted_manifest_list_avro_bytes(summary: CompactionManifestListSummary<'_>
                 "manifest_length".to_string(),
                 apache_avro::types::Value::Long(i64::try_from(summary.manifest_length).unwrap_or(i64::MAX)),
             ),
-            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
+            ("partition_spec_id".to_string(), apache_avro::types::Value::Int(summary.partition_spec_id)),
             ("content".to_string(), apache_avro::types::Value::Int(0)),
             ("sequence_number".to_string(), apache_avro::types::Value::Long(summary.sequence_number)),
             (
@@ -6409,47 +6511,132 @@ fn compacted_manifest_list_avro_bytes(summary: CompactionManifestListSummary<'_>
         .map_err(|err| TableCatalogStoreError::Internal(format!("failed to flush compaction manifest list: {err}")))
 }
 
-fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<Vec<u8>> {
-    let schema = apache_avro::Schema::parse_str(
-        r#"
-        {
-          "type": "record",
-          "name": "manifest_entry",
-          "fields": [
+fn compacted_manifest_avro_schema(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<apache_avro::Schema> {
+    let partition_fields = compaction_partition_schema_fields(data_files)?;
+    let partition_schema_fields = partition_fields
+        .into_iter()
+        .map(|(name, field_type)| {
+            serde_json::json!({
+                "name": name,
+                "type": field_type
+            })
+        })
+        .collect::<Vec<_>>();
+    let schema = serde_json::json!({
+        "type": "record",
+        "name": "manifest_entry",
+        "fields": [
             {"name": "status", "type": "int"},
             {"name": "snapshot_id", "type": "long"},
             {"name": "sequence_number", "type": "long"},
             {"name": "file_sequence_number", "type": "long"},
             {
-              "name": "data_file",
-              "type": {
-                "type": "record",
                 "name": "data_file",
-                "fields": [
-                  {"name": "content", "type": "int"},
-                  {"name": "file_path", "type": "string"},
-                  {"name": "file_format", "type": "string"},
-                  {"name": "partition", "type": {"type": "record", "name": "partition", "fields": []}},
-                  {"name": "record_count", "type": "long"},
-                  {"name": "file_size_in_bytes", "type": "long"},
-                  {"name": "column_sizes", "type": ["null", {"type": "map", "values": "long"}], "default": null},
-                  {"name": "value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
-                  {"name": "null_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
-                  {"name": "nan_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
-                  {"name": "lower_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
-                  {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
-                  {"name": "key_metadata", "type": ["null", "bytes"], "default": null},
-                  {"name": "split_offsets", "type": ["null", {"type": "array", "items": "long"}], "default": null},
-                  {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}], "default": null},
-                  {"name": "sort_order_id", "type": ["null", "int"], "default": null}
-                ]
-              }
+                "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                        {"name": "content", "type": "int"},
+                        {"name": "file_path", "type": "string"},
+                        {"name": "file_format", "type": "string"},
+                        {
+                            "name": "partition",
+                            "type": {
+                                "type": "record",
+                                "name": "partition",
+                                "fields": partition_schema_fields
+                            }
+                        },
+                        {"name": "record_count", "type": "long"},
+                        {"name": "file_size_in_bytes", "type": "long"},
+                        {"name": "column_sizes", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                        {"name": "value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                        {"name": "null_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                        {"name": "nan_value_counts", "type": ["null", {"type": "map", "values": "long"}], "default": null},
+                        {"name": "lower_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                        {"name": "upper_bounds", "type": ["null", {"type": "map", "values": "bytes"}], "default": null},
+                        {"name": "key_metadata", "type": ["null", "bytes"], "default": null},
+                        {"name": "split_offsets", "type": ["null", {"type": "array", "items": "long"}], "default": null},
+                        {"name": "equality_ids", "type": ["null", {"type": "array", "items": "int"}], "default": null},
+                        {"name": "sort_order_id", "type": ["null", "int"], "default": null}
+                    ]
+                }
             }
-          ]
+        ]
+    });
+    apache_avro::Schema::parse_str(&schema.to_string())
+        .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction manifest schema: {err}")))
+}
+
+fn compaction_partition_schema_fields(
+    data_files: &[CompactedDataFile],
+) -> TableCatalogStoreResult<Vec<(String, serde_json::Value)>> {
+    let Some(first) = data_files.first() else {
+        return Ok(Vec::new());
+    };
+    let mut expected = Vec::with_capacity(first.partition.len());
+    for (field_name, field_value) in &first.partition {
+        let Some(field_type) = compaction_partition_field_schema(field_value) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction partition value type is unsupported".to_string(),
+            ));
+        };
+        expected.push((field_name.clone(), field_type));
+    }
+
+    for data_file in data_files.iter().skip(1) {
+        if data_file.partition.len() != expected.len() {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction manifest partition schemas must match".to_string(),
+            ));
         }
-        "#,
-    )
-    .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction manifest schema: {err}")))?;
+        for ((expected_name, expected_type), (field_name, field_value)) in expected.iter().zip(&data_file.partition) {
+            let Some(field_type) = compaction_partition_field_schema(field_value) else {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction partition value type is unsupported".to_string(),
+                ));
+            };
+            if expected_name != field_name || expected_type != &field_type {
+                return Err(TableCatalogStoreError::Invalid(
+                    "compaction manifest partition schemas must match".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(expected)
+}
+
+fn compaction_partition_field_schema(value: &apache_avro::types::Value) -> Option<serde_json::Value> {
+    match avro_non_union_value(value) {
+        apache_avro::types::Value::Boolean(_) => Some(serde_json::json!("boolean")),
+        apache_avro::types::Value::Int(_) => Some(serde_json::json!("int")),
+        apache_avro::types::Value::Long(_) => Some(serde_json::json!("long")),
+        apache_avro::types::Value::Float(_) => Some(serde_json::json!("float")),
+        apache_avro::types::Value::Double(_) => Some(serde_json::json!("double")),
+        apache_avro::types::Value::Bytes(_) => Some(serde_json::json!("bytes")),
+        apache_avro::types::Value::String(_) => Some(serde_json::json!("string")),
+        apache_avro::types::Value::Date(_) => Some(serde_json::json!({"type": "int", "logicalType": "date"})),
+        apache_avro::types::Value::TimeMillis(_) => Some(serde_json::json!({"type": "int", "logicalType": "time-millis"})),
+        apache_avro::types::Value::TimeMicros(_) => Some(serde_json::json!({"type": "long", "logicalType": "time-micros"})),
+        apache_avro::types::Value::TimestampMillis(_) => {
+            Some(serde_json::json!({"type": "long", "logicalType": "timestamp-millis"}))
+        }
+        apache_avro::types::Value::TimestampMicros(_) => {
+            Some(serde_json::json!({"type": "long", "logicalType": "timestamp-micros"}))
+        }
+        apache_avro::types::Value::LocalTimestampMillis(_) => {
+            Some(serde_json::json!({"type": "long", "logicalType": "local-timestamp-millis"}))
+        }
+        apache_avro::types::Value::LocalTimestampMicros(_) => {
+            Some(serde_json::json!({"type": "long", "logicalType": "local-timestamp-micros"}))
+        }
+        apache_avro::types::Value::Uuid(_) => Some(serde_json::json!({"type": "string", "logicalType": "uuid"})),
+        _ => None,
+    }
+}
+
+fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<Vec<u8>> {
+    let schema = compacted_manifest_avro_schema(data_files)?;
     let mut writer = apache_avro::Writer::new(&schema, Vec::new());
     for data_file in data_files {
         writer
@@ -6467,7 +6654,7 @@ fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatal
                         ("content".to_string(), apache_avro::types::Value::Int(0)),
                         ("file_path".to_string(), apache_avro::types::Value::String(data_file.file_path.clone())),
                         ("file_format".to_string(), apache_avro::types::Value::String("PARQUET".to_string())),
-                        ("partition".to_string(), apache_avro::types::Value::Record(Vec::new())),
+                        ("partition".to_string(), apache_avro::types::Value::Record(data_file.partition.clone())),
                         (
                             "record_count".to_string(),
                             apache_avro::types::Value::Long(i64::try_from(data_file.record_count).unwrap_or(i64::MAX)),
@@ -8217,6 +8404,7 @@ mod tests {
               "name": "manifest_file",
               "fields": [
                 {"name": "manifest_path", "type": "string"},
+                {"name": "partition_spec_id", "type": "int"},
                 {"name": "sequence_number", "type": "long"},
                 {"name": "added_snapshot_id", "type": "long"}
               ]
@@ -8232,6 +8420,7 @@ mod tests {
                         "manifest_path".to_string(),
                         apache_avro::types::Value::String((*manifest_path).to_string()),
                     ),
+                    ("partition_spec_id".to_string(), apache_avro::types::Value::Int(0)),
                     ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
                     ("added_snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
                 ]))
@@ -8301,6 +8490,68 @@ mod tests {
         writer.into_inner().expect("manifest avro bytes should flush")
     }
 
+    fn manifest_avro_bytes_with_dt_partition(files: &[(&str, i32, &str)]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": "long"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "file_sequence_number", "type": "long"},
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"},
+                      {"name": "partition", "type": {"type": "record", "name": "partition", "fields": [
+                        {"name": "dt", "type": "string"}
+                      ]}},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"}
+                    ]
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("partitioned manifest avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (file_path, content, partition_value) in files {
+            writer
+                .append(apache_avro::types::Value::Record(vec![
+                    ("status".to_string(), apache_avro::types::Value::Int(1)),
+                    ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    ("file_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    (
+                        "data_file".to_string(),
+                        apache_avro::types::Value::Record(vec![
+                            ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                            ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                            (
+                                "partition".to_string(),
+                                apache_avro::types::Value::Record(vec![(
+                                    "dt".to_string(),
+                                    apache_avro::types::Value::String((*partition_value).to_string()),
+                                )]),
+                            ),
+                            ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                            ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                        ]),
+                    ),
+                ]))
+                .expect("partitioned manifest record should append");
+        }
+        writer.into_inner().expect("partitioned manifest avro bytes should flush")
+    }
+
     fn parquet_i32_bytes(values: &[i32]) -> Vec<u8> {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(Arc::clone(&schema) as SchemaRef, vec![Arc::new(Int32Array::from(values.to_vec()))])
@@ -8343,30 +8594,6 @@ mod tests {
             values.extend((0..column.len()).map(|index| column.value(index)));
         }
         values
-    }
-
-    #[test]
-    fn compaction_partition_validation_rejects_partitioned_default_spec() {
-        let metadata = serde_json::json!({
-            "default-spec-id": 1,
-            "partition-specs": [
-                {
-                    "spec-id": 1,
-                    "fields": [
-                        {
-                            "source-id": 1,
-                            "field-id": 1000,
-                            "name": "dt",
-                            "transform": "identity"
-                        }
-                    ]
-                }
-            ]
-        });
-
-        let error = validate_unpartitioned_compaction_table(&metadata).expect_err("partitioned compaction should be rejected");
-
-        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("unpartitioned tables only")));
     }
 
     #[async_trait::async_trait]
@@ -10909,6 +11136,192 @@ mod tests {
         assert!(manifest_data_files.contains(&retained_data));
         assert!(!manifest_data_files.contains(&left_data));
         assert!(!manifest_data_files.contains(&right_data));
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_keeps_partition_rewrite_groups_isolated() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = "tables/table-id/data";
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let left_data = format!("{data_dir}/dt=2026-06-24/part-left.parquet");
+        let right_data = format!("{data_dir}/dt=2026-06-24/part-right.parquet");
+        let other_partition_data = format!("{data_dir}/dt=2026-06-25/part-only.parquet");
+        let left_parquet = parquet_i32_bytes(&[1, 2]);
+        let right_parquet = parquet_i32_bytes(&[3, 4]);
+        let other_partition_parquet = parquet_i32_bytes(&[5, 6]);
+        let small_file_threshold_bytes =
+            u64::try_from(left_parquet.len().max(right_parquet.len()).max(other_partition_parquet.len())).unwrap();
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &manifest,
+                manifest_avro_bytes_with_dt_partition(&[
+                    (&left_data, 0, "2026-06-24"),
+                    (&right_data, 0, "2026-06-24"),
+                    (&other_partition_data, 0, "2026-06-25"),
+                ]),
+            )
+            .await;
+        backend.seed_object(bucket, &left_data, left_parquet).await;
+        backend.seed_object(bucket, &right_data, right_parquet).await;
+        backend
+            .seed_object(bucket, &other_partition_data, other_partition_parquet)
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://analytics/tables/table-id",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 2000,
+                    "schemas": [
+                        {
+                            "schema-id": 0,
+                            "type": "struct",
+                            "fields": [
+                                {"id": 1, "name": "id", "required": true, "type": "int"},
+                                {"id": 2, "name": "dt", "required": false, "type": "string"}
+                            ]
+                        }
+                    ],
+                    "current-schema-id": 0,
+                    "partition-specs": [
+                        {
+                            "spec-id": 0,
+                            "fields": [
+                                {
+                                    "source-id": 2,
+                                    "field-id": 1000,
+                                    "name": "dt",
+                                    "transform": "identity"
+                                }
+                            ]
+                        }
+                    ],
+                    "default-spec-id": 0,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "sequence-number": 7,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list,
+                            "summary": {
+                                "operation": "append"
+                            }
+                        }
+                    ],
+                    "current-snapshot-id": 20,
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .commit_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 64 * 1024,
+                    small_file_threshold_bytes,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 128 * 1024,
+                },
+            )
+            .await
+            .expect("partition-local compaction rewrite should commit");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::Committed);
+        assert_eq!(report.candidate_file_count, 3);
+        assert_eq!(report.rewrite_group_count, 1);
+        let rewrite_group = report.rewrite_groups.first().expect("rewrite group should be reported");
+        assert_eq!(rewrite_group.input_file_locations, vec![left_data.clone(), right_data.clone()]);
+        let output_file = rewrite_group
+            .output_file_location
+            .as_ref()
+            .expect("rewrite group should include output data file");
+        assert!(output_file.starts_with("s3://analytics/tables/table-id/data/dt=2026-06-24/"));
+        let output_file_key =
+            table_catalog_object_key_from_location(bucket, output_file).expect("output file should be inside the table bucket");
+        let output_object = backend
+            .read_object(bucket, &output_file_key)
+            .await
+            .unwrap()
+            .expect("compacted partition data file should be written");
+        assert_eq!(parquet_i32_values(output_object.data), vec![1, 2, 3, 4]);
+        assert!(backend.object_exists(bucket, &other_partition_data).await.unwrap());
+
+        let table_entry = store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should still exist");
+        let metadata_object = backend
+            .read_object(bucket, &table_entry.metadata_location)
+            .await
+            .unwrap()
+            .expect("compaction metadata should be written");
+        let metadata = serde_json::from_slice::<serde_json::Value>(&metadata_object.data).unwrap();
+        let current_manifest_list = metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .last()
+            .and_then(|snapshot| snapshot.get("manifest-list"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let manifest_list_object = backend
+            .read_object(bucket, current_manifest_list)
+            .await
+            .unwrap()
+            .expect("compaction manifest list should be written");
+        let manifest_references = manifest_list_references_from_manifest_list_avro(&manifest_list_object.data).unwrap();
+        assert_eq!(manifest_references.len(), 1);
+        assert_eq!(manifest_references[0].partition_spec_id, Some(0));
+        let manifest_object = backend
+            .read_object(bucket, &manifest_references[0].manifest_path)
+            .await
+            .unwrap()
+            .expect("compaction manifest should be written");
+        let data_file_references = data_file_references_from_manifest_avro(&manifest_object.data).unwrap();
+        let output_reference = data_file_references
+            .iter()
+            .find(|reference| reference.location == *output_file)
+            .expect("compacted output should be present in the manifest");
+        assert_eq!(
+            output_reference.partition,
+            vec![("dt".to_string(), apache_avro::types::Value::String("2026-06-24".to_string()))]
+        );
+        let retained_reference = data_file_references
+            .iter()
+            .find(|reference| reference.location == other_partition_data)
+            .expect("retained partition file should stay in the manifest");
+        assert_eq!(
+            retained_reference.partition,
+            vec![("dt".to_string(), apache_avro::types::Value::String("2026-06-25".to_string()))]
+        );
     }
 
     #[tokio::test]

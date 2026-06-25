@@ -290,7 +290,7 @@ current unsupported inventory is:
 - manifest/data reachability cleanup: metadata maintenance reads manifest-list and manifest Avro references, reports manifest/data/delete reachability, and deletes only unreferenced table objects that pass the safety window
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
 - automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
-- compaction rewrite: controlled run-once support for unpartitioned Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
+- compaction rewrite: controlled run-once support for partition-local Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
 - row-level delete/update/merge commits: standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item
 - external catalog bridges: metadata import/register and operator-supplied metadata pointer sync are supported for Polaris/Glue/DLF/Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed
 - multi-table transactions: not a short-term production claim
