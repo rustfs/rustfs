@@ -87,6 +87,7 @@ RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_local_compat_glob_e
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
+RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_storage_mod_direct_storage_source_hits.txt"
 RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
@@ -762,7 +763,7 @@ fi
     --glob '!**/ecstore_test_compat/**' \
     --glob '!**/ecstore_fuzz_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod)\.rs|rustfs/src/storage/storage_api\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -971,6 +972,16 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::|^use rustfs_storage_api|rustfs_storage_api::' \
+    rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
+  report_failure "RustFS storage module root must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --no-heading 'pub\(crate\)\s+use rustfs_ecstore::api::bucket::\{[^}]*\b(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::bucket::(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|utils|versioning|versioning_sys)\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::\{[^}]*\bstorageclass\b[^}]*\}\s*;|pub\(crate\)\s+use rustfs_ecstore::api::config::storageclass\s*;' \
     rustfs/src/admin/storage_compat.rs 2>/dev/null || true
 ) >"$RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE"
@@ -1111,7 +1122,7 @@ fi
     --glob '!**/ecstore_compat.rs' \
     --glob '!**/ecstore_test_compat.rs' \
     --glob '!**/ecstore_test_compat/**' |
-    rg -v '^(fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/storage_api\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1137,7 +1148,7 @@ fi
     crates/e2e_test/src/replication_extension_test.rs \
     rustfs/src/admin/mod.rs \
     rustfs/src/app/mod.rs \
-    rustfs/src/storage/mod.rs \
+    rustfs/src/storage/storage_api.rs \
     fuzz/fuzz_targets/bucket_validation.rs \
     fuzz/fuzz_targets/path_containment.rs || true
 ) >"$COMPLETED_EXTERNAL_OWNER_MODULE_ALIAS_HITS_FILE"
@@ -1165,7 +1176,7 @@ fi
     crates/e2e_test/src/replication_extension_test.rs \
     rustfs/src/admin/mod.rs \
     rustfs/src/app/mod.rs \
-    rustfs/src/storage/mod.rs \
+    rustfs/src/storage/storage_api.rs \
     fuzz/fuzz_targets/bucket_validation.rs \
     fuzz/fuzz_targets/path_containment.rs || true
 ) >"$COMPLETED_OWNER_BARE_FACADE_IMPORT_HITS_FILE"
@@ -1193,7 +1204,7 @@ fi
     crates/e2e_test/src/replication_extension_test.rs \
     rustfs/src/admin/mod.rs \
     rustfs/src/app/mod.rs \
-    rustfs/src/storage/mod.rs \
+    rustfs/src/storage/storage_api.rs \
     fuzz/fuzz_targets/bucket_validation.rs \
     fuzz/fuzz_targets/path_containment.rs |
     rg -v '^[^:]+:[0-9]+:\s*(?:pub\(crate\)\s+)?use\s+rustfs_ecstore::api::[a-z_]+::' || true
