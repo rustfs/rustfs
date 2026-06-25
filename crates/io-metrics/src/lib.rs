@@ -182,6 +182,16 @@ fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
     }
 }
 
+#[inline(always)]
+fn usize_to_f64(value: usize) -> f64 {
+    value as f64
+}
+
+#[inline(always)]
+fn i64_non_negative_to_f64(value: i64) -> f64 {
+    value.max(0) as f64
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrackedMemoryGauge {
     GetObjectBufferedBytes,
@@ -266,9 +276,44 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
 pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
     counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
     histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
-        .record(buffer_size_bytes as f64);
+        .record(usize_to_f64(buffer_size_bytes));
     histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
-        .record(response_size_bytes.max(0) as f64);
+        .record(i64_non_negative_to_f64(response_size_bytes));
+}
+
+/// Record the response-body handoff shape from a GetObject reader into the S3 streaming body.
+#[inline(always)]
+pub fn record_get_object_response_handoff(
+    strategy: &str,
+    buffer_source: &str,
+    buffer_size_bytes: usize,
+    response_size_bytes: i64,
+    duration_secs: f64,
+) {
+    counter!(
+        "rustfs_io_get_object_response_handoff_total",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_io_get_object_response_handoff_buffer_size_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(usize_to_f64(buffer_size_bytes));
+    histogram!(
+        "rustfs_io_get_object_response_handoff_response_size_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(i64_non_negative_to_f64(response_size_bytes));
+    histogram!(
+        "rustfs_io_get_object_response_handoff_duration_seconds",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(duration_secs);
 }
 
 /// Record I/O queue congestion observation.
@@ -307,6 +352,126 @@ pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str,
     histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
 }
 
+/// Record the selected GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_path(path: &'static str) {
+    counter!("rustfs_io_get_object_reader_path_total", "path" => path).increment(1);
+}
+
+/// Record why the codec streaming reader was not selected.
+#[inline(always)]
+pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
+    counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
+}
+
+/// Record one decoded reader stripe processed by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_stripe(path: &'static str) {
+    counter!("rustfs_io_get_object_reader_stripes_total", "path" => path).increment(1);
+}
+
+/// Record bytes emitted by a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_bytes(path: &'static str, bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_bytes_total", "path" => path).increment(bytes);
+}
+
+/// Record one reader buffer produced by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_buffer(path: &'static str, role: &'static str, bytes: usize) {
+    histogram!("rustfs_io_get_object_reader_buffer_bytes", "path" => path, "role" => role).record(usize_to_f64(bytes));
+}
+
+/// Record one copy from a GetObject reader's internal buffer into the downstream read buffer.
+#[inline(always)]
+pub fn record_get_object_reader_copy(
+    path: &'static str,
+    bytes: usize,
+    read_buf_remaining_before: usize,
+    output_remaining_before: usize,
+    duration_secs: f64,
+) {
+    let bytes_counter = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_copy_chunks_total", "path" => path).increment(1);
+    counter!("rustfs_io_get_object_reader_copy_bytes_total", "path" => path).increment(bytes_counter);
+    histogram!("rustfs_io_get_object_reader_copy_bytes", "path" => path).record(usize_to_f64(bytes));
+    histogram!("rustfs_io_get_object_reader_copy_read_buf_remaining_bytes", "path" => path)
+        .record(usize_to_f64(read_buf_remaining_before));
+    histogram!("rustfs_io_get_object_reader_copy_output_remaining_bytes", "path" => path)
+        .record(usize_to_f64(output_remaining_before));
+    histogram!("rustfs_io_get_object_reader_copy_duration_seconds", "path" => path).record(duration_secs);
+}
+
+/// Record one downstream poll of the response-facing GetObject reader.
+#[inline(always)]
+pub fn record_get_object_reader_poll(
+    path: &'static str,
+    outcome: &'static str,
+    read_buf_remaining_before: usize,
+    filled_bytes: usize,
+    duration_secs: f64,
+) {
+    let filled_bytes_counter = u64::try_from(filled_bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_poll_total", "path" => path, "outcome" => outcome).increment(1);
+    counter!("rustfs_io_get_object_reader_poll_filled_bytes_total", "path" => path, "outcome" => outcome)
+        .increment(filled_bytes_counter);
+    histogram!("rustfs_io_get_object_reader_poll_read_buf_remaining_bytes", "path" => path, "outcome" => outcome)
+        .record(usize_to_f64(read_buf_remaining_before));
+    histogram!("rustfs_io_get_object_reader_poll_filled_bytes", "path" => path, "outcome" => outcome)
+        .record(usize_to_f64(filled_bytes));
+    histogram!("rustfs_io_get_object_reader_poll_duration_seconds", "path" => path, "outcome" => outcome).record(duration_secs);
+}
+
+/// Record a bounded prefetch outcome for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch(path: &'static str, outcome: &'static str) {
+    counter!("rustfs_io_get_object_reader_prefetch_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record how long a GetObject reader spent waiting for a prefetch/fill result.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch_wait(path: &'static str, duration_secs: f64) {
+    histogram!("rustfs_io_get_object_reader_prefetch_wait_seconds", "path" => path).record(duration_secs);
+}
+
+/// Record one underlying shard read attempt for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read(
+    path: &'static str,
+    role: &'static str,
+    outcome: &'static str,
+    bytes: usize,
+    duration_secs: f64,
+) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_shard_read_total", "path" => path, "role" => role, "outcome" => outcome).increment(1);
+    counter!("rustfs_io_get_object_shard_read_bytes_total", "path" => path, "role" => role, "outcome" => outcome)
+        .increment(bytes);
+    histogram!("rustfs_io_get_object_shard_read_duration_seconds", "path" => path, "role" => role, "outcome" => outcome)
+        .record(duration_secs);
+}
+
+#[inline(always)]
+fn shard_read_fanout_to_f64(value: usize) -> f64 {
+    u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+/// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read_fanout(
+    path: &'static str,
+    scheduled: usize,
+    completed: usize,
+    successful: usize,
+    failed: usize,
+) {
+    histogram!("rustfs_io_get_object_shard_read_scheduled", "path" => path).record(shard_read_fanout_to_f64(scheduled));
+    histogram!("rustfs_io_get_object_shard_read_completed", "path" => path).record(shard_read_fanout_to_f64(completed));
+    histogram!("rustfs_io_get_object_shard_read_successful", "path" => path).record(shard_read_fanout_to_f64(successful));
+    histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
+}
+
 /// Record GetObject metadata resolution duration.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
@@ -336,6 +501,12 @@ pub fn record_get_object_duplex_backpressure_duration(duration_secs: f64) {
 pub fn record_get_object_pipeline_failure(stage: &'static str, reason: &'static str) {
     counter!("rustfs_io_get_object_pipeline_failures_total", "path" => "legacy_duplex", "stage" => stage, "reason" => reason)
         .increment(1);
+}
+
+/// Record GetObject read pipeline failures for an explicit bounded path label.
+#[inline(always)]
+pub fn record_get_object_pipeline_failure_for_path(path: &'static str, stage: &'static str, reason: &'static str) {
+    counter!("rustfs_io_get_object_pipeline_failures_total", "path" => path, "stage" => stage, "reason" => reason).increment(1);
 }
 
 /// Record a zero-copy read operation.
@@ -935,11 +1106,22 @@ mod tests {
     #[test]
     fn test_record_get_object_stage_metrics() {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_reader_path("codec_streaming");
+        record_get_object_codec_streaming_fallback("range");
+        record_get_object_reader_stripe("codec_streaming");
+        record_get_object_reader_bytes("codec_streaming", 1024);
+        record_get_object_reader_buffer("codec_streaming", "output", 1024);
+        record_get_object_reader_copy("codec_streaming", 512, 8192, 1024, 0.0001);
+        record_get_object_reader_poll("codec_streaming", "ready_data", 8192, 512, 0.0002);
+        record_get_object_reader_prefetch("codec_streaming", "stored");
+        record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
+        record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
         record_get_object_metadata_phase_duration(0.002);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
         record_get_object_pipeline_failure("decode", "read_quorum");
+        record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
 
         assert!(0.005_f64.is_sign_positive());
     }

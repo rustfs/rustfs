@@ -73,6 +73,7 @@ Enhanced options:
   --retry-per-round            Retry count per failed round (default: 2)
   --retry-sleep-secs           Sleep seconds between retries (default: 2)
   --cooldown-secs              Sleep seconds between rounds/sizes (default: 0)
+  --round-cooldown-secs        Compatibility alias for --cooldown-secs
   --baseline-csv               Baseline median CSV to compare
   --extra-args                 Extra args appended to tool command, quoted as one string
 
@@ -130,6 +131,7 @@ parse_args() {
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --retry-sleep-secs) RETRY_SLEEP_SECS="$2"; shift 2 ;;
       --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
+      --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
@@ -421,12 +423,13 @@ run_one_attempt() {
 
 run_size() {
   local size="$1"
-  local round success attempt rc
+  local round success attempt rc max_attempts
+  max_attempts=$((RETRY_PER_ROUND + 1))
 
   for ((round=1; round<=ROUNDS; round++)); do
     success="no"
-    for ((attempt=1; attempt<=RETRY_PER_ROUND+1; attempt++)); do
-      echo "==== size=$size round=$round attempt=$attempt/${RETRY_PER_ROUND+1} ===="
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+      echo "==== size=$size round=$round attempt=$attempt/$max_attempts ===="
       rc="$(run_one_attempt "$size" "$round" "$attempt")"
       if [[ "$rc" == "ok" || "$DRY_RUN" == "true" ]]; then
         success="yes"
