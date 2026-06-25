@@ -19,12 +19,39 @@ use super::quota::checker::QuotaChecker;
 use super::storageclass;
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::ECStore;
+use super::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use super::storage_api::concurrency::{
+    self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_put_concurrency_aware_buffer_size,
+};
+use super::storage_api::deadlock_detector;
+use super::storage_api::ecfs::FS;
+use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::options::{
+    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+};
+use super::storage_api::request_context::{self, spawn_traced};
+use super::storage_api::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::storage_api::sse::{
+    DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
+    encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
+    extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
+};
+use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::{
+    RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
+    parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
+    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+};
 use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
 use super::{DiskError, is_all_buckets_not_found};
-use super::{DynReader, HashReader, WritePlan, wrap_reader};
 use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use super::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::{get_lock_acquire_timeout, is_valid_storage_class};
 use super::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
@@ -44,32 +71,14 @@ use super::{
     tagging::decode_tags,
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::context::{
-    AppContext, get_global_app_context, resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
+use crate::app::runtime_sources::{
+    AppContext, get_global_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
+    resolve_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
-use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
-use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
-};
-use crate::storage::ecfs::*;
-use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::options::{
-    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
-};
-use crate::storage::request_context::spawn_traced;
-use crate::storage::s3_api::multipart::parse_list_parts_params;
-use crate::storage::sse::{
-    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
-    map_get_object_reader_error,
-};
-use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
-use crate::storage::*;
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -78,6 +87,7 @@ use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
+use rustfs_config::MI_B;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -114,9 +124,20 @@ use rustfs_utils::http::{
 };
 use rustfs_utils::path::{encode_dir_object, is_dir_object, path_join_buf};
 use rustfs_zip::{ArchiveLimits, CompressionFormat};
-use s3s::dto::*;
+use s3s::dto::{
+    CacheControl, Checksum, ChecksumAlgorithm, ChecksumType, ContentDisposition, ContentEncoding, ContentLanguage, ContentType,
+    CopyObjectInput, CopyObjectOutput, CopyObjectResult, CopySource, DeleteObjectInput, DeleteObjectOutput, DeleteObjectsInput,
+    DeleteObjectsOutput, DeletedObject, ETag, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
+    GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
+    ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
+    PutObjectOutput, Range, ReplicationConfiguration, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus,
+    SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput,
+    ServerSideEncryption, StorageClass, StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+};
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+
+const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
@@ -135,7 +156,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use crate::storage::{
+use super::storage_api::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
@@ -247,6 +268,7 @@ struct GetObjectStrategyContext {
     #[allow(dead_code)]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
+    enable_readahead: bool,
 }
 
 struct GetObjectOutputContext {
@@ -260,6 +282,46 @@ enum GetObjectTimeoutStage {
     BeforeProcessing,
     DiskPermitWait { permit_wait_duration: Duration },
     BeforeRead,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetObjectStreamStrategy {
+    Standard,
+    LargeSequentialReadahead,
+}
+
+impl GetObjectStreamStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::LargeSequentialReadahead => "large_sequential_readahead",
+        }
+    }
+}
+
+const LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES: i64 = 1024 * 1024 * 1024;
+const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
+const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
+const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
+const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
+const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
+
+fn get_reader_stream_buffer_size_override() -> Option<usize> {
+    static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
+    *GET_READER_STREAM_BUFFER_SIZE_OVERRIDE.get_or_init(|| {
+        std::env::var(ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE)
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+    })
+}
+
+fn resolve_reader_stream_buffer_size(selected_size: usize, override_size: Option<usize>) -> (usize, &'static str) {
+    if let Some(override_size) = override_size.filter(|value| *value > 0) {
+        return (override_size, GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE);
+    }
+
+    (selected_size.max(1), GET_READER_STREAM_BUFFER_SOURCE_SELECTED)
 }
 
 async fn enqueue_transitioned_delete_cleanup(
@@ -291,7 +353,8 @@ async fn enqueue_transitioned_delete_cleanup(
 
     super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let mut expiry_state = super::lifecycle::bucket_lifecycle_ops::GLOBAL_ExpiryState.write().await;
+    let expiry_state = resolve_expiry_state_handle();
+    let mut expiry_state = expiry_state.write().await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
         warn!(
             bucket,
@@ -409,6 +472,43 @@ impl AsyncRead for PooledBufferReader {
     }
 }
 
+struct ChunkedBytesReader {
+    chunks: Vec<Bytes>,
+    chunk_index: usize,
+    chunk_offset: usize,
+}
+
+impl ChunkedBytesReader {
+    fn new(chunks: Vec<Bytes>) -> Self {
+        Self {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+        }
+    }
+}
+
+impl AsyncRead for ChunkedBytesReader {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        while self.chunk_index < self.chunks.len() {
+            let chunk = &self.chunks[self.chunk_index];
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+
+            let remaining = &chunk[self.chunk_offset..];
+            let to_read = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_read]);
+            self.chunk_offset += to_read;
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Determine if zero-copy write should be used for this PutObject operation.
 ///
 /// Zero-copy is beneficial for large objects without encryption or compression.
@@ -459,6 +559,34 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
                 return false;
             }
         }
+    }
+
+    true
+}
+
+fn should_use_zero_copy_eager_put_path(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> bool {
+    const ZERO_COPY_EAGER_PUT_MAX_SIZE: i64 = 32 * 1024 * 1024;
+
+    if is_extract || should_compress || server_side_encryption_requested {
+        return false;
+    }
+
+    if size <= 0 || size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
+        return false;
+    }
+
+    if !should_use_zero_copy(size, headers) {
+        return false;
+    }
+
+    if request_uses_aws_chunked(headers) && decoded_content_length_from_headers(headers).ok().flatten().is_none() {
+        return false;
     }
 
     true
@@ -563,6 +691,41 @@ where
     Ok(std::io::Cursor::new(buf))
 }
 
+async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut chunks = Vec::new();
+    let mut filled = 0usize;
+
+    while filled < size {
+        let Some(chunk) = body.next().await else {
+            return Err(s3_error!(IncompleteBody));
+        };
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        if filled.saturating_add(chunk.len()) > size {
+            return Err(s3_error!(UnexpectedContent));
+        }
+
+        rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
+        filled += chunk.len();
+        chunks.push(chunk);
+    }
+
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if !chunk.is_empty() {
+            return Err(s3_error!(UnexpectedContent));
+        }
+    }
+
+    Ok(ChunkedBytesReader::new(chunks))
+}
+
 fn object_seek_support_threshold() -> usize {
     static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
     *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
@@ -617,7 +780,7 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use crate::app::storage_api::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]
@@ -1347,6 +1510,10 @@ pub struct DefaultObjectUsecase {
 }
 
 impl DefaultObjectUsecase {
+    fn should_use_large_put_concurrency_tuning(size: i64) -> bool {
+        size >= DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES
+    }
+
     #[cfg(test)]
     pub fn without_context() -> Self {
         Self { context: None }
@@ -1405,15 +1572,45 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    fn build_reader_blob<R>(reader: R, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob>
+    fn select_stream_buffer_strategy(
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        enable_readahead: bool,
+        has_range: bool,
+    ) -> (usize, GetObjectStreamStrategy) {
+        if enable_readahead && !has_range && response_content_length >= LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES {
+            let expanded_buffer_size = optimal_buffer_size
+                .saturating_mul(LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER)
+                .min(LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES)
+                .max(optimal_buffer_size);
+            return (expanded_buffer_size, GetObjectStreamStrategy::LargeSequentialReadahead);
+        }
+
+        (optimal_buffer_size, GetObjectStreamStrategy::Standard)
+    }
+
+    fn build_reader_blob<R>(
+        reader: R,
+        response_content_length: i64,
+        stream_buffer_size: usize,
+        stream_strategy: GetObjectStreamStrategy,
+    ) -> Option<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + 'static,
     {
-        let expected = response_content_length.max(0) as usize;
+        let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let (stream_buffer_size, buffer_source) =
+            resolve_reader_stream_buffer_size(stream_buffer_size, get_reader_stream_buffer_size_override());
+        rustfs_io_metrics::record_get_object_stream_strategy(
+            stream_strategy.as_str(),
+            stream_buffer_size,
+            response_content_length,
+        );
+        let handoff_start = std::time::Instant::now();
         #[cfg(feature = "tracing-chunk-debug")]
         let stream = {
             let mut emitted = 0usize;
-            ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
+            ReaderStream::with_capacity(reader, stream_buffer_size).inspect(move |item| match item {
                 Ok(bytes) => {
                     emitted += bytes.len();
                     tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
@@ -1429,8 +1626,16 @@ impl DefaultObjectUsecase {
             })
         };
         #[cfg(not(feature = "tracing-chunk-debug"))]
-        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size);
-        Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
+        let stream = ReaderStream::with_capacity(reader, stream_buffer_size);
+        let blob = StreamingBlob::wrap(bytes_stream(stream, expected));
+        rustfs_io_metrics::record_get_object_response_handoff(
+            stream_strategy.as_str(),
+            buffer_source,
+            stream_buffer_size,
+            response_content_length,
+            handoff_start.elapsed().as_secs_f64(),
+        );
+        Some(blob)
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
@@ -1750,7 +1955,11 @@ impl DefaultObjectUsecase {
         queue_status: &concurrency::IoQueueStatus,
         concurrent_requests: usize,
     ) -> GetObjectStrategyContext {
-        let base_buffer_size = self.base_buffer_size();
+        let base_buffer_size = if response_content_length > 0 {
+            get_buffer_size_opt_in(response_content_length)
+        } else {
+            self.base_buffer_size()
+        };
 
         let is_sequential_hint = if rs.is_none() {
             true
@@ -1818,9 +2027,8 @@ impl DefaultObjectUsecase {
             "I/O priority finalized with actual request size"
         );
 
-        let base_buffer_size = get_buffer_size_opt_in(response_content_length);
         let optimal_buffer_size = if io_strategy.buffer_size > 0 {
-            io_strategy.buffer_size.min(base_buffer_size)
+            io_strategy.buffer_size
         } else {
             get_concurrency_aware_buffer_size(response_content_length, base_buffer_size)
         };
@@ -1829,10 +2037,12 @@ impl DefaultObjectUsecase {
             "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}, io_strategy={:?}",
             response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests, io_strategy.load_level
         );
+        let enable_readahead = io_strategy.enable_readahead;
 
         GetObjectStrategyContext {
             io_strategy,
             optimal_buffer_size,
+            enable_readahead,
         }
     }
 
@@ -1879,6 +2089,7 @@ impl DefaultObjectUsecase {
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
+        enable_readahead: bool,
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
@@ -1909,7 +2120,14 @@ impl DefaultObjectUsecase {
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
-            return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
+            let (stream_buffer_size, stream_strategy) =
+                Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+            return Ok(Self::build_reader_blob(
+                final_stream,
+                response_content_length,
+                stream_buffer_size,
+                stream_strategy,
+            ));
         }
 
         let should_provide_seek_support =
@@ -1935,7 +2153,14 @@ impl DefaultObjectUsecase {
             }
         }
 
-        Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size))
+        let (stream_buffer_size, stream_strategy) =
+            Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+        Ok(Self::build_reader_blob(
+            final_stream,
+            response_content_length,
+            stream_buffer_size,
+            stream_strategy,
+        ))
     }
 
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
@@ -2035,16 +2260,19 @@ impl DefaultObjectUsecase {
         let server_side_encryption_requested =
             server_side_encryption.is_some() || sse_customer_algorithm.is_some() || ssekms_key_id.is_some();
 
+        let mut put_request_guard = PutObjectGuard::new();
+        let concurrent_put_requests = PutObjectGuard::concurrent_requests();
+
         // Apply adaptive buffer sizing based on file size for optimal streaming performance.
         // Uses workload profile configuration (enabled by default) to select appropriate buffer size.
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
-        // Concurrency-aware adjustment reduces buffer size under high concurrency to lower memory pressure.
-        // TODO: get_concurrency_aware_buffer_size reads ACTIVE_GET_REQUESTS (GET concurrency tracker),
-        // not PUT concurrency. Under pure PUT load the counter stays zero so buffers never shrink;
-        // unrelated GET load can shrink PUT buffers instead. Fix by adding ACTIVE_PUT_REQUESTS +
-        // PutObjectGuard and using PUT concurrency here. See PR #3514 review comment.
+        // Concurrency-aware adjustment reduces buffer size under high PUT concurrency to lower memory pressure.
         let base_buffer_size = get_buffer_size_opt_in(size);
-        let buffer_size = get_concurrency_aware_buffer_size(size, base_buffer_size);
+        let buffer_size = if Self::should_use_large_put_concurrency_tuning(size) {
+            get_put_concurrency_aware_buffer_size(size, base_buffer_size)
+        } else {
+            base_buffer_size
+        };
 
         // Detect zero-copy opportunity before encryption/compression decisions
         // Zero-copy is beneficial for large unencrypted, uncompressed objects
@@ -2059,8 +2287,12 @@ impl DefaultObjectUsecase {
 
         let use_small_eager_put_path =
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_zero_copy_eager_put_path =
+            should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let put_path = if should_compress {
             "stream_compressed"
+        } else if use_zero_copy_eager_put_path {
+            "zero_copy_eager"
         } else if use_small_eager_put_path {
             "small_eager"
         } else {
@@ -2194,7 +2426,7 @@ impl DefaultObjectUsecase {
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
             let algorithm = CompressionAlgorithm::default();
-            insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -2205,14 +2437,19 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            if use_small_eager_put_path {
+            if use_zero_copy_eager_put_path {
+                let zero_copy_start = std::time::Instant::now();
+                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
+                rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
+                HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            } else if use_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -2388,6 +2625,7 @@ impl DefaultObjectUsecase {
                     "PutObject store write returned"
                 );
                 let result: S3Result<S3Response<PutObjectOutput>> = Err(err.into());
+                put_request_guard.finish_err();
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -2472,6 +2710,19 @@ impl DefaultObjectUsecase {
                 enable_zero_copy, // Track if zero-copy was enabled
             );
         }
+
+        debug!(
+            target: "rustfs::app::object_usecase",
+            component = "app",
+            subsystem = "object",
+            bucket = %bucket,
+            key = %key,
+            concurrent_put_requests,
+            buffer_size,
+            "PutObject request completed"
+        );
+
+        put_request_guard.finish_ok();
 
         result
     }
@@ -2614,6 +2865,7 @@ impl DefaultObjectUsecase {
         let GetObjectStrategyContext {
             io_strategy: _,
             optimal_buffer_size,
+            enable_readahead,
         } = strategy;
 
         let body = Self::build_get_object_body(
@@ -2621,6 +2873,7 @@ impl DefaultObjectUsecase {
             &info,
             response_content_length,
             optimal_buffer_size,
+            enable_readahead,
             part_number,
             rs.is_some(),
             encryption_applied,
@@ -3273,7 +3526,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                super::compression_metadata_value(CompressionAlgorithm::default()),
+                compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -4845,7 +5098,7 @@ impl DefaultObjectUsecase {
                     .map_err(ApiError::from)?
             } else if should_compress {
                 let algorithm = CompressionAlgorithm::default();
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;
@@ -4993,8 +5246,9 @@ mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, HeaderName, HeaderValue, Method, Uri};
     use s3s::dto::{
-        DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
-        ExistingObjectReplicationStatus, ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus,
+        Delete, DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
+        ExistingObjectReplicationStatus, ObjectIdentifier, ReplicaModifications, ReplicaModificationsStatus,
+        ReplicationConfiguration, ReplicationRule, ReplicationRuleStatus, RestoreRequest, SourceSelectionCriteria,
     };
     use std::pin::Pin;
     use std::sync::Arc;
@@ -5364,6 +5618,7 @@ mod tests {
             &info,
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
+            true,
             None,
             false,
             false,
@@ -5395,6 +5650,7 @@ mod tests {
             &info,
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
+            true,
             None,
             false,
             true,
@@ -5408,6 +5664,52 @@ mod tests {
             0,
             "large encrypted object response construction should not pre-read object data"
         );
+    }
+
+    #[test]
+    fn select_stream_buffer_strategy_expands_large_sequential_gets() {
+        let (buffer_size, strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(2_i64 * 1024 * 1024 * 1024, 2 * MI_B, true, false);
+
+        assert_eq!(strategy, GetObjectStreamStrategy::LargeSequentialReadahead);
+        assert_eq!(buffer_size, 4 * MI_B);
+    }
+
+    #[test]
+    fn select_stream_buffer_strategy_keeps_ranges_and_small_gets_standard() {
+        let (range_buffer_size, range_strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(2_i64 * 1024 * 1024 * 1024, 2 * MI_B, true, true);
+        assert_eq!(range_strategy, GetObjectStreamStrategy::Standard);
+        assert_eq!(range_buffer_size, 2 * MI_B);
+
+        let (small_buffer_size, small_strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(64 * 1024 * 1024, 512 * 1024, true, false);
+        assert_eq!(small_strategy, GetObjectStreamStrategy::Standard);
+        assert_eq!(small_buffer_size, 512 * 1024);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_keeps_selected_default() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, None);
+
+        assert_eq!(buffer_size, 128 * 1024);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_applies_positive_override() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, Some(MI_B));
+
+        assert_eq!(buffer_size, MI_B);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE);
+    }
+
+    #[test]
+    fn resolve_reader_stream_buffer_size_ignores_zero_override() {
+        let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, Some(0));
+
+        assert_eq!(buffer_size, 128 * 1024);
+        assert_eq!(source, GET_READER_STREAM_BUFFER_SOURCE_SELECTED);
     }
 
     #[test]
@@ -5472,6 +5774,24 @@ mod tests {
         assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
+    #[test]
+    fn should_use_zero_copy_eager_put_path_allows_large_plain_objects_within_cap() {
+        let headers = HeaderMap::new();
+
+        assert!(should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, false));
+        assert!(should_use_zero_copy_eager_put_path(32 * 1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(32 * 1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[test]
+    fn should_use_zero_copy_eager_put_path_rejects_compression_sse_and_extract() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, true, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, true, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, true));
+    }
+
     #[tokio::test]
     async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
         let pool = get_concurrency_manager().bytes_pool();
@@ -5495,6 +5815,42 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_reads_chunked_body() {
+        use tokio::io::AsyncReadExt;
+
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello ")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"world")),
+        ]);
+
+        let mut reader = read_zero_copy_put_body_exact(body, 11)
+            .await
+            .expect("zero-copy eager body read should succeed");
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("chunked bytes reader should be readable");
+
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_rejects_extra_bytes() {
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"!")),
+        ]);
+
+        let err = match read_zero_copy_put_body_exact(body, 5).await {
+            Ok(_) => panic!("extra bytes should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]

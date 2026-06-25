@@ -104,7 +104,7 @@ where
 
 impl SetDisks {
     async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !is_dist_erasure().await
+        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
     }
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
@@ -361,7 +361,7 @@ impl SetDisks {
         let version_id = version_id.to_string();
         let opts = opts.clone();
 
-        let processor = get_global_processors().read_processor();
+        let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
             .iter()
             .take(required_reads + 2) // Read a few extra for reliability
@@ -1187,7 +1187,7 @@ impl SetDisks {
                 files[idx].data.as_deref(),
                 disk_op.as_ref(),
                 bucket,
-                &format!("{}/{}/part.{}", object, files[idx].data_dir.clone().unwrap_or_default(), part_number),
+                &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
                 0,
                 till_offset,
                 erasure.shard_size(),
@@ -1234,8 +1234,8 @@ impl SetDisks {
 
         let total_shards = erasure.data_shards + erasure.parity_shards;
         let missing_shards = total_shards.saturating_sub(available_shards);
-        if missing_shards > 0 {
-            if let Err(e) =
+        if missing_shards > 0
+            && let Err(e) =
                 rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
                     bucket.to_string(),
                     Some(object.to_string()),
@@ -1245,18 +1245,23 @@ impl SetDisks {
                     Some(set_index),
                 ))
                 .await
-            {
-                warn!(
-                    bucket,
-                    object,
-                    part_number,
-                    error = %e,
-                    "Failed to enqueue heal request for missing shards"
-                );
-            }
+        {
+            warn!(
+                bucket,
+                object,
+                part_number,
+                error = %e,
+                "Failed to enqueue heal request for missing shards"
+            );
         }
 
-        let source = erasure_coding::decode::ParallelReader::new(readers, erasure.clone(), 0, part_size);
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+            readers,
+            erasure.clone(),
+            0,
+            part_size,
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
         let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
         let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
         Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))
@@ -1597,7 +1602,7 @@ mod tests {
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
                 );
 
-                let mut remote_fi = fi.clone();
+                let mut remote_fi = fi;
                 remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
                 let remote = codec_streaming_test_object_info(&remote_fi);
                 assert_eq!(

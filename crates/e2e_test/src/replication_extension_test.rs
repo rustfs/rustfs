@@ -14,6 +14,7 @@
 
 use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
+    rustfs_binary_path,
 };
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
@@ -21,6 +22,11 @@ use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
 use aws_sdk_s3::{Client, Config};
 use http::header::{CONTENT_TYPE, HOST};
+use local_ip_address::local_ip;
+use rcgen::{
+    BasicConstraints, CertificateParams, CertifiedIssuer, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose,
+    SanType, generate_simple_self_signed,
+};
 use reqwest::StatusCode;
 use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_madmin::{
@@ -33,8 +39,13 @@ use s3s::Body;
 use serial_test::serial;
 use std::collections::BTreeMap;
 use std::error::Error;
-use time::Duration as TimeDuration;
+use std::net::IpAddr;
+use std::path::Path;
+use std::process::Command;
+use time::{Duration as TimeDuration, OffsetDateTime};
+use tokio::fs;
 use tokio::time::{Duration, sleep};
+use uuid::Uuid;
 
 type TestResult = Result<(), Box<dyn Error + Send + Sync>>;
 
@@ -76,6 +87,39 @@ async fn signed_request(
 
     let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
     let client = local_http_client();
+    let mut request_builder = client.request(reqwest_method, url);
+    for (name, value) in signed.headers() {
+        request_builder = request_builder.header(name, value);
+    }
+    if let Some(body) = body {
+        request_builder = request_builder.body(body);
+    }
+
+    Ok(request_builder.send().await?)
+}
+
+async fn signed_request_with_client(
+    client: &reqwest::Client,
+    method: http::Method,
+    url: &str,
+    access_key: &str,
+    secret_key: &str,
+    body: Option<Vec<u8>>,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response, Box<dyn Error + Send + Sync>> {
+    let uri = url.parse::<http::Uri>()?;
+    let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
+    let mut request = http::Request::builder().method(method.clone()).uri(uri);
+    request = request.header(HOST, authority);
+    request = request.header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
+    if let Some(content_type) = content_type {
+        request = request.header(CONTENT_TYPE, content_type);
+    }
+
+    let content_len = body.as_ref().map(|body| body.len() as i64).unwrap_or_default();
+    let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
+
+    let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())?;
     let mut request_builder = client.request(reqwest_method, url);
     for (name, value) in signed.headers() {
         request_builder = request_builder.header(name, value);
@@ -146,22 +190,57 @@ fn parse_assume_role_credentials(xml: &str) -> Result<(String, String, String), 
     Ok((access_key, secret_key, session_token))
 }
 
+struct ReplicationTargetOptions<'a> {
+    endpoint: &'a str,
+    access_key: &'a str,
+    secret_key: &'a str,
+    target_bucket: &'a str,
+    secure: bool,
+    skip_tls_verify: bool,
+    ca_cert_pem: Option<&'a str>,
+}
+
 async fn set_replication_target(
     source_env: &RustFSTestEnvironment,
     source_bucket: &str,
     target_env: &RustFSTestEnvironment,
     target_bucket: &str,
 ) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let body = serde_json::json!({
-        "endpoint": target_env.address,
-        "credentials": {
-            "accessKey": target_env.access_key,
-            "secretKey": target_env.secret_key
+    set_replication_target_with_options(
+        source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: &target_env.address,
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: false,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
         },
-        "targetbucket": target_bucket,
-        "secure": false,
+    )
+    .await
+}
+
+async fn set_replication_target_with_options(
+    source_env: &RustFSTestEnvironment,
+    source_bucket: &str,
+    options: ReplicationTargetOptions<'_>,
+) -> Result<String, Box<dyn Error + Send + Sync>> {
+    let mut body = serde_json::json!({
+        "endpoint": options.endpoint,
+        "credentials": {
+            "accessKey": options.access_key,
+            "secretKey": options.secret_key
+        },
+        "targetbucket": options.target_bucket,
+        "secure": options.secure,
+        "skipTlsVerify": options.skip_tls_verify,
         "type": "replication"
     });
+    if let Some(ca_cert_pem) = options.ca_cert_pem {
+        body["caCertPem"] = serde_json::Value::String(ca_cert_pem.to_string());
+    }
     let url = format!(
         "{}/rustfs/admin/v3/set-remote-target?bucket={}",
         source_env.url,
@@ -332,6 +411,241 @@ async fn enable_bucket_versioning(env: &RustFSTestEnvironment, bucket: &str) -> 
         .send()
         .await?;
     Ok(())
+}
+
+fn insecure_https_client() -> Result<reqwest::Client, Box<dyn Error + Send + Sync>> {
+    Ok(reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .build()?)
+}
+
+fn trusted_https_client(ca_cert_pem: &str) -> Result<reqwest::Client, Box<dyn Error + Send + Sync>> {
+    let ca_cert = reqwest::Certificate::from_pem(ca_cert_pem.as_bytes())?;
+    Ok(reqwest::Client::builder().no_proxy().add_root_certificate(ca_cert).build()?)
+}
+
+async fn new_private_tmp_test_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    let temp_dir = format!("/private/tmp/rustfs_e2e_test_{}", Uuid::new_v4());
+    fs::create_dir_all(&temp_dir)
+        .await
+        .map_err(|err| std::io::Error::other(format!("create temp dir {temp_dir} failed: {err}")))?;
+    let port = RustFSTestEnvironment::find_available_port()
+        .await
+        .map_err(|err| std::io::Error::other(format!("find available port failed: {err}")))?;
+    let address = format!("127.0.0.1:{port}");
+    let url = format!("http://{address}");
+
+    Ok(RustFSTestEnvironment {
+        temp_dir,
+        address,
+        url,
+        access_key: "rustfsadmin".to_string(),
+        secret_key: "rustfsadmin".to_string(),
+        process: None,
+    })
+}
+
+async fn new_private_tmp_https_target_env() -> Result<RustFSTestEnvironment, Box<dyn Error + Send + Sync>> {
+    let mut env = new_private_tmp_test_env().await?;
+    let public_ip = local_ip().map_err(|err| std::io::Error::other(format!("resolve local IP failed: {err}")))?;
+    let port = env
+        .address
+        .rsplit(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target env address missing port"))?
+        .to_string();
+    env.address = format!("0.0.0.0:{port}");
+    env.url = format!("https://{public_ip}:{port}");
+    Ok(env)
+}
+
+async fn generate_self_signed_tls_material(tls_dir: &Path, additional_san: &str) -> Result<(), Box<dyn Error + Send + Sync>> {
+    fs::create_dir_all(tls_dir).await?;
+    let cert = generate_simple_self_signed(vec!["localhost".to_string(), "127.0.0.1".to_string(), additional_san.to_string()])?;
+    fs::write(tls_dir.join("rustfs_cert.pem"), cert.cert.pem()).await?;
+    fs::write(tls_dir.join("rustfs_key.pem"), cert.signing_key.serialize_pem()).await?;
+    Ok(())
+}
+
+fn test_certificate_params(common_name: &str) -> CertificateParams {
+    let mut params = CertificateParams::default();
+    let issued_at = OffsetDateTime::now_utc() - TimeDuration::minutes(5);
+    params.not_before = issued_at;
+    params.not_after = issued_at + TimeDuration::days(1);
+    params.distinguished_name.push(DnType::CountryName, "US");
+    params.distinguished_name.push(DnType::OrganizationName, "RustFS");
+    params.distinguished_name.push(DnType::CommonName, common_name);
+    params
+}
+
+async fn generate_private_ca_tls_material(tls_dir: &Path, additional_san: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
+    fs::create_dir_all(tls_dir).await?;
+
+    let ca_key = KeyPair::generate()?;
+    let mut ca_params = test_certificate_params("RustFS Replication Test CA");
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca = CertifiedIssuer::self_signed(ca_params, ca_key)?;
+
+    let server_key = KeyPair::generate()?;
+    let mut server_params = test_certificate_params("localhost");
+    server_params.is_ca = IsCa::ExplicitNoCa;
+    server_params.key_usages = vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment];
+    server_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    server_params
+        .subject_alt_names
+        .push(SanType::DnsName("localhost".try_into()?));
+    server_params
+        .subject_alt_names
+        .push(SanType::IpAddress("127.0.0.1".parse::<IpAddr>()?));
+    match additional_san.parse::<IpAddr>() {
+        Ok(ip) => server_params.subject_alt_names.push(SanType::IpAddress(ip)),
+        Err(_) => server_params
+            .subject_alt_names
+            .push(SanType::DnsName(additional_san.try_into()?)),
+    }
+
+    let server_cert = server_params.signed_by(&server_key, &ca)?;
+    let ca_cert_pem = ca.pem();
+    fs::write(tls_dir.join("rustfs_cert.pem"), server_cert.pem()).await?;
+    fs::write(tls_dir.join("rustfs_key.pem"), server_key.serialize_pem()).await?;
+    fs::write(tls_dir.join("ca.crt"), &ca_cert_pem).await?;
+
+    Ok(ca_cert_pem)
+}
+
+async fn start_https_rustfs_server(env: &mut RustFSTestEnvironment, tls_dir: &Path) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let binary_path = rustfs_binary_path();
+    let process = Command::new(&binary_path)
+        .env("RUST_LOG", "rustfs=info,rustfs_notify=debug")
+        .env("RUSTFS_TLS_PATH", tls_dir)
+        .env("RUSTFS_CONSOLE_ENABLE", "false")
+        .args([
+            "--address",
+            &env.address,
+            "--access-key",
+            &env.access_key,
+            "--secret-key",
+            &env.secret_key,
+            &env.temp_dir,
+        ])
+        .spawn()?;
+    env.process = Some(process);
+    Ok(())
+}
+
+async fn wait_for_https_server_ready(
+    client: &reqwest::Client,
+    env: &RustFSTestEnvironment,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let url = format!("{}/", env.url);
+
+    for _ in 0..60 {
+        match signed_request_with_client(client, http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(_) | Err(_) => sleep(Duration::from_millis(500)).await,
+        }
+    }
+
+    Err("RustFS HTTPS server failed to become ready within 30 seconds".into())
+}
+
+async fn ensure_https_bucket_exists(
+    client: &reqwest::Client,
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let bucket_url = format!("{}/{bucket}/", env.url);
+    let response =
+        signed_request_with_client(client, http::Method::HEAD, &bucket_url, &env.access_key, &env.secret_key, None, None).await?;
+
+    if response.status() == StatusCode::OK {
+        return Ok(());
+    }
+
+    let response = signed_request_with_client(
+        client,
+        http::Method::PUT,
+        &bucket_url,
+        &env.access_key,
+        &env.secret_key,
+        Some(Vec::new()),
+        None,
+    )
+    .await?;
+    match response.status() {
+        StatusCode::OK | StatusCode::CONFLICT => Ok(()),
+        status => Err(format!("unexpected HTTPS bucket setup status: {status}").into()),
+    }
+}
+
+async fn enable_bucket_versioning_over_https(
+    client: &reqwest::Client,
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let body = r#"<VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
+    let url = format!("{}/{bucket}?versioning", env.url);
+    let response = signed_request_with_client(
+        client,
+        http::Method::PUT,
+        &url,
+        &env.access_key,
+        &env.secret_key,
+        Some(body.as_bytes().to_vec()),
+        Some("application/xml"),
+    )
+    .await?;
+
+    if response.status() != StatusCode::OK {
+        let status = response.status();
+        let body = response.text().await.unwrap_or_default();
+        return Err(format!("enable HTTPS bucket versioning failed: {status} {body}").into());
+    }
+
+    Ok(())
+}
+
+async fn wait_for_replicated_object_over_https(
+    client: &reqwest::Client,
+    env: &RustFSTestEnvironment,
+    bucket: &str,
+    key: &str,
+    expected_body: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    let url = format!("{}/{bucket}/{key}", env.url);
+
+    loop {
+        let response =
+            signed_request_with_client(client, http::Method::GET, &url, &env.access_key, &env.secret_key, None, None).await?;
+
+        match response.status() {
+            StatusCode::OK => {
+                let body = response.text().await?;
+                if body == expected_body {
+                    return Ok(());
+                }
+                return Err(format!("replicated HTTPS object body mismatch: expected {expected_body}, got {body}").into());
+            }
+            StatusCode::NOT_FOUND if tokio::time::Instant::now() < deadline => {
+                sleep(Duration::from_secs(1)).await;
+            }
+            status if tokio::time::Instant::now() < deadline => {
+                let body = response.text().await.unwrap_or_default();
+                if body.contains("NoSuchKey") || body.contains("NotFound") {
+                    sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+                return Err(format!("unexpected HTTPS replication read status: {status} {body}").into());
+            }
+            status => {
+                let body = response.text().await.unwrap_or_default();
+                return Err(format!("HTTPS replicated object was not readable in time: {status} {body}").into());
+            }
+        }
+    }
 }
 
 fn create_user_s3_client(env: &RustFSTestEnvironment, access_key: &str, secret_key: &str) -> Client {
@@ -1402,6 +1716,359 @@ async fn test_set_remote_target_rejects_invalid_target_url() -> Result<(), Box<d
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert!(body.contains("InvalidRequest"), "unexpected response: {body}");
     assert!(body.to_ascii_lowercase().contains("invalid target url"), "unexpected response: {body}");
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_rejects_self_signed_https_target_without_skip_tls_verify()
+-> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = new_private_tmp_test_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
+    source_env
+        .start_rustfs_server(vec![])
+        .await
+        .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
+
+    let mut target_env = new_private_tmp_https_target_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    generate_self_signed_tls_material(&tls_dir, &target_host)
+        .await
+        .map_err(|err| std::io::Error::other(format!("generate self-signed TLS material failed: {err}")))?;
+    start_https_rustfs_server(&mut target_env, &tls_dir)
+        .await
+        .map_err(|err| std::io::Error::other(format!("start target HTTPS server failed: {err}")))?;
+    let https_client =
+        insecure_https_client().map_err(|err| std::io::Error::other(format!("build HTTPS client failed: {err}")))?;
+    wait_for_https_server_ready(&https_client, &target_env)
+        .await
+        .map_err(|err| std::io::Error::other(format!("wait for target HTTPS server ready failed: {err}")))?;
+
+    let source_bucket = "replication-self-signed-src";
+    let target_bucket = "replication-self-signed-dst";
+
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source bucket failed: {err}")))?;
+    enable_bucket_versioning(&source_env, source_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable source bucket versioning failed: {err}")))?;
+
+    ensure_https_bucket_exists(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target HTTPS bucket failed: {err}")))?;
+    enable_bucket_versioning_over_https(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable target HTTPS bucket versioning failed: {err}")))?;
+
+    let err = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await
+    .expect_err("self-signed HTTPS target should fail without skipTlsVerify");
+    let err = err.to_string();
+
+    assert!(err.contains("400 Bad Request"), "unexpected HTTPS target setup error: {err}");
+    assert!(err.contains("InvalidRequest"), "unexpected HTTPS target setup error: {err}");
+    assert!(
+        err.to_ascii_lowercase().contains("certificate") || err.to_ascii_lowercase().contains("tls"),
+        "unexpected HTTPS target setup error: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_allows_self_signed_https_target_with_skip_tls_verify() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut source_env = new_private_tmp_test_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
+    source_env
+        .start_rustfs_server(vec![])
+        .await
+        .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
+
+    let mut target_env = new_private_tmp_https_target_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    generate_self_signed_tls_material(&tls_dir, &target_host)
+        .await
+        .map_err(|err| std::io::Error::other(format!("generate self-signed TLS material failed: {err}")))?;
+    start_https_rustfs_server(&mut target_env, &tls_dir)
+        .await
+        .map_err(|err| std::io::Error::other(format!("start target HTTPS server failed: {err}")))?;
+    let https_client =
+        insecure_https_client().map_err(|err| std::io::Error::other(format!("build HTTPS client failed: {err}")))?;
+    wait_for_https_server_ready(&https_client, &target_env)
+        .await
+        .map_err(|err| std::io::Error::other(format!("wait for target HTTPS server ready failed: {err}")))?;
+
+    let source_bucket = "replication-self-signed-ok-src";
+    let target_bucket = "replication-self-signed-ok-dst";
+    let object_key = "self-signed-replication.txt";
+    let body = "replication over self-signed https should succeed";
+
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source bucket failed: {err}")))?;
+    enable_bucket_versioning(&source_env, source_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable source bucket versioning failed: {err}")))?;
+
+    ensure_https_bucket_exists(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target HTTPS bucket failed: {err}")))?;
+    enable_bucket_versioning_over_https(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable target HTTPS bucket versioning failed: {err}")))?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: true,
+            ca_cert_pem: None,
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(&https_client, &target_env, target_bucket, object_key, body).await?;
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_rejects_private_ca_https_target_without_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>>
+{
+    init_logging();
+
+    let mut source_env = new_private_tmp_test_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
+    source_env
+        .start_rustfs_server(vec![])
+        .await
+        .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
+
+    let mut target_env = new_private_tmp_https_target_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    let ca_cert_pem = generate_private_ca_tls_material(&tls_dir, &target_host)
+        .await
+        .map_err(|err| std::io::Error::other(format!("generate private CA TLS material failed: {err}")))?;
+    start_https_rustfs_server(&mut target_env, &tls_dir)
+        .await
+        .map_err(|err| std::io::Error::other(format!("start target HTTPS server failed: {err}")))?;
+    let https_client =
+        trusted_https_client(&ca_cert_pem).map_err(|err| std::io::Error::other(format!("build HTTPS client failed: {err}")))?;
+    wait_for_https_server_ready(&https_client, &target_env)
+        .await
+        .map_err(|err| std::io::Error::other(format!("wait for target HTTPS server ready failed: {err}")))?;
+
+    let source_bucket = "replication-private-ca-src";
+    let target_bucket = "replication-private-ca-dst";
+
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source bucket failed: {err}")))?;
+    enable_bucket_versioning(&source_env, source_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable source bucket versioning failed: {err}")))?;
+
+    ensure_https_bucket_exists(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target HTTPS bucket failed: {err}")))?;
+    enable_bucket_versioning_over_https(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable target HTTPS bucket versioning failed: {err}")))?;
+
+    let err = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: None,
+        },
+    )
+    .await
+    .expect_err("private CA HTTPS target should fail without caCertPem");
+    let err = err.to_string();
+
+    assert!(err.contains("400 Bad Request"), "unexpected private CA target setup error: {err}");
+    assert!(err.contains("InvalidRequest"), "unexpected private CA target setup error: {err}");
+    assert!(
+        err.to_ascii_lowercase().contains("certificate") || err.to_ascii_lowercase().contains("tls"),
+        "unexpected private CA target setup error: {err}"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+#[serial]
+async fn test_set_remote_target_allows_private_ca_https_target_with_ca_cert_pem() -> Result<(), Box<dyn Error + Send + Sync>> {
+    init_logging();
+
+    let mut source_env = new_private_tmp_test_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source env failed: {err}")))?;
+    source_env
+        .start_rustfs_server(vec![])
+        .await
+        .map_err(|err| std::io::Error::other(format!("start source HTTP server failed: {err}")))?;
+
+    let mut target_env = new_private_tmp_https_target_env()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target env failed: {err}")))?;
+    let tls_dir = std::path::PathBuf::from(&target_env.temp_dir).join("tls");
+    let target_host = target_env
+        .url
+        .trim_start_matches("https://")
+        .split(':')
+        .next()
+        .ok_or_else(|| std::io::Error::other("target HTTPS URL missing host"))?
+        .to_string();
+    let ca_cert_pem = generate_private_ca_tls_material(&tls_dir, &target_host)
+        .await
+        .map_err(|err| std::io::Error::other(format!("generate private CA TLS material failed: {err}")))?;
+    start_https_rustfs_server(&mut target_env, &tls_dir)
+        .await
+        .map_err(|err| std::io::Error::other(format!("start target HTTPS server failed: {err}")))?;
+    let https_client =
+        trusted_https_client(&ca_cert_pem).map_err(|err| std::io::Error::other(format!("build HTTPS client failed: {err}")))?;
+    wait_for_https_server_ready(&https_client, &target_env)
+        .await
+        .map_err(|err| std::io::Error::other(format!("wait for target HTTPS server ready failed: {err}")))?;
+
+    let source_bucket = "replication-private-ca-ok-src";
+    let target_bucket = "replication-private-ca-ok-dst";
+    let object_key = "private-ca-replication.txt";
+    let body = "replication over private ca https should succeed";
+
+    let source_client = source_env.create_s3_client();
+    source_client
+        .create_bucket()
+        .bucket(source_bucket)
+        .send()
+        .await
+        .map_err(|err| std::io::Error::other(format!("create source bucket failed: {err}")))?;
+    enable_bucket_versioning(&source_env, source_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable source bucket versioning failed: {err}")))?;
+
+    ensure_https_bucket_exists(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("create target HTTPS bucket failed: {err}")))?;
+    enable_bucket_versioning_over_https(&https_client, &target_env, target_bucket)
+        .await
+        .map_err(|err| std::io::Error::other(format!("enable target HTTPS bucket versioning failed: {err}")))?;
+
+    let target_arn = set_replication_target_with_options(
+        &source_env,
+        source_bucket,
+        ReplicationTargetOptions {
+            endpoint: target_env.url.trim_start_matches("https://"),
+            access_key: &target_env.access_key,
+            secret_key: &target_env.secret_key,
+            target_bucket,
+            secure: true,
+            skip_tls_verify: false,
+            ca_cert_pem: Some(&ca_cert_pem),
+        },
+    )
+    .await?;
+    put_bucket_replication(&source_env, source_bucket, &target_arn).await?;
+
+    let response = run_replication_check(&source_env, source_bucket).await?;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    source_client
+        .put_object()
+        .bucket(source_bucket)
+        .key(object_key)
+        .body(ByteStream::from(body.as_bytes().to_vec()))
+        .send()
+        .await?;
+
+    wait_for_replicated_object_over_https(&https_client, &target_env, target_bucket, object_key, body).await?;
 
     Ok(())
 }

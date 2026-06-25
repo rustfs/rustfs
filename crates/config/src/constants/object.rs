@@ -281,6 +281,19 @@ pub const ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT: &str = "RUSTFS_OBJECT_LOCK_ACQUIRE_TI
 /// Default lock acquisition timeout: 5 seconds.
 pub const DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT: u64 = 5;
 
+/// Environment variable for remote namespace lock RPC transport timeout in milliseconds.
+///
+/// This timeout bounds the internode RPC call itself. It is intentionally
+/// separate from `RUSTFS_OBJECT_LOCK_ACQUIRE_TIMEOUT` and the distributed lock
+/// per-attempt acquire budget so short lock-contention windows do not become
+/// aggressive network deadlines.
+///
+/// Default: 3000 milliseconds (can be overridden by `RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS`).
+pub const ENV_OBJECT_LOCK_RPC_TIMEOUT_MS: &str = "RUSTFS_OBJECT_LOCK_RPC_TIMEOUT_MS";
+
+/// Default remote lock RPC transport timeout: 3000 milliseconds.
+pub const DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS: u64 = 3000;
+
 /// Environment variable to enable object namespace lock diagnostics.
 ///
 /// When enabled, RustFS emits slow lock acquisition and long lock hold

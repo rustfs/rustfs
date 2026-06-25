@@ -26,7 +26,7 @@ use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
 use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
 use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
 use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
-use rustfs_ecstore::api::global::GLOBAL_TierConfigMgr;
+use rustfs_ecstore::api::global::get_global_tier_config_mgr;
 use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_ecstore::api::tier::tier_config::{TierConfig, TierMinIO, TierType};
@@ -423,7 +423,8 @@ async fn create_test_tier(server: u32) {
             })
         },
     };
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr_handle = get_global_tier_config_mgr();
+    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     if let Err(err) = tier_config_mgr.add(args, false).await {
         println!("tier_config_mgr add failed, e: {err:?}");
         panic!("tier add failed. {err}");
@@ -761,7 +762,8 @@ impl ScannerWarmBackend for MockWarmBackend {
 
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     let backend = MockWarmBackend::default();
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr_handle = get_global_tier_config_mgr();
+    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     tier_config_mgr.tiers.insert(
         tier_name.to_string(),
         TierConfig {
