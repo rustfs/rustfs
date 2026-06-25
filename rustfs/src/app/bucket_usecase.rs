@@ -14,11 +14,6 @@
 
 //! Bucket application use-case contracts.
 
-use super::s3_api::bucket::{
-    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
-    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
-    rustfs_owner,
-};
 use super::storage_api::ECStore;
 use super::storage_api::StorageObjectInfo as ObjectInfo;
 use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
@@ -46,6 +41,15 @@ use super::storage_api::data_usage::remove_bucket_usage_from_backend;
 use super::storage_api::error::StorageError;
 use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::object_utils::to_s3s_etag;
+use super::storage_api::s3_api::bucket::{
+    ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+    build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
+    rustfs_owner,
+};
+use super::storage_api::{
+    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
+};
 use super::storage_api::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
@@ -70,10 +74,6 @@ use rustfs_policy::policy::{
     {BucketPolicy, BucketPolicyArgs, Effect, Validator},
 };
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
-};
 use rustfs_targets::{
     EventName,
     arn::{ARN, TargetIDError},

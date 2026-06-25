@@ -12,11 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
-use rustfs_storage_api::{
-    CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
+use crate::storage_api::{
+    CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, EndpointServerPools, MemorySamplingState, ObservabilitySnapshot,
     ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
-    UserspaceProfilingCapability,
+    UserspaceProfilingCapability, topology_snapshot_from_endpoint_pools_with_capabilities,
 };
 
 const NOT_WIRED_INTO_RUNTIME: &str = "not wired into runtime";
@@ -185,8 +184,9 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_api::{Endpoint, Endpoints, PoolEndpoints};
-    use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
+    use crate::storage_api::{
+        CapabilityState, Endpoint, Endpoints, ObservabilitySnapshotProvider, PoolEndpoints, TopologySnapshotProvider,
+    };
 
     #[tokio::test]
     async fn observability_provider_returns_platform_snapshot() {

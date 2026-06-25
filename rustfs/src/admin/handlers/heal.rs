@@ -15,6 +15,7 @@
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::resolve_object_store_handle;
+use crate::admin::storage_api::HealOperations as _;
 use crate::admin::storage_api::ecstore_utils::is_valid_object_prefix;
 use crate::admin::storage_api::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::spawn_traced;
@@ -29,7 +30,6 @@ use rustfs_config::MAX_HEAL_REQUEST_SIZE;
 use rustfs_heal::heal::utils::format_set_disk_id;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_scanner::scanner::{BackgroundHealInfo, read_background_heal_info};
-use rustfs_storage_api::HealOperations as _;
 use rustfs_utils::path::path_join;
 use s3s::header::{CONTENT_LENGTH, CONTENT_TYPE};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};

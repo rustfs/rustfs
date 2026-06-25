@@ -234,9 +234,8 @@ pub async fn init_event_notifier() {
 #[cfg(test)]
 mod tests {
     use super::{convert_ecstore_object_info, parse_host_and_port};
-    use crate::storage_api::StorageObjectInfo;
+    use crate::storage_api::{StorageObjectInfo, TransitionedObject};
     use chrono::{DateTime, Utc};
-    use rustfs_storage_api::TransitionedObject;
     use std::{collections::HashMap, sync::Arc};
     use time::{Duration, OffsetDateTime};
 

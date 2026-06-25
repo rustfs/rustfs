@@ -14,6 +14,7 @@
 
 //! Admin application use-case contracts.
 
+use super::storage_api::StorageAdminApi;
 use super::storage_api::admin::get_server_info;
 use super::storage_api::capacity::{
     PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
@@ -29,7 +30,6 @@ use crate::error::ApiError;
 use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
-use rustfs_storage_api::StorageAdminApi;
 use s3s::S3ErrorCode;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};

@@ -411,6 +411,13 @@ pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_
 pub(crate) use crate::storage::StorageObjectOptions;
 pub(crate) use crate::storage::access::{ReqInfo, authorize_request};
 pub(crate) use crate::storage::request_context::{RequestContext, spawn_traced};
+pub(crate) use rustfs_storage_api::{
+    BucketOperations, BucketOptions, CapabilitySnapshotError, CapabilityState, CapabilityStatus, DeleteBucketOptions,
+    HealOperations, ListOperations, MakeBucketOptions, ObjectIO, ObjectOperations, ObservabilitySnapshot,
+    ObservabilitySnapshotProvider, SRBucketDeleteOp, StorageAdminApi, TopologySnapshot, TopologySnapshotProvider,
+};
+#[cfg(test)]
+pub(crate) use rustfs_storage_api::{MemorySamplingState, PlatformSupport, TopologyCapabilities, UserspaceProfilingCapability};
 
 pub(crate) mod data_usage {
     use std::sync::Arc;

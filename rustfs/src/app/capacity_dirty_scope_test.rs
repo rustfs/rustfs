@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use super::storage_api::bucket::metadata_sys;
+use super::storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
 use super::storage_api::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
 use serial_test::serial;
 use std::{
     collections::HashSet,

@@ -702,6 +702,24 @@ pub(crate) mod timeout_wrapper {
     pub(crate) use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
 }
 
+pub(crate) mod s3_api {
+    pub(crate) mod bucket {
+        pub(crate) use crate::storage::s3_api::bucket::{
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
+        };
+        pub(crate) use crate::storage::s3_api::common::rustfs_owner;
+    }
+
+    pub(crate) mod multipart {
+        pub(crate) use crate::storage::s3_api::multipart::{
+            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
+            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+        };
+    }
+}
+
 pub(crate) use crate::storage::{
     RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader,
     check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
@@ -710,3 +728,10 @@ pub(crate) use crate::storage::{
     validate_list_object_unordered_with_delimiter, validate_object_key, validate_sse_headers_for_read,
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
+pub(crate) use rustfs_storage_api::{
+    BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, HTTPRangeSpec, ListObjectVersionsInfo, ListObjectsV2Info,
+    ListOperations, MakeBucketOptions, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectOperations,
+    StorageAdminApi,
+};
+#[cfg(test)]
+pub(crate) use rustfs_storage_api::{HTTPPreconditions, HealOperations};

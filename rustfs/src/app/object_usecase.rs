@@ -15,8 +15,9 @@
 //! Object application use-case contracts.
 
 // Performance metrics recording (with zero-copy-metrics integration)
-use super::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::ECStore;
+#[cfg(test)]
+use super::storage_api::HTTPPreconditions;
 use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use super::storage_api::bucket::quota::checker::QuotaChecker;
 use super::storage_api::bucket::{
@@ -63,6 +64,7 @@ use super::storage_api::options::{
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
 use super::storage_api::request_context::{self, spawn_traced};
+use super::storage_api::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use super::storage_api::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
@@ -71,6 +73,7 @@ use super::storage_api::sse::{
 };
 use super::storage_api::storage_class as storageclass;
 use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use super::storage_api::{
     RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
@@ -107,9 +110,6 @@ use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
-#[cfg(test)]
-use rustfs_storage_api::HTTPPreconditions;
-use rustfs_storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use rustfs_targets::{
     EventName, extract_params_header, extract_resp_elements, get_request_host, get_request_port, get_request_user_agent,
 };

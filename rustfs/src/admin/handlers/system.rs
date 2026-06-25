@@ -16,6 +16,9 @@ use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::resolve_endpoints_handle;
+use crate::admin::storage_api::{
+    CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
+};
 use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
@@ -27,9 +30,6 @@ use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use rustfs_storage_api::{
-    CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
-};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -297,7 +297,7 @@ pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
-    pub observability: rustfs_storage_api::ObservabilitySnapshot,
+    pub observability: crate::admin::storage_api::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
@@ -306,7 +306,7 @@ pub struct RuntimeCapabilitiesResponse {
 pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
--> Result<RuntimeCapabilitiesResponse, rustfs_storage_api::CapabilitySnapshotError> {
+-> Result<RuntimeCapabilitiesResponse, crate::admin::storage_api::CapabilitySnapshotError> {
     let usecase = DefaultAdminUsecase::from_global();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
@@ -339,7 +339,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 }
 
 fn build_runtime_capabilities_summary(
-    observability: &rustfs_storage_api::ObservabilitySnapshot,
+    observability: &crate::admin::storage_api::ObservabilitySnapshot,
     topology: Option<&TopologySnapshot>,
     topology_status: &CapabilityStatus,
     cluster_snapshot_summary: Option<&CapabilityStatus>,
@@ -515,13 +515,13 @@ mod tests {
         OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
         build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
-    use crate::app::admin_usecase::DefaultAdminUsecase;
-    use rustfs_concurrency::{AdmissionState, WorkloadClass};
-    use rustfs_madmin::{InfoMessage, StorageInfo};
-    use rustfs_storage_api::{
+    use crate::admin::storage_api::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };
+    use crate::app::admin_usecase::DefaultAdminUsecase;
+    use rustfs_concurrency::{AdmissionState, WorkloadClass};
+    use rustfs_madmin::{InfoMessage, StorageInfo};
 
     #[tokio::test]
     async fn runtime_capabilities_response_reports_missing_topology_before_storage_init() {
