@@ -14,7 +14,7 @@
 
 use super::super::storageclass;
 use super::super::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
-use crate::app::context::{
+use crate::admin::runtime_sources::{
     AppContext, get_global_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
     resolve_object_store_handle, resolve_object_store_handle_for_context,
 };
