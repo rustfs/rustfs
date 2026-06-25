@@ -22,13 +22,13 @@ use super::{
 };
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::context::resolve_object_store_handle;
 use crate::app::multipart_usecase::DefaultMultipartUsecase;
 use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
+use crate::storage::runtime_sources;
 use crate::storage::s3_api::acl;
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
@@ -97,7 +97,7 @@ impl FS {
         object: &str,
         version_id: Option<&str>,
     ) -> S3Result<std::collections::HashMap<String, Vec<String>>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Ok(std::collections::HashMap::new());
         };
         let opts = ObjectOptions {
@@ -341,7 +341,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteBucketWebsiteInput>,
     ) -> S3Result<S3Response<DeleteBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -390,7 +390,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &object).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -472,7 +472,7 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetBucketAcl, &req.input.bucket);
         let GetBucketAclInput { bucket, .. } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -488,7 +488,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<GetBucketAccelerateConfigurationOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -578,7 +578,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<GetBucketRequestPaymentOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -626,7 +626,7 @@ impl S3 for FS {
     }
 
     async fn get_bucket_website(&self, req: S3Request<GetBucketWebsiteInput>) -> S3Result<S3Response<GetBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
 
@@ -664,7 +664,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -694,7 +694,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -755,7 +755,7 @@ impl S3 for FS {
         record_s3_op(S3Operation::GetObjectLockConfiguration, &req.input.bucket);
         let GetObjectLockConfigurationInput { bucket, .. } = req.input;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -803,7 +803,7 @@ impl S3 for FS {
             bucket, key, version_id, ..
         } = req.input.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -855,7 +855,7 @@ impl S3 for FS {
         let bucket = req.input.bucket.as_str();
         let object = req.input.key.as_str();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             error!(
                 component = LOG_COMPONENT_STORAGE,
                 subsystem = LOG_SUBSYSTEM_TAGGING,
@@ -1013,7 +1013,7 @@ impl S3 for FS {
         } = req.input;
         record_s3_op(S3Operation::PutBucketAcl, &bucket);
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1036,7 +1036,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketAccelerateConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketAccelerateConfigurationOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1061,7 +1061,7 @@ impl S3 for FS {
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
         record_s3_op(S3Operation::GetBucketLogging, &req.input.bucket);
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1080,7 +1080,7 @@ impl S3 for FS {
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
         record_s3_op(S3Operation::PutBucketLogging, &req.input.bucket);
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1139,7 +1139,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketRequestPaymentInput>,
     ) -> S3Result<S3Response<PutBucketRequestPaymentOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1181,7 +1181,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(s3_error!(InternalError, "Not init"));
         };
         store
@@ -1211,7 +1211,7 @@ impl S3 for FS {
         let key = &req.input.key;
         let version_id = req.input.version_id.clone();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1253,7 +1253,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1307,7 +1307,7 @@ impl S3 for FS {
 
         let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1379,7 +1379,7 @@ impl S3 for FS {
 
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -1458,7 +1458,7 @@ impl S3 for FS {
 
         crate::storage::s3_api::tagging::validate_object_tag_set(&tagging.tag_set)?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

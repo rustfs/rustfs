@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{
-    resolve_endpoints_handle, resolve_iam_ready, resolve_lock_clients_handle, resolve_object_store_handle,
-};
+use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
 use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure};
@@ -448,7 +446,7 @@ pub async fn collect_dependency_readiness() -> DependencyReadiness {
 }
 
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
-    let iam_ready_raw = resolve_iam_ready();
+    let iam_ready_raw = runtime_sources::iam_ready();
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
         cached
     } else {
@@ -471,7 +469,7 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
         storage_ready: collect_storage_readiness_uncached().await,
-        iam_ready: resolve_iam_ready(),
+        iam_ready: runtime_sources::iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
     };
 
@@ -489,7 +487,7 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
 }
 
 async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready_raw = resolve_iam_ready();
+    let iam_ready_raw = runtime_sources::iam_ready();
     let storage_ready = collect_storage_readiness_uncached().await;
     let lock_quorum_status = collect_lock_quorum_status_uncached().await;
 
@@ -504,7 +502,7 @@ async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
 }
 
 async fn collect_storage_readiness_uncached() -> bool {
-    if let Some(store) = resolve_object_store_handle() {
+    if let Some(store) = runtime_sources::object_store_handle() {
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
     } else {
@@ -595,10 +593,10 @@ async fn collect_lock_quorum_status_uncached() -> LockQuorumStatus {
         };
     }
 
-    let Some(pool_endpoints) = resolve_endpoints_handle() else {
+    let Some(pool_endpoints) = runtime_sources::endpoints_handle() else {
         return LockQuorumStatus::default();
     };
-    let Some(lock_clients) = resolve_lock_clients_handle() else {
+    let Some(lock_clients) = runtime_sources::lock_clients_handle() else {
         return LockQuorumStatus::default();
     };
 

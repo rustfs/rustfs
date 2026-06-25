@@ -154,6 +154,8 @@ RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_
 IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/iam_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_runtime_source_bypass_hits.txt"
 RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
+RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
+RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -1334,6 +1336,40 @@ fi
 
 if [[ -s "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS startup runtime globals must stay behind rustfs/src/startup_runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_server_config|resolve_notify_interface|resolve_object_store_handle|resolve_kms_runtime_service_manager|resolve_iam_ready|resolve_endpoints_handle|resolve_lock_clients_handle)\b|(?:resolve_server_config|resolve_notify_interface|resolve_object_store_handle|resolve_kms_runtime_service_manager|resolve_iam_ready|resolve_endpoints_handle|resolve_lock_clients_handle)\b)' \
+    rustfs/src/server/audit.rs \
+    rustfs/src/server/event.rs \
+    rustfs/src/server/layer.rs \
+    rustfs/src/server/module_switch.rs \
+    rustfs/src/server/readiness.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS server runtime source reads must stay behind rustfs/src/server/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b|(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b)' \
+    rustfs/src/storage/access.rs \
+    rustfs/src/storage/ecfs.rs \
+    rustfs/src/storage/ecfs_extend.rs \
+    rustfs/src/storage/helper.rs \
+    rustfs/src/storage/concurrency/manager.rs \
+    rustfs/src/storage/sse.rs \
+    rustfs/src/storage/rpc/disk.rs \
+    rustfs/src/storage/rpc/health.rs \
+    rustfs/src/storage/rpc/http_service.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
 fi
 
 (
