@@ -360,8 +360,8 @@ impl Operation for ExportBucketMetadata {
                             }
                         };
 
-                        let config_json =
-                            serde_json::to_vec(&config).map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
+                        let config_json = serde_json::to_vec(&config.redacted_credentials())
+                            .map_err(|e| s3_error!(InternalError, "serialize config failed: {e}"))?;
 
                         zip_writer
                             .start_file(conf_path, SimpleFileOptions::default())

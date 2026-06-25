@@ -367,6 +367,7 @@ impl Operation for ListRemoteTargetHandler {
             let sys = BucketTargetSys::get();
             let targets = sys.list_targets(bucket, "").await;
 
+            let targets: Vec<_> = targets.iter().map(|target| target.redacted_credentials()).collect();
             let json_targets = serde_json::to_vec(&targets).map_err(|e| {
                 error!("Serialization error: {}", e);
                 S3Error::with_message(S3ErrorCode::InternalError, "Failed to serialize targets".to_string())

@@ -11,16 +11,24 @@ This PR hardens the site replication control plane in small, reviewable commits.
 1. `docs: plan site replication hardening`
    - Purpose: establish the execution plan and PR draft before code changes.
    - Reason: the site replication follow-up touches security, compatibility, operations, and tests, so reviewers need a durable record of each step and why it exists.
+2. `fix: redact site replication target secrets`
+   - Purpose: prevent bucket replication target credentials from leaking through admin listing, bucket metadata export, and debug formatting.
+   - Reason: site replication stores the `site-replicator-0` secret in bucket targets today; keeping the internal storage format intact while redacting external surfaces reduces immediate blast radius without changing replication target loading.
 
 ## Verification
 
 Baseline started from `origin/main` at `758677da`.
 
 - Passed: `cargo test -p rustfs route_policy --lib`
+- Passed: `cargo test -p rustfs-ecstore bucket_target --lib`
+- Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo fmt --all`
 
 ## Impact
 
 The planned implementation is intended to reduce credential exposure, require stronger permission for diagnostic write-like endpoints, clean removed site replication targets, and make replication status more actionable. Compatibility-sensitive behavior will be called out per commit in the implementation log.
+
+The credential redaction step changes admin/export visibility of bucket target secrets. Stored target configuration is not migrated or reformatted by this PR step.
 
 ## Additional Notes
 
