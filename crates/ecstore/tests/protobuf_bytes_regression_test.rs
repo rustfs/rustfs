@@ -3,7 +3,8 @@
 
 use bytes::Bytes;
 use rustfs_protos::proto_gen::node_service::{
-    ReadMultipleRequest, ReadMultipleResponse, ReadVersionResponse, ReadXlResponse, UpdateMetadataRequest, WriteMetadataRequest,
+    ReadMultipleRequest, ReadMultipleResponse, ReadVersionResponse, ReadXlResponse, RenameDataRequest, RenameDataResponse,
+    UpdateMetadataRequest, WriteMetadataRequest,
 };
 
 fn expect_bytes(_: &Bytes) {}
@@ -16,6 +17,12 @@ fn protobuf_bytes_fields_use_bytes_consistently() {
 
     let write = WriteMetadataRequest::default();
     expect_bytes(&write.file_info_bin);
+
+    let rename_data = RenameDataRequest::default();
+    expect_bytes(&rename_data.file_info_bin);
+
+    let rename_data_response = RenameDataResponse::default();
+    expect_bytes(&rename_data_response.rename_data_resp_bin);
 
     let version = ReadVersionResponse::default();
     expect_bytes(&version.file_info_bin);

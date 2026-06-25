@@ -1,8 +1,9 @@
 use super::meta::{
     apply_rebalance_save_option, apply_rebalance_terminal_event, classify_rebalance_terminal_event, clone_first_arc,
     complete_rebalance_pools_at_goal, complete_rebalance_pools_with_empty_queue, ensure_valid_rebalance_pool_index,
-    has_deferred_rebalance_error, is_rebalance_in_progress, rebalance_goal_reached, resolve_rebalance_participants,
-    should_preserve_rebalance_stopped_state, should_skip_start_rebalance, validate_start_rebalance_state,
+    has_deferred_rebalance_error, has_rebalance_cleanup_warnings, is_rebalance_in_progress, rebalance_goal_reached,
+    resolve_rebalance_participants, should_preserve_rebalance_stopped_state, should_skip_start_rebalance,
+    validate_start_rebalance_state,
 };
 use super::worker::{
     resolve_rebalance_bucket_result, resolve_rebalance_meta_save_result, resolve_rebalance_save_task_result,
@@ -13,7 +14,7 @@ use super::{
     RebalanceBucketOutcome,
 };
 use crate::error::{Error, Result};
-use crate::global::get_global_endpoints;
+use crate::runtime_sources;
 use crate::store::ECStore;
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -119,11 +120,7 @@ impl ECStore {
                 continue;
             }
 
-            if !get_global_endpoints()
-                .as_ref()
-                .get(idx)
-                .is_some_and(|v| v.endpoints.as_ref().first().is_some_and(|e| e.is_local))
-            {
+            if !runtime_sources::endpoint_pool_is_local(idx) {
                 debug!(
                     event = EVENT_REBALANCE_STATE,
                     component = LOG_COMPONENT_ECSTORE,
@@ -211,7 +208,20 @@ impl ECStore {
                         if let Some(meta) = rebalance_meta.as_mut() {
                             let meta_stopped = meta.stopped_at.is_some();
                             if let Some(pool_stat) = meta.pool_stats.get_mut(pool_index) {
-                                if should_preserve_rebalance_stopped_state(
+                                if matches!(&terminal_event, super::meta::RebalanceTerminalEvent::Completed { .. })
+                                    && has_rebalance_cleanup_warnings(pool_stat)
+                                {
+                                    pool_stat.info.stopping = false;
+                                    pool_stat.info.status = RebalStatus::Failed;
+                                    pool_stat.info.end_time = Some(now);
+                                    pool_stat.info.last_error = Some(
+                                        pool_stat
+                                            .cleanup_warnings
+                                            .last_message
+                                            .clone()
+                                            .unwrap_or_else(|| "rebalance source cleanup warnings prevented completion".to_string()),
+                                    );
+                                } else if should_preserve_rebalance_stopped_state(
                                     meta_stopped,
                                     pool_stat.info.status,
                                     &terminal_event,
@@ -513,6 +523,7 @@ impl ECStore {
             };
 
             if !has_deferred_rebalance_error(pool_stat)
+                && !has_rebalance_cleanup_warnings(pool_stat)
                 && rebalance_goal_reached(
                     pool_stat.init_free_space,
                     pool_stat.init_capacity,

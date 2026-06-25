@@ -42,7 +42,7 @@ impl NodeService {
             }));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = self.resolve_object_store() else {
             return Ok(Response::new(LoadBucketMetadataResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),

@@ -16,6 +16,7 @@ use serde::{Deserialize, Serialize};
 use std::time::SystemTime;
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct HealProgress {
     /// Objects scanned
     pub objects_scanned: u64,
@@ -221,6 +222,22 @@ mod tests {
         progress.set_current_object(None);
 
         assert!(progress.current_object.is_none());
+    }
+
+    #[test]
+    fn test_heal_progress_serializes_camel_case_fields() {
+        let mut progress = HealProgress::new();
+        progress.update_progress(10, 8, 2, 1024);
+        progress.set_current_object(Some("test-bucket/test-object".to_string()));
+
+        let json = serde_json::to_value(&progress).expect("progress should serialize");
+
+        assert_eq!(json["objectsScanned"], 10);
+        assert_eq!(json["objectsHealed"], 8);
+        assert_eq!(json["objectsFailed"], 2);
+        assert_eq!(json["bytesProcessed"], 1024);
+        assert_eq!(json["currentObject"], "test-bucket/test-object");
+        assert!(json["progressPercentage"].is_number());
     }
 
     #[test]

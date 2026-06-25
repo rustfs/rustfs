@@ -77,7 +77,11 @@ fn check() -> Result<(), OpaConfigError> {
     Ok(())
 }
 async fn validate(config: &Args) -> Result<(), OpaConfigError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .connect_timeout(Duration::from_secs(1))
+        .build()
+        .map_err(OpaConfigError::Connection)?;
 
     match client.post(&config.url).send().await {
         Ok(resp) => {
