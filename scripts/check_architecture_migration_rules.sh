@@ -165,6 +165,7 @@ RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits
 RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s3_api_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_api_bypass_hits.txt"
 RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_admin_storage_api_bypass_hits.txt"
+RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_root_facade_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
@@ -1498,6 +1499,24 @@ fi
 
 if [[ -s "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app/admin runtime and data-usage facades must stay behind local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      '\b(?:ecstore_(?:bucket|capacity|client|cluster|config|disk|error|layout|metrics|notification|rebalance|rpc|storage|tier)|AdminReplicationConfigExt|AdminVersioningConfigExt|RUSTFS_META_BUCKET|STORAGE_CLASS_SUB_SYS|read_admin_config|read_admin_config_without_migrate|save_admin_config|save_admin_server_config|delete_admin_config|init_admin_config_defaults|StorageError|ECStore|Endpoint|Endpoints|EndpointServerPools|PoolEndpoints|PeerRestClient|RebalanceStats|RebalanceMeta|RebalanceStopPropagationRecord)\b' \
+      rustfs/src/admin/mod.rs || true
+    rg -n --with-filename \
+      '(?:crate::admin|super(?::super)+)::(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|versioning|versioning_sys|storageclass|tier|AdminReplicationConfigExt|AdminVersioningConfigExt|RUSTFS_META_BUCKET|STORAGE_CLASS_SUB_SYS|read_admin_config|read_admin_config_without_migrate|save_admin_config|save_admin_server_config|delete_admin_config|init_admin_config_defaults|StorageError|Error|ECStore|Endpoint|Endpoints|EndpointServerPools|PoolEndpoints|PeerRestClient|RebalanceStats|RebalanceMeta|RebalanceStopPropagationRecord|collect_local_metrics|is_reserved_or_invalid_bucket)\b' \
+      rustfs/src/admin \
+      -g '*.rs' \
+      -g '!storage_api.rs' || true
+  }
+) >"$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE" ]]; then
+  report_failure "RustFS admin storage facades must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE")"
 fi
 
 (

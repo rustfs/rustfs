@@ -5,9 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-runtime-global-facade-cleanup`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215`.
-- Based on: stacked on API-215 while PR #3856 is pending.
+- Branch: `overtrue/arch-admin-facade-storage-api-cleanup`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216`.
+- Based on: API-216 merged; branch replays the admin storage_api cleanup on latest `main`.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -46,7 +46,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   helpers, plus server readiness/audit/event/module-switch runtime source
   helpers, storage request/RPC/SSE runtime source helpers, and admin
   handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports, app-local S3 API response helper imports for bucket/object/multipart usecases, app-local storage helper boundary imports for select/bucket/object/multipart usecases, admin/app test storage helper boundary imports for request context, authorization, object options, and ECFS test harness consumers, app storage IO/compression/set-disk helper boundary imports for object and multipart usecases, app storage error, ETag, and storage-class helper boundary imports for bucket/object/multipart usecases and lifecycle transition tests, app bucket owner facade imports for lifecycle, metadata, object-lock, quota, replication, tagging, target, versioning, and transition test helpers, and app/admin runtime, capacity, data-usage, endpoint, and global facade imports,
-  through AppContext-first or owner-crate resolver boundaries.
+  admin root storage facade consumers for config, bucket metadata, replication,
+  rebalancing, tier, quota, metrics, object zip, site replication, and admin
+  service config paths, through AppContext-first or owner-crate resolver
+  boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -56,8 +59,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   event-bridge thin module regressions, plus IAM runtime-source bypasses;
   accept the reviewed AppContext resolver reverse dependencies in the layer
   baseline, and block direct admin AppContext resolver consumers outside the
-  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, and reject app/admin runtime/data-usage root facade regressions.
-- Docs changes: record the API-136 through API-216 owner facade and lifecycle
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, reject app/admin runtime/data-usage root facade regressions, and reject admin root storage facade regressions from migrated admin consumers.
+- Docs changes: record the API-136 through API-217 owner facade and lifecycle
   runtime-source cleanup.
 
 ## Phase 0 Tasks
@@ -5121,14 +5124,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, diff hygiene, residual migrated facade scan, Rust risk scan,
     fast PR gate, and full PR gate before PR.
 
+- [x] `API-217` Route admin storage facades through storage_api boundary.
+  - Do: move admin-facing ECStore bucket/config/rebalance/tier/metrics/error
+    facades from the admin root module into `admin::storage_api`, then route
+    admin handlers, router, and config/site-replication services through that
+    boundary.
+  - Acceptance: admin root no longer exposes the migrated storage facade
+    modules, aliases, constants, or wrappers, and migration rules reject
+    root-level regressions for completed admin storage facade consumers.
+  - Must preserve: admin config IO/default initialization, bucket metadata and
+    target management, replication/resync DTO handling, rebalance status
+    projection, quota usage reads, tier admin contracts, metrics collection,
+    object-zip error mapping, and site-replication metadata serialization.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated facade scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: batch remaining app/admin facade cleanup after API-216.
+1. `consumer-migration`: continue larger app/admin/storage facade batches after API-217.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-217 moves admin storage facade ownership behind admin storage_api and removes the admin root compatibility surface. |
+| Migration preservation | pass | Config IO/defaults, bucket metadata/targets, replication/resync, rebalance, quota, tier, metrics, object zip, and site replication keep the same storage implementations. |
+| Testing/verification | pass | Focused RustFS admin compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-216 removes app root runtime/global facades and routes app/admin data-usage and runtime consumers through local storage_api boundaries. |
 | Migration preservation | pass | Admin info/capacity, data-usage accounting, AppContext fallback runtime sources, lifecycle test disk initialization, tier warm-backend tests, and scanner metrics keep the same storage implementations. |
 | Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |

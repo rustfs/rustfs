@@ -14,12 +14,12 @@
 
 use crate::admin::{
     auth::validate_admin_request,
-    ecstore_cluster::{
+    router::{AdminOperation, Operation, S3Router},
+    storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     },
-    router::{AdminOperation, Operation, S3Router},
     system,
 };
 use crate::app::admin_usecase::DefaultAdminUsecase;
@@ -590,7 +590,7 @@ fn summarize_named_capability_statuses<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
-    use crate::admin::ecstore_cluster::{
+    use crate::admin::storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,

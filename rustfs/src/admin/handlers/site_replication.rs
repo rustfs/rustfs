@@ -12,18 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::Error as StorageError;
-use super::super::bucket_target_sys::BucketTargetSys;
-use super::super::ecstore_utils::{deserialize, serialize};
-use super::super::metadata::{
-    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
-    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
-};
-use super::super::metadata_sys;
-use super::super::replication::ResyncOpts;
-use super::super::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
-use super::super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
-use super::super::{delete_admin_config, read_admin_config, save_admin_config};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
@@ -35,6 +23,18 @@ use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
     site_identity_key,
 };
+use crate::admin::storage_api::Error as StorageError;
+use crate::admin::storage_api::bucket_target_sys::BucketTargetSys;
+use crate::admin::storage_api::ecstore_utils::{deserialize, serialize};
+use crate::admin::storage_api::metadata::{
+    BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE, BUCKET_REPLICATION_CONFIG,
+    BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
+};
+use crate::admin::storage_api::metadata_sys;
+use crate::admin::storage_api::replication::ResyncOpts;
+use crate::admin::storage_api::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
+use crate::admin::storage_api::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use crate::admin::storage_api::{delete_admin_config, read_admin_config, save_admin_config};
 use crate::admin::utils::{encode_compatible_admin_payload, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::config::get_config_snapshot;
@@ -652,7 +652,7 @@ async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
     built
 }
 
-fn runtime_tls_enabled_with(endpoints: Option<&super::super::EndpointServerPools>) -> bool {
+fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_api::EndpointServerPools>) -> bool {
     if !rustfs_utils::get_env_str(ENV_RUSTFS_TLS_PATH, DEFAULT_RUSTFS_TLS_PATH).is_empty() {
         return true;
     }
@@ -3357,7 +3357,10 @@ fn is_stale_update(local_updated_at: OffsetDateTime, incoming_updated_at: Option
     incoming_updated_at.is_some_and(|incoming_updated_at| incoming_updated_at < local_updated_at)
 }
 
-fn bucket_meta_local_updated_at(bucket_meta: &super::super::metadata::BucketMetadata, config_file: &str) -> OffsetDateTime {
+fn bucket_meta_local_updated_at(
+    bucket_meta: &crate::admin::storage_api::metadata::BucketMetadata,
+    config_file: &str,
+) -> OffsetDateTime {
     match config_file {
         BUCKET_POLICY_CONFIG => bucket_meta.policy_config_updated_at,
         BUCKET_TAGGING_CONFIG => bucket_meta.tagging_config_updated_at,
@@ -4600,10 +4603,10 @@ impl Operation for SRRotateServiceAccountHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::Endpoint;
-    use super::super::super::{EndpointServerPools, Endpoints, PoolEndpoints};
     use super::*;
     use crate::admin::runtime_sources::{resolve_outbound_tls_generation, set_test_outbound_tls_generation};
+    use crate::admin::storage_api::Endpoint;
+    use crate::admin::storage_api::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
     use rustfs_policy::policy::action::S3Action;
     use serial_test::serial;

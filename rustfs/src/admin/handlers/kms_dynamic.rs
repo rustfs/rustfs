@@ -14,12 +14,12 @@
 
 //! KMS dynamic configuration admin API handlers
 
-use super::super::{read_admin_config, save_admin_config};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     resolve_kms_runtime_service_manager, resolve_object_store_handle, resolve_or_init_kms_runtime_service_manager,
 };
+use crate::admin::storage_api::{read_admin_config, save_admin_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{Method, StatusCode};

@@ -27,9 +27,9 @@ use tracing::{error, info, warn};
 use crate::{
     admin::runtime_sources::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     admin::{
-        EndpointServerPools, PeerRestClient,
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
+        storage_api::{EndpointServerPools, PeerRestClient},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
     auth::{check_key_valid, get_session_token},
@@ -211,7 +211,7 @@ macro_rules! log_pool_response_emitted {
     };
 }
 
-fn endpoints_from_context() -> Option<super::super::EndpointServerPools> {
+fn endpoints_from_context() -> Option<crate::admin::storage_api::EndpointServerPools> {
     resolve_endpoints_handle()
 }
 
@@ -1078,7 +1078,7 @@ mod pools_handler_tests {
         pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
         validate_pool_mutation_leader, validate_start_decommission_guards,
     };
-    use crate::admin::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::admin::storage_api::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
     fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
         let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");

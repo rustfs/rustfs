@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_token_signing_key};
+use crate::admin::storage_api::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},

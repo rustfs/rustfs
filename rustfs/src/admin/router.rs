@@ -12,16 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::PeerRestClient;
-use super::bandwidth::monitor::BandwidthDetails;
-use super::bucket_target_sys::{BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient};
-use super::metadata::BUCKET_TARGETS_FILE;
-use super::metadata_sys;
-use super::read_admin_config_without_migrate;
-use super::replication::{BucketReplicationResyncStatus, BucketStats, ObjectOpts, ResyncOpts};
-use super::target::{BucketTarget, BucketTargetType, BucketTargets};
-use super::versioning_sys::BucketVersioningSys;
-use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
+use super::storage_api::PeerRestClient;
+use super::storage_api::bandwidth::monitor::BandwidthDetails;
+use super::storage_api::bucket_target_sys::{
+    BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
+};
+use super::storage_api::metadata::BUCKET_TARGETS_FILE;
+use super::storage_api::metadata_sys;
+use super::storage_api::read_admin_config_without_migrate;
+use super::storage_api::replication::{BucketReplicationResyncStatus, BucketStats, ObjectOpts, ResyncOpts};
+use super::storage_api::target::{BucketTarget, BucketTargetType, BucketTargets};
+use super::storage_api::versioning_sys::BucketVersioningSys;
+use super::storage_api::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _, StorageError};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
@@ -1414,7 +1416,7 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(super::StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
+        Err(StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -1938,7 +1940,7 @@ async fn resolve_replication_target_client(bucket: &str, target: &BucketTarget) 
 
 fn build_replication_probe_put_options(now: OffsetDateTime) -> PutObjectOptions {
     PutObjectOptions {
-        internal: super::bucket_target_sys::AdvancedPutOptions {
+        internal: super::storage_api::bucket_target_sys::AdvancedPutOptions {
             source_version_id: Uuid::new_v4().to_string(),
             replication_status: ReplicationStatusType::Replica,
             source_mtime: now,
@@ -2053,7 +2055,7 @@ async fn source_bucket_requires_object_lock(bucket: &str) -> S3Result<bool> {
             .object_lock_enabled
             .as_ref()
             .is_some_and(|state| state.as_str() == s3s::dto::ObjectLockEnabled::ENABLED)),
-        Err(super::StorageError::ConfigNotFound) => Ok(false),
+        Err(StorageError::ConfigNotFound) => Ok(false),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -2767,7 +2769,7 @@ mod tests {
     #[test]
     fn apply_replication_reset_to_targets_updates_matching_target() {
         let mut targets = BucketTargets {
-            targets: vec![super::super::target::BucketTarget {
+            targets: vec![crate::admin::storage_api::target::BucketTarget {
                 arn: "arn:target".to_string(),
                 ..Default::default()
             }],
@@ -2789,10 +2791,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            super::super::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-01-03 00:00 UTC)),
-                resync_status: super::super::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_api::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2802,10 +2804,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            super::super::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-01-02 00:00 UTC)),
-                resync_status: super::super::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_api::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),
@@ -2835,10 +2837,10 @@ mod tests {
         let mut status = BucketReplicationResyncStatus::new();
         status.targets_map.insert(
             "arn:z".to_string(),
-            super::super::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-z".to_string(),
                 last_update: Some(datetime!(2025-02-03 00:00 UTC)),
-                resync_status: super::super::replication::ResyncStatusType::ResyncFailed,
+                resync_status: crate::admin::storage_api::replication::ResyncStatusType::ResyncFailed,
                 failed_count: 2,
                 failed_size: 4,
                 bucket: "bucket-z".to_string(),
@@ -2848,10 +2850,10 @@ mod tests {
         );
         status.targets_map.insert(
             "arn:a".to_string(),
-            super::super::replication::TargetReplicationResyncStatus {
+            crate::admin::storage_api::replication::TargetReplicationResyncStatus {
                 resync_id: "rid-a".to_string(),
                 last_update: Some(datetime!(2025-02-02 00:00 UTC)),
-                resync_status: super::super::replication::ResyncStatusType::ResyncCompleted,
+                resync_status: crate::admin::storage_api::replication::ResyncStatusType::ResyncCompleted,
                 replicated_count: 3,
                 replicated_size: 9,
                 bucket: "bucket-a".to_string(),

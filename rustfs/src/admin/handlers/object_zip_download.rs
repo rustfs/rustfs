@@ -645,7 +645,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: super::super::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 
