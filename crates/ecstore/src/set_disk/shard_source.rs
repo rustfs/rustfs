@@ -42,6 +42,10 @@ impl ShardSlot {
         self.data.is_some()
     }
 
+    pub(crate) fn data_bytes(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
+
     pub(crate) fn error(&self) -> Option<&Error> {
         self.error.as_ref()
     }
@@ -79,6 +83,10 @@ impl StripeReadState {
 
     pub(crate) fn slots(&self) -> &[ShardSlot] {
         &self.slots
+    }
+
+    pub(crate) fn data_shards_complete(&self, data_shards: usize) -> bool {
+        (0..data_shards).all(|index| self.slots.iter().any(|slot| slot.index == index && slot.has_data()))
     }
 
     pub(crate) fn into_parts(self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
@@ -138,5 +146,20 @@ mod tests {
         assert!(state.can_decode());
         assert_eq!(state.slots()[1].index(), 1);
         assert_eq!(state.slots()[1].error(), Some(&Error::FileNotFound));
+    }
+
+    #[test]
+    fn stripe_read_state_reports_complete_data_shards_without_parity() {
+        let state = StripeReadState::from_parts(vec![Some(vec![1]), Some(vec![2]), None], Vec::new(), 2);
+
+        assert!(state.data_shards_complete(2));
+        assert_eq!(state.slots()[0].data_bytes(), Some(&[1][..]));
+    }
+
+    #[test]
+    fn stripe_read_state_rejects_missing_data_shard_for_complete_fast_path() {
+        let state = StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![3])], Vec::new(), 2);
+
+        assert!(!state.data_shards_complete(2));
     }
 }

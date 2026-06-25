@@ -207,8 +207,24 @@ where
         return Err(DiskError::ErasureReadQuorum.into());
     }
 
-    let (mut shards, _errs) = state.into_parts();
     let reconstruct_stage_start = Instant::now();
+    if state.data_shards_complete(engine.data_shards()) {
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_RECONSTRUCT,
+            reconstruct_stage_start.elapsed().as_secs_f64(),
+        );
+        let emit_stage_start = Instant::now();
+        let output = emit_data_shards(state.slots(), engine.data_shards(), engine.block_size(), remaining)?;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_EMIT,
+            emit_stage_start.elapsed().as_secs_f64(),
+        );
+        return Ok(Some(output));
+    }
+
+    let (mut shards, _errs) = state.into_parts();
     if let Err(err) = engine.reconstruct_into(&mut shards, workspace) {
         rustfs_io_metrics::record_get_object_stage_duration(
             GET_OBJECT_PATH_CODEC_STREAMING,
@@ -249,6 +265,29 @@ where
     );
 
     Ok(Some(output))
+}
+
+fn emit_data_shards(
+    slots: &[crate::set_disk::shard_source::ShardSlot],
+    data_shards: usize,
+    block_size: usize,
+    remaining: usize,
+) -> io::Result<Vec<u8>> {
+    let mut output = Vec::with_capacity(block_size.min(remaining));
+    for index in 0..data_shards {
+        if output.len() >= remaining {
+            break;
+        }
+        let Some(slot) = slots.iter().find(|slot| slot.index() == index) else {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
+        };
+        let Some(shard) = slot.data_bytes() else {
+            return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
+        };
+        let copy_len = shard.len().min(remaining - output.len());
+        output.extend_from_slice(&shard[..copy_len]);
+    }
+    Ok(output)
 }
 
 #[cfg(test)]
@@ -359,6 +398,20 @@ mod tests {
         let decoded = decode_all(erasure, &data, &[1])
             .await
             .expect("reader should reconstruct one missing data shard");
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_reads_when_only_parity_shards_are_missing() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..120u16)
+            .map(|value| value.wrapping_mul(11).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+
+        let decoded = decode_all(erasure, &data, &[4, 5])
+            .await
+            .expect("reader should emit complete data shards without parity reconstruction");
 
         assert_eq!(decoded, data);
     }
