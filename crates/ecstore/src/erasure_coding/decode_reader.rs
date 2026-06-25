@@ -14,7 +14,11 @@
 
 use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
-use crate::get_diagnostics::{GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ};
+use crate::get_diagnostics::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_PREFETCH_DIRECT,
+    GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
+    GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ,
+};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::io;
 use std::io::ErrorKind;
@@ -44,6 +48,7 @@ where
     output_pos: usize,
     prefetched_buf: Option<Vec<u8>>,
     prefetch_error: Option<io::Error>,
+    prefetch_wait_started_at: Option<Instant>,
     remaining: usize,
     // Bounded lookahead: at most one background stripe read/decode is in flight.
     fill: Option<FillTask<S, E::Workspace>>,
@@ -73,6 +78,7 @@ where
             output_pos: 0,
             prefetched_buf: None,
             prefetch_error: None,
+            prefetch_wait_started_at: None,
             remaining: total_length,
             fill: None,
         })
@@ -154,22 +160,68 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        match ready!(self.poll_fill_result(cx)) {
+        if self.prefetch_wait_started_at.is_none() {
+            self.prefetch_wait_started_at = Some(Instant::now());
+        }
+
+        let fill = match self.poll_fill_result(cx) {
+            Poll::Ready(result) => {
+                if let Some(started_at) = self.prefetch_wait_started_at.take() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch_wait(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                result
+            }
+            Poll::Pending => return Poll::Pending,
+        };
+
+        match fill {
             Ok(Some(buf)) => {
                 if self.output_pos < self.output_buf.len() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_STORED,
+                    );
+                    rustfs_io_metrics::record_get_object_reader_buffer(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_BUFFER_PREFETCH,
+                        buf.len(),
+                    );
                     self.prefetched_buf = Some(buf);
                 } else {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_DIRECT,
+                    );
+                    rustfs_io_metrics::record_get_object_reader_buffer(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_BUFFER_OUTPUT,
+                        buf.len(),
+                    );
                     self.output_buf = buf;
                     self.output_pos = 0;
                 }
                 Poll::Ready(Ok(()))
             }
-            Ok(None) => Poll::Ready(Ok(())),
+            Ok(None) => {
+                rustfs_io_metrics::record_get_object_reader_prefetch(GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_PREFETCH_EOF);
+                Poll::Ready(Ok(()))
+            }
             Err(err) => {
                 if self.output_pos < self.output_buf.len() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_ERROR_DEFERRED,
+                    );
                     self.prefetch_error = Some(err);
                     Poll::Ready(Ok(()))
                 } else {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_ERROR_IMMEDIATE,
+                    );
                     Poll::Ready(Err(err))
                 }
             }
@@ -205,13 +257,30 @@ where
                 }
 
                 let available = &self.output_buf[self.output_pos..];
+                let read_buf_remaining_before = buf.remaining();
+                let output_remaining_before = available.len();
                 let copy_len = available.len().min(buf.remaining());
+                let copy_start = Instant::now();
                 buf.put_slice(&available[..copy_len]);
                 self.output_pos += copy_len;
+                if copy_len > 0 {
+                    rustfs_io_metrics::record_get_object_reader_copy(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        copy_len,
+                        read_buf_remaining_before,
+                        output_remaining_before,
+                        copy_start.elapsed().as_secs_f64(),
+                    );
+                }
                 return Poll::Ready(Ok(()));
             }
 
             if let Some(next_buf) = self.prefetched_buf.take() {
+                rustfs_io_metrics::record_get_object_reader_buffer(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_READER_BUFFER_OUTPUT,
+                    next_buf.len(),
+                );
                 self.output_buf = next_buf;
                 self.output_pos = 0;
                 continue;

@@ -29,6 +29,14 @@ pub(crate) const GET_STAGE_READER_SETUP: &str = "reader_setup";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
 pub(crate) const GET_STAGE_STRIPE_READ: &str = "stripe_read";
 
+pub(crate) const GET_READER_BUFFER_OUTPUT: &str = "output";
+pub(crate) const GET_READER_BUFFER_PREFETCH: &str = "prefetch";
+pub(crate) const GET_READER_PREFETCH_DIRECT: &str = "direct";
+pub(crate) const GET_READER_PREFETCH_EOF: &str = "eof";
+pub(crate) const GET_READER_PREFETCH_ERROR_DEFERRED: &str = "error_deferred";
+pub(crate) const GET_READER_PREFETCH_ERROR_IMMEDIATE: &str = "error_immediate";
+pub(crate) const GET_READER_PREFETCH_STORED: &str = "stored";
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GetObjectFailureReason {
     BitrotMismatch,
@@ -159,5 +167,12 @@ mod tests {
         assert_eq!(GetObjectFailureReason::DownstreamClosed.as_str(), "downstream_closed");
         assert_eq!(GetObjectFailureReason::BitrotMismatch.as_str(), "bitrot_mismatch");
         assert_eq!(GetObjectFailureReason::DecodeError.as_str(), "decode_error");
+        assert_eq!(GET_READER_BUFFER_OUTPUT, "output");
+        assert_eq!(GET_READER_BUFFER_PREFETCH, "prefetch");
+        assert_eq!(GET_READER_PREFETCH_DIRECT, "direct");
+        assert_eq!(GET_READER_PREFETCH_STORED, "stored");
+        assert_eq!(GET_READER_PREFETCH_EOF, "eof");
+        assert_eq!(GET_READER_PREFETCH_ERROR_DEFERRED, "error_deferred");
+        assert_eq!(GET_READER_PREFETCH_ERROR_IMMEDIATE, "error_immediate");
     }
 }

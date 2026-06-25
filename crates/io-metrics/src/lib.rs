@@ -308,6 +308,43 @@ pub fn record_get_object_reader_bytes(path: &'static str, bytes: usize) {
     counter!("rustfs_io_get_object_reader_bytes_total", "path" => path).increment(bytes);
 }
 
+/// Record one reader buffer produced by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_buffer(path: &'static str, role: &'static str, bytes: usize) {
+    histogram!("rustfs_io_get_object_reader_buffer_bytes", "path" => path, "role" => role).record(bytes as f64);
+}
+
+/// Record one copy from a GetObject reader's internal buffer into the downstream read buffer.
+#[inline(always)]
+pub fn record_get_object_reader_copy(
+    path: &'static str,
+    bytes: usize,
+    read_buf_remaining_before: usize,
+    output_remaining_before: usize,
+    duration_secs: f64,
+) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_copy_chunks_total", "path" => path).increment(1);
+    counter!("rustfs_io_get_object_reader_copy_bytes_total", "path" => path).increment(bytes);
+    histogram!("rustfs_io_get_object_reader_copy_bytes", "path" => path).record(bytes as f64);
+    histogram!("rustfs_io_get_object_reader_copy_read_buf_remaining_bytes", "path" => path)
+        .record(read_buf_remaining_before as f64);
+    histogram!("rustfs_io_get_object_reader_copy_output_remaining_bytes", "path" => path).record(output_remaining_before as f64);
+    histogram!("rustfs_io_get_object_reader_copy_duration_seconds", "path" => path).record(duration_secs);
+}
+
+/// Record a bounded prefetch outcome for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch(path: &'static str, outcome: &'static str) {
+    counter!("rustfs_io_get_object_reader_prefetch_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record how long a GetObject reader spent waiting for a prefetch/fill result.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch_wait(path: &'static str, duration_secs: f64) {
+    histogram!("rustfs_io_get_object_reader_prefetch_wait_seconds", "path" => path).record(duration_secs);
+}
+
 /// Record GetObject metadata resolution duration.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
@@ -946,6 +983,10 @@ mod tests {
         record_get_object_codec_streaming_fallback("range");
         record_get_object_reader_stripe("codec_streaming");
         record_get_object_reader_bytes("codec_streaming", 1024);
+        record_get_object_reader_buffer("codec_streaming", "output", 1024);
+        record_get_object_reader_copy("codec_streaming", 512, 8192, 1024, 0.0001);
+        record_get_object_reader_prefetch("codec_streaming", "stored");
+        record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_metadata_phase_duration(0.002);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
