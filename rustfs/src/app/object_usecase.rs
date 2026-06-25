@@ -19,6 +19,7 @@ use super::quota::checker::QuotaChecker;
 use super::storageclass;
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::ECStore;
+use super::s3_api::multipart::parse_list_parts_params;
 use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
 use super::{DiskError, is_all_buckets_not_found};
 use super::{DynReader, HashReader, WritePlan, wrap_reader};
@@ -65,7 +66,6 @@ use crate::storage::options::{
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
 use crate::storage::request_context::spawn_traced;
-use crate::storage::s3_api::multipart::parse_list_parts_params;
 use crate::storage::sse::{
     SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
     map_get_object_reader_error,

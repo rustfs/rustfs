@@ -5,9 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-explicit-dto-imports`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209`.
-- Based on: stacked on API-208 while PR #3848 is pending.
+- Branch: `overtrue/arch-app-s3-api-boundary`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210`.
+- Based on: latest main after PR #3853 merged.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -45,7 +45,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   readiness-time, observability, metrics, buffer, and TLS runtime source
   helpers, plus server readiness/audit/event/module-switch runtime source
   helpers, storage request/RPC/SSE runtime source helpers, and admin
-  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, and app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports,
+  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports, and app-local S3 API response helper imports for bucket/object/multipart usecases,
   through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
@@ -56,8 +56,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   event-bridge thin module regressions, plus IAM runtime-source bypasses;
   accept the reviewed AppContext resolver reverse dependencies in the layer
   baseline, and block direct admin AppContext resolver consumers outside the
-  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, and narrow the object-usecase ECFS layer baseline entry to `FS`.
-- Docs changes: record the API-136 through API-209 owner facade and lifecycle
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, and reject direct storage S3 API helper imports from app usecase files.
+- Docs changes: record the API-136 through API-210 owner facade and lifecycle
   runtime-source cleanup.
 
 ## Phase 0 Tasks
@@ -5011,6 +5011,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, diff hygiene, residual wildcard scan, Rust risk scan, fast PR
     gate, and full PR gate before PR.
 
+- [x] `API-210` Route app S3 API helper imports through app boundary.
+  - Do: add an app-local S3 API helper boundary and route bucket, object, and
+    multipart usecases through it instead of direct `crate::storage::s3_api`
+    imports.
+  - Acceptance: app usecase files no longer import storage S3 API helpers
+    directly, layer baseline records the reviewed app boundary, and migration
+    rules reject direct usecase bypasses.
+  - Must preserve: bucket list response mapping, multipart list/part-number
+    parsing, object list-parts parameter parsing, owner/initiator response
+    metadata, and existing storage S3 API helper behavior.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct S3 API scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -5019,6 +5033,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-210 routes app usecase S3 API helper imports through an app-local boundary and adds a direct-bypass guard. |
+| Migration preservation | pass | Bucket list response mapping, multipart list/part-number parsing, object list-parts parsing, and S3 owner metadata keep the same storage helper implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual direct S3 API scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-209 removes app-layer S3 DTO and ECFS wildcard imports and adds a regression guard for the completed boundary. |
 | Migration preservation | pass | Select-object streaming, bucket DTO mapping, object CRUD/copy/delete/restore DTO handling, multipart checksum/copy behavior, and ECFS FS test harness usage keep the same call paths. |
 | Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual wildcard scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |

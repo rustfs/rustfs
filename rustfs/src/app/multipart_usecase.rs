@@ -19,6 +19,10 @@ use super::is_disk_compressible;
 use super::is_valid_storage_class;
 use super::object_api_utils::to_s3s_etag;
 use super::quota::checker::QuotaChecker;
+use super::s3_api::multipart::{
+    ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
+    parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+};
 #[cfg(test)]
 use super::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use super::{HashReader, WritePlan};
@@ -39,10 +43,6 @@ use crate::storage::helper::OperationHelper;
 use crate::storage::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
-};
-use crate::storage::s3_api::multipart::{
-    ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
-    parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
 use crate::storage::sse::{
     build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
