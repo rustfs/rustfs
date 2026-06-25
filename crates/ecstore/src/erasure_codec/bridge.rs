@@ -34,6 +34,10 @@ pub(crate) trait ErasureDecodeEngine: Send + Sync + 'static {
     fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<()>;
 }
 
+fn data_shards_complete(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
+    shards.len() >= data_shards && shards.iter().take(data_shards).all(Option::is_some)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LegacyDecodeWorkspace {
     shard_len: usize,
@@ -90,6 +94,10 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
     }
 
     fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<()> {
+        if data_shards_complete(shards, self.erasure.data_shards) {
+            return Ok(());
+        }
+
         self.erasure.decode_data(shards)
     }
 }
@@ -97,6 +105,22 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_shards_complete_ignores_parity_slots() {
+        let shards = vec![Some(vec![1]), Some(vec![2]), None];
+
+        assert!(data_shards_complete(&shards, 2));
+    }
+
+    #[test]
+    fn data_shards_complete_requires_all_data_slots() {
+        let missing_data = vec![Some(vec![1]), None, Some(vec![3])];
+        let short = vec![Some(vec![1])];
+
+        assert!(!data_shards_complete(&missing_data, 2));
+        assert!(!data_shards_complete(&short, 2));
+    }
 
     #[test]
     fn legacy_decode_engine_reports_erasure_shape() {
