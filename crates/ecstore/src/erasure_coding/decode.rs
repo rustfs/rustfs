@@ -20,6 +20,7 @@ use crate::get_diagnostics::{
     GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GetObjectFailureReason, classify_io_error,
     record_get_object_pipeline_failure,
 };
+use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::future::Future;
@@ -183,6 +184,18 @@ where
 
     pub fn can_decode(&self, shards: &[Option<Vec<u8>>]) -> bool {
         shards.iter().filter(|s| s.is_some()).count() >= self.data_shards
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> ShardStripeSource for ParallelReader<R>
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
+    async fn read_next_stripe(&mut self) -> StripeReadState {
+        let read_quorum = self.data_shards;
+        let (shards, errors) = ParallelReader::read(self).await;
+        StripeReadState::from_parts(shards, errors, read_quorum)
     }
 }
 

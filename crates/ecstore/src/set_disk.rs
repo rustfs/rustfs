@@ -280,6 +280,10 @@ const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
 const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
+const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -289,7 +293,7 @@ mod metadata;
 mod multipart;
 mod read;
 mod replication;
-mod shard_source;
+pub(crate) mod shard_source;
 mod write;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
@@ -343,6 +347,34 @@ pub fn is_deadlock_detection_enabled() -> bool {
         rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
         rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
     )
+}
+
+fn is_get_codec_streaming_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+}
+
+fn get_codec_streaming_min_size() -> usize {
+    rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+}
+
+fn should_use_get_codec_streaming_reader(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    lock_optimization_enabled: bool,
+) -> bool {
+    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+        return false;
+    };
+
+    is_get_codec_streaming_enabled()
+        && lock_optimization_enabled
+        && range.is_none()
+        && object_info.size >= min_size
+        && !object_info.is_encrypted()
+        && !object_info.is_compressed()
+        && !object_info.is_remote()
+        && fi.parts.len() == 1
 }
 
 /// Record a lock acquisition for deadlock detection.
@@ -1000,6 +1032,22 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         } else {
             read_lock_guard
         };
+
+        if should_use_get_codec_streaming_reader(&range, &object_info, &fi, lock_optimization_enabled) {
+            let stream = Self::get_object_decode_reader_with_fileinfo(
+                bucket,
+                object,
+                fi,
+                files,
+                &disks,
+                self.set_index,
+                self.pool_index,
+                opts.skip_verify_bitrot,
+            )
+            .await?;
+            let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+            return Ok(reader);
+        }
 
         let duplex_buffer_size = get_duplex_buffer_size();
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
