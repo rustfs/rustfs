@@ -124,6 +124,10 @@ enum ScannerCycleWakeReason {
 }
 
 async fn wait_for_next_scanner_cycle(ctx: &CancellationToken, delay: Duration) -> ScannerCycleWakeReason {
+    if dirty_usage_buckets_pending() {
+        return ScannerCycleWakeReason::DirtyUsage;
+    }
+
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
 
@@ -1619,6 +1623,19 @@ mod tests {
         let reason = tokio::time::timeout(Duration::from_secs(1), wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)))
             .await
             .expect("dirty usage should wake scanner before timer");
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_sees_existing_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)).await;
 
         assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
         crate::scanner_io::clear_dirty_usage_bucket("photos");
