@@ -133,10 +133,6 @@ mod ecstore_config {
     pub(crate) use crate::storage::ecstore_config::{com, init, storageclass};
 }
 
-mod ecstore_data_usage {
-    pub(crate) use crate::storage::ecstore_data_usage::load_data_usage_from_backend;
-}
-
 #[allow(unused_imports)]
 mod ecstore_disk {
     pub(crate) use crate::storage::ecstore_disk::{RUSTFS_META_BUCKET, endpoint};
@@ -471,12 +467,6 @@ pub(crate) async fn save_admin_server_config(api: Arc<ECStore>, cfg: &rustfs_con
 
 pub(crate) fn init_admin_config_defaults() {
     ecstore_config::init();
-}
-
-pub(crate) async fn load_data_usage_from_backend(
-    store: Arc<ECStore>,
-) -> std::result::Result<rustfs_data_usage::DataUsageInfo, Error> {
-    ecstore_data_usage::load_data_usage_from_backend(store).await
 }
 
 pub(crate) async fn collect_local_metrics(

@@ -153,6 +153,7 @@ ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff
 RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
 IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/iam_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_runtime_source_bypass_hits.txt"
+RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_runtime_storage_api_bypass_hits.txt"
 RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
 RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
 RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
@@ -1473,6 +1474,30 @@ fi
 
 if [[ -s "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app/admin completed storage helper consumers must use local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b|(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b)' \
+      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
+      -g '!storage_api.rs' || true
+    rg -n --with-filename \
+      'super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)|super::super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)' \
+      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
+      -g '!storage_api.rs' || true
+    rg -n --with-filename \
+      'crate::app::(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|get_global_|set_object_store_resolver)' \
+      rustfs/src --glob '*.rs' || true
+    rg -n --with-filename \
+      'ecstore_data_usage|pub\(crate\) async fn load_data_usage_from_backend|super::super::load_data_usage_from_backend|crate::admin::load_data_usage_from_backend' \
+      rustfs/src/admin/mod.rs rustfs/src/admin/handlers/*.rs || true
+  }
+) >"$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin runtime and data-usage facades must stay behind local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE")"
 fi
 
 (

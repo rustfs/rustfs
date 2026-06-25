@@ -67,7 +67,9 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequest, message.into())
 }
 
-fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<crate::app::ECStore>> {
+fn resolve_runtime_config_store_for_context(
+    context: Option<&AppContext>,
+) -> S3Result<std::sync::Arc<crate::app::storage_api::ECStore>> {
     resolve_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 

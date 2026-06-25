@@ -15,8 +15,8 @@
 //! Object application use-case contracts.
 
 // Performance metrics recording (with zero-copy-metrics integration)
-use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::ECStore;
 use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
 use super::storage_api::bucket::quota::checker::QuotaChecker;
 use super::storage_api::bucket::{
@@ -47,6 +47,7 @@ use super::storage_api::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
 };
+use super::storage_api::data_usage::{record_bucket_object_delete_memory, record_bucket_object_write_memory};
 use super::storage_api::deadlock_detector;
 use super::storage_api::ecfs::FS;
 use super::storage_api::error::{
@@ -2596,7 +2597,7 @@ impl DefaultObjectUsecase {
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -3563,7 +3564,7 @@ impl DefaultObjectUsecase {
 
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            super::record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
@@ -3840,7 +3841,7 @@ impl DefaultObjectUsecase {
                     );
                 }
                 let size = object_sizes[i].max(0) as u64;
-                super::record_bucket_object_delete_memory(
+                record_bucket_object_delete_memory(
                     &bucket,
                     size,
                     existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
@@ -4077,7 +4078,7 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        super::record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
+        record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {

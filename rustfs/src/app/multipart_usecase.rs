@@ -14,11 +14,11 @@
 
 //! Multipart application use-case contracts.
 
-use super::ECStore;
 use super::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
+use super::storage_api::ECStore;
 use super::storage_api::access::has_bypass_governance_header;
 use super::storage_api::bucket::quota::checker::QuotaChecker;
 use super::storage_api::bucket::{
@@ -29,6 +29,7 @@ use super::storage_api::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::compression::is_disk_compressible;
+use super::storage_api::data_usage::record_bucket_object_write_memory;
 use super::storage_api::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::helper::OperationHelper;
 #[cfg(test)]
@@ -488,7 +489,7 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    super::record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);

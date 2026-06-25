@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{ECStore, set_object_store_resolver};
+use super::super::storage_api::ECStore;
+use super::super::storage_api::runtime::set_object_store_resolver;
 use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_boot_time_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,

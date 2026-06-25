@@ -15,3 +15,13 @@
 pub(crate) use crate::storage::StorageObjectOptions;
 pub(crate) use crate::storage::access::{ReqInfo, authorize_request};
 pub(crate) use crate::storage::request_context::{RequestContext, spawn_traced};
+
+pub(crate) mod data_usage {
+    use std::sync::Arc;
+
+    pub(crate) async fn load_data_usage_from_backend(
+        store: Arc<crate::storage::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::StorageError> {
+        crate::storage::ecstore_data_usage::load_data_usage_from_backend(store).await
+    }
+}

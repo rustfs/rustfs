@@ -14,6 +14,168 @@
 
 //! App-local boundary for storage-layer helper APIs used by S3 use cases.
 
+pub(crate) use crate::storage::ECStore;
+#[cfg(test)]
+pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
+pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
+
+#[cfg(test)]
+#[allow(non_snake_case)]
+pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
+    crate::storage::EndpointServerPools::from(pools)
+}
+
+pub(crate) mod admin {
+    pub(crate) async fn get_server_info(get_pools: bool) -> rustfs_madmin::InfoMessage {
+        crate::storage::ecstore_admin::get_server_info(get_pools).await
+    }
+}
+
+pub(crate) mod capacity {
+    pub(crate) type PoolDecommissionInfo = crate::storage::ecstore_capacity::PoolDecommissionInfo;
+    pub(crate) type PoolStatus = crate::storage::ecstore_capacity::PoolStatus;
+    pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
+
+    pub(crate) fn get_total_usable_capacity(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
+        crate::storage::ecstore_capacity::get_total_usable_capacity(disks, info)
+    }
+
+    pub(crate) fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info: &rustfs_madmin::StorageInfo) -> usize {
+        crate::storage::ecstore_capacity::get_total_usable_capacity_free(disks, info)
+    }
+}
+
+pub(crate) mod data_usage {
+    use std::sync::Arc;
+
+    pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
+        crate::storage::ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
+    }
+
+    pub(crate) async fn load_data_usage_from_backend(
+        store: Arc<super::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::StorageError> {
+        crate::storage::ecstore_data_usage::load_data_usage_from_backend(store).await
+    }
+
+    pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
+        crate::storage::ecstore_data_usage::record_bucket_object_delete_memory(bucket, deleted_size, removed_current_object)
+            .await;
+    }
+
+    pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
+        crate::storage::ecstore_data_usage::record_bucket_object_write_memory(bucket, previous_current_size, new_size).await;
+    }
+
+    pub(crate) async fn remove_bucket_usage_from_backend(
+        store: Arc<super::ECStore>,
+        bucket: &str,
+    ) -> Result<(), crate::storage::StorageError> {
+        crate::storage::ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
+    }
+}
+
+pub(crate) mod runtime {
+    use std::{collections::HashMap, sync::Arc};
+
+    pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
+    pub(crate) type DailyAllTierStats = crate::storage::DailyAllTierStats;
+    pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
+    pub(crate) type ExpiryState = crate::storage::ExpiryState;
+    pub(crate) type NotificationSys = crate::storage::NotificationSys;
+    pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
+    pub(crate) type ReplicationStats = crate::storage::ReplicationStats;
+    pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+    pub(crate) type StorageClassConfig = crate::storage::ecstore_config::storageclass::Config;
+    pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
+
+    #[cfg(test)]
+    pub(crate) type TierConfig = crate::storage::ecstore_tier::tier_config::TierConfig;
+    #[cfg(test)]
+    pub(crate) type TierType = crate::storage::ecstore_tier::tier_config::TierType;
+    #[cfg(test)]
+    pub(crate) use crate::storage::ecstore_tier::warm_backend::WarmBackend as AppWarmBackend;
+    #[cfg(test)]
+    pub(crate) type WarmBackendGetOpts = crate::storage::ecstore_tier::warm_backend::WarmBackendGetOpts;
+
+    pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
+        crate::storage::ecstore_config::set_global_storage_class(cfg);
+    }
+
+    pub(crate) fn get_global_endpoints_opt() -> Option<super::EndpointServerPools> {
+        crate::storage::get_global_endpoints_opt()
+    }
+
+    pub(crate) fn get_global_deployment_id() -> Option<String> {
+        crate::storage::get_global_deployment_id()
+    }
+
+    pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+        crate::storage::get_global_lock_client()
+    }
+
+    pub(crate) fn get_global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
+        crate::storage::get_global_lock_clients()
+    }
+
+    pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
+        crate::storage::get_global_region()
+    }
+
+    pub(crate) fn global_rustfs_port() -> u16 {
+        crate::storage::global_rustfs_port()
+    }
+
+    pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
+        crate::storage::get_global_tier_config_mgr()
+    }
+
+    pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
+        crate::storage::get_global_expiry_state()
+    }
+
+    pub(crate) fn new_object_layer_fn() -> Option<Arc<super::ECStore>> {
+        crate::storage::new_object_layer_fn()
+    }
+
+    pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
+        crate::storage::set_object_store_resolver(resolver)
+    }
+
+    pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
+        crate::storage::get_global_notification_sys()
+    }
+
+    pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
+        crate::storage::get_global_bucket_monitor()
+    }
+
+    pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
+        crate::storage::get_global_replication_pool()
+    }
+
+    pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+        crate::storage::get_global_replication_stats()
+    }
+
+    pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
+        crate::storage::get_global_boot_time()
+    }
+
+    pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
+        crate::storage::get_daily_all_tier_stats()
+    }
+
+    pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
+        rustfs_common::metrics::global_metrics().report().await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn init_local_disks(endpoint_pools: super::EndpointServerPools) -> Result<(), crate::storage::StorageError> {
+        crate::storage::init_local_disks(endpoint_pools).await
+    }
+}
+
 pub(crate) mod access {
     pub(crate) use crate::storage::access::{
         PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,

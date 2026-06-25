@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::storage_api::bucket::metadata_sys;
-use super::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use super::storage_api::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
@@ -78,7 +78,9 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    super::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    super::storage_api::runtime::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())

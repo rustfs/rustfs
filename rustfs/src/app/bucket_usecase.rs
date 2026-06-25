@@ -14,12 +14,12 @@
 
 //! Bucket application use-case contracts.
 
-use super::ECStore;
 use super::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     rustfs_owner,
 };
+use super::storage_api::ECStore;
 use super::storage_api::StorageObjectInfo as ObjectInfo;
 use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
 #[cfg(test)]
@@ -42,6 +42,7 @@ use super::storage_api::bucket::{
     utils::serialize,
     versioning_sys::BucketVersioningSys,
 };
+use super::storage_api::data_usage::remove_bucket_usage_from_backend;
 use super::storage_api::error::StorageError;
 use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
 use super::storage_api::object_utils::to_s3s_etag;
@@ -867,7 +868,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
-        if let Err(err) = super::remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
+        if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");
         }
 

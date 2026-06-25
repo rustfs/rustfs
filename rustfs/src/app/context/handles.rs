@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::EndpointServerPools;
-use super::super::StorageClassConfig;
-use super::super::TierConfigMgr;
+use super::super::storage_api::EndpointServerPools;
 use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+};
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
@@ -153,7 +155,7 @@ impl NotifyInterface for NotifyHandle {
 pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
-    fn handle(&self) -> Option<&'static super::super::NotificationSys> {
+    fn handle(&self) -> Option<&'static NotificationSys> {
         runtime_sources::notification_system()
     }
 }
@@ -173,7 +175,7 @@ impl BucketMetadataInterface for BucketMetadataHandle {
 pub struct BucketMonitorHandle;
 
 impl BucketMonitorInterface for BucketMonitorHandle {
-    fn handle(&self) -> Option<Arc<super::super::BucketBandwidthMonitor>> {
+    fn handle(&self) -> Option<Arc<BucketBandwidthMonitor>> {
         runtime_sources::bucket_monitor()
     }
 }
@@ -183,7 +185,7 @@ impl BucketMonitorInterface for BucketMonitorHandle {
 pub struct ReplicationPoolHandle;
 
 impl ReplicationPoolInterface for ReplicationPoolHandle {
-    fn handle(&self) -> Option<Arc<super::super::DynReplicationPool>> {
+    fn handle(&self) -> Option<Arc<DynReplicationPool>> {
         runtime_sources::replication_pool()
     }
 }
@@ -193,7 +195,7 @@ impl ReplicationPoolInterface for ReplicationPoolHandle {
 pub struct ReplicationStatsHandle;
 
 impl ReplicationStatsInterface for ReplicationStatsHandle {
-    fn handle(&self) -> Option<Arc<super::super::ReplicationStats>> {
+    fn handle(&self) -> Option<Arc<ReplicationStats>> {
         runtime_sources::replication_stats()
     }
 }
@@ -213,7 +215,7 @@ impl BootTimeInterface for BootTimeHandle {
 pub struct TierStatsHandle;
 
 impl TierStatsInterface for TierStatsHandle {
-    fn daily_all(&self) -> super::super::DailyAllTierStats {
+    fn daily_all(&self) -> DailyAllTierStats {
         runtime_sources::daily_tier_stats()
     }
 }
@@ -224,7 +226,7 @@ pub struct ScannerMetricsHandle;
 
 #[async_trait]
 impl ScannerMetricsInterface for ScannerMetricsHandle {
-    async fn report(&self) -> super::super::ScannerMetricsReport {
+    async fn report(&self) -> ScannerMetricsReport {
         runtime_sources::scanner_metrics_report().await
     }
 }
@@ -360,7 +362,7 @@ impl TierConfigInterface for TierConfigHandle {
 pub struct ExpiryStateHandle;
 
 impl ExpiryStateInterface for ExpiryStateHandle {
-    fn handle(&self) -> Arc<RwLock<super::super::ExpiryState>> {
+    fn handle(&self) -> Arc<RwLock<ExpiryState>> {
         runtime_sources::expiry_state()
     }
 }
