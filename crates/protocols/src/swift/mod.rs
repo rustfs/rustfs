@@ -33,16 +33,6 @@
 //! and stores credentials in task-local storage, which Swift handlers access
 //! to enforce tenant isolation.
 
-use std::sync::Arc;
-
-pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
-use rustfs_ecstore::api::bucket::metadata_sys::{
-    get as get_swift_bucket_metadata_from_backend, set_bucket_metadata as set_swift_bucket_metadata_in_backend,
-};
-pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
-pub(crate) use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_swift_object_store_handle;
-use rustfs_ecstore::api::storage::ECStore as SwiftStore;
-
 pub mod account;
 pub mod acl;
 pub mod bulk;
@@ -61,6 +51,7 @@ pub mod ratelimit;
 pub mod router;
 pub mod slo;
 pub mod staticweb;
+mod storage_api;
 pub mod symlink;
 pub mod sync;
 pub mod tempurl;
@@ -70,18 +61,7 @@ pub mod versioning;
 pub use errors::{SwiftError, SwiftResult};
 pub use router::{SwiftRoute, SwiftRouter};
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
+pub use storage_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+pub(crate) use storage_api::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};
-
-pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
-pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
-pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
-pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
-
-pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
-    get_swift_bucket_metadata_from_backend(bucket).await
-}
-
-pub(crate) async fn set_swift_bucket_metadata(bucket: String, metadata: SwiftBucketMetadata) -> SwiftStorageResult<()> {
-    set_swift_bucket_metadata_in_backend(bucket, metadata).await
-}

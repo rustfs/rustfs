@@ -30,7 +30,6 @@ use futures_core::stream::BoxStream;
 use http::{HeaderMap, HeaderValue, header::HeaderName};
 use pin_project_lite::pin_project;
 use rustfs_common::DEFAULT_DELIMITER;
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use s3s::S3Result;
 use s3s::dto::SelectObjectContentInput;
 use s3s::header::{
@@ -48,6 +47,8 @@ use tokio::io::AsyncReadExt;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
+
+use crate::storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)

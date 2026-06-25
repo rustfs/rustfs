@@ -12,18 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::{IamNotificationSys, notification_sys as ecstore_notification_sys};
-use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config};
-use rustfs_credentials::{Credentials, get_global_action_cred};
-
-pub(crate) fn action_credentials() -> Option<Credentials> {
-    get_global_action_cred()
-}
-
-pub(crate) fn current_server_config() -> Option<ServerConfig> {
-    get_global_server_config()
-}
-
-pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
-    ecstore_notification_sys()
-}
+pub(crate) use rustfs_ecstore::api::bucket::utils::{
+    check_object_name_for_length_and_slash, has_bad_path_component, is_valid_object_prefix,
+};

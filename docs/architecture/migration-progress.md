@@ -5,9 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-external-crate-storage-boundary-sweep`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221`.
-- Based on: API-221 branch; branch routes scanner and heal source plus integration test storage symbols through local `storage_api` boundaries.
+- Branch: `overtrue/arch-remaining-external-storage-boundaries`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222`.
+- Based on: API-222 branch; branch routes remaining external runtime, test, and fuzz storage symbols through local `storage_api` boundaries.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -56,8 +56,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   config tests through a root-local storage_api boundary, plus root/server/startup
   `rustfs_storage_api` contract imports through the same boundary, app/admin
   `rustfs_storage_api` contract imports through their local boundaries, app
-  S3 helper forwarding through `app::storage_api`, and scanner/heal source and
+  S3 helper forwarding through `app::storage_api`, scanner/heal source and
   test ECStore plus storage contract imports through crate-local `storage_api`
+  boundaries, and remaining IAM, notify, OBS metrics, Swift, S3 Select, e2e,
+  and fuzz ECStore/storage contract imports through local `storage_api`
   boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
@@ -68,8 +70,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   event-bridge thin module regressions, plus IAM runtime-source bypasses;
   accept the reviewed AppContext resolver reverse dependencies in the layer
   baseline, and block direct admin AppContext resolver consumers outside the
-  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, reject app/admin runtime/data-usage root facade regressions, reject admin root storage facade regressions from migrated admin consumers, reject root/server/startup direct storage facade regressions from migrated outer consumers, reject root/server/startup direct storage contract imports from migrated outer consumers, reject app/admin direct storage contract imports from migrated owner consumers, keep app S3 helper imports routed through `app::storage_api`, and reject scanner/heal direct ECStore or storage contract imports outside their local `storage_api` boundaries.
-- Docs changes: record the API-136 through API-222 owner facade and lifecycle
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, reject app/admin runtime/data-usage root facade regressions, reject admin root storage facade regressions from migrated admin consumers, reject root/server/startup direct storage facade regressions from migrated outer consumers, reject root/server/startup direct storage contract imports from migrated outer consumers, reject app/admin direct storage contract imports from migrated owner consumers, keep app S3 helper imports routed through `app::storage_api`, reject scanner/heal direct ECStore or storage contract imports outside their local `storage_api` boundaries, and reject external runtime/test/fuzz ECStore or storage contract imports outside their local `storage_api` boundaries.
+- Docs changes: record the API-136 through API-223 owner facade and lifecycle
   runtime-source cleanup.
 
 ## Phase 0 Tasks
@@ -5228,14 +5230,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration and layer guards, diff hygiene, residual scanner/heal boundary
     scan, Rust risk scan, fast PR gate, and full PR gate before PR.
 
+- [x] `API-223` Route remaining external storage imports through local storage_api boundaries.
+  - Do: move IAM, notify, OBS metrics, Swift, S3 Select, e2e, and fuzz ECStore
+    plus `rustfs_storage_api` imports into local boundary modules, then route
+    callers through those boundaries.
+  - Acceptance: migrated external runtime/test/fuzz consumers no longer import
+    ECStore or storage contract symbols directly, and migration rules reject
+    direct bypasses outside the reviewed boundary modules.
+  - Must preserve: IAM config/error/notification behavior, notify config
+    persistence, OBS capacity/data-usage metrics, Swift bucket/object/range
+    operations, S3 Select object reads, e2e RPC/disk/bucket-target helpers, and
+    fuzz validation semantics.
+  - Verification: focused external crate and fuzz compile coverage, formatting,
+    migration and layer guards, diff hygiene, residual external boundary scan,
+    Rust risk scan, fast PR gate, and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-222.
+1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-223.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-223 moves the remaining external runtime/test/fuzz ECStore and storage contract imports behind local storage_api boundaries. |
+| Migration preservation | pass | IAM, notify, OBS metrics, Swift, S3 Select, e2e, and fuzz callers keep the same ECStore/storage implementations and behavior. |
+| Testing/verification | pass | Focused external crate/fuzz compile coverage, formatting, migration/layer guards, residual boundary scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-222 routes scanner and heal ECStore/storage contract imports through crate-local storage_api boundaries. |
 | Migration preservation | pass | Scanner lifecycle/tier/replication IO and heal disk/object/bucket test contracts keep the same ECStore and storage-api implementations. |
 | Testing/verification | pass | Focused scanner/heal compile coverage, formatting, migration/layer guards, residual boundary scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
