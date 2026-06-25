@@ -422,6 +422,7 @@ impl PathCategory {
             || path.starts_with("/health/")
             || path == "/minio/health/live"
             || path == "/minio/health/ready"
+            || path == "/minio/health/cluster"
         {
             PathCategory::Probe
         } else {
@@ -772,6 +773,7 @@ mod tests {
         assert_eq!(PathCategory::classify("/health/ready"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/minio/health/live"), PathCategory::Probe);
         assert_eq!(PathCategory::classify("/minio/health/ready"), PathCategory::Probe);
+        assert_eq!(PathCategory::classify("/minio/health/cluster"), PathCategory::Probe);
     }
 
     #[test]

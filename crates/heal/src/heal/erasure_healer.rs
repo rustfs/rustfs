@@ -15,7 +15,8 @@
 use crate::heal::{
     progress::HealProgress,
     resume::{CheckpointManager, ResumeManager, ResumeUtils},
-    storage::HealStorageAPI,
+    storage::{HealStorageAPI, next_heal_listing_token},
+    task::is_missing_object_dir_heal_result,
 };
 use crate::{Error, Result};
 use futures::{StreamExt, future::join_all, stream::FuturesUnordered};
@@ -562,6 +563,7 @@ impl ErasureSetHealer {
                         } else {
                             match storage.heal_object(&bucket_name, &object_name, None, &heal_opts).await {
                                 Ok((_result, None)) => Ok(true),
+                                Ok((_, Some(err))) if is_missing_object_dir_heal_result(&object_name, &err) => Ok(false),
                                 Ok((_, Some(err))) => Err(Error::other(err)),
                                 Err(err) => Err(err),
                             }
@@ -677,20 +679,7 @@ impl ErasureSetHealer {
                 break;
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                warn!(
-                    target: "rustfs::heal::erasure_healer",
-                    event = EVENT_HEAL_ERASURE_BUCKET_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
-                    set_disk_id,
-                    bucket,
-                    state = "missing_continuation_token",
-                    "Erasure set bucket listing truncated without continuation token"
-                );
-                break;
-            }
+            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
         }
 
         Ok(())
@@ -827,19 +816,7 @@ impl ErasureSetHealer {
                 break;
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                warn!(
-                    target: "rustfs::heal::erasure_healer",
-                    event = EVENT_HEAL_ERASURE_BUCKET_STATE,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
-                    bucket,
-                    state = "missing_continuation_token",
-                    "Erasure set bucket listing truncated without continuation token"
-                );
-                break;
-            }
+            continuation_token = next_heal_listing_token(bucket, "", next_token, is_truncated)?;
         }
 
         // 7. final progress update

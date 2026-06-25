@@ -16,10 +16,10 @@ use super::super::ecstore_utils::is_valid_object_prefix;
 use super::super::is_reserved_or_invalid_bucket;
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::resolve_object_store_handle;
+use crate::admin::storage_api::spawn_traced;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
-use crate::storage::request_context::spawn_traced;
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue, Uri};
 use hyper::{Method, StatusCode};
@@ -194,6 +194,8 @@ struct HealTaskStatus {
     heal_settings: HealOpts,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -211,6 +213,8 @@ struct HealTaskStatusPayload {
     summary: String,
     #[serde(default)]
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    #[serde(default)]
+    progress: Option<serde_json::Value>,
 }
 
 fn map_heal_response(result: Option<HealResp>) -> S3Result<(StatusCode, Vec<u8>)> {
@@ -253,6 +257,7 @@ fn encode_heal_task_status(
     failure_detail: String,
     heal_settings: HealOpts,
     items: Vec<rustfs_madmin::heal_commands::HealResultItem>,
+    progress: Option<serde_json::Value>,
 ) -> S3Result<Vec<u8>> {
     encode_json(&HealTaskStatus {
         summary,
@@ -260,12 +265,14 @@ fn encode_heal_task_status(
         start_time: current_rfc3339_time()?,
         heal_settings,
         items,
+        progress,
     })
 }
 
 fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     let root_erasure_set_target =
         hip.bucket.is_empty() && hip.obj_prefix.is_empty() && matches!((hip.hs.pool, hip.hs.set), (Some(_), Some(_)));
+    let root_cluster_target = hip.bucket.is_empty() && hip.obj_prefix.is_empty() && hip.hs.pool.is_none() && hip.hs.set.is_none();
     let recursive = if (!hip.bucket.is_empty() && hip.obj_prefix.is_empty()) || root_erasure_set_target {
         true
     } else {
@@ -291,7 +298,7 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
     heal_request.remove_corrupted = Some(hip.hs.remove);
     heal_request.recreate_missing = Some(hip.hs.recreate);
     heal_request.update_parity = Some(hip.hs.update_parity);
-    heal_request.recursive = Some(recursive);
+    heal_request.recursive = Some(recursive || root_cluster_target);
     heal_request.dry_run = Some(hip.hs.dry_run);
     heal_request.source = HealRequestSource::Admin;
     heal_request
@@ -299,15 +306,15 @@ fn build_heal_channel_request(hip: &HealInitParams) -> HealChannelRequest {
 
 fn heal_channel_response_status(
     response: &rustfs_common::heal_channel::HealChannelResponse,
-) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>) {
+) -> (String, Vec<rustfs_madmin::heal_commands::HealResultItem>, Option<serde_json::Value>) {
     let Some(data) = response.data.as_deref() else {
-        return ("running".to_string(), Vec::new());
+        return ("running".to_string(), Vec::new(), None);
     };
 
     if let Ok(payload) = serde_json::from_slice::<HealTaskStatusPayload>(data)
         && !payload.summary.is_empty()
     {
-        return (payload.summary, payload.items);
+        return (payload.summary, payload.items, payload.progress);
     }
 
     let summary = std::str::from_utf8(data)
@@ -315,7 +322,7 @@ fn heal_channel_response_status(
         .filter(|summary| !summary.is_empty())
         .unwrap_or("running")
         .to_string();
-    (summary, Vec::new())
+    (summary, Vec::new(), None)
 }
 
 #[cfg(test)]
@@ -328,6 +335,11 @@ fn heal_channel_response_items(
     response: &rustfs_common::heal_channel::HealChannelResponse,
 ) -> Vec<rustfs_madmin::heal_commands::HealResultItem> {
     heal_channel_response_status(response).1
+}
+
+#[cfg(test)]
+fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealChannelResponse) -> Option<serde_json::Value> {
+    heal_channel_response_status(response).2
 }
 
 fn encode_background_heal_status(
@@ -362,20 +374,16 @@ fn validate_heal_request_mode(hip: &HealInitParams) -> S3Result<()> {
             (Some(_), None) | (None, Some(_)) => {
                 Err(s3_error!(InvalidRequest, "root heal erasure-set target requires both pool and set"))
             }
-            (None, None) => Err(s3_error!(InvalidRequest, "starting heal without a bucket target is not supported")),
+            (None, None) if hip.hs.recursive => Ok(()),
+            (None, None) => Err(s3_error!(InvalidRequest, "root heal requires recursive=true or a bucket target")),
         };
     }
 
     Ok(())
 }
 
-fn should_handle_root_heal_directly(hip: &HealInitParams) -> bool {
-    hip.bucket.is_empty()
-        && hip.obj_prefix.is_empty()
-        && hip.client_token.is_empty()
-        && !hip.force_stop
-        && hip.hs.pool.is_none()
-        && hip.hs.set.is_none()
+fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
+    false
 }
 
 fn map_root_heal_status(heal_err: Option<super::super::Error>) -> S3Result<()> {
@@ -529,9 +537,14 @@ impl Operation for HealHandler {
             spawn_traced(async move {
                 match rustfs_common::heal_channel::query_heal_status(heal_path_str, client_token).await {
                     Ok(response) if response.success => {
-                        let (summary, items) = heal_channel_response_status(&response);
-                        let resp_bytes =
-                            encode_heal_task_status(summary, response.error.unwrap_or_default(), HealOpts::default(), items);
+                        let (summary, items, progress) = heal_channel_response_status(&response);
+                        let resp_bytes = encode_heal_task_status(
+                            summary,
+                            response.error.unwrap_or_default(),
+                            HealOpts::default(),
+                            items,
+                            progress,
+                        );
                         match resp_bytes {
                             Ok(resp_bytes) => {
                                 let _ = tx_clone
@@ -582,8 +595,8 @@ impl Operation for HealHandler {
                         let resp_bytes = if client_token.is_empty() {
                             encode_heal_start_success(response.request_id, client_address)
                         } else {
-                            let (summary, items) = heal_channel_response_status(&response);
-                            encode_heal_task_status(summary, response.error.unwrap_or_default(), heal_settings, items)
+                            let (summary, items, progress) = heal_channel_response_status(&response);
+                            encode_heal_task_status(summary, response.error.unwrap_or_default(), heal_settings, items, progress)
                         };
                         match resp_bytes {
                             Ok(resp_bytes) => {
@@ -734,8 +747,9 @@ mod tests {
     use super::extract_heal_init_params;
     use super::{
         HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, heal_channel_response_items, heal_channel_response_summary, json_response, map_heal_response,
-        map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode, validate_heal_target,
+        encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary,
+        json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode,
+        validate_heal_target,
     };
     use bytes::Bytes;
     use http::StatusCode;
@@ -919,6 +933,31 @@ mod tests {
     }
 
     #[test]
+    fn test_root_recursive_heal_channel_request_targets_cluster() {
+        let hip = HealInitParams {
+            hs: HealOpts {
+                recursive: true,
+                scan_mode: HealScanMode::Deep,
+                recreate: true,
+                ..Default::default()
+            },
+            force_start: true,
+            ..Default::default()
+        };
+
+        let request = build_heal_channel_request(&hip);
+
+        assert_eq!(request.bucket, "");
+        assert_eq!(request.disk, None);
+        assert_eq!(request.object_prefix, None);
+        assert_eq!(request.priority, HealChannelPriority::High);
+        assert_eq!(request.source, HealRequestSource::Admin);
+        assert_eq!(request.scan_mode, Some(HealScanMode::Deep));
+        assert_eq!(request.recursive, Some(true));
+        assert_eq!(request.recreate_missing, Some(true));
+    }
+
+    #[test]
     fn test_bucket_heal_channel_request_defaults_to_recursive() {
         let hip = HealInitParams {
             bucket: "bucket".to_string(),
@@ -973,8 +1012,20 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
         assert!(
             err.to_string()
-                .contains("starting heal without a bucket target is not supported")
+                .contains("root heal requires recursive=true or a bucket target")
         );
+    }
+
+    #[test]
+    fn test_validate_heal_request_mode_allows_root_recursive_heal_start() {
+        validate_heal_request_mode(&HealInitParams {
+            hs: HealOpts {
+                recursive: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .expect("root recursive heal should start tracked cluster heal");
     }
 
     #[test]
@@ -1009,9 +1060,9 @@ mod tests {
     }
 
     #[test]
-    fn test_should_handle_root_heal_directly_for_root_start_modes() {
-        assert!(should_handle_root_heal_directly(&HealInitParams::default()));
-        assert!(should_handle_root_heal_directly(&HealInitParams {
+    fn test_should_handle_root_heal_directly_is_disabled_for_root_start_modes() {
+        assert!(!should_handle_root_heal_directly(&HealInitParams::default()));
+        assert!(!should_handle_root_heal_directly(&HealInitParams {
             force_start: true,
             ..Default::default()
         }));
@@ -1169,9 +1220,14 @@ mod tests {
 
     #[test]
     fn test_encode_heal_task_status_uses_client_wire_shape() {
-        let encoded =
-            encode_heal_task_status("Heal status query accepted".to_string(), String::new(), HealOpts::default(), Vec::new())
-                .expect("status response should serialize");
+        let encoded = encode_heal_task_status(
+            "Heal status query accepted".to_string(),
+            String::new(),
+            HealOpts::default(),
+            Vec::new(),
+            None,
+        )
+        .expect("status response should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["summary"], "Heal status query accepted");
@@ -1180,6 +1236,26 @@ mod tests {
         assert!(json["settings"].is_object());
         let start_time = json["startTime"].as_str().expect("startTime should be a string");
         OffsetDateTime::parse(start_time, &Rfc3339).expect("startTime should be RFC3339");
+    }
+
+    #[test]
+    fn test_encode_heal_task_status_preserves_progress() {
+        let progress = json!({
+            "objectsScanned": 7,
+            "objectsHealed": 3,
+            "currentObject": "bucket-a/object-a"
+        });
+        let encoded = encode_heal_task_status(
+            "running".to_string(),
+            String::new(),
+            HealOpts::default(),
+            Vec::new(),
+            Some(progress.clone()),
+        )
+        .expect("status response should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
+
+        assert_eq!(json["progress"], progress);
     }
 
     #[test]
@@ -1262,6 +1338,29 @@ mod tests {
         assert_eq!(items[0].bucket, "bucket-a");
         assert_eq!(items[0].object, "object-a");
         assert_eq!(items[0].object_size, 1024);
+    }
+
+    #[test]
+    fn test_heal_channel_response_status_preserves_progress() {
+        let progress = serde_json::json!({
+            "objectsScanned": 4,
+            "objectsHealed": 2,
+            "currentObject": "bucket-a/object-a"
+        });
+        let payload = serde_json::json!({
+            "summary": "running",
+            "items": [],
+            "progress": progress
+        });
+        let response = rustfs_common::heal_channel::create_heal_response(
+            "token".to_string(),
+            true,
+            Some(serde_json::to_vec(&payload).expect("payload should serialize")),
+            None,
+        );
+
+        assert_eq!(heal_channel_response_summary(&response), "running");
+        assert_eq!(heal_channel_response_progress(&response), Some(progress));
     }
 
     #[test]
