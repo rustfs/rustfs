@@ -20,6 +20,32 @@ use super::storageclass;
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::concurrency::{
+    self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_put_concurrency_aware_buffer_size,
+};
+use super::storage_api::deadlock_detector;
+use super::storage_api::ecfs::FS;
+use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::options::{
+    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+};
+use super::storage_api::request_context::{self, spawn_traced};
+use super::storage_api::sse::{
+    DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
+    encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
+    extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
+};
+use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::{
+    RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
+    parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
+    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+};
 use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
 use super::{DiskError, is_all_buckets_not_found};
 use super::{DynReader, HashReader, WritePlan, wrap_reader};
@@ -53,32 +79,6 @@ use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
-use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
-use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
-    get_put_concurrency_aware_buffer_size,
-};
-use crate::storage::ecfs::FS;
-use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::options::{
-    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
-};
-use crate::storage::request_context::spawn_traced;
-use crate::storage::sse::{
-    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
-    map_get_object_reader_error,
-};
-use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
-use crate::storage::{
-    DecryptionRequest, EncryptionRequest, RFC1123, apply_bucket_default_lock_retention, check_preconditions, concurrency,
-    deadlock_detector, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, get_buffer_size_opt_in,
-    get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, request_context, sse_decryption, sse_encryption,
-    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
-};
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -155,7 +155,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use crate::storage::{
+use super::storage_api::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
@@ -638,7 +638,7 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use crate::app::storage_api::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]

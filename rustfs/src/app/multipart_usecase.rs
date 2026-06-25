@@ -23,6 +23,19 @@ use super::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
+use super::storage_api::access::has_bypass_governance_header;
+use super::storage_api::helper::OperationHelper;
+use super::storage_api::options::{
+    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
+    parse_copy_source_range, put_opts, validate_archive_content_encoding,
+};
+use super::storage_api::sse::{
+    DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
+    build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error,
+    mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
+};
+use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 #[cfg(test)]
 use super::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use super::{HashReader, WritePlan};
@@ -38,21 +51,6 @@ use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_e
 use crate::app::runtime_sources::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
-use crate::storage::access::has_bypass_governance_header;
-use crate::storage::helper::OperationHelper;
-use crate::storage::options::{
-    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
-    parse_copy_source_range, put_opts, validate_archive_content_encoding,
-};
-use crate::storage::sse::{
-    build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
-    extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
-};
-use crate::storage::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
-    extract_server_side_encryption_from_headers, get_buffer_size_opt_in, sse_decryption, sse_prepare_encryption,
-};
-use crate::storage::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -664,7 +662,7 @@ impl DefaultMultipartUsecase {
                 let ssekms_key_id = material.kms_key_id.clone();
 
                 let mut encryption_metadata = encryption_material_to_metadata(&material)?;
-                if material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
+                if material.key_kind == EncryptionKeyKind::Object {
                     mark_encrypted_multipart_metadata(&mut encryption_metadata);
                 }
                 metadata.extend(encryption_metadata);
@@ -896,10 +894,10 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
+                EncryptionKeyKind::Object => {
                     super::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
+                EncryptionKeyKind::Direct => {
                     super::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
                 }
             };
@@ -916,10 +914,10 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
+                EncryptionKeyKind::Object => {
                     super::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
+                EncryptionKeyKind::Direct => {
                     super::WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
                 }
             };
@@ -1235,10 +1233,10 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing SSE-C session material")))?;
             let ssec_write = match ssec_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
+                EncryptionKeyKind::Object => {
                     super::WriteEncryption::multipart_object_key(ssec_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
+                EncryptionKeyKind::Direct => {
                     super::WriteEncryption::multipart(ssec_material.key_bytes, ssec_material.base_nonce, part_id)
                 }
             };
@@ -1259,10 +1257,10 @@ impl DefaultMultipartUsecase {
             .await?
             .ok_or_else(|| ApiError::from(StorageError::other("Missing managed SSE session material")))?;
             let managed_write = match managed_material.key_kind {
-                crate::storage::sse::EncryptionKeyKind::Object => {
+                EncryptionKeyKind::Object => {
                     super::WriteEncryption::multipart_object_key(managed_material.key_bytes, part_id as u32)
                 }
-                crate::storage::sse::EncryptionKeyKind::Direct => {
+                EncryptionKeyKind::Direct => {
                     super::WriteEncryption::multipart(managed_material.key_bytes, managed_material.base_nonce, part_id)
                 }
             };
@@ -1502,12 +1500,12 @@ mod tests {
                 let mut encrypted_one = Vec::new();
                 #[cfg(feature = "rio-v2")]
                 let mut part_one_reader = match part_one_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_one_plaintext.clone()),
                         part_one_material.key_bytes,
                         1,
                     ),
-                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => EncryptReader::new_multipart(
                         Cursor::new(part_one_plaintext.clone()),
                         part_one_material.key_bytes,
                         part_one_material.base_nonce,
@@ -1539,12 +1537,12 @@ mod tests {
                 let mut encrypted_two = Vec::new();
                 #[cfg(feature = "rio-v2")]
                 let mut part_two_reader = match part_two_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => EncryptReader::new_multipart_with_object_key(
                         Cursor::new(part_two_plaintext.clone()),
                         part_two_material.key_bytes,
                         2,
                     ),
-                    crate::storage::sse::EncryptionKeyKind::Direct => EncryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => EncryptReader::new_multipart(
                         Cursor::new(part_two_plaintext.clone()),
                         part_two_material.key_bytes,
                         part_two_material.base_nonce,
@@ -1563,7 +1561,7 @@ mod tests {
                     .await
                     .expect("read encrypted part two");
 
-                if session_material.key_kind == crate::storage::sse::EncryptionKeyKind::Object {
+                if session_material.key_kind == EncryptionKeyKind::Object {
                     assert!(session_metadata.contains_key("X-Minio-Internal-Encrypted-Multipart"));
                     assert!(session_metadata.contains_key("X-Minio-Internal-Server-Side-Encryption-S3-Sealed-Key"));
                 } else {
@@ -1603,12 +1601,12 @@ mod tests {
                 let plaintext_size = multipart_plaintext_size(&parts, -1);
                 #[cfg(feature = "rio-v2")]
                 let decrypted_stream = match decryption_material.key_kind {
-                    crate::storage::sse::EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
+                    EncryptionKeyKind::Object => boxed_reader(DecryptReader::new_multipart_with_object_key(
                         wrap_reader(Cursor::new(encrypted_stream)),
                         decryption_material.key_bytes,
                         multipart_part_numbers(&parts),
                     )),
-                    crate::storage::sse::EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
+                    EncryptionKeyKind::Direct => boxed_reader(DecryptReader::new_multipart(
                         wrap_reader(Cursor::new(encrypted_stream)),
                         decryption_material.key_bytes,
                         decryption_material.base_nonce,
