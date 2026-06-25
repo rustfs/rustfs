@@ -60,9 +60,9 @@ use rustfs_madmin::{
     BucketBandwidth, GroupStatus, IDPSettings, InProgressMetric, InQueueMetric, LDAPConfigSettings, LDAPSettings,
     OpenIDProviderSettings, PeerInfo, PeerSite, QStat, ReplProxyMetric, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, ResyncBucketStatus, SITE_REPL_API_VERSION, SRBucketInfo, SRBucketMeta, SRBucketStatsSummary,
-    SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerJoinReq,
-    SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSiteSummary, SRStateEditReq, SRStateInfo,
-    SRStatusInfo, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
+    SRGroupStatsSummary, SRIAMItem, SRIAMPolicy, SRILMExpiryStatsSummary, SRInfo, SRMetric, SRMetricsSummary, SRPeerError,
+    SRPeerJoinReq, SRPendingOperation, SRPolicyMapping, SRPolicyStatsSummary, SRRemoveReq, SRResyncOpStatus, SRSiteSummary,
+    SRStateEditReq, SRStateInfo, SRStatusInfo, SRUserStatsSummary, SiteReplicationInfo, SyncStatus, WorkerStat,
 };
 use rustfs_policy::policy::{
     Policy,
@@ -2266,6 +2266,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
 
     let mut site_infos = BTreeMap::new();
     let mut reachable_peers = HashSet::new();
+    let mut peer_errors = BTreeMap::new();
     for (deployment_id, peer) in &state.peers {
         if deployment_id == &local_peer.deployment_id || same_identity_endpoint(&peer.endpoint, &local_peer.endpoint) {
             site_infos.insert(deployment_id.clone(), local_info.take().unwrap_or_default());
@@ -2289,6 +2290,7 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
                         error = ?err,
                         "admin site replication state"
                     );
+                    peer_errors.insert(deployment_id.clone(), status_peer_error(peer, err.to_string()));
                     site_infos.insert(deployment_id.clone(), SRInfo::default());
                 }
             },
@@ -2300,6 +2302,10 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
                     peer = %peer.endpoint,
                     result = "site_replication_service_account_missing",
                     "admin site replication state"
+                );
+                peer_errors.insert(
+                    deployment_id.clone(),
+                    status_peer_error(peer, "site replication service account secret unavailable".to_string()),
                 );
                 site_infos.insert(deployment_id.clone(), SRInfo::default());
             }
@@ -2320,6 +2326,8 @@ async fn build_status_info(state: &SiteReplicationState, local_peer: &PeerInfo, 
         max_policies,
         max_ilm_expiry_rules,
         sites: state.peers.clone(),
+        peer_errors,
+        pending_operation: pending_operation_for_state(state, local_peer),
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
         ..Default::default()
     };
@@ -2535,6 +2543,47 @@ fn site_replication_remove_status(peer_errors: &[String]) -> ReplicateRemoveStat
         },
         api_version: Some(SITE_REPL_API_VERSION.to_string()),
     }
+}
+
+fn status_peer_error(peer: &PeerInfo, detail: String) -> SRPeerError {
+    SRPeerError {
+        name: peer.name.clone(),
+        endpoint: peer.endpoint.clone(),
+        error: summarize_peer_error_detail(&detail),
+        api_version: Some(SITE_REPL_API_VERSION.to_string()),
+    }
+}
+
+fn pending_operation_for_state(state: &SiteReplicationState, local_peer: &PeerInfo) -> Option<SRPendingOperation> {
+    if let Some(pending) = state.pending_remove.as_ref() {
+        let pending_peers = pending_remote_peer_ids(&pending.original_peers, local_peer)
+            .into_iter()
+            .filter(|deployment_id| !pending.acked_deployment_ids.contains(deployment_id))
+            .collect();
+        return Some(SRPendingOperation {
+            operation: "remove".to_string(),
+            id: pending.id.clone(),
+            pending_peers,
+            acked_peers: pending.acked_deployment_ids.iter().cloned().collect(),
+            updated_at: pending.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        });
+    }
+
+    state.pending_rotation.as_ref().map(|pending| {
+        let pending_peers = pending_remote_peer_ids(&pending.peers, local_peer)
+            .into_iter()
+            .filter(|deployment_id| !pending.acked_deployment_ids.contains(deployment_id))
+            .collect();
+        SRPendingOperation {
+            operation: "rotate-svc-acct".to_string(),
+            id: pending.id.clone(),
+            pending_peers,
+            acked_peers: pending.acked_deployment_ids.iter().cloned().collect(),
+            updated_at: pending.updated_at,
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+        }
+    })
 }
 
 fn pending_remote_peer_ids(peers: &BTreeMap<String, PeerInfo>, local_peer: &PeerInfo) -> BTreeSet<String> {
@@ -5897,6 +5946,58 @@ mod tests {
 
         assert!(!pending_all_remote_peers_acked(&peers, &local, &BTreeSet::new()));
         assert!(pending_all_remote_peers_acked(&peers, &local, &BTreeSet::from(["remote".to_string()])));
+    }
+
+    #[test]
+    fn test_pending_operation_for_state_reports_remove_progress() {
+        let local = PeerInfo {
+            deployment_id: "local".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let remote_a = PeerInfo {
+            deployment_id: "remote-a".to_string(),
+            ..peer("remote-a", "https://remote-a.example.com")
+        };
+        let remote_b = PeerInfo {
+            deployment_id: "remote-b".to_string(),
+            ..peer("remote-b", "https://remote-b.example.com")
+        };
+        let state = SiteReplicationState {
+            pending_remove: Some(PendingRemove {
+                id: "remove-id".to_string(),
+                original_peers: BTreeMap::from([
+                    (local.deployment_id.clone(), local.clone()),
+                    (remote_a.deployment_id.clone(), remote_a),
+                    (remote_b.deployment_id.clone(), remote_b),
+                ]),
+                acked_deployment_ids: BTreeSet::from(["remote-a".to_string()]),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let operation = pending_operation_for_state(&state, &local).expect("pending remove operation");
+
+        assert_eq!(operation.operation, "remove");
+        assert_eq!(operation.id, "remove-id");
+        assert_eq!(operation.acked_peers, vec!["remote-a".to_string()]);
+        assert_eq!(operation.pending_peers, vec!["remote-b".to_string()]);
+    }
+
+    #[test]
+    fn test_status_peer_error_summarizes_details() {
+        let remote = PeerInfo {
+            deployment_id: "remote".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let detail = "x".repeat(SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT + 32);
+
+        let error = status_peer_error(&remote, detail);
+
+        assert_eq!(error.name, "remote");
+        assert_eq!(error.endpoint, "https://remote.example.com");
+        assert!(error.error.ends_with("(truncated)"));
+        assert!(error.error.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
     }
 
     #[test]

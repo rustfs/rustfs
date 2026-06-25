@@ -20,6 +20,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 4. `fix: clean site replication targets on remove`
    - Purpose: remove bucket targets and `site-repl-*` replication rules that point at a removed deployment before completing pending remove.
    - Reason: removing a site only from site replication state leaves bucket-level replication configuration behind, so object replication can continue attempting to reach a removed peer.
+5. `feat: expose site replication status diagnostics`
+   - Purpose: add machine-readable peer fetch errors and pending operation progress to site replication status.
+   - Reason: operators previously saw only `Unknown` sync state or logs when peer metainfo fetches failed or remove/rotation was pending, which made automation and troubleshooting unnecessarily opaque.
 
 ## Verification
 
@@ -27,6 +30,9 @@ Baseline started from `origin/main` at `758677da`.
 
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs-ecstore bucket_target --lib`
+- Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo fmt --all`
+- Passed: `cargo test -p rustfs-madmin site_replication --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
 - Passed: `cargo test -p rustfs route_policy --lib`
@@ -44,6 +50,8 @@ The credential redaction step changes admin/export visibility of bucket target s
 The diagnostic authorization step intentionally changes required permission for `POST /site-replication/devnull` and `POST /site-replication/netperf` from `SiteReplicationInfoAction` to `SiteReplicationOperationAction`.
 
 The remove cleanup step preserves user-managed replication rules and non-replication targets, and only prunes targets/rules associated with removed site replication deployment IDs.
+
+The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fields to the status response. Existing clients can ignore them, while automation can use them to distinguish peer reachability/auth failures from content mismatch.
 
 ## Additional Notes
 
