@@ -21,9 +21,9 @@
 use super::super::{CollectMetricsOpts, MetricType, collect_local_metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::Operation;
+use crate::admin::storage_api::spawn_traced;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
-use crate::storage::request_context::spawn_traced;
 use bytes::Bytes;
 use futures::{Stream, StreamExt};
 use http::{HeaderMap, HeaderValue, Uri};

@@ -1,8 +1,8 @@
-use crate::app::context::resolve_s3select_db;
+use super::storage_api::options::get_opts;
+use super::storage_api::request_context::spawn_traced;
+use super::storage_api::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
+use crate::app::runtime_sources::resolve_s3select_db;
 use crate::error::ApiError;
-use crate::storage::options::get_opts;
-use crate::storage::request_context::spawn_traced;
-use crate::storage::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::{QuoteStyle, WriterBuilder as CsvWriterBuilder, writer::Terminator},
@@ -17,7 +17,12 @@ use rustfs_s3select_api::{
     query::{Context, Query},
 };
 use rustfs_storage_api::ObjectOperations as _;
-use s3s::dto::*;
+use s3s::dto::{
+    CSVOutput, CompressionType, ContinuationEvent, EndEvent, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput,
+    JSONOutput, JSONType, OutputSerialization, Progress, ProgressEvent, QuoteFields, RecordsEvent, SelectObjectContentEvent,
+    SelectObjectContentEventStream, SelectObjectContentInput, SelectObjectContentOutput, SelectObjectContentRequest, Stats,
+    StatsEvent,
+};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -545,6 +550,7 @@ mod tests {
     use super::*;
     use datafusion::sql::sqlparser::parser::ParserError;
     use http::HeaderMap;
+    use s3s::dto::{CSVInput, ParquetInput, ScanRange};
 
     fn base_input() -> SelectObjectContentInput {
         SelectObjectContentInput {

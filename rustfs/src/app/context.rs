@@ -19,6 +19,7 @@
 mod global;
 mod handles;
 mod interfaces;
+mod runtime_sources;
 mod startup;
 
 pub use global::*;
@@ -32,14 +33,13 @@ use super::ScannerMetricsReport;
 use super::StorageClassConfig;
 use super::TierConfigMgr;
 use super::metadata_sys::BucketMetadataSys;
-use super::new_object_layer_fn;
-use super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
+use super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Error as IamError, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
-use rustfs_kms::{KmsServiceManager, ObjectEncryptionService, init_global_kms_service_manager};
+use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
 use rustfs_lock::LockClient;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
@@ -54,17 +54,22 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
 
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
-    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), init_global_kms_service_manager)
+    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), runtime_sources::init_kms_service_manager)
 }
 
 /// Resolve KMS encryption service using AppContext-first precedence.
 pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    resolve_encryption_service_with(get_global_app_context(), rustfs_kms::get_global_encryption_service).await
+    resolve_encryption_service_with(get_global_app_context(), runtime_sources::encryption_service).await
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
 pub fn resolve_outbound_tls_generation() -> TlsGeneration {
     resolve_outbound_tls_generation_with(get_global_app_context(), || default_outbound_tls_runtime_interface().generation())
+}
+
+#[cfg(test)]
+pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
+    runtime_sources::set_outbound_tls_generation(generation);
 }
 
 /// Resolve outbound TLS state using AppContext-first precedence.
@@ -74,29 +79,27 @@ pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
 
 /// Resolve IAM readiness using AppContext-first precedence.
 pub fn resolve_iam_ready() -> bool {
-    resolve_iam_ready_with(get_global_app_context(), || {
-        rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
-    })
+    resolve_iam_ready_with(get_global_app_context(), runtime_sources::iam_is_ready)
 }
 
 /// Resolve IAM system handle using AppContext-first precedence.
 pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    resolve_iam_handle_with(get_global_app_context(), rustfs_iam::get_global_iam_sys)
-}
-
-/// Resolve a ready IAM system handle using AppContext-first precedence.
-pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    resolve_ready_iam_handle_with(get_global_app_context(), rustfs_iam::get)
+    resolve_iam_handle_with(get_global_app_context(), runtime_sources::iam_handle)
 }
 
 /// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
-    resolve_oidc_handle_with(get_global_app_context(), rustfs_iam::get_oidc)
+    resolve_oidc_handle_with(get_global_app_context(), runtime_sources::oidc_handle)
+}
+
+/// Resolve a ready IAM system handle using AppContext-first precedence.
+pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    resolve_ready_iam_handle_with(get_global_app_context(), runtime_sources::ready_iam_handle)
 }
 
 /// Resolve token signing key using AppContext-first precedence.
 pub fn resolve_token_signing_key() -> Option<String> {
-    resolve_token_signing_key_with(get_global_app_context(), rustfs_iam::manager::get_token_signing_key)
+    resolve_token_signing_key_with(get_global_app_context(), runtime_sources::token_signing_key)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
@@ -112,7 +115,9 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
 
 /// Resolve object store handle using an explicit AppContext, falling back to the legacy global object layer.
 pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
-    context.map(|context| context.object_store()).or_else(new_object_layer_fn)
+    context
+        .map(|context| context.object_store())
+        .or_else(runtime_sources::object_store)
 }
 
 /// Resolve notify interface using AppContext-first precedence.
@@ -212,7 +217,7 @@ pub async fn resolve_s3select_db(
 
 /// Resolve local node name using AppContext-first precedence.
 pub async fn resolve_local_node_name() -> String {
-    resolve_local_node_name_with(get_global_app_context(), rustfs_common::get_global_local_node_name).await
+    resolve_local_node_name_with(get_global_app_context(), runtime_sources::local_node_name).await
 }
 
 /// Resolve action credentials using AppContext-first precedence.
@@ -228,6 +233,11 @@ pub fn resolve_region() -> Option<s3s::region::Region> {
 /// Resolve tier config handle using AppContext-first precedence.
 pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
     resolve_tier_config_handle_with(get_global_app_context(), || default_tier_config_interface().handle())
+}
+
+/// Resolve lifecycle expiry state using AppContext-first precedence.
+pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
+    resolve_expiry_state_handle_with(get_global_app_context(), || default_expiry_state_interface().handle())
 }
 
 /// Resolve server config using AppContext-first precedence.
@@ -510,6 +520,15 @@ fn resolve_tier_config_handle_with(
     context.map(|context| context.tier_config().handle()).unwrap_or_else(fallback)
 }
 
+fn resolve_expiry_state_handle_with(
+    context: Option<Arc<AppContext>>,
+    fallback: impl FnOnce() -> Arc<RwLock<ExpiryState>>,
+) -> Arc<RwLock<ExpiryState>> {
+    context
+        .map(|context| context.expiry_state().handle())
+        .unwrap_or_else(fallback)
+}
+
 fn resolve_server_config_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<Config>) -> Option<Config> {
     context.map_or_else(fallback, |context| context.server_config().get())
 }
@@ -545,7 +564,6 @@ fn resolve_buffer_config_with(
 mod tests {
     use super::super::Endpoint;
     use super::super::init_local_disks;
-    use super::super::new_object_layer_fn;
     use super::super::{Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
@@ -847,6 +865,16 @@ mod tests {
         }
     }
 
+    struct TestExpiryStateInterface {
+        expiry_state: Arc<RwLock<ExpiryState>>,
+    }
+
+    impl ExpiryStateInterface for TestExpiryStateInterface {
+        fn handle(&self) -> Arc<RwLock<ExpiryState>> {
+            self.expiry_state.clone()
+        }
+    }
+
     struct TestServerConfigInterface {
         config: Option<Config>,
         published: Arc<AtomicUsize>,
@@ -883,7 +911,7 @@ mod tests {
     }
 
     async fn test_store() -> (TempDir, Arc<ECStore>, EndpointServerPools) {
-        if let Some(store) = new_object_layer_fn() {
+        if let Some(store) = runtime_sources::object_store() {
             let endpoints = EndpointServerPools(store.pools.iter().map(|pool| pool.endpoints.clone()).collect());
             return (tempfile::tempdir().expect("compat test temp dir"), store, endpoints);
         }
@@ -916,7 +944,7 @@ mod tests {
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-        if let Some(store) = new_object_layer_fn() {
+        if let Some(store) = runtime_sources::object_store() {
             return (temp_dir, store, endpoint_pools);
         }
 
@@ -974,6 +1002,8 @@ mod tests {
             ..Default::default()
         };
         let tier_config = TierConfigMgr::new();
+        let context_expiry_state = ExpiryState::new();
+        let fallback_expiry_state = ExpiryState::new();
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let fallback_server_config_published = Arc::new(AtomicUsize::new(0));
@@ -1101,6 +1131,9 @@ mod tests {
                 tier_config: Arc::new(TestTierConfigInterface {
                     tier_config: tier_config.clone(),
                 }),
+                expiry_state: Arc::new(TestExpiryStateInterface {
+                    expiry_state: context_expiry_state.clone(),
+                }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
                     published: context_server_config_published.clone(),
@@ -1222,6 +1255,10 @@ mod tests {
             &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
             &tier_config
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_expiry_state_handle_with(Some(context.clone()), || fallback_expiry_state.clone()),
+            &context_expiry_state
+        ));
         assert_eq!(
             resolve_server_config_with(Some(context.clone()), || None).expect("context server config"),
             server_config
@@ -1254,6 +1291,8 @@ mod tests {
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
+        // OIDC fallback path: both context absent and fallback return None.
+        assert!(resolve_oidc_handle_with(None, || None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
@@ -1332,6 +1371,10 @@ mod tests {
             fallback_region
         );
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
+        assert!(Arc::ptr_eq(
+            &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
+            &fallback_expiry_state
+        ));
         assert_eq!(
             resolve_server_config_with(None, || Some(server_config.clone())).expect("fallback server config"),
             server_config

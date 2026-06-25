@@ -14,6 +14,7 @@
 
 use super::super::ECStore;
 use super::global::{AppContext, get_global_app_context, init_global_app_context};
+use super::runtime_sources;
 use rustfs_kms::KmsServiceManager;
 use std::io::{Error, Result};
 use std::sync::Arc;
@@ -26,14 +27,15 @@ pub(crate) enum StartupAppContextBootstrap {
 
 impl AppContext {
     pub(crate) fn ensure_startup_kms_interface() -> Arc<KmsServiceManager> {
-        ensure_startup_kms_interface_with(rustfs_kms::get_global_kms_service_manager, rustfs_kms::init_global_kms_service_manager)
+        ensure_startup_kms_interface_with(runtime_sources::kms_service_manager, runtime_sources::init_kms_service_manager)
     }
 
     pub(crate) fn ensure_startup_after_iam(store: Arc<ECStore>, kms_interface: Arc<KmsServiceManager>) -> Result<()> {
         ensure_startup_app_context_after_iam_with(
             || get_global_app_context().is_some(),
             || {
-                let iam_interface = rustfs_iam::get().map_err(|_| Error::other("IAM is initialized but unavailable"))?;
+                let iam_interface =
+                    runtime_sources::ready_iam_handle().map_err(|_| Error::other("IAM is initialized but unavailable"))?;
                 init_global_app_context(AppContext::with_default_interfaces(store, iam_interface, kms_interface));
                 Ok(())
             },

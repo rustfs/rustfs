@@ -14,6 +14,7 @@
 
 use crate::heal::{
     manager::{HealManager, HealTaskReport},
+    progress::HealProgress,
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
     utils,
 };
@@ -48,6 +49,8 @@ pub struct HealChannelProcessor {
 struct HealTaskStatusPayload {
     summary: String,
     items: Vec<HealResultItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<HealProgress>,
 }
 
 impl HealChannelProcessor {
@@ -268,38 +271,48 @@ impl HealChannelProcessor {
             self.heal_manager.get_task_report_for_path(&heal_path, &client_token).await
         };
 
-        let (summary, detail, items) = match report {
+        let (summary, detail, items, progress) = match report {
             Ok(HealTaskReport {
                 status: HealTaskStatus::Pending | HealTaskStatus::Running,
                 result_items,
-            }) => ("running".to_string(), None, result_items),
+                progress,
+            }) => ("running".to_string(), None, result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Retrying { error, retry_attempt },
                 result_items,
+                progress,
             }) => (
                 "running".to_string(),
                 Some(format!("heal task retrying after recoverable failure, attempt {retry_attempt}: {error}")),
                 result_items,
+                progress,
             ),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Completed,
                 result_items,
-            }) => ("finished".to_string(), None, result_items),
+                progress,
+            }) => ("finished".to_string(), None, result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Cancelled,
                 result_items,
-            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items),
+                progress,
+            }) => ("stopped".to_string(), Some("heal task cancelled".to_string()), result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Timeout,
                 result_items,
-            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items),
+                progress,
+            }) => ("stopped".to_string(), Some("heal task timed out".to_string()), result_items, progress),
             Ok(HealTaskReport {
                 status: HealTaskStatus::Failed { error },
                 result_items,
-            }) => ("stopped".to_string(), Some(error), result_items),
-            Err(crate::Error::TaskNotFound { .. }) => {
-                ("notFound".to_string(), Some("heal task not found or expired".to_string()), Vec::new())
-            }
+                progress,
+            }) => ("stopped".to_string(), Some(error), result_items, progress),
+            Err(crate::Error::TaskNotFound { .. }) => (
+                "notFound".to_string(),
+                Some("heal task not found or expired".to_string()),
+                Vec::new(),
+                None,
+            ),
             Err(crate::Error::InvalidClientToken) => {
                 let response = HealChannelResponse {
                     request_id: client_token,
@@ -325,8 +338,12 @@ impl HealChannelProcessor {
             }
         };
 
-        let data = serde_json::to_vec(&HealTaskStatusPayload { summary, items })
-            .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
+        let data = serde_json::to_vec(&HealTaskStatusPayload {
+            summary,
+            items,
+            progress,
+        })
+        .map_err(|e| crate::Error::Serialization(format!("failed to serialize heal task status: {e}")))?;
 
         let response = HealChannelResponse {
             request_id: client_token,
@@ -400,6 +417,7 @@ impl HealChannelProcessor {
 
     /// Convert channel request to heal request
     fn convert_to_heal_request(&self, request: HealChannelRequest) -> Result<HealRequest> {
+        let recursive = request.recursive.unwrap_or(false);
         let heal_type = if let Some(disk_id) = &request.disk {
             let set_disk_id = utils::normalize_set_disk_id(disk_id).ok_or_else(|| Error::InvalidHealType {
                 heal_type: format!("erasure-set({disk_id})"),
@@ -408,12 +426,21 @@ impl HealChannelProcessor {
                 buckets: vec![],
                 set_disk_id,
             }
+        } else if request.bucket.is_empty() {
+            HealType::Cluster
         } else if let Some(prefix) = &request.object_prefix {
             if !prefix.is_empty() {
-                HealType::Object {
-                    bucket: request.bucket.clone(),
-                    object: prefix.clone(),
-                    version_id: request.object_version_id.clone(),
+                if recursive {
+                    HealType::Prefix {
+                        bucket: request.bucket.clone(),
+                        prefix: prefix.clone(),
+                    }
+                } else {
+                    HealType::Object {
+                        bucket: request.bucket.clone(),
+                        object: prefix.clone(),
+                        version_id: request.object_version_id.clone(),
+                    }
                 }
             } else {
                 HealType::Bucket {
@@ -439,7 +466,7 @@ impl HealChannelProcessor {
             remove_corrupted: request.remove_corrupted.unwrap_or(false),
             recreate_missing: request.recreate_missing.unwrap_or(true),
             update_parity: request.update_parity.unwrap_or(true),
-            recursive: request.recursive.unwrap_or(false),
+            recursive,
             dry_run: request.dry_run.unwrap_or(false),
             timeout: request.timeout_seconds.map(std::time::Duration::from_secs),
             pool_index: request.pool_index,
@@ -634,6 +661,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_convert_to_heal_request_cluster() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: String::new(),
+            object_prefix: None,
+            object_version_id: None,
+            disk: None,
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Normal),
+            remove_corrupted: Some(false),
+            recreate_missing: Some(true),
+            update_parity: Some(true),
+            recursive: Some(true),
+            dry_run: Some(false),
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+            source: HealRequestSource::Admin,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+        assert!(matches!(heal_request.heal_type, HealType::Cluster));
+        assert!(heal_request.options.recursive);
+    }
+
+    #[tokio::test]
     async fn test_convert_to_heal_request_object() {
         let heal_manager = create_test_heal_manager();
         let processor = HealChannelProcessor::new(heal_manager);
@@ -665,6 +723,40 @@ mod tests {
         assert_eq!(heal_request.options.scan_mode, HealScanMode::Deep);
         assert!(heal_request.options.remove_corrupted);
         assert!(heal_request.options.recreate_missing);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_prefix_when_recursive() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("logs/".to_string()),
+            object_version_id: None,
+            disk: None,
+            priority: HealChannelPriority::High,
+            scan_mode: Some(HealScanMode::Normal),
+            remove_corrupted: Some(false),
+            recreate_missing: Some(true),
+            update_parity: Some(true),
+            recursive: Some(true),
+            dry_run: Some(false),
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+            source: HealRequestSource::Admin,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+        assert!(matches!(
+            heal_request.heal_type,
+            HealType::Prefix { ref bucket, ref prefix } if bucket == "test-bucket" && prefix == "logs/"
+        ));
+        assert!(heal_request.options.recursive);
     }
 
     #[tokio::test]

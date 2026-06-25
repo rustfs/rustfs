@@ -14,7 +14,13 @@
 
 use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
-use crate::get_diagnostics::{GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ};
+use crate::get_diagnostics::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_POLL_PENDING,
+    GET_READER_POLL_READY_DATA, GET_READER_POLL_READY_EMPTY, GET_READER_POLL_READY_ERROR, GET_READER_PREFETCH_DIRECT,
+    GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
+    GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_FILL, GET_STAGE_OUTPUT_LOCK_WAIT, GET_STAGE_OUTPUT_POLL, GET_STAGE_RECONSTRUCT,
+    GET_STAGE_STRIPE_READ,
+};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::io;
 use std::io::ErrorKind;
@@ -44,6 +50,7 @@ where
     output_pos: usize,
     prefetched_buf: Option<Vec<u8>>,
     prefetch_error: Option<io::Error>,
+    prefetch_wait_started_at: Option<Instant>,
     remaining: usize,
     // Bounded lookahead: at most one background stripe read/decode is in flight.
     fill: Option<FillTask<S, E::Workspace>>,
@@ -73,6 +80,7 @@ where
             output_pos: 0,
             prefetched_buf: None,
             prefetch_error: None,
+            prefetch_wait_started_at: None,
             remaining: total_length,
             fill: None,
         })
@@ -91,6 +99,7 @@ where
             let engine = self.engine.clone();
             let remaining = self.remaining;
             self.fill = Some(tokio::spawn(async move {
+                let fill_stage_start = Instant::now();
                 let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
                 rustfs_io_metrics::record_get_object_stage_duration(
@@ -98,7 +107,18 @@ where
                     GET_STAGE_STRIPE_READ,
                     stripe_read_stage_start.elapsed().as_secs_f64(),
                 );
+                let decode_stage_start = Instant::now();
                 let result = decode_stripe(&engine, &mut workspace, state, remaining);
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_DECODE,
+                    decode_stage_start.elapsed().as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_FILL,
+                    fill_stage_start.elapsed().as_secs_f64(),
+                );
                 FillResult {
                     source,
                     workspace,
@@ -154,22 +174,68 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        match ready!(self.poll_fill_result(cx)) {
+        if self.prefetch_wait_started_at.is_none() {
+            self.prefetch_wait_started_at = Some(Instant::now());
+        }
+
+        let fill = match self.poll_fill_result(cx) {
+            Poll::Ready(result) => {
+                if let Some(started_at) = self.prefetch_wait_started_at.take() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch_wait(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        started_at.elapsed().as_secs_f64(),
+                    );
+                }
+                result
+            }
+            Poll::Pending => return Poll::Pending,
+        };
+
+        match fill {
             Ok(Some(buf)) => {
                 if self.output_pos < self.output_buf.len() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_STORED,
+                    );
+                    rustfs_io_metrics::record_get_object_reader_buffer(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_BUFFER_PREFETCH,
+                        buf.len(),
+                    );
                     self.prefetched_buf = Some(buf);
                 } else {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_DIRECT,
+                    );
+                    rustfs_io_metrics::record_get_object_reader_buffer(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_BUFFER_OUTPUT,
+                        buf.len(),
+                    );
                     self.output_buf = buf;
                     self.output_pos = 0;
                 }
                 Poll::Ready(Ok(()))
             }
-            Ok(None) => Poll::Ready(Ok(())),
+            Ok(None) => {
+                rustfs_io_metrics::record_get_object_reader_prefetch(GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_PREFETCH_EOF);
+                Poll::Ready(Ok(()))
+            }
             Err(err) => {
                 if self.output_pos < self.output_buf.len() {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_ERROR_DEFERRED,
+                    );
                     self.prefetch_error = Some(err);
                     Poll::Ready(Ok(()))
                 } else {
+                    rustfs_io_metrics::record_get_object_reader_prefetch(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        GET_READER_PREFETCH_ERROR_IMMEDIATE,
+                    );
                     Poll::Ready(Err(err))
                 }
             }
@@ -198,20 +264,39 @@ where
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.output_pos < self.output_buf.len() {
-                if self.prefetched_buf.is_none() && self.prefetch_error.is_none() && self.remaining > 0 {
-                    if let Poll::Ready(result) = self.poll_prefetch(cx) {
-                        result?;
-                    }
+                if self.prefetched_buf.is_none()
+                    && self.prefetch_error.is_none()
+                    && self.remaining > 0
+                    && let Poll::Ready(result) = self.poll_prefetch(cx)
+                {
+                    result?;
                 }
 
                 let available = &self.output_buf[self.output_pos..];
+                let read_buf_remaining_before = buf.remaining();
+                let output_remaining_before = available.len();
                 let copy_len = available.len().min(buf.remaining());
+                let copy_start = Instant::now();
                 buf.put_slice(&available[..copy_len]);
                 self.output_pos += copy_len;
+                if copy_len > 0 {
+                    rustfs_io_metrics::record_get_object_reader_copy(
+                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        copy_len,
+                        read_buf_remaining_before,
+                        output_remaining_before,
+                        copy_start.elapsed().as_secs_f64(),
+                    );
+                }
                 return Poll::Ready(Ok(()));
             }
 
             if let Some(next_buf) = self.prefetched_buf.take() {
+                rustfs_io_metrics::record_get_object_reader_buffer(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_READER_BUFFER_OUTPUT,
+                    next_buf.len(),
+                );
                 self.output_buf = next_buf;
                 self.output_pos = 0;
                 continue;
@@ -247,11 +332,50 @@ where
     R: AsyncRead + Unpin + Send,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let lock_wait_start = Instant::now();
         let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned"))),
+            Ok(inner) => {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_OUTPUT_LOCK_WAIT,
+                    lock_wait_start.elapsed().as_secs_f64(),
+                );
+                inner
+            }
+            Err(_) => {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_OUTPUT_LOCK_WAIT,
+                    lock_wait_start.elapsed().as_secs_f64(),
+                );
+                return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned")));
+            }
         };
-        Pin::new(&mut *inner).poll_read(cx, buf)
+        let read_buf_remaining_before = buf.remaining();
+        let filled_before = buf.filled().len();
+        let poll_start = Instant::now();
+        let result = Pin::new(&mut *inner).poll_read(cx, buf);
+        let poll_duration = poll_start.elapsed().as_secs_f64();
+        let filled_bytes = buf.filled().len().saturating_sub(filled_before);
+        let poll_outcome = match &result {
+            Poll::Ready(Ok(())) if filled_bytes > 0 => GET_READER_POLL_READY_DATA,
+            Poll::Ready(Ok(())) => GET_READER_POLL_READY_EMPTY,
+            Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
+            Poll::Pending => GET_READER_POLL_PENDING,
+        };
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_OUTPUT_POLL,
+            poll_duration,
+        );
+        rustfs_io_metrics::record_get_object_reader_poll(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            poll_outcome,
+            read_buf_remaining_before,
+            filled_bytes,
+            poll_duration,
+        );
+        result
     }
 }
 
@@ -279,7 +403,7 @@ where
             reconstruct_stage_start.elapsed().as_secs_f64(),
         );
         let emit_stage_start = Instant::now();
-        let output = emit_data_shards(state.slots(), engine.data_shards(), engine.block_size(), remaining)?;
+        let output = emit_data_shards(&state, engine.data_shards(), engine.block_size(), remaining)?;
         rustfs_io_metrics::record_get_object_stage_duration(
             GET_OBJECT_PATH_CODEC_STREAMING,
             GET_STAGE_EMIT,
@@ -331,18 +455,13 @@ where
     Ok(Some(output))
 }
 
-fn emit_data_shards(
-    slots: &[crate::set_disk::shard_source::ShardSlot],
-    data_shards: usize,
-    block_size: usize,
-    remaining: usize,
-) -> io::Result<Vec<u8>> {
+fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::with_capacity(block_size.min(remaining));
     for index in 0..data_shards {
         if output.len() >= remaining {
             break;
         }
-        let Some(slot) = slots.iter().find(|slot| slot.index() == index) else {
+        let Some(slot) = state.slot_by_index(index) else {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
         };
         let Some(shard) = slot.data_bytes() else {
@@ -359,7 +478,7 @@ mod tests {
     use super::*;
     use crate::erasure_codec::bridge::LegacyEcDecodeEngine;
     use crate::erasure_coding::Erasure;
-    use crate::set_disk::shard_source::StripeReadState;
+    use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -490,6 +609,22 @@ mod tests {
             .expect("reader should emit complete data shards without parity reconstruction");
 
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn emit_data_shards_preserves_output_order_for_out_of_order_slots() {
+        let state = StripeReadState::new(
+            vec![
+                ShardSlot::data(1, b"cd".to_vec()),
+                ShardSlot::data(0, b"ab".to_vec()),
+                ShardSlot::data(2, b"ef".to_vec()),
+            ],
+            2,
+        );
+
+        let output = emit_data_shards(&state, 3, 6, 5).expect("out-of-order data slots should emit by shard index");
+
+        assert_eq!(output, b"abcde");
     }
 
     #[tokio::test]

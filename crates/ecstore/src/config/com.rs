@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::config::{audit, notify, oidc, set_global_storage_class, storageclass};
+use crate::config::{audit, notify, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
-use crate::global::is_first_cluster_node_local;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::runtime_sources;
 use crate::storage_api_contracts::EcstoreObjectIO;
 use http::HeaderMap;
 use rustfs_config::audit::{
@@ -1150,7 +1150,7 @@ where
     S: EcstoreObjectIO + StorageAdminApi,
 {
     warn!("Configuration not found ({}): Start initializing new configuration", context);
-    let cfg = if is_first_cluster_node_local().await {
+    let cfg = if runtime_sources::first_cluster_node_is_local().await {
         new_and_save_server_config(api.clone()).await?
     } else {
         let mut cfg = new_server_config();
@@ -1288,7 +1288,7 @@ where
             match storageclass::lookup_config(&kvs, *count) {
                 Ok(res) => {
                     if i == 0 {
-                        set_global_storage_class(res);
+                        runtime_sources::set_storage_class_config(res);
                     }
                 }
                 Err(err) => {
@@ -1312,8 +1312,8 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
-    use crate::global::{is_dist_erasure, is_erasure, is_erasure_sd, update_erasure_type};
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+    use crate::runtime_sources;
     use crate::set_disk::SetDisks;
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
@@ -1413,7 +1413,7 @@ mod tests {
     impl SetupTypeGuard {
         async fn switch_to(next: SetupType) -> Self {
             let previous = current_setup_type().await;
-            update_erasure_type(next).await;
+            runtime_sources::set_setup_type(next).await;
             Self { previous }
         }
     }
@@ -1424,22 +1424,14 @@ mod tests {
             let handle = tokio::runtime::Handle::current();
             tokio::task::block_in_place(|| {
                 handle.block_on(async move {
-                    update_erasure_type(previous).await;
+                    runtime_sources::set_setup_type(previous).await;
                 });
             });
         }
     }
 
     async fn current_setup_type() -> SetupType {
-        if is_dist_erasure().await {
-            SetupType::DistErasure
-        } else if is_erasure_sd().await {
-            SetupType::ErasureSD
-        } else if is_erasure().await {
-            SetupType::Erasure
-        } else {
-            SetupType::Unknown
-        }
+        runtime_sources::current_setup_type().await
     }
 
     impl LockingConfigStorage {
