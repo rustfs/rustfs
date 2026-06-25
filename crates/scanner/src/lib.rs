@@ -21,11 +21,12 @@
 )]
 
 use http::HeaderMap;
+use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
 use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
 use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
-    GLOBAL_ExpiryState as ECSTORE_GLOBAL_EXPIRY_STATE, apply_expiry_rule as ecstore_apply_expiry_rule,
-    apply_transition_rule as ecstore_apply_transition_rule,
+    apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
+    get_global_expiry_state as ecstore_get_global_expiry_state,
 };
 use rustfs_ecstore::api::bucket::lifecycle::evaluator::Evaluator as EcstoreEvaluator;
 use rustfs_ecstore::api::bucket::lifecycle::lifecycle::{
@@ -67,7 +68,7 @@ use rustfs_ecstore::api::disk::{
 use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, DiskStore as EcstoreDiskStore, new_disk as ecstore_new_disk};
 use rustfs_ecstore::api::error::{Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError};
 use rustfs_ecstore::api::global::{
-    GLOBAL_TierConfigMgr as ECSTORE_GLOBAL_TIER_CONFIG_MGR, is_erasure as ecstore_is_erasure,
+    get_global_tier_config_mgr as ecstore_get_global_tier_config_mgr, is_erasure as ecstore_is_erasure,
     is_erasure_sd as ecstore_is_erasure_sd, resolve_object_store_handle as ecstore_resolve_object_store_handle,
 };
 use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
@@ -271,21 +272,25 @@ pub(crate) async fn apply_expiry_rule(event: &Event, src: &LcEventSrc, oi: &Scan
     ecstore_apply_expiry_rule(event, src, oi).await
 }
 
-pub(crate) async fn list_global_tiers() -> Vec<EcstoreTierConfig> {
-    ECSTORE_GLOBAL_TIER_CONFIG_MGR.read().await.list_tiers()
+pub(crate) fn resolve_scanner_server_config() -> Option<ServerConfig> {
+    config_get_global_server_config()
 }
 
-pub(crate) async fn enqueue_global_free_version(oi: ScannerObjectInfo) {
-    ECSTORE_GLOBAL_EXPIRY_STATE.write().await.enqueue_free_version(oi).await;
+pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
+    ecstore_get_global_tier_config_mgr().read().await.list_tiers()
 }
 
-pub(crate) async fn enqueue_global_newer_noncurrent(
+pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
+    ecstore_get_global_expiry_state().write().await.enqueue_free_version(oi).await;
+}
+
+pub(crate) async fn enqueue_runtime_newer_noncurrent(
     bucket: &str,
     to_delete_objs: Vec<ObjectToDelete>,
     event: Event,
     src: &LcEventSrc,
 ) -> bool {
-    ECSTORE_GLOBAL_EXPIRY_STATE
+    ecstore_get_global_expiry_state()
         .write()
         .await
         .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
@@ -317,11 +322,11 @@ pub(crate) fn path2_bucket_object_with_base_path(base_path: &str, path: &str) ->
     ecstore_path2_bucket_object_with_base_path(base_path, path)
 }
 
-pub(crate) async fn is_erasure() -> bool {
+pub(crate) async fn scanner_is_erasure() -> bool {
     ecstore_is_erasure().await
 }
 
-pub(crate) async fn is_erasure_sd() -> bool {
+pub(crate) async fn scanner_is_erasure_sd() -> bool {
     ecstore_is_erasure_sd().await
 }
 

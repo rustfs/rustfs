@@ -120,6 +120,7 @@ shadow-rs.workspace = true
 async-recursion.workspace = true
 aws-credential-types = { workspace = true }
 aws-smithy-types = { workspace = true }
+aws-smithy-runtime-api = { workspace = true }
 parking_lot = { workspace = true }
 base64-simd.workspace = true
 serde_urlencoded.workspace = true
@@ -141,6 +142,7 @@ tracing-subscriber = { workspace = true, features = ["json"] }
 serial_test = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 proptest = "1"
+rcgen.workspace = true
 
 [build-dependencies]
 shadow-rs = { workspace = true, features = ["build", "metadata"] }

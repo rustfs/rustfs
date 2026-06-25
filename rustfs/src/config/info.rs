@@ -19,7 +19,7 @@
 //! configuration, and dependencies.
 
 use super::{InfoOpts, InfoType};
-use crate::app::context::resolve_buffer_config;
+use crate::runtime_sources::resolve_buffer_config;
 use crate::version::build;
 use rustfs_credentials::Masked;
 use serde::Serialize;

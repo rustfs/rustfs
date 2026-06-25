@@ -14,7 +14,7 @@
 
 use super::profile::authorize_profile_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_outbound_tls_state;
+use crate::admin::runtime_sources::resolve_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
 use http::{HeaderMap, HeaderValue};

@@ -19,12 +19,12 @@ use super::super::{
 };
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::{publish_server_config, resolve_object_store_handle, resolve_server_config};
 use crate::admin::service::config::{
     apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
     validate_server_config,
 };
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
-use crate::app::context::{publish_server_config, resolve_object_store_handle, resolve_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
