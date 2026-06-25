@@ -15,7 +15,8 @@
 use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
 use crate::get_diagnostics::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_PREFETCH_DIRECT,
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_POLL_PENDING,
+    GET_READER_POLL_READY_DATA, GET_READER_POLL_READY_EMPTY, GET_READER_POLL_READY_ERROR, GET_READER_PREFETCH_DIRECT,
     GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
     GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_FILL, GET_STAGE_OUTPUT_LOCK_WAIT, GET_STAGE_OUTPUT_POLL, GET_STAGE_RECONSTRUCT,
     GET_STAGE_STRIPE_READ,
@@ -350,12 +351,29 @@ where
                 return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned")));
             }
         };
+        let read_buf_remaining_before = buf.remaining();
+        let filled_before = buf.filled().len();
         let poll_start = Instant::now();
         let result = Pin::new(&mut *inner).poll_read(cx, buf);
+        let poll_duration = poll_start.elapsed().as_secs_f64();
+        let filled_bytes = buf.filled().len().saturating_sub(filled_before);
+        let poll_outcome = match &result {
+            Poll::Ready(Ok(())) if filled_bytes > 0 => GET_READER_POLL_READY_DATA,
+            Poll::Ready(Ok(())) => GET_READER_POLL_READY_EMPTY,
+            Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
+            Poll::Pending => GET_READER_POLL_PENDING,
+        };
         rustfs_io_metrics::record_get_object_stage_duration(
             GET_OBJECT_PATH_CODEC_STREAMING,
             GET_STAGE_OUTPUT_POLL,
-            poll_start.elapsed().as_secs_f64(),
+            poll_duration,
+        );
+        rustfs_io_metrics::record_get_object_reader_poll(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            poll_outcome,
+            read_buf_remaining_before,
+            filled_bytes,
+            poll_duration,
         );
         result
     }
