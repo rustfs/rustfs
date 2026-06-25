@@ -90,7 +90,7 @@ use std::sync::LazyLock;
 use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -2637,22 +2637,54 @@ async fn finalize_pending_rotation_if_complete(rotation_id: &str, local_peer: &P
     Ok(true)
 }
 
-async fn finalize_pending_remove_if_complete(remove_id: &str, local_peer: &PeerInfo) -> S3Result<bool> {
+async fn pending_remove_ready_to_finalize(remove_id: &str, local_peer: &PeerInfo) -> S3Result<Option<PendingRemove>> {
     let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-    let mut state = load_site_replication_state().await?;
+    let state = load_site_replication_state().await?;
     let Some(pending) = state.pending_remove.as_ref() else {
-        return Ok(true);
+        return Ok(None);
     };
     if pending.id != remove_id {
-        return Ok(false);
+        return Ok(None);
     }
     if !pending_all_remote_peers_acked(&pending.original_peers, local_peer, &pending.acked_deployment_ids) {
-        return Ok(false);
+        return Ok(None);
     }
 
-    state.pending_remove = None;
-    persist_site_replication_state(&state).await?;
-    Ok(true)
+    Ok(Some(pending.clone()))
+}
+
+async fn clear_pending_remove(remove_id: &str) -> S3Result<()> {
+    let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
+    let mut state = load_site_replication_state().await?;
+    if state
+        .pending_remove
+        .as_ref()
+        .map(|pending| pending.id.as_str() == remove_id)
+        .unwrap_or(false)
+    {
+        state.pending_remove = None;
+        persist_site_replication_state(&state).await?;
+    }
+    Ok(())
+}
+
+fn removed_deployment_ids_for_pending_remove(pending: &PendingRemove, local_peer: &PeerInfo) -> HashSet<String> {
+    if pending.req.remove_all || pending.req.site_names.iter().any(|name| name == &local_peer.name) {
+        return pending
+            .original_peers
+            .keys()
+            .filter(|deployment_id| *deployment_id != &local_peer.deployment_id)
+            .cloned()
+            .collect();
+    }
+
+    let removed_names: HashSet<&str> = pending.req.site_names.iter().map(String::as_str).collect();
+    pending
+        .original_peers
+        .iter()
+        .filter(|(_, peer)| removed_names.contains(peer.name.as_str()))
+        .map(|(deployment_id, _)| deployment_id.clone())
+        .collect()
 }
 
 fn resync_status_for_state(
@@ -2837,6 +2869,112 @@ fn reconcile_site_replication_bucket_targets(
     Ok(BucketTargets { targets })
 }
 
+fn bucket_target_deployment_id(target: &BucketTarget) -> Option<String> {
+    if !target.deployment_id.trim().is_empty() {
+        return Some(target.deployment_id.clone());
+    }
+    replication_target_arn_deployment_id(&target.arn)
+}
+
+fn replication_target_arn_deployment_id(arn: &str) -> Option<String> {
+    if let Ok(parsed) = arn.parse::<ARN>()
+        && parsed.arn_type == BucketTargetType::ReplicationService
+    {
+        if !parsed.id.is_empty() {
+            return Some(parsed.id);
+        }
+        if !parsed.region.is_empty() {
+            return Some(parsed.region);
+        }
+    }
+
+    let parts: Vec<_> = arn.split(':').collect();
+    if parts.len() == 6 && parts[0] == "arn" && parts[1] == "rustfs" && parts[2] == "replication" {
+        return if parts[3].is_empty() {
+            (!parts[4].is_empty()).then(|| parts[4].to_string())
+        } else {
+            Some(parts[3].to_string())
+        };
+    }
+
+    None
+}
+
+fn prune_removed_site_replication_bucket_targets(
+    existing: BucketTargets,
+    removed_deployment_ids: &HashSet<String>,
+) -> (BucketTargets, usize) {
+    if removed_deployment_ids.is_empty() {
+        return (existing, 0);
+    }
+
+    let original_len = existing.targets.len();
+    let targets = existing
+        .targets
+        .into_iter()
+        .filter(|target| {
+            target.target_type != BucketTargetType::ReplicationService
+                || bucket_target_deployment_id(target)
+                    .map(|deployment_id| !removed_deployment_ids.contains(&deployment_id))
+                    .unwrap_or(true)
+        })
+        .collect::<Vec<_>>();
+    let removed = original_len.saturating_sub(targets.len());
+
+    (BucketTargets { targets }, removed)
+}
+
+fn replication_rule_deployment_id(rule: &ReplicationRule) -> Option<String> {
+    if let Some(rule_id) = rule.id.as_deref() {
+        if let Some(deployment_id) = rule_id.strip_prefix("site-repl-")
+            && !deployment_id.is_empty()
+        {
+            return Some(deployment_id.to_string());
+        }
+        return None;
+    }
+
+    replication_target_arn_deployment_id(&rule.destination.bucket)
+}
+
+fn prune_removed_site_replication_rules(
+    mut config: ReplicationConfiguration,
+    removed_deployment_ids: &HashSet<String>,
+) -> (Option<ReplicationConfiguration>, usize) {
+    if removed_deployment_ids.is_empty() {
+        return (Some(config), 0);
+    }
+
+    if replication_target_arn_deployment_id(&config.role)
+        .map(|deployment_id| removed_deployment_ids.contains(&deployment_id))
+        .unwrap_or(false)
+    {
+        config.role.clear();
+    }
+
+    let original_len = config.rules.len();
+    config.rules.retain(|rule| {
+        replication_rule_deployment_id(rule)
+            .map(|deployment_id| !removed_deployment_ids.contains(&deployment_id))
+            .unwrap_or(true)
+    });
+    let removed = original_len.saturating_sub(config.rules.len());
+
+    if removed == 0 {
+        return (Some(config), 0);
+    }
+
+    if config.rules.is_empty() {
+        return (None, removed);
+    }
+
+    for (index, rule) in config.rules.iter_mut().enumerate() {
+        rule.priority = Some(i32::try_from(index + 1).unwrap_or(i32::MAX));
+    }
+
+    (Some(config), removed)
+}
+
 fn build_site_replication_rule(arn: &str, priority: i32, rule_id: &str) -> ReplicationRule {
     ReplicationRule {
         delete_marker_replication: Some(DeleteMarkerReplication {
@@ -2987,6 +3125,90 @@ async fn ensure_site_replication_bucket_replication_config(
         .map_err(ApiError::from)?;
 
     Ok(())
+}
+
+async fn cleanup_removed_site_replication_bucket(bucket: &str, removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
+    let mut removed = 0usize;
+
+    match metadata_sys::list_bucket_targets(bucket).await {
+        Ok(targets) => {
+            let (updated_targets, removed_targets) =
+                prune_removed_site_replication_bucket_targets(targets, removed_deployment_ids);
+            if removed_targets > 0 {
+                let json_targets = serde_json::to_vec(&updated_targets).map_err(|e| {
+                    S3Error::with_message(S3ErrorCode::InternalError, format!("serialize bucket targets failed: {e}"))
+                })?;
+                metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
+                    .await
+                    .map_err(ApiError::from)?;
+                BucketTargetSys::get()
+                    .update_all_targets(bucket, Some(&updated_targets))
+                    .await;
+                removed = removed.saturating_add(removed_targets);
+            }
+        }
+        Err(StorageError::ConfigNotFound) => {}
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    match metadata_sys::get_replication_config(bucket).await {
+        Ok((config, _)) => {
+            let (updated_config, removed_rules) = prune_removed_site_replication_rules(config, removed_deployment_ids);
+            if removed_rules > 0 {
+                if let Some(updated_config) = updated_config {
+                    let data = serialize(&updated_config).map_err(|e| {
+                        S3Error::with_message(S3ErrorCode::InternalError, format!("serialize replication failed: {e}"))
+                    })?;
+                    metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data)
+                        .await
+                        .map_err(ApiError::from)?;
+                } else {
+                    metadata_sys::delete(bucket, BUCKET_REPLICATION_CONFIG)
+                        .await
+                        .map_err(ApiError::from)?;
+                }
+                removed = removed.saturating_add(removed_rules);
+            }
+        }
+        Err(StorageError::ConfigNotFound) => {}
+        Err(err) => return Err(ApiError::from(err).into()),
+    }
+
+    Ok(removed)
+}
+
+async fn cleanup_removed_site_replication_buckets(removed_deployment_ids: &HashSet<String>) -> S3Result<usize> {
+    if removed_deployment_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let Some(store) = resolve_object_store_handle() else {
+        return Ok(0);
+    };
+    let buckets = store.list_bucket(&BucketOptions::default()).await.map_err(ApiError::from)?;
+    let mut removed = 0usize;
+
+    for bucket in buckets {
+        match cleanup_removed_site_replication_bucket(&bucket.name, removed_deployment_ids).await {
+            Ok(bucket_removed) => {
+                removed = removed.saturating_add(bucket_removed);
+            }
+            Err(err) => {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    bucket = %bucket.name,
+                    result = "remove_cleanup_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+                return Err(err);
+            }
+        }
+    }
+
+    Ok(removed)
 }
 
 pub async fn site_replication_peer_deployment_id_for_endpoint(endpoint: &str) -> Option<String> {
@@ -3894,7 +4116,32 @@ impl Operation for SiteReplicationRemoveHandler {
             }
         }
 
-        let complete = finalize_pending_remove_if_complete(&pending_remove.id, &local_peer).await?;
+        let finalize_candidate = pending_remove_ready_to_finalize(&pending_remove.id, &local_peer).await?;
+        let complete = if let Some(finalized_remove) = finalize_candidate {
+            let removed_deployment_ids = removed_deployment_ids_for_pending_remove(&finalized_remove, &local_peer);
+            match cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
+                Ok(removed) => {
+                    if removed > 0 {
+                        info!(
+                            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                            component = LOG_COMPONENT_ADMIN,
+                            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                            removed,
+                            result = "remove_cleanup_completed",
+                            "admin site replication state"
+                        );
+                    }
+                    clear_pending_remove(&pending_remove.id).await?;
+                    true
+                }
+                Err(err) => {
+                    peer_errors.push(summarize_peer_error_detail(&format!("local remove cleanup failed: {err}")));
+                    false
+                }
+            }
+        } else {
+            false
+        };
         if !complete && peer_errors.is_empty() {
             peer_errors.push("site replication remove is still pending".to_string());
         }
@@ -5531,6 +5778,68 @@ mod tests {
             .expect("site replication target should carry credentials");
         assert_eq!(credentials.access_key, "site-replicator-0");
         assert_eq!(credentials.secret_key, "runtime-iam-secret");
+    }
+
+    #[test]
+    fn test_prune_removed_site_replication_bucket_targets_keeps_unrelated_targets() {
+        let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
+        let targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: "arn:rustfs:replication::removed-dep:photos".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:rustfs:replication::kept-dep:photos".to_string(),
+                    deployment_id: "kept-dep".to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: "arn:rustfs:ilm::removed-dep:photos".to_string(),
+                    deployment_id: "removed-dep".to_string(),
+                    target_type: BucketTargetType::IlmService,
+                    ..Default::default()
+                },
+            ],
+        };
+
+        let (updated, removed) = prune_removed_site_replication_bucket_targets(targets, &removed_deployment_ids);
+
+        assert_eq!(removed, 1);
+        assert_eq!(updated.targets.len(), 2);
+        assert!(updated.targets.iter().any(|target| target.deployment_id == "kept-dep"));
+        assert!(
+            updated
+                .targets
+                .iter()
+                .any(|target| target.target_type == BucketTargetType::IlmService)
+        );
+    }
+
+    #[test]
+    fn test_prune_removed_site_replication_rules_removes_site_rule_and_reorders_priorities() {
+        let removed_deployment_ids = HashSet::from(["removed-dep".to_string()]);
+        let kept_rule = build_site_replication_rule("arn:rustfs:replication::kept-dep:photos", 3, "site-repl-kept-dep");
+        let removed_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 1, "site-repl-removed-dep");
+        let user_rule = build_site_replication_rule("arn:rustfs:replication::removed-dep:photos", 9, "user-managed-rule");
+        let config = ReplicationConfiguration {
+            role: "arn:rustfs:replication::removed-dep:photos".to_string(),
+            rules: vec![removed_rule, user_rule, kept_rule],
+        };
+
+        let (updated, removed) = prune_removed_site_replication_rules(config, &removed_deployment_ids);
+        let updated = updated.expect("config should keep non-removed rules");
+
+        assert_eq!(removed, 1);
+        assert!(updated.role.is_empty());
+        assert_eq!(updated.rules.len(), 2);
+        assert_eq!(updated.rules[0].id.as_deref(), Some("user-managed-rule"));
+        assert_eq!(updated.rules[0].priority, Some(1));
+        assert_eq!(updated.rules[1].id.as_deref(), Some("site-repl-kept-dep"));
+        assert_eq!(updated.rules[1].priority, Some(2));
     }
 
     #[test]

@@ -17,6 +17,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 3. `fix: require operation access for replication diagnostics`
    - Purpose: require operation-level admin authorization for site replication diagnostic POST endpoints and clamp netperf duration.
    - Reason: `devnull` and `netperf` read request bodies and exercise diagnostic work, so granting them through read-only site replication info permission was broader than intended.
+4. `fix: clean site replication targets on remove`
+   - Purpose: remove bucket targets and `site-repl-*` replication rules that point at a removed deployment before completing pending remove.
+   - Reason: removing a site only from site replication state leaves bucket-level replication configuration behind, so object replication can continue attempting to reach a removed peer.
 
 ## Verification
 
@@ -29,6 +32,8 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
+- Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo fmt --all`
 
 ## Impact
 
@@ -37,6 +42,8 @@ The planned implementation is intended to reduce credential exposure, require st
 The credential redaction step changes admin/export visibility of bucket target secrets. Stored target configuration is not migrated or reformatted by this PR step.
 
 The diagnostic authorization step intentionally changes required permission for `POST /site-replication/devnull` and `POST /site-replication/netperf` from `SiteReplicationInfoAction` to `SiteReplicationOperationAction`.
+
+The remove cleanup step preserves user-managed replication rules and non-replication targets, and only prunes targets/rules associated with removed site replication deployment IDs.
 
 ## Additional Notes
 
