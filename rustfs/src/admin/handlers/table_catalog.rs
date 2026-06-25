@@ -1710,6 +1710,10 @@ fn validate_table_location_in_bucket(bucket: &str, location: &str) -> S3Result<(
     crate::table_catalog::validate_table_warehouse_location(bucket, location).map_err(catalog_store_error)
 }
 
+fn validate_view_location_in_bucket(bucket: &str, location: &str) -> S3Result<()> {
+    crate::table_catalog::validate_view_warehouse_location(bucket, location).map_err(catalog_store_error)
+}
+
 fn metadata_table_uuid(metadata: &serde_json::Value) -> S3Result<&str> {
     metadata
         .get("table-uuid")
@@ -1742,7 +1746,7 @@ fn validate_metadata_table_location_in_bucket(bucket: &str, metadata: &serde_jso
 
 fn validate_metadata_view_location_in_bucket(bucket: &str, metadata: &serde_json::Value) -> S3Result<()> {
     let location = metadata_table_location(metadata)?;
-    validate_table_location_in_bucket(bucket, location)
+    validate_view_location_in_bucket(bucket, location)
 }
 
 fn validate_metadata_matches_current_metadata(
@@ -1922,7 +1926,7 @@ fn view_entry_from_create_view_request(
     let view_id = Uuid::new_v4().to_string();
     let view_uuid = Uuid::new_v4().to_string();
     let warehouse_location = request.location.unwrap_or_else(|| format!("s3://{bucket}/views/{view_id}"));
-    validate_table_location_in_bucket(bucket, &warehouse_location)?;
+    validate_view_location_in_bucket(bucket, &warehouse_location)?;
     let metadata_location =
         crate::table_catalog::default_view_metadata_file_path(namespace, &view, &next_metadata_file_name(1, &view_id));
 
@@ -8401,6 +8405,47 @@ mod tests {
 
         assert_eq!(request.name, "recent_events");
         assert_eq!(request.properties.get("comment").map(String::as_str), Some("recent event ids"));
+    }
+
+    #[test]
+    fn create_view_request_accepts_deep_warehouse_location() {
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        let deep_prefix = (0..80).map(|index| format!("level-{index}")).collect::<Vec<_>>().join("/");
+        let location = format!("s3://warehouse/{deep_prefix}");
+        assert!(crate::table_catalog::validate_table_warehouse_location("warehouse", &location).is_err());
+        let request: CreateViewRequest = serde_json::from_value(serde_json::json!({
+            "name": "recent_events",
+            "location": location,
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": []
+            },
+            "view-version": {
+                "version-id": 1,
+                "schema-id": 0,
+                "summary": {
+                    "engine-name": "spark"
+                },
+                "default-catalog": "warehouse",
+                "default-namespace": ["analytics"],
+                "representations": [
+                    {
+                        "type": "sql",
+                        "sql": "SELECT 1",
+                        "dialect": "spark"
+                    }
+                ]
+            }
+        }))
+        .expect("deep create view request should parse");
+
+        let (entry, metadata) = view_entry_from_create_view_request("warehouse", &namespace, request)
+            .expect("view location should not inherit table warehouse index depth limits");
+
+        assert_eq!(entry.warehouse_location, format!("s3://warehouse/{deep_prefix}"));
+        validate_metadata_view_location_in_bucket("warehouse", &metadata)
+            .expect("view metadata location should not inherit table warehouse index depth limits");
     }
 
     #[tokio::test]
