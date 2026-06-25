@@ -16,7 +16,6 @@ use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
 use crate::get_diagnostics::{GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
-use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -24,8 +23,9 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::task::JoinHandle;
 
-type FillFuture<S, W> = Pin<Box<dyn Future<Output = FillResult<S, W>> + Send>>;
+type FillTask<S, W> = JoinHandle<FillResult<S, W>>;
 
 struct FillResult<S, W> {
     source: S,
@@ -42,8 +42,11 @@ where
     workspace: Option<E::Workspace>,
     output_buf: Vec<u8>,
     output_pos: usize,
+    prefetched_buf: Option<Vec<u8>>,
+    prefetch_error: Option<io::Error>,
     remaining: usize,
-    fill: Option<FillFuture<S, E::Workspace>>,
+    // Bounded lookahead: at most one background stripe read/decode is in flight.
+    fill: Option<FillTask<S, E::Workspace>>,
 }
 
 impl<S, E> ErasureDecodeReader<S, E>
@@ -68,12 +71,14 @@ where
             workspace: Some(workspace),
             output_buf: Vec::new(),
             output_pos: 0,
+            prefetched_buf: None,
+            prefetch_error: None,
             remaining: total_length,
             fill: None,
         })
     }
 
-    fn poll_fill(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+    fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
         if self.fill.is_none() {
             let Some(mut source) = self.source.take() else {
                 return Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader source missing")));
@@ -85,7 +90,7 @@ where
 
             let engine = self.engine.clone();
             let remaining = self.remaining;
-            self.fill = Some(Box::pin(async move {
+            self.fill = Some(tokio::spawn(async move {
                 let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
                 rustfs_io_metrics::record_get_object_stage_duration(
@@ -106,11 +111,18 @@ where
             .fill
             .as_mut()
             .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "erasure reader fill future missing"))?;
+        let fill_result = ready!(Pin::new(fill).poll(cx));
         let FillResult {
             source,
             workspace,
             result,
-        } = ready!(fill.as_mut().poll(cx));
+        } = match fill_result {
+            Ok(result) => result,
+            Err(err) => {
+                self.fill = None;
+                return Poll::Ready(Err(io::Error::other(format!("erasure reader fill task failed: {err}"))));
+            }
+        };
 
         self.source = Some(source);
         self.workspace = Some(workspace);
@@ -124,18 +136,54 @@ where
                 rustfs_io_metrics::record_get_object_reader_stripe(GET_OBJECT_PATH_CODEC_STREAMING);
                 rustfs_io_metrics::record_get_object_reader_bytes(GET_OBJECT_PATH_CODEC_STREAMING, buf.len());
                 self.remaining -= buf.len();
-                self.output_buf = buf;
-                self.output_pos = 0;
-                Poll::Ready(Ok(()))
+                Poll::Ready(Ok(Some(buf)))
             }
             Ok(None) => {
                 if self.remaining == 0 {
-                    Poll::Ready(Ok(()))
+                    Poll::Ready(Ok(None))
                 } else {
                     Poll::Ready(Err(DiskError::LessData.into()))
                 }
             }
             Err(err) => Poll::Ready(Err(err)),
+        }
+    }
+
+    fn poll_prefetch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.prefetched_buf.is_some() || self.prefetch_error.is_some() || self.remaining == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        match ready!(self.poll_fill_result(cx)) {
+            Ok(Some(buf)) => {
+                if self.output_pos < self.output_buf.len() {
+                    self.prefetched_buf = Some(buf);
+                } else {
+                    self.output_buf = buf;
+                    self.output_pos = 0;
+                }
+                Poll::Ready(Ok(()))
+            }
+            Ok(None) => Poll::Ready(Ok(())),
+            Err(err) => {
+                if self.output_pos < self.output_buf.len() {
+                    self.prefetch_error = Some(err);
+                    Poll::Ready(Ok(()))
+                } else {
+                    Poll::Ready(Err(err))
+                }
+            }
+        }
+    }
+}
+
+impl<S, E> Drop for ErasureDecodeReader<S, E>
+where
+    E: ErasureDecodeEngine,
+{
+    fn drop(&mut self) {
+        if let Some(fill) = self.fill.take() {
+            fill.abort();
         }
     }
 }
@@ -150,6 +198,12 @@ where
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.output_pos < self.output_buf.len() {
+                if self.prefetched_buf.is_none() && self.prefetch_error.is_none() && self.remaining > 0 {
+                    if let Poll::Ready(result) = self.poll_prefetch(cx) {
+                        result?;
+                    }
+                }
+
                 let available = &self.output_buf[self.output_pos..];
                 let copy_len = available.len().min(buf.remaining());
                 buf.put_slice(&available[..copy_len]);
@@ -157,11 +211,21 @@ where
                 return Poll::Ready(Ok(()));
             }
 
+            if let Some(next_buf) = self.prefetched_buf.take() {
+                self.output_buf = next_buf;
+                self.output_pos = 0;
+                continue;
+            }
+
+            if let Some(err) = self.prefetch_error.take() {
+                return Poll::Ready(Err(err));
+            }
+
             if self.remaining == 0 {
                 return Poll::Ready(Ok(()));
             }
 
-            ready!(self.poll_fill(cx))?;
+            ready!(self.poll_prefetch(cx))?;
         }
     }
 }
@@ -297,16 +361,24 @@ mod tests {
     use crate::erasure_coding::Erasure;
     use crate::set_disk::shard_source::StripeReadState;
     use std::collections::VecDeque;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
+    use tokio::task::yield_now;
+    use tokio::time::{Duration, timeout};
 
     struct VecStripeSource {
         stripes: VecDeque<StripeReadState>,
         read_quorum: usize,
+        read_count: Option<Arc<AtomicUsize>>,
     }
 
     #[async_trait::async_trait]
     impl ShardStripeSource for VecStripeSource {
         async fn read_next_stripe(&mut self) -> StripeReadState {
+            if let Some(read_count) = &self.read_count {
+                read_count.fetch_add(1, Ordering::SeqCst);
+            }
             self.stripes
                 .pop_front()
                 .unwrap_or_else(|| StripeReadState::new(Vec::new(), self.read_quorum))
@@ -335,7 +407,11 @@ mod tests {
             })
             .collect();
 
-        VecStripeSource { stripes, read_quorum }
+        VecStripeSource {
+            stripes,
+            read_quorum,
+            read_count: None,
+        }
     }
 
     async fn decode_all(erasure: Erasure, data: &[u8], missing_indexes: &[usize]) -> io::Result<Vec<u8>> {
@@ -422,6 +498,7 @@ mod tests {
         let source = VecStripeSource {
             stripes: VecDeque::new(),
             read_quorum: erasure.data_shards,
+            read_count: None,
         };
         let engine = LegacyEcDecodeEngine::new(erasure);
         let mut reader = ErasureDecodeReader::new(source, engine, 1).expect("reader should be constructed");
@@ -434,5 +511,31 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::Other);
         assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_prefetches_next_stripe_while_output_remains() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..96u16)
+            .map(|value| value.wrapping_mul(3).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut first_read = [0u8; 1];
+
+        let read = reader.read(&mut first_read).await.expect("first read should succeed");
+
+        assert_eq!(read, first_read.len());
+        assert_eq!(first_read[0], data[0]);
+        timeout(Duration::from_secs(1), async {
+            while read_count.load(Ordering::SeqCst) < 2 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("reader should start reading the next stripe before the current output buffer is fully consumed");
     }
 }
