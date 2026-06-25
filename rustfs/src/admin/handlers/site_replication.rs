@@ -260,6 +260,17 @@ struct SiteReplicationRuntime {
     service_account_secret_key: String,
 }
 
+#[derive(Debug, Clone)]
+struct SiteReplicationAddPreflightInfo {
+    name: String,
+    endpoint: String,
+    deployment_id: String,
+    enabled: bool,
+    bucket_count: usize,
+    peer_deployment_ids: BTreeSet<String>,
+    idp_settings: serde_json::Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct SRPeerJoinResponse {
     peer: PeerInfo,
@@ -1061,6 +1072,136 @@ fn validate_add_sites(sites: &[PeerSite], local_peer: &PeerInfo) -> S3Result<()>
     Ok(())
 }
 
+fn idp_settings_value(settings: &IDPSettings) -> S3Result<serde_json::Value> {
+    serde_json::to_value(settings)
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize IDP settings failed: {e}")))
+}
+
+fn add_preflight_info_from_sr_info(
+    site: &PeerSite,
+    info: SRInfo,
+    idp_settings: IDPSettings,
+) -> S3Result<SiteReplicationAddPreflightInfo> {
+    Ok(SiteReplicationAddPreflightInfo {
+        name: if info.name.is_empty() { site.name.clone() } else { info.name },
+        endpoint: site.endpoint.clone(),
+        deployment_id: info.deployment_id,
+        enabled: info.enabled,
+        bucket_count: info.buckets.len(),
+        peer_deployment_ids: info.state.peers.keys().cloned().collect(),
+        idp_settings: idp_settings_value(&idp_settings)?,
+    })
+}
+
+async fn local_add_preflight_info(
+    state: &SiteReplicationState,
+    local_peer: &PeerInfo,
+    local_site: &PeerSite,
+) -> S3Result<SiteReplicationAddPreflightInfo> {
+    add_preflight_info_from_sr_info(local_site, build_sr_info(state, local_peer).await?, local_idp_settings())
+}
+
+async fn remote_add_preflight_info(site: &PeerSite) -> S3Result<SiteReplicationAddPreflightInfo> {
+    let info_body = send_peer_admin_get_request(
+        &site.endpoint,
+        "/rustfs/admin/v3/site-replication/metainfo",
+        &site.access_key,
+        &site.secret_key,
+    )
+    .await?;
+    let info: SRInfo = serde_json::from_slice(&info_body).map_err(|e| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("invalid site replication metainfo from `{}`: {e}", site.endpoint),
+        )
+    })?;
+
+    let idp_body = send_peer_admin_get_request(
+        &site.endpoint,
+        "/rustfs/admin/v3/site-replication/peer/idp-settings",
+        &site.access_key,
+        &site.secret_key,
+    )
+    .await?;
+    let idp_settings: IDPSettings = serde_json::from_slice(&idp_body).map_err(|e| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            format!("invalid site replication IDP settings from `{}`: {e}", site.endpoint),
+        )
+    })?;
+
+    add_preflight_info_from_sr_info(site, info, idp_settings)
+}
+
+fn validate_add_preflight_topology(infos: &[SiteReplicationAddPreflightInfo], local_peer: &PeerInfo) -> S3Result<()> {
+    let mut deployment_ids = HashSet::new();
+    let mut local_seen = false;
+    let mut non_empty_sites = Vec::new();
+    let local_idp = infos
+        .iter()
+        .find(|info| info.deployment_id == local_peer.deployment_id)
+        .map(|info| &info.idp_settings);
+
+    for info in infos {
+        if info.deployment_id.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "site `{}` did not report deploymentID", info.endpoint));
+        }
+        if !deployment_ids.insert(info.deployment_id.clone()) {
+            return Err(s3_error!(
+                InvalidRequest,
+                "duplicate deploymentID `{}` in site replication add request",
+                info.deployment_id
+            ));
+        }
+        if info.deployment_id == local_peer.deployment_id {
+            local_seen = true;
+        }
+        if info.bucket_count > 0 {
+            non_empty_sites.push(info.name.clone());
+        }
+    }
+
+    if !local_seen {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication add request must include the local deployment"
+        ));
+    }
+
+    let Some(local_idp) = local_idp else {
+        return Err(s3_error!(
+            InvalidRequest,
+            "local IDP settings unavailable for site replication add preflight"
+        ));
+    };
+    for info in infos {
+        if &info.idp_settings != local_idp {
+            return Err(s3_error!(InvalidRequest, "IDP settings mismatch for site `{}`", info.endpoint));
+        }
+    }
+
+    if non_empty_sites.len() > 1 {
+        return Err(s3_error!(
+            InvalidRequest,
+            "site replication can be initialized with data on only one site; non-empty sites: {}",
+            non_empty_sites.join(", ")
+        ));
+    }
+
+    let requested: BTreeSet<String> = infos.iter().map(|info| info.deployment_id.clone()).collect();
+    for info in infos.iter().filter(|info| info.enabled) {
+        if !info.peer_deployment_ids.is_empty() && info.peer_deployment_ids != requested {
+            return Err(s3_error!(
+                InvalidRequest,
+                "site `{}` is already configured with a different site replication peer set",
+                info.endpoint
+            ));
+        }
+    }
+
+    Ok(())
+}
+
 fn build_join_peers(
     state: &SiteReplicationState,
     local_peer: &PeerInfo,
@@ -1723,6 +1864,44 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
     }
 
     Ok(info)
+}
+
+fn local_idp_settings() -> IDPSettings {
+    let mut settings = IDPSettings::default();
+    if let Some(oidc) = resolve_oidc_handle() {
+        let providers = oidc.list_providers();
+        settings.open_id.enabled = !providers.is_empty();
+        settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();
+
+        for provider in providers {
+            let Some(config) = oidc.get_provider_config(&provider.provider_id) else {
+                continue;
+            };
+            let provider_settings = OpenIDProviderSettings {
+                claim_name: config.claim_name.clone(),
+                claim_userinfo_enabled: false,
+                role_policy: config.role_policy.clone(),
+                client_id: config.client_id.clone(),
+                hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
+            };
+
+            let claim_provider_unset = settings.open_id.claim_provider.client_id.is_empty()
+                && settings.open_id.claim_provider.claim_name.is_empty()
+                && settings.open_id.claim_provider.role_policy.is_empty()
+                && settings.open_id.claim_provider.hashed_client_secret.is_empty();
+
+            if provider.provider_id == "default" || claim_provider_unset {
+                settings.open_id.claim_provider = provider_settings.clone();
+            } else {
+                settings.open_id.roles.insert(provider.provider_id.clone(), provider_settings);
+            }
+        }
+    }
+
+    let (ldap, ldap_configs) = load_ldap_idp_settings();
+    settings.ldap = ldap;
+    settings.ldap_configs = ldap_configs;
+    settings
 }
 
 fn mapped_policy_to_sr_mapping(name: String, is_group: bool, user_type: UserType, mapping: MappedPolicy) -> SRPolicyMapping {
@@ -4062,6 +4241,15 @@ impl Operation for SiteReplicationAddHandler {
         let local_peer = current_local_peer(&req, &current_state);
         let sites: Vec<PeerSite> = read_site_replication_json(req, &cred.secret_key, true).await?;
         validate_add_sites(&sites, &local_peer)?;
+        let mut preflight_infos = Vec::with_capacity(sites.len());
+        for site in &sites {
+            if same_identity_endpoint(&site.endpoint, &local_peer.endpoint) {
+                preflight_infos.push(local_add_preflight_info(&current_state, &local_peer, site).await?);
+            } else {
+                preflight_infos.push(remote_add_preflight_info(site).await?);
+            }
+        }
+        validate_add_preflight_topology(&preflight_infos, &local_peer)?;
         let (service_account_access_key, service_account_secret_key) =
             ensure_site_replicator_service_account(&cred.access_key, false).await?;
         let mut state = merge_add_sites(
@@ -4568,41 +4756,7 @@ impl Operation for SRPeerGetIDPSettingsHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationAddAction).await?;
 
-        let mut settings = IDPSettings::default();
-        if let Some(oidc) = resolve_oidc_handle() {
-            let providers = oidc.list_providers();
-            settings.open_id.enabled = !providers.is_empty();
-            settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();
-
-            for provider in providers {
-                let Some(config) = oidc.get_provider_config(&provider.provider_id) else {
-                    continue;
-                };
-                let provider_settings = OpenIDProviderSettings {
-                    claim_name: config.claim_name.clone(),
-                    claim_userinfo_enabled: false,
-                    role_policy: config.role_policy.clone(),
-                    client_id: config.client_id.clone(),
-                    hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),
-                };
-
-                let claim_provider_unset = settings.open_id.claim_provider.client_id.is_empty()
-                    && settings.open_id.claim_provider.claim_name.is_empty()
-                    && settings.open_id.claim_provider.role_policy.is_empty()
-                    && settings.open_id.claim_provider.hashed_client_secret.is_empty();
-
-                if provider.provider_id == "default" || claim_provider_unset {
-                    settings.open_id.claim_provider = provider_settings.clone();
-                } else {
-                    settings.open_id.roles.insert(provider.provider_id.clone(), provider_settings);
-                }
-            }
-        }
-        let (ldap, ldap_configs) = load_ldap_idp_settings();
-        settings.ldap = ldap;
-        settings.ldap_configs = ldap_configs;
-
-        json_response(&settings)
+        json_response(&local_idp_settings())
     }
 }
 
@@ -5229,6 +5383,109 @@ mod tests {
         let err = validate_add_sites(&sites, &local_peer).expect_err("missing remote secret should fail");
 
         assert!(err.to_string().contains("secretKey is required"));
+    }
+
+    fn preflight_site(name: &str, endpoint: &str, deployment_id: &str, bucket_count: usize) -> SiteReplicationAddPreflightInfo {
+        SiteReplicationAddPreflightInfo {
+            name: name.to_string(),
+            endpoint: endpoint.to_string(),
+            deployment_id: deployment_id.to_string(),
+            enabled: false,
+            bucket_count,
+            peer_deployment_ids: BTreeSet::new(),
+            idp_settings: serde_json::json!({"provider": "same"}),
+        }
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_accepts_matching_sites() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 1),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 0),
+        ];
+
+        validate_add_preflight_topology(&infos, &local_peer).expect("matching preflight should pass");
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_duplicate_deployment_id() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 0),
+            preflight_site("remote", "https://remote.example.com", "local-dep", 0),
+        ];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("duplicate deploymentID should fail");
+
+        assert!(err.to_string().contains("duplicate deploymentID"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_requires_local_deployment() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![preflight_site("remote", "https://remote.example.com", "remote-dep", 0)];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("missing local deployment should fail");
+
+        assert!(err.to_string().contains("must include the local deployment"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_idp_mismatch() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.idp_settings = serde_json::json!({"provider": "different"});
+        let infos = vec![preflight_site("local", "https://local.example.com", "local-dep", 0), remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("IDP mismatch should fail");
+
+        assert!(err.to_string().contains("IDP settings mismatch"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_multiple_non_empty_sites() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let infos = vec![
+            preflight_site("local", "https://local.example.com", "local-dep", 1),
+            preflight_site("remote", "https://remote.example.com", "remote-dep", 1),
+        ];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("multiple non-empty sites should fail");
+
+        assert!(err.to_string().contains("only one site"));
+    }
+
+    #[test]
+    fn test_validate_add_preflight_topology_rejects_existing_peer_set_mismatch() {
+        let local_peer = PeerInfo {
+            deployment_id: "local-dep".to_string(),
+            ..peer("local", "https://local.example.com")
+        };
+        let local = preflight_site("local", "https://local.example.com", "local-dep", 0);
+        let mut remote = preflight_site("remote", "https://remote.example.com", "remote-dep", 0);
+        remote.enabled = true;
+        remote.peer_deployment_ids = BTreeSet::from(["remote-dep".to_string(), "old-dep".to_string()]);
+        let infos = vec![local, remote];
+
+        let err = validate_add_preflight_topology(&infos, &local_peer).expect_err("peer set mismatch should fail");
+
+        assert!(err.to_string().contains("different site replication peer set"));
     }
 
     #[test]

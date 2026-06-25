@@ -29,6 +29,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 7. `fix: align site replication peer paths with minio`
    - Purpose: send peer site-replication calls over MinIO-compatible admin paths and accept the MinIO-style peer join route.
    - Reason: RustFS already accepts `/minio/admin` as an alias, so using MinIO wire paths improves mixed-cluster compatibility without removing RustFS route support.
+8. `fix: validate site replication add topology`
+   - Purpose: preflight add requests with remote metainfo and IDP settings before creating service accounts, joining peers, or persisting state.
+   - Reason: MinIO rejects unsafe add topologies up front; RustFS now rejects duplicate deployment IDs, missing local deployment, IDP mismatch, multiple non-empty initial sites, and peers already configured with a different site-replication set.
 
 ## Verification
 
@@ -42,12 +45,14 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
+- Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p rustfs site_replication --lib`
 
 Not run in this step: `make pre-commit`, `make pre-pr`.
 
 ## Impact
 
-The planned implementation is intended to reduce credential exposure, require stronger permission for diagnostic write-like endpoints, clean removed site replication targets, and make replication status more actionable. Compatibility-sensitive behavior will be called out per commit in the implementation log.
+The planned implementation is intended to reduce credential exposure, require stronger permission for diagnostic write-like endpoints, clean removed site replication targets, and make replication status more actionable. Compatibility-sensitive behavior is called out per commit in the implementation log.
 
 The credential redaction step changes admin/export visibility of bucket target secrets. Stored target configuration is not migrated or reformatted by this PR step.
 
@@ -59,8 +64,10 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 
 ## Additional Notes
 
-This PR intentionally keeps durable outbox/bootstrap/heal work as follow-up architecture unless the initial hardening steps require small supporting hooks.
+This PR continues with bootstrap, durable retry, and repair work in later commits so the expanded hardening can land as one reviewable PR.
 
 The expanded single-PR scope also includes MinIO wire-contract bootstrap validation, durable site-replication retry, full add-time IAM/bootstrap sync, lifecycle compatibility, and site-level repair.
 
 The peer path compatibility step maps outbound peer requests to `/minio/admin/v3/site-replication/...`. Peer join uses the encrypted MinIO payload contract, while internal peer metadata/IAM/remove/edit requests remain plain JSON to match MinIO handlers.
+
+The add preflight step performs remote reads before state mutation, so add fails earlier when a peer cannot report metainfo or IDP settings.

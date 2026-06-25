@@ -243,15 +243,15 @@ git commit -m "fix: align site replication peer paths with minio"
 - Modify: `rustfs/src/admin/handlers/site_replication.rs`
 - Modify: `docs/architecture/site-replication-hardening-pr.md`
 
-- [ ] **Step 1: Validate self, deployment identity, IDP, and initial data shape**
+- [x] **Step 1: Validate self, deployment identity, IDP, and initial data shape**
 
 Before persisting add state, fetch remote metainfo and IDP settings, reject duplicate deployment IDs, missing local site, existing site-replication topology gaps, IDP mismatch, and multiple non-empty initial sites.
 
-- [ ] **Step 2: Add focused tests**
+- [x] **Step 2: Add focused tests**
 
 Cover pure topology validation for duplicate deployments, missing self, IDP mismatch, and more than one non-empty site.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
