@@ -35,8 +35,8 @@ pub(crate) type IamEcstoreError = EcstoreErrorType;
 pub(crate) type IamStorageError = EcstoreStorageError;
 pub(crate) type IamStorageResult<T> = EcstoreResultType<T>;
 pub(crate) type IamStore = EcstoreStore;
-pub(crate) type IamConfigObjectInfo = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
-pub(crate) type IamConfigObjectOptions = <IamStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub(crate) type IamConfigObjectInfo = <IamStore as ObjectOperations>::ObjectInfo;
+pub(crate) type IamConfigObjectOptions = <IamStore as ObjectOperations>::ObjectOptions;
 pub(crate) type IamNotificationSys = EcstoreNotificationSys;
 pub(crate) type IamEcstoreNotificationPeerErr = EcstoreNotificationPeerErr;
 

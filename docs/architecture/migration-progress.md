@@ -5297,14 +5297,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, diff hygiene, residual ECStore storage contract scan, Rust
     risk scan, fast PR gate, and full PR gate before PR.
 
+- [x] `API-227` Normalize local storage-api boundary contract aliases.
+  - Do: replace raw fully qualified `rustfs_storage_api::...` paths inside
+    completed RustFS/app/admin/storage and external crate `storage_api`
+    boundaries with imported local aliases, and guard against regressions.
+  - Acceptance: completed local storage-api boundary files no longer keep raw
+    fully qualified storage contract paths internally; direct imports remain
+    only at the boundary edge.
+  - Must preserve: RustFS storage owner peer S3 bucket operations, topology
+    snapshots, app lifecycle/replication helper signatures, IAM config object
+    contract aliases, Swift object aliases, and S3 Select object aliases.
+  - Verification: RustFS test compile coverage, explicit IAM/S3 Select/Swift
+    compile coverage, formatting, migration and layer guards, diff hygiene,
+    residual raw-path scan, Rust risk scan, and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-226.
+1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-227.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-227 normalizes completed local storage-api boundary internals to use imported local aliases instead of raw fully qualified contract paths. |
+| Migration preservation | pass | Storage owner peer S3 operations, topology snapshots, app lifecycle/replication helpers, IAM config aliases, Swift aliases, and S3 Select aliases keep the same storage-api contracts. |
+| Testing/verification | pass | RustFS test compile coverage, explicit IAM/S3 Select/Swift compile coverage, migration/layer guards, residual raw-path scan, formatting, and diff hygiene passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-226 routes ECStore internal storage contract imports through the owner-local storage_api_contracts boundary. |
 | Migration preservation | pass | Object/list/multipart/heal/admin trait impls, set-disk/sets behavior, lifecycle/tier/replication DTOs, config storage, peer S3 client, range helpers, and error mappings keep the same storage contracts. |
 | Testing/verification | pass | Focused ECStore/RustFS compile coverage, ECStore lib tests, migration/layer guards, residual import scan, Rust risk scan, formatting, and diff hygiene passed; full PR gate is planned before PR. |

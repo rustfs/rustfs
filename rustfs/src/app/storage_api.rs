@@ -17,6 +17,7 @@
 pub(crate) use crate::storage::ECStore;
 #[cfg(test)]
 pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_storage_api::{ObjectToDelete, TransitionedObject};
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
 
 #[cfg(test)]
@@ -347,7 +348,7 @@ pub(crate) mod bucket {
                 version_id: Option<uuid::Uuid>,
                 versioned: bool,
                 suspended: bool,
-                transitioned: &rustfs_storage_api::TransitionedObject,
+                transitioned: &crate::app::storage_api::TransitionedObject,
             ) -> Option<Jentry> {
                 crate::storage::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
                     version_id,
@@ -358,7 +359,7 @@ pub(crate) mod bucket {
             }
 
             pub(crate) fn transitioned_force_delete_journal_entry(
-                transitioned: &rustfs_storage_api::TransitionedObject,
+                transitioned: &crate::app::storage_api::TransitionedObject,
             ) -> Option<Jentry> {
                 crate::storage::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(transitioned)
             }
@@ -543,7 +544,7 @@ pub(crate) mod bucket {
 
         pub(crate) async fn check_replicate_delete(
             bucket: &str,
-            dobj: &rustfs_storage_api::ObjectToDelete,
+            dobj: &crate::app::storage_api::ObjectToDelete,
             oi: &crate::storage::StorageObjectInfo,
             del_opts: &crate::storage::StorageObjectOptions,
             gerr: Option<String>,

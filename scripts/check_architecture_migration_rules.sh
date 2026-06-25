@@ -64,6 +64,7 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_ext
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
+LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
@@ -992,6 +993,25 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
   report_failure "RustFS storage owner modules must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_storage_api::[A-Za-z_]' \
+    rustfs/src/storage_api.rs \
+    rustfs/src/app/storage_api.rs \
+    rustfs/src/admin/storage_api.rs \
+    rustfs/src/storage/storage_api.rs \
+    crates/iam/src/storage_api.rs \
+    crates/protocols/src/swift/storage_api.rs \
+    crates/s3select-api/src/storage_api.rs \
+    crates/scanner/src/storage_api.rs \
+    crates/obs/src/metrics/storage_api.rs \
+    crates/heal/src/heal/storage_api.rs || true
+) >"$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE"
+
+if [[ -s "$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE" ]]; then
+  report_failure "local storage_api boundaries must import storage-api contracts once and use local aliases internally: $(paste -sd '; ' "$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE")"
 fi
 
 (
