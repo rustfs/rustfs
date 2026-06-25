@@ -23,7 +23,10 @@ pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
 
 pub(crate) const GET_STAGE_DECODE: &str = "decode";
 pub(crate) const GET_STAGE_EMIT: &str = "emit";
+pub(crate) const GET_STAGE_FILL: &str = "fill";
 pub(crate) const GET_STAGE_METADATA: &str = "metadata";
+pub(crate) const GET_STAGE_OUTPUT_LOCK_WAIT: &str = "output_lock_wait";
+pub(crate) const GET_STAGE_OUTPUT_POLL: &str = "output_poll";
 pub(crate) const GET_STAGE_RANGE: &str = "range";
 pub(crate) const GET_STAGE_READER_SETUP: &str = "reader_setup";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
@@ -181,6 +184,16 @@ mod tests {
         assert_eq!(GET_READER_PREFETCH_EOF, "eof");
         assert_eq!(GET_READER_PREFETCH_ERROR_DEFERRED, "error_deferred");
         assert_eq!(GET_READER_PREFETCH_ERROR_IMMEDIATE, "error_immediate");
+        assert_eq!(GET_STAGE_DECODE, "decode");
+        assert_eq!(GET_STAGE_EMIT, "emit");
+        assert_eq!(GET_STAGE_FILL, "fill");
+        assert_eq!(GET_STAGE_METADATA, "metadata");
+        assert_eq!(GET_STAGE_OUTPUT_LOCK_WAIT, "output_lock_wait");
+        assert_eq!(GET_STAGE_OUTPUT_POLL, "output_poll");
+        assert_eq!(GET_STAGE_RANGE, "range");
+        assert_eq!(GET_STAGE_READER_SETUP, "reader_setup");
+        assert_eq!(GET_STAGE_RECONSTRUCT, "reconstruct");
+        assert_eq!(GET_STAGE_STRIPE_READ, "stripe_read");
         assert_eq!(GET_STAGE_STRIPE_READ_FIRST_SHARD, "stripe_read_first_shard");
         assert_eq!(GET_STAGE_STRIPE_READ_QUORUM, "stripe_read_quorum");
         assert_eq!(GET_SHARD_READ_OUTCOME_ERROR, "error");
