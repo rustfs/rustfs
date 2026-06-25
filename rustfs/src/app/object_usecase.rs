@@ -532,6 +532,7 @@ struct GetObjectStreamingReader<R> {
     started: std::time::Instant,
     first_byte_reported: bool,
     completed: bool,
+    _foreground_read_guard: rustfs_scanner::ForegroundReadGuard,
 }
 
 impl<R> GetObjectStreamingReader<R> {
@@ -547,6 +548,7 @@ impl<R> GetObjectStreamingReader<R> {
             started: std::time::Instant::now(),
             first_byte_reported: false,
             completed: expected == 0,
+            _foreground_read_guard: rustfs_scanner::ForegroundReadGuard::new(),
         }
     }
 

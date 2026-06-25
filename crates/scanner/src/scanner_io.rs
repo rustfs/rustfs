@@ -1660,34 +1660,51 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn scanner_concurrency_limit_preserves_available_when_unconfigured() {
+        crate::reset_foreground_read_activity_for_test();
         assert_eq!(scanner_concurrency_limit(0, 4), 4);
     }
 
     #[test]
+    #[serial]
     fn scanner_concurrency_limit_caps_to_configured_value() {
+        crate::reset_foreground_read_activity_for_test();
         assert_eq!(scanner_concurrency_limit(2, 4), 2);
     }
 
     #[test]
     #[serial]
     fn scanner_concurrency_limit_never_exceeds_available_work() {
+        crate::reset_foreground_read_activity_for_test();
         assert_eq!(scanner_concurrency_limit(8, 4), 4);
     }
 
     #[test]
     #[serial]
     fn scanner_concurrency_limit_handles_no_available_work() {
+        crate::reset_foreground_read_activity_for_test();
         assert_eq!(scanner_concurrency_limit(2, 0), 0);
     }
 
     #[test]
     #[serial]
     fn scanner_concurrency_limit_yields_to_foreground_reads() {
+        crate::reset_foreground_read_activity_for_test();
         crate::set_foreground_read_activity(8);
         assert_eq!(scanner_concurrency_limit(0, 4), 1);
         assert_eq!(scanner_concurrency_limit(3, 4), 1);
-        crate::set_foreground_read_activity(0);
+        crate::reset_foreground_read_activity_for_test();
+    }
+
+    #[test]
+    #[serial]
+    fn scanner_concurrency_limit_yields_to_streaming_reads() {
+        crate::reset_foreground_read_activity_for_test();
+        let _guard = crate::ForegroundReadGuard::new();
+
+        assert_eq!(scanner_concurrency_limit(0, 4), 1);
+        assert_eq!(scanner_concurrency_limit(3, 4), 1);
     }
 
     #[test]

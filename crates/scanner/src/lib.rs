@@ -64,17 +64,50 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
+static SCANNER_FOREGROUND_STREAM_READS: AtomicU64 = AtomicU64::new(0);
 
 pub fn current_scanner_activity() -> u64 {
     SCANNER_ACTIVE_WORK_UNITS.load(Ordering::Relaxed)
 }
 
 pub fn set_foreground_read_activity(active: usize) {
-    SCANNER_FOREGROUND_READ_ACTIVITY.store(active as u64, Ordering::Relaxed);
+    let active = u64::try_from(active).unwrap_or(u64::MAX);
+    SCANNER_FOREGROUND_READ_ACTIVITY.store(active, Ordering::Relaxed);
 }
 
 pub fn current_foreground_read_activity() -> u64 {
-    SCANNER_FOREGROUND_READ_ACTIVITY.load(Ordering::Relaxed)
+    SCANNER_FOREGROUND_READ_ACTIVITY
+        .load(Ordering::Relaxed)
+        .max(SCANNER_FOREGROUND_STREAM_READS.load(Ordering::Relaxed))
+}
+
+#[derive(Debug)]
+pub struct ForegroundReadGuard;
+
+impl ForegroundReadGuard {
+    pub fn new() -> Self {
+        SCANNER_FOREGROUND_STREAM_READS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Default for ForegroundReadGuard {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for ForegroundReadGuard {
+    fn drop(&mut self) {
+        let _ =
+            SCANNER_FOREGROUND_STREAM_READS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn reset_foreground_read_activity_for_test() {
+    SCANNER_FOREGROUND_READ_ACTIVITY.store(0, Ordering::Relaxed);
+    SCANNER_FOREGROUND_STREAM_READS.store(0, Ordering::Relaxed);
 }
 
 pub(crate) struct ScannerActivityGuard;
@@ -350,4 +383,37 @@ impl<T> ScannerObjectIO for T where
             PutObjectReader = ScannerPutObjReader,
         >
 {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    #[serial]
+    fn foreground_read_guard_tracks_stream_lifetime() {
+        reset_foreground_read_activity_for_test();
+        assert_eq!(current_foreground_read_activity(), 0);
+
+        {
+            let _guard = ForegroundReadGuard::new();
+            assert_eq!(current_foreground_read_activity(), 1);
+        }
+
+        assert_eq!(current_foreground_read_activity(), 0);
+    }
+
+    #[test]
+    #[serial]
+    fn foreground_read_activity_keeps_larger_signal() {
+        reset_foreground_read_activity_for_test();
+        let _guard = ForegroundReadGuard::new();
+
+        set_foreground_read_activity(3);
+        assert_eq!(current_foreground_read_activity(), 3);
+
+        set_foreground_read_activity(0);
+        assert_eq!(current_foreground_read_activity(), 1);
+    }
 }
