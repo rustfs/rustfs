@@ -26,6 +26,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 6. `docs: expand site replication hardening scope`
    - Purpose: keep the single-PR plan aligned with the expanded request to include MinIO compatibility, add preflight, bootstrap, lifecycle compatibility, retry, and repair work.
    - Reason: the remaining work is larger than the first hardening pass, so reviewers need to see the intended sequence before more behavior changes land.
+7. `fix: align site replication peer paths with minio`
+   - Purpose: send peer site-replication calls over MinIO-compatible admin paths and accept the MinIO-style peer join route.
+   - Reason: RustFS already accepts `/minio/admin` as an alias, so using MinIO wire paths improves mixed-cluster compatibility without removing RustFS route support.
 
 ## Verification
 
@@ -36,6 +39,9 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs-madmin site_replication --lib`
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo test -p rustfs route_policy --lib`
+- Passed: `cargo test -p rustfs site_replication --lib`
+- Passed: `cargo fmt --all`
 
 Not run in this step: `make pre-commit`, `make pre-pr`.
 
@@ -56,3 +62,5 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 This PR intentionally keeps durable outbox/bootstrap/heal work as follow-up architecture unless the initial hardening steps require small supporting hooks.
 
 The expanded single-PR scope also includes MinIO wire-contract bootstrap validation, durable site-replication retry, full add-time IAM/bootstrap sync, lifecycle compatibility, and site-level repair.
+
+The peer path compatibility step maps outbound peer requests to `/minio/admin/v3/site-replication/...`. Peer join uses the encrypted MinIO payload contract, while internal peer metadata/IAM/remove/edit requests remain plain JSON to match MinIO handlers.

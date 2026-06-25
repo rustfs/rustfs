@@ -115,6 +115,10 @@ const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
+const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
+const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
+const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
+const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
 
 fn site_replicator_service_account_policy() -> S3Result<Policy> {
     Policy::parse_config(
@@ -353,6 +357,7 @@ pub fn register_site_replication_route(r: &mut S3Router<AdminOperation>) -> std:
             "/v3/site-replication/netperf",
             AdminOperation(&SiteReplicationNetPerfHandler {}),
         ),
+        (Method::PUT, "/v3/site-replication/join", AdminOperation(&SRPeerJoinHandler {})),
         (Method::PUT, "/v3/site-replication/peer/join", AdminOperation(&SRPeerJoinHandler {})),
         (
             Method::PUT,
@@ -1207,6 +1212,39 @@ async fn ensure_site_replicator_service_account(parent_user: &str, rotate_secret
     Ok((access_key, secret_key))
 }
 
+fn site_replication_peer_wire_path(path: &str) -> String {
+    let (path_only, query) = path
+        .split_once('?')
+        .map(|(path, query)| (path, Some(query)))
+        .unwrap_or((path, None));
+    let wire_path = if path_only == SITE_REPLICATION_PEER_JOIN_PATH {
+        MINIO_SITE_REPLICATION_JOIN_PATH.to_string()
+    } else if let Some(suffix) = path_only.strip_prefix(RUSTFS_ADMIN_V3_PREFIX) {
+        format!("{MINIO_ADMIN_V3_PREFIX}{suffix}")
+    } else if path_only.starts_with(MINIO_ADMIN_PREFIX) {
+        path_only.to_string()
+    } else {
+        path_only.to_string()
+    };
+
+    match query {
+        Some(query) => format!("{wire_path}?{query}"),
+        None => wire_path,
+    }
+}
+
+fn site_replication_peer_payload_encrypted(wire_path: &str) -> bool {
+    wire_path.split_once('?').map(|(path, _)| path).unwrap_or(wire_path) == MINIO_SITE_REPLICATION_JOIN_PATH
+}
+
+fn site_replication_peer_payload(path: &str, secret_key: &str, payload: Vec<u8>) -> S3Result<(Vec<u8>, &'static str)> {
+    if site_replication_peer_payload_encrypted(path) {
+        encode_compatible_admin_payload(path, secret_key, payload)
+    } else {
+        Ok((payload, "application/json"))
+    }
+}
+
 async fn send_peer_admin_request<T: Serialize>(
     endpoint: &str,
     path: &str,
@@ -1214,6 +1252,7 @@ async fn send_peer_admin_request<T: Serialize>(
     secret_key: &str,
     body: &T,
 ) -> S3Result<Vec<u8>> {
+    let path = site_replication_peer_wire_path(path);
     let base = endpoint.trim_end_matches('/');
     let url = format!("{base}{path}");
     let uri = url
@@ -1225,7 +1264,7 @@ async fn send_peer_admin_request<T: Serialize>(
         .to_string();
     let payload = serde_json::to_vec(body)
         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("serialize peer request failed: {e}")))?;
-    let (payload, content_type) = encode_compatible_admin_payload(path, secret_key, payload)?;
+    let (payload, content_type) = site_replication_peer_payload(&path, secret_key, payload)?;
 
     let signed = sign_v4(
         http::Request::builder()
@@ -1331,6 +1370,7 @@ fn peer_error_may_be_secret_mismatch(detail: &str) -> bool {
 }
 
 async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &str, secret_key: &str) -> S3Result<Vec<u8>> {
+    let path = site_replication_peer_wire_path(path);
     let base = endpoint.trim_end_matches('/');
     let url = format!("{base}{path}");
     let uri = url
@@ -5998,6 +6038,34 @@ mod tests {
         assert_eq!(error.endpoint, "https://remote.example.com");
         assert!(error.error.ends_with("(truncated)"));
         assert!(error.error.chars().count() <= SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT);
+    }
+
+    #[test]
+    fn test_site_replication_peer_wire_path_matches_minio_routes() {
+        assert_eq!(
+            site_replication_peer_wire_path(SITE_REPLICATION_PEER_JOIN_PATH),
+            "/minio/admin/v3/site-replication/join"
+        );
+        assert_eq!(
+            site_replication_peer_wire_path("/rustfs/admin/v3/site-replication/peer/bucket-meta"),
+            "/minio/admin/v3/site-replication/peer/bucket-meta"
+        );
+        assert_eq!(
+            site_replication_peer_wire_path("/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos"),
+            "/minio/admin/v3/site-replication/peer/bucket-ops?bucket=photos"
+        );
+    }
+
+    #[test]
+    fn test_site_replication_peer_payload_encryption_matches_minio_contract() {
+        assert!(site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/join"));
+        assert!(site_replication_peer_payload_encrypted(
+            "/minio/admin/v3/site-replication/join?replicateILMExpiry=true"
+        ));
+        assert!(!site_replication_peer_payload_encrypted(
+            "/minio/admin/v3/site-replication/peer/bucket-meta"
+        ));
+        assert!(!site_replication_peer_payload_encrypted("/minio/admin/v3/site-replication/peer/iam-item"));
     }
 
     #[test]

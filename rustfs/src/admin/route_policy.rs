@@ -466,6 +466,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/site-replication/join",
+        SITE_REPLICATION_ADD,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/site-replication/peer/join",
         SITE_REPLICATION_ADD,
         RouteRiskLevel::High,
@@ -1532,6 +1538,11 @@ mod tests {
             assert_action(HttpMethod::Post, path, SITE_REPLICATION_OPERATION);
             assert_not_action(HttpMethod::Post, path, SITE_REPLICATION_INFO);
         }
+    }
+
+    #[test]
+    fn route_policy_accepts_minio_style_site_replication_join_alias() {
+        assert_action(HttpMethod::Put, "/rustfs/admin/v3/site-replication/join", SITE_REPLICATION_ADD);
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {
