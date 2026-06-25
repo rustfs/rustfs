@@ -44,14 +44,15 @@ mod ecfs_test;
 pub(crate) mod head_prefix;
 #[cfg(test)]
 mod multi_factor_scheduler_integration_test;
+pub(crate) mod runtime_sources;
 #[cfg(test)]
 mod sse_test;
 
 pub(crate) use ecfs_extend::*;
 pub(crate) use sse::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers,
-    extract_ssec_params_from_headers, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
-    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers, sse_decryption,
+    sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read,
 };
 
 use std::sync::Arc;
@@ -76,7 +77,9 @@ pub(crate) mod ecstore_capacity {
 }
 
 pub(crate) mod ecstore_client {
-    pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils, transition_api};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::client::transition_api;
+    pub(crate) use rustfs_ecstore::api::client::{admin_handler_utils, object_api_utils};
 }
 
 pub(crate) mod ecstore_compression {
@@ -84,7 +87,12 @@ pub(crate) mod ecstore_compression {
 }
 
 pub(crate) mod ecstore_cluster {
-    pub(crate) use rustfs_ecstore::api::cluster::topology_snapshot_from_endpoint_pools_with_capabilities;
+    pub(crate) use rustfs_ecstore::api::cluster::{
+        ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage,
+        ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth,
+        ClusterPeerHealthSnapshot, ClusterPoolState, ClusterPoolStateSnapshot,
+        topology_snapshot_from_endpoint_pools_with_capabilities,
+    };
 }
 
 pub(crate) mod ecstore_config {
@@ -96,7 +104,7 @@ pub(crate) mod ecstore_config {
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
         apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
-        record_bucket_object_write_memory,
+        record_bucket_object_write_memory, remove_bucket_usage_from_backend,
     };
 }
 
@@ -182,7 +190,9 @@ pub(crate) mod ecstore_storage {
 
 pub(crate) mod ecstore_tier {
     pub(crate) use rustfs_ecstore::api::tier::tier::TierConfigMgr;
-    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::tier::warm_backend;
+    pub(crate) use rustfs_ecstore::api::tier::{tier, tier_admin, tier_config, tier_handlers};
 }
 
 pub(crate) const BUCKET_ACCELERATE_CONFIG: &str = ecstore_bucket::metadata::BUCKET_ACCELERATE_CONFIG;
@@ -230,9 +240,11 @@ pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 pub(crate) type Endpoints = ecstore_layout::Endpoints;
 pub(crate) type EndpointServerPools = ecstore_layout::EndpointServerPools;
 pub(crate) type EventArgs = ecstore_event::EventArgs;
+pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::ExpiryState;
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
+pub(crate) type FS = ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;
@@ -311,7 +323,11 @@ pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
 }
 
 pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-    ecstore_bucket::lifecycle::bucket_lifecycle_ops::GLOBAL_TransitionState.get_daily_all_tier_stats()
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state().get_daily_all_tier_stats()
+}
+
+pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {

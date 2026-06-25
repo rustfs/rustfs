@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::storage_api::{ReqInfo, StorageObjectOptions as ObjectOptions, authorize_request};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use crate::storage::access::{ReqInfo, authorize_request};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -46,8 +46,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
-
-use crate::storage::StorageObjectOptions as ObjectOptions;
 
 const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
 const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -647,7 +645,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: super::super::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 

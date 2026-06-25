@@ -28,6 +28,7 @@ use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::object_api::{ObjectInfo, ObjectOptions};
+use crate::runtime_sources;
 use crate::storage_api_contracts::EcstoreObjectIO;
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
@@ -1399,12 +1400,11 @@ pub async fn init_background_replication<S: ReplicationStorage>(storage: Arc<S>)
         })
         .await;
 
-    assert!(GLOBAL_REPLICATION_STATS.get().is_some());
-    assert!(GLOBAL_REPLICATION_POOL.get().is_some());
+    assert!(runtime_sources::replication_runtime_initialized());
 }
 
 pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
-    GLOBAL_REPLICATION_POOL.get().cloned()
+    runtime_sources::replication_pool()
 }
 
 pub async fn schedule_replication<S: ReplicationStorage>(
@@ -1454,17 +1454,17 @@ pub async fn schedule_replication<S: ReplicationStorage>(
     }
     if dsc.is_synchronous() {
         replicate_object(ri, o).await
-    } else if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+    } else if let Some(pool) = runtime_sources::replication_pool() {
         let _ = pool.queue_replica_task(ri).await;
     }
 }
 
 pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
-    if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+    if let Some(pool) = runtime_sources::replication_pool() {
         let _ = pool.queue_replica_delete_task(dv.clone()).await;
     }
 
-    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, GLOBAL_REPLICATION_STATS.get()) {
+    if let (Some(rs), Some(stats)) = (dv.delete_object.replication_state, runtime_sources::replication_stats()) {
         for (k, _v) in rs.targets.iter() {
             let ri = ReplicatedTargetInfo {
                 arn: k.clone(),
@@ -1600,7 +1600,7 @@ pub async fn queue_replication_heal_internal(
             || roi.version_purge_status == VersionPurgeStatusType::Failed
             || roi.version_purge_status == VersionPurgeStatusType::Pending
         {
-            let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {
                 ReplicationQueueAdmission::Missed
@@ -1636,7 +1636,7 @@ pub async fn queue_replication_heal_internal(
     match roi.replication_status {
         ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
             roi.event_type = REPLICATE_HEAL.to_string();
-            let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_task(roi.clone()).await
             } else {
                 ReplicationQueueAdmission::Missed
@@ -1651,7 +1651,7 @@ pub async fn queue_replication_heal_internal(
 
     if roi.existing_obj_resync.must_resync() {
         roi.event_type = REPLICATE_EXISTING.to_string();
-        let admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+        let admission = if let Some(pool) = runtime_sources::replication_pool() {
             pool.queue_replica_task(roi.clone()).await
         } else {
             ReplicationQueueAdmission::Missed
@@ -1679,7 +1679,7 @@ async fn queue_replicate_deletes_wrapper(
             let mut dv = doi.clone();
             dv.reset_id = v.reset_id.clone();
             dv.target_arn = k.clone();
-            let target_admission = if let Some(pool) = GLOBAL_REPLICATION_POOL.get() {
+            let target_admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {
                 ReplicationQueueAdmission::Missed

@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::StorageError;
-use super::super::bucket_target_sys::{BucketTargetError, BucketTargetSys};
-use super::super::metadata::BUCKET_TARGETS_FILE;
-use super::super::metadata_sys;
-use super::super::metadata_sys::get_replication_config;
-use super::super::replication::BucketStats;
-use super::super::target::BucketTarget;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
+use crate::admin::storage_api::StorageError;
+use crate::admin::storage_api::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+use crate::admin::storage_api::metadata::BUCKET_TARGETS_FILE;
+use crate::admin::storage_api::metadata_sys;
+use crate::admin::storage_api::metadata_sys::get_replication_config;
+use crate::admin::storage_api::replication::BucketStats;
+use crate::admin::storage_api::target::BucketTarget;
 use crate::admin::utils::read_compatible_admin_body;
-use crate::app::context::{resolve_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -66,6 +66,24 @@ fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
         }
         BucketTargetError::Io(io_err) => S3Error::with_message(S3ErrorCode::InternalError, io_err.to_string()),
     }
+}
+
+fn validate_remote_target_tls_settings(remote_target: &BucketTarget) -> S3Result<()> {
+    let has_custom_ca = !remote_target.ca_cert_pem.trim().is_empty();
+
+    if !remote_target.secure && remote_target.skip_tls_verify {
+        return Err(s3_error!(InvalidRequest, "skipTlsVerify requires an HTTPS remote target"));
+    }
+
+    if !remote_target.secure && has_custom_ca {
+        return Err(s3_error!(InvalidRequest, "caCertPem requires an HTTPS remote target"));
+    }
+
+    if remote_target.skip_tls_verify && has_custom_ca {
+        return Err(s3_error!(InvalidRequest, "skipTlsVerify and caCertPem cannot be enabled together"));
+    }
+
+    Ok(())
 }
 
 pub fn register_replication_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -213,6 +231,7 @@ impl Operation for SetRemoteTargetHandler {
             error!("Failed to parse BucketTarget from body: {}", e);
             ApiError::other(e)
         })?;
+        validate_remote_target_tls_settings(&remote_target)?;
 
         let Ok(target_url) = remote_target.url() else {
             return Err(s3_error!(InvalidRequest, "invalid target url"));
@@ -278,9 +297,19 @@ impl Operation for SetRemoteTargetHandler {
             target.path = remote_target.path;
             target.replication_sync = remote_target.replication_sync;
             target.bandwidth_limit = remote_target.bandwidth_limit;
+            target.skip_tls_verify = remote_target.skip_tls_verify;
+            target.ca_cert_pem = remote_target.ca_cert_pem;
             target.health_check_duration = remote_target.health_check_duration;
 
-            warn!("update target, target: {:?}", target);
+            warn!(
+                bucket = %bucket,
+                arn = %target.arn,
+                endpoint = %target.endpoint,
+                secure = target.secure,
+                skip_tls_verify = target.skip_tls_verify,
+                has_custom_ca = !target.ca_cert_pem.trim().is_empty(),
+                "update remote target"
+            );
             remote_target = target;
         }
 
@@ -418,7 +447,8 @@ impl Operation for RemoveRemoteTargetHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_query_params;
+    use super::{extract_query_params, validate_remote_target_tls_settings};
+    use crate::admin::storage_api::target::BucketTarget;
     use http::Uri;
 
     #[test]
@@ -430,5 +460,55 @@ mod tests {
 
         assert_eq!(params.get("bucket"), Some(&"foo/bar".to_string()));
         assert_eq!(params.get("flag"), Some(&"a b".to_string()));
+    }
+
+    #[test]
+    fn validate_remote_target_tls_settings_rejects_insecure_tls_for_http_targets() {
+        let err = validate_remote_target_tls_settings(&BucketTarget {
+            secure: false,
+            skip_tls_verify: true,
+            ..Default::default()
+        })
+        .expect_err("HTTP targets must reject skipTlsVerify");
+
+        assert!(err.to_string().contains("skipTlsVerify requires an HTTPS remote target"));
+    }
+
+    #[test]
+    fn validate_remote_target_tls_settings_rejects_custom_ca_for_http_targets() {
+        let err = validate_remote_target_tls_settings(&BucketTarget {
+            secure: false,
+            ca_cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_string(),
+            ..Default::default()
+        })
+        .expect_err("HTTP targets must reject custom CA PEM");
+
+        assert!(err.to_string().contains("caCertPem requires an HTTPS remote target"));
+    }
+
+    #[test]
+    fn validate_remote_target_tls_settings_rejects_insecure_and_custom_ca_combination() {
+        let err = validate_remote_target_tls_settings(&BucketTarget {
+            secure: true,
+            skip_tls_verify: true,
+            ca_cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_string(),
+            ..Default::default()
+        })
+        .expect_err("custom CA and insecure TLS must be mutually exclusive");
+
+        assert!(
+            err.to_string()
+                .contains("skipTlsVerify and caCertPem cannot be enabled together")
+        );
+    }
+
+    #[test]
+    fn validate_remote_target_tls_settings_allows_https_insecure_without_custom_ca() {
+        validate_remote_target_tls_settings(&BucketTarget {
+            secure: true,
+            skip_tls_verify: true,
+            ..Default::default()
+        })
+        .expect("HTTPS targets should allow skipTlsVerify when no custom CA is configured");
     }
 }

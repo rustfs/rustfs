@@ -151,6 +151,23 @@ ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE="${TMP_DIR}/ecstore_compat_passthrough_
 ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_actual.txt"
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
 RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
+IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/iam_runtime_source_bypass_hits.txt"
+RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_runtime_source_bypass_hits.txt"
+RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_runtime_storage_api_bypass_hits.txt"
+RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
+RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
+RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
+RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_source_bypass_hits.txt"
+RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
+RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
+RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_wildcard_hits.txt"
+RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits.txt"
+RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s3_api_bypass_hits.txt"
+RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_api_bypass_hits.txt"
+RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_admin_storage_api_bypass_hits.txt"
+RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_root_facade_hits.txt"
+RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_bypass_hits.txt"
+RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -737,7 +754,7 @@ fi
     --glob '!**/ecstore_test_compat/**' \
     --glob '!**/ecstore_fuzz_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod|storage/mod)\.rs|crates/e2e_test/src/(replication_extension_test|reliant/(grpc_lock_client|node_interact_test))\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)\.rs|crates/iam/src/(lib|runtime_sources)\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|fuzz/fuzz_targets/(bucket_validation|path_containment)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1086,7 +1103,7 @@ fi
     --glob '!**/ecstore_compat.rs' \
     --glob '!**/ecstore_test_compat.rs' \
     --glob '!**/ecstore_test_compat/**' |
-    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/lib\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/bucket_validation\.rs|fuzz/fuzz_targets/path_containment\.rs|crates/e2e_test/src/reliant/grpc_lock_client\.rs|crates/e2e_test/src/reliant/node_interact_test\.rs|crates/e2e_test/src/replication_extension_test\.rs|crates/heal/src/heal/mod\.rs|crates/heal/tests/endpoint_index_test\.rs|crates/heal/tests/heal_bug_fixes_test\.rs|crates/heal/tests/heal_integration_test\.rs|crates/iam/src/(lib|runtime_sources)\.rs|crates/notify/src/lib\.rs|crates/obs/src/metrics/mod\.rs|crates/protocols/src/swift/mod\.rs|crates/s3select-api/src/lib\.rs|crates/scanner/src/lib\.rs|crates/scanner/tests/lifecycle_integration_test\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/mod\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1286,11 +1303,246 @@ fi
     crates/scanner/src \
     --glob '*.rs' \
     --glob '!**/ecstore_compat.rs' |
-    rg -v '^(crates/heal/src/heal/mod.rs|crates/iam/src/lib.rs|crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs|crates/scanner/src/lib.rs):' || true
+    rg -v '^(crates/heal/src/heal/mod.rs|crates/iam/src/(lib|runtime_sources).rs|crates/notify/src/lib.rs|crates/obs/src/metrics/mod.rs|crates/protocols/src/swift/mod.rs|crates/s3select-api/src/lib.rs|crates/scanner/src/lib.rs):' || true
 ) >"$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
   report_failure "external runtime crates must source ECStore API symbols through their owner root or ecstore_compat boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'get_global_(?:action_cred|server_config|notification_sys)' \
+    crates/iam/src \
+    --glob '*.rs' |
+    rg -v '^crates/iam/src/runtime_sources\.rs:' || true
+) >"$IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "IAM runtime-source globals must stay behind crates/iam/src/runtime_sources.rs: $(paste -sd '; ' "$IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'get_global_(?:kms_service_manager|encryption_service|iam_sys|action_cred|server_config|notification_sys|bucket_metadata_sys|bucket_monitor|replication_pool|replication_stats|boot_time|endpoints_opt|deployment_id|lock_client|lock_clients|region|tier_config_mgr|expiry_state|local_node_name|buffer_config|db)|init_global_kms_service_manager|set_global_(?:server_config|storage_class|outbound_tls_generation)|load_global_outbound_tls_(?:generation|state)|global_(?:rustfs_port|internode_metrics)|get_daily_all_tier_stats|collect_scanner_metrics_report|new_object_layer_fn|notifier_global::' \
+    rustfs/src/app/context.rs \
+    rustfs/src/app/context \
+    --glob '*.rs' |
+    rg -v '^rustfs/src/app/context/runtime_sources\.rs:' || true
+) >"$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS AppContext fallback runtime globals must stay behind rustfs/src/app/context/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(?:init_global_action_credentials|set_global_region|set_global_rustfs_port|set_global_addr|set_global_init_time_now|init_global_kms_service_manager|init_global_buffer_config|set_buffer_profile_enabled)\b|rustfs_obs::(?:\{[^}]*\b(?:init_obs|set_global_guard)\b|(?:init_obs|set_global_guard|observability_metric_enabled|init_metrics_runtime)\b)|rustfs_io_metrics::set_put_stage_metrics_enabled\b|\b(?:publish_global_outbound_tls_state|record_tls_generation|record_tls_reload_result|record_tls_reload_skipped|init_tls_metrics)\b' \
+    rustfs/src/init.rs \
+    rustfs/src/startup_*.rs \
+    rustfs/src/server/tls_material.rs \
+    --glob '*.rs' |
+    rg -v 'startup_runtime_sources::' |
+    rg -v '^rustfs/src/startup_runtime_sources\.rs:' || true
+) >"$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS startup runtime globals must stay behind rustfs/src/startup_runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_server_config|resolve_notify_interface|resolve_object_store_handle|resolve_kms_runtime_service_manager|resolve_iam_ready|resolve_endpoints_handle|resolve_lock_clients_handle)\b|(?:resolve_server_config|resolve_notify_interface|resolve_object_store_handle|resolve_kms_runtime_service_manager|resolve_iam_ready|resolve_endpoints_handle|resolve_lock_clients_handle)\b)' \
+    rustfs/src/server/audit.rs \
+    rustfs/src/server/event.rs \
+    rustfs/src/server/layer.rs \
+    rustfs/src/server/module_switch.rs \
+    rustfs/src/server/readiness.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS server runtime source reads must stay behind rustfs/src/server/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::(?:\{[^}]*\b(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b|(?:resolve_object_store_handle|resolve_buffer_config|resolve_internode_metrics|resolve_local_node_name|resolve_action_credentials|resolve_notify_interface|resolve_performance_metrics|resolve_encryption_service|resolve_region|resolve_ready_iam_handle)\b)' \
+    rustfs/src/storage/access.rs \
+    rustfs/src/storage/ecfs.rs \
+    rustfs/src/storage/ecfs_extend.rs \
+    rustfs/src/storage/helper.rs \
+    rustfs/src/storage/concurrency/manager.rs \
+    rustfs/src/storage/sse.rs \
+    rustfs/src/storage/rpc/disk.rs \
+    rustfs/src/storage/rpc/health.rs \
+    rustfs/src/storage/rpc/http_service.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/admin \
+    | rg -v '^rustfs/src/admin/runtime_sources\.rs:' || true
+) >"$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS admin runtime source reads must stay behind rustfs/src/admin/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src --glob '*.rs' |
+    rg -v '^rustfs/src/app/context' |
+    rg -v '(^rustfs/src/[^/]*runtime_sources\.rs:|/runtime_sources\.rs:)' || true
+) >"$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS AppContext resolver reads must stay behind context or runtime_sources modules: $(paste -sd '; ' "$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/app --glob '*.rs' |
+    rg -v '^rustfs/src/app/context' |
+    rg -v '^rustfs/src/app/runtime_sources\.rs:' || true
+) >"$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase runtime source reads must stay behind rustfs/src/app/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use crate::storage::\*;' rustfs/src/app --glob '*_usecase.rs' || true
+) >"$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase consumers must import storage owner APIs explicitly instead of crate::storage::*: $(paste -sd '; ' "$RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use (s3s::dto|crate::storage::ecfs)::\*;' rustfs/src/app --glob '*.rs' || true
+) >"$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE" ]]; then
+  report_failure "RustFS app consumers must import S3 DTO and ECFS owner APIs explicitly instead of wildcard imports: $(paste -sd '; ' "$RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::storage::s3_api::|use crate::storage::s3_api' rustfs/src/app --glob '*_usecase.rs' || true
+) >"$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app usecases must consume S3 API helpers through rustfs/src/app/s3_api.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|StorageError|DiskError|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b|(?:object_api_utils::to_s3s_etag|storageclass|StorageError|DiskError|DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class|is_all_buckets_not_found|is_err_bucket_not_found|is_err_object_not_found|is_err_version_not_found)\b)' \
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs || true
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b|(?:AppObjectLockConfigExt|AppReplicationConfigExt|AppVersioningConfigExt|predict_lifecycle_expiration|validate_restore_request|bucket_target_sys|lifecycle|metadata|metadata_sys|object_lock|policy_sys|quota|replication|tagging|target|utils|versioning_sys|transition_api|ObjectInfo|ObjectOptions)\b)|super::(?:lifecycle|metadata_sys|object_lock|quota|replication|tagging|target|utils|versioning_sys|transition_api)::|super::super::(?:metadata_sys|lifecycle|target)::' \
+      rustfs/src/app/bucket_usecase.rs rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs rustfs/src/app/lifecycle_transition_api_test.rs rustfs/src/app/capacity_dirty_scope_test.rs rustfs/src/app/context.rs rustfs/src/app/context/handles.rs rustfs/src/app/context/interfaces.rs rustfs/src/app/context/runtime_sources.rs || true
+  }
+) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app usecases must consume storage helper APIs through rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '(use crate::storage::(access|request_context|ecfs)|use crate::storage::\{[^}]*Storage(ObjectInfo|ObjectOptions|PutObjReader)|crate::storage::StorageObjectOptions)' \
+    rustfs/src/app/*_test.rs \
+    rustfs/src/admin/router.rs \
+    rustfs/src/admin/console.rs \
+    rustfs/src/admin/handlers/heal.rs \
+    rustfs/src/admin/handlers/metrics.rs \
+    rustfs/src/admin/handlers/object_zip_download.rs || true
+) >"$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin completed storage helper consumers must use local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b|(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b)' \
+      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
+      -g '!storage_api.rs' || true
+    rg -n --with-filename \
+      'super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)|super::super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)' \
+      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
+      -g '!storage_api.rs' || true
+    rg -n --with-filename \
+      'crate::app::(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|get_global_|set_object_store_resolver)' \
+      rustfs/src --glob '*.rs' || true
+    rg -n --with-filename \
+      'ecstore_data_usage|pub\(crate\) async fn load_data_usage_from_backend|super::super::load_data_usage_from_backend|crate::admin::load_data_usage_from_backend' \
+      rustfs/src/admin/mod.rs rustfs/src/admin/handlers/*.rs || true
+  }
+) >"$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin runtime and data-usage facades must stay behind local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      '\b(?:ecstore_(?:bucket|capacity|client|cluster|config|disk|error|layout|metrics|notification|rebalance|rpc|storage|tier)|AdminReplicationConfigExt|AdminVersioningConfigExt|RUSTFS_META_BUCKET|STORAGE_CLASS_SUB_SYS|read_admin_config|read_admin_config_without_migrate|save_admin_config|save_admin_server_config|delete_admin_config|init_admin_config_defaults|StorageError|ECStore|Endpoint|Endpoints|EndpointServerPools|PoolEndpoints|PeerRestClient|RebalanceStats|RebalanceMeta|RebalanceStopPropagationRecord)\b' \
+      rustfs/src/admin/mod.rs || true
+    rg -n --with-filename \
+      '(?:crate::admin|super(?::super)+)::(?:bandwidth|bucket_target_sys|lifecycle|metadata|metadata_sys|quota|replication|target|versioning|versioning_sys|storageclass|tier|AdminReplicationConfigExt|AdminVersioningConfigExt|RUSTFS_META_BUCKET|STORAGE_CLASS_SUB_SYS|read_admin_config|read_admin_config_without_migrate|save_admin_config|save_admin_server_config|delete_admin_config|init_admin_config_defaults|StorageError|Error|ECStore|Endpoint|Endpoints|EndpointServerPools|PoolEndpoints|PeerRestClient|RebalanceStats|RebalanceMeta|RebalanceStopPropagationRecord|collect_local_metrics|is_reserved_or_invalid_bucket)\b' \
+      rustfs/src/admin \
+      -g '*.rs' \
+      -g '!storage_api.rs' || true
+  }
+) >"$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE" ]]; then
+  report_failure "RustFS admin storage facades must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use crate::storage(?:;|::|\s*\{)|crate::storage::' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!rustfs/src/admin/**' \
+    --glob '!rustfs/src/app/**' \
+    --glob '!rustfs/src/storage/**' \
+    --glob '!rustfs/src/storage_api.rs' || true
+) >"$RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS root/server/startup storage facades must stay behind rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' rustfs/src/storage --glob '*.rs' |
+    rg -v '^rustfs/src/storage/runtime_sources\.rs:' || true
+) >"$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE")"
 fi
 
 (

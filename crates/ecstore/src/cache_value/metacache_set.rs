@@ -29,7 +29,7 @@ use tokio::io::AsyncRead;
 use tokio::spawn;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
@@ -53,6 +53,10 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
         Ok(Err(err)) => PeekOutcome::Error(err),
         Err(_) => PeekOutcome::TimedOut,
     }
+}
+
+fn is_missing_path_error(err: &DiskError) -> bool {
+    matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
 }
 
 #[cfg(test)]
@@ -197,17 +201,31 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             "metacache_walk_dir_primary_failed",
                             primary_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
-                        warn!(
-                            event = EVENT_METACACHE_LISTING,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
-                            disk_index = disk_idx,
-                            state = "walk_dir_failed",
-                            error = ?err,
-                            "Metacache walk_dir failed"
-                        );
+                        if is_missing_path_error(&err) {
+                            debug!(
+                                event = EVENT_METACACHE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_METACACHE,
+                                bucket = %opts_clone.bucket,
+                                path = %opts_clone.path,
+                                disk_index = disk_idx,
+                                state = "walk_dir_missing_path",
+                                error = ?err,
+                                "Metacache walk_dir missing path skipped"
+                            );
+                        } else {
+                            warn!(
+                                event = EVENT_METACACHE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_METACACHE,
+                                bucket = %opts_clone.bucket,
+                                path = %opts_clone.path,
+                                disk_index = disk_idx,
+                                state = "walk_dir_failed",
+                                error = ?err,
+                                "Metacache walk_dir failed"
+                            );
+                        }
                         last_err = Some(err);
                         need_fallback = true;
                     }
@@ -232,17 +250,32 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 }
 
                 let Some(disk) = disk_op else {
-                    warn!(
-                        event = EVENT_METACACHE_LISTING,
-                        component = LOG_COMPONENT_ECSTORE,
-                        subsystem = LOG_SUBSYSTEM_METACACHE,
-                        bucket = %opts_clone.bucket,
-                        path = %opts_clone.path,
-                        disk_index = disk_idx,
-                        state = "fallback_disk_missing",
-                        "Metacache fallback disk missing"
-                    );
                     let err = last_err.unwrap_or(DiskError::DiskNotFound);
+                    if is_missing_path_error(&err) {
+                        debug!(
+                            event = EVENT_METACACHE_LISTING,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_METACACHE,
+                            bucket = %opts_clone.bucket,
+                            path = %opts_clone.path,
+                            disk_index = disk_idx,
+                            state = "fallback_disk_missing_for_path",
+                            error = ?err,
+                            "Metacache fallback disk unavailable for missing path"
+                        );
+                    } else {
+                        warn!(
+                            event = EVENT_METACACHE_LISTING,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_METACACHE,
+                            bucket = %opts_clone.bucket,
+                            path = %opts_clone.path,
+                            disk_index = disk_idx,
+                            state = "fallback_disk_missing",
+                            error = ?err,
+                            "Metacache fallback disk missing"
+                        );
+                    }
                     record_producer_error(&producer_errs_clone, disk_idx, &err);
                     return Err(err);
                 };
@@ -279,17 +312,31 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                             "metacache_walk_dir_fallback_failed",
                             fallback_walk_started.elapsed().as_secs_f64() * 1000.0,
                         );
-                        error!(
-                            event = EVENT_METACACHE_LISTING,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
-                            disk_index = disk_idx,
-                            state = "fallback_walk_dir_failed",
-                            error = ?err,
-                            "Metacache fallback walk_dir failed"
-                        );
+                        if is_missing_path_error(&err) {
+                            debug!(
+                                event = EVENT_METACACHE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_METACACHE,
+                                bucket = %opts_clone.bucket,
+                                path = %opts_clone.path,
+                                disk_index = disk_idx,
+                                state = "fallback_walk_dir_missing_path",
+                                error = ?err,
+                                "Metacache fallback walk_dir missing path skipped"
+                            );
+                        } else {
+                            error!(
+                                event = EVENT_METACACHE_LISTING,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_METACACHE,
+                                bucket = %opts_clone.bucket,
+                                path = %opts_clone.path,
+                                disk_index = disk_idx,
+                                state = "fallback_walk_dir_failed",
+                                error = ?err,
+                                "Metacache fallback walk_dir failed"
+                            );
+                        }
                         last_err = Some(err);
                     }
                 }
@@ -560,16 +607,29 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     let merge_started = std::time::Instant::now();
     if let Err(err) = revjob.await.map_err(std::io::Error::other)? {
         rustfs_io_metrics::record_stage_duration("metacache_merge_failed", merge_started.elapsed().as_secs_f64() * 1000.0);
-        error!(
-            event = EVENT_METACACHE_LISTING,
-            component = LOG_COMPONENT_ECSTORE,
-            subsystem = LOG_SUBSYSTEM_METACACHE,
-            bucket = %log_bucket,
-            path = %log_path,
-            state = "merge_job_failed",
-            error = ?err,
-            "Metacache merge job failed"
-        );
+        if is_missing_path_error(&err) {
+            debug!(
+                event = EVENT_METACACHE_LISTING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_METACACHE,
+                bucket = %log_bucket,
+                path = %log_path,
+                state = "merge_job_missing_path",
+                error = ?err,
+                "Metacache merge job missing path skipped"
+            );
+        } else {
+            error!(
+                event = EVENT_METACACHE_LISTING,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_METACACHE,
+                bucket = %log_bucket,
+                path = %log_path,
+                state = "merge_job_failed",
+                error = ?err,
+                "Metacache merge job failed"
+            );
+        }
         cancel_rx.cancel();
         for job in jobs {
             job.abort();
@@ -597,8 +657,8 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
         match result {
             Ok(Ok(())) => {}
             Ok(Err(err)) => {
-                if matches!(err, DiskError::FileNotFound | DiskError::VolumeNotFound) {
-                    warn!(
+                if is_missing_path_error(&err) {
+                    debug!(
                         event = EVENT_METACACHE_LISTING,
                         component = LOG_COMPONENT_ECSTORE,
                         subsystem = LOG_SUBSYSTEM_METACACHE,
@@ -666,6 +726,16 @@ mod tests {
             .expect_err("empty drive list should fail");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn missing_path_error_classification_excludes_actionable_failures() {
+        assert!(is_missing_path_error(&DiskError::FileNotFound));
+        assert!(is_missing_path_error(&DiskError::FileVersionNotFound));
+        assert!(is_missing_path_error(&DiskError::VolumeNotFound));
+        assert!(!is_missing_path_error(&DiskError::Timeout));
+        assert!(!is_missing_path_error(&DiskError::DiskNotFound));
+        assert!(!is_missing_path_error(&DiskError::FileAccessDenied));
     }
 
     #[tokio::test]

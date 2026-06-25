@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{read_admin_config_without_migrate, save_admin_server_config};
 use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_object_store_handle, resolve_oidc_handle, resolve_server_config};
+use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_oidc_handle, resolve_server_config};
+use crate::admin::storage_api::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, RemoteAddr};
 use http::StatusCode;
@@ -268,6 +268,7 @@ pub struct ListOidcProvidersHandler {}
 #[async_trait::async_trait]
 impl Operation for ListOidcProvidersHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let providers = oidc_sys.list_visible_providers();
@@ -439,6 +440,7 @@ impl Operation for OidcAuthorizeHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
+        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         // Derive the callback redirect URI from the request
@@ -512,6 +514,7 @@ impl Operation for OidcCallbackHandler {
             ));
         }
 
+        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
@@ -599,6 +602,7 @@ impl Operation for OidcLogoutHandler {
             return redirect_response(&fallback_location);
         };
 
+        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let location = match resolve_oidc_handle() {
             Some(oidc_sys) => match oidc_sys.build_logout_url(&logout_token, &fallback_location).await {
                 Ok(Some(url)) => url,
@@ -628,6 +632,7 @@ impl Operation for OidcLogoutHandler {
 /// an explicit redirect_uri is recommended to prevent header manipulation.
 fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
     // Use explicitly configured redirect_uri if available
+    // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
     if let Some(oidc_sys) = resolve_oidc_handle()
         && let Some(config) = oidc_sys.get_provider_config(provider_id)
     {

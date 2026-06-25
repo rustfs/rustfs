@@ -323,7 +323,7 @@ impl SetDisks {
         let version_id = version_id.to_string();
         let opts = opts.clone();
 
-        let processor = get_global_processors().read_processor();
+        let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
             .iter()
             .take(required_reads + 2) // Read a few extra for reliability

@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::resolve_action_credentials;
-use crate::storage::ecfs::FS;
+use crate::runtime_sources::resolve_action_credentials;
+use crate::storage_api::ecfs::FS;
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
 use rustfs_credentials;
@@ -151,7 +151,7 @@ impl ProtocolStorageClient {
             secret_key: params.secret_key.to_string().into(),
         });
 
-        extensions.insert(crate::storage::access::ReqInfo {
+        extensions.insert(crate::storage_api::access::ReqInfo {
             cred: Some(rustfs_credentials::Credentials {
                 access_key: params.access_key.to_string(),
                 secret_key: params.secret_key.to_string(),
@@ -169,7 +169,7 @@ impl ProtocolStorageClient {
             object: params.object,
             version_id: None,
             region: None,
-            request_context: Some(crate::storage::request_context::RequestContext::fallback()),
+            request_context: Some(crate::storage_api::request_context::RequestContext::fallback()),
         });
 
         let req = S3Request {

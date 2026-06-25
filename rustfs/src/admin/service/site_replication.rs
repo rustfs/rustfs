@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::Error as StorageError;
-use super::super::{read_admin_config, save_admin_config};
+use crate::admin::runtime_sources::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::storage_api::Error as StorageError;
+use crate::admin::storage_api::{read_admin_config, save_admin_config};
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};
@@ -90,8 +90,8 @@ fn normalize_site_replication_state_json(data: &[u8]) -> Result<Option<Vec<u8>>,
 ///
 /// RustFS does not currently keep a separate in-memory cache for this state,
 /// so "reload" means validating that the persisted JSON is readable.
-pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
+pub async fn reload_site_replication_runtime_state_for_context(context: Option<&AppContext>) -> S3Result<()> {
+    let Some(store) = resolve_object_store_handle_for_context(context) else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
@@ -114,6 +114,11 @@ pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
             format!("failed to load site replication state: {err}"),
         )),
     }
+}
+
+pub async fn reload_site_replication_runtime_state() -> S3Result<()> {
+    let context = get_global_app_context();
+    reload_site_replication_runtime_state_for_context(context.as_deref()).await
 }
 
 #[cfg(test)]

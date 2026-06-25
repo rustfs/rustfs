@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::ecstore_utils::{deserialize, serialize};
-use super::super::{
+use crate::admin::storage_api::ecstore_utils::{deserialize, serialize};
+use crate::admin::storage_api::{
     StorageError,
     metadata::{
         BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
@@ -25,11 +25,11 @@ use super::super::{
     target::BucketTargets,
 };
 use crate::{
+    admin::runtime_sources::resolve_object_store_handle,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::resolve_object_store_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };

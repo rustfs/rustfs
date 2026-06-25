@@ -225,6 +225,20 @@ pub fn record_get_object_request_result(status: &str, duration_secs: f64) {
     histogram!("rustfs_io_get_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
 }
 
+/// Record PutObject request start.
+#[inline(always)]
+pub fn record_put_object_request_start(concurrent_requests: usize) {
+    counter!("rustfs_io_put_object_requests_total").increment(1);
+    gauge!("rustfs_io_put_object_concurrent_requests").set(concurrent_requests as f64);
+}
+
+/// Record PutObject request result.
+#[inline(always)]
+pub fn record_put_object_request_result(status: &str, duration_secs: f64) {
+    counter!("rustfs_io_put_object_request_results_total", "status" => status.to_string()).increment(1);
+    histogram!("rustfs_io_put_object_request_duration_seconds", "status" => status.to_string()).record(duration_secs);
+}
+
 /// Record GetObject timeout for a specific stage.
 #[inline(always)]
 pub fn record_get_object_timeout(stage: Option<&str>, elapsed_secs: Option<f64>) {
@@ -245,6 +259,16 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
     histogram!("rustfs_io_get_object_total_duration_seconds").record(total_duration_secs);
     histogram!("rustfs_io_get_object_response_size_bytes").record(response_size_bytes as f64);
     histogram!("rustfs_io_get_object_buffer_size_bytes").record(buffer_size_bytes as f64);
+}
+
+/// Record the streaming strategy chosen for a GetObject response body.
+#[inline(always)]
+pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
+    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
+    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
+        .record(buffer_size_bytes as f64);
+    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
+        .record(response_size_bytes.max(0) as f64);
 }
 
 /// Record I/O queue congestion observation.
@@ -924,6 +948,13 @@ mod tests {
     fn test_record_put_object() {
         record_put_object(200.0, 1024 * 1024, true);
         record_put_object(100.0, 512, false);
+    }
+
+    #[test]
+    fn test_record_put_object_request_metrics() {
+        record_put_object_request_start(3);
+        record_put_object_request_result("ok", 0.25);
+        record_put_object_request_result("error", 0.5);
     }
 
     #[test]

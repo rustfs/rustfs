@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::DailyAllTierStats;
-use super::super::EndpointServerPools;
-use super::super::ScannerMetricsReport;
-use super::super::StorageClassConfig;
-use super::super::TierConfigMgr;
-use super::super::metadata_sys::BucketMetadataSys;
-use super::super::{BucketBandwidthMonitor, DynReplicationPool, NotificationSys, ReplicationStats};
+use super::super::storage_api::EndpointServerPools;
+use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
@@ -191,6 +190,11 @@ pub trait RegionInterface: Send + Sync {
 /// Tier config interface for application-layer and admin handlers.
 pub trait TierConfigInterface: Send + Sync {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>>;
+}
+
+/// Lifecycle expiry state interface for transition cleanup queues.
+pub trait ExpiryStateInterface: Send + Sync {
+    fn handle(&self) -> Arc<RwLock<ExpiryState>>;
 }
 
 /// Server config interface for application-layer and server modules.

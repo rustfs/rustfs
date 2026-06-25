@@ -12,8 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation};
-use rustfs_obs::{init_obs, set_global_guard};
+use crate::{config::Config, license::init_license, startup_runtime::init_startup_runtime_foundation, startup_runtime_sources};
 use rustfs_utils::{ExternalEnvCompatReport, apply_external_env_compat};
 use std::{
     fmt,
@@ -73,11 +72,11 @@ pub(crate) async fn init_startup_server_preflight(
 }
 
 async fn init_startup_observability(obs_endpoint: String) -> std::result::Result<(), StartupServerPreflightError> {
-    let guard = init_obs(Some(obs_endpoint))
+    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
         .await
         .map_err(|err| StartupServerPreflightError::ObservabilityInit(Error::other(err)))?;
 
-    match set_global_guard(guard).map_err(Error::other) {
+    match startup_runtime_sources::set_observability_guard(guard).map_err(Error::other) {
         Ok(_) => {
             debug!(
                 target: "rustfs::main",

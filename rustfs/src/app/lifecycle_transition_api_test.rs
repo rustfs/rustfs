@@ -12,20 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{
-    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, GLOBAL_TierConfigMgr, PoolEndpoints, TierConfig, TierType,
-    WarmBackendGetOpts,
+use super::storage_api::bucket::{
+    lifecycle,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    object_api_utils::to_s3s_etag,
     transition_api::{ReadCloser, ReaderImpl},
+};
+use super::storage_api::ecfs::FS;
+use super::storage_api::object_utils::to_s3s_etag;
+use super::storage_api::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
+use super::storage_api::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::storage::ecfs::FS;
-use crate::storage::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-};
+use crate::app::runtime_sources::resolve_tier_config_handle;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
@@ -107,7 +109,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    super::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    super::storage_api::runtime::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -124,7 +128,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    super::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -337,7 +341,8 @@ impl AppWarmBackend for MockWarmBackend {
 
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     let backend = MockWarmBackend::default();
-    let mut tier_config_mgr = GLOBAL_TierConfigMgr.write().await;
+    let tier_config_mgr_handle = resolve_tier_config_handle();
+    let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     tier_config_mgr.tiers.insert(
         tier_name.to_string(),
         TierConfig {
@@ -924,7 +929,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
         .await
         .expect("Failed to enqueue transitioned object");
 
@@ -981,7 +986,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
         .await
         .expect("Failed to enqueue transitioned object");
 
