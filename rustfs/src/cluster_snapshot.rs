@@ -16,8 +16,8 @@ use crate::runtime_capabilities::runtime_observability_snapshot;
 use crate::server::{
     DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
 };
-use crate::storage::EndpointServerPools;
-use crate::storage::ecstore_cluster::{
+use crate::storage_api::EndpointServerPools;
+use crate::storage_api::ecstore_cluster::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
 };
@@ -116,7 +116,7 @@ pub fn cluster_has_actionable_pressure(snapshot: &ClusterReadOnlySnapshot) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
+    use crate::storage_api::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_concurrency::{WorkloadAdmissionSnapshot, WorkloadClass};
     use rustfs_storage_api::{CapabilityState, CapabilityStatus, DiskCapabilities, TopologyCapabilities};
 

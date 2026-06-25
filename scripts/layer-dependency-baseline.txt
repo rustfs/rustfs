@@ -38,7 +38,6 @@ dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::multipart::p
 dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
 dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::multipart::parse_upload_part_number
 dep|rustfs/src/init.rs|infra->interface|crate::admin
-dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
 dep|rustfs/src/server/http.rs|infra->interface|crate::admin
 dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path

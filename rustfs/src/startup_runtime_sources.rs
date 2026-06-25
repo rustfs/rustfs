@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::config::RustFSBufferConfig;
-use crate::storage::{DynReplicationPool, set_global_region, set_global_rustfs_port};
+use crate::storage_api::{DynReplicationPool, set_global_region, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};

@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use crate::runtime_sources::resolve_replication_pool_handle;
-use crate::storage::{bucket_metadata_runtime_initialized, replication_queue_current_count};
+use crate::storage_api::{bucket_metadata_runtime_initialized, replication_queue_current_count};
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
     WorkloadClass,
 };
 
-use crate::storage::concurrency::get_concurrency_manager;
+use crate::storage_api::concurrency::get_concurrency_manager;
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
 const FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER: &str = "foreground write admission not yet exposed by RustFS runtime";

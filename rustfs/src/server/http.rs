@@ -30,11 +30,11 @@ use crate::server::{
         TlsAcceptorHolder, TlsHandshakeFailureKind, build_acceptor_from_loaded, load_tls_material, spawn_reload_loop,
     },
 };
-use crate::storage;
-use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
-use crate::storage::rpc::InternodeRpcService;
-use crate::storage::tonic_service::make_server;
-use crate::storage::{TONIC_RPC_PREFIX, verify_rpc_signature};
+use crate::storage_api as storage;
+use crate::storage_api::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage_api::rpc::InternodeRpcService;
+use crate::storage_api::tonic_service::make_server;
+use crate::storage_api::{TONIC_RPC_PREFIX, verify_rpc_signature};
 use bytes::Bytes;
 use http::{HeaderMap, Method, Request as HttpRequest, Response};
 use hyper::body::Incoming;
@@ -1104,7 +1104,7 @@ fn process_connection(
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                            let request_context = request.extensions().get::<crate::storage_api::request_context::RequestContext>();
                             let request_id = request_context
                                 .map(|ctx| ctx.request_id.as_str())
                                 .unwrap_or("unknown");
@@ -1253,7 +1253,7 @@ fn process_connection(
                 .layer(
                     TraceLayer::new_for_http()
                         .make_span_with(|request: &HttpRequest<_>| {
-                            let request_context = request.extensions().get::<crate::storage::request_context::RequestContext>();
+                            let request_context = request.extensions().get::<crate::storage_api::request_context::RequestContext>();
                             let request_id = request_context
                                 .map(|ctx| ctx.request_id.as_str())
                                 .unwrap_or("unknown");

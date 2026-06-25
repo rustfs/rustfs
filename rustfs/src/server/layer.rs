@@ -25,8 +25,8 @@ use crate::server::{
     RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path,
     is_table_catalog_path,
 };
-use crate::storage::apply_cors_headers;
-use crate::storage::request_context::{
+use crate::storage_api::apply_cors_headers;
+use crate::storage_api::request_context::{
     RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
 };
 use bytes::Bytes;

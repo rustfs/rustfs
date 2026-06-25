@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::shutdown_background_services;
+use crate::storage_api::shutdown_background_services;
 use crate::{
     server::{ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier, stop_audit_system},
     startup_optional_runtime_sidecars::{
