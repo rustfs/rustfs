@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::startup_runtime_sources;
-use crate::storage::{ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config};
+use crate::storage_api::{ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config};
 use rustfs_storage_api::{BucketOperations, BucketOptions};
 use std::{
     io::{Error, Result},

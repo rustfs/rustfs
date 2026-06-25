@@ -244,6 +244,7 @@ pub(crate) type ExpiryState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::E
 pub(crate) type FileInfoVersions = ecstore_disk::FileInfoVersions;
 pub(crate) type FileReader = ecstore_disk::FileReader;
 pub(crate) type FileWriter = ecstore_disk::FileWriter;
+pub(crate) type FS = ecfs::FS;
 pub(crate) type HashReader = ecstore_rio::HashReader;
 pub(crate) type LocalPeerS3Client = ecstore_rpc::LocalPeerS3Client;
 pub(crate) type MetricType = ecstore_metrics::MetricType;

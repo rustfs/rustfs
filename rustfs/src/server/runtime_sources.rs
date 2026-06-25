@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::app::context;
-use crate::storage::{ECStore, EndpointServerPools};
+use crate::storage_api::{ECStore, EndpointServerPools};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use std::collections::HashMap;

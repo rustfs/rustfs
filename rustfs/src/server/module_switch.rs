@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::runtime_sources;
-use crate::storage::{Error as StorageError, read_config, save_config};
+use crate::storage_api::{Error as StorageError, read_config, save_config};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
 

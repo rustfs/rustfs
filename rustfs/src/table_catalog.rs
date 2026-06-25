@@ -27,7 +27,7 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
-use crate::storage::{
+use crate::storage_api::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
     BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata,
     get_lock_acquire_timeout, table_catalog_path_hash,
@@ -51,7 +51,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::io::AsyncReadExt;
 use uuid::Uuid;
 
-use crate::storage::{
+use crate::storage_api::{
     StorageDeletedObject as DeletedObject, StorageGetObjectReader as GetObjectReader, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };

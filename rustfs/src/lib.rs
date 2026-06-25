@@ -95,6 +95,7 @@ pub(crate) mod startup_shutdown;
 pub(crate) mod startup_storage;
 pub(crate) mod startup_tls_material;
 pub mod storage;
+pub(crate) mod storage_api;
 pub(crate) mod table_catalog;
 pub mod tls;
 pub mod update;

@@ -17,7 +17,7 @@
 mod tests {
     use crate::config::cli::default_server_opts;
     use crate::config::{CommandResult, Config, Opt, TlsCommands};
-    use crate::storage::DisksLayout;
+    use crate::storage_api::DisksLayout;
     use rustfs_config::{DEFAULT_CONSOLE_ADDRESS, DEFAULT_CONSOLE_ENABLE, DEFAULT_OBS_ENDPOINT, RUSTFS_REGION};
     use rustfs_credentials::{DEFAULT_ACCESS_KEY, DEFAULT_SECRET_KEY};
     use serial_test::serial;
@@ -275,7 +275,7 @@ mod tests {
     #[test]
     #[serial]
     fn test_volumes_and_disk_layout_parsing() {
-        use crate::storage::DisksLayout;
+        use crate::storage_api::DisksLayout;
 
         // Test case 1: Single volume path
         let args = vec!["rustfs", "/data/vol1"];

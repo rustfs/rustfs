@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
+use crate::storage_api::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 use rustfs_storage_api::{
     CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
     ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
@@ -185,7 +185,7 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
+    use crate::storage_api::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_storage_api::{CapabilityState, ObservabilitySnapshotProvider, TopologySnapshotProvider};
 
     #[tokio::test]

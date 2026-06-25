@@ -13,7 +13,7 @@
 //  limitations under the License.
 
 use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store, runtime_sources};
-use crate::storage::{EventArgs as EcstoreEventArgs, StorageObjectInfo, register_event_dispatch_hook};
+use crate::storage_api::{EventArgs as EcstoreEventArgs, StorageObjectInfo, register_event_dispatch_hook};
 use chrono::{DateTime, Utc};
 use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
 use rustfs_s3_types::EventName;
@@ -234,7 +234,7 @@ pub async fn init_event_notifier() {
 #[cfg(test)]
 mod tests {
     use super::{convert_ecstore_object_info, parse_host_and_port};
-    use crate::storage::StorageObjectInfo;
+    use crate::storage_api::StorageObjectInfo;
     use chrono::{DateTime, Utc};
     use rustfs_storage_api::TransitionedObject;
     use std::{collections::HashMap, sync::Arc};
