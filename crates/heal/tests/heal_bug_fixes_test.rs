@@ -12,12 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
 use rustfs_heal::heal::{
     event::{HealEvent, Severity},
     task::{HealPriority, HealType},
     utils,
 };
+
+#[path = "heal_bug_fixes_test/storage_api.rs"]
+mod storage_api;
+
+use storage_api::{BucketInfo, DiskStore, Endpoint};
 
 #[test]
 fn test_heal_event_to_heal_request_no_panic() {
@@ -191,13 +195,13 @@ fn test_heal_task_status_atomic_update() {
         async fn format_disk(&self, _endpoint: &Endpoint) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_storage_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> rustfs_heal::Result<()> {
             Ok(())
         }
-        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_storage_api::BucketInfo>> {
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> rustfs_heal::Result<bool> {
@@ -320,7 +324,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(())
         }
 
-        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<rustfs_storage_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> rustfs_heal::Result<Option<BucketInfo>> {
             Ok(None)
         }
 
@@ -328,7 +332,7 @@ async fn test_heal_task_transient_object_exists_skip_avoids_recreate() {
             Ok(())
         }
 
-        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<rustfs_storage_api::BucketInfo>> {
+        async fn list_buckets(&self) -> rustfs_heal::Result<Vec<BucketInfo>> {
             Ok(Vec::new())
         }
 

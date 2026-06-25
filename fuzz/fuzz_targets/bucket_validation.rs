@@ -1,7 +1,8 @@
 #![no_main]
 
 use libfuzzer_sys::fuzz_target;
-use rustfs_ecstore::api::bucket::utils::{
+mod bucket_validation_storage_api;
+use bucket_validation_storage_api::{
     check_bucket_and_object_names, check_list_objs_args, check_valid_bucket_name_strict, is_meta_bucketname,
 };
 
