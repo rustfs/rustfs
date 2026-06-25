@@ -20,6 +20,32 @@ use super::storageclass;
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::concurrency::{
+    self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
+    get_put_concurrency_aware_buffer_size,
+};
+use super::storage_api::deadlock_detector;
+use super::storage_api::ecfs::FS;
+use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::options::{
+    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
+    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+};
+use super::storage_api::request_context::{self, spawn_traced};
+use super::storage_api::sse::{
+    DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
+    encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
+    extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
+};
+use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::{
+    RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
+    parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
+    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+};
 use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
 use super::{DiskError, is_all_buckets_not_found};
 use super::{DynReader, HashReader, WritePlan, wrap_reader};
@@ -53,32 +79,6 @@ use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
 use crate::error::ApiError;
 use crate::server::convert_ecstore_object_info;
-use crate::storage::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
-use crate::storage::concurrency::{
-    ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
-    get_put_concurrency_aware_buffer_size,
-};
-use crate::storage::ecfs::FS;
-use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::options::{
-    copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
-    filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
-};
-use crate::storage::request_context::spawn_traced;
-use crate::storage::sse::{
-    SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssekms_context_from_headers,
-    map_get_object_reader_error,
-};
-use crate::storage::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
-use crate::storage::{
-    DecryptionRequest, EncryptionRequest, RFC1123, apply_bucket_default_lock_retention, check_preconditions, concurrency,
-    deadlock_detector, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, get_buffer_size_opt_in,
-    get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy, request_context, sse_decryption, sse_encryption,
-    strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
-};
 use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
@@ -156,7 +156,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use crate::storage::{
+use super::storage_api::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
@@ -451,6 +451,43 @@ impl AsyncRead for PooledBufferReader {
     }
 }
 
+struct ChunkedBytesReader {
+    chunks: Vec<Bytes>,
+    chunk_index: usize,
+    chunk_offset: usize,
+}
+
+impl ChunkedBytesReader {
+    fn new(chunks: Vec<Bytes>) -> Self {
+        Self {
+            chunks,
+            chunk_index: 0,
+            chunk_offset: 0,
+        }
+    }
+}
+
+impl AsyncRead for ChunkedBytesReader {
+    fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        while self.chunk_index < self.chunks.len() {
+            let chunk = &self.chunks[self.chunk_index];
+            if self.chunk_offset >= chunk.len() {
+                self.chunk_index += 1;
+                self.chunk_offset = 0;
+                continue;
+            }
+
+            let remaining = &chunk[self.chunk_offset..];
+            let to_read = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_read]);
+            self.chunk_offset += to_read;
+            return Poll::Ready(Ok(()));
+        }
+
+        Poll::Ready(Ok(()))
+    }
+}
+
 /// Determine if zero-copy write should be used for this PutObject operation.
 ///
 /// Zero-copy is beneficial for large objects without encryption or compression.
@@ -501,6 +538,34 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
                 return false;
             }
         }
+    }
+
+    true
+}
+
+fn should_use_zero_copy_eager_put_path(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> bool {
+    const ZERO_COPY_EAGER_PUT_MAX_SIZE: i64 = 32 * 1024 * 1024;
+
+    if is_extract || should_compress || server_side_encryption_requested {
+        return false;
+    }
+
+    if size <= 0 || size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
+        return false;
+    }
+
+    if !should_use_zero_copy(size, headers) {
+        return false;
+    }
+
+    if request_uses_aws_chunked(headers) && decoded_content_length_from_headers(headers).ok().flatten().is_none() {
+        return false;
     }
 
     true
@@ -605,6 +670,41 @@ where
     Ok(std::io::Cursor::new(buf))
 }
 
+async fn read_zero_copy_put_body_exact<S, E>(mut body: S, size: usize) -> S3Result<ChunkedBytesReader>
+where
+    S: futures::Stream<Item = std::result::Result<Bytes, E>> + Unpin,
+    E: std::fmt::Display,
+{
+    let mut chunks = Vec::new();
+    let mut filled = 0usize;
+
+    while filled < size {
+        let Some(chunk) = body.next().await else {
+            return Err(s3_error!(IncompleteBody));
+        };
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if chunk.is_empty() {
+            continue;
+        }
+        if filled.saturating_add(chunk.len()) > size {
+            return Err(s3_error!(UnexpectedContent));
+        }
+
+        rustfs_io_metrics::record_zero_copy_buffer_operation("put_chunk", chunk.len());
+        filled += chunk.len();
+        chunks.push(chunk);
+    }
+
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.map_err(|err| ApiError::from(StorageError::other(err.to_string())))?;
+        if !chunk.is_empty() {
+            return Err(s3_error!(UnexpectedContent));
+        }
+    }
+
+    Ok(ChunkedBytesReader::new(chunks))
+}
+
 fn object_seek_support_threshold() -> usize {
     static OBJECT_SEEK_SUPPORT_THRESHOLD: OnceLock<usize> = OnceLock::new();
     *OBJECT_SEEK_SUPPORT_THRESHOLD.get_or_init(|| {
@@ -659,7 +759,7 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::storage::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use crate::app::storage_api::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]
@@ -2144,8 +2244,12 @@ impl DefaultObjectUsecase {
 
         let use_small_eager_put_path =
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_zero_copy_eager_put_path =
+            should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let put_path = if should_compress {
             "stream_compressed"
+        } else if use_zero_copy_eager_put_path {
+            "zero_copy_eager"
         } else if use_small_eager_put_path {
             "small_eager"
         } else {
@@ -2297,7 +2401,12 @@ impl DefaultObjectUsecase {
             write_plan = write_plan.with_compression(algorithm);
             hrd
         } else {
-            if use_small_eager_put_path {
+            if use_zero_copy_eager_put_path {
+                let zero_copy_start = std::time::Instant::now();
+                let eager_body = read_zero_copy_put_body_exact(body, actual_size as usize).await?;
+                rustfs_io_metrics::record_zero_copy_write(actual_size as usize, zero_copy_start.elapsed().as_secs_f64() * 1000.0);
+                HashReader::from_stream(eager_body, size, actual_size, md5hex, sha256hex, false).map_err(ApiError::from)?
+            } else if use_small_eager_put_path {
                 if (actual_size as usize) <= POOL_BYPASS_MAX_SIZE {
                     // Bypass BytesPool for very small objects to avoid Small-tier
                     // Mutex contention under high concurrency. Direct allocation
@@ -5580,6 +5689,24 @@ mod tests {
         assert!(!should_use_small_eager_put_path(1024 * 1024 + 1, &headers, false, false, false));
     }
 
+    #[test]
+    fn should_use_zero_copy_eager_put_path_allows_large_plain_objects_within_cap() {
+        let headers = HeaderMap::new();
+
+        assert!(should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, false));
+        assert!(should_use_zero_copy_eager_put_path(32 * 1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(32 * 1024 * 1024 + 1, &headers, false, false, false));
+    }
+
+    #[test]
+    fn should_use_zero_copy_eager_put_path_rejects_compression_sse_and_extract() {
+        let headers = HeaderMap::new();
+
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, true, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, true, false));
+        assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, true));
+    }
+
     #[tokio::test]
     async fn read_small_put_body_exact_pooled_reads_exact_bytes() {
         let pool = get_concurrency_manager().bytes_pool();
@@ -5603,6 +5730,42 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::IncompleteBody);
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_reads_chunked_body() {
+        use tokio::io::AsyncReadExt;
+
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello ")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"world")),
+        ]);
+
+        let mut reader = read_zero_copy_put_body_exact(body, 11)
+            .await
+            .expect("zero-copy eager body read should succeed");
+        let mut out = Vec::new();
+        reader
+            .read_to_end(&mut out)
+            .await
+            .expect("chunked bytes reader should be readable");
+
+        assert_eq!(out, b"hello world");
+    }
+
+    #[tokio::test]
+    async fn read_zero_copy_put_body_exact_rejects_extra_bytes() {
+        let body = futures::stream::iter(vec![
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"hello")),
+            Ok::<Bytes, std::io::Error>(Bytes::from_static(b"!")),
+        ]);
+
+        let err = match read_zero_copy_put_body_exact(body, 5).await {
+            Ok(_) => panic!("extra bytes should fail"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
     }
 
     #[tokio::test]
