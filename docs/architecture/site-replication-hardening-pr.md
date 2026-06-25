@@ -85,7 +85,7 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 
 ## Additional Notes
 
-This draft PR includes bootstrap, durable retry, and repair work in one reviewable branch. It should remain draft until CI or a full local pre-PR run confirms the latest `main` baseline.
+This draft PR includes bootstrap, durable retry, and repair work in one reviewable branch. It should remain draft until CI or a full local pre-PR run confirms the latest default branch baseline.
 
 The expanded single-PR scope also includes MinIO wire-contract bootstrap validation, durable site-replication retry, full add-time IAM/bootstrap sync, lifecycle compatibility, and site-level repair.
 
