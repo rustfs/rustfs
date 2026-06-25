@@ -109,6 +109,14 @@ bash scripts/prepare_gt1g_get_test_objects.sh \
    - `sequential`
    - `ranged_parallel`
 
+补充说明：
+
+1. 如果本机没有 `mc`，脚本会自动 fallback 到仓库内置的 `rustfs/tests/gt1g_get_benchmark_tool.rs`
+2. fallback 模式下，结果目录会落在：
+   - `rustfs/target/bench/...`
+3. 非 fallback 模式下，结果目录仍按脚本参数落在：
+   - `target/bench/...`
+
 ### 5.1 baseline：sequential + ranged_parallel
 
 ```bash

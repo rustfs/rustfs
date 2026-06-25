@@ -63,6 +63,38 @@ require_cmd() {
   fi
 }
 
+run_rust_helper_fallback() {
+  local objects_arg=""
+  local helper_out_dir="$OUT_DIR"
+  local raw_spec
+  IFS=',' read -r -a object_specs <<< "$OBJECTS"
+  for raw_spec in "${object_specs[@]}"; do
+    local spec size object_name
+    spec="$(echo "$raw_spec" | awk '{$1=$1;print}')"
+    [[ -z "$spec" ]] && continue
+    size="${spec%%=*}"
+    object_name="${spec#*=}"
+    objects_arg+="${size}=${PREFIX%/}/${object_name},"
+  done
+  objects_arg="${objects_arg%,}"
+
+  if [[ -n "$helper_out_dir" && "$helper_out_dir" != /* ]]; then
+    helper_out_dir="$PWD/$helper_out_dir"
+  fi
+
+  echo "mc not found; falling back to rustfs/tests/gt1g_get_benchmark_tool.rs"
+  GT1G_GET_ACTION=prepare \
+  GT1G_GET_ENDPOINT="$ENDPOINT" \
+  GT1G_GET_ACCESS_KEY="$ACCESS_KEY" \
+  GT1G_GET_SECRET_KEY="$SECRET_KEY" \
+  GT1G_GET_BUCKET="$BUCKET" \
+  GT1G_GET_REGION="$REGION" \
+  GT1G_GET_OBJECTS="$objects_arg" \
+  GT1G_GET_OUT_DIR="${helper_out_dir:-$PWD/target/bench/issue713-prepare-helper}" \
+  GT1G_GET_FORCE="$([[ "$FORCE" == "true" ]] && echo true || echo false)" \
+  cargo test -p rustfs --test gt1g_get_benchmark_tool gt1g_get_benchmark_tool -- --ignored --nocapture
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -141,7 +173,11 @@ object_exists() {
 main() {
   parse_args "$@"
   validate_args
-  require_cmd "$MC_BIN"
+
+  if ! command -v "$MC_BIN" >/dev/null 2>&1; then
+    run_rust_helper_fallback
+    exit 0
+  fi
 
   local tmp_root
   tmp_root="$(mktemp -d "${TMPDIR:-/tmp}/issue713-gt1g-get.XXXXXX")"

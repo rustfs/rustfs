@@ -78,6 +78,30 @@ require_cmd() {
   fi
 }
 
+run_rust_helper_fallback() {
+  local helper_out_dir="$OUT_DIR"
+  if [[ -n "$helper_out_dir" && "$helper_out_dir" != /* ]]; then
+    helper_out_dir="$PWD/$helper_out_dir"
+  fi
+
+  echo "mc not found; falling back to rustfs/tests/gt1g_get_benchmark_tool.rs"
+
+  GT1G_GET_ACTION=bench \
+  GT1G_GET_ENDPOINT="$ENDPOINT" \
+  GT1G_GET_ACCESS_KEY="$ACCESS_KEY" \
+  GT1G_GET_SECRET_KEY="$SECRET_KEY" \
+  GT1G_GET_BUCKET="$BUCKET" \
+  GT1G_GET_REGION="$REGION" \
+  GT1G_GET_OBJECTS="$OBJECTS" \
+  GT1G_GET_MODES="$MODES" \
+  GT1G_GET_CONCURRENCIES="$CONCURRENCIES" \
+  GT1G_GET_RANGE_WORKERS="$RANGE_WORKERS" \
+  GT1G_GET_ROUNDS="$ROUNDS" \
+  GT1G_GET_COOLDOWN_SECS="$COOLDOWN_SECS" \
+  GT1G_GET_OUT_DIR="$helper_out_dir" \
+  cargo test -p rustfs --test gt1g_get_benchmark_tool gt1g_get_benchmark_tool -- --ignored --nocapture
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -390,6 +414,12 @@ main() {
   fi
   validate_positive_int "$ROUNDS" "--rounds"
   validate_nonnegative_int "$COOLDOWN_SECS" "--cooldown-secs"
+  if ! command -v "$MC_BIN" >/dev/null 2>&1; then
+    setup_output
+    run_rust_helper_fallback
+    exit 0
+  fi
+
   require_cmd "$MC_BIN"
   require_cmd "$CURL_BIN"
   require_cmd "$JQ_BIN"
