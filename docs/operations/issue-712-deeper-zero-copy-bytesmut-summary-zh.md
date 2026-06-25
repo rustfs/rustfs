@@ -113,3 +113,68 @@ RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true
    - 更多重复性普通 PUT 复测
    - 视情况加入 `64MiB` 面
 4. 在证据收敛前，不把这条分支直接合回当前 `issue-712` 主线 PR
+
+## 8. `32/64/128MiB` 聚焦矩阵
+
+在继续推进时，又补了一组更聚焦的普通 PUT 矩阵：
+
+1. `issue712-deeper-zero-copy-bytesmut-v6`
+2. `issue712-deeper-zero-copy-bytesmut-v7`
+
+固定条件：
+
+1. `32MiB / 64MiB / 128MiB`
+2. `c16`
+3. `duration=60s`
+4. `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true`
+
+### 8.1 `v6`
+
+1. `32MiB`: `402.13 MiB/s`, `1285.7ms`
+2. `64MiB`: `413.68 MiB/s`, `2583.3ms`
+3. `128MiB`: `388.22 MiB/s`, `5496.0ms`
+
+### 8.2 `v7`
+
+1. `32MiB`: `327.00 MiB/s`, `1654.3ms`
+2. `64MiB`: `334.44 MiB/s`, `3345.5ms`
+3. `128MiB`: `381.49 MiB/s`, `5591.9ms`
+
+## 9. `v6/v7` 两轮汇总
+
+### `32MiB`
+
+1. Avg throughput: `364.56 MiB/s`
+2. Avg latency: `1470.0ms`
+
+### `64MiB`
+
+1. Avg throughput: `374.06 MiB/s`
+2. Avg latency: `2964.4ms`
+
+### `128MiB`
+
+1. Avg throughput: `384.86 MiB/s`
+2. Avg latency: `5543.9ms`
+
+## 10. 阶段性判断更新
+
+补完这组聚焦矩阵后，可以把结论进一步收窄为：
+
+1. `BytesMut ingest` 在 `32/64/128MiB` 区间依然值得继续保留为实验方向
+2. 但 `32MiB` 与 `64MiB` 的波动仍然明显，当前还不够稳定
+3. `128MiB` 两轮结果更接近，稳定性相对更好
+
+也就是说，这条 deeper-zero-copy 线当前更像是：
+
+1. 对更大对象区间更有潜力
+2. 但还没有足够证据支持直接收敛成默认行为
+
+## 11. 当前最稳妥建议
+
+到这一轮为止，建议更新为：
+
+1. 继续把 `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true` 作为 `env-only` 实验能力保留
+2. 后续如果继续压测，优先关注 `64MiB` 与 `128MiB`
+3. `32MiB` 可以保留，但不再作为唯一核心判断点
+4. 当前不建议把这条线直接并回主线 PR
