@@ -35,6 +35,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 9. `feat: bootstrap site replication metadata on add`
    - Purpose: replay the local site replication snapshot to joined peers during add, before object backfill starts.
    - Reason: existing hooks only replicate changes after site replication is enabled; existing policies, users, groups, bucket metadata, and buckets must be bootstrapped so a newly joined site does not start with an incomplete control-plane snapshot.
+10. `fix: align lifecycle replication with minio semantics`
+   - Purpose: replicate bucket lifecycle metadata only when site replication has `replicate-ilm-expiry` enabled.
+   - Reason: MinIO keeps lifecycle expiry replication opt-in; RustFS should not replicate lifecycle metadata by default during live bucket metadata hooks or add-time bootstrap.
 
 ## Verification
 
@@ -48,6 +51,8 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all`
+- Passed: `cargo fmt --all --check`
+- Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all --check`
@@ -78,3 +83,5 @@ The peer path compatibility step maps outbound peer requests to `/minio/admin/v3
 The add preflight step performs remote reads before state mutation, so add fails earlier when a peer cannot report metainfo or IDP settings.
 
 The bootstrap step replays IAM policies, built-in users with stored secret material, group membership/status, policy mappings, bucket creation, and bucket metadata through the existing peer replication handlers. It does not synthesize ordinary service-account secrets when the snapshot does not contain them; the site-replicator service account remains distributed through the join flow.
+
+Lifecycle metadata is now skipped by default in site replication hooks and bootstrap snapshots unless the site replication peer state enables `replicate-ilm-expiry`.

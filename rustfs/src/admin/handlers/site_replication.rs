@@ -1268,7 +1268,11 @@ fn append_bootstrap_bucket_item(
     Ok(())
 }
 
-fn append_bootstrap_bucket_items(plan: &mut SiteReplicationBootstrapPlan, bucket: &SRBucketInfo) -> S3Result<()> {
+fn append_bootstrap_bucket_items(
+    plan: &mut SiteReplicationBootstrapPlan,
+    bucket: &SRBucketInfo,
+    replicate_ilm_expiry: bool,
+) -> S3Result<()> {
     append_bootstrap_bucket_item(
         &mut plan.bucket_items,
         bucket,
@@ -1349,18 +1353,20 @@ fn append_bootstrap_bucket_items(plan: &mut SiteReplicationBootstrapPlan, bucket
             Ok(())
         },
     )?;
-    append_bootstrap_bucket_item(
-        &mut plan.bucket_items,
-        bucket,
-        "lc-config",
-        bucket.expiry_lc_config.clone(),
-        bucket.expiry_lc_config_updated_at,
-        |item, value| {
-            item.expiry_lc_config = Some(value);
-            item.expiry_updated_at = item.updated_at;
-            Ok(())
-        },
-    )?;
+    if replicate_ilm_expiry {
+        append_bootstrap_bucket_item(
+            &mut plan.bucket_items,
+            bucket,
+            "lc-config",
+            bucket.expiry_lc_config.clone(),
+            bucket.expiry_lc_config_updated_at,
+            |item, value| {
+                item.expiry_lc_config = Some(value);
+                item.expiry_updated_at = item.updated_at;
+                Ok(())
+            },
+        )?;
+    }
     append_bootstrap_bucket_item(
         &mut plan.bucket_items,
         bucket,
@@ -1382,8 +1388,17 @@ fn group_status_from_desc(status: &str) -> GroupStatus {
     }
 }
 
+fn site_replication_info_replicates_ilm_expiry(info: &SRInfo) -> bool {
+    info.state.peers.values().any(|peer| peer.replicate_ilm_expiry)
+}
+
+fn site_replication_state_replicates_ilm_expiry(state: &SiteReplicationState) -> bool {
+    state.peers.values().any(|peer| peer.replicate_ilm_expiry)
+}
+
 fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBootstrapPlan> {
     let mut plan = SiteReplicationBootstrapPlan::default();
+    let replicate_ilm_expiry = site_replication_info_replicates_ilm_expiry(info);
 
     for (name, policy) in &info.policies {
         plan.iam_items.push(SRIAMItem {
@@ -1451,7 +1466,7 @@ fn site_replication_bootstrap_plan(info: &SRInfo) -> S3Result<SiteReplicationBoo
 
     for bucket in info.buckets.values() {
         plan.bucket_make_ops.push(bootstrap_bucket_make_op_path(bucket));
-        append_bootstrap_bucket_items(&mut plan, bucket)?;
+        append_bootstrap_bucket_items(&mut plan, bucket, replicate_ilm_expiry)?;
         plan.bucket_configure_ops
             .push(bootstrap_bucket_op_path(&bucket.bucket, "configure-replication"));
     }
@@ -1870,6 +1885,14 @@ async fn broadcast_site_replication_json<T: Serialize>(path: &str, body: &T) -> 
     let Some(runtime) = runtime_site_replication_targets().await? else {
         return Ok(());
     };
+    broadcast_site_replication_json_with_runtime(&runtime, path, body).await
+}
+
+async fn broadcast_site_replication_json_with_runtime<T: Serialize>(
+    runtime: &SiteReplicationRuntime,
+    path: &str,
+    body: &T,
+) -> S3Result<()> {
     let state = &runtime.state;
     let local_peer = &runtime.local_peer;
 
@@ -2051,8 +2074,18 @@ pub async fn site_replication_delete_bucket_hook(bucket: &str, force_delete: boo
 }
 
 pub async fn site_replication_bucket_meta_hook(item: SRBucketMeta) -> S3Result<()> {
-    broadcast_site_replication_json("/rustfs/admin/v3/site-replication/peer/bucket-meta", &encode_bucket_meta_wire_item(item))
-        .await
+    let Some(runtime) = runtime_site_replication_targets().await? else {
+        return Ok(());
+    };
+    if item.r#type == "lc-config" && !site_replication_state_replicates_ilm_expiry(&runtime.state) {
+        return Ok(());
+    }
+    broadcast_site_replication_json_with_runtime(
+        &runtime,
+        "/rustfs/admin/v3/site-replication/peer/bucket-meta",
+        &encode_bucket_meta_wire_item(item),
+    )
+    .await
 }
 
 pub async fn site_replication_iam_change_hook(item: SRIAMItem) -> S3Result<()> {
@@ -5839,6 +5872,13 @@ mod tests {
     #[test]
     fn test_site_replication_bootstrap_plan_includes_replayable_snapshot_items() {
         let mut info = SRInfo::default();
+        info.state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
         info.policies.insert(
             "readwrite".to_string(),
             SRIAMPolicy {
@@ -5923,6 +5963,38 @@ mod tests {
             .and_then(|item| item.quota.as_ref())
             .expect("quota item should exist");
         assert_eq!(quota["quota"], 1024);
+    }
+
+    #[test]
+    fn test_site_replication_bootstrap_plan_skips_lifecycle_by_default() {
+        let mut info = SRInfo::default();
+        info.buckets.insert(
+            "photos".to_string(),
+            SRBucketInfo {
+                bucket: "photos".to_string(),
+                expiry_lc_config: Some(BASE64_STANDARD.encode("<LifecycleConfiguration/>")),
+                api_version: Some(SITE_REPL_API_VERSION.to_string()),
+                ..Default::default()
+            },
+        );
+
+        let plan = site_replication_bootstrap_plan(&info).expect("bootstrap plan should build");
+
+        assert!(!plan.bucket_items.iter().any(|item| item.r#type == "lc-config"));
+    }
+
+    #[test]
+    fn test_site_replication_state_replicates_ilm_expiry_detects_enabled_peer() {
+        let mut state = SiteReplicationState::default();
+        state.peers.insert(
+            "remote".to_string(),
+            PeerInfo {
+                replicate_ilm_expiry: true,
+                ..peer("remote", "https://remote.example.com")
+            },
+        );
+
+        assert!(site_replication_state_replicates_ilm_expiry(&state));
     }
 
     #[test]

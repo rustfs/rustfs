@@ -286,15 +286,15 @@ git commit -m "feat: bootstrap site replication metadata on add"
 - Modify: `rustfs/src/admin/handlers/site_replication.rs`
 - Modify: `docs/architecture/site-replication-hardening-pr.md`
 
-- [ ] **Step 1: Stop default full lifecycle replication**
+- [x] **Step 1: Stop default full lifecycle replication**
 
 Only replicate lifecycle expiry metadata when `replicate_ilm_expiry` is enabled for site replication peers.
 
-- [ ] **Step 2: Add focused tests**
+- [x] **Step 2: Add focused tests**
 
 Assert lifecycle metadata is skipped by default and included only for expiry-enabled peers.
 
-- [ ] **Step 3: Commit**
+- [x] **Step 3: Commit**
 
 ```bash
 git add rustfs/src/app/bucket_usecase.rs rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
