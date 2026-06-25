@@ -152,6 +152,7 @@ ECSTORE_COMPAT_PASSTHROUGH_ACTUAL_FILE="${TMP_DIR}/ecstore_compat_passthrough_ac
 ECSTORE_COMPAT_PASSTHROUGH_DIFF_FILE="${TMP_DIR}/ecstore_compat_passthrough_diff.txt"
 RUSTFS_WORKLOAD_DIRECT_FOREGROUND_MAPPING_HITS_FILE="${TMP_DIR}/rustfs_workload_direct_foreground_mapping_hits.txt"
 IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/iam_runtime_source_bypass_hits.txt"
+RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_runtime_source_bypass_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -1304,6 +1305,19 @@ fi
 
 if [[ -s "$IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "IAM runtime-source globals must stay behind crates/iam/src/runtime_sources.rs: $(paste -sd '; ' "$IAM_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'get_global_(?:kms_service_manager|encryption_service|iam_sys|action_cred|server_config|notification_sys|bucket_metadata_sys|bucket_monitor|replication_pool|replication_stats|boot_time|endpoints_opt|deployment_id|lock_client|lock_clients|region|tier_config_mgr|expiry_state|local_node_name|buffer_config|db)|init_global_kms_service_manager|set_global_(?:server_config|storage_class|outbound_tls_generation)|load_global_outbound_tls_(?:generation|state)|global_(?:rustfs_port|internode_metrics)|get_daily_all_tier_stats|collect_scanner_metrics_report|new_object_layer_fn|notifier_global::' \
+    rustfs/src/app/context.rs \
+    rustfs/src/app/context \
+    --glob '*.rs' |
+    rg -v '^rustfs/src/app/context/runtime_sources\.rs:' || true
+) >"$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS AppContext fallback runtime globals must stay behind rustfs/src/app/context/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_CONTEXT_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
 fi
 
 (

@@ -15,13 +15,7 @@
 use super::super::EndpointServerPools;
 use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
-use super::super::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys};
-use super::super::{
-    collect_scanner_metrics_report, get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor,
-    get_global_deployment_id, get_global_endpoints_opt, get_global_expiry_state, get_global_lock_client, get_global_lock_clients,
-    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
-    get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
-};
+use super::super::metadata_sys::BucketMetadataSys;
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
@@ -30,26 +24,19 @@ use super::interfaces::{
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
     ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
-use crate::config::{RustFSBufferConfig, get_global_buffer_config};
+use super::runtime_sources;
+use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
-use rustfs_common::get_global_local_node_name;
 use rustfs_config::server_config::Config;
-use rustfs_config::server_config::{get_global_server_config, set_global_server_config};
-use rustfs_credentials::{Credentials, get_global_action_cred};
-use rustfs_iam::{get_oidc, oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
-use rustfs_io_metrics::{
-    PerformanceMetrics,
-    global_metrics::get_global_metrics,
-    internode_metrics::{InternodeMetrics, global_internode_metrics},
-};
-use rustfs_kms::{KmsServiceManager, get_global_kms_service_manager};
+use rustfs_credentials::Credentials;
+use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
+use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
+use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
-use rustfs_notify::{EventArgs, NotificationError, notifier_global};
+use rustfs_notify::{EventArgs, NotificationError};
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
-use rustfs_tls_runtime::{
-    GlobalPublishedOutboundTlsState, TlsGeneration, load_global_outbound_tls_generation, load_global_outbound_tls_state,
-};
+use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use s3s::dto::SelectObjectContentInput;
 use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
@@ -72,15 +59,15 @@ impl IamInterface for IamHandle {
     }
 
     fn is_ready(&self) -> bool {
-        rustfs_iam::get().is_ok()
+        runtime_sources::ready_iam_handle().is_ok()
     }
 
     fn oidc(&self) -> Option<Arc<OidcSys>> {
-        rustfs_iam::get_oidc()
+        runtime_sources::oidc_handle()
     }
 
     fn token_signing_key(&self) -> Option<String> {
-        rustfs_iam::manager::get_token_signing_key()
+        runtime_sources::token_signing_key()
     }
 }
 
@@ -90,7 +77,7 @@ pub struct OidcHandle;
 
 impl OidcInterface for OidcHandle {
     fn handle(&self) -> Option<Arc<OidcSys>> {
-        get_oidc()
+        runtime_sources::oidc_handle()
     }
 }
 
@@ -118,7 +105,7 @@ pub struct KmsRuntimeHandle;
 
 impl KmsRuntimeInterface for KmsRuntimeHandle {
     fn service_manager(&self) -> Option<Arc<KmsServiceManager>> {
-        get_global_kms_service_manager()
+        runtime_sources::kms_service_manager()
     }
 }
 
@@ -129,11 +116,11 @@ pub struct OutboundTlsRuntimeHandle;
 #[async_trait]
 impl OutboundTlsRuntimeInterface for OutboundTlsRuntimeHandle {
     fn generation(&self) -> TlsGeneration {
-        load_global_outbound_tls_generation()
+        runtime_sources::outbound_tls_generation()
     }
 
     async fn state(&self) -> GlobalPublishedOutboundTlsState {
-        load_global_outbound_tls_state().await
+        runtime_sources::outbound_tls_state().await
     }
 }
 
@@ -144,7 +131,7 @@ pub struct NotifyHandle;
 #[async_trait]
 impl NotifyInterface for NotifyHandle {
     async fn notify(&self, args: EventArgs) {
-        notifier_global::notify(args).await;
+        runtime_sources::notify(args).await;
     }
 
     async fn add_event_specific_rules(
@@ -153,11 +140,11 @@ impl NotifyInterface for NotifyHandle {
         region: &str,
         event_rules: &[(Vec<EventName>, String, String, Vec<TargetID>)],
     ) -> Result<(), NotificationError> {
-        notifier_global::add_event_specific_rules(bucket_name, region, event_rules).await
+        runtime_sources::add_event_specific_rules(bucket_name, region, event_rules).await
     }
 
     async fn clear_bucket_notification_rules(&self, bucket_name: &str) -> Result<(), NotificationError> {
-        notifier_global::clear_bucket_notification_rules(bucket_name).await
+        runtime_sources::clear_bucket_notification_rules(bucket_name).await
     }
 }
 
@@ -167,7 +154,7 @@ pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
     fn handle(&self) -> Option<&'static super::super::NotificationSys> {
-        get_global_notification_sys()
+        runtime_sources::notification_system()
     }
 }
 
@@ -177,7 +164,7 @@ pub struct BucketMetadataHandle;
 
 impl BucketMetadataInterface for BucketMetadataHandle {
     fn handle(&self) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-        get_global_bucket_metadata_sys()
+        runtime_sources::bucket_metadata()
     }
 }
 
@@ -187,7 +174,7 @@ pub struct BucketMonitorHandle;
 
 impl BucketMonitorInterface for BucketMonitorHandle {
     fn handle(&self) -> Option<Arc<super::super::BucketBandwidthMonitor>> {
-        get_global_bucket_monitor()
+        runtime_sources::bucket_monitor()
     }
 }
 
@@ -197,7 +184,7 @@ pub struct ReplicationPoolHandle;
 
 impl ReplicationPoolInterface for ReplicationPoolHandle {
     fn handle(&self) -> Option<Arc<super::super::DynReplicationPool>> {
-        get_global_replication_pool()
+        runtime_sources::replication_pool()
     }
 }
 
@@ -207,7 +194,7 @@ pub struct ReplicationStatsHandle;
 
 impl ReplicationStatsInterface for ReplicationStatsHandle {
     fn handle(&self) -> Option<Arc<super::super::ReplicationStats>> {
-        get_global_replication_stats()
+        runtime_sources::replication_stats()
     }
 }
 
@@ -217,7 +204,7 @@ pub struct BootTimeHandle;
 
 impl BootTimeInterface for BootTimeHandle {
     fn get(&self) -> Option<SystemTime> {
-        get_global_boot_time()
+        runtime_sources::boot_time()
     }
 }
 
@@ -227,7 +214,7 @@ pub struct TierStatsHandle;
 
 impl TierStatsInterface for TierStatsHandle {
     fn daily_all(&self) -> super::super::DailyAllTierStats {
-        get_daily_all_tier_stats()
+        runtime_sources::daily_tier_stats()
     }
 }
 
@@ -238,7 +225,7 @@ pub struct ScannerMetricsHandle;
 #[async_trait]
 impl ScannerMetricsInterface for ScannerMetricsHandle {
     async fn report(&self) -> super::super::ScannerMetricsReport {
-        collect_scanner_metrics_report().await
+        runtime_sources::scanner_metrics_report().await
     }
 }
 
@@ -248,7 +235,7 @@ pub struct EndpointsHandle;
 
 impl EndpointsInterface for EndpointsHandle {
     fn handle(&self) -> Option<EndpointServerPools> {
-        get_global_endpoints_opt()
+        runtime_sources::endpoints()
     }
 }
 
@@ -258,7 +245,7 @@ pub struct DeploymentIdHandle;
 
 impl DeploymentIdInterface for DeploymentIdHandle {
     fn get(&self) -> Option<String> {
-        get_global_deployment_id()
+        runtime_sources::deployment_id()
     }
 }
 
@@ -268,7 +255,7 @@ pub struct RuntimePortHandle;
 
 impl RuntimePortInterface for RuntimePortHandle {
     fn get(&self) -> u16 {
-        global_rustfs_port()
+        runtime_sources::runtime_port()
     }
 }
 
@@ -278,7 +265,7 @@ pub struct LockClientHandle;
 
 impl LockClientInterface for LockClientHandle {
     fn handle(&self) -> Option<Arc<dyn LockClient>> {
-        get_global_lock_client()
+        runtime_sources::lock_client()
     }
 }
 
@@ -288,7 +275,7 @@ pub struct LockClientsHandle;
 
 impl LockClientsInterface for LockClientsHandle {
     fn handle(&self) -> Option<HashMap<String, Arc<dyn LockClient>>> {
-        get_global_lock_clients().cloned()
+        runtime_sources::lock_clients()
     }
 }
 
@@ -298,7 +285,7 @@ pub struct PerformanceMetricsHandle;
 
 impl PerformanceMetricsInterface for PerformanceMetricsHandle {
     fn handle(&self) -> Arc<PerformanceMetrics> {
-        get_global_metrics()
+        runtime_sources::performance_metrics()
     }
 }
 
@@ -308,7 +295,7 @@ pub struct InternodeMetricsHandle;
 
 impl InternodeMetricsInterface for InternodeMetricsHandle {
     fn handle(&self) -> Arc<InternodeMetrics> {
-        global_internode_metrics().clone()
+        runtime_sources::internode_metrics()
     }
 }
 
@@ -323,7 +310,7 @@ impl S3SelectDbInterface for S3SelectDbHandle {
         input: SelectObjectContentInput,
         enable_debug: bool,
     ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
-        rustfs_s3select_query::get_global_db(input, enable_debug).await
+        runtime_sources::s3select_db(input, enable_debug).await
     }
 }
 
@@ -334,7 +321,7 @@ pub struct LocalNodeNameHandle;
 #[async_trait]
 impl LocalNodeNameInterface for LocalNodeNameHandle {
     async fn get(&self) -> String {
-        get_global_local_node_name().await
+        runtime_sources::local_node_name().await
     }
 }
 
@@ -344,7 +331,7 @@ pub struct ActionCredentialHandle;
 
 impl ActionCredentialInterface for ActionCredentialHandle {
     fn get(&self) -> Option<Credentials> {
-        get_global_action_cred()
+        runtime_sources::action_credentials()
     }
 }
 
@@ -354,7 +341,7 @@ pub struct RegionHandle;
 
 impl RegionInterface for RegionHandle {
     fn get(&self) -> Option<s3s::region::Region> {
-        get_global_region()
+        runtime_sources::region()
     }
 }
 
@@ -364,7 +351,7 @@ pub struct TierConfigHandle;
 
 impl TierConfigInterface for TierConfigHandle {
     fn handle(&self) -> Arc<RwLock<TierConfigMgr>> {
-        get_global_tier_config_mgr()
+        runtime_sources::tier_config()
     }
 }
 
@@ -374,7 +361,7 @@ pub struct ExpiryStateHandle;
 
 impl ExpiryStateInterface for ExpiryStateHandle {
     fn handle(&self) -> Arc<RwLock<super::super::ExpiryState>> {
-        get_global_expiry_state()
+        runtime_sources::expiry_state()
     }
 }
 
@@ -384,11 +371,11 @@ pub struct ServerConfigHandle;
 
 impl ServerConfigInterface for ServerConfigHandle {
     fn get(&self) -> Option<Config> {
-        get_global_server_config()
+        runtime_sources::server_config()
     }
 
     fn set(&self, config: Config) {
-        set_global_server_config(config);
+        runtime_sources::set_server_config(config);
     }
 }
 
@@ -398,7 +385,7 @@ pub struct StorageClassHandle;
 
 impl StorageClassInterface for StorageClassHandle {
     fn set(&self, config: StorageClassConfig) {
-        set_global_storage_class(config);
+        runtime_sources::set_storage_class(config);
     }
 }
 
@@ -408,7 +395,7 @@ pub struct BufferConfigHandle;
 
 impl BufferConfigInterface for BufferConfigHandle {
     fn get(&self) -> RustFSBufferConfig {
-        get_global_buffer_config().clone()
+        runtime_sources::buffer_config()
     }
 }
 
