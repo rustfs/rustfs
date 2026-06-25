@@ -1255,7 +1255,13 @@ impl SetDisks {
             );
         }
 
-        let source = erasure_coding::decode::ParallelReader::new(readers, erasure.clone(), 0, part_size);
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+            readers,
+            erasure.clone(),
+            0,
+            part_size,
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
         let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
         let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
         Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))

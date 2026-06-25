@@ -28,6 +28,8 @@ pub(crate) const GET_STAGE_RANGE: &str = "range";
 pub(crate) const GET_STAGE_READER_SETUP: &str = "reader_setup";
 pub(crate) const GET_STAGE_RECONSTRUCT: &str = "reconstruct";
 pub(crate) const GET_STAGE_STRIPE_READ: &str = "stripe_read";
+pub(crate) const GET_STAGE_STRIPE_READ_FIRST_SHARD: &str = "stripe_read_first_shard";
+pub(crate) const GET_STAGE_STRIPE_READ_QUORUM: &str = "stripe_read_quorum";
 
 pub(crate) const GET_READER_BUFFER_OUTPUT: &str = "output";
 pub(crate) const GET_READER_BUFFER_PREFETCH: &str = "prefetch";
@@ -36,6 +38,11 @@ pub(crate) const GET_READER_PREFETCH_EOF: &str = "eof";
 pub(crate) const GET_READER_PREFETCH_ERROR_DEFERRED: &str = "error_deferred";
 pub(crate) const GET_READER_PREFETCH_ERROR_IMMEDIATE: &str = "error_immediate";
 pub(crate) const GET_READER_PREFETCH_STORED: &str = "stored";
+pub(crate) const GET_SHARD_READ_OUTCOME_ERROR: &str = "error";
+pub(crate) const GET_SHARD_READ_OUTCOME_MISSING: &str = "missing";
+pub(crate) const GET_SHARD_READ_OUTCOME_SUCCESS: &str = "success";
+pub(crate) const GET_SHARD_ROLE_DATA: &str = "data";
+pub(crate) const GET_SHARD_ROLE_PARITY: &str = "parity";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GetObjectFailureReason {
@@ -174,5 +181,12 @@ mod tests {
         assert_eq!(GET_READER_PREFETCH_EOF, "eof");
         assert_eq!(GET_READER_PREFETCH_ERROR_DEFERRED, "error_deferred");
         assert_eq!(GET_READER_PREFETCH_ERROR_IMMEDIATE, "error_immediate");
+        assert_eq!(GET_STAGE_STRIPE_READ_FIRST_SHARD, "stripe_read_first_shard");
+        assert_eq!(GET_STAGE_STRIPE_READ_QUORUM, "stripe_read_quorum");
+        assert_eq!(GET_SHARD_READ_OUTCOME_ERROR, "error");
+        assert_eq!(GET_SHARD_READ_OUTCOME_MISSING, "missing");
+        assert_eq!(GET_SHARD_READ_OUTCOME_SUCCESS, "success");
+        assert_eq!(GET_SHARD_ROLE_DATA, "data");
+        assert_eq!(GET_SHARD_ROLE_PARITY, "parity");
     }
 }

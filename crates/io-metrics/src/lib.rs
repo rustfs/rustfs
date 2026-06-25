@@ -345,6 +345,43 @@ pub fn record_get_object_reader_prefetch_wait(path: &'static str, duration_secs:
     histogram!("rustfs_io_get_object_reader_prefetch_wait_seconds", "path" => path).record(duration_secs);
 }
 
+/// Record one underlying shard read attempt for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read(
+    path: &'static str,
+    role: &'static str,
+    outcome: &'static str,
+    bytes: usize,
+    duration_secs: f64,
+) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_shard_read_total", "path" => path, "role" => role, "outcome" => outcome).increment(1);
+    counter!("rustfs_io_get_object_shard_read_bytes_total", "path" => path, "role" => role, "outcome" => outcome)
+        .increment(bytes);
+    histogram!("rustfs_io_get_object_shard_read_duration_seconds", "path" => path, "role" => role, "outcome" => outcome)
+        .record(duration_secs);
+}
+
+#[inline(always)]
+fn shard_read_fanout_to_f64(value: usize) -> f64 {
+    u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+/// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read_fanout(
+    path: &'static str,
+    scheduled: usize,
+    completed: usize,
+    successful: usize,
+    failed: usize,
+) {
+    histogram!("rustfs_io_get_object_shard_read_scheduled", "path" => path).record(shard_read_fanout_to_f64(scheduled));
+    histogram!("rustfs_io_get_object_shard_read_completed", "path" => path).record(shard_read_fanout_to_f64(completed));
+    histogram!("rustfs_io_get_object_shard_read_successful", "path" => path).record(shard_read_fanout_to_f64(successful));
+    histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
+}
+
 /// Record GetObject metadata resolution duration.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
