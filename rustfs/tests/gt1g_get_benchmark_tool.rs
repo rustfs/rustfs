@@ -57,6 +57,9 @@ struct ToolSettings {
     force: bool,
 }
 
+type BenchGroupKey = (String, String, String, usize, usize);
+type BenchGroupValue = (bool, u64, f64, f64, f64);
+
 fn parse_action() -> Result<ToolAction> {
     match env::var("GT1G_GET_ACTION")
         .unwrap_or_else(|_| "bench".to_string())
@@ -447,7 +450,7 @@ async fn run_bench(settings: &ToolSettings, client: &Client) -> Result<()> {
     }
 
     use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<(String, String, String, usize, usize), Vec<(bool, u64, f64, f64, f64)>> = BTreeMap::new();
+    let mut grouped: BTreeMap<BenchGroupKey, Vec<BenchGroupValue>> = BTreeMap::new();
     for (label, key, mode, range_workers, concurrency, status, total_bytes, elapsed_ms, throughput_bps, avg_latency_ms) in rows {
         grouped
             .entry((label, key, mode, range_workers, concurrency))
