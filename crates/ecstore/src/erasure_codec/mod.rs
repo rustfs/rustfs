@@ -13,3 +13,4 @@
 // limitations under the License.
 
 pub(crate) mod bridge;
+pub(crate) mod workspace;

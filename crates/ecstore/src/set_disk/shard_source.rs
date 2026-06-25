@@ -42,6 +42,10 @@ impl ShardSlot {
         self.data.is_some()
     }
 
+    pub(crate) fn data_bytes(&self) -> Option<&[u8]> {
+        self.data.as_deref()
+    }
+
     pub(crate) fn error(&self) -> Option<&Error> {
         self.error.as_ref()
     }
@@ -79,6 +83,19 @@ impl StripeReadState {
 
     pub(crate) fn slots(&self) -> &[ShardSlot] {
         &self.slots
+    }
+
+    pub(crate) fn slot_by_index(&self, index: usize) -> Option<&ShardSlot> {
+        if let Some(slot) = self.slots.get(index)
+            && slot.index == index
+        {
+            return Some(slot);
+        }
+        self.slots.iter().find(|slot| slot.index == index)
+    }
+
+    pub(crate) fn data_shards_complete(&self, data_shards: usize) -> bool {
+        (0..data_shards).all(|index| self.slot_by_index(index).is_some_and(ShardSlot::has_data))
     }
 
     pub(crate) fn into_parts(self) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>) {
@@ -138,5 +155,29 @@ mod tests {
         assert!(state.can_decode());
         assert_eq!(state.slots()[1].index(), 1);
         assert_eq!(state.slots()[1].error(), Some(&Error::FileNotFound));
+    }
+
+    #[test]
+    fn stripe_read_state_reports_complete_data_shards_without_parity() {
+        let state = StripeReadState::from_parts(vec![Some(vec![1]), Some(vec![2]), None], Vec::new(), 2);
+
+        assert!(state.data_shards_complete(2));
+        assert_eq!(state.slots()[0].data_bytes(), Some(&[1][..]));
+        assert_eq!(state.slot_by_index(1).and_then(ShardSlot::data_bytes), Some(&[2][..]));
+    }
+
+    #[test]
+    fn stripe_read_state_rejects_missing_data_shard_for_complete_fast_path() {
+        let state = StripeReadState::from_parts(vec![Some(vec![1]), None, Some(vec![3])], Vec::new(), 2);
+
+        assert!(!state.data_shards_complete(2));
+    }
+
+    #[test]
+    fn stripe_read_state_finds_out_of_order_slots_by_index() {
+        let state = StripeReadState::new(vec![ShardSlot::data(2, vec![3]), ShardSlot::data(0, vec![1])], 2);
+
+        assert_eq!(state.slot_by_index(0).and_then(ShardSlot::data_bytes), Some(&[1][..]));
+        assert!(state.slot_by_index(1).is_none());
     }
 }

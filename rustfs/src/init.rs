@@ -12,12 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_notify_interface, resolve_region};
+use crate::runtime_sources::{resolve_notify_interface, resolve_region};
 use crate::server::ShutdownHandle;
 use crate::storage::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
-use crate::{admin, config, version};
+use crate::{admin, config, startup_runtime_sources, version};
 use rustfs_config::{
     DEFAULT_BUFFER_MAX_SIZE, DEFAULT_BUFFER_MIN_SIZE, DEFAULT_BUFFER_PROFILE, DEFAULT_BUFFER_UNKNOWN_SIZE, DEFAULT_UPDATE_CHECK,
     ENV_RUSTFS_BUFFER_DEFAULT_SIZE, ENV_RUSTFS_BUFFER_MAX_SIZE, ENV_RUSTFS_BUFFER_MIN_SIZE, ENV_UPDATE_CHECK, RUSTFS_REGION,
@@ -403,7 +403,7 @@ async fn configure_and_start_kms(
 #[instrument(skip(config))]
 pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
     // Initialize global KMS service manager (starts in NotConfigured state)
-    let service_manager = rustfs_kms::init_global_kms_service_manager();
+    let service_manager = startup_runtime_sources::init_kms_service_manager();
 
     // If KMS is enabled in configuration, configure and start the service
     if config.kms_enable {
@@ -491,7 +491,7 @@ pub async fn init_kms_system(config: &config::Config) -> std::io::Result<()> {
 /// # Arguments
 /// * `config` - The application configuration options
 pub fn init_buffer_profile_system(config: &config::Config) {
-    use crate::config::{WorkloadProfile, init_global_buffer_config, set_buffer_profile_enabled};
+    use crate::config::WorkloadProfile;
 
     // Whether buffer profiling is disabled or not, it is enabled by default, unless the user explicitly sets '--buffer-profile-disable' or 'RUSTFS_BUFFER_PROFILE_DISABLE=true'
     if config.buffer_profile_disable {
@@ -506,7 +506,7 @@ pub fn init_buffer_profile_system(config: &config::Config) {
             reason = "flag_override",
             "Buffer profile state changed"
         );
-        set_buffer_profile_enabled(false);
+        startup_runtime_sources::set_buffer_profile_enabled(false);
     } else {
         // Enabled by default: use configured workload profile
         info!(
@@ -574,7 +574,7 @@ pub fn init_buffer_profile_system(config: &config::Config) {
                 fallback_profile = DEFAULT_BUFFER_PROFILE,
                 "Buffer profile initialization disabled after validation failures"
             );
-            set_buffer_profile_enabled(false);
+            startup_runtime_sources::set_buffer_profile_enabled(false);
             return;
         };
 
@@ -590,10 +590,10 @@ pub fn init_buffer_profile_system(config: &config::Config) {
         );
 
         // Initialize the global buffer configuration
-        init_global_buffer_config(buffer_config);
+        startup_runtime_sources::init_buffer_config(buffer_config);
 
         // Enable buffer profiling globally
-        set_buffer_profile_enabled(true);
+        startup_runtime_sources::set_buffer_profile_enabled(true);
 
         info!(
             target: "rustfs::init",

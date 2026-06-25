@@ -14,11 +14,12 @@
 
 use super::*;
 use crate::get_diagnostics::{
-    GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error,
-    record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
+    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
 };
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::future::Future;
+use tokio::io::AsyncRead;
 use tokio::task::JoinSet;
 
 async fn collect_read_multiple_results<F>(
@@ -103,7 +104,7 @@ where
 
 impl SetDisks {
     async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !is_dist_erasure().await
+        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
     }
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
@@ -360,7 +361,7 @@ impl SetDisks {
         let version_id = version_id.to_string();
         let opts = opts.clone();
 
-        let processor = get_global_processors().read_processor();
+        let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
             .iter()
             .take(required_reads + 2) // Read a few extra for reliability
@@ -1137,6 +1138,134 @@ impl SetDisks {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn get_object_decode_reader_with_fileinfo(
+        bucket: &str,
+        object: &str,
+        fi: FileInfo,
+        files: Vec<FileInfo>,
+        disks: &[Option<DiskStore>],
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+    ) -> Result<Box<dyn AsyncRead + Unpin + Send + Sync>> {
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+        if fi.parts.len() != 1 {
+            return Err(Error::other("codec streaming reader only supports single-part plain objects"));
+        }
+
+        let erasure = erasure_coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        let part = &fi.parts[0];
+        let part_number = part.number;
+        let part_size = part.size;
+        let part_length = usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
+        if part_length > part_size {
+            return Err(Error::other("codec streaming reader part length exceeds part size"));
+        }
+
+        let checksum_info = fi.erasure.get_checksum_info(part_number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+        {
+            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
+        let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+        let till_offset = erasure.shard_file_offset(0, part_length, part_size);
+
+        let reader_setup_stage_start = Instant::now();
+        let mut readers = Vec::with_capacity(disks.len());
+        let mut errors = Vec::with_capacity(disks.len());
+        for (idx, disk_op) in disks.iter().enumerate() {
+            match create_bitrot_reader(
+                files[idx].data.as_deref(),
+                disk_op.as_ref(),
+                bucket,
+                &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                0,
+                till_offset,
+                erasure.shard_size(),
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_zero_copy,
+            )
+            .await
+            {
+                Ok(Some(reader)) => {
+                    readers.push(Some(reader));
+                    errors.push(None);
+                }
+                Ok(None) => {
+                    readers.push(None);
+                    errors.push(Some(DiskError::DiskNotFound));
+                }
+                Err(e) => {
+                    readers.push(None);
+                    errors.push(Some(e));
+                }
+            }
+        }
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_READER_SETUP,
+            reader_setup_stage_start.elapsed().as_secs_f64(),
+        );
+
+        let available_shards = errors.iter().filter(|err| err.is_none()).count();
+        if available_shards < erasure.data_shards {
+            if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                let reason = classify_disk_error(&read_err);
+                record_get_object_pipeline_failure_for_path(GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_READER_SETUP, reason);
+                return Err(to_object_err(read_err.into(), vec![bucket, object]));
+            }
+            record_get_object_pipeline_failure_for_path(
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                GET_STAGE_READER_SETUP,
+                GetObjectFailureReason::ReadQuorum,
+            );
+            return Err(Error::other(format!("not enough disks to read: {errors:?}")));
+        }
+
+        let total_shards = erasure.data_shards + erasure.parity_shards;
+        let missing_shards = total_shards.saturating_sub(available_shards);
+        if missing_shards > 0
+            && let Err(e) =
+                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
+                    bucket.to_string(),
+                    Some(object.to_string()),
+                    false,
+                    Some(HealChannelPriority::Normal),
+                    Some(pool_index),
+                    Some(set_index),
+                ))
+                .await
+        {
+            warn!(
+                bucket,
+                object,
+                part_number,
+                error = %e,
+                "Failed to enqueue heal request for missing shards"
+            );
+        }
+
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+            readers,
+            erasure.clone(),
+            0,
+            part_size,
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
+        let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
+        let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
+        Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))
+    }
 }
 
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
@@ -1379,6 +1508,145 @@ mod metadata_cache_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn codec_streaming_test_fileinfo(size: i64, part_count: usize) -> FileInfo {
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = size;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+
+        let size = usize::try_from(size).expect("test object size should fit usize");
+        let part_count = part_count.max(1);
+        let part_size = size.div_ceil(part_count);
+        for index in 0..part_count {
+            let remaining = size.saturating_sub(index * part_size);
+            let current_part_size = remaining.min(part_size);
+            fi.add_object_part(
+                index + 1,
+                format!("etag-{index}"),
+                current_part_size,
+                None,
+                i64::try_from(current_part_size).expect("test part size should fit i64"),
+                None,
+                None,
+            );
+        }
+
+        fi
+    }
+
+    fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {
+        ObjectInfo::from_file_info(fi, "bucket", "object", false)
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_is_conservative() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Use
+                );
+
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, false),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled)
+                );
+
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: 1,
+                });
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&range, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range)
+                );
+
+                let multipart_fi = codec_streaming_test_fileinfo(1024, 2);
+                let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &multipart_object_info, &multipart_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
+                );
+
+                let mut encrypted_fi = fi.clone();
+                encrypted_fi
+                    .metadata
+                    .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+                let encrypted = codec_streaming_test_object_info(&encrypted_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &encrypted, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
+                );
+
+                let mut compressed_fi = fi.clone();
+                insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
+                let compressed = codec_streaming_test_object_info(&compressed_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &compressed, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
+                );
+
+                let small_fi = codec_streaming_test_fileinfo(0, 1);
+                let small_object_info = codec_streaming_test_object_info(&small_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &small_object_info, &small_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                );
+
+                let mut remote_fi = fi;
+                remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+                let remote = codec_streaming_test_object_info(&remote_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &remote, &remote_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_fallback_metric_labels_are_stable() {
+        assert_eq!(GetCodecStreamingFallbackReason::Disabled.as_str(), "disabled");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::LockOptimizationDisabled.as_str(),
+            "lock_optimization_disabled"
+        );
+        assert_eq!(GetCodecStreamingFallbackReason::Range.as_str(), "range");
+        assert_eq!(GetCodecStreamingFallbackReason::BelowMinSize.as_str(), "below_min_size");
+        assert_eq!(GetCodecStreamingFallbackReason::Encrypted.as_str(), "encrypted");
+        assert_eq!(GetCodecStreamingFallbackReason::Compressed.as_str(), "compressed");
+        assert_eq!(GetCodecStreamingFallbackReason::Remote.as_str(), "remote");
+        assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
+        assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_defaults_to_disabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
+                );
+            },
+        );
+    }
 
     #[tokio::test]
     async fn collect_read_multiple_results_fails_early_when_quorum_is_impossible() {

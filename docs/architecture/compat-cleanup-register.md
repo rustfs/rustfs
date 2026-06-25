@@ -12,7 +12,9 @@ for later deletion.
 
 ## Open Items
 
-No compatibility code is currently registered.
+- `CTX-002`
+  - Why: admin OIDC and STS consumers now resolve through `resolve_oidc_handle()`, but that resolver still falls back to legacy global OIDC state while the AppContext-owned OIDC wiring is being completed.
+  - Remove after: OIDC ownership is initialized and consumed through AppContext end-to-end, and `resolve_oidc_handle()` no longer needs the legacy global fallback path.
 
 ## Review Checklist
 

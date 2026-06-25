@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_action_credentials, resolve_notify_interface};
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+use crate::storage::runtime_sources;
 use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
@@ -312,7 +312,7 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(cred) = resolve_action_credentials() {
+            if let Some(cred) = runtime_sources::action_credentials() {
                 final_builder = final_builder.access_key(&cred.access_key);
             }
 
@@ -383,7 +383,7 @@ impl Drop for OperationHelper {
             if !event_args.is_replication_request() {
                 let ctx = state.request_context.clone();
                 spawn_background_with_context(ctx, async move {
-                    resolve_notify_interface().notify(event_args).await;
+                    runtime_sources::notify_interface().notify(event_args).await;
                 });
             }
         }

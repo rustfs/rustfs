@@ -165,6 +165,10 @@ pub struct BucketTarget {
     pub replication_sync: bool,
     #[serde(default)]
     pub storage_class: String,
+    #[serde(rename = "skipTlsVerify", default)]
+    pub skip_tls_verify: bool,
+    #[serde(rename = "caCertPem", default)]
+    pub ca_cert_pem: String,
     #[serde(rename = "healthCheckDuration", with = "duration_seconds", default)]
     pub health_check_duration: Duration,
     #[serde(rename = "disableProxy", default)]
@@ -277,6 +281,8 @@ mod tests {
             "bandwidth_limit": 1000000,
             "replicationSync": true,
             "storage_class": "STANDARD",
+            "skipTlsVerify": true,
+            "caCertPem": "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n",
             "healthCheckDuration": 30,
             "disableProxy": false,
             "resetBeforeDate": null,
@@ -314,6 +320,8 @@ mod tests {
         assert_eq!(target.bandwidth_limit, 1000000);
         assert!(target.replication_sync);
         assert_eq!(target.storage_class, "STANDARD");
+        assert!(target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n");
         assert_eq!(target.health_check_duration, Duration::from_secs(30));
         assert!(!target.disable_proxy);
         assert_eq!(target.reset_id, "reset-123");
@@ -363,6 +371,8 @@ mod tests {
             bandwidth_limit: 500000,
             replication_sync: false,
             storage_class: "REDUCED_REDUNDANCY".to_string(),
+            skip_tls_verify: true,
+            ca_cert_pem: "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n".to_string(),
             health_check_duration: Duration::from_secs(60),
             disable_proxy: true,
             reset_before_date: Some(OffsetDateTime::now_utc()),
@@ -396,6 +406,8 @@ mod tests {
         assert_eq!(original.region, deserialized.region);
         assert_eq!(original.bandwidth_limit, deserialized.bandwidth_limit);
         assert_eq!(original.replication_sync, deserialized.replication_sync);
+        assert_eq!(original.skip_tls_verify, deserialized.skip_tls_verify);
+        assert_eq!(original.ca_cert_pem, deserialized.ca_cert_pem);
         assert_eq!(original.health_check_duration, deserialized.health_check_duration);
         assert_eq!(original.online, deserialized.online);
         assert_eq!(original.edge, deserialized.edge);
@@ -478,6 +490,8 @@ mod tests {
                     "bandwidth_limit": 0,
                     "replicationSync": false,
                     "storage_class": "",
+                    "skipTlsVerify": false,
+                    "caCertPem": "",
                     "healthCheckDuration": 0,
                     "disableProxy": false,
                     "resetBeforeDate": null,
@@ -526,6 +540,8 @@ mod tests {
             "api": "s3v4",
             "type": "replication",
             "replicationSync": false,
+            "skipTlsVerify": true,
+            "caCertPem": "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n",
             "healthCheckDuration": 60,
             "disableProxy": false,
             "resetBeforeDate": "0001-01-01T00:00:00Z",
@@ -556,6 +572,8 @@ mod tests {
         assert_eq!(target.api, "s3v4");
         assert_eq!(target.target_type, BucketTargetType::ReplicationService);
         assert!(!target.replication_sync);
+        assert!(target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n");
         assert_eq!(target.health_check_duration, Duration::from_secs(60));
         assert!(!target.disable_proxy);
         assert!(!target.online);
@@ -604,6 +622,8 @@ mod tests {
                     "region": "",
                     "replicationSync": false,
                     "storage_class": "",
+                    "skipTlsVerify": true,
+                    "caCertPem": "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n",
                     "healthCheckDuration": 60,
                     "disableProxy": false,
                     "resetBeforeDate": "0001-01-01T00:00:00Z",
@@ -637,6 +657,8 @@ mod tests {
         assert_eq!(target.endpoint, "localhost:8000");
         assert_eq!(target.target_bucket, "test");
         assert_eq!(target.bandwidth_limit, 107374182400);
+        assert!(target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n");
 
         println!("✅ User provided JSON successfully deserialized to BucketTargets");
     }
@@ -670,6 +692,8 @@ mod tests {
         assert_eq!(target.bandwidth_limit, 0); // i64 default is 0
         assert!(!target.replication_sync); // bool default is false
         assert_eq!(target.storage_class, ""); // String default is empty
+        assert!(!target.skip_tls_verify); // bool default is false
+        assert_eq!(target.ca_cert_pem, ""); // String default is empty
         assert_eq!(target.health_check_duration, Duration::from_secs(0)); // Duration default
         assert!(!target.disable_proxy); // bool default is false
         assert!(target.reset_before_date.is_none()); // Option default is None
@@ -709,6 +733,8 @@ mod tests {
         assert_eq!(target.bandwidth_limit, 0);
         assert!(!target.replication_sync);
         assert_eq!(target.storage_class, "");
+        assert!(!target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "");
         assert_eq!(target.health_check_duration, Duration::from_secs(0));
         assert!(!target.disable_proxy);
         assert!(target.reset_before_date.is_none());
@@ -746,6 +772,8 @@ mod tests {
             "api": "s3v4",
             "type": "replication",
             "replicationSync": false,
+            "skipTlsVerify": true,
+            "caCertPem": "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n",
             "healthCheckDuration": 60,
             "disableProxy": false,
             "resetBeforeDate": "0001-01-01T00:00:00Z",
@@ -774,6 +802,8 @@ mod tests {
         assert_eq!(target.api, "s3v4");
         assert_eq!(target.target_type, BucketTargetType::ReplicationService);
         assert!(!target.replication_sync);
+        assert!(target.skip_tls_verify);
+        assert_eq!(target.ca_cert_pem, "-----BEGIN CERTIFICATE-----\nMC4x\n-----END CERTIFICATE-----\n");
         assert_eq!(target.health_check_duration, Duration::from_secs(60));
         assert!(!target.disable_proxy);
         assert!(!target.online);

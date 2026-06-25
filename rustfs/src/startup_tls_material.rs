@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::resolve_outbound_tls_generation;
 use crate::config::Config;
+use crate::startup_runtime_sources;
 use std::io::{Error, Result};
 use tracing::{error, info};
 
@@ -27,11 +27,9 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
     if let Some(tls_path) = normalized_tls_path(config.tls_path.as_deref()) {
         match crate::server::tls_material::load_tls_material(tls_path).await {
             Ok(snapshot) => {
-                use rustfs_tls_runtime::{publish_global_outbound_tls_state, record_tls_generation};
-
-                let generation = next_tls_generation(resolve_outbound_tls_generation().0);
-                publish_global_outbound_tls_state(generation, &snapshot.outbound).await;
-                record_tls_generation(TLS_STARTUP_GENERATION_CONSUMER, generation.0);
+                let generation = next_tls_generation(startup_runtime_sources::current_outbound_tls_generation());
+                startup_runtime_sources::publish_outbound_tls_state(generation, &snapshot.outbound).await;
+                startup_runtime_sources::record_tls_generation(TLS_STARTUP_GENERATION_CONSUMER, generation.0);
                 info!(
                     target: "rustfs::main",
                     event = EVENT_TLS_OUTBOUND_INITIALIZED,
@@ -55,8 +53,8 @@ pub(crate) async fn init_outbound_tls_material(config: &Config) -> Result<()> {
                 return Err(Error::other(err.to_string()));
             }
         }
-        if rustfs_obs::observability_metric_enabled() {
-            rustfs_tls_runtime::init_tls_metrics();
+        if startup_runtime_sources::observability_metric_enabled() {
+            startup_runtime_sources::init_tls_metrics();
         }
     }
 
