@@ -333,3 +333,59 @@ supporting evidence 的关键点：
 4. 更合理的下一步应转向：
    - 先分析为什么 `v8` 和 `v9` 差异如此大
    - 再决定是否继续压测，或改为更细粒度观测
+
+## 21. `capture-backed v4` 与 build 后冷却 spot check
+
+在 `capture-backed v3` 之后，又补了一轮：
+
+1. 清掉 `target/debug` 编译缓存
+2. 重新 `cargo build -p rustfs --bins`
+3. 按同矩阵重跑 `capture-backed v4`
+
+结果目录：
+
+1. `target/bench/issue712-deeper-zero-copy-capture-v4-20260625T085009Z`
+
+结果：
+
+1. `64MiB`: `232.92 MiB/s`, `4252.0ms`
+2. `128MiB`: `317.89 MiB/s`, `6379.1ms`
+3. `256MiB`: `314.68 MiB/s`, `12918.0ms`
+
+与 `capture-backed v3` 对比：
+
+1. `64MiB`: `379.49 -> 232.92 MiB/s`
+2. `128MiB`: `364.71 -> 317.89 MiB/s`
+3. `256MiB`: `358.57 -> 314.68 MiB/s`
+
+但这轮 supporting evidence 仍然是干净的：
+
+1. `25/25` 个 `health` 快照正常
+2. `25/25` 个 `ready` 快照都返回 `ready=true`
+3. 末尾 snapshot 中 4 块盘的 `availability/io/timeout` error counter 都仍为 `0`
+4. `internode dial/errors` counter 仍为 `0`
+
+为了继续验证“是不是刚 build 完就压测导致”的假设，又补了一轮更小面的 spot check：
+
+1. build 完成后显式冷却约 `115s`
+2. 仅跑 `64MiB / c16 / 60s / 1 round`
+
+结果目录：
+
+1. `target/bench/issue712-deeper-zero-copy-postbuild-cooldown-v1-20260625T093544Z`
+
+结果：
+
+1. `64MiB`: `243.99 MiB/s`, `4301.8ms`
+
+## 22. 对波动原因的进一步收敛
+
+补完 `v4` 与 build 后冷却的单点复测之后，可以把判断进一步收紧为：
+
+1. `v4` 的低位结果不能只用“build 后没有冷却”来解释
+2. 即使补了 build 后冷却，`64MiB` 单点结果也没有回到 `v3` 的高位
+3. 这说明 `build-aftereffect` 可能是噪声来源之一，但不是唯一决定因素
+4. 当前更像是：
+   - `BytesMut` deeper-zero-copy 方向仍然存在较强运行面波动
+   - `64MiB+` 区间还没有收敛成稳定的端到端优势
+5. 因此这条线仍应继续保留为实验分支 / env-gated 能力，而不是默认行为变更
