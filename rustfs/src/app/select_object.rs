@@ -1,8 +1,8 @@
+use super::storage_api::options::get_opts;
+use super::storage_api::request_context::spawn_traced;
+use super::storage_api::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use crate::app::runtime_sources::resolve_s3select_db;
 use crate::error::ApiError;
-use crate::storage::options::get_opts;
-use crate::storage::request_context::spawn_traced;
-use crate::storage::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 use bytes::Bytes;
 use datafusion::arrow::{
     csv::{QuoteStyle, WriterBuilder as CsvWriterBuilder, writer::Terminator},
