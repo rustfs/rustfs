@@ -24,6 +24,7 @@ pub mod router;
 pub(crate) mod runtime_sources;
 pub mod service;
 pub mod site_replication_identity;
+pub(crate) mod storage_api;
 pub mod utils;
 
 #[cfg(test)]

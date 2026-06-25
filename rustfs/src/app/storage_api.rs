@@ -27,6 +27,10 @@ pub(crate) mod concurrency {
     };
 }
 
+pub(crate) mod compression {
+    pub(crate) use crate::storage::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+}
+
 pub(crate) mod deadlock_detector {
     #[cfg(test)]
     pub(crate) use crate::storage::deadlock_detector::RequestHangDetectionPolicy;
@@ -43,6 +47,12 @@ pub(crate) mod head_prefix {
 
 pub(crate) mod helper {
     pub(crate) use crate::storage::helper::{OperationHelper, spawn_background_with_context};
+}
+
+pub(crate) mod io {
+    #[cfg(test)]
+    pub(crate) use crate::storage::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader};
+    pub(crate) use crate::storage::{DynReader, HashReader, WriteEncryption, WritePlan, compression_metadata_value, wrap_reader};
 }
 
 pub(crate) mod options {
@@ -68,6 +78,10 @@ pub(crate) mod sse {
         extract_server_side_encryption_from_headers, get_buffer_size_opt_in, sse_decryption, sse_encryption,
         sse_prepare_encryption,
     };
+}
+
+pub(crate) mod set_disk {
+    pub(crate) use crate::storage::{get_lock_acquire_timeout, is_valid_storage_class};
 }
 
 pub(crate) mod timeout_wrapper {
