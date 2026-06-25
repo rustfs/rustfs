@@ -16,6 +16,14 @@
 
 use std::sync::Arc;
 
+pub(crate) use rustfs_storage_api::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, HTTPPreconditions, HTTPRangeSpec, ListMultipartsInfo,
+    ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ListPartsInfo, MakeBucketOptions, ObjectLockRetentionOptions,
+    ObjectOperations, StorageAdminApi,
+};
+#[cfg(test)]
+pub(crate) use rustfs_storage_api::{MultipartInfo, PartInfo};
+
 pub(crate) type StorageDeletedObject = rustfs_storage_api::DeletedObject;
 pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;

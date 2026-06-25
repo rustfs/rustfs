@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use super::super::{
-    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
-    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
-    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
-    load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+    BucketOptions, CollectMetricsOpts, DeleteBucketOptions, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error,
+    FileInfoVersions, LocalPeerS3Client, MakeBucketOptions, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageAdminApi,
+    StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
+    find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
+    resolve_object_store_handle, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
@@ -40,7 +41,6 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use serde::Deserialize;
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;

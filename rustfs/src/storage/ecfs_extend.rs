@@ -14,8 +14,8 @@
 
 use super::StorageReplicationConfigExt as _;
 use super::{
-    StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
-    resolve_object_store_handle,
+    BucketOperations, BucketOptions, StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config,
+    get_bucket_replication_config, resolve_object_store_handle,
 };
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
@@ -24,7 +24,6 @@ use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{

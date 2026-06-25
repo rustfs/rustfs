@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::BucketOperations;
 use super::ECStore;
 use super::ecfs::FS;
 use super::resolve_object_store_handle;
@@ -31,7 +32,6 @@ use rustfs_policy::policy::{
     Args, BucketPolicy, BucketPolicyArgs, bucket_policy_needs_existing_object_tag_for_args,
     bucket_policy_uses_existing_object_tag_conditions,
 };
-use rustfs_storage_api::BucketOperations;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::http::AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE;
 use s3s::access::{S3Access, S3AccessContext};
