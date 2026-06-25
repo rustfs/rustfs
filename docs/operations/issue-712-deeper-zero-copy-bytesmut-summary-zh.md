@@ -178,3 +178,47 @@ RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true
 2. 后续如果继续压测，优先关注 `64MiB` 与 `128MiB`
 3. `32MiB` 可以保留，但不再作为唯一核心判断点
 4. 当前不建议把这条线直接并回主线 PR
+
+## 12. 更大对象区间补充矩阵
+
+为了继续判断这条 deeper-zero-copy 线是否主要对更大对象区间成立，又补了一轮：
+
+1. `issue712-deeper-zero-copy-bytesmut-v8`
+
+固定条件：
+
+1. `64MiB / 128MiB / 256MiB`
+2. `c16`
+3. `duration=60s`
+4. `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true`
+
+结果：
+
+1. `64MiB`: `431.39 MiB/s`, `2472.9ms`
+2. `128MiB`: `437.21 MiB/s`, `4889.5ms`
+3. `256MiB`: `435.43 MiB/s`, `9755.9ms`
+
+## 13. 当前判断更新
+
+补完 `64/128/256MiB` 这一轮之后，可以把结论进一步更新为：
+
+1. 这条 `BytesMut ingest` deeper-zero-copy 线对更大对象区间的信号明显 stronger
+2. `64MiB` 已经比前一轮 `v6/v7` 更强
+3. `128MiB` 和 `256MiB` 两个点都保持了很高吞吐
+
+这说明：
+
+1. 这条实验线很可能不是“普适 plain PUT 优化”
+2. 更像是对更大对象区间更有效
+
+## 14. 当前最稳妥建议
+
+到这一步，最稳妥的推进顺序可以更新为：
+
+1. `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true` 继续保留为 env-gated 实验能力
+2. 后续验证重心优先放在：
+   - `64MiB`
+   - `128MiB`
+   - `256MiB`
+3. `16MiB` 和 `32MiB` 可以作为对照，但不再是核心判断区间
+4. 在还没有更多重复性复测前，这条线仍然不直接并回主线 PR
