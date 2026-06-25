@@ -63,13 +63,9 @@ mod ecstore_capacity {
     };
 }
 
-#[allow(unused_imports)]
+#[cfg(test)]
 mod ecstore_client {
-    pub(crate) use crate::storage::ecstore_client::{object_api_utils, transition_api};
-}
-
-mod ecstore_config {
-    pub(crate) use crate::storage::ecstore_config::storageclass;
+    pub(crate) use crate::storage::ecstore_client::transition_api;
 }
 
 mod ecstore_data_usage {
@@ -84,7 +80,6 @@ mod ecstore_tier {
     pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
 }
 
-pub(crate) type DiskError = crate::storage::DiskError;
 pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
@@ -97,8 +92,7 @@ pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations
 pub(crate) type PoolDecommissionInfo = ecstore_capacity::PoolDecommissionInfo;
 pub(crate) type PoolStatus = ecstore_capacity::PoolStatus;
 pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
-pub(crate) type StorageError = crate::storage::StorageError;
-pub(crate) type Error = StorageError;
+pub(crate) type Error = crate::storage::StorageError;
 pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
 
 #[cfg(test)]
@@ -394,12 +388,6 @@ pub(crate) mod metadata_sys {
     }
 }
 
-pub(crate) mod object_api_utils {
-    pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-        crate::storage::to_s3s_etag(etag)
-    }
-}
-
 pub(crate) mod object_lock {
     pub(crate) mod objectlock {
         pub(crate) fn get_object_legalhold_meta(
@@ -528,12 +516,6 @@ pub(crate) mod transition_api {
     pub(crate) type ReaderImpl = super::ecstore_client::transition_api::ReaderImpl;
 }
 
-pub(crate) mod storageclass {
-    pub(crate) const STANDARD: &str = super::ecstore_config::storageclass::STANDARD;
-    #[cfg(test)]
-    pub(crate) const STANDARD_IA: &str = super::ecstore_config::storageclass::STANDARD_IA;
-}
-
 pub(crate) type StorageClassConfig = crate::storage::ecstore_config::storageclass::Config;
 
 pub(crate) fn set_global_storage_class(cfg: StorageClassConfig) {
@@ -568,22 +550,6 @@ pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_cur
 
 pub(crate) async fn remove_bucket_usage_from_backend(store: Arc<ECStore>, bucket: &str) -> std::result::Result<(), Error> {
     ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
-}
-
-pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
-    crate::storage::is_all_buckets_not_found(errs)
-}
-
-pub(crate) fn is_err_bucket_not_found(err: &Error) -> bool {
-    crate::storage::is_err_bucket_not_found(err)
-}
-
-pub(crate) fn is_err_object_not_found(err: &Error) -> bool {
-    crate::storage::is_err_object_not_found(err)
-}
-
-pub(crate) fn is_err_version_not_found(err: &Error) -> bool {
-    crate::storage::is_err_version_not_found(err)
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {

@@ -41,12 +41,25 @@ pub(crate) mod ecfs {
     pub(crate) use crate::storage::ecfs::FS;
 }
 
+pub(crate) mod error {
+    pub(crate) use crate::storage::{
+        DiskError, StorageError, is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found,
+        is_err_version_not_found,
+    };
+
+    pub(crate) type Error = StorageError;
+}
+
 pub(crate) mod head_prefix {
     pub(crate) use crate::storage::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 }
 
 pub(crate) mod helper {
     pub(crate) use crate::storage::helper::{OperationHelper, spawn_background_with_context};
+}
+
+pub(crate) mod object_utils {
+    pub(crate) use crate::storage::to_s3s_etag;
 }
 
 pub(crate) mod io {
@@ -82,6 +95,12 @@ pub(crate) mod sse {
 
 pub(crate) mod set_disk {
     pub(crate) use crate::storage::{get_lock_acquire_timeout, is_valid_storage_class};
+}
+
+pub(crate) mod storage_class {
+    pub(crate) use crate::storage::ecstore_config::storageclass::STANDARD;
+    #[cfg(test)]
+    pub(crate) use crate::storage::ecstore_config::storageclass::STANDARD_IA;
 }
 
 pub(crate) mod timeout_wrapper {

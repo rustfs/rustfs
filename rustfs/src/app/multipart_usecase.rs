@@ -15,7 +15,6 @@
 //! Multipart application use-case contracts.
 
 use super::ECStore;
-use super::object_api_utils::to_s3s_etag;
 use super::quota::checker::QuotaChecker;
 use super::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
@@ -23,10 +22,12 @@ use super::s3_api::multipart::{
 };
 use super::storage_api::access::has_bypass_governance_header;
 use super::storage_api::compression::is_disk_compressible;
+use super::storage_api::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::helper::OperationHelper;
 #[cfg(test)]
 use super::storage_api::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use super::storage_api::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::object_utils::to_s3s_etag;
 use super::storage_api::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
@@ -39,7 +40,6 @@ use super::storage_api::sse::{
     mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
-use super::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,

@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::storage_api::ecfs::FS;
+use super::storage_api::object_utils::to_s3s_etag;
 use super::storage_api::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
@@ -20,7 +21,6 @@ use super::{
     AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, TierConfig, TierType, WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    object_api_utils::to_s3s_etag,
     transition_api::{ReadCloser, ReaderImpl},
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};

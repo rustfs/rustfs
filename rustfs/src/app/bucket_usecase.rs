@@ -15,8 +15,6 @@
 //! Bucket application use-case contracts.
 
 use super::ECStore;
-use super::StorageError;
-use super::object_api_utils::to_s3s_etag;
 use super::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
@@ -24,7 +22,9 @@ use super::s3_api::bucket::{
 };
 use super::storage_api::StorageObjectInfo as ObjectInfo;
 use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
+use super::storage_api::error::StorageError;
 use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_utils::to_s3s_etag;
 use super::storage_api::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
