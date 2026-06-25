@@ -25,13 +25,13 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
+    admin::runtime_sources::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     admin::{
         EndpointServerPools, PeerRestClient,
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
     app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
