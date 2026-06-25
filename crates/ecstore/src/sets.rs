@@ -16,6 +16,14 @@
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
+use crate::storage_api_contracts::CompletePart;
+use crate::storage_api_contracts::HTTPRangeSpec;
+use crate::storage_api_contracts::{
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo, ListPartsInfo,
+    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo, StorageListObjectVersionsInfo,
+    StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+};
+use crate::storage_api_contracts::{ObjectIO as _, ObjectOperations as _};
 use crate::{
     disk::{
         DiskAPI, DiskOption, DiskStore,
@@ -41,15 +49,6 @@ use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
-use rustfs_storage_api::CompletePart;
-use rustfs_storage_api::HTTPRangeSpec;
-use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListPartsInfo,
-    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectToDelete, PartInfo,
-    WalkOptions as StorageWalkOptions,
-};
-use rustfs_storage_api::{ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
 use tokio::sync::RwLock;
@@ -401,7 +400,7 @@ fn apply_delete_objects_results(
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectIO for Sets {
+impl crate::storage_api_contracts::ObjectIO for Sets {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -494,7 +493,7 @@ impl BucketOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectOperations for Sets {
+impl crate::storage_api_contracts::ObjectOperations for Sets {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -702,7 +701,7 @@ impl rustfs_storage_api::ObjectOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ListOperations for Sets {
+impl crate::storage_api_contracts::ListOperations for Sets {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -763,7 +762,7 @@ impl rustfs_storage_api::ListOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::MultipartOperations for Sets {
+impl crate::storage_api_contracts::MultipartOperations for Sets {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -877,7 +876,7 @@ impl rustfs_storage_api::MultipartOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::HealOperations for Sets {
+impl crate::storage_api_contracts::HealOperations for Sets {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -1017,7 +1016,7 @@ impl rustfs_storage_api::HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::NamespaceLocking for Sets {
+impl crate::storage_api_contracts::NamespaceLocking for Sets {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -1093,8 +1092,8 @@ async fn init_storage_disks_with_errors(
 mod tests {
     use super::*;
     use crate::layout::endpoint::Endpoint;
-    use rustfs_storage_api::HealOperations as _;
-    use rustfs_storage_api::ListOperations as _;
+    use crate::storage_api_contracts::HealOperations as _;
+    use crate::storage_api_contracts::ListOperations as _;
 
     #[test]
     fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {

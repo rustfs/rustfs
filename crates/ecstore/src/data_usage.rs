@@ -14,6 +14,7 @@
 
 pub mod local_snapshot;
 
+use crate::storage_api_contracts::{ListOperations as _, ObjectIO as _};
 use crate::{
     bucket::metadata_sys::get_replication_config,
     config::com::read_config,
@@ -27,7 +28,6 @@ use rustfs_data_usage::{
     BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
-use rustfs_storage_api::{ListOperations as _, ObjectIO as _};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
@@ -746,7 +746,11 @@ pub fn create_cache_entry_from_summary(summary: &SizeSummary) -> DataUsageEntry 
 }
 
 /// Convert data usage cache to DataUsageInfo
-pub fn cache_to_data_usage_info(cache: &DataUsageCache, path: &str, buckets: &[rustfs_storage_api::BucketInfo]) -> DataUsageInfo {
+pub fn cache_to_data_usage_info(
+    cache: &DataUsageCache,
+    path: &str,
+    buckets: &[crate::storage_api_contracts::BucketInfo],
+) -> DataUsageInfo {
     let e = match cache.find(path) {
         Some(e) => e,
         None => return DataUsageInfo::default(),

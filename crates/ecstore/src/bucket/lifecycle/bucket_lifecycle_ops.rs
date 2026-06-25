@@ -36,6 +36,10 @@ use crate::event_notification::{EventArgs, send_event};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::runtime_sources;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
+use crate::storage_api_contracts::{
+    DeletedObject, ExpirationOptions, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _,
+    ObjectToDelete,
+};
 use crate::store::ECStore;
 use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
@@ -57,10 +61,6 @@ use rustfs_filemeta::{
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
 use rustfs_s3_types::EventName;
-use rustfs_storage_api::{
-    DeletedObject, ExpirationOptions, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _,
-    ObjectToDelete,
-};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -387,7 +387,7 @@ pub trait ExpiryOp: 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub use rustfs_storage_api::TransitionedObject;
+pub use crate::storage_api_contracts::TransitionedObject;
 
 struct FreeVersionTask(ObjectInfo);
 
@@ -2891,13 +2891,13 @@ mod tests {
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
+    use crate::storage_api_contracts::ExpirationOptions;
+    use crate::storage_api_contracts::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use crate::store::ECStore;
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
-    use rustfs_storage_api::ExpirationOptions;
-    use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
     use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
     use serial_test::serial;
     use sha2::{Digest, Sha256};
@@ -4167,7 +4167,7 @@ mod tests {
                 &bucket,
                 object,
                 &upload.upload_id,
-                vec![rustfs_storage_api::CompletePart {
+                vec![crate::storage_api_contracts::CompletePart {
                     part_num: 1,
                     etag: second_part.etag.clone(),
                     checksum_crc32: None,

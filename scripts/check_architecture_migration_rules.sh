@@ -71,6 +71,7 @@ STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycl
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
+ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE="${TMP_DIR}/ecstore_direct_storage_api_source_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
 ECSTORE_API_FACADE_REQUIRED_HITS_FILE="${TMP_DIR}/ecstore_api_facade_required_hits.txt"
 ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
@@ -632,11 +633,11 @@ fi
 
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/core.rs" \
-  "pub use rustfs_storage_api::ExpirationOptions;" \
+  "pub use crate::storage_api_contracts::ExpirationOptions;" \
   "ECStore ExpirationOptions compatibility re-export"
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
-  "pub use rustfs_storage_api::TransitionedObject;" \
+  "pub use crate::storage_api_contracts::TransitionedObject;" \
   "ECStore TransitionedObject compatibility re-export"
 
 (
@@ -657,6 +658,18 @@ fi
 
 if [[ -s "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE" ]]; then
   report_failure "external list response consumers must use rustfs-storage-api contracts: $(paste -sd '; ' "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^use rustfs_storage_api|^pub use rustfs_storage_api|rustfs_storage_api::' \
+    crates/ecstore/src \
+    --glob '*.rs' \
+    --glob '!storage_api_contracts.rs' || true
+) >"$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE"
+
+if [[ -s "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE" ]]; then
+  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts.rs: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
 fi
 
 (

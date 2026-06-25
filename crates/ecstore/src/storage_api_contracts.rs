@@ -1,10 +1,16 @@
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{
-    DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectToDelete,
-    WalkOptions as StorageWalkOptions,
+pub use rustfs_storage_api::{
+    BucketInfo, BucketOperations, BucketOptions, CapabilityStatus, CompletePart, DeleteBucketOptions, DeletedObject,
+    DiskCapabilities, DiskSetSelector, ExpirationOptions, HTTPPreconditions, HTTPRangeError, HTTPRangeSpec, HealOperations,
+    ListMultipartsInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, ListPartsInfo, MakeBucketOptions, MultipartInfo,
+    MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
+    ObjectLockRetentionOptions, ObjectOperations, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
+    ObjectToDelete, PartInfo, StorageAdminApi, StorageErrorCode, TopologyCapabilities, TopologyDisk, TopologyLabels,
+    TopologyPool, TopologySet, TopologySnapshot, TransitionedObject, VersionMarker, WalkOptions as StorageWalkOptions,
+    WalkVersionsSortOrder,
 };
 use std::fmt::Debug;
 use tokio_util::sync::CancellationToken;
@@ -15,7 +21,7 @@ type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 
 pub(crate) trait EcstoreObjectIO:
-    rustfs_storage_api::ObjectIO<
+    ObjectIO<
         Error = Error,
         RangeSpec = HTTPRangeSpec,
         HeaderMap = http::HeaderMap,
@@ -31,7 +37,7 @@ pub(crate) trait EcstoreObjectIO:
 }
 
 impl<T> EcstoreObjectIO for T where
-    T: rustfs_storage_api::ObjectIO<
+    T: ObjectIO<
             Error = Error,
             RangeSpec = HTTPRangeSpec,
             HeaderMap = http::HeaderMap,
@@ -47,7 +53,7 @@ impl<T> EcstoreObjectIO for T where
 }
 
 pub(crate) trait EcstoreObjectOperations:
-    rustfs_storage_api::ObjectOperations<
+    ObjectOperations<
         Error = Error,
         ObjectInfo = ObjectInfo,
         ObjectOptions = ObjectOptions,
@@ -61,7 +67,7 @@ pub(crate) trait EcstoreObjectOperations:
 }
 
 impl<T> EcstoreObjectOperations for T where
-    T: rustfs_storage_api::ObjectOperations<
+    T: ObjectOperations<
             Error = Error,
             ObjectInfo = ObjectInfo,
             ObjectOptions = ObjectOptions,
@@ -75,7 +81,7 @@ impl<T> EcstoreObjectOperations for T where
 }
 
 pub(crate) trait EcstoreListOperations:
-    rustfs_storage_api::ListOperations<
+    ListOperations<
         Error = Error,
         ListObjectsV2Info = ListObjectsV2Info,
         ListObjectVersionsInfo = ListObjectVersionsInfo,
@@ -90,7 +96,7 @@ pub(crate) trait EcstoreListOperations:
 }
 
 impl<T> EcstoreListOperations for T where
-    T: rustfs_storage_api::ListOperations<
+    T: ListOperations<
             Error = Error,
             ListObjectsV2Info = ListObjectsV2Info,
             ListObjectVersionsInfo = ListObjectVersionsInfo,

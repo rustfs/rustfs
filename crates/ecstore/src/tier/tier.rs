@@ -38,6 +38,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
+use crate::storage_api_contracts::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete};
 use crate::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
@@ -54,7 +55,6 @@ use crate::{
 };
 use rustfs_filemeta::FileInfo;
 use rustfs_rio::HashReader;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join};
 use s3s::S3ErrorCode;
 
