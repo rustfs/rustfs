@@ -87,6 +87,7 @@ use md5::Context as Md5Context;
 use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
+use rustfs_config::MI_B;
 use rustfs_filemeta::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
     ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
@@ -267,6 +268,7 @@ struct GetObjectStrategyContext {
     #[allow(dead_code)]
     io_strategy: concurrency::IoStrategy,
     optimal_buffer_size: usize,
+    enable_readahead: bool,
 }
 
 struct GetObjectOutputContext {
@@ -281,6 +283,25 @@ enum GetObjectTimeoutStage {
     DiskPermitWait { permit_wait_duration: Duration },
     BeforeRead,
 }
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetObjectStreamStrategy {
+    Standard,
+    LargeSequentialReadahead,
+}
+
+impl GetObjectStreamStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::LargeSequentialReadahead => "large_sequential_readahead",
+        }
+    }
+}
+
+const LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES: i64 = 1024 * 1024 * 1024;
+const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
+const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 
 async fn enqueue_transitioned_delete_cleanup(
     store: Arc<ECStore>,
@@ -1530,15 +1551,42 @@ impl DefaultObjectUsecase {
         )))
     }
 
-    fn build_reader_blob<R>(reader: R, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob>
+    fn select_stream_buffer_strategy(
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        enable_readahead: bool,
+        has_range: bool,
+    ) -> (usize, GetObjectStreamStrategy) {
+        if enable_readahead && !has_range && response_content_length >= LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES {
+            let expanded_buffer_size = optimal_buffer_size
+                .saturating_mul(LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER)
+                .min(LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES)
+                .max(optimal_buffer_size);
+            return (expanded_buffer_size, GetObjectStreamStrategy::LargeSequentialReadahead);
+        }
+
+        (optimal_buffer_size, GetObjectStreamStrategy::Standard)
+    }
+
+    fn build_reader_blob<R>(
+        reader: R,
+        response_content_length: i64,
+        stream_buffer_size: usize,
+        stream_strategy: GetObjectStreamStrategy,
+    ) -> Option<StreamingBlob>
     where
         R: AsyncRead + Send + Sync + 'static,
     {
         let expected = response_content_length.max(0) as usize;
+        rustfs_io_metrics::record_get_object_stream_strategy(
+            stream_strategy.as_str(),
+            stream_buffer_size,
+            response_content_length,
+        );
         #[cfg(feature = "tracing-chunk-debug")]
         let stream = {
             let mut emitted = 0usize;
-            ReaderStream::with_capacity(reader, optimal_buffer_size).inspect(move |item| match item {
+            ReaderStream::with_capacity(reader, stream_buffer_size).inspect(move |item| match item {
                 Ok(bytes) => {
                     emitted += bytes.len();
                     tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
@@ -1554,7 +1602,7 @@ impl DefaultObjectUsecase {
             })
         };
         #[cfg(not(feature = "tracing-chunk-debug"))]
-        let stream = ReaderStream::with_capacity(reader, optimal_buffer_size);
+        let stream = ReaderStream::with_capacity(reader, stream_buffer_size);
         Some(StreamingBlob::wrap(bytes_stream(stream, expected)))
     }
 
@@ -1864,7 +1912,11 @@ impl DefaultObjectUsecase {
         queue_status: &concurrency::IoQueueStatus,
         concurrent_requests: usize,
     ) -> GetObjectStrategyContext {
-        let base_buffer_size = self.base_buffer_size();
+        let base_buffer_size = if response_content_length > 0 {
+            get_buffer_size_opt_in(response_content_length)
+        } else {
+            self.base_buffer_size()
+        };
 
         let is_sequential_hint = if rs.is_none() {
             true
@@ -1932,9 +1984,8 @@ impl DefaultObjectUsecase {
             "I/O priority finalized with actual request size"
         );
 
-        let base_buffer_size = get_buffer_size_opt_in(response_content_length);
         let optimal_buffer_size = if io_strategy.buffer_size > 0 {
-            io_strategy.buffer_size.min(base_buffer_size)
+            io_strategy.buffer_size
         } else {
             get_concurrency_aware_buffer_size(response_content_length, base_buffer_size)
         };
@@ -1943,10 +1994,12 @@ impl DefaultObjectUsecase {
             "GetObject buffer sizing: file_size={}, base={}, optimal={}, concurrent_requests={}, io_strategy={:?}",
             response_content_length, base_buffer_size, optimal_buffer_size, concurrent_requests, io_strategy.load_level
         );
+        let enable_readahead = io_strategy.enable_readahead;
 
         GetObjectStrategyContext {
             io_strategy,
             optimal_buffer_size,
+            enable_readahead,
         }
     }
 
@@ -1993,6 +2046,7 @@ impl DefaultObjectUsecase {
         info: &ObjectInfo,
         response_content_length: i64,
         optimal_buffer_size: usize,
+        enable_readahead: bool,
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
@@ -2023,7 +2077,14 @@ impl DefaultObjectUsecase {
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
-            return Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size));
+            let (stream_buffer_size, stream_strategy) =
+                Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+            return Ok(Self::build_reader_blob(
+                final_stream,
+                response_content_length,
+                stream_buffer_size,
+                stream_strategy,
+            ));
         }
 
         let should_provide_seek_support =
@@ -2049,7 +2110,14 @@ impl DefaultObjectUsecase {
             }
         }
 
-        Ok(Self::build_reader_blob(final_stream, response_content_length, optimal_buffer_size))
+        let (stream_buffer_size, stream_strategy) =
+            Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+        Ok(Self::build_reader_blob(
+            final_stream,
+            response_content_length,
+            stream_buffer_size,
+            stream_strategy,
+        ))
     }
 
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
@@ -2754,6 +2822,7 @@ impl DefaultObjectUsecase {
         let GetObjectStrategyContext {
             io_strategy: _,
             optimal_buffer_size,
+            enable_readahead,
         } = strategy;
 
         let body = Self::build_get_object_body(
@@ -2761,6 +2830,7 @@ impl DefaultObjectUsecase {
             &info,
             response_content_length,
             optimal_buffer_size,
+            enable_readahead,
             part_number,
             rs.is_some(),
             encryption_applied,
@@ -5487,6 +5557,7 @@ mod tests {
             &info,
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
+            true,
             None,
             false,
             false,
@@ -5518,6 +5589,7 @@ mod tests {
             &info,
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
+            true,
             None,
             false,
             true,
@@ -5531,6 +5603,28 @@ mod tests {
             0,
             "large encrypted object response construction should not pre-read object data"
         );
+    }
+
+    #[test]
+    fn select_stream_buffer_strategy_expands_large_sequential_gets() {
+        let (buffer_size, strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(2_i64 * 1024 * 1024 * 1024, 2 * MI_B, true, false);
+
+        assert_eq!(strategy, GetObjectStreamStrategy::LargeSequentialReadahead);
+        assert_eq!(buffer_size, 4 * MI_B);
+    }
+
+    #[test]
+    fn select_stream_buffer_strategy_keeps_ranges_and_small_gets_standard() {
+        let (range_buffer_size, range_strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(2_i64 * 1024 * 1024 * 1024, 2 * MI_B, true, true);
+        assert_eq!(range_strategy, GetObjectStreamStrategy::Standard);
+        assert_eq!(range_buffer_size, 2 * MI_B);
+
+        let (small_buffer_size, small_strategy) =
+            DefaultObjectUsecase::select_stream_buffer_strategy(64 * 1024 * 1024, 512 * 1024, true, false);
+        assert_eq!(small_strategy, GetObjectStreamStrategy::Standard);
+        assert_eq!(small_buffer_size, 512 * 1024);
     }
 
     #[test]

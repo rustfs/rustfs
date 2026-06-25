@@ -889,6 +889,11 @@ impl IoStrategy {
         // Stage 1: Start with base buffer size
         let mut buffer_size;
         let mut buffer_multiplier = 1.0;
+        let effective_access_pattern = if context.is_sequential_hint {
+            AccessPattern::Sequential
+        } else {
+            context.access_pattern
+        };
 
         // Stage 2: Apply load level reduction based on permit wait
         let load_level = IoLoadLevel::from_wait_duration_with_thresholds(
@@ -924,7 +929,7 @@ impl IoStrategy {
         );
 
         // Stage 5: Apply access pattern adjustments
-        let pattern_multiplier = match context.access_pattern {
+        let pattern_multiplier = match effective_access_pattern {
             AccessPattern::Sequential => storage_profile.sequential_boost_multiplier,
             AccessPattern::Random => storage_profile.random_penalty_multiplier,
             AccessPattern::Mixed => 1.0,
@@ -964,7 +969,7 @@ impl IoStrategy {
 
         // Apply final clamp (safety bounds)
         let clamp_min = 32 * KI_B;
-        let clamp_max = MI_B;
+        let clamp_max = buffer_cap.max(MI_B);
         #[cfg(feature = "io-scheduler-debug")]
         let clamp_min_applied = buffer_size < clamp_min;
         #[cfg(feature = "io-scheduler-debug")]
@@ -982,7 +987,7 @@ impl IoStrategy {
         };
 
         // Apply access pattern override
-        let readahead_disabled_by_pattern = matches!(context.access_pattern, AccessPattern::Random);
+        let readahead_disabled_by_pattern = matches!(effective_access_pattern, AccessPattern::Random);
         if readahead_disabled_by_pattern {
             should_enable_readahead = false;
             #[cfg(feature = "io-scheduler-debug")]
@@ -993,7 +998,7 @@ impl IoStrategy {
 
         // Apply concurrency override
         let readahead_disabled_by_concurrency = context.concurrent_requests >= config.random_readahead_disable_concurrency;
-        if readahead_disabled_by_concurrency && matches!(context.access_pattern, AccessPattern::Random) {
+        if readahead_disabled_by_concurrency && matches!(effective_access_pattern, AccessPattern::Random) {
             should_enable_readahead = false;
             #[cfg(feature = "io-scheduler-debug")]
             {
@@ -1039,7 +1044,7 @@ impl IoStrategy {
         let core = IoStrategyCore {
             // ===== Basic Configuration =====
             storage_media: context.storage_media,
-            access_pattern: context.access_pattern,
+            access_pattern: effective_access_pattern,
             request_size: context.file_size,
             base_buffer_size: context.base_buffer_size,
             buffer_cap,
@@ -1055,7 +1060,7 @@ impl IoStrategy {
             observed_bandwidth_bps: context.observed_bandwidth_bps,
             bandwidth_tier,
             bandwidth_limited,
-            sequential_detected: matches!(context.access_pattern, AccessPattern::Sequential),
+            sequential_detected: matches!(effective_access_pattern, AccessPattern::Sequential),
 
             // ===== Decision Flags =====
             storage_profile,
@@ -1065,8 +1070,8 @@ impl IoStrategy {
 
             // ===== Tuning Multipliers =====
             final_multiplier: buffer_multiplier,
-            should_throttle_random_io: matches!(context.access_pattern, AccessPattern::Random),
-            should_expand_for_sequential: matches!(context.access_pattern, AccessPattern::Sequential),
+            should_throttle_random_io: matches!(effective_access_pattern, AccessPattern::Random),
+            should_expand_for_sequential: matches!(effective_access_pattern, AccessPattern::Sequential),
             should_reduce_for_concurrency: concurrency_multiplier < 1.0,
             should_reduce_for_bandwidth: bandwidth_limited,
             should_disable_readahead: !enable_readahead,
@@ -1112,7 +1117,7 @@ impl IoStrategy {
 
             // ===== State Labels =====
             load_level_label: load_level_clone.as_str(),
-            pattern_label: context.access_pattern.as_str(),
+            pattern_label: effective_access_pattern.as_str(),
             media_label: match context.storage_media {
                 StorageMedia::Nvme => "nvme",
                 StorageMedia::Ssd => "ssd",
@@ -1143,8 +1148,8 @@ impl IoStrategy {
             read_size_known: context.file_size > 0,
 
             // ===== Decision Tracking =====
-            random_penalty_applied: matches!(context.access_pattern, AccessPattern::Random),
-            sequential_boost_applied: matches!(context.access_pattern, AccessPattern::Sequential),
+            random_penalty_applied: matches!(effective_access_pattern, AccessPattern::Random),
+            sequential_boost_applied: matches!(effective_access_pattern, AccessPattern::Sequential),
             buffer_cap_applied,
             clamp_min_applied,
             clamp_max_applied,
@@ -2265,11 +2270,36 @@ mod tests {
         let config = IoSchedulerConfig::default();
         let strategy = IoStrategy::from_context_with_config(&context, &config);
 
-        // Should be capped at NVMe buffer cap and 1MB max
-        assert!(strategy.buffer_size <= MI_B, "Should be capped at 1MB max");
+        // Should be capped at the configured NVMe media cap.
+        assert_eq!(strategy.buffer_size, rustfs_config::DEFAULT_OBJECT_IO_NVME_BUFFER_CAP);
 
         #[cfg(feature = "io-scheduler-debug")]
         assert!(strategy.debug_info.buffer_cap_applied, "Buffer cap should be applied");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_multi_factor_strategy_applies_sequential_hint_when_pattern_unknown() {
+        let context = IoSchedulingContext {
+            file_size: 2 * 1024 * 1024 * 1024,              // 2GiB
+            base_buffer_size: 1024 * 1024,                  // 1MiB base
+            permit_wait_duration: Duration::from_millis(1), // Low load
+            is_sequential_hint: true,
+            access_pattern: AccessPattern::Unknown,
+            storage_media: StorageMedia::Nvme,
+            observed_bandwidth_bps: Some(1000 * 1024 * 1024),
+            concurrent_requests: 1,
+        };
+
+        let config = IoSchedulerConfig::default();
+        let strategy = IoStrategy::from_context_with_config(&context, &config);
+
+        assert_eq!(strategy.access_pattern, AccessPattern::Sequential);
+        assert!(strategy.enable_readahead, "Sequential hint should keep readahead enabled");
+        assert!(
+            strategy.buffer_size > context.base_buffer_size,
+            "Sequential hint should allow a larger buffer for large GETs"
+        );
     }
 
     #[tokio::test]
