@@ -68,10 +68,6 @@ mod ecstore_client {
     pub(crate) use crate::storage::ecstore_client::{object_api_utils, transition_api};
 }
 
-mod ecstore_compression {
-    pub(crate) use crate::storage::ecstore_compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-}
-
 mod ecstore_config {
     pub(crate) use crate::storage::ecstore_config::storageclass;
 }
@@ -88,15 +84,11 @@ mod ecstore_tier {
     pub(crate) use crate::storage::ecstore_tier::{tier, tier_config, warm_backend};
 }
 
-pub(crate) const MIN_DISK_COMPRESSIBLE_SIZE: usize = ecstore_compression::MIN_DISK_COMPRESSIBLE_SIZE;
-
 pub(crate) type DiskError = crate::storage::DiskError;
-pub(crate) type DynReader = crate::storage::DynReader;
 pub(crate) type DynReplicationPool = crate::storage::DynReplicationPool;
 pub(crate) type ECStore = crate::storage::ECStore;
 pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
 pub(crate) type ExpiryState = crate::storage::ExpiryState;
-pub(crate) type HashReader = crate::storage::HashReader;
 pub(crate) type NotificationSys = crate::storage::NotificationSys;
 pub(crate) type BucketBandwidthMonitor = crate::storage::BucketBandwidthMonitor;
 pub(crate) type ObjectStoreResolver = crate::storage::ObjectStoreResolver;
@@ -108,19 +100,11 @@ pub(crate) type RebalStatus = crate::storage::ecstore_rebalance::RebalStatus;
 pub(crate) type StorageError = crate::storage::StorageError;
 pub(crate) type Error = StorageError;
 pub(crate) type TierConfigMgr = crate::storage::TierConfigMgr;
-pub(crate) type WriteEncryption = crate::storage::WriteEncryption;
-pub(crate) type WritePlan = crate::storage::WritePlan;
 
-#[cfg(test)]
-pub(crate) type DecryptReader<R> = crate::storage::DecryptReader<R>;
-#[cfg(test)]
-pub(crate) type EncryptReader<R> = crate::storage::EncryptReader<R>;
 #[cfg(test)]
 pub(crate) type Endpoint = crate::storage::Endpoint;
 #[cfg(test)]
 pub(crate) type Endpoints = crate::storage::Endpoints;
-#[cfg(test)]
-pub(crate) type HardLimitReader<R> = crate::storage::HardLimitReader<R>;
 #[cfg(test)]
 pub(crate) type PoolEndpoints = crate::storage::PoolEndpoints;
 #[cfg(test)]
@@ -564,10 +548,6 @@ pub(crate) fn get_total_usable_capacity_free(disks: &[rustfs_madmin::Disk], info
     ecstore_capacity::get_total_usable_capacity_free(disks, info)
 }
 
-pub(crate) fn is_disk_compressible(headers: &http::HeaderMap, object_name: &str) -> bool {
-    ecstore_compression::is_disk_compressible(headers, object_name)
-}
-
 pub(crate) async fn apply_bucket_usage_memory_overlay(data_usage_info: &mut rustfs_data_usage::DataUsageInfo) {
     ecstore_data_usage::apply_bucket_usage_memory_overlay(data_usage_info).await;
 }
@@ -678,33 +658,6 @@ pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsRep
 
 pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
     rustfs_common::metrics::global_metrics().report().await
-}
-
-#[cfg(test)]
-pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
-where
-    R: crate::storage::ecstore_rio::Reader + 'static,
-{
-    crate::storage::boxed_reader(reader)
-}
-
-pub(crate) fn compression_metadata_value(algorithm: rustfs_utils::CompressionAlgorithm) -> String {
-    crate::storage::compression_metadata_value(algorithm)
-}
-
-pub(crate) fn wrap_reader<R>(reader: R) -> DynReader
-where
-    R: crate::storage::ecstore_rio::ReadStream + 'static,
-{
-    crate::storage::wrap_reader(reader)
-}
-
-pub(crate) fn get_lock_acquire_timeout() -> tokio::time::Duration {
-    crate::storage::get_lock_acquire_timeout()
-}
-
-pub(crate) fn is_valid_storage_class(storage_class: &str) -> bool {
-    crate::storage::is_valid_storage_class(storage_class)
 }
 
 #[cfg(test)]

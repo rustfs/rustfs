@@ -1442,9 +1442,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename \
-    '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
-    rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+  {
+    rg -n --with-filename \
+      '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class)\b|(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class)\b)' \
+      rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs || true
+  }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
