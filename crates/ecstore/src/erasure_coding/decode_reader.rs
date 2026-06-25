@@ -250,10 +250,12 @@ where
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.output_pos < self.output_buf.len() {
-                if self.prefetched_buf.is_none() && self.prefetch_error.is_none() && self.remaining > 0 {
-                    if let Poll::Ready(result) = self.poll_prefetch(cx) {
-                        result?;
-                    }
+                if self.prefetched_buf.is_none()
+                    && self.prefetch_error.is_none()
+                    && self.remaining > 0
+                    && let Poll::Ready(result) = self.poll_prefetch(cx)
+                {
+                    result?;
                 }
 
                 let available = &self.output_buf[self.output_pos..];
