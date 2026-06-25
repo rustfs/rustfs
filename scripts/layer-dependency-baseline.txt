@@ -37,7 +37,7 @@ dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::m
 dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_multipart_uploads_params
 dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
 dep|rustfs/src/app/multipart_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_upload_part_number
-dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs
+dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs::FS
 dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::s3_api::multipart::parse_list_parts_params
 dep|rustfs/src/init.rs|infra->interface|crate::admin
 dep|rustfs/src/protocols/client.rs|infra->interface|crate::storage::ecfs::FS
