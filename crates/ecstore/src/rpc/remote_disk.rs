@@ -568,7 +568,7 @@ impl RemoteDisk {
     {
         // Check if disk is faulty
         if self.health.is_faulty() {
-            warn!(
+            debug!(
                 event = EVENT_REMOTE_DISK_HEALTH,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
@@ -747,6 +747,12 @@ impl RemoteDisk {
 
 fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     let mut serializer = rmp_serde::Serializer::new(Vec::new());
+    value.serialize(&mut serializer)?;
+    Ok(serializer.into_inner())
+}
+
+fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
     value.serialize(&mut serializer)?;
     Ok(serializer.into_inner())
 }
@@ -1524,6 +1530,7 @@ impl DiskAPI for RemoteDisk {
             "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
+                let file_info_bin = encode_msgpack_named(&fi)?;
                 let mut client = self
                     .get_client()
                     .await
@@ -1535,6 +1542,7 @@ impl DiskAPI for RemoteDisk {
                     file_info,
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
+                    file_info_bin: file_info_bin.into(),
                 });
 
                 let response = client.rename_data(request).await?.into_inner();
@@ -1543,7 +1551,8 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+                let rename_data_resp =
+                    decode_msgpack_or_json::<RenameDataResp>(&response.rename_data_resp_bin, &response.rename_data_resp)?;
 
                 Ok(rename_data_resp)
             },
@@ -2220,7 +2229,7 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
-    use rustfs_common::GLOBAL_CONN_MAP;
+    use crate::runtime_sources;
     use serde_json::Value;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;
@@ -2371,6 +2380,64 @@ mod tests {
         fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    fn sample_rename_data_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            data_dir: Some(Uuid::new_v4()),
+            size: 64 * 1024,
+            mod_time: Some(::time::OffsetDateTime::UNIX_EPOCH + ::time::Duration::seconds(1)),
+            metadata: [
+                ("etag".to_string(), "etag-value".to_string()),
+                ("content-type".to_string(), "application/octet-stream".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            erasure: rustfs_filemeta::ErasureInfo {
+                algorithm: rustfs_filemeta::ERASURE_ALGORITHM.to_string(),
+                data_blocks: 4,
+                parity_blocks: 2,
+                block_size: 1024 * 1024,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_data_file_info_named_msgpack_is_smaller_than_json() {
+        let file_info = sample_rename_data_file_info();
+        let json = serde_json::to_vec(&file_info).expect("file info json should encode");
+        let named_msgpack = encode_msgpack_named(&file_info).expect("file info named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn rename_data_resp_named_msgpack_is_smaller_than_json() {
+        let response = RenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![1_u8; 32]),
+        };
+        let json = serde_json::to_vec(&response).expect("rename data response json should encode");
+        let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
     }
 
     #[derive(Debug, Default)]
@@ -2709,7 +2776,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_disk_recovery_requires_disk_rpc_readiness() {
         init_tracing(Level::ERROR);
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
 
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -2737,8 +2804,8 @@ mod tests {
         health.mark_failure(&endpoint, "test_failure");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
         let channel = TonicEndpoint::from_shared(base_addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(base_addr.clone(), channel);
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&base_addr));
+        runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&base_addr).await);
 
         temp_env::async_with_vars(
             [
@@ -2764,7 +2831,7 @@ mod tests {
                     "a plain TCP listener without disk_info RPC readiness must not restore the remote disk online"
                 );
                 assert!(
-                    !GLOBAL_CONN_MAP.read().await.contains_key(&base_addr),
+                    !runtime_sources::test_node_channel_is_cached(&base_addr).await,
                     "failed recovery probes should evict stale cached gRPC channels"
                 );
             },
@@ -3336,8 +3403,8 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
         let _ = remote_disk
             .execute_with_timeout(
@@ -3351,7 +3418,7 @@ mod tests {
             .expect_err("timeout should fail");
 
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "timeout should evict cached connection"
         );
     }
@@ -3380,7 +3447,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(
@@ -3407,7 +3474,7 @@ mod tests {
             "first timeout-like error should move the remote disk into suspect state"
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "timeout-like errors should evict cached connection"
         );
     }
@@ -3436,7 +3503,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(
@@ -3468,7 +3535,7 @@ mod tests {
             "first network-like error should move the remote disk into suspect state"
         );
         assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            !runtime_sources::test_node_channel_is_cached(&addr).await,
             "network-like errors should evict cached connection"
         );
     }
@@ -3497,7 +3564,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout_for_op_and_health_action(
@@ -3521,7 +3588,7 @@ mod tests {
             "ignored network-like error should not mark remote disk faulty"
         );
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            runtime_sources::test_node_channel_is_cached(&addr).await,
             "ignored network-like error should not evict cached connection"
         );
     }
@@ -3550,7 +3617,7 @@ mod tests {
         .unwrap();
 
         let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.clone(), channel);
+        runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
             .execute_with_timeout(|| async { Err::<(), Error>(DiskError::FileNotFound) }, Duration::from_secs(1))
@@ -3560,7 +3627,7 @@ mod tests {
         assert_eq!(err, DiskError::FileNotFound);
         assert!(remote_disk.is_online().await, "business errors should not mark remote disk faulty");
         assert!(
-            GLOBAL_CONN_MAP.read().await.contains_key(&addr),
+            runtime_sources::test_node_channel_is_cached(&addr).await,
             "business errors should not evict cached connection"
         );
     }

@@ -86,10 +86,10 @@ catalog extension.
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
 | Maintenance worker run endpoint | Preview / controlled | Supports run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
-| Compaction planning | Preview / controlled | Plans binpack candidates for unpartitioned Parquet files. |
-| Compaction commit | Preview / controlled | Can commit a safe unpartitioned Parquet rewrite through the catalog. |
+| Compaction planning | Preview / controlled | Plans partition-local binpack candidates for Parquet files and does not mix data files from different partition directories in one rewrite group. |
+| Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog. |
 | Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
-| Partition-aware, sort, delete-file, or row-level compaction | Not claimed | These remain future compatibility and maintenance validation items. |
+| Sort, delete-file, or row-level compaction | Not claimed | These remain future compatibility and maintenance validation items. |
 
 ## Recovery And Strong Backing Matrix
 

@@ -12,8 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store};
-use crate::app::context::{resolve_notify_interface, resolve_server_config};
+use super::{module_switch::resolve_notify_module_state, refresh_persisted_module_switches_from_store, runtime_sources};
 use crate::storage::{EventArgs as EcstoreEventArgs, StorageObjectInfo, register_event_dispatch_hook};
 use chrono::{DateTime, Utc};
 use rustfs_notify::{EventArgs as NotifyEventArgs, NotifyObjectInfo};
@@ -26,7 +25,7 @@ use tracing::{error, info, instrument, warn};
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
-    resolve_server_config()
+    runtime_sources::server_config()
 }
 
 pub fn refresh_notify_module_enabled() -> bool {
@@ -118,7 +117,7 @@ fn install_ecstore_event_dispatch_hook() {
             return;
         };
         spawn(async move {
-            resolve_notify_interface().notify(notify_args).await;
+            runtime_sources::notify_interface().notify(notify_args).await;
         });
     });
 

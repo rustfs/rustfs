@@ -12,8 +12,7 @@
 //  See the License for the specific language governing permissions and
 //  limitations under the License.
 
-use super::{module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from_store};
-use crate::app::context::resolve_server_config;
+use super::{module_switch::resolve_audit_module_state, refresh_persisted_module_switches_from_store, runtime_sources};
 use rustfs_audit::{AuditError, AuditResult, audit_system, init_audit_system, system::AuditSystemState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use tracing::{info, warn};
@@ -21,7 +20,7 @@ use tracing::{info, warn};
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
-    resolve_server_config()
+    runtime_sources::server_config()
 }
 
 pub fn refresh_audit_module_enabled() -> bool {
