@@ -14,11 +14,8 @@
 
 use super::*;
 use crate::error::is_err_decommission_running;
-use crate::global::{
-    GLOBAL_EventNotifier, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_TierConfigMgr,
-    get_global_bucket_monitor, is_dist_erasure, is_first_cluster_node_local,
-};
 use crate::pools::local_decommission_queue_prefix;
+use crate::runtime_sources;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -63,7 +60,7 @@ fn pool_meta_has_active_decommission(meta: &PoolMeta) -> bool {
     meta.pools.iter().any(|pool| {
         pool.decommission
             .as_ref()
-            .is_some_and(|info| !info.complete && !info.failed && !info.canceled)
+            .is_some_and(|info| info.has_decommission_state() && !info.complete && !info.failed && !info.canceled)
     })
 }
 
@@ -171,11 +168,11 @@ impl ECStore {
         );
         let mut host = address.ip().to_string();
         if host.is_empty() {
-            host = GLOBAL_RUSTFS_HOST.read().await.to_string()
+            host = runtime_sources::rustfs_host().await
         }
         let mut port = address.port().to_string();
         if port.is_empty() {
-            port = GLOBAL_RUSTFS_PORT.read().await.to_string()
+            port = runtime_sources::rustfs_port().to_string()
         }
         debug!(
             event = EVENT_ECSTORE_INIT_STATUS,
@@ -301,12 +298,8 @@ impl ECStore {
         }
 
         // Replace the local disk
-        if !is_dist_erasure().await {
-            let mut global_local_disk_map = GLOBAL_LOCAL_DISK_MAP.write().await;
-            for disk in local_disks {
-                let path = disk.endpoint().to_string();
-                global_local_disk_map.insert(path, Some(disk.clone()));
-            }
+        if !runtime_sources::setup_is_dist_erasure().await {
+            runtime_sources::record_local_disks(local_disks).await;
         }
 
         let peer_sys = S3PeerSys::new(&endpoint_pools);
@@ -325,19 +318,17 @@ impl ECStore {
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(()),
 
-            local_disk_map: GLOBAL_LOCAL_DISK_MAP.clone(),
-            local_disk_id_map: GLOBAL_LOCAL_DISK_ID_MAP.clone(),
-            local_disk_set_drives: GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
-            tier_config_mgr: GLOBAL_TierConfigMgr.clone(),
-            event_notifier: GLOBAL_EventNotifier.clone(),
+            local_disk_map: runtime_sources::local_disk_map_handle(),
+            local_disk_id_map: runtime_sources::local_disk_id_map_handle(),
+            local_disk_set_drives: runtime_sources::local_disk_set_drives_handle(),
+            tier_config_mgr: runtime_sources::tier_config_mgr_handle(),
+            event_notifier: runtime_sources::event_notifier_handle(),
             bucket_monitor: OnceLock::new(),
         });
 
         // Only set it when the global deployment ID is not yet configured
-        if let Some(dep_id) = deployment_id
-            && get_global_deployment_id().is_none()
-        {
-            set_global_deployment_id(dep_id);
+        if let Some(dep_id) = deployment_id {
+            runtime_sources::ensure_deployment_id(dep_id);
         }
 
         let wait_sec = 5;
@@ -360,9 +351,9 @@ impl ECStore {
             break;
         }
 
-        set_object_layer(ec.clone()).await;
+        runtime_sources::publish_object_store(ec.clone()).await;
 
-        if let Some(monitor) = get_global_bucket_monitor() {
+        if let Some(monitor) = runtime_sources::bucket_monitor() {
             let _ = ec.bucket_monitor.set(monitor);
         }
 
@@ -371,7 +362,7 @@ impl ECStore {
 
     #[instrument(level = "debug", skip(self, rx))]
     pub async fn init(self: &Arc<Self>, rx: CancellationToken) -> Result<()> {
-        GLOBAL_BOOT_TIME.get_or_init(|| async { SystemTime::now() }).await;
+        runtime_sources::ensure_boot_time().await;
 
         let mut meta = PoolMeta::default();
         resolve_store_init_stage_result(
@@ -386,8 +377,8 @@ impl ECStore {
             "load_pool_meta",
         )?;
         let update = meta.validate(self.pools.clone())?;
-        let endpoints = get_global_endpoints();
-        let should_persist_pool_meta = is_first_cluster_node_local().await;
+        let endpoints = runtime_sources::endpoint_pools_or_default();
+        let should_persist_pool_meta = runtime_sources::first_cluster_node_is_local().await;
 
         let installed_pool_meta = if !update {
             meta.clone()
@@ -449,8 +440,7 @@ impl ECStore {
             });
         }
 
-        let num_nodes = get_global_endpoints().get_nodes().len() as u64;
-        init_global_bucket_monitor(num_nodes);
+        runtime_sources::init_bucket_monitor_for_current_endpoints();
 
         init_background_expiry(self.clone()).await;
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
@@ -458,7 +448,7 @@ impl ECStore {
         TransitionState::init(self.clone()).await;
         crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
-        if let Err(err) = GLOBAL_TierConfigMgr.write().await.init(self.clone()).await {
+        if let Err(err) = runtime_sources::init_tier_config_mgr(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
         }
 

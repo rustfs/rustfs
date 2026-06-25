@@ -15,7 +15,7 @@
 use super::super::versioning_sys::BucketVersioningSys;
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_action_credentials, resolve_object_store_handle};
+use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle};
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -69,7 +69,7 @@ impl Operation for AccountInfoHandler {
 
         let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 

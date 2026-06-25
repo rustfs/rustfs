@@ -19,7 +19,7 @@ use super::super::quota::checker::QuotaChecker;
 use super::super::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_bucket_metadata_handle, resolve_object_store_handle};
+use crate::admin::runtime_sources::{resolve_bucket_metadata_handle, resolve_object_store_handle};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};

@@ -21,8 +21,10 @@ mod plugin_contract;
 #[allow(dead_code)]
 pub(crate) mod route_policy;
 pub mod router;
+pub(crate) mod runtime_sources;
 pub mod service;
 pub mod site_replication_identity;
+pub(crate) mod storage_api;
 pub mod utils;
 
 #[cfg(test)]
@@ -31,9 +33,9 @@ mod console_test;
 mod route_registration_test;
 
 use handlers::{
-    audit, bucket_meta, config_admin, extensions, heal, health, kms, module_switch, object_zip_download, oidc, plugins_catalog,
-    plugins_instances, pools, profile_admin, quota as quota_handler, rebalance, replication as replication_handler, scanner,
-    site_replication, sts, system, table_catalog, tier, tls_debug, user,
+    audit, bucket_meta, cluster_snapshot, config_admin, extensions, heal, health, kms, module_switch, object_zip_download, oidc,
+    plugins_catalog, plugins_instances, pools, profile_admin, quota as quota_handler, rebalance,
+    replication as replication_handler, scanner, site_replication, sts, system, table_catalog, tier, tls_debug, user,
 };
 use router::{AdminOperation, S3Router};
 use s3s::route::S3Route;
@@ -70,6 +72,7 @@ fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()
     scanner::register_scanner_route(r)?;
     audit::register_audit_target_route(r)?;
     module_switch::register_module_switch_route(r)?;
+    cluster_snapshot::register_cluster_snapshot_route(r)?;
     extensions::register_extension_route(r)?;
     object_zip_download::register_object_zip_download_route(r)?;
     plugins_catalog::register_plugin_catalog_route(r)?;
@@ -116,6 +119,14 @@ mod ecstore_capacity {
 
 mod ecstore_client {
     pub(crate) use crate::storage::ecstore_client::admin_handler_utils;
+}
+
+mod ecstore_cluster {
+    pub(crate) use crate::storage::ecstore_cluster::{
+        ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
+        ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
+        ClusterPoolStateSnapshot,
+    };
 }
 
 mod ecstore_config {

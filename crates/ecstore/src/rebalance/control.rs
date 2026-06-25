@@ -1,7 +1,8 @@
 use super::meta::{
-    clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index,
-    invalid_rebalance_pool_index_error, is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done,
-    merge_rebalance_meta, percent_free_ratio, rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
+    RebalanceMetaMergeOutcome, clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue,
+    ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error, is_rebalance_actively_running,
+    is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done, merge_rebalance_meta, percent_free_ratio,
+    rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
     record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket, rollback_rebalance_start_meta_snapshot_for_id,
     should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot_for_id,
     validate_init_rebalance_state,
@@ -27,6 +28,51 @@ use time::OffsetDateTime;
 use tracing::{debug, info};
 use uuid::Uuid;
 
+pub(super) fn validate_rebalance_disk_stats_coverage(disk_stats: &[DiskStat]) -> Result<()> {
+    for (idx, disk_stat) in disk_stats.iter().enumerate() {
+        if disk_stat.total_space == 0 {
+            return Err(Error::other(format!(
+                "rebalance storage info is incomplete: pool {idx} has no reported capacity"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
+fn pool_rebalance_status_from_meta(meta: Option<&RebalanceMeta>, pool_index: usize) -> (RebalStatus, bool) {
+    meta.and_then(|meta| meta.pool_stats.get(pool_index))
+        .filter(|pool_stat| pool_stat.participating)
+        .map(|pool_stat| (pool_stat.info.status, pool_stat.info.stopping))
+        .unwrap_or_default()
+}
+
+fn merge_rebalance_status_refresh(current: &mut Option<RebalanceMeta>, persisted: RebalanceMeta) {
+    if persisted.id.is_empty() && persisted.pool_stats.is_empty() {
+        clear_rebalance_status_refresh(current);
+        return;
+    }
+
+    match current.as_mut() {
+        Some(current_meta) => {
+            if merge_rebalance_meta(current_meta, &persisted) == RebalanceMetaMergeOutcome::RejectedActiveConflict
+                && !is_rebalance_actively_running(current_meta)
+            {
+                *current = Some(persisted);
+            }
+        }
+        None => {
+            *current = Some(persisted);
+        }
+    }
+}
+
+fn clear_rebalance_status_refresh(current: &mut Option<RebalanceMeta>) {
+    if current.as_ref().is_none_or(|meta| !is_rebalance_actively_running(meta)) {
+        *current = None;
+    }
+}
+
 impl ECStore {
     pub(super) async fn save_rebalance_meta_with_merge<S>(
         &self,
@@ -50,7 +96,9 @@ impl ECStore {
         let mut merged = RebalanceMeta::new();
         match merged.load_with_opts(pool.clone(), opts.clone()).await {
             Ok(()) => {
-                merge_rebalance_meta(&mut merged, local_snapshot);
+                if merge_rebalance_meta(&mut merged, local_snapshot) == RebalanceMetaMergeOutcome::RejectedActiveConflict {
+                    return Err(Error::RebalanceAlreadyRunning);
+                }
             }
             Err(Error::ConfigNotFound) => {
                 merged = local_snapshot.clone();
@@ -90,6 +138,10 @@ impl ECStore {
                 "Loaded rebalance metadata"
             );
         } else {
+            {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                *rebalance_meta = None;
+            }
             debug!(
                 event = EVENT_REBALANCE_STATE,
                 component = LOG_COMPONENT_ECSTORE,
@@ -98,6 +150,27 @@ impl ECStore {
                 reason = "rebalance_not_started",
                 "Rebalance metadata not found"
             );
+        }
+
+        Ok(())
+    }
+
+    #[tracing::instrument(skip_all)]
+    pub async fn refresh_rebalance_status_meta(&self) -> Result<()> {
+        let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
+        let mut persisted = RebalanceMeta::new();
+        match persisted.load(pool).await {
+            Ok(()) => {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                merge_rebalance_status_refresh(&mut rebalance_meta, persisted);
+            }
+            Err(Error::ConfigNotFound) => {
+                let mut rebalance_meta = self.rebalance_meta.write().await;
+                clear_rebalance_status_refresh(&mut rebalance_meta);
+            }
+            Err(err) => {
+                return Err(Error::other(format!("rebalance metadata refresh failed during pool status: {err}")));
+            }
         }
 
         Ok(())
@@ -191,6 +264,7 @@ impl ECStore {
         }
 
         let percent_free_goal = percent_free_ratio(total_free, total_cap);
+        validate_rebalance_disk_stats_coverage(&disk_stats)?;
 
         let mut pool_stats = Vec::with_capacity(self.pools.len());
 
@@ -421,6 +495,11 @@ impl ECStore {
         false
     }
 
+    pub async fn pool_rebalance_status(&self, pool_index: usize) -> (RebalStatus, bool) {
+        let rebalance_meta = self.rebalance_meta.read().await;
+        pool_rebalance_status_from_meta(rebalance_meta.as_ref(), pool_index)
+    }
+
     pub async fn current_rebalance_id(&self) -> Option<String> {
         let rebalance_meta = self.rebalance_meta.read().await;
         rebalance_meta
@@ -500,5 +579,201 @@ impl ECStore {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pool_rebalance_status_ignores_non_participating_pool_state() {
+        let meta = RebalanceMeta {
+            pool_stats: vec![
+                RebalanceStats {
+                    participating: false,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        stopping: true,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                RebalanceStats {
+                    participating: true,
+                    info: RebalanceInfo {
+                        status: RebalStatus::Started,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 0), (RebalStatus::None, false));
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 1), (RebalStatus::Started, false));
+        assert_eq!(pool_rebalance_status_from_meta(Some(&meta), 2), (RebalStatus::None, false));
+    }
+
+    #[test]
+    fn rebalance_status_refresh_applies_persisted_terminal_state() {
+        let rebalance_id = "rebalance-id".to_string();
+        let now = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let mut current = Some(RebalanceMeta {
+            id: rebalance_id.clone(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let persisted = RebalanceMeta {
+            id: rebalance_id,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    start_time: Some(now),
+                    end_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_status_refresh(&mut current, persisted);
+
+        let refreshed = current.as_ref().expect("refresh should keep rebalance metadata");
+        assert_eq!(refreshed.pool_stats[0].info.status, RebalStatus::Completed);
+        assert_eq!(refreshed.pool_stats[0].info.end_time, Some(now));
+    }
+
+    #[test]
+    fn rebalance_status_refresh_preserves_runtime_cancel_token() {
+        let rebalance_id = "rebalance-id".to_string();
+        let now = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let mut current = Some(RebalanceMeta {
+            id: rebalance_id.clone(),
+            cancel: Some(tokio_util::sync::CancellationToken::new()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let persisted = RebalanceMeta {
+            id: rebalance_id,
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_status_refresh(&mut current, persisted);
+
+        assert!(
+            current.as_ref().and_then(|meta| meta.cancel.as_ref()).is_some(),
+            "status refresh must not drop the runtime cancellation token"
+        );
+    }
+
+    #[test]
+    fn rebalance_status_refresh_preserves_local_active_different_id_conflict() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let mut current = Some(RebalanceMeta {
+            id: "old-active-id".to_string(),
+            cancel: Some(tokio_util::sync::CancellationToken::new()),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let persisted = RebalanceMeta {
+            id: "new-terminal-id".to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    start_time: Some(now),
+                    end_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_status_refresh(&mut current, persisted);
+
+        let refreshed = current.as_ref().expect("local active metadata should remain visible");
+        assert_eq!(refreshed.id, "old-active-id");
+        assert_eq!(refreshed.pool_stats[0].info.status, RebalStatus::Started);
+        assert!(
+            refreshed.cancel.is_some(),
+            "status refresh must not drop a live runtime cancellation token"
+        );
+    }
+
+    #[test]
+    fn rebalance_status_refresh_replaces_stale_memory_without_runtime_token() {
+        let now = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let mut current = Some(RebalanceMeta {
+            id: "old-stale-id".to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Started,
+                    start_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        });
+        let persisted = RebalanceMeta {
+            id: "new-terminal-id".to_string(),
+            pool_stats: vec![RebalanceStats {
+                participating: true,
+                info: RebalanceInfo {
+                    status: RebalStatus::Completed,
+                    start_time: Some(now),
+                    end_time: Some(now),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+
+        merge_rebalance_status_refresh(&mut current, persisted);
+
+        let refreshed = current.as_ref().expect("persisted metadata should replace stale memory");
+        assert_eq!(refreshed.id, "new-terminal-id");
+        assert_eq!(refreshed.pool_stats[0].info.status, RebalStatus::Completed);
+        assert!(refreshed.cancel.is_none());
     }
 }

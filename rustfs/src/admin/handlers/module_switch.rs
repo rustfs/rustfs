@@ -16,6 +16,7 @@ use crate::admin::{
     auth::validate_admin_request,
     router::{AdminOperation, Operation, S3Router},
 };
+use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
     ADMIN_PREFIX, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, RemoteAddr, current_module_switch_snapshot,
@@ -62,10 +63,22 @@ struct ModuleSwitchesResponse {
     persisted_audit_enabled: bool,
     notify_source: ModuleSwitchSource,
     audit_source: ModuleSwitchSource,
+    admin_discovery: ModuleSwitchDiscovery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+struct ModuleSwitchDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: &'static str,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: &'static str,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: &'static str,
 }
 
 impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
     fn from(value: ModuleSwitchSnapshot) -> Self {
+        let usecase = DefaultAdminUsecase::from_global();
         Self {
             notify_enabled: value.notify_enabled,
             audit_enabled: value.audit_enabled,
@@ -73,6 +86,11 @@ impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
             persisted_audit_enabled: value.persisted_audit_enabled,
             notify_source: value.notify_source,
             audit_source: value.audit_source,
+            admin_discovery: ModuleSwitchDiscovery {
+                runtime_capabilities: usecase.runtime_capabilities_route(),
+                cluster_snapshot: usecase.cluster_snapshot_route(),
+                extensions_catalog: usecase.extensions_catalog_route(),
+            },
         }
     }
 }
@@ -195,6 +213,8 @@ impl Operation for UpdateModuleSwitchesHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::{ModuleSwitchDiscovery, ModuleSwitchSource, ModuleSwitchesResponse};
+
     #[test]
     fn module_switch_handlers_require_admin_authorization_contract() {
         let src = include_str!("module_switch.rs");
@@ -213,6 +233,28 @@ mod tests {
             put_block.contains("authorize_module_switch_request(&req, AdminAction::ConfigUpdateAdminAction).await?;"),
             "module switch PUT should require ConfigUpdateAdminAction"
         );
+    }
+
+    #[test]
+    fn module_switch_response_exposes_admin_discovery_paths() {
+        let response = ModuleSwitchesResponse {
+            notify_enabled: true,
+            audit_enabled: false,
+            persisted_notify_enabled: true,
+            persisted_audit_enabled: false,
+            notify_source: ModuleSwitchSource::Console,
+            audit_source: ModuleSwitchSource::Console,
+            admin_discovery: ModuleSwitchDiscovery {
+                runtime_capabilities: "/rustfs/admin/v4/runtime/capabilities",
+                cluster_snapshot: "/rustfs/admin/v4/cluster/snapshot",
+                extensions_catalog: "/rustfs/admin/v4/extensions/catalog",
+            },
+        };
+
+        let value = serde_json::to_value(response).expect("module switch response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 
     fn extract_block_between_markers<'a>(src: &'a str, start_marker: &str, end_marker: &str) -> &'a str {

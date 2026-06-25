@@ -42,6 +42,7 @@ mod pools;
 mod rebalance;
 mod rio;
 mod rpc;
+mod runtime_sources;
 mod set_disk;
 mod sets;
 mod storage_api_contracts;
