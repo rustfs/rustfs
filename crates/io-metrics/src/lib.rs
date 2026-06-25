@@ -261,6 +261,16 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
     histogram!("rustfs_io_get_object_buffer_size_bytes").record(buffer_size_bytes as f64);
 }
 
+/// Record the streaming strategy chosen for a GetObject response body.
+#[inline(always)]
+pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
+    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
+    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
+        .record(buffer_size_bytes as f64);
+    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
+        .record(response_size_bytes.max(0) as f64);
+}
+
 /// Record I/O queue congestion observation.
 #[inline(always)]
 pub fn record_io_queue_congestion() {
