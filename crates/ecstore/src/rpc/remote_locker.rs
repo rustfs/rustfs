@@ -122,25 +122,21 @@ impl RemoteClient {
         resources.join(", ")
     }
 
-    fn rpc_timeout(timeout_duration: Duration) -> Duration {
-        if timeout_duration.is_zero() {
-            Duration::from_millis(1)
-        } else {
-            timeout_duration
-        }
+    fn rpc_timeout() -> Duration {
+        Duration::from_millis(
+            rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS,
+                rustfs_config::DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS,
+            )
+            .max(1),
+        )
     }
 
-    async fn execute_rpc<T, F>(
-        &self,
-        op: &'static str,
-        timeout_duration: Duration,
-        resource_summary: &str,
-        future: F,
-    ) -> std::result::Result<T, LockError>
+    async fn execute_rpc<T, F>(&self, op: &'static str, resource_summary: &str, future: F) -> std::result::Result<T, LockError>
     where
         F: std::future::Future<Output = std::result::Result<T, tonic::Status>>,
     {
-        let lock_timeout = Self::rpc_timeout(timeout_duration);
+        let lock_timeout = Self::rpc_timeout();
         match timeout(lock_timeout, future).await {
             Ok(Ok(response)) => Ok(response),
             Ok(Err(err)) => {
@@ -216,15 +212,6 @@ impl RemoteClient {
             .collect()
     }
 
-    fn batch_rpc_timeout(requests: &[LockRequest]) -> Duration {
-        requests
-            .iter()
-            .map(|request| request.acquire_timeout)
-            .max()
-            .map(Self::rpc_timeout)
-            .unwrap_or_else(|| Duration::from_millis(1))
-    }
-
     fn build_lock_info(request: &LockRequest, lock_info_json: Option<String>) -> LockInfo {
         if let Some(lock_info_json) = lock_info_json {
             match serde_json::from_str::<LockInfo>(&lock_info_json) {
@@ -275,10 +262,7 @@ impl LockClient for RemoteClient {
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
 
-        let resp = match self
-            .execute_rpc("lock", request.acquire_timeout, &resource_summary, client.lock(req))
-            .await
-        {
+        let resp = match self.execute_rpc("lock", &resource_summary, client.lock(req)).await {
             Ok(resp) => resp.into_inner(),
             Err(err @ LockError::Timeout { .. }) => return Ok(Self::rpc_timeout_failure_response(request, &err)),
             Err(err) => return Ok(Self::rpc_failure_response(request, &err)),
@@ -317,7 +301,7 @@ impl LockClient for RemoteClient {
         });
 
         let resp = match self
-            .execute_rpc("lock_batch", Self::batch_rpc_timeout(requests), &resource_summary, client.lock_batch(req))
+            .execute_rpc("lock_batch", &resource_summary, client.lock_batch(req))
             .await
         {
             Ok(resp) => resp.into_inner(),
@@ -552,7 +536,7 @@ impl LockClient for RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_common::GLOBAL_CONN_MAP;
+    use crate::runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;
@@ -576,11 +560,11 @@ mod tests {
 
     async fn cache_lazy_channel(addr: &str) {
         let channel = TonicEndpoint::from_shared(addr.to_string()).unwrap().connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
+        runtime_sources::cache_test_node_channel(addr.to_string(), channel).await;
     }
 
     fn ensure_test_rpc_secret() {
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
     }
 
     fn test_lock_request(timeout_duration: Duration) -> LockRequest {
@@ -590,81 +574,110 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_remote_client_acquire_lock_respects_request_timeout_and_evicts_connection() {
+    #[serial_test::serial]
+    async fn test_remote_client_acquire_lock_uses_rpc_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
         let Some((addr, accept_task)) = spawn_hanging_listener().await else {
             return;
         };
         cache_lazy_channel(&addr).await;
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
-        let client = RemoteClient::new(addr.clone());
-        let request = test_lock_request(Duration::from_millis(50));
-        let started_at = tokio::time::Instant::now();
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"))], async {
+            let client = RemoteClient::new(addr.clone());
+            let request = test_lock_request(Duration::from_millis(5));
+            let started_at = tokio::time::Instant::now();
 
-        let response = client.acquire_lock(&request).await.unwrap();
+            let response = client.acquire_lock(&request).await.unwrap();
+            let elapsed = started_at.elapsed();
 
-        assert!(
-            started_at.elapsed() < Duration::from_secs(1),
-            "remote lock RPC should honor request timeout"
-        );
-        assert!(!response.success, "timed out lock acquisition should fail");
-        assert!(
-            response
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
-            "expected remote RPC timeout marker, got {:?}",
-            response.error
-        );
-        assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
-            "timeout should evict cached connection"
-        );
+            assert!(
+                elapsed >= Duration::from_millis(40),
+                "remote lock RPC should use configured transport timeout, got {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "test RPC timeout should keep the test fast, got {elapsed:?}"
+            );
+            assert!(!response.success, "timed out lock acquisition should fail");
+            assert!(
+                response
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+                "expected remote RPC timeout marker, got {:?}",
+                response.error
+            );
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "transport timeout should evict cached connection"
+            );
+        })
+        .await;
 
         accept_task.abort();
     }
 
     #[tokio::test]
-    async fn test_remote_client_acquire_locks_batch_respects_request_timeout_and_evicts_connection() {
+    #[serial_test::serial]
+    async fn test_remote_client_acquire_locks_batch_uses_rpc_timeout_and_evicts_connection() {
         ensure_test_rpc_secret();
         let Some((addr, accept_task)) = spawn_hanging_listener().await else {
             return;
         };
         cache_lazy_channel(&addr).await;
-        assert!(GLOBAL_CONN_MAP.read().await.contains_key(&addr));
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
-        let client = RemoteClient::new(addr.clone());
-        let requests = vec![test_lock_request(Duration::from_millis(50))];
-        let started_at = tokio::time::Instant::now();
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"))], async {
+            let client = RemoteClient::new(addr.clone());
+            let requests = vec![test_lock_request(Duration::from_millis(5))];
+            let started_at = tokio::time::Instant::now();
 
-        let responses = client.acquire_locks_batch(&requests).await.unwrap();
+            let responses = client.acquire_locks_batch(&requests).await.unwrap();
+            let elapsed = started_at.elapsed();
 
-        assert!(
-            started_at.elapsed() < Duration::from_secs(1),
-            "remote batch lock RPC should honor request timeout"
-        );
-        assert_eq!(responses.len(), 1);
-        assert!(!responses[0].success, "timed out batch lock acquisition should fail");
-        assert!(
-            responses[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Remote lock RPC timed out")),
-            "expected remote RPC timeout marker, got {:?}",
-            responses[0].error
-        );
-        assert!(
-            !GLOBAL_CONN_MAP.read().await.contains_key(&addr),
-            "batch timeout should evict cached connection"
-        );
+            assert!(
+                elapsed >= Duration::from_millis(40),
+                "remote batch lock RPC should use configured transport timeout, got {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "test RPC timeout should keep the test fast, got {elapsed:?}"
+            );
+            assert_eq!(responses.len(), 1);
+            assert!(!responses[0].success, "timed out batch lock acquisition should fail");
+            assert!(
+                responses[0]
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Remote lock RPC timed out")),
+                "expected remote RPC timeout marker, got {:?}",
+                responses[0].error
+            );
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "batch transport timeout should evict cached connection"
+            );
+        })
+        .await;
 
         accept_task.abort();
     }
 
     #[test]
-    fn test_remote_client_zero_timeout_is_clamped() {
-        assert_eq!(RemoteClient::rpc_timeout(Duration::ZERO), Duration::from_millis(1));
-        assert_eq!(RemoteClient::rpc_timeout(Duration::from_millis(25)), Duration::from_millis(25));
+    #[serial_test::serial]
+    fn test_remote_client_rpc_timeout_honors_configured_deadline() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, None::<&str>, || {
+            assert_eq!(
+                RemoteClient::rpc_timeout(),
+                Duration::from_millis(rustfs_config::DEFAULT_OBJECT_LOCK_RPC_TIMEOUT_MS)
+            );
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"), || {
+            assert_eq!(RemoteClient::rpc_timeout(), Duration::from_millis(50));
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("0"), || {
+            assert_eq!(RemoteClient::rpc_timeout(), Duration::from_millis(1));
+        });
     }
 }

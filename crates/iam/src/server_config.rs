@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config};
+use rustfs_config::server_config::Config as ServerConfig;
 
 pub(crate) fn current_server_config() -> Option<ServerConfig> {
-    get_global_server_config()
+    crate::runtime_sources::current_server_config()
 }

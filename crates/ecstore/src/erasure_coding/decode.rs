@@ -14,20 +14,91 @@
 
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
+use crate::erasure_codec::workspace::ShardBufferPool;
 use crate::erasure_coding::{BitrotReader, Erasure};
 use crate::get_diagnostics::{
-    GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GetObjectFailureReason, classify_io_error,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_OUTCOME_ERROR, GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS,
+    GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ,
+    GET_STAGE_STRIPE_READ_FIRST_SHARD, GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error,
     record_get_object_pipeline_failure,
 };
+use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
+use std::future::Future;
 use std::io;
 use std::io::ErrorKind;
+use std::pin::Pin;
 use std::time::Instant;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
+
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, Error>)> + Send + 'a>>;
+
+fn shard_role(index: usize, data_shards: usize) -> &'static str {
+    if index < data_shards {
+        GET_SHARD_ROLE_DATA
+    } else {
+        GET_SHARD_ROLE_PARITY
+    }
+}
+
+fn read_shard<'a, R>(
+    index: usize,
+    reader: &'a mut Option<BitrotReader<R>>,
+    recycled_buf: Option<Vec<u8>>,
+    shard_size: usize,
+    data_shards: usize,
+    metrics_path: Option<&'static str>,
+) -> ShardReadFuture<'a>
+where
+    R: AsyncRead + Unpin + Send + Sync + 'a,
+{
+    let role = shard_role(index, data_shards);
+    if let Some(reader) = reader {
+        Box::pin(async move {
+            let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
+            debug_assert_eq!(buf.len(), shard_size);
+            let read_start = Instant::now();
+            match reader.read(&mut buf).await {
+                Ok(n) => {
+                    buf.truncate(n);
+                    if let Some(path) = metrics_path {
+                        rustfs_io_metrics::record_get_object_shard_read(
+                            path,
+                            role,
+                            GET_SHARD_READ_OUTCOME_SUCCESS,
+                            n,
+                            read_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    (index, Ok(buf))
+                }
+                Err(e) => {
+                    if let Some(path) = metrics_path {
+                        rustfs_io_metrics::record_get_object_shard_read(
+                            path,
+                            role,
+                            GET_SHARD_READ_OUTCOME_ERROR,
+                            0,
+                            read_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    (index, Err(Error::from(e)))
+                }
+            }
+        })
+    } else {
+        Box::pin(async move {
+            if let Some(path) = metrics_path {
+                rustfs_io_metrics::record_get_object_shard_read(path, role, GET_SHARD_READ_OUTCOME_MISSING, 0, 0.0);
+            }
+            (index, Err(Error::FileNotFound))
+        })
+    }
+}
 
 pin_project! {
 pub(crate) struct ParallelReader<R> {
@@ -38,9 +109,10 @@ pub(crate) struct ParallelReader<R> {
     shard_file_size: usize,
     data_shards: usize,
     total_shards: usize,
-    // Shard buffers handed back by the caller to be reused by the next `read`,
-    // avoiding a per-stripe allocation + zero-fill on the object read hot path.
-    recycled: Vec<Option<Vec<u8>>>,
+    metrics_path: Option<&'static str>,
+    // Request-scoped shard buffers keyed by shard index. Keeping ownership in
+    // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
+    buffers: ShardBufferPool,
 }
 }
 
@@ -50,6 +122,16 @@ where
 {
     // Readers should handle disk errors before being passed in, ensuring each reader reaches the available number of BitrotReaders
     pub fn new(readers: Vec<Option<BitrotReader<R>>>, e: Erasure, offset: usize, total_length: usize) -> Self {
+        Self::new_with_metrics_path(readers, e, offset, total_length, None)
+    }
+
+    pub fn new_with_metrics_path(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+    ) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
@@ -64,7 +146,8 @@ where
             shard_file_size,
             data_shards: e.data_shards,
             total_shards: e.data_shards + e.parity_shards,
-            recycled: Vec::new(),
+            metrics_path,
+            buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
 }
@@ -92,76 +175,124 @@ where
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
 
-        // Reuse the previous stripe's shard buffers instead of allocating and
-        // zero-filling a fresh `vec![0u8; shard_size]` per shard every stripe.
-        // `BitrotReader::read` overwrites `buf[..n]` and the caller truncates to
-        // `n`, so leftover bytes from the prior stripe are never observed.
-        let mut recycled = std::mem::take(&mut self.recycled);
-        recycled.resize_with(num_readers, || None);
+        self.buffers.ensure_slots(num_readers);
 
-        let mut futures = Vec::with_capacity(self.total_shards);
         let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
-        for (i, reader) in reader_iter.enumerate() {
-            let future = if let Some(reader) = reader {
-                // Only claim a recycled buffer when a shard will actually be read
-                // into it; missing shards are reconstructed by `decode_data`.
-                let recycled_buf = recycled[i].take();
-                Box::pin(async move {
-                    let mut buf = recycled_buf.unwrap_or_default();
-                    buf.resize(shard_size, 0);
-                    match reader.read(&mut buf).await {
-                        Ok(n) => {
-                            buf.truncate(n);
-                            (i, Ok(buf))
-                        }
-                        Err(e) => (i, Err(Error::from(e))),
-                    }
-                }) as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            } else {
-                // Return FileNotFound error when reader is None
-                Box::pin(async move { (i, Err(Error::FileNotFound)) })
-                    as std::pin::Pin<Box<dyn std::future::Future<Output = (usize, Result<Vec<u8>, Error>)> + Send>>
-            };
-
-            futures.push(future);
-        }
-
-        if futures.len() >= self.data_shards {
-            let mut fut_iter = futures.into_iter();
+        if num_readers >= self.data_shards {
+            let mut reader_iter = reader_iter.enumerate();
             let mut sets = FuturesUnordered::new();
+            let stripe_read_start = Instant::now();
+            let mut scheduled = 0usize;
             for _ in 0..self.data_shards {
-                if let Some(future) = fut_iter.next() {
-                    sets.push(future);
+                if let Some((i, reader)) = reader_iter.next() {
+                    // Only claim a request-scoped buffer when a shard will actually be read.
+                    let recycled_buf = if reader.is_some() {
+                        Some(self.buffers.take(i, shard_size))
+                    } else {
+                        None
+                    };
+                    scheduled += 1;
+                    sets.push(read_shard(i, reader, recycled_buf, shard_size, self.data_shards, self.metrics_path));
                 }
             }
 
             let mut success = 0;
+            let mut completed = 0usize;
+            let mut failed = 0usize;
+            let mut first_shard_recorded = false;
+            let mut quorum_recorded = false;
             while let Some((i, result)) = sets.next().await {
+                completed += 1;
+                if !first_shard_recorded {
+                    if let Some(path) = self.metrics_path {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            path,
+                            GET_STAGE_STRIPE_READ_FIRST_SHARD,
+                            stripe_read_start.elapsed().as_secs_f64(),
+                        );
+                    }
+                    first_shard_recorded = true;
+                }
+
                 match result {
                     Ok(v) => {
                         shards[i] = Some(v);
                         success += 1;
                     }
                     Err(e) => {
+                        failed += 1;
                         errs[i] = Some(e);
 
-                        if let Some(future) = fut_iter.next() {
-                            sets.push(future);
+                        if let Some((next_i, next_reader)) = reader_iter.next() {
+                            let recycled_buf = if next_reader.is_some() {
+                                Some(self.buffers.take(next_i, shard_size))
+                            } else {
+                                None
+                            };
+                            scheduled += 1;
+                            sets.push(read_shard(
+                                next_i,
+                                next_reader,
+                                recycled_buf,
+                                shard_size,
+                                self.data_shards,
+                                self.metrics_path,
+                            ));
                         }
                     }
                 }
 
                 if success >= self.data_shards {
+                    if let Some(path) = self.metrics_path {
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            path,
+                            GET_STAGE_STRIPE_READ_QUORUM,
+                            stripe_read_start.elapsed().as_secs_f64(),
+                        );
+                        rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
+                    }
+                    quorum_recorded = true;
                     break;
                 }
+            }
+
+            if !quorum_recorded && let Some(path) = self.metrics_path {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    path,
+                    GET_STAGE_STRIPE_READ_QUORUM,
+                    stripe_read_start.elapsed().as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
             }
         }
 
         (shards, errs)
     }
 
+    pub fn recycle_shards(&mut self, shards: &mut [Option<Vec<u8>>]) {
+        for (i, reader) in self.readers.iter().enumerate() {
+            if reader.is_some()
+                && let Some(buf) = shards.get_mut(i).and_then(Option::take)
+            {
+                self.buffers.put(i, buf);
+            }
+        }
+    }
+
     pub fn can_decode(&self, shards: &[Option<Vec<u8>>]) -> bool {
         shards.iter().filter(|s| s.is_some()).count() >= self.data_shards
+    }
+}
+
+#[async_trait::async_trait]
+impl<R> ShardStripeSource for ParallelReader<R>
+where
+    R: AsyncRead + Unpin + Send + Sync,
+{
+    async fn read_next_stripe(&mut self) -> StripeReadState {
+        let read_quorum = self.data_shards;
+        let (shards, errors) = ParallelReader::read(self).await;
+        StripeReadState::from_parts(shards, errors, read_quorum)
     }
 }
 
@@ -333,7 +464,13 @@ impl Erasure {
 
         let mut written = 0;
 
-        let mut reader = ParallelReader::new(readers, self.clone(), offset, total_length);
+        let mut reader = ParallelReader::new_with_metrics_path(
+            readers,
+            self.clone(),
+            offset,
+            total_length,
+            Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+        );
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
@@ -449,16 +586,9 @@ impl Erasure {
 
             written += n;
 
-            // Hand this stripe's buffers back so the next `read` reuses them.
-            // Only retain slots with an active reader; missing shards are always
-            // re-allocated by `decode_data`, so retaining their buffers here would
-            // hold memory that `read` can never reuse.
-            for (i, r) in reader.readers.iter().enumerate() {
-                if r.is_none() {
-                    shards[i] = None;
-                }
-            }
-            reader.recycled = shards;
+            // Hand active-reader buffers back so the next stripe can reuse them
+            // without retaining offline shard data that cannot be read again.
+            reader.recycle_shards(&mut shards);
         }
 
         if ret_err.is_some() {

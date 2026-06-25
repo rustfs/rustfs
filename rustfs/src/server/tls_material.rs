@@ -20,7 +20,7 @@
 //! (system roots, leaf-as-CA, mTLS env-var path overrides) and builds the server
 //! TLS acceptor directly from the pre-loaded server material — no double reads.
 
-use crate::app::context::resolve_outbound_tls_generation;
+use crate::startup_runtime_sources;
 use rustfs_common::MtlsIdentityPem;
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
@@ -30,8 +30,7 @@ use rustfs_config::{
 };
 use rustfs_tls_runtime::{
     ServerTlsMaterial as RuntimeServerTlsMaterial, TlsGeneration, TlsSource, WebPkiClientVerifierOptions,
-    build_webpki_client_verifier, create_multi_cert_resolver, publish_global_outbound_tls_state, record_tls_generation,
-    record_tls_reload_result, record_tls_reload_skipped,
+    build_webpki_client_verifier, create_multi_cert_resolver,
 };
 use rustfs_utils::{get_env_bool, get_env_opt_str};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
@@ -541,7 +540,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
             match rustfs_tls_runtime::TlsMaterialSnapshot::load(&tls_source).await {
                 Ok(mut snapshot) => {
                     if let Err(e) = enrich_outbound(&mut snapshot.outbound, &tls_dir).await {
-                        record_tls_reload_result("rustfs_server_reload_loop", "enrich_err", None, None);
+                        startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "enrich_err", None, None);
                         warn!(
                             component = LOG_COMPONENT_TLS,
                             subsystem = LOG_SUBSYSTEM_TLS,
@@ -553,9 +552,9 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                         continue;
                     }
 
-                    let generation = resolve_outbound_tls_generation().0.saturating_add(1);
-                    publish_global_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
-                    record_tls_generation("rustfs_server_reload_loop", generation);
+                    let generation = startup_runtime_sources::current_outbound_tls_generation().saturating_add(1);
+                    startup_runtime_sources::publish_outbound_tls_state(TlsGeneration(generation), &snapshot.outbound).await;
+                    startup_runtime_sources::record_tls_generation("rustfs_server_reload_loop", generation);
                     if !snapshot.outbound.root_ca_pem.is_empty() {
                         info!(
                             component = LOG_COMPONENT_TLS,
@@ -578,10 +577,15 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                                 "TLS reload state changed"
                             );
                             holder.swap(&new_holder);
-                            record_tls_reload_result("rustfs_server_reload_loop", "ok", None, Some(generation));
+                            startup_runtime_sources::record_tls_reload_result(
+                                "rustfs_server_reload_loop",
+                                "ok",
+                                None,
+                                Some(generation),
+                            );
                         }
                         Ok(None) => {
-                            record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
+                            startup_runtime_sources::record_tls_reload_skipped("rustfs_server_reload_loop", "no_acceptor");
                             warn!(
                                 component = LOG_COMPONENT_TLS,
                                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -592,7 +596,12 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                             )
                         }
                         Err(e) => {
-                            record_tls_reload_result("rustfs_server_reload_loop", "acceptor_err", None, Some(generation));
+                            startup_runtime_sources::record_tls_reload_result(
+                                "rustfs_server_reload_loop",
+                                "acceptor_err",
+                                None,
+                                Some(generation),
+                            );
                             warn!(
                                 component = LOG_COMPONENT_TLS,
                                 subsystem = LOG_SUBSYSTEM_TLS,
@@ -606,7 +615,7 @@ pub(crate) fn spawn_reload_loop(tls_path: String, holder: Arc<TlsAcceptorHolder>
                     }
                 }
                 Err(e) => {
-                    record_tls_reload_result("rustfs_server_reload_loop", "load_err", None, None);
+                    startup_runtime_sources::record_tls_reload_result("rustfs_server_reload_loop", "load_err", None, None);
                     warn!(
                         component = LOG_COMPONENT_TLS,
                         subsystem = LOG_SUBSYSTEM_TLS,

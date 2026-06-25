@@ -49,4 +49,4 @@ criterion = { workspace = true }
 serial_test = { workspace = true }
 temp-env = { workspace = true, features = ["async_closure"] }
 tempfile = { workspace = true }
-tokio = { workspace = true, features = ["test-util"] }
+tokio = { workspace = true, features = ["test-util", "macros", "rt"] }

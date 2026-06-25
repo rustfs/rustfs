@@ -14,6 +14,7 @@
 
 mod bitrot;
 pub mod decode;
+pub mod decode_reader;
 pub mod encode;
 pub mod erasure;
 pub mod heal;

@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::metrics;
+use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::resolve_endpoints_handle;
 use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
-use crate::app::context::resolve_endpoints_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -25,6 +25,7 @@ use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
+use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
 use rustfs_storage_api::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -149,6 +150,36 @@ impl Operation for ServiceHandle {
 
 pub struct ServerInfoHandler {}
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct SystemAdminDiscovery {
+    #[serde(rename = "runtimeCapabilities")]
+    runtime_capabilities: String,
+    #[serde(rename = "clusterSnapshot")]
+    cluster_snapshot: String,
+    #[serde(rename = "extensionsCatalog")]
+    extensions_catalog: String,
+}
+
+#[derive(Serialize)]
+struct ServerInfoResponse {
+    info: InfoMessage,
+    admin_discovery: SystemAdminDiscovery,
+}
+
+#[derive(Serialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+    admin_discovery: SystemAdminDiscovery,
+}
+
+fn system_admin_discovery(usecase: &DefaultAdminUsecase) -> SystemAdminDiscovery {
+    SystemAdminDiscovery {
+        runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
+        cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
+        extensions_catalog: usecase.extensions_catalog_route().to_string(),
+    }
+}
+
 #[async_trait::async_trait]
 impl Operation for ServerInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
@@ -177,8 +208,12 @@ impl Operation for ServerInfoHandler {
             .await
             .map_err(S3Error::from)?
             .info;
+        let response = ServerInfoResponse {
+            info,
+            admin_discovery: system_admin_discovery(&usecase),
+        };
 
-        let data = serde_json::to_vec(&info).map_err(|e| {
+        let data = serde_json::to_vec(&response).map_err(|e| {
             log_system_request_failed!("query_server_info", "serialize_server_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "parse serverInfo failed")
         })?;
@@ -227,8 +262,12 @@ impl Operation for StorageInfoHandler {
 
         let usecase = DefaultAdminUsecase::from_global();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
+        let response = StorageInfoResponse {
+            info,
+            admin_discovery: system_admin_discovery(&usecase),
+        };
 
-        let data = serde_json::to_vec(&info).map_err(|e| {
+        let data = serde_json::to_vec(&response).map_err(|e| {
             log_system_request_failed!("query_storage_info", "serialize_storage_info_failed", e);
             S3Error::with_message(S3ErrorCode::InternalError, "failed to serialize storage info")
         })?;
@@ -250,11 +289,14 @@ pub struct RuntimeCapabilitiesSummary {
     pub memory_sampling: CapabilityStatus,
     pub platform: CapabilityStatus,
     pub topology: CapabilityStatus,
+    pub cluster_snapshot: CapabilityStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
+    pub cluster_snapshot_path: String,
+    pub cluster_snapshot_summary: Option<CapabilityStatus>,
     pub observability: rustfs_storage_api::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
@@ -265,9 +307,11 @@ pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
 -> Result<RuntimeCapabilitiesResponse, rustfs_storage_api::CapabilitySnapshotError> {
+    let usecase = DefaultAdminUsecase::from_global();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
+    let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
 
     let (topology, topology_status) = if let Some(endpoint_pools) = resolve_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
@@ -276,10 +320,17 @@ pub(crate) async fn build_runtime_capabilities_response()
     } else {
         (None, CapabilityStatus::unknown().with_reason(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE))
     };
-    let summary = build_runtime_capabilities_summary(&observability, topology.as_ref(), &topology_status);
+    let summary = build_runtime_capabilities_summary(
+        &observability,
+        topology.as_ref(),
+        &topology_status,
+        cluster_snapshot_discovery.summary.as_ref(),
+    );
 
     Ok(RuntimeCapabilitiesResponse {
         summary,
+        cluster_snapshot_path: usecase.cluster_snapshot_route().to_string(),
+        cluster_snapshot_summary: cluster_snapshot_discovery.summary,
         observability,
         workload_admission,
         topology,
@@ -291,6 +342,7 @@ fn build_runtime_capabilities_summary(
     observability: &rustfs_storage_api::ObservabilitySnapshot,
     topology: Option<&TopologySnapshot>,
     topology_status: &CapabilityStatus,
+    cluster_snapshot_summary: Option<&CapabilityStatus>,
 ) -> RuntimeCapabilitiesSummary {
     let userspace_profiling = summarize_named_capability_statuses(
         [
@@ -347,6 +399,9 @@ fn build_runtime_capabilities_summary(
         memory_sampling,
         platform,
         topology: topology_summary,
+        cluster_snapshot: cluster_snapshot_summary.cloned().unwrap_or_else(|| {
+            CapabilityStatus::unknown().with_reason("cluster snapshot is not available before storage endpoint pools initialize")
+        }),
     }
 }
 
@@ -457,10 +512,12 @@ impl Operation for DataUsageInfoHandler {
 #[cfg(test)]
 mod tests {
     use super::{
-        OBSERVABILITY_SUMMARY_RESOLVED, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
-        build_runtime_capabilities_response, build_runtime_capabilities_summary,
+        OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
+        build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
+    use crate::app::admin_usecase::DefaultAdminUsecase;
     use rustfs_concurrency::{AdmissionState, WorkloadClass};
+    use rustfs_madmin::{InfoMessage, StorageInfo};
     use rustfs_storage_api::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
@@ -477,6 +534,9 @@ mod tests {
         assert_eq!(response.topology_status.reason.as_deref(), Some(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE));
         assert_eq!(response.summary.topology.state, CapabilityState::Unknown);
         assert_eq!(response.summary.topology.reason.as_deref(), Some(TOPOLOGY_SNAPSHOT_NOT_AVAILABLE));
+        assert_eq!(response.cluster_snapshot_path, "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(response.cluster_snapshot_summary, None);
+        assert_eq!(response.summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert_eq!(response.observability.platform.os.as_deref(), Some(std::env::consts::OS));
         assert_eq!(
             response
@@ -493,6 +553,49 @@ mod tests {
             Some(AdmissionState::Disabled)
         );
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
+    }
+
+    #[test]
+    fn server_info_response_exposes_admin_discovery_paths() {
+        let usecase = DefaultAdminUsecase::without_context();
+        let response = ServerInfoResponse {
+            info: InfoMessage {
+                mode: None,
+                domain: None,
+                region: None,
+                sqs_arn: None,
+                deployment_id: None,
+                buckets: None,
+                objects: None,
+                versions: None,
+                delete_markers: None,
+                usage: None,
+                services: None,
+                backend: None,
+                servers: None,
+                pools: None,
+            },
+            admin_discovery: system_admin_discovery(&usecase),
+        };
+
+        let value = serde_json::to_value(response).expect("server info response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
+    }
+
+    #[test]
+    fn storage_info_response_exposes_admin_discovery_paths() {
+        let usecase = DefaultAdminUsecase::without_context();
+        let response = super::StorageInfoResponse {
+            info: StorageInfo::default(),
+            admin_discovery: system_admin_discovery(&usecase),
+        };
+
+        let value = serde_json::to_value(response).expect("storage info response should serialize");
+        assert_eq!(value["admin_discovery"]["runtimeCapabilities"], "/rustfs/admin/v4/runtime/capabilities");
+        assert_eq!(value["admin_discovery"]["clusterSnapshot"], "/rustfs/admin/v4/cluster/snapshot");
+        assert_eq!(value["admin_discovery"]["extensionsCatalog"], "/rustfs/admin/v4/extensions/catalog");
     }
 
     #[test]
@@ -529,7 +632,12 @@ mod tests {
             },
         };
 
-        let summary = build_runtime_capabilities_summary(&observability, Some(&topology), &CapabilityStatus::supported());
+        let summary = build_runtime_capabilities_summary(
+            &observability,
+            Some(&topology),
+            &CapabilityStatus::supported(),
+            Some(&CapabilityStatus::supported().with_reason("cluster snapshot is available")),
+        );
 
         assert_eq!(summary.observability.state, CapabilityState::Supported);
         assert_eq!(summary.observability.reason.as_deref(), Some(OBSERVABILITY_SUMMARY_RESOLVED));
@@ -538,6 +646,7 @@ mod tests {
         assert_eq!(summary.platform.state, CapabilityState::Supported);
         assert_eq!(summary.topology.state, CapabilityState::Supported);
         assert_eq!(summary.topology.reason.as_deref(), Some(TOPOLOGY_SUMMARY_RESOLVED));
+        assert_eq!(summary.cluster_snapshot.state, CapabilityState::Supported);
     }
 
     #[test]
@@ -574,13 +683,19 @@ mod tests {
             },
         };
 
-        let summary = build_runtime_capabilities_summary(&observability, Some(&topology), &CapabilityStatus::supported());
+        let summary = build_runtime_capabilities_summary(
+            &observability,
+            Some(&topology),
+            &CapabilityStatus::supported(),
+            Some(&CapabilityStatus::unknown().with_reason("cluster snapshot unresolved")),
+        );
 
         assert_eq!(summary.observability.state, CapabilityState::Unknown);
         assert_eq!(summary.userspace_profiling.state, CapabilityState::Unknown);
         assert_eq!(summary.memory_sampling.state, CapabilityState::Unknown);
         assert_eq!(summary.platform.state, CapabilityState::Unknown);
         assert_eq!(summary.topology.state, CapabilityState::Unknown);
+        assert_eq!(summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert!(
             summary
                 .userspace_profiling

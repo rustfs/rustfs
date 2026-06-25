@@ -164,6 +164,7 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
 mod tests {
     use super::*;
     use crate::rpc::context_propagation::REQUEST_ID_HEADER;
+    use crate::runtime_sources;
     use http::{HeaderMap, Method};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};
@@ -215,7 +216,7 @@ mod tests {
     }
 
     fn ensure_test_rpc_secret() {
-        let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set("test-rpc-secret".to_string());
+        runtime_sources::ensure_test_rpc_secret();
     }
 
     #[test]
