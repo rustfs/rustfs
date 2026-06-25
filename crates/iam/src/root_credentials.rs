@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_credentials::{Credentials, get_global_action_cred};
+use rustfs_credentials::Credentials;
 
 pub(crate) fn credentials() -> Option<Credentials> {
-    get_global_action_cred()
+    crate::runtime_sources::action_credentials()
 }
 
 pub(crate) fn credentials_or_default() -> Credentials {

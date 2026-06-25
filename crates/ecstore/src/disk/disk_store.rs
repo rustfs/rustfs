@@ -23,7 +23,7 @@ use crate::disk::{
     },
     local::{LocalDisk, ScanGuard},
 };
-use crate::global::GLOBAL_LOCAL_DISK_ID_MAP;
+use crate::runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
@@ -962,13 +962,7 @@ impl LocalDiskWrapper {
         drop(disk_id);
 
         if self.disk.is_local() {
-            let mut disk_id_map = GLOBAL_LOCAL_DISK_ID_MAP.write().await;
-            if let Some(previous_id) = previous {
-                disk_id_map.remove(&previous_id);
-            }
-            if let Some(current_id) = id {
-                disk_id_map.insert(current_id, self.disk.endpoint().to_string());
-            }
+            runtime_sources::replace_local_disk_id(previous, id, self.disk.endpoint().to_string()).await;
         }
         Ok(())
     }

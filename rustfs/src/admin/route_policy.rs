@@ -235,6 +235,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         DECOMMISSION,
         RouteRiskLevel::High,
     ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/decommission/status",
+        DECOMMISSION,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(HttpMethod::Post, "/rustfs/admin/v3/pools/cancel", DECOMMISSION, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/pools/clear", DECOMMISSION, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/rebalance/start", REBALANCE, RouteRiskLevel::High),
@@ -338,6 +344,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::Sensitive,
     ),
     admin(HttpMethod::Put, "/rustfs/admin/v3/module-switches", CONFIG_UPDATE, RouteRiskLevel::High),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v4/cluster/snapshot",
+        SERVER_INFO,
+        RouteRiskLevel::Sensitive,
+    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v4/extensions/catalog",
