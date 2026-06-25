@@ -1185,7 +1185,7 @@ impl std::error::Error for TableCatalogStoreError {}
 
 pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
 
-fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreResult<String> {
+fn normalize_warehouse_object_prefix(object_prefix: &str, max_prefix_depth: Option<usize>) -> TableCatalogStoreResult<String> {
     let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
     if object_prefix.is_empty() {
         return Err(TableCatalogStoreError::Invalid(
@@ -1206,7 +1206,7 @@ fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreRe
             ));
         }
     }
-    if segment_count > WAREHOUSE_INDEX_MAX_PREFIX_DEPTH {
+    if max_prefix_depth.is_some_and(|max_prefix_depth| segment_count > max_prefix_depth) {
         return Err(TableCatalogStoreError::Invalid(
             "table warehouse location exceeds the maximum prefix depth".to_string(),
         ));
@@ -1217,7 +1217,11 @@ fn normalize_warehouse_object_prefix(object_prefix: &str) -> TableCatalogStoreRe
     Ok(normalized)
 }
 
-fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+fn warehouse_object_prefix_from_location(
+    table_bucket: &str,
+    warehouse_location: &str,
+    max_prefix_depth: Option<usize>,
+) -> TableCatalogStoreResult<String> {
     let location = warehouse_location
         .strip_prefix("s3://")
         .ok_or_else(|| TableCatalogStoreError::Invalid("table warehouse location must be an s3 URI".to_string()))?;
@@ -1229,11 +1233,23 @@ fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_loc
             "table warehouse location must be inside the table bucket".to_string(),
         ));
     }
-    normalize_warehouse_object_prefix(object_prefix)
+    normalize_warehouse_object_prefix(object_prefix, max_prefix_depth)
+}
+
+fn table_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+    warehouse_object_prefix_from_location(table_bucket, warehouse_location, Some(WAREHOUSE_INDEX_MAX_PREFIX_DEPTH))
+}
+
+fn view_warehouse_object_prefix_from_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<String> {
+    warehouse_object_prefix_from_location(table_bucket, warehouse_location, None)
 }
 
 pub(crate) fn validate_table_warehouse_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<()> {
     table_warehouse_object_prefix_from_location(table_bucket, warehouse_location).map(|_| ())
+}
+
+pub(crate) fn validate_view_warehouse_location(table_bucket: &str, warehouse_location: &str) -> TableCatalogStoreResult<()> {
+    view_warehouse_object_prefix_from_location(table_bucket, warehouse_location).map(|_| ())
 }
 
 pub(crate) fn table_warehouse_object_prefix(entry: &TableEntry) -> TableCatalogStoreResult<String> {
@@ -1264,14 +1280,31 @@ fn metadata_warehouse_location(
     table_bucket: &str,
     metadata_location: &str,
     metadata_object: &TableCatalogObject,
+    validate_location: fn(&str, &str) -> TableCatalogStoreResult<()>,
 ) -> TableCatalogStoreResult<Option<String>> {
     let metadata: serde_json::Value = serde_json::from_slice(&metadata_object.data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse new metadata {metadata_location}: {err}")))?;
     let Some(location) = metadata.get("location").and_then(serde_json::Value::as_str) else {
         return Ok(None);
     };
-    table_warehouse_object_prefix_from_location(table_bucket, location)?;
+    validate_location(table_bucket, location)?;
     Ok(Some(location.to_string()))
+}
+
+fn table_metadata_warehouse_location(
+    table_bucket: &str,
+    metadata_location: &str,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<Option<String>> {
+    metadata_warehouse_location(table_bucket, metadata_location, metadata_object, validate_table_warehouse_location)
+}
+
+fn view_metadata_warehouse_location(
+    table_bucket: &str,
+    metadata_location: &str,
+    metadata_object: &TableCatalogObject,
+) -> TableCatalogStoreResult<Option<String>> {
+    metadata_warehouse_location(table_bucket, metadata_location, metadata_object, validate_view_warehouse_location)
 }
 
 fn warehouse_index_candidate_prefixes(object: &str) -> Vec<&str> {
@@ -1458,6 +1491,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     }
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()>;
+
+    async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
+        self.delete_object(bucket, object).await
+    }
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>>;
 
@@ -2456,7 +2493,7 @@ where
             );
         };
         let next_warehouse_location =
-            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+            table_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let cas_started = Instant::now();
         let (result, snapshot, precondition, rollback_state) = {
@@ -2514,6 +2551,7 @@ where
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         validate_catalog_entry_version("view", entry.version)?;
+        validate_view_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let view = parse_table_for_store(&entry.view)?;
         let key = Self::table_key(&entry.table_bucket, &namespace, &view);
@@ -2585,7 +2623,7 @@ where
             )));
         };
         let next_warehouse_location =
-            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+            view_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let key = Self::table_key(&request.table_bucket, &namespace, &view);
         let mut state = self.state.lock().await;
@@ -2811,8 +2849,40 @@ where
         object: &str,
         index: &TableWarehouseIndexEntry,
         reason: &'static str,
+    ) -> TableCatalogStoreResult<bool> {
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), object).await?;
+        let Some((current, _)) = self
+            .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), object)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if current != *index {
+            tracing::warn!(
+                table_bucket = %index.table_bucket,
+                namespace = %index.namespace,
+                table = %index.table,
+                table_id = %index.table_id,
+                warehouse_object_prefix = %index.warehouse_object_prefix,
+                current_namespace = %current.namespace,
+                current_table = %current.table,
+                current_table_id = %current.table_id,
+                reason = %reason,
+                "skipped deleting table warehouse index because owner changed"
+            );
+            return Ok(false);
+        }
+        self.delete_warehouse_index_object_unlocked(object, index, reason).await?;
+        Ok(true)
+    }
+
+    async fn delete_warehouse_index_object_unlocked(
+        &self,
+        object: &str,
+        index: &TableWarehouseIndexEntry,
+        reason: &'static str,
     ) -> TableCatalogStoreResult<()> {
-        self.backend.delete_object(self.catalog_bucket(), object).await?;
+        self.backend.delete_object_unlocked(self.catalog_bucket(), object).await?;
         tracing::warn!(
             table_bucket = %index.table_bucket,
             namespace = %index.namespace,
@@ -2820,9 +2890,32 @@ where
             table_id = %index.table_id,
             warehouse_object_prefix = %index.warehouse_object_prefix,
             reason = %reason,
-            "deleted stale table warehouse index"
+            "deleted table warehouse index"
         );
         Ok(())
+    }
+
+    async fn replace_stale_table_warehouse_index(
+        &self,
+        object: &str,
+        stale: &TableWarehouseIndexEntry,
+        replacement: &TableWarehouseIndexEntry,
+        reason: &'static str,
+    ) -> TableCatalogStoreResult<bool> {
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), object).await?;
+        let Some((current, _)) = self
+            .read_entry_unlocked::<TableWarehouseIndexEntry>(self.catalog_bucket(), object)
+            .await?
+        else {
+            return Ok(false);
+        };
+        if current != *stale {
+            return Ok(false);
+        }
+        self.delete_warehouse_index_object_unlocked(object, stale, reason).await?;
+        self.write_entry_unlocked(self.catalog_bucket(), object, replacement, TableCatalogPutPrecondition::IfAbsent)
+            .await?;
+        Ok(true)
     }
 
     async fn reserve_table_warehouse_index(&self, entry: &TableEntry) -> TableCatalogStoreResult<WarehouseIndexReservation> {
@@ -2830,7 +2923,6 @@ where
         let object = self
             .paths
             .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix);
-        let mut repaired_stale_index = false;
         loop {
             match self
                 .write_entry(self.catalog_bucket(), &object, &index, TableCatalogPutPrecondition::IfAbsent)
@@ -2847,8 +2939,7 @@ where
                     if existing == index {
                         return Ok(WarehouseIndexReservation::AlreadyReserved);
                     }
-                    if repaired_stale_index
-                        || existing.table_bucket != index.table_bucket
+                    if existing.table_bucket != index.table_bucket
                         || existing.warehouse_object_prefix != index.warehouse_object_prefix
                         || self.warehouse_index_entry_has_active_owner(&existing).await?
                     {
@@ -2857,9 +2948,12 @@ where
                             index.warehouse_object_prefix
                         )));
                     }
-                    self.delete_warehouse_index_object(&object, &existing, "stale reservation conflict")
-                        .await?;
-                    repaired_stale_index = true;
+                    if self
+                        .replace_stale_table_warehouse_index(&object, &existing, &index, "stale reservation conflict")
+                        .await?
+                    {
+                        return Ok(WarehouseIndexReservation::Created);
+                    }
                 }
                 Err(err) => return Err(err),
             }
@@ -2874,6 +2968,7 @@ where
     ) -> TableCatalogStoreResult<()> {
         self.delete_warehouse_index_object(object, index, reason)
             .await
+            .map(|_| ())
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to delete stale warehouse index {object}: {err}")))
     }
 
@@ -2966,14 +3061,15 @@ where
         let Ok(index) = table_warehouse_index_entry(entry) else {
             return Ok(());
         };
-        self.backend
-            .delete_object(
-                self.catalog_bucket(),
-                &self
-                    .paths
-                    .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix),
-            )
-            .await
+        self.delete_warehouse_index_object(
+            &self
+                .paths
+                .warehouse_index_entry_path(&index.table_bucket, &index.warehouse_object_prefix),
+            &index,
+            "table warehouse index owner removed",
+        )
+        .await
+        .map(|_| ())
     }
 
     async fn delete_table_warehouse_index_if_changed(&self, current: &TableEntry, next: &TableEntry) {
@@ -3027,6 +3123,25 @@ where
         Ok(None)
     }
 
+    async fn backfill_active_table_warehouse_index(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<()> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+        let Some((current, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
+            return Ok(());
+        };
+        if current.state != TableCatalogEntryState::Active {
+            return Ok(());
+        }
+        self.reserve_table_warehouse_index(&current).await.map(|_| ())
+    }
+
     async fn backfill_table_warehouse_index(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
         let state_object = self.paths.warehouse_index_state_path(table_bucket);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &state_object).await?;
@@ -3041,7 +3156,10 @@ where
                 if table.state != TableCatalogEntryState::Active {
                     continue;
                 }
-                if let Err(err) = self.reserve_table_warehouse_index(&table).await {
+                if let Err(err) = self
+                    .backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
+                    .await
+                {
                     if matches!(&err, TableCatalogStoreError::Invalid(_)) {
                         tracing::warn!(
                             table_bucket = %table.table_bucket,
@@ -3154,7 +3272,7 @@ where
         self.require_table_bucket(&entry.table_bucket).await?;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let view = parse_table_for_store(&entry.view)?;
-        validate_table_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
+        validate_view_warehouse_location(&entry.table_bucket, &entry.warehouse_location)?;
         if self.get_namespace(&entry.table_bucket, &entry.namespace).await?.is_none() {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "namespace {}/{}",
@@ -5042,7 +5160,7 @@ where
             );
         };
         let next_warehouse_location =
-            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+            table_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let has_existing_commit = existing_commit.is_some();
         let mut staged_commit_log = existing_commit.unwrap_or_else(|| CommitLogEntry {
@@ -5158,10 +5276,8 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let object = self.paths.table_entry_path(table_bucket, &namespace, &table);
-        let Some(entry) = self
-            .load_table(table_bucket, &namespace.public_name(), table.as_str())
-            .await?
-        else {
+        let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &object).await?;
+        let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "table {}/{}/{}",
                 table_bucket,
@@ -5169,10 +5285,10 @@ where
                 table.as_str()
             )));
         };
-        self.backend.delete_object(self.catalog_bucket(), &object).await?;
+        self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await?;
         if let Err(err) = self.delete_table_warehouse_index(&entry).await {
             if let Err(restore_err) = self
-                .write_entry(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
+                .write_entry_unlocked(self.catalog_bucket(), &object, &entry, TableCatalogPutPrecondition::IfAbsent)
                 .await
             {
                 tracing::warn!(
@@ -5268,7 +5384,7 @@ where
             )));
         };
         let next_warehouse_location =
-            metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
+            view_metadata_warehouse_location(&request.table_bucket, &request.new_metadata_location, &new_metadata_object)?;
 
         let mut next = current;
         next.metadata_location = request.new_metadata_location;
@@ -5403,6 +5519,25 @@ where
 
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
         match self.store.delete_object(bucket, object, ObjectOptions::default()).await {
+            Ok(_) => Ok(()),
+            Err(err) if is_missing_storage_error(&err) => Ok(()),
+            Err(err) => Err(storage_error_to_catalog("delete catalog object", err)),
+        }
+    }
+
+    async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
+        match self
+            .store
+            .delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
             Ok(_) => Ok(()),
             Err(err) if is_missing_storage_error(&err) => Ok(()),
             Err(err) => Err(storage_error_to_catalog("delete catalog object", err)),
@@ -9056,7 +9191,7 @@ mod tests {
     #[derive(Clone, Default)]
     struct TestCatalogObjectBackend {
         state: std::sync::Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
-        write_lock: std::sync::Arc<tokio::sync::Mutex<()>>,
+        locks: std::sync::Arc<tokio::sync::Mutex<BTreeMap<(String, String), std::sync::Arc<tokio::sync::Mutex<()>>>>>,
     }
 
     #[derive(Default)]
@@ -9503,8 +9638,15 @@ mod tests {
                 .collect())
         }
 
-        async fn acquire_write_lock(&self, _bucket: &str, _object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
-            Ok(Box::new(self.write_lock.clone().lock_owned().await))
+        async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Box<dyn Send>> {
+            let lock = {
+                let mut locks = self.locks.lock().await;
+                locks
+                    .entry((bucket.to_string(), object.to_string()))
+                    .or_insert_with(|| std::sync::Arc::new(tokio::sync::Mutex::new(())))
+                    .clone()
+            };
+            Ok(Box::new(lock.lock_owned().await))
         }
     }
 
@@ -9686,8 +9828,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let v1 = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let v2 = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
         let current = default_table_metadata_file_path(&namespace, &table, "00003.metadata.json");
@@ -9951,7 +10093,7 @@ mod tests {
                 TableCatalogPutPrecondition::Any,
             )
             .await
-            .unwrap();
+            .expect("table bucket entry should be seeded");
         store
             .write_entry(
                 store.catalog_bucket(),
@@ -9989,6 +10131,69 @@ mod tests {
         assert_eq!(indexed_resource.table, "orders");
         assert_eq!(backend.list_call_count().await, 0);
         assert!(backend.read_call_count().await <= 5);
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_backfill_skips_table_deleted_after_listing() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let bucket_entry = test_bucket_entry(bucket);
+        let namespace_entry = test_namespace_entry(bucket, &namespace);
+        let table_entry = test_table_entry(bucket, &namespace, &table, current);
+        let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
+        let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
+
+        store
+            .write_entry(
+                store.catalog_bucket(),
+                &store.paths.table_bucket_entry_path(bucket),
+                &bucket_entry,
+                TableCatalogPutPrecondition::Any,
+            )
+            .await
+            .unwrap();
+        store
+            .write_entry(
+                store.catalog_bucket(),
+                &store.paths.namespace_entry_path(bucket, &namespace),
+                &namespace_entry,
+                TableCatalogPutPrecondition::Any,
+            )
+            .await
+            .expect("namespace entry should be seeded");
+        store
+            .write_entry(store.catalog_bucket(), &table_path, &table_entry, TableCatalogPutPrecondition::Any)
+            .await
+            .expect("table entry should be seeded without an index");
+
+        let listed = store
+            .list_tables(bucket, &namespace.public_name())
+            .await
+            .expect("table listing should succeed");
+        assert_eq!(listed.len(), 1);
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &table_path)
+            .await
+            .expect("listed table entry should be deleted before backfill");
+
+        for table in listed {
+            store
+                .backfill_active_table_warehouse_index(&table.table_bucket, &table.namespace, &table.table)
+                .await
+                .expect("backfill should skip a table deleted after listing");
+        }
+
+        assert!(
+            store
+                .read_entry::<TableWarehouseIndexEntry>(store.catalog_bucket(), &index_path)
+                .await
+                .expect("warehouse index lookup should succeed")
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -10139,15 +10344,18 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend);
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let view = IdentifierSegment::parse("recent_orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let view = IdentifierSegment::parse("recent_orders").expect("view should parse");
         let current = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
 
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .put_table_bucket(test_bucket_entry(bucket))
+            .await
+            .expect("table bucket should be created");
         store
             .create_namespace(test_namespace_entry(bucket, &namespace))
             .await
-            .unwrap();
+            .expect("namespace should be created");
 
         let mut entry = test_view_entry(bucket, &namespace, &view, current);
         entry.warehouse_location = format!("s3://{bucket}/views/../view-id");
@@ -10157,6 +10365,62 @@ mod tests {
             error,
             TableCatalogStoreError::Invalid(message) if message.contains("invalid path segment")
         ));
+    }
+
+    #[tokio::test]
+    async fn object_table_catalog_store_allows_deep_view_warehouse_location() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let view = IdentifierSegment::parse("recent_orders").unwrap();
+        let current = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+        let next = default_view_metadata_file_path(&namespace, &view, "00002.metadata.json");
+        let deep_prefix = (0..=WAREHOUSE_INDEX_MAX_PREFIX_DEPTH)
+            .map(|index| format!("level-{index}"))
+            .collect::<Vec<_>>()
+            .join("/");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+
+        let mut entry = test_view_entry(bucket, &namespace, &view, current.clone());
+        entry.warehouse_location = format!("s3://{bucket}/{deep_prefix}");
+        store
+            .create_view(entry)
+            .await
+            .expect("view warehouse location should not inherit table index depth limits");
+
+        let relocated_prefix = format!("{deep_prefix}/relocated");
+        backend
+            .seed_object(
+                bucket,
+                &next,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 1,
+                    "view-uuid": "view-uuid",
+                    "location": format!("s3://{bucket}/{relocated_prefix}")
+                }))
+                .expect("view metadata should serialize"),
+            )
+            .await;
+
+        let result = store
+            .replace_view(ViewCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                view: view.as_str().to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current,
+                new_metadata_location: next,
+            })
+            .await
+            .expect("view metadata location should not inherit table index depth limits");
+
+        assert_eq!(result.view.warehouse_location, format!("s3://{bucket}/{relocated_prefix}"));
     }
 
     #[tokio::test]
@@ -13647,10 +13911,11 @@ mod tests {
             .create_namespace(test_namespace_entry(bucket, &namespace))
             .await
             .unwrap();
+        let old_entry = test_table_entry(bucket, &namespace, &table, current_metadata.clone());
         store
-            .create_table(test_table_entry(bucket, &namespace, &table, current_metadata.clone()))
+            .create_table(old_entry.clone())
             .await
-            .unwrap();
+            .expect("old table should be created");
         backend
             .seed_object(
                 bucket,
@@ -13696,6 +13961,17 @@ mod tests {
             .expect("reused prefix index should exist");
         assert_eq!(index.table, "returns");
         assert_eq!(index.table_id, "next-table-id");
+
+        store
+            .delete_table_warehouse_index(&old_entry)
+            .await
+            .expect("old owner should not delete reused prefix index");
+        let reused_resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
+            .await
+            .expect("reused prefix lookup should succeed")
+            .expect("reused prefix should still resolve to the new table");
+        assert_eq!(reused_resource.table, "returns");
+        assert_eq!(reused_resource.table_id, "next-table-id");
     }
 
     #[tokio::test]
