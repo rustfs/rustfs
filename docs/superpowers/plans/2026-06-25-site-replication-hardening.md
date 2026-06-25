@@ -198,3 +198,131 @@ Update the PR draft with commands run, failures, skips, and remaining follow-up 
 git add docs/architecture/site-replication-hardening-pr.md
 git commit -m "docs: finalize site replication hardening notes"
 ```
+
+## Task 7: Extend Scope for Full Single-PR Completion
+
+**Files:**
+- Modify: `docs/superpowers/plans/2026-06-25-site-replication-hardening.md`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Record the expanded single-PR scope**
+
+Add follow-up tasks for MinIO wire compatibility, add preflight validation, bootstrap sync, lifecycle compatibility, durable retry, and repair.
+
+- [ ] **Step 2: Commit**
+
+```bash
+git add docs/superpowers/plans/2026-06-25-site-replication-hardening.md docs/architecture/site-replication-hardening-pr.md
+git commit -m "docs: expand site replication hardening scope"
+```
+
+## Task 8: MinIO-Compatible Peer Transport Contract
+
+**Files:**
+- Modify: `rustfs/src/admin/handlers/site_replication.rs`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Add peer admin path mapping**
+
+Route outbound peer requests through MinIO-compatible `/minio/admin/v3/site-replication/...` paths when talking to a MinIO-compatible peer, while preserving RustFS compatibility through the existing alias handling.
+
+- [ ] **Step 2: Add focused tests**
+
+Assert peer path mapping preserves the request path used for signing and URL construction.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
+git commit -m "fix: align site replication peer paths with minio"
+```
+
+## Task 9: Add-Time Topology Preflight
+
+**Files:**
+- Modify: `rustfs/src/admin/handlers/site_replication.rs`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Validate self, deployment identity, IDP, and initial data shape**
+
+Before persisting add state, fetch remote metainfo and IDP settings, reject duplicate deployment IDs, missing local site, existing site-replication topology gaps, IDP mismatch, and multiple non-empty initial sites.
+
+- [ ] **Step 2: Add focused tests**
+
+Cover pure topology validation for duplicate deployments, missing self, IDP mismatch, and more than one non-empty site.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
+git commit -m "fix: validate site replication add topology"
+```
+
+## Task 10: Full Bootstrap Sync
+
+**Files:**
+- Modify: `rustfs/src/admin/handlers/site_replication.rs`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Add snapshot bootstrap after add/join**
+
+Use `build_sr_info` as the canonical local snapshot and sync IAM and bucket metadata to peers after add, before object resync.
+
+- [ ] **Step 2: Add focused tests**
+
+Cover bootstrap task planning order and item counts without requiring live peers.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
+git commit -m "feat: bootstrap site replication metadata on add"
+```
+
+## Task 11: Lifecycle Compatibility
+
+**Files:**
+- Modify: `rustfs/src/app/bucket_usecase.rs`
+- Modify: `rustfs/src/admin/handlers/site_replication.rs`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Stop default full lifecycle replication**
+
+Only replicate lifecycle expiry metadata when `replicate_ilm_expiry` is enabled for site replication peers.
+
+- [ ] **Step 2: Add focused tests**
+
+Assert lifecycle metadata is skipped by default and included only for expiry-enabled peers.
+
+- [ ] **Step 3: Commit**
+
+```bash
+git add rustfs/src/app/bucket_usecase.rs rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
+git commit -m "fix: align lifecycle replication with minio semantics"
+```
+
+## Task 12: Durable Retry and Repair MVP
+
+**Files:**
+- Modify: `crates/madmin/src/site_replication.rs`
+- Modify: `rustfs/src/admin/handlers/site_replication.rs`
+- Modify: `docs/architecture/site-replication-hardening-pr.md`
+
+- [ ] **Step 1: Add minimal persistent retry queue**
+
+Record failed bucket/IAM/state replication events with peer, path, payload, retry count, and last error; expose pending/failed counts in status.
+
+- [ ] **Step 2: Add repair once operation**
+
+Provide an operation-level admin path that compares local snapshot to peer metainfo and replays missing metadata.
+
+- [ ] **Step 3: Add focused tests**
+
+Cover queue serialization, retry status summaries, and repair task generation.
+
+- [ ] **Step 4: Commit**
+
+```bash
+git add crates/madmin/src/site_replication.rs rustfs/src/admin/handlers/site_replication.rs docs/architecture/site-replication-hardening-pr.md
+git commit -m "feat: add site replication retry and repair MVP"
+```

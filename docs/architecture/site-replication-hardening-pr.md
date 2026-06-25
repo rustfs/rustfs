@@ -23,6 +23,9 @@ This PR hardens the site replication control plane in small, reviewable commits.
 5. `feat: expose site replication status diagnostics`
    - Purpose: add machine-readable peer fetch errors and pending operation progress to site replication status.
    - Reason: operators previously saw only `Unknown` sync state or logs when peer metainfo fetches failed or remove/rotation was pending, which made automation and troubleshooting unnecessarily opaque.
+6. `docs: expand site replication hardening scope`
+   - Purpose: keep the single-PR plan aligned with the expanded request to include MinIO compatibility, add preflight, bootstrap, lifecycle compatibility, retry, and repair work.
+   - Reason: the remaining work is larger than the first hardening pass, so reviewers need to see the intended sequence before more behavior changes land.
 
 ## Verification
 
@@ -52,4 +55,4 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 
 This PR intentionally keeps durable outbox/bootstrap/heal work as follow-up architecture unless the initial hardening steps require small supporting hooks.
 
-Follow-up work should still address MinIO wire-contract bootstrap validation, durable site-replication outbox/retry, full add-time IAM/bootstrap sync, and site-level heal/reconcile.
+The expanded single-PR scope also includes MinIO wire-contract bootstrap validation, durable site-replication retry, full add-time IAM/bootstrap sync, lifecycle compatibility, and site-level repair.
