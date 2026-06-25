@@ -15,11 +15,11 @@
 use super::super::ecstore_utils::serialize;
 use super::is_admin::IsAdminHandler;
 use crate::{
+    admin::runtime_sources::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     admin::{
         handlers::site_replication::site_replication_iam_change_hook,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     auth::{check_key_valid, extract_string_list_claim, get_session_token},
     server::ADMIN_PREFIX,
     server::RemoteAddr,
@@ -188,7 +188,7 @@ async fn handle_assume_role(
         return Err(s3_error!(InvalidRequest, "AccessDenied"));
     }
 
-    let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
     let conditions = crate::auth::get_condition_values(&headers, &cred, None, None, remote_addr);
@@ -441,7 +441,7 @@ pub async fn create_oidc_sts_credentials(
 
     // Store temp user in IAM
     let iam_store =
-        crate::app::context::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
+        crate::admin::runtime_sources::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "IAM not initialized"))?;
 
     let updated_at = iam_store
         .set_temp_user(&new_cred.access_key, &new_cred, None)

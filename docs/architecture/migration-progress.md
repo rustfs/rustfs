@@ -5,9 +5,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-runtime-sources`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203`.
-- Based on: stacked on PR #3828 head after PR #3827.
+- Branch: `overtrue/arch-admin-context-import-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207`.
+- Based on: stacked on PR #3846 head while PR #3846 is pending.
 - PR type for this branch: `consumer-migration`
 - Runtime behavior changes: none.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
@@ -43,7 +43,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   source helpers, plus AppContext fallback KMS/IAM/ECStore/config/metrics/TLS
   runtime source helpers, plus startup/root KMS, credentials, region,
   readiness-time, observability, metrics, buffer, and TLS runtime source
-  helpers,
+  helpers, plus server readiness/audit/event/module-switch runtime source
+  helpers, storage request/RPC/SSE runtime source helpers, and admin
+  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, and remaining admin grouped context import runtime source helpers,
   through AppContext-first or owner-crate resolver boundaries.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
@@ -53,8 +55,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions, plus IAM runtime-source bypasses;
   accept the reviewed AppContext resolver reverse dependencies in the layer
-  baseline.
-- Docs changes: record the API-136 through API-203 owner facade and lifecycle
+  baseline, and block direct admin AppContext resolver consumers outside the
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, and catch grouped AppContext imports.
+- Docs changes: record the API-136 through API-207 owner facade and lifecycle
   runtime-source cleanup.
 
 ## Phase 0 Tasks
@@ -4920,6 +4923,66 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     global scan, migration/layer guards, fast PR gate, and full PR gate before
     PR.
 
+- [x] `API-204` Centralize server and storage runtime source readers.
+  - Do: route server audit/event/module-switch/readiness/KMS health reads,
+    startup bucket replication-pool reads, and storage request/RPC/SSE runtime
+    reads through owner runtime-source boundaries.
+  - Acceptance: the migrated server/startup/storage files no longer import
+    AppContext resolvers directly, and migration rules reject reintroducing
+    those direct resolver reads outside the owner runtime-source modules.
+  - Must preserve: audit/notify module switch behavior, public health KMS
+    readiness behavior, dependency readiness cache behavior, bucket metadata
+    replication resync startup, buffer profile lookup, object-store lookup,
+    internode metrics recording, local-node naming, request credential/notify
+    dispatch, performance metrics, encryption service lookup, region lookup,
+    and IAM authorization behavior.
+  - Verification: focused RustFS storage/server compile and tests, formatting,
+    migration/layer guards, diff hygiene, residual direct AppContext scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-205` Centralize admin runtime source readers.
+  - Do: route admin handler, router, auth, console, and service runtime
+    AppContext resolver consumers through the admin runtime-source boundary.
+  - Acceptance: admin consumers no longer import AppContext resolvers directly,
+    and migration rules reject new direct admin AppContext resolver consumers
+    outside `rustfs/src/admin/runtime_sources.rs`.
+  - Must preserve: admin auth/authorization, IAM readiness errors, KMS manager
+    fallback, OIDC console behavior, replication status, site replication peer
+    TLS behavior, dynamic config publication, object-store reads, region
+    rendering, scanner reports, and bucket metadata/admin storage behavior.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-206` Centralize root, app, and storage RPC runtime source readers.
+  - Do: route root auth/init/config/protocol/workload consumers, app usecase
+    consumers, and storage node-service runtime resolver consumers through
+    root, app, or storage runtime-source boundaries.
+  - Acceptance: migrated root/app/storage consumers no longer import AppContext
+    resolvers directly, and migration rules reject reintroducing those direct
+    resolver reads outside the owner runtime-source modules.
+  - Must preserve: request credential lookup, IAM readiness checks, update and
+    notification startup behavior, runtime region and buffer config lookup,
+    workload admission replication status, S3 Select DB lookup, app-context
+    object-store/notification resolution, and node-service IAM/lock behavior.
+  - Verification: focused RustFS compile/tests, formatting, migration and layer
+    guards, diff hygiene, residual direct AppContext scan, Rust risk scan, fast
+    PR gate, and full PR gate before PR.
+
+- [x] `API-207` Close remaining admin grouped AppContext imports.
+  - Do: route grouped admin handler AppContext resolver imports through the
+    admin runtime-source boundary and extend migration rules to catch grouped
+    `app::context` imports.
+  - Acceptance: admin handlers no longer import AppContext resolvers directly,
+    including grouped `crate::{ app::context::... }` imports, and migration
+    rules reject reintroducing them.
+  - Must preserve: admin credential checks, STS OIDC/token-signing lookups,
+    pool/rebalance notification and object-store behavior, tier stats/config
+    behavior, and bucket metadata object-store access.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
@@ -4928,6 +4991,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-207 closes the remaining grouped admin AppContext imports behind the admin runtime-source boundary and tightens guard coverage. |
+| Migration preservation | pass | Admin credentials, STS, pool/rebalance, tier, and bucket metadata resolver behavior preserve existing AppContext fallback semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-206 keeps root, app usecase, and storage node-service AppContext resolver consumers behind owner runtime-source boundaries and adds regression guards. |
+| Migration preservation | pass | Request credentials, IAM readiness, startup notify/region, buffer config, workload admission, S3 Select, app-context object-store/notify, and node-service IAM/lock behavior preserve existing semantics. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-205 keeps direct admin AppContext resolver consumers behind the admin runtime-source boundary and adds a guard against regressions. |
+| Migration preservation | pass | Admin auth, IAM readiness, KMS manager fallback, site replication TLS, config publication, and object-store resolver behavior preserve existing semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-199 keeps RustFS test tier-config and TLS-generation mutation behind AppContext-owned runtime-source helpers and retires the stale tier-config test compat shim. |
 | Migration preservation | pass | Lifecycle transition tier registration and site replication peer-client generation-cache behavior preserve existing semantics. |
 | Testing/verification | pass | Focused RustFS tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |

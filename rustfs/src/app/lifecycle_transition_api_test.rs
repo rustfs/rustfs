@@ -21,7 +21,7 @@ use super::{
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::context::resolve_tier_config_handle;
+use crate::app::runtime_sources::resolve_tier_config_handle;
 use crate::storage::ecfs::FS;
 use crate::storage::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,

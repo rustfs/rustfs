@@ -23,6 +23,7 @@ mod module_switch;
 mod prefix;
 mod readiness;
 mod runtime;
+pub(crate) mod runtime_sources;
 mod service_state;
 pub mod tls_material;
 

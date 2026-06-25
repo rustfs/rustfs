@@ -19,7 +19,7 @@ use super::io_schedule::{
     get_advanced_buffer_size,
 };
 use super::request_guard::{GetObjectGuard, PutObjectGuard};
-use crate::app::context::resolve_performance_metrics;
+use crate::storage::runtime_sources;
 use rustfs_concurrency::{
     AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
     WorkloadAdmissionSnapshotProvider, WorkloadClass,
@@ -118,7 +118,7 @@ impl ConcurrencyManager {
 
         // Use global performance metrics instance for consistent metrics tracking
         // This allows AutoTuner and other components to access the same metrics data
-        let performance_metrics = resolve_performance_metrics();
+        let performance_metrics = runtime_sources::performance_metrics();
 
         // Initialize metrics collector for I/O latency tracking
         // Keep 1000 samples for P95/P99 calculation
@@ -235,7 +235,7 @@ impl ConcurrencyManager {
     ///
     /// Arc-wrapped PerformanceMetrics instance
     pub fn performance_metrics(&self) -> Arc<PerformanceMetrics> {
-        resolve_performance_metrics()
+        runtime_sources::performance_metrics()
     }
 
     /// Calculate an adaptive I/O strategy based on disk permit wait time.

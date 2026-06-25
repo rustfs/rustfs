@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::resolve_replication_pool_handle;
+use crate::runtime_sources::resolve_replication_pool_handle;
 use crate::storage::{bucket_metadata_runtime_initialized, replication_queue_current_count};
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,

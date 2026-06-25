@@ -16,7 +16,7 @@ use super::super::ecstore_utils::is_valid_object_prefix;
 use super::super::is_reserved_or_invalid_bucket;
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::resolve_object_store_handle;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use crate::storage::request_context::spawn_traced;

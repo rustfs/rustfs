@@ -24,7 +24,7 @@ use super::versioning_sys::BucketVersioningSys;
 use super::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::app::context::{
+use crate::admin::runtime_sources::{
     resolve_boot_time, resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system,
     resolve_object_store_handle, resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle,
     resolve_server_config,
