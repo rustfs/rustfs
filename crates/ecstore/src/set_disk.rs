@@ -152,6 +152,9 @@ const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
 static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
+const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
+static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
 use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -827,11 +830,29 @@ impl SmallWritePath {
             SmallWritePath::PipelineBatchedLarge => "write_pipeline_batched_large",
         }
     }
+
+    fn multipart_metric_label(&self) -> &'static str {
+        match self {
+            SmallWritePath::Inline => "multipart_write_inline",
+            SmallWritePath::SingleBlockNonInline => "multipart_write_single_block_non_inline",
+            SmallWritePath::Pipeline => "multipart_write_pipeline",
+            SmallWritePath::PipelineBatchedLarge => "multipart_write_pipeline_batched_large",
+        }
+    }
 }
 
 fn put_large_batch_min_size_bytes() -> usize {
     *CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES.get_or_init(|| {
         rustfs_utils::get_env_usize(ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES, DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES)
+    })
+}
+
+fn multipart_put_large_batch_min_size_bytes() -> usize {
+    *CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES,
+            DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES,
+        )
     })
 }
 
@@ -855,6 +876,17 @@ fn classify_put_write_path(is_inline_buffer: bool, object_size: i64, block_size:
 
     match usize::try_from(object_size) {
         Ok(size) if !is_inline_buffer && size >= put_large_batch_min_size_bytes() => SmallWritePath::PipelineBatchedLarge,
+        _ => SmallWritePath::Pipeline,
+    }
+}
+
+fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> SmallWritePath {
+    if should_use_single_block_non_inline_fast_path(false, object_size, block_size) {
+        return SmallWritePath::SingleBlockNonInline;
+    }
+
+    match usize::try_from(object_size) {
+        Ok(size) if size >= multipart_put_large_batch_min_size_bytes() => SmallWritePath::PipelineBatchedLarge,
         _ => SmallWritePath::Pipeline,
     }
 }
@@ -3392,6 +3424,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
         let mut errors = Vec::with_capacity(shuffle_disks.len());
@@ -3433,6 +3466,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             }
         }
 
+        if let Some(stage_start) = writer_setup_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_writer_setup",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
+
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
             if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
@@ -3442,12 +3482,16 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             return Err(Error::other(format!("not enough disks to write: {errors:?}")));
         }
 
+        // Capture the original part size before swapping the stream out for encoding.
+        let multipart_part_size = data.size();
         let stream = mem::replace(
             &mut data.stream,
             HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
         );
 
-        let write_path = classify_small_write_path(false, data.size(), fi.erasure.block_size);
+        let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);
+        rustfs_io_metrics::record_put_object_path(write_path.multipart_metric_label());
+        let encode_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let (reader, w_size) = match write_path {
             SmallWritePath::SingleBlockNonInline => {
@@ -3455,10 +3499,18 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
                     .encode_single_block_non_inline(stream, &mut writers, write_quorum)
                     .await?
             }
-            SmallWritePath::Inline | SmallWritePath::Pipeline | SmallWritePath::PipelineBatchedLarge => {
+            SmallWritePath::PipelineBatchedLarge => Arc::new(erasure).encode_batched(stream, &mut writers, write_quorum).await?,
+            SmallWritePath::Inline | SmallWritePath::Pipeline => {
                 Arc::new(erasure).encode(stream, &mut writers, write_quorum).await?
             }
         }; // TODO: delete temporary directory on error
+
+        if let Some(stage_start) = encode_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_set_disk_encode",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
+        }
 
         let _ = mem::replace(&mut data.stream, reader);
 
@@ -4337,6 +4389,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
             );
         }
 
+        let complete_tail_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
         self.cleanup_multipart_path(&parts).await;
 
         let (online_disks, versions, op_old_dir, cleanup_disks) = Self::rename_data(
@@ -4353,6 +4406,13 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
         if let Some(old_dir) = op_old_dir {
             self.commit_rename_data_dir(&cleanup_disks, bucket, object, &old_dir.to_string(), write_quorum)
                 .await?;
+        }
+
+        if let Some(stage_start) = complete_tail_stage_start {
+            rustfs_io_metrics::record_put_object_stage_duration(
+                "multipart_complete_tail",
+                stage_start.elapsed().as_secs_f64() * 1000.0,
+            );
         }
 
         drop(object_lock_guard); // drop object lock guard to release the lock
@@ -7490,6 +7550,35 @@ mod tests {
             classify_small_write_path(false, 4096, 4096),
             SmallWritePath::SingleBlockNonInline
         ));
+    }
+
+    #[test]
+    fn multipart_put_large_batch_path_only_applies_at_128m_and_above() {
+        assert!(matches!(
+            classify_multipart_part_write_path(128 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::PipelineBatchedLarge
+        ));
+        assert!(matches!(
+            classify_multipart_part_write_path(64 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_multipart_part_write_path(1024 * 1024, 1024 * 1024),
+            SmallWritePath::SingleBlockNonInline
+        ));
+    }
+
+    #[test]
+    fn multipart_write_paths_use_distinct_metric_labels() {
+        assert_eq!(SmallWritePath::Pipeline.multipart_metric_label(), "multipart_write_pipeline");
+        assert_eq!(
+            SmallWritePath::PipelineBatchedLarge.multipart_metric_label(),
+            "multipart_write_pipeline_batched_large"
+        );
+        assert_eq!(
+            SmallWritePath::SingleBlockNonInline.multipart_metric_label(),
+            "multipart_write_single_block_non_inline"
+        );
     }
 
     #[test]

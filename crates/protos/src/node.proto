@@ -253,12 +253,14 @@ message RenameDataRequest {
   string file_info = 4;
   string dst_volume = 5;
   string dst_path = 6;
+  bytes file_info_bin = 7;
 }
 
 message RenameDataResponse {
   bool success = 1;
   string rename_data_resp = 2;
   optional Error error = 3;
+  bytes rename_data_resp_bin = 4;
 }
 
 message MakeVolumesRequest {

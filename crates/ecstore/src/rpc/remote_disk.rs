@@ -751,6 +751,12 @@ fn encode_msgpack<T: Serialize>(value: &T) -> Result<Vec<u8>> {
     Ok(serializer.into_inner())
 }
 
+fn encode_msgpack_named<T: Serialize>(value: &T) -> Result<Vec<u8>> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    value.serialize(&mut serializer)?;
+    Ok(serializer.into_inner())
+}
+
 fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Result<T> {
     if !binary.is_empty() {
         let mut deserializer = rmp_serde::Deserializer::new(Cursor::new(binary));
@@ -1524,6 +1530,7 @@ impl DiskAPI for RemoteDisk {
             "rename_data",
             || async {
                 let file_info = serde_json::to_string(&fi)?;
+                let file_info_bin = encode_msgpack_named(&fi)?;
                 let mut client = self
                     .get_client()
                     .await
@@ -1535,6 +1542,7 @@ impl DiskAPI for RemoteDisk {
                     file_info,
                     dst_volume: dst_volume.to_string(),
                     dst_path: dst_path.to_string(),
+                    file_info_bin: file_info_bin.into(),
                 });
 
                 let response = client.rename_data(request).await?.into_inner();
@@ -1543,7 +1551,8 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let rename_data_resp = serde_json::from_str::<RenameDataResp>(&response.rename_data_resp)?;
+                let rename_data_resp =
+                    decode_msgpack_or_json::<RenameDataResp>(&response.rename_data_resp_bin, &response.rename_data_resp)?;
 
                 Ok(rename_data_resp)
             },
@@ -2371,6 +2380,64 @@ mod tests {
         fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
             Poll::Ready(Ok(()))
         }
+    }
+
+    fn sample_rename_data_file_info() -> FileInfo {
+        FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(Uuid::new_v4()),
+            data_dir: Some(Uuid::new_v4()),
+            size: 64 * 1024,
+            mod_time: Some(::time::OffsetDateTime::UNIX_EPOCH + ::time::Duration::seconds(1)),
+            metadata: [
+                ("etag".to_string(), "etag-value".to_string()),
+                ("content-type".to_string(), "application/octet-stream".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            erasure: rustfs_filemeta::ErasureInfo {
+                algorithm: rustfs_filemeta::ERASURE_ALGORITHM.to_string(),
+                data_blocks: 4,
+                parity_blocks: 2,
+                block_size: 1024 * 1024,
+                index: 1,
+                distribution: vec![1, 2, 3, 4, 5, 6],
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn rename_data_file_info_named_msgpack_is_smaller_than_json() {
+        let file_info = sample_rename_data_file_info();
+        let json = serde_json::to_vec(&file_info).expect("file info json should encode");
+        let named_msgpack = encode_msgpack_named(&file_info).expect("file info named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
+    }
+
+    #[test]
+    fn rename_data_resp_named_msgpack_is_smaller_than_json() {
+        let response = RenameDataResp {
+            old_data_dir: Some(Uuid::new_v4()),
+            sign: Some(vec![1_u8; 32]),
+        };
+        let json = serde_json::to_vec(&response).expect("rename data response json should encode");
+        let named_msgpack = encode_msgpack_named(&response).expect("rename data response named msgpack should encode");
+
+        assert!(
+            named_msgpack.len() < json.len(),
+            "expected named msgpack payload to be smaller than json (msgpack={}, json={})",
+            named_msgpack.len(),
+            json.len()
+        );
     }
 
     #[derive(Debug, Default)]
