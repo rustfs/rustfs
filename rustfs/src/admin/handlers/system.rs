@@ -15,8 +15,8 @@
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
+use crate::admin::runtime_sources::resolve_endpoints_handle;
 use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
-use crate::app::context::resolve_endpoints_handle;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};

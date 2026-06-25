@@ -227,7 +227,7 @@ impl Operation for AddUser {
             return Err(s3_error!(InvalidArgument, "cannot create a user with the system access key"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -356,7 +356,7 @@ impl Operation for SetUserStatus {
         let status = AccountStatus::try_from(query.status.as_deref().unwrap_or_default())
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, e))?;
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -408,7 +408,7 @@ impl Operation for ListUsers {
             }
         };
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -481,7 +481,7 @@ impl Operation for RemoveUser {
             return Err(s3_error!(InvalidArgument, "cannot remove the current user"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -558,7 +558,7 @@ impl Operation for GetUserInfo {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -654,7 +654,7 @@ impl Operation for ExportIam {
         )
         .await?;
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -888,7 +888,7 @@ impl Operation for ImportIam {
         let mut zip_reader =
             ZipArchive::new(Cursor::new(body)).map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 

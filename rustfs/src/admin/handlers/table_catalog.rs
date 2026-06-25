@@ -13,12 +13,12 @@
 // limitations under the License.
 
 use super::super::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
+use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_token_signing_key};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
 use crate::app::admin_usecase::DefaultAdminUsecase;
-use crate::app::context::{resolve_object_store_handle, resolve_token_signing_key};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
@@ -713,7 +713,8 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);
 
-        let iam_store = crate::app::context::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+        let iam_store =
+            crate::admin::runtime_sources::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
         iam_store
             .set_temp_user(&credential.access_key, &credential, None)
             .await

@@ -144,7 +144,7 @@ impl Operation for ListCannedPolicies {
             }
         };
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -252,7 +252,7 @@ impl Operation for AddCannedPolicy {
         if policy.version.is_empty() {
             return Err(s3_error!(InvalidArgument, "policy version is required"));
         }
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -340,7 +340,7 @@ impl Operation for InfoCannedPolicy {
             return Err(s3_error!(InvalidArgument, "too many policies"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -401,7 +401,7 @@ impl Operation for RemoveCannedPolicy {
             return Err(s3_error!(InvalidArgument, "policy name is required"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -492,7 +492,7 @@ impl Operation for SetPolicyForUserOrGroup {
             return Err(s3_error!(InvalidArgument, "user or group is required"));
         }
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -825,7 +825,7 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
 
     let query = parse_policy_entities_query(req.uri.query());
 
-    let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
 
@@ -961,7 +961,7 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
         .map_err(|e| s3_error!(InvalidRequest, "unmarshal policy association body failed, e: {:?}", e))?;
     validate_policy_association_req(&assoc_req)?;
 
-    let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
 
