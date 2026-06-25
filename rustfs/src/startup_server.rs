@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{set_global_region, set_global_rustfs_port};
 use crate::{
     capacity::capacity_integration::init_capacity_management,
     config::Config,
     server::{ServiceState, ServiceStateManager, ShutdownHandle, start_http_server},
+    startup_runtime_sources,
 };
-use rustfs_common::{GlobalReadiness, set_global_addr};
-use rustfs_credentials::init_global_action_credentials;
+use rustfs_common::GlobalReadiness;
 use rustfs_utils::net::parse_and_resolve_address;
 use std::{
     io::{Error, ErrorKind, Result},
@@ -84,7 +83,7 @@ pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<Start
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(set_global_region)
+            .map(startup_runtime_sources::publish_region)
             .map_err(|err| Error::other(format!("invalid region '{}': {}", region_str, err)))?;
     }
 
@@ -116,8 +115,8 @@ pub(crate) async fn init_startup_listen_context(config: &Config) -> Result<Start
     );
 
     init_startup_action_credentials(config)?;
-    set_global_rustfs_port(server_port);
-    set_global_addr(&config.address).await;
+    startup_runtime_sources::publish_server_port(server_port);
+    startup_runtime_sources::publish_server_addr(&config.address).await;
 
     Ok(StartupListenContext {
         readiness,
@@ -205,18 +204,18 @@ pub(crate) async fn init_embedded_startup_listen_context(config: &Config) -> Res
         ));
     }
 
-    init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone()))
+    startup_runtime_sources::init_action_credentials(config.access_key.clone(), config.secret_key.clone())
         .map_err(|err| Error::other(format!("credentials: {err:?}")))?;
 
     if let Some(region_str) = &config.region {
         region_str
             .parse::<s3s::region::Region>()
-            .map(set_global_region)
+            .map(startup_runtime_sources::publish_region)
             .map_err(|err| Error::other(format!("invalid region '{region_str}': {err}")))?;
     }
 
-    set_global_rustfs_port(server_addr.port());
-    set_global_addr(&config.address).await;
+    startup_runtime_sources::publish_server_port(server_addr.port());
+    startup_runtime_sources::publish_server_addr(&config.address).await;
 
     Ok(EmbeddedStartupListenContext {
         readiness,
@@ -276,7 +275,7 @@ fn log_sanitized_server_config(config: &Config) {
 }
 
 fn init_startup_action_credentials(config: &Config) -> Result<()> {
-    match init_global_action_credentials(Some(config.access_key.clone()), Some(config.secret_key.clone())) {
+    match startup_runtime_sources::init_action_credentials(config.access_key.clone(), config.secret_key.clone()) {
         Ok(_) => {
             debug!(
                 target: "rustfs::main::run",

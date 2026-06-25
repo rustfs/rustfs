@@ -414,13 +414,10 @@ impl SetDisks {
                                     }
                                 }
 
-                                let is_inline_buffer = {
-                                    if let Some(sc) = get_global_storage_class() {
-                                        sc.should_inline(erasure.shard_file_size(latest_meta.size), false)
-                                    } else {
-                                        false
-                                    }
-                                };
+                                let is_inline_buffer = runtime_sources::storage_class_should_inline(
+                                    erasure.shard_file_size(latest_meta.size),
+                                    false,
+                                );
                                 // create writers for all disk positions, but only for outdated disks
                                 for (index, disk_op) in out_dated_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = disk_op {

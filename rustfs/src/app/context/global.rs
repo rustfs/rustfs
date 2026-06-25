@@ -16,9 +16,9 @@ use super::super::{ECStore, set_object_store_resolver};
 use super::handles::{
     IamHandle, KmsHandle, default_action_credential_interface, default_boot_time_interface, default_bucket_metadata_interface,
     default_bucket_monitor_interface, default_buffer_config_interface, default_deployment_id_interface,
-    default_endpoints_interface, default_internode_metrics_interface, default_kms_runtime_interface,
-    default_local_node_name_interface, default_lock_client_interface, default_lock_clients_interface,
-    default_notification_system_interface, default_notify_interface, default_oidc_interface,
+    default_endpoints_interface, default_expiry_state_interface, default_internode_metrics_interface,
+    default_kms_runtime_interface, default_local_node_name_interface, default_lock_client_interface,
+    default_lock_clients_interface, default_notification_system_interface, default_notify_interface, default_oidc_interface,
     default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
     default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
     default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
@@ -26,11 +26,11 @@ use super::handles::{
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
-    DeploymentIdInterface, EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface,
-    LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface, NotifyInterface,
-    OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface, ReplicationPoolInterface,
-    ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface, ServerConfigInterface,
-    StorageClassInterface, TierConfigInterface, TierStatsInterface,
+    DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
+    KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
+    NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
+    ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
+    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
 use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -67,6 +67,7 @@ pub struct AppContext {
     action_credentials: Arc<dyn ActionCredentialInterface>,
     region: Arc<dyn RegionInterface>,
     tier_config: Arc<dyn TierConfigInterface>,
+    expiry_state: Arc<dyn ExpiryStateInterface>,
     server_config: Arc<dyn ServerConfigInterface>,
     storage_class: Arc<dyn StorageClassInterface>,
     buffer_config: Arc<dyn BufferConfigInterface>,
@@ -102,6 +103,7 @@ impl AppContext {
             action_credentials: default_action_credential_interface(),
             region: default_region_interface(),
             tier_config: default_tier_config_interface(),
+            expiry_state: default_expiry_state_interface(),
             server_config: default_server_config_interface(),
             storage_class: default_storage_class_interface(),
             buffer_config: default_buffer_config_interface(),
@@ -225,6 +227,10 @@ impl AppContext {
         self.tier_config.clone()
     }
 
+    pub fn expiry_state(&self) -> Arc<dyn ExpiryStateInterface> {
+        self.expiry_state.clone()
+    }
+
     pub fn server_config(&self) -> Arc<dyn ServerConfigInterface> {
         self.server_config.clone()
     }
@@ -266,6 +272,7 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) action_credentials: Arc<dyn ActionCredentialInterface>,
     pub(super) region: Arc<dyn RegionInterface>,
     pub(super) tier_config: Arc<dyn TierConfigInterface>,
+    pub(super) expiry_state: Arc<dyn ExpiryStateInterface>,
     pub(super) server_config: Arc<dyn ServerConfigInterface>,
     pub(super) storage_class: Arc<dyn StorageClassInterface>,
     pub(super) buffer_config: Arc<dyn BufferConfigInterface>,
@@ -302,6 +309,7 @@ impl AppContext {
             action_credentials: interfaces.action_credentials,
             region: interfaces.region,
             tier_config: interfaces.tier_config,
+            expiry_state: interfaces.expiry_state,
             server_config: interfaces.server_config,
             storage_class: interfaces.storage_class,
             buffer_config: interfaces.buffer_config,

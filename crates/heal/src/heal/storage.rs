@@ -34,6 +34,21 @@ const EVENT_HEAL_STORAGE_OBJECT_VERIFY: &str = "heal_storage_object_verify";
 const EVENT_HEAL_STORAGE_ADMIN_OP: &str = "heal_storage_admin_op";
 const EVENT_HEAL_STORAGE_REPAIR_OP: &str = "heal_storage_repair_op";
 
+pub(crate) fn next_heal_listing_token(
+    bucket: &str,
+    prefix: &str,
+    next_token: Option<String>,
+    is_truncated: bool,
+) -> Result<Option<String>> {
+    if !is_truncated {
+        return Ok(None);
+    }
+
+    next_token.map(Some).ok_or_else(|| Error::TaskExecutionFailed {
+        message: format!("Object listing for {bucket}/{prefix} was truncated without continuation token"),
+    })
+}
+
 /// Disk status for heal operations
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiskStatus {
@@ -1086,21 +1101,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 break;
             }
 
-            continuation_token = next_token;
-            if continuation_token.is_none() {
-                warn!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_ADMIN_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "list_objects_for_heal",
-                    bucket,
-                    prefix,
-                    state = "missing_continuation_token",
-                    "Heal storage object listing truncated without continuation token"
-                );
-                break;
-            }
+            continuation_token = next_heal_listing_token(bucket, prefix, next_token, is_truncated)?;
         }
 
         debug!(
@@ -1233,7 +1234,32 @@ impl HealStorageAPI for ECStoreHealStorage {
 #[cfg(test)]
 mod tests {
     use super::super::StorageError;
-    use super::{is_transient_object_exists_error, is_transient_object_exists_message};
+    use super::{is_transient_object_exists_error, is_transient_object_exists_message, next_heal_listing_token};
+
+    #[test]
+    fn next_heal_listing_token_returns_none_for_complete_page() {
+        assert_eq!(
+            next_heal_listing_token("bucket", "prefix", None, false).expect("complete page should not fail"),
+            None
+        );
+    }
+
+    #[test]
+    fn next_heal_listing_token_returns_token_for_truncated_page() {
+        assert_eq!(
+            next_heal_listing_token("bucket", "prefix", Some("token-1".to_string()), true)
+                .expect("truncated page with token should continue"),
+            Some("token-1".to_string())
+        );
+    }
+
+    #[test]
+    fn next_heal_listing_token_fails_for_truncated_page_without_token() {
+        let err = next_heal_listing_token("bucket", "prefix", None, true).expect_err("truncated page without token must fail");
+
+        assert!(matches!(err, super::Error::TaskExecutionFailed { .. }));
+        assert!(err.to_string().contains("truncated without continuation token"));
+    }
 
     #[test]
     fn transient_object_exists_message_matches_lock_quorum_failures() {

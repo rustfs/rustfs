@@ -565,6 +565,53 @@ impl Erasure {
         Ok(shards)
     }
 
+    /// Encode data from an owned `BytesMut` buffer, avoiding the initial copy
+    /// from a borrowed slice into a fresh `BytesMut`.
+    pub fn encode_data_bytes_mut(&self, mut data_buffer: BytesMut, data_len: usize) -> io::Result<Vec<Bytes>> {
+        let shard_size_fn = if self.uses_legacy {
+            calc_shard_size_legacy
+        } else {
+            calc_shard_size
+        };
+        let per_shard_size = shard_size_fn(data_len, self.data_shards);
+        if per_shard_size == 0 {
+            return Ok(vec![Bytes::new(); self.total_shard_count()]);
+        }
+        let need_total_size = per_shard_size * self.total_shard_count();
+
+        if data_buffer.len() > data_len {
+            data_buffer.truncate(data_len);
+        }
+        data_buffer.resize(need_total_size, 0u8);
+
+        {
+            let data_slices: SmallVec<[&mut [u8]; 16]> = data_buffer.chunks_exact_mut(per_shard_size).collect();
+
+            if self.parity_shards > 0 {
+                if self.uses_legacy {
+                    if let Some(encoder) = self.legacy_encoder.as_ref() {
+                        encoder.encode(data_slices)?;
+                    } else {
+                        warn!("parity_shards > 0, uses_legacy but legacy_encoder is None");
+                    }
+                } else if let Some(encoder) = self.encoder.as_ref() {
+                    encoder.encode(data_slices)?;
+                } else {
+                    warn!("parity_shards > 0, but encoder is None");
+                }
+            }
+        }
+
+        let mut data_buffer = data_buffer.freeze();
+        let mut shards = Vec::with_capacity(self.total_shard_count());
+        for _ in 0..self.total_shard_count() {
+            let shard = data_buffer.split_to(per_shard_size);
+            shards.push(shard);
+        }
+
+        Ok(shards)
+    }
+
     /// Decode and reconstruct missing data shards in-place.
     ///
     /// # Arguments
@@ -796,6 +843,21 @@ mod tests {
             assert_owned_encode_matches_borrowed(&erasure, Vec::new());
             assert_owned_encode_matches_borrowed(&erasure, b"small payload".to_vec());
             assert_owned_encode_matches_borrowed(&erasure, (0_u8..37).collect());
+        }
+    }
+
+    #[test]
+    fn encode_data_bytes_mut_matches_borrowed_path() {
+        for uses_legacy in [false, true] {
+            let erasure = Erasure::new_with_options(4, 2, 64, uses_legacy);
+            for data in [Vec::new(), b"small payload".to_vec(), (0_u8..37).collect::<Vec<_>>()] {
+                let borrowed = erasure.encode_data(&data).expect("borrowed encode should succeed");
+                let bytes_mut = BytesMut::from(&data[..]);
+                let owned = erasure
+                    .encode_data_bytes_mut(bytes_mut, data.len())
+                    .expect("bytesmut encode should succeed");
+                assert_eq!(owned, borrowed);
+            }
         }
     }
 
