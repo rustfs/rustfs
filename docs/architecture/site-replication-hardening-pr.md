@@ -28,18 +28,13 @@ This PR hardens the site replication control plane in small, reviewable commits.
 
 Baseline started from `origin/main` at `758677da`.
 
-- Passed: `cargo test -p rustfs route_policy --lib`
+- Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs-ecstore bucket_target --lib`
-- Passed: `cargo test -p rustfs site_replication --lib`
-- Passed: `cargo fmt --all`
 - Passed: `cargo test -p rustfs-madmin site_replication --lib`
-- Passed: `cargo test -p rustfs site_replication --lib`
-- Passed: `cargo fmt --all`
 - Passed: `cargo test -p rustfs route_policy --lib`
 - Passed: `cargo test -p rustfs site_replication --lib`
-- Passed: `cargo fmt --all`
-- Passed: `cargo test -p rustfs site_replication --lib`
-- Passed: `cargo fmt --all`
+
+Not run in this step: `make pre-commit`, `make pre-pr`.
 
 ## Impact
 
@@ -56,3 +51,5 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 ## Additional Notes
 
 This PR intentionally keeps durable outbox/bootstrap/heal work as follow-up architecture unless the initial hardening steps require small supporting hooks.
+
+Follow-up work should still address MinIO wire-contract bootstrap validation, durable site-replication outbox/retry, full add-time IAM/bootstrap sync, and site-level heal/reconcile.
