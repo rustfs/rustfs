@@ -47,7 +47,8 @@ use tracing::{debug, error, info, instrument, warn};
 
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
-    get_lifecycle_config, get_replication_config, is_erasure_sd, read_config, replace_bucket_usage_memory_from_info, save_config,
+    get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
+    scanner_is_erasure_sd,
 };
 
 const LOG_COMPONENT_SCANNER: &str = "scanner";
@@ -123,6 +124,10 @@ enum ScannerCycleWakeReason {
 }
 
 async fn wait_for_next_scanner_cycle(ctx: &CancellationToken, delay: Duration) -> ScannerCycleWakeReason {
+    if dirty_usage_buckets_pending() {
+        return ScannerCycleWakeReason::DirtyUsage;
+    }
+
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
 
@@ -419,7 +424,7 @@ async fn detect_scanner_maintenance_features(storeapi: &Arc<ECStore>) -> Scanner
 }
 
 async fn configure_scanner_defaults(storeapi: &Arc<ECStore>) -> ScannerMaintenanceFeatures {
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         let features = detect_scanner_maintenance_features(storeapi).await;
         let default_cycle_secs = single_disk_default_cycle_secs(features);
         set_scanner_default_speed(single_disk_default_speed());
@@ -568,7 +573,7 @@ pub struct BackgroundHealInfo {
 /// Read background healing information from storage
 pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHealInfo {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return BackgroundHealInfo::default();
     }
 
@@ -610,7 +615,7 @@ pub async fn read_background_heal_info(storeapi: Arc<ECStore>) -> BackgroundHeal
 #[instrument(skip(storeapi))]
 pub async fn save_background_heal_info(storeapi: Arc<ECStore>, info: BackgroundHealInfo) {
     // Skip for ErasureSD setup
-    if is_erasure_sd().await {
+    if scanner_is_erasure_sd().await {
         return;
     }
 
@@ -1618,6 +1623,19 @@ mod tests {
         let reason = tokio::time::timeout(Duration::from_secs(1), wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)))
             .await
             .expect("dirty usage should wake scanner before timer");
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_sees_existing_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)).await;
 
         assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
         crate::scanner_io::clear_dirty_usage_bucket("photos");

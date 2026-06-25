@@ -104,7 +104,7 @@ where
 
 impl SetDisks {
     async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !is_dist_erasure().await
+        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
     }
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
@@ -361,7 +361,7 @@ impl SetDisks {
         let version_id = version_id.to_string();
         let opts = opts.clone();
 
-        let processor = get_global_processors().read_processor();
+        let processor = runtime_sources::batch_processors().read_processor();
         let tasks: Vec<_> = disks
             .iter()
             .take(required_reads + 2) // Read a few extra for reliability
@@ -1255,7 +1255,13 @@ impl SetDisks {
             );
         }
 
-        let source = erasure_coding::decode::ParallelReader::new(readers, erasure.clone(), 0, part_size);
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+            readers,
+            erasure.clone(),
+            0,
+            part_size,
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
         let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
         let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
         Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))

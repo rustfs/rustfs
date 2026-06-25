@@ -15,9 +15,11 @@
 use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
 use crate::get_diagnostics::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_PREFETCH_DIRECT,
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_POLL_PENDING,
+    GET_READER_POLL_READY_DATA, GET_READER_POLL_READY_EMPTY, GET_READER_POLL_READY_ERROR, GET_READER_PREFETCH_DIRECT,
     GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
-    GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ,
+    GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_FILL, GET_STAGE_OUTPUT_LOCK_WAIT, GET_STAGE_OUTPUT_POLL, GET_STAGE_RECONSTRUCT,
+    GET_STAGE_STRIPE_READ,
 };
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::io;
@@ -97,6 +99,7 @@ where
             let engine = self.engine.clone();
             let remaining = self.remaining;
             self.fill = Some(tokio::spawn(async move {
+                let fill_stage_start = Instant::now();
                 let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
                 rustfs_io_metrics::record_get_object_stage_duration(
@@ -104,7 +107,18 @@ where
                     GET_STAGE_STRIPE_READ,
                     stripe_read_stage_start.elapsed().as_secs_f64(),
                 );
+                let decode_stage_start = Instant::now();
                 let result = decode_stripe(&engine, &mut workspace, state, remaining);
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_DECODE,
+                    decode_stage_start.elapsed().as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_FILL,
+                    fill_stage_start.elapsed().as_secs_f64(),
+                );
                 FillResult {
                     source,
                     workspace,
@@ -318,11 +332,50 @@ where
     R: AsyncRead + Unpin + Send,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let lock_wait_start = Instant::now();
         let mut inner = match self.inner.lock() {
-            Ok(inner) => inner,
-            Err(_) => return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned"))),
+            Ok(inner) => {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_OUTPUT_LOCK_WAIT,
+                    lock_wait_start.elapsed().as_secs_f64(),
+                );
+                inner
+            }
+            Err(_) => {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_OUTPUT_LOCK_WAIT,
+                    lock_wait_start.elapsed().as_secs_f64(),
+                );
+                return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned")));
+            }
         };
-        Pin::new(&mut *inner).poll_read(cx, buf)
+        let read_buf_remaining_before = buf.remaining();
+        let filled_before = buf.filled().len();
+        let poll_start = Instant::now();
+        let result = Pin::new(&mut *inner).poll_read(cx, buf);
+        let poll_duration = poll_start.elapsed().as_secs_f64();
+        let filled_bytes = buf.filled().len().saturating_sub(filled_before);
+        let poll_outcome = match &result {
+            Poll::Ready(Ok(())) if filled_bytes > 0 => GET_READER_POLL_READY_DATA,
+            Poll::Ready(Ok(())) => GET_READER_POLL_READY_EMPTY,
+            Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
+            Poll::Pending => GET_READER_POLL_PENDING,
+        };
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_OUTPUT_POLL,
+            poll_duration,
+        );
+        rustfs_io_metrics::record_get_object_reader_poll(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            poll_outcome,
+            read_buf_remaining_before,
+            filled_bytes,
+            poll_duration,
+        );
+        result
     }
 }
 
@@ -350,7 +403,7 @@ where
             reconstruct_stage_start.elapsed().as_secs_f64(),
         );
         let emit_stage_start = Instant::now();
-        let output = emit_data_shards(state.slots(), engine.data_shards(), engine.block_size(), remaining)?;
+        let output = emit_data_shards(&state, engine.data_shards(), engine.block_size(), remaining)?;
         rustfs_io_metrics::record_get_object_stage_duration(
             GET_OBJECT_PATH_CODEC_STREAMING,
             GET_STAGE_EMIT,
@@ -402,18 +455,13 @@ where
     Ok(Some(output))
 }
 
-fn emit_data_shards(
-    slots: &[crate::set_disk::shard_source::ShardSlot],
-    data_shards: usize,
-    block_size: usize,
-    remaining: usize,
-) -> io::Result<Vec<u8>> {
+fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
     let mut output = Vec::with_capacity(block_size.min(remaining));
     for index in 0..data_shards {
         if output.len() >= remaining {
             break;
         }
-        let Some(slot) = slots.iter().find(|slot| slot.index() == index) else {
+        let Some(slot) = state.slot_by_index(index) else {
             return Err(io::Error::new(ErrorKind::UnexpectedEof, "decoded stripe is missing a data shard"));
         };
         let Some(shard) = slot.data_bytes() else {
@@ -430,7 +478,7 @@ mod tests {
     use super::*;
     use crate::erasure_codec::bridge::LegacyEcDecodeEngine;
     use crate::erasure_coding::Erasure;
-    use crate::set_disk::shard_source::StripeReadState;
+    use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use std::collections::VecDeque;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -561,6 +609,22 @@ mod tests {
             .expect("reader should emit complete data shards without parity reconstruction");
 
         assert_eq!(decoded, data);
+    }
+
+    #[test]
+    fn emit_data_shards_preserves_output_order_for_out_of_order_slots() {
+        let state = StripeReadState::new(
+            vec![
+                ShardSlot::data(1, b"cd".to_vec()),
+                ShardSlot::data(0, b"ab".to_vec()),
+                ShardSlot::data(2, b"ef".to_vec()),
+            ],
+            2,
+        );
+
+        let output = emit_data_shards(&state, 3, 6, 5).expect("out-of-order data slots should emit by shard index");
+
+        assert_eq!(output, b"abcde");
     }
 
     #[tokio::test]

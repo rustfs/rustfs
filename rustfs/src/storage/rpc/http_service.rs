@@ -17,9 +17,9 @@ use super::super::StorageDiskRpcExt as _;
 use super::super::WalkDirOptions;
 use super::super::find_local_disk_by_ref;
 use super::super::verify_rpc_signature;
-use crate::app::context::resolve_internode_metrics;
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
+use crate::storage::runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -302,7 +302,7 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
     }
 
     if let Some(operation) = operation {
-        resolve_internode_metrics().record_duration_for_operation_and_backend(
+        runtime_sources::internode_metrics().record_duration_for_operation_and_backend(
             operation,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
             started_at.elapsed(),
@@ -322,7 +322,7 @@ fn internode_http_operation(path: &str) -> Option<&'static str> {
 }
 
 fn record_internode_rpc_error(operation: Option<&'static str>) {
-    let metrics = resolve_internode_metrics();
+    let metrics = runtime_sources::internode_metrics();
     match operation {
         Some(operation) => metrics.record_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP),
         None => metrics.record_error(),
@@ -410,7 +410,7 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    resolve_internode_metrics().record_incoming_request_for_operation_and_backend(
+    runtime_sources::internode_metrics().record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_READ_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
     );
@@ -430,7 +430,7 @@ fn read_file_body_stream<R>(
 where
     R: tokio::io::AsyncRead + Unpin + Send + Sync + 'static,
 {
-    let metrics = resolve_internode_metrics();
+    let metrics = runtime_sources::internode_metrics();
     let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
         bytes
@@ -545,9 +545,9 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         }
     });
 
-    resolve_internode_metrics()
+    runtime_sources::internode_metrics()
         .record_incoming_request_for_operation_and_backend(INTERNODE_OPERATION_WALK_DIR, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
-    let metrics = resolve_internode_metrics();
+    let metrics = runtime_sources::internode_metrics();
     let stream = ReaderStream::with_capacity(rd, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
@@ -614,7 +614,7 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         }
     };
 
-    let metrics = resolve_internode_metrics();
+    let metrics = runtime_sources::internode_metrics();
     metrics.record_incoming_request_for_operation_and_backend(
         INTERNODE_OPERATION_PUT_FILE_STREAM,
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,

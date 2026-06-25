@@ -29,7 +29,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::storage::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 
 static CAPACITY_DIRTY_SCOPE_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
 static CAPACITY_DIRTY_SCOPE_INIT: Once = Once::new();

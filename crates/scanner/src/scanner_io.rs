@@ -46,9 +46,9 @@ use crate::ScannerObjectInfo as ObjectInfo;
 use crate::{
     BucketTargetSys, BucketVersioningSys, Disk, DiskError, ECStore, EcstoreError as Error, EcstoreResult as Result,
     ReplicationConfig, STORAGE_FORMAT_FILE, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_global_free_version,
-    get_lifecycle_config, get_object_lock_config, get_replication_config, list_global_tiers, resolve_scanner_object_store_handle,
-    storageclass,
+    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, SetDisks, StorageError, enqueue_runtime_free_version,
+    get_lifecycle_config, get_object_lock_config, get_replication_config, list_runtime_tiers,
+    resolve_scanner_object_store_handle, storageclass,
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
@@ -163,6 +163,15 @@ fn clear_dirty_usage_buckets(snapshot: &DirtyUsageBuckets) {
     };
     global_metrics()
         .record_scanner_dirty_usage_cycle_clear(usize_to_u64_saturated(cleared_buckets), usize_to_u64_saturated(pending_buckets));
+}
+
+fn dirty_usage_snapshot_covers_current(snapshot: &DirtyUsageBuckets) -> bool {
+    let dirty_buckets = dirty_usage_buckets();
+    dirty_buckets.iter().all(|(bucket, generation)| {
+        snapshot
+            .get(bucket)
+            .is_some_and(|snapshot_generation| snapshot_generation == generation)
+    })
 }
 
 #[cfg(test)]
@@ -421,9 +430,10 @@ fn completed_data_usage_info(
     all_buckets: &[String],
     budget_elapsed: bool,
     cancelled: bool,
+    dirty_usage_current: bool,
 ) -> Option<(DataUsageInfo, SystemTime)> {
     let completed_set_count = results.iter().filter(|result| result.info.last_update.is_some()).count();
-    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) {
+    if !should_publish_completed_snapshot(completed_set_count, results.len(), budget_elapsed, cancelled) || !dirty_usage_current {
         return None;
     }
 
@@ -478,12 +488,17 @@ mod publish_gate_tests {
         let first_set = completed_root_cache("bucket-a", 1, 10);
         let second_set = completed_root_cache("bucket-b", 2, 20);
 
-        assert!(completed_data_usage_info(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false).is_none());
-        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, true, false).is_none());
-        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, true).is_none());
+        assert!(
+            completed_data_usage_info(&[first_set.clone(), DataUsageCache::default()], &all_buckets, false, false, true)
+                .is_none()
+        );
+        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, true, false, true).is_none());
+        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, true, true).is_none());
+        assert!(completed_data_usage_info(&[first_set.clone(), second_set.clone()], &all_buckets, false, false, false).is_none());
 
-        let (data_usage_info, last_update) = completed_data_usage_info(&[first_set, second_set], &all_buckets, false, false)
-            .expect("all completed sets should produce a publishable data usage snapshot");
+        let (data_usage_info, last_update) =
+            completed_data_usage_info(&[first_set, second_set], &all_buckets, false, false, true)
+                .expect("all completed sets should produce a publishable data usage snapshot");
         assert_eq!(last_update, SystemTime::UNIX_EPOCH + Duration::from_secs(20));
         assert_eq!(data_usage_info.objects_total_count, 3);
         assert_eq!(data_usage_info.buckets_usage.len(), 2);
@@ -773,6 +788,7 @@ impl ScannerIO for ECStore {
         let results_mutex_for_updates = results_mutex.clone();
         let budget_for_updates = budget.clone();
         let child_token_for_updates = child_token.clone();
+        let dirty_usage_buckets_for_updates = dirty_usage_buckets.clone();
         tokio::spawn(async move {
             let mut last_update = SystemTime::UNIX_EPOCH;
             let mut has_sent_once = false;
@@ -795,6 +811,7 @@ impl ScannerIO for ECStore {
                                 &all_buckets_clone,
                                 budget_for_updates.budget_elapsed(),
                                 child_token_for_updates.is_cancelled(),
+                                dirty_usage_snapshot_covers_current(dirty_usage_buckets_for_updates.as_ref()),
                             )
                         };
 
@@ -813,6 +830,7 @@ impl ScannerIO for ECStore {
                                 &all_buckets_clone,
                                 budget_for_updates.budget_elapsed(),
                                 child_token_for_updates.is_cancelled(),
+                                dirty_usage_snapshot_covers_current(dirty_usage_buckets_for_updates.as_ref()),
                             )
                         };
 
@@ -1350,7 +1368,7 @@ impl ScannerIODisk for Disk {
 
         let mut size_summary = SizeSummary::default();
 
-        let tiers = list_global_tiers().await;
+        let tiers = list_runtime_tiers().await;
 
         for tier in tiers.iter() {
             size_summary.tier_stats.insert(tier.name.clone(), TierStats::default());
@@ -1373,7 +1391,7 @@ impl ScannerIODisk for Disk {
 
         if !free_version_infos.is_empty() {
             for oi in free_version_infos {
-                enqueue_global_free_version(oi).await;
+                enqueue_runtime_free_version(oi).await;
             }
         }
 
@@ -1551,6 +1569,22 @@ mod tests {
         clear_dirty_usage_buckets(&snapshot);
 
         assert_eq!(dirty_usage_bucket_count(), 1);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn dirty_usage_snapshot_detects_uncovered_generation() {
+        clear_dirty_usage_buckets_for_tests();
+        record_dirty_usage_bucket("photos");
+        let buckets = vec![bucket_info("photos")];
+        let snapshot = snapshot_dirty_usage_buckets(&buckets);
+
+        assert!(dirty_usage_snapshot_covers_current(&snapshot));
+
+        record_dirty_usage_bucket("photos");
+
+        assert!(!dirty_usage_snapshot_covers_current(&snapshot));
         clear_dirty_usage_buckets_for_tests();
     }
 

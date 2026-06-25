@@ -34,7 +34,7 @@ SAMPLES=20000
 ROUNDS=3
 RETRY_PER_ROUND=2
 RETRY_SLEEP_SECS=2
-ROUND_COOLDOWN_SECS=0
+COOLDOWN_SECS=0
 BASELINE_CSV=""
 EXTRA_ARGS=()
 
@@ -72,7 +72,8 @@ Enhanced options:
   --rounds                     Benchmark rounds per size (default: 3)
   --retry-per-round            Retry count per failed round (default: 2)
   --retry-sleep-secs           Sleep seconds between retries (default: 2)
-  --round-cooldown-secs        Cooldown seconds after each completed round (default: 0)
+  --cooldown-secs              Sleep seconds between rounds/sizes (default: 0)
+  --round-cooldown-secs        Compatibility alias for --cooldown-secs
   --baseline-csv               Baseline median CSV to compare
   --extra-args                 Extra args appended to tool command, quoted as one string
 
@@ -129,7 +130,8 @@ parse_args() {
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --retry-sleep-secs) RETRY_SLEEP_SECS="$2"; shift 2 ;;
-      --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
+      --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
+      --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
@@ -155,12 +157,24 @@ validate_positive_int() {
   fi
 }
 
-validate_non_negative_int() {
+validate_nonnegative_int() {
   local v="$1"
   local n="$2"
   if ! [[ "$v" =~ ^[0-9]+$ ]]; then
-    echo "ERROR: $n must be a non-negative integer, got: $v" >&2
+    echo "ERROR: $n must be a nonnegative integer, got: $v" >&2
     exit 1
+  fi
+}
+
+cooldown_sleep() {
+  local secs="$1"
+  if (( secs <= 0 )); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY-RUN] sleep ${secs}"
+  else
+    sleep "$secs"
   fi
 }
 
@@ -177,7 +191,7 @@ validate_args() {
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_positive_int "$RETRY_SLEEP_SECS" "--retry-sleep-secs"
-  validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
+  validate_nonnegative_int "$COOLDOWN_SECS" "--cooldown-secs"
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
   fi
@@ -431,13 +445,9 @@ run_size() {
       echo "WARN: size=$size round=$round failed after retries."
     fi
 
-    if [[ "$ROUND_COOLDOWN_SECS" -gt 0 ]]; then
-      if [[ "$DRY_RUN" == "true" ]]; then
-        echo "[DRY-RUN] cooldown ${ROUND_COOLDOWN_SECS}s after size=$size round=$round"
-      else
-        echo "Cooldown ${ROUND_COOLDOWN_SECS}s after size=$size round=$round..."
-        sleep "$ROUND_COOLDOWN_SECS"
-      fi
+    if (( COOLDOWN_SECS > 0 && round < ROUNDS )); then
+      echo "Cooldown after size=$size round=$round: ${COOLDOWN_SECS}s"
+      cooldown_sleep "$COOLDOWN_SECS"
     fi
   done
 }
@@ -521,13 +531,20 @@ main() {
   echo "Concurrency: $CONCURRENCY"
   echo "Rounds: $ROUNDS"
   echo "Retry per round: $RETRY_PER_ROUND"
-  echo "Round cooldown seconds: $ROUND_COOLDOWN_SECS"
+  echo "Cooldown secs: $COOLDOWN_SECS"
 
   IFS=',' read -r -a size_arr <<< "$SIZES"
+  local total_sizes="${#size_arr[@]}"
+  local size_index=0
   for raw in "${size_arr[@]}"; do
     size="$(trim "$raw")"
     [[ -z "$size" ]] && continue
+    size_index=$(( size_index + 1 ))
     run_size "$size"
+    if (( COOLDOWN_SECS > 0 && size_index < total_sizes )); then
+      echo "Cooldown after size=$size: ${COOLDOWN_SECS}s"
+      cooldown_sleep "$COOLDOWN_SECS"
+    fi
   done
 
   build_median_summary

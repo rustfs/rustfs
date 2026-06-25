@@ -11,7 +11,7 @@ use chacha20poly1305::ChaCha20Poly1305;
 #[cfg(feature = "rio-v2")]
 use hmac::{Hmac, Mac};
 use md5::{Digest, Md5};
-use rustfs_kms::{service_manager::get_global_encryption_service, types::ObjectEncryptionContext};
+use rustfs_kms::types::ObjectEncryptionContext;
 use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
 use rustfs_utils::path::path_join_buf;
 #[cfg(feature = "rio-v2")]
@@ -1308,7 +1308,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     let kms_context: Option<HashMap<String, String>> = None;
     let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
 
-    let decrypted_key = if let Some(service) = get_global_encryption_service().await {
+    let decrypted_key = if let Some(service) = crate::runtime_sources::object_encryption_service().await {
         #[cfg(feature = "rio-v2")]
         let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
             service.decrypt_legacy_data_key(&encrypted_dek).await

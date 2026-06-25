@@ -664,6 +664,27 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn start_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::StartDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::StartDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn cancel_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::CancelDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::CancelDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn clear_decommission(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ClearDecommissionRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::ClearDecommissionResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn get_metrics(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::GetMetricsRequest>,

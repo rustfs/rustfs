@@ -173,6 +173,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route(Method::GET, "/v3/metrics"),
         admin_route(Method::GET, "/v3/pools/list"),
         admin_route(Method::GET, "/v3/pools/status"),
+        admin_route(Method::GET, "/v3/decommission/status"),
         admin_route(Method::POST, "/v3/pools/decommission"),
         admin_route(Method::POST, "/v3/pools/cancel"),
         admin_route(Method::POST, "/v3/pools/clear"),
@@ -224,6 +225,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         ),
         admin_route(Method::GET, "/v3/module-switches"),
         admin_route(Method::PUT, "/v3/module-switches"),
+        admin_route(Method::GET, "/v4/cluster/snapshot"),
         admin_route(Method::GET, "/v4/extensions/catalog"),
         admin_route(Method::GET, "/v4/extensions/instances"),
         admin_route(Method::GET, "/v4/runtime/capabilities"),
@@ -723,6 +725,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/audit/target/list"));
     assert_route(&router, Method::GET, &admin_path("/v3/module-switches"));
     assert_route(&router, Method::PUT, &admin_path("/v3/module-switches"));
+    assert_route(&router, Method::GET, &admin_path("/v4/cluster/snapshot"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/catalog"));
     assert_route(&router, Method::GET, &admin_path("/v4/extensions/instances"));
     assert_route(&router, Method::GET, &admin_path("/v4/runtime/capabilities"));
@@ -1036,6 +1039,7 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::GET, &admin_path("/v3/metrics"));
 
     assert_route(&router, Method::GET, &admin_path("/v3/pools/list"));
+    assert_route(&router, Method::GET, &admin_path("/v3/decommission/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/rebalance/start"));
     assert_route(&router, Method::GET, &admin_path("/v3/rebalance/status"));
     assert_route(&router, Method::POST, &admin_path("/v3/heal/"));

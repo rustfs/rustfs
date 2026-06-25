@@ -14,7 +14,7 @@
 
 use crate::admin::{
     auth::validate_admin_request,
-    handlers::{plugins_instances, system},
+    handlers::{cluster_snapshot, plugins_instances, system},
     plugin_contract::{
         PluginContractDomain, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount, PluginInstanceEntry,
         PluginInstanceSource, PluginOperationalStateContract,
@@ -62,6 +62,7 @@ pub fn register_extension_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 pub(crate) struct ExtensionCatalogResponse {
     pub extensions: Vec<ExtensionSchema>,
     pub runtime_capabilities: ExtensionRuntimeCapabilitiesResponse,
+    pub cluster_snapshot: cluster_snapshot::ClusterSnapshotDiscoveryResponse,
     pub external_plugin_flow: TargetPluginExternalFlowGateStatus,
 }
 
@@ -123,10 +124,12 @@ async fn build_extension_catalog_response() -> Result<ExtensionCatalogResponse, 
     extensions.push(target_marketplace_extension_schema(&example.manifest));
     extensions.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
     let runtime_capabilities = system::build_runtime_capabilities_response().await?;
+    let cluster_snapshot = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
 
     Ok(ExtensionCatalogResponse {
         extensions,
         runtime_capabilities: build_extension_runtime_capabilities_response(&runtime_capabilities),
+        cluster_snapshot,
         external_plugin_flow: TargetPluginExternalFlowGate::default().status(),
     })
 }
@@ -450,6 +453,8 @@ mod tests {
             Some(&runtime_capabilities.summary.userspace_profiling)
         );
         assert!(validate_ops_profiler_contract(&response.runtime_capabilities.ops_profiler.contract).is_ok());
+
+        assert_eq!(response.cluster_snapshot.path, format!("{}{}", ADMIN_PREFIX, "/v4/cluster/snapshot"));
     }
 
     #[test]
