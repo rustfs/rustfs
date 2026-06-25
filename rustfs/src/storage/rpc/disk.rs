@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::app::context::resolve_internode_metrics;
+use crate::storage::runtime_sources;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
 };
@@ -952,7 +952,7 @@ impl NodeService {
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         let data_len = request.data.len();
-        let metrics = resolve_internode_metrics();
+        let metrics = runtime_sources::internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_WRITE_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
@@ -992,7 +992,7 @@ impl NodeService {
         debug!("read all");
 
         let request = request.into_inner();
-        let metrics = resolve_internode_metrics();
+        let metrics = runtime_sources::internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_READ_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,

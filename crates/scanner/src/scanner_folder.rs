@@ -463,14 +463,14 @@ fn build_object_heal_request(
 
 fn resolve_object_heal_entry(entries: &MetaCacheEntries, resolver: MetadataResolutionParams) -> Option<MetaCacheEntry> {
     if let Some(entry) = entries.resolve(resolver) {
-        return Some(entry);
+        return entry.is_object().then_some(entry);
     }
 
     entries
         .as_ref()
         .iter()
         .flatten()
-        .find(|entry| !entry.name.ends_with(SLASH_SEPARATOR))
+        .find(|entry| entry.is_object() && !entry.name.ends_with(SLASH_SEPARATOR))
         .cloned()
 }
 
@@ -3121,6 +3121,48 @@ mod tests {
     }
 
     #[test]
+    fn test_resolve_object_heal_entry_skips_resolved_empty_directory_candidate() {
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: Vec::new(),
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: Vec::new(),
+                ..Default::default()
+            }),
+        ]);
+
+        assert!(
+            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
+            "resolved empty directory candidates must not be submitted as object heals"
+        );
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_skips_only_empty_directory_fallback_candidates() {
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: Vec::new(),
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "prefix/".to_string(),
+                metadata: Vec::new(),
+                ..Default::default()
+            }),
+        ]);
+
+        assert!(
+            resolve_object_heal_entry(&entries, test_metadata_resolver("bucket")).is_none(),
+            "unresolved fallback must ignore empty directory candidates"
+        );
+    }
+
+    #[test]
     fn test_resolve_object_heal_entry_uses_plain_fallback_after_trailing_slash() {
         let entries = MetaCacheEntries(vec![
             Some(MetaCacheEntry {
@@ -3137,6 +3179,27 @@ mod tests {
 
         let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
             .expect("plain object fallback should remain eligible after a trailing-slash candidate");
+
+        assert_eq!(entry.name, "object");
+    }
+
+    #[test]
+    fn test_resolve_object_heal_entry_uses_plain_fallback_after_empty_directory_candidate() {
+        let entries = MetaCacheEntries(vec![
+            Some(MetaCacheEntry {
+                name: "object/".to_string(),
+                metadata: Vec::new(),
+                ..Default::default()
+            }),
+            Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: vec![1, 2, 3],
+                ..Default::default()
+            }),
+        ]);
+
+        let entry = resolve_object_heal_entry(&entries, test_metadata_resolver("bucket"))
+            .expect("plain object fallback should remain eligible after an empty directory candidate");
 
         assert_eq!(entry.name, "object");
     }

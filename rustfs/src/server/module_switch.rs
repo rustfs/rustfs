@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::resolve_object_store_handle;
+use super::runtime_sources;
 use crate::storage::{Error as StorageError, read_config, save_config};
 use serde::{Deserialize, Serialize};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -159,7 +159,7 @@ pub(crate) fn validate_module_switch_update(requested: PersistedModuleSwitches) 
 }
 
 pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<PersistedModuleSwitches, String> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = runtime_sources::object_store_handle() else {
         return Err("storage layer not initialized".to_string());
     };
 
@@ -180,7 +180,7 @@ pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<Per
 }
 
 pub(crate) async fn save_persisted_module_switches_to_store(config: PersistedModuleSwitches) -> Result<(), String> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = runtime_sources::object_store_handle() else {
         return Err("storage layer not initialized".to_string());
     };
 

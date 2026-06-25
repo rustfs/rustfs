@@ -14,7 +14,7 @@
 
 use super::super::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
-use crate::app::context::resolve_object_store_handle;
+use crate::admin::runtime_sources::resolve_object_store_handle;
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
 use rustfs_config::server_config::Config;
