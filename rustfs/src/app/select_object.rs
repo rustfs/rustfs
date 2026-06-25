@@ -1,4 +1,4 @@
-use crate::app::context::resolve_s3select_db;
+use crate::app::runtime_sources::resolve_s3select_db;
 use crate::error::ApiError;
 use crate::storage::options::get_opts;
 use crate::storage::request_context::spawn_traced;

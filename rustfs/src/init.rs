@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context::{resolve_notify_interface, resolve_region};
+use crate::runtime_sources::{resolve_notify_interface, resolve_region};
 use crate::server::ShutdownHandle;
 use crate::storage::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,

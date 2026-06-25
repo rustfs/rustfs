@@ -20,6 +20,7 @@ pub mod bucket_usecase;
 pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;
+pub(crate) mod runtime_sources;
 mod select_object;
 
 #[cfg(test)]

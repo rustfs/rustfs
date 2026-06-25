@@ -157,6 +157,9 @@ RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtim
 RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
 RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
 RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_source_bypass_hits.txt"
+RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
+RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
+RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
   /^## PR Types$/ {
@@ -1381,6 +1384,38 @@ fi
 
 if [[ -s "$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS admin runtime source reads must stay behind rustfs/src/admin/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src --glob '*.rs' |
+    rg -v '^rustfs/src/app/context' |
+    rg -v '(^rustfs/src/[^/]*runtime_sources\.rs:|/runtime_sources\.rs:)' || true
+) >"$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS AppContext resolver reads must stay behind context or runtime_sources modules: $(paste -sd '; ' "$RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src/app --glob '*.rs' |
+    rg -v '^rustfs/src/app/context' |
+    rg -v '^rustfs/src/app/runtime_sources\.rs:' || true
+) >"$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase runtime source reads must stay behind rustfs/src/app/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context' rustfs/src/storage --glob '*.rs' |
+    rg -v '^rustfs/src/storage/runtime_sources\.rs:' || true
+) >"$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE")"
 fi
 
 (

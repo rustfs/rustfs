@@ -30,8 +30,8 @@ use super::{
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
     versioning_sys::BucketVersioningSys,
 };
-use crate::app::context::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
+use crate::app::runtime_sources::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;

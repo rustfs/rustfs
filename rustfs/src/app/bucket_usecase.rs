@@ -38,7 +38,7 @@ use super::{
 use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
-use crate::app::context::{
+use crate::app::runtime_sources::{
     AppContext, get_global_app_context, resolve_encryption_service, resolve_notification_system,
     resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
 };

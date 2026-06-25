@@ -19,10 +19,17 @@ use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Result as IamResult, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};
 use rustfs_kms::ObjectEncryptionService;
+use rustfs_lock::LockClient;
 use std::sync::Arc;
+
+pub(crate) use context::{AppContext, get_global_app_context};
 
 pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
     context::resolve_object_store_handle()
+}
+
+pub(crate) fn object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
+    context::resolve_object_store_handle_for_context(context)
 }
 
 pub(crate) fn buffer_config() -> RustFSBufferConfig {
@@ -59,4 +66,12 @@ pub(crate) fn region() -> Option<s3s::region::Region> {
 
 pub(crate) fn ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
     context::resolve_ready_iam_handle()
+}
+
+pub(crate) fn iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
+    context::resolve_iam_handle()
+}
+
+pub(crate) fn lock_client() -> Option<Arc<dyn LockClient>> {
+    context::resolve_lock_client()
 }
