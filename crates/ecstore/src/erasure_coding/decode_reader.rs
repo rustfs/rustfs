@@ -14,6 +14,7 @@
 
 use crate::disk::error::Error as DiskError;
 use crate::erasure_codec::bridge::ErasureDecodeEngine;
+use crate::get_diagnostics::{GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_EMIT, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::future::Future;
 use std::io;
@@ -21,6 +22,7 @@ use std::io::ErrorKind;
 use std::pin::Pin;
 use std::sync::Mutex;
 use std::task::{Context, Poll, ready};
+use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 
 type FillFuture<S, W> = Pin<Box<dyn Future<Output = FillResult<S, W>> + Send>>;
@@ -84,7 +86,13 @@ where
             let engine = self.engine.clone();
             let remaining = self.remaining;
             self.fill = Some(Box::pin(async move {
+                let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    GET_STAGE_STRIPE_READ,
+                    stripe_read_stage_start.elapsed().as_secs_f64(),
+                );
                 let result = decode_stripe(&engine, &mut workspace, state, remaining);
                 FillResult {
                     source,
@@ -113,6 +121,8 @@ where
                 if buf.is_empty() && self.remaining > 0 {
                     return Poll::Ready(Err(DiskError::LessData.into()));
                 }
+                rustfs_io_metrics::record_get_object_reader_stripe(GET_OBJECT_PATH_CODEC_STREAMING);
+                rustfs_io_metrics::record_get_object_reader_bytes(GET_OBJECT_PATH_CODEC_STREAMING, buf.len());
                 self.remaining -= buf.len();
                 self.output_buf = buf;
                 self.output_pos = 0;
@@ -198,7 +208,20 @@ where
     }
 
     let (mut shards, _errs) = state.into_parts();
-    engine.reconstruct_into(&mut shards, workspace)?;
+    let reconstruct_stage_start = Instant::now();
+    if let Err(err) = engine.reconstruct_into(&mut shards, workspace) {
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_RECONSTRUCT,
+            reconstruct_stage_start.elapsed().as_secs_f64(),
+        );
+        return Err(err);
+    }
+    rustfs_io_metrics::record_get_object_stage_duration(
+        GET_OBJECT_PATH_CODEC_STREAMING,
+        GET_STAGE_RECONSTRUCT,
+        reconstruct_stage_start.elapsed().as_secs_f64(),
+    );
 
     if shards.len() < engine.data_shards() {
         return Err(io::Error::new(
@@ -207,6 +230,7 @@ where
         ));
     }
 
+    let emit_stage_start = Instant::now();
     let mut output = Vec::with_capacity(engine.block_size().min(remaining));
     for shard in shards.iter().take(engine.data_shards()) {
         if output.len() >= remaining {
@@ -218,6 +242,11 @@ where
         let copy_len = shard.len().min(remaining - output.len());
         output.extend_from_slice(&shard[..copy_len]);
     }
+    rustfs_io_metrics::record_get_object_stage_duration(
+        GET_OBJECT_PATH_CODEC_STREAMING,
+        GET_STAGE_EMIT,
+        emit_stage_start.elapsed().as_secs_f64(),
+    );
 
     Ok(Some(output))
 }

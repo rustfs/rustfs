@@ -16,6 +16,11 @@ use crate::disk::error::DiskError;
 use crate::error::StorageError;
 use std::io;
 
+pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING: &str = "codec_streaming";
+pub(crate) const GET_OBJECT_PATH_EMPTY: &str = "empty";
+pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
+pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
+
 pub(crate) const GET_STAGE_DECODE: &str = "decode";
 pub(crate) const GET_STAGE_EMIT: &str = "emit";
 pub(crate) const GET_STAGE_METADATA: &str = "metadata";
@@ -86,6 +91,14 @@ pub(crate) fn classify_io_error(err: &io::Error) -> GetObjectFailureReason {
 
 pub(crate) fn record_get_object_pipeline_failure(stage: &'static str, reason: GetObjectFailureReason) {
     rustfs_io_metrics::record_get_object_pipeline_failure(stage, reason.as_str());
+}
+
+pub(crate) fn record_get_object_pipeline_failure_for_path(
+    path: &'static str,
+    stage: &'static str,
+    reason: GetObjectFailureReason,
+) {
+    rustfs_io_metrics::record_get_object_pipeline_failure_for_path(path, stage, reason.as_str());
 }
 
 #[cfg(test)]

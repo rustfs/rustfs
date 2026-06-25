@@ -35,7 +35,10 @@ use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::get_diagnostics::{GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure};
+use crate::get_diagnostics::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
+    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+};
 use crate::global::{GLOBAL_LocalNodeName, GLOBAL_TierConfigMgr};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
@@ -357,24 +360,77 @@ fn get_codec_streaming_min_size() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
 }
 
-fn should_use_get_codec_streaming_reader(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingDecision {
+    Use,
+    Fallback(GetCodecStreamingFallbackReason),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingFallbackReason {
+    Disabled,
+    LockOptimizationDisabled,
+    Range,
+    BelowMinSize,
+    Encrypted,
+    Compressed,
+    Remote,
+    Multipart,
+    InvalidMinSize,
+}
+
+impl GetCodecStreamingFallbackReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::LockOptimizationDisabled => "lock_optimization_disabled",
+            Self::Range => "range",
+            Self::BelowMinSize => "below_min_size",
+            Self::Encrypted => "encrypted",
+            Self::Compressed => "compressed",
+            Self::Remote => "remote",
+            Self::Multipart => "multipart",
+            Self::InvalidMinSize => "invalid_min_size",
+        }
+    }
+}
+
+fn get_codec_streaming_reader_decision(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
-) -> bool {
-    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
-        return false;
-    };
+) -> GetCodecStreamingDecision {
+    if !is_get_codec_streaming_enabled() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled);
+    }
+    if !lock_optimization_enabled {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled);
+    }
+    if range.is_some() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range);
+    }
 
-    is_get_codec_streaming_enabled()
-        && lock_optimization_enabled
-        && range.is_none()
-        && object_info.size >= min_size
-        && !object_info.is_encrypted()
-        && !object_info.is_compressed()
-        && !object_info.is_remote()
-        && fi.parts.len() == 1
+    let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize);
+    };
+    if object_info.size < min_size {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize);
+    }
+    if object_info.is_encrypted() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted);
+    }
+    if object_info.is_compressed() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed);
+    }
+    if object_info.is_remote() {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote);
+    }
+    if fi.parts.len() != 1 {
+        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart);
+    }
+
+    GetCodecStreamingDecision::Use
 }
 
 /// Record a lock acquisition for deadlock detection.
@@ -994,6 +1050,7 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
         // }
 
         if object_info.size == 0 {
+            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_EMPTY);
             // if let Some(rs) = range {
             //     let _ = rs.get_offset_length(object_info.size)?;
             // }
@@ -1005,7 +1062,13 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        let codec_streaming_decision = get_codec_streaming_reader_decision(&range, &object_info, &fi, lock_optimization_enabled);
+
         if object_info.is_remote() {
+            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_decision {
+                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+            }
+            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_REMOTE_TRANSITION);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
                 opts.part_number = Some(1);
@@ -1033,21 +1096,29 @@ impl rustfs_storage_api::ObjectIO for SetDisks {
             read_lock_guard
         };
 
-        if should_use_get_codec_streaming_reader(&range, &object_info, &fi, lock_optimization_enabled) {
-            let stream = Self::get_object_decode_reader_with_fileinfo(
-                bucket,
-                object,
-                fi,
-                files,
-                &disks,
-                self.set_index,
-                self.pool_index,
-                opts.skip_verify_bitrot,
-            )
-            .await?;
-            let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
-            return Ok(reader);
+        match codec_streaming_decision {
+            GetCodecStreamingDecision::Use => {
+                rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_CODEC_STREAMING);
+                let stream = Self::get_object_decode_reader_with_fileinfo(
+                    bucket,
+                    object,
+                    fi,
+                    files,
+                    &disks,
+                    self.set_index,
+                    self.pool_index,
+                    opts.skip_verify_bitrot,
+                )
+                .await?;
+                let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                return Ok(reader);
+            }
+            GetCodecStreamingDecision::Fallback(reason) => {
+                rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+            }
         }
+
+        rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_LEGACY_DUPLEX);
 
         let duplex_buffer_size = get_duplex_buffer_size();
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);

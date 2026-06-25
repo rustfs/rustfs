@@ -14,8 +14,8 @@
 
 use super::*;
 use crate::get_diagnostics::{
-    GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error,
-    record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
+    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
 };
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::future::Future;
@@ -1211,16 +1211,24 @@ impl SetDisks {
                 }
             }
         }
-        rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_stage_start.elapsed().as_secs_f64());
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_READER_SETUP,
+            reader_setup_stage_start.elapsed().as_secs_f64(),
+        );
 
         let available_shards = errors.iter().filter(|err| err.is_none()).count();
         if available_shards < erasure.data_shards {
             if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                 let reason = classify_disk_error(&read_err);
-                record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
+                record_get_object_pipeline_failure_for_path(GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_READER_SETUP, reason);
                 return Err(to_object_err(read_err.into(), vec![bucket, object]));
             }
-            record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, GetObjectFailureReason::ReadQuorum);
+            record_get_object_pipeline_failure_for_path(
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                GET_STAGE_READER_SETUP,
+                GetObjectFailureReason::ReadQuorum,
+            );
             return Err(Error::other(format!("not enough disks to read: {errors:?}")));
         }
 
@@ -1537,34 +1545,83 @@ mod tests {
             || {
                 let fi = codec_streaming_test_fileinfo(1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
-                assert!(should_use_get_codec_streaming_reader(&None, &object_info, &fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Use
+                );
 
-                assert!(!should_use_get_codec_streaming_reader(&None, &object_info, &fi, false));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, false),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled)
+                );
 
                 let range = Some(HTTPRangeSpec {
                     is_suffix_length: false,
                     start: 0,
                     end: 1,
                 });
-                assert!(!should_use_get_codec_streaming_reader(&range, &object_info, &fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&range, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range)
+                );
 
                 let multipart_fi = codec_streaming_test_fileinfo(1024, 2);
                 let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
-                assert!(!should_use_get_codec_streaming_reader(&None, &multipart_object_info, &multipart_fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &multipart_object_info, &multipart_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
+                );
 
                 let mut encrypted_fi = fi.clone();
                 encrypted_fi
                     .metadata
                     .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
                 let encrypted = codec_streaming_test_object_info(&encrypted_fi);
-                assert!(!should_use_get_codec_streaming_reader(&None, &encrypted, &fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &encrypted, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
+                );
 
                 let mut compressed_fi = fi.clone();
                 insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
                 let compressed = codec_streaming_test_object_info(&compressed_fi);
-                assert!(!should_use_get_codec_streaming_reader(&None, &compressed, &fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &compressed, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
+                );
+
+                let small_fi = codec_streaming_test_fileinfo(0, 1);
+                let small_object_info = codec_streaming_test_object_info(&small_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &small_object_info, &small_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                );
+
+                let mut remote_fi = fi.clone();
+                remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+                let remote = codec_streaming_test_object_info(&remote_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &remote, &remote_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
+                );
             },
         );
+    }
+
+    #[test]
+    fn codec_streaming_fallback_metric_labels_are_stable() {
+        assert_eq!(GetCodecStreamingFallbackReason::Disabled.as_str(), "disabled");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::LockOptimizationDisabled.as_str(),
+            "lock_optimization_disabled"
+        );
+        assert_eq!(GetCodecStreamingFallbackReason::Range.as_str(), "range");
+        assert_eq!(GetCodecStreamingFallbackReason::BelowMinSize.as_str(), "below_min_size");
+        assert_eq!(GetCodecStreamingFallbackReason::Encrypted.as_str(), "encrypted");
+        assert_eq!(GetCodecStreamingFallbackReason::Compressed.as_str(), "compressed");
+        assert_eq!(GetCodecStreamingFallbackReason::Remote.as_str(), "remote");
+        assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
+        assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
     }
 
     #[test]
@@ -1578,7 +1635,10 @@ mod tests {
                 let fi = codec_streaming_test_fileinfo(1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
 
-                assert!(!should_use_get_codec_streaming_reader(&None, &object_info, &fi, true));
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
+                );
             },
         );
     }

@@ -283,6 +283,31 @@ pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str,
     histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
 }
 
+/// Record the selected GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_path(path: &'static str) {
+    counter!("rustfs_io_get_object_reader_path_total", "path" => path).increment(1);
+}
+
+/// Record why the codec streaming reader was not selected.
+#[inline(always)]
+pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
+    counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
+}
+
+/// Record one decoded reader stripe processed by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_stripe(path: &'static str) {
+    counter!("rustfs_io_get_object_reader_stripes_total", "path" => path).increment(1);
+}
+
+/// Record bytes emitted by a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_bytes(path: &'static str, bytes: usize) {
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_bytes_total", "path" => path).increment(bytes);
+}
+
 /// Record GetObject metadata resolution duration.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
@@ -312,6 +337,12 @@ pub fn record_get_object_duplex_backpressure_duration(duration_secs: f64) {
 pub fn record_get_object_pipeline_failure(stage: &'static str, reason: &'static str) {
     counter!("rustfs_io_get_object_pipeline_failures_total", "path" => "legacy_duplex", "stage" => stage, "reason" => reason)
         .increment(1);
+}
+
+/// Record GetObject read pipeline failures for an explicit bounded path label.
+#[inline(always)]
+pub fn record_get_object_pipeline_failure_for_path(path: &'static str, stage: &'static str, reason: &'static str) {
+    counter!("rustfs_io_get_object_pipeline_failures_total", "path" => path, "stage" => stage, "reason" => reason).increment(1);
 }
 
 /// Record a zero-copy read operation.
@@ -911,11 +942,16 @@ mod tests {
     #[test]
     fn test_record_get_object_stage_metrics() {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_reader_path("codec_streaming");
+        record_get_object_codec_streaming_fallback("range");
+        record_get_object_reader_stripe("codec_streaming");
+        record_get_object_reader_bytes("codec_streaming", 1024);
         record_get_object_metadata_phase_duration(0.002);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
         record_get_object_pipeline_failure("decode", "read_quorum");
+        record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
 
         assert!(0.005_f64.is_sign_positive());
     }
