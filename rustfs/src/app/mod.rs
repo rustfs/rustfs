@@ -21,6 +21,7 @@ pub mod context;
 pub mod multipart_usecase;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
+pub(crate) mod s3_api;
 mod select_object;
 
 #[cfg(test)]
