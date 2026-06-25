@@ -68,6 +68,7 @@ pub mod profiling;
 #[cfg(any(feature = "ftps", feature = "webdav", feature = "sftp"))]
 pub mod protocols;
 pub mod runtime_capabilities;
+pub(crate) mod runtime_sources;
 pub mod server;
 pub(crate) mod startup_audit;
 pub(crate) mod startup_auth;
