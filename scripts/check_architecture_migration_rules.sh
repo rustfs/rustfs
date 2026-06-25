@@ -163,6 +163,7 @@ RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_sto
 RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits.txt"
 RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s3_api_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_api_bypass_hits.txt"
+RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_admin_storage_api_bypass_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
 
 awk '
@@ -1441,13 +1442,34 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename \
-    '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
-    rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+  {
+    rg -n --with-filename \
+      '(use crate::storage::(access|helper|options|request_context|sse|timeout_wrapper|head_prefix|concurrency|ecfs)|crate::storage::sse::EncryptionKeyKind|use crate::storage::\{|use crate::storage::[A-Z])' \
+      rustfs/src/app/select_object.rs rustfs/src/app/*_usecase.rs || true
+    rg -n --with-filename \
+      'use super::(?:\{[^}]*\b(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class)\b|(?:DynReader|HashReader|WriteEncryption|WritePlan|DecryptReader|EncryptReader|HardLimitReader|boxed_reader|wrap_reader|compression_metadata_value|is_disk_compressible|MIN_DISK_COMPRESSIBLE_SIZE|get_lock_acquire_timeout|is_valid_storage_class)\b)' \
+      rustfs/src/app/object_usecase.rs rustfs/src/app/multipart_usecase.rs || true
+  }
 ) >"$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app usecases must consume storage helper APIs through rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '(use crate::storage::(access|request_context|ecfs)|use crate::storage::\{[^}]*Storage(ObjectInfo|ObjectOptions|PutObjReader)|crate::storage::StorageObjectOptions)' \
+    rustfs/src/app/*_test.rs \
+    rustfs/src/admin/router.rs \
+    rustfs/src/admin/console.rs \
+    rustfs/src/admin/handlers/heal.rs \
+    rustfs/src/admin/handlers/metrics.rs \
+    rustfs/src/admin/handlers/object_zip_download.rs || true
+) >"$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin completed storage helper consumers must use local storage_api boundaries: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_STORAGE_API_BYPASS_HITS_FILE")"
 fi
 
 (

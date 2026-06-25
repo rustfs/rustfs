@@ -21,6 +21,7 @@ use super::storageclass;
 use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
@@ -29,11 +30,13 @@ use super::storage_api::deadlock_detector;
 use super::storage_api::ecfs::FS;
 use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
 use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 use super::storage_api::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
 use super::storage_api::request_context::{self, spawn_traced};
+use super::storage_api::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
 use super::storage_api::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
     encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
@@ -48,10 +51,7 @@ use super::storage_api::{
 };
 use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
 use super::{DiskError, is_all_buckets_not_found};
-use super::{DynReader, HashReader, WritePlan, wrap_reader};
 use super::{Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found};
-use super::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::{get_lock_acquire_timeout, is_valid_storage_class};
 use super::{
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
@@ -2383,7 +2383,7 @@ impl DefaultObjectUsecase {
                 StreamReader::new(body.map(|f| f.map_err(|e| std::io::Error::other(e.to_string())))),
             );
             let algorithm = CompressionAlgorithm::default();
-            insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+            insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             let mut hrd =
@@ -2394,7 +2394,7 @@ impl DefaultObjectUsecase {
             }
 
             opts.want_checksum = hrd.checksum();
-            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+            insert_str(&mut opts.user_defined, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
             insert_str(&mut opts.user_defined, SUFFIX_ACTUAL_SIZE, size.to_string());
 
             size = HashReader::SIZE_PRESERVE_LAYER;
@@ -3465,7 +3465,7 @@ impl DefaultObjectUsecase {
             insert_str(
                 &mut compress_metadata,
                 SUFFIX_COMPRESSION,
-                super::compression_metadata_value(CompressionAlgorithm::default()),
+                compression_metadata_value(CompressionAlgorithm::default()),
             );
             insert_str(&mut compress_metadata, SUFFIX_ACTUAL_SIZE, actual_size.to_string());
         } else {
@@ -5037,7 +5037,7 @@ impl DefaultObjectUsecase {
                     .map_err(ApiError::from)?
             } else if should_compress {
                 let algorithm = CompressionAlgorithm::default();
-                insert_str(&mut metadata, SUFFIX_COMPRESSION, super::compression_metadata_value(algorithm));
+                insert_str(&mut metadata, SUFFIX_COMPRESSION, compression_metadata_value(algorithm));
                 insert_str(&mut metadata, SUFFIX_ACTUAL_SIZE, size.to_string());
 
                 let hrd = HashReader::from_stream(f, size, actual_size, None, None, false).map_err(ApiError::from)?;

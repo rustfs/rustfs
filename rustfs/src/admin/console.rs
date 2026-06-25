@@ -14,6 +14,7 @@
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::admin::runtime_sources::resolve_oidc_handle;
+use crate::admin::storage_api::RequestContext;
 use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
@@ -21,7 +22,6 @@ use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
     RequestContextLayer, VERSION,
 };
-use crate::storage::request_context::RequestContext;
 use crate::version::build;
 use axum::{
     Json, Router,

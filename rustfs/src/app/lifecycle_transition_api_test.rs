@@ -12,6 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::storage_api::ecfs::FS;
+use super::storage_api::{
+    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+};
 use super::{
     AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, TierConfig, TierType, WarmBackendGetOpts,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
@@ -22,10 +26,6 @@ use super::{
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
 use crate::app::runtime_sources::resolve_tier_config_handle;
-use crate::storage::ecfs::FS;
-use crate::storage::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-};
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
