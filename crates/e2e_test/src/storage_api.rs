@@ -12,18 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::{IamNotificationSys, notification_sys as ecstore_notification_sys};
-use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config};
-use rustfs_credentials::{Credentials, get_global_action_cred};
-
-pub(crate) fn action_credentials() -> Option<Credentials> {
-    get_global_action_cred()
-}
-
-pub(crate) fn current_server_config() -> Option<ServerConfig> {
-    get_global_server_config()
-}
-
-pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
-    ecstore_notification_sys()
-}
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::disk::{VolumeInfo, WalkDirOptions};
+pub(crate) use rustfs_ecstore::api::rpc::{TonicInterceptor, node_service_time_out_client_no_auth};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_interceptor, node_service_time_out_client};

@@ -16,6 +16,7 @@ use crate::common::{
     RustFSTestEnvironment, awscurl_available, awscurl_post_sts_form_urlencoded, init_logging, local_http_client,
     rustfs_binary_path,
 };
+use crate::storage_api::BucketTargetSys;
 use aws_sdk_s3::config::{Credentials, Region};
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -28,7 +29,6 @@ use rcgen::{
     SanType, generate_simple_self_signed,
 };
 use reqwest::StatusCode;
-use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys;
 use rustfs_madmin::{
     AddServiceAccountReq, ListServiceAccountsResp, PeerInfo, PeerSite, ReplicateAddStatus, ReplicateEditStatus,
     ReplicateRemoveStatus, SRRemoveReq, SRResyncOpStatus, SRStatusInfo, SiteReplicationInfo, SyncStatus,

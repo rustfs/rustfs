@@ -14,10 +14,10 @@
 
 //! Swift account operations and validation
 
+use super::storage_api::{BucketOperations, MakeBucketOptions};
 use super::{SwiftError, SwiftResult};
 use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 use rustfs_credentials::Credentials;
-use rustfs_storage_api::{BucketOperations, MakeBucketOptions};
 use s3s::dto::{Tag, Tagging};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
