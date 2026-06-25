@@ -22,6 +22,13 @@ use super::s3_api::bucket::{
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     rustfs_owner,
 };
+use super::storage_api::StorageObjectInfo as ObjectInfo;
+use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
+use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::{
+    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    request_context, validate_list_object_unordered_with_delimiter,
+};
 use super::{AppObjectLockConfigExt as _, AppVersioningConfigExt as _};
 use super::{
     bucket_target_sys::BucketTargetSys,
@@ -50,13 +57,6 @@ use crate::app::runtime_sources::{
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
-use crate::storage::StorageObjectInfo as ObjectInfo;
-use crate::storage::access::{ReqInfo, authorize_request, req_info_ref};
-use crate::storage::helper::{OperationHelper, spawn_background_with_context};
-use crate::storage::{
-    get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    request_context, validate_list_object_unordered_with_delimiter,
-};
 use futures::StreamExt;
 use http::StatusCode;
 use metrics::counter;

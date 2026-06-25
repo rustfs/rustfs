@@ -22,7 +22,7 @@ dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook
 dep|rustfs/src/app/lifecycle_transition_api_test.rs|app->interface|crate::storage::ecfs::FS
-dep|rustfs/src/app/object_usecase.rs|app->interface|crate::storage::ecfs::FS
+dep|rustfs/src/app/storage_api.rs|app->interface|crate::storage::ecfs::FS
 dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::bucket::ListObjectVersionsParams
 dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::bucket::ListObjectsV2Params
 dep|rustfs/src/app/s3_api.rs|app->interface|crate::storage::s3_api::bucket::build_list_buckets_output
