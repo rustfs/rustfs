@@ -258,9 +258,72 @@ RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true
 
 1. 更大对象区间虽然在 `v8` 中表现很好
 2. 但 `v9` 再次出现了明显回落
-3. 当前还不能把“对更大对象更有效”当成稳定结论
+3. 因此单靠 `v8/v9` 两轮结果，还不能把这条线判断成“已经稳定成立”的优化
 
-## 17. 当前最保守结论
+## 17. `capture-backed v3` 确认性复测
+
+为降低上一轮波动判断里的环境不确定性，又补了一轮带 supporting evidence 的确认性复测：
+
+1. `issue712-deeper-zero-copy-capture-v3-20260625T080909Z`
+
+固定条件：
+
+1. `RUSTFS_ERASURE_ENCODE_BYTESMUT_INGEST=true`
+2. `64MiB / 128MiB / 256MiB`
+3. `c16`
+4. `duration=60s`
+5. `rounds=1`
+6. `cooldown=20s`
+7. 同步采集 `health/ready`、Prometheus text snapshot、host snapshot
+
+结果：
+
+1. `64MiB`: `379.49 MiB/s`, `2692.7ms`
+2. `128MiB`: `364.71 MiB/s`, `5603.5ms`
+3. `256MiB`: `358.57 MiB/s`, `11306.0ms`
+
+`aggregate_median_summary.csv` 对应中位吞吐分别为：
+
+1. `64MiB`: `397924106.24 B/s`
+2. `128MiB`: `382426152.96 B/s`
+3. `256MiB`: `375987896.32 B/s`
+
+## 18. 这轮 capture 证据说明了什么
+
+这轮目录：
+
+1. `target/bench/issue712-deeper-zero-copy-capture-v3-20260625T080909Z`
+
+supporting evidence 的关键点：
+
+1. `25/25` 个 `health` 快照都正常
+2. `25/25` 个 `ready` 快照都返回 `ready=true`，没有再出现上一轮那种持续 `503`
+3. `25` 个 Prometheus text snapshot 都成功落盘
+4. 末尾 snapshot 中 4 块盘的 `availability/io/timeout` error counter 都仍为 `0`
+5. `internode dial/errors` counter 仍为 `0`
+6. 末尾 snapshot 中 RustFS process resident memory 约为 `2.06 GiB`
+7. `ps.*.txt` 能稳定看到 RustFS 进程，最后一个样本 RSS 约 `2013424 KiB`
+
+也要保留一个约束：
+
+1. 这轮 `host/iostat.txt` 在 macOS 上只记录到了 `iostat: illegal option -- x`
+2. 所以这次 capture 对 CPU / health / ready / Prometheus 是可用的
+3. 但对更细的磁盘侧 host telemetry 仍然不是完整证据链
+
+## 19. 阶段性判断再收紧
+
+补完这轮 `capture-backed v3` 后，可以把判断更新为：
+
+1. 上一轮失败更像是运行环境/实例就绪问题导致的假阴性，不是这条实验分支必然失效
+2. 在运行面稳定、带冷却时间、并补齐 supporting evidence 的前提下，这条线在 `64MiB+` 普通 PUT 上仍然能跑出一组干净结果
+3. 这进一步说明 `Erasure::encode` ingest 的 deeper-zero-copy 方向值得继续保留为实验线
+4. 但这轮仍然只有单次 `capture-backed` 确认，不足以证明它已经稳定优于主线
+5. 当前仍应把这条能力保留为 `env-gated`
+6. 这条线仍更适合作为实验 PR / Draft PR 持续收集证据
+7. 后续如果再补验证，优先做同矩阵重复性复测，而不是直接改默认行为
+8. 当前还不能把“对更大对象更有效”当成稳定结论
+
+## 20. 当前最保守结论
 
 到当前阶段，应把结论再次收紧为：
 
