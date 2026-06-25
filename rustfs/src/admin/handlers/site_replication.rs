@@ -118,7 +118,6 @@ const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
 const SITE_REPLICATION_PEER_EDIT_PATH: &str = "/rustfs/admin/v3/site-replication/peer/edit";
 const SITE_REPLICATION_PEER_REMOVE_PATH: &str = "/rustfs/admin/v3/site-replication/peer/remove";
-const MINIO_ADMIN_PREFIX: &str = "/minio/admin";
 const RUSTFS_ADMIN_V3_PREFIX: &str = "/rustfs/admin/v3";
 const MINIO_ADMIN_V3_PREFIX: &str = "/minio/admin/v3";
 const MINIO_SITE_REPLICATION_JOIN_PATH: &str = "/minio/admin/v3/site-replication/join";
@@ -1656,8 +1655,6 @@ fn site_replication_peer_wire_path(path: &str) -> String {
         MINIO_SITE_REPLICATION_JOIN_PATH.to_string()
     } else if let Some(suffix) = path_only.strip_prefix(RUSTFS_ADMIN_V3_PREFIX) {
         format!("{MINIO_ADMIN_V3_PREFIX}{suffix}")
-    } else if path_only.starts_with(MINIO_ADMIN_PREFIX) {
-        path_only.to_string()
     } else {
         path_only.to_string()
     };
@@ -6174,19 +6171,21 @@ mod tests {
 
     #[test]
     fn test_retry_stats_for_state_counts_pending_and_failed() {
-        let mut state = SiteReplicationState::default();
-        state.retry_queue = vec![
-            SiteReplicationRetryEvent {
-                failed: false,
-                last_error: "pending".to_string(),
-                ..Default::default()
-            },
-            SiteReplicationRetryEvent {
-                failed: true,
-                last_error: "failed".to_string(),
-                ..Default::default()
-            },
-        ];
+        let state = SiteReplicationState {
+            retry_queue: vec![
+                SiteReplicationRetryEvent {
+                    failed: false,
+                    last_error: "pending".to_string(),
+                    ..Default::default()
+                },
+                SiteReplicationRetryEvent {
+                    failed: true,
+                    last_error: "failed".to_string(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
 
         let stats = retry_stats_for_state(&state).expect("retry stats should be present");
 
@@ -6197,23 +6196,25 @@ mod tests {
 
     #[test]
     fn test_remove_sites_prunes_retry_queue_for_removed_peer() {
-        let mut state = SiteReplicationState::default();
-        state.name = "local".to_string();
-        state.peers.insert(
-            "remote-dep".to_string(),
-            PeerInfo {
-                deployment_id: "remote-dep".to_string(),
-                name: "remote".to_string(),
-                endpoint: "https://remote.example.com".to_string(),
+        let state = SiteReplicationState {
+            name: "local".to_string(),
+            peers: BTreeMap::from([(
+                "remote-dep".to_string(),
+                PeerInfo {
+                    deployment_id: "remote-dep".to_string(),
+                    name: "remote".to_string(),
+                    endpoint: "https://remote.example.com".to_string(),
+                    ..Default::default()
+                },
+            )]),
+            retry_queue: vec![SiteReplicationRetryEvent {
+                peer_deployment_id: "remote-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
                 ..Default::default()
-            },
-        );
-        state.retry_queue.push(SiteReplicationRetryEvent {
-            peer_deployment_id: "remote-dep".to_string(),
-            peer_endpoint: "https://remote.example.com".to_string(),
-            path: "/rustfs/admin/v3/site-replication/peer/iam-item".to_string(),
+            }],
             ..Default::default()
-        });
+        };
 
         let state = remove_sites(
             state,

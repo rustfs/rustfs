@@ -41,10 +41,13 @@ This PR hardens the site replication control plane in small, reviewable commits.
 11. `feat: add site replication retry and repair MVP`
    - Purpose: persist failed peer replication attempts as retry metadata, expose retry counts in status, and add an operation-level repair endpoint that replays the current local snapshot.
    - Reason: transient peer failures were previously only visible through logs and required manual reconstruction; a durable, secret-safe queue plus repair replay gives operators a concrete recovery path without persisting sensitive request payloads.
+12. `fix: satisfy site replication pre-pr checks`
+   - Purpose: remove a redundant MinIO admin-path branch and construct retry test fixtures directly.
+   - Reason: the full pre-PR gate enforces clippy warnings as errors; this keeps the final branch green without changing site replication behavior.
 
 ## Verification
 
-Baseline started from `origin/main` at `758677da`.
+Baseline started from `origin/main` at `758677da`, then was rebased onto the latest `origin/main` at `1d6a8259`.
 
 - Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs-ecstore bucket_target --lib`
@@ -65,8 +68,8 @@ Baseline started from `origin/main` at `758677da`.
 - Passed: `cargo test -p rustfs site_replication --lib`
 - Passed: `cargo fmt --all --check`
 - Passed: `cargo test -p rustfs site_replication --lib`
-
-Not run in this step: `make pre-commit`, `make pre-pr`.
+- Passed before the final main rebase: `make pre-pr`
+- Not completed after rebasing onto `1d6a8259`: `make pre-pr` was interrupted during clippy at request time; formatting, unsafe-code, architecture, and logging guardrails had already passed in that run.
 
 ## Impact
 
@@ -82,7 +85,7 @@ The status diagnostics step adds optional `PeerErrors` and `PendingOperation` fi
 
 ## Additional Notes
 
-This PR continues with bootstrap, durable retry, and repair work in later commits so the expanded hardening can land as one reviewable PR.
+This draft PR includes bootstrap, durable retry, and repair work in one reviewable branch. It should remain draft until CI or a full local pre-PR run confirms the latest `main` baseline.
 
 The expanded single-PR scope also includes MinIO wire-contract bootstrap validation, durable site-replication retry, full add-time IAM/bootstrap sync, lifecycle compatibility, and site-level repair.
 
