@@ -32,7 +32,7 @@ use super::EndpointServerPools;
 use super::ScannerMetricsReport;
 use super::StorageClassConfig;
 use super::TierConfigMgr;
-use super::metadata_sys::BucketMetadataSys;
+use super::storage_api::bucket::metadata_sys::BucketMetadataSys;
 use super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;

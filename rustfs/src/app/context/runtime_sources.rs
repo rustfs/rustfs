@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
 use super::super::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ECStore, EndpointServerPools, ExpiryState, NotificationSys,
     ReplicationStats, ScannerMetricsReport, StorageClassConfig, TierConfigMgr, collect_scanner_metrics_report,
@@ -108,7 +108,7 @@ pub fn notification_system() -> Option<&'static NotificationSys> {
 }
 
 pub fn bucket_metadata() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    super::super::metadata_sys::get_global_bucket_metadata_sys()
+    super::super::storage_api::bucket::metadata_sys::get_global_bucket_metadata_sys()
 }
 
 pub fn bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {

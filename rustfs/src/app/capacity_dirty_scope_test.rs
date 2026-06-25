@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, metadata_sys};
+use super::storage_api::bucket::metadata_sys;
+use super::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use rustfs_storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};

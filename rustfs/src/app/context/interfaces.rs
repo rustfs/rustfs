@@ -17,7 +17,7 @@ use super::super::EndpointServerPools;
 use super::super::ScannerMetricsReport;
 use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
-use super::super::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
 use super::super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;

@@ -15,7 +15,7 @@
 use super::super::EndpointServerPools;
 use super::super::StorageClassConfig;
 use super::super::TierConfigMgr;
-use super::super::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,

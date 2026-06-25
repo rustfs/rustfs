@@ -14,11 +14,34 @@
 
 //! Object application use-case contracts.
 
-use super::quota::checker::QuotaChecker;
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::ECStore;
 use super::s3_api::multipart::parse_list_parts_params;
 use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
+use super::storage_api::bucket::quota::checker::QuotaChecker;
+use super::storage_api::bucket::{
+    ReplicationConfigExt as _, VersioningConfigExt as _,
+    lifecycle::{
+        bucket_lifecycle_audit::LcEventSrc,
+        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
+        lifecycle::{self, TransitionOptions},
+        tier_delete_journal, tier_sweeper,
+    },
+    metadata_sys,
+    object_lock::{
+        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
+        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
+    },
+    predict_lifecycle_expiration,
+    quota::QuotaOperation,
+    replication::{
+        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
+        must_replicate, schedule_replication, schedule_replication_delete,
+    },
+    tagging::decode_tags,
+    validate_restore_request,
+    versioning_sys::BucketVersioningSys,
+};
 use super::storage_api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 use super::storage_api::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
@@ -52,26 +75,6 @@ use super::storage_api::{
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
     strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
-};
-use super::{AppReplicationConfigExt as _, AppVersioningConfigExt as _, predict_lifecycle_expiration, validate_restore_request};
-use super::{
-    lifecycle::{
-        bucket_lifecycle_audit::LcEventSrc,
-        bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
-        lifecycle::{self, TransitionOptions},
-    },
-    metadata_sys,
-    object_lock::{
-        objectlock::{get_object_legalhold_meta, get_object_retention_meta},
-        objectlock_sys::{BucketObjectLockSys, check_object_lock_for_deletion, is_retention_active},
-    },
-    quota::QuotaOperation,
-    replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
-        must_replicate, schedule_replication, schedule_replication_delete,
-    },
-    tagging::decode_tags,
-    versioning_sys::BucketVersioningSys,
 };
 use crate::app::runtime_sources::{
     AppContext, get_global_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
@@ -318,10 +321,10 @@ async fn enqueue_transitioned_delete_cleanup(
     let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Cleanup);
 
     let je = if opts.delete_prefix {
-        super::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
+        tier_sweeper::transitioned_force_delete_journal_entry(&existing.transitioned_object)
     } else {
         let version_id = opts.version_id.as_ref().and_then(|v| Uuid::parse_str(v).ok());
-        super::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
+        tier_sweeper::transitioned_delete_journal_entry(
             version_id,
             opts.versioned,
             opts.version_suspended,
@@ -332,7 +335,7 @@ async fn enqueue_transitioned_delete_cleanup(
         return Ok(());
     };
 
-    super::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
+    tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
     let expiry_state = resolve_expiry_state_handle();
     let mut expiry_state = expiry_state.write().await;
