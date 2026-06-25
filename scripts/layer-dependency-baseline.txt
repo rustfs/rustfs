@@ -59,9 +59,7 @@ dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_endpo
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_iam_ready
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_lock_clients_handle
 dep|rustfs/src/server/readiness.rs|infra->app|crate::app::context::resolve_object_store_handle
-dep|rustfs/src/server/tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
 dep|rustfs/src/startup_bucket_metadata.rs|infra->app|crate::app::context::resolve_replication_pool_handle
-dep|rustfs/src/startup_tls_material.rs|infra->app|crate::app::context::resolve_outbound_tls_generation
 dep|rustfs/src/startup_iam.rs|infra->app|crate::app::context::AppContext
 dep|rustfs/src/storage/ecfs_extend.rs|infra->app|crate::app::context::resolve_buffer_config
 dep|rustfs/src/storage/ecfs_extend.rs|infra->interface|crate::storage::ecfs::ListObjectUnorderedQuery

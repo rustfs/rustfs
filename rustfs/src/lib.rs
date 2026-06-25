@@ -87,6 +87,7 @@ pub(crate) mod startup_preflight;
 pub(crate) mod startup_protocols;
 pub(crate) mod startup_runtime;
 pub(crate) mod startup_runtime_hooks;
+pub(crate) mod startup_runtime_sources;
 pub(crate) mod startup_server;
 pub(crate) mod startup_services;
 pub(crate) mod startup_shutdown;
