@@ -449,13 +449,13 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/site-replication/devnull",
-        SITE_REPLICATION_INFO,
+        SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Post,
         "/rustfs/admin/v3/site-replication/netperf",
-        SITE_REPLICATION_INFO,
+        SITE_REPLICATION_OPERATION,
         RouteRiskLevel::High,
     ),
     admin(
@@ -1521,6 +1521,17 @@ mod tests {
     #[test]
     fn route_policy_maps_metrics_to_explicit_admin_action() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/metrics", GET_METRICS);
+    }
+
+    #[test]
+    fn route_policy_requires_operation_for_site_replication_diagnostics() {
+        for path in [
+            "/rustfs/admin/v3/site-replication/devnull",
+            "/rustfs/admin/v3/site-replication/netperf",
+        ] {
+            assert_action(HttpMethod::Post, path, SITE_REPLICATION_OPERATION);
+            assert_not_action(HttpMethod::Post, path, SITE_REPLICATION_INFO);
+        }
     }
 
     fn route_policy_inventory_keys() -> BTreeSet<String> {

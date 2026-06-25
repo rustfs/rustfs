@@ -106,6 +106,7 @@ const SITE_REPL_RESYNC_START: &str = "start";
 const SITE_REPL_RESYNC_CANCEL: &str = "cancel";
 const SITE_REPL_RESYNC_STATUS: &str = "status";
 const SITE_REPL_MIN_NETPERF_DURATION: Duration = Duration::from_secs(1);
+const SITE_REPL_MAX_NETPERF_DURATION: Duration = Duration::from_secs(30);
 const SITE_REPLICATION_PEER_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
@@ -432,6 +433,14 @@ fn json_response<T: Serialize>(value: &T) -> S3Result<S3Response<(StatusCode, Bo
 fn go_gob_site_netperf_response(value: &SiteNetPerfNodeResult) -> S3Response<(StatusCode, Body)> {
     let data = encode_go_gob_site_netperf_node_result(value);
     S3Response::new((StatusCode::OK, Body::from(data)))
+}
+
+fn site_repl_netperf_duration(uri: &Uri) -> Duration {
+    query_pairs(uri)
+        .get("duration")
+        .and_then(|value| rustfs_madmin::utils::parse_duration(value).ok())
+        .unwrap_or(SITE_REPL_MIN_NETPERF_DURATION)
+        .clamp(SITE_REPL_MIN_NETPERF_DURATION, SITE_REPL_MAX_NETPERF_DURATION)
 }
 
 fn encode_go_gob_site_netperf_node_result(value: &SiteNetPerfNodeResult) -> Vec<u8> {
@@ -3950,7 +3959,7 @@ pub struct SiteReplicationDevNullHandler {}
 #[async_trait::async_trait]
 impl Operation for SiteReplicationDevNullHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
+        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
         let _ = read_plain_admin_body(req.input).await?;
         Ok(empty_response(StatusCode::NO_CONTENT))
     }
@@ -3961,12 +3970,8 @@ pub struct SiteReplicationNetPerfHandler {}
 #[async_trait::async_trait]
 impl Operation for SiteReplicationNetPerfHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationInfoAction).await?;
-        let duration = query_pairs(&req.uri)
-            .get("duration")
-            .and_then(|value| rustfs_madmin::utils::parse_duration(value).ok())
-            .unwrap_or(SITE_REPL_MIN_NETPERF_DURATION)
-            .max(SITE_REPL_MIN_NETPERF_DURATION);
+        validate_site_replication_admin_request(&req, AdminAction::SiteReplicationOperationAction).await?;
+        let duration = site_repl_netperf_duration(&req.uri);
 
         let endpoint = request_endpoint(&req.uri, &req.headers);
         let started_at = Instant::now();
@@ -5895,6 +5900,19 @@ mod tests {
         set_test_outbound_tls_generation(previous_generation);
         let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
         *cache = previous_cache;
+    }
+
+    #[test]
+    fn test_site_repl_netperf_duration_is_bounded() {
+        let default_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf");
+        let too_short_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=0s");
+        let too_long_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=60s");
+        let valid_uri = Uri::from_static("/rustfs/admin/v3/site-replication/netperf?duration=5s");
+
+        assert_eq!(site_repl_netperf_duration(&default_uri), SITE_REPL_MIN_NETPERF_DURATION);
+        assert_eq!(site_repl_netperf_duration(&too_short_uri), SITE_REPL_MIN_NETPERF_DURATION);
+        assert_eq!(site_repl_netperf_duration(&too_long_uri), SITE_REPL_MAX_NETPERF_DURATION);
+        assert_eq!(site_repl_netperf_duration(&valid_uri), Duration::from_secs(5));
     }
 
     #[test]
