@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::license::license_status;
+use crate::startup_runtime_sources;
 use rustls::crypto::aws_lc_rs::default_provider;
 use std::future::Future;
 use std::io::{Error, Result};
@@ -104,10 +105,10 @@ pub(crate) fn install_default_crypto_provider() {
 }
 
 pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<()> {
-    let guard = rustfs_obs::init_obs(Some(obs_endpoint))
+    let guard = startup_runtime_sources::init_observability_guard(obs_endpoint)
         .await
         .map_err(|err| Error::other(format!("init_obs: {err}")))?;
-    rustfs_obs::set_global_guard(guard).map_err(|err| Error::other(format!("set_global_guard: {err}")))?;
+    startup_runtime_sources::set_observability_guard(guard).map_err(|err| Error::other(format!("set_global_guard: {err}")))?;
 
     install_embedded_default_crypto_provider();
     rustfs_trusted_proxies::init();
