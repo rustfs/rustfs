@@ -1,4 +1,4 @@
-use super::storage_api::select_object::ObjectOperations as _;
+use super::storage_api::select_object::contract::object::ObjectOperations as _;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
 use super::storage_api::select_object::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};

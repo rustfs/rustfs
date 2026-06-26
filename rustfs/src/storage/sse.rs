@@ -70,7 +70,7 @@
 //! ```
 
 use super::StorageError;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
 use aes_gcm::{
@@ -2402,10 +2402,38 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
-    use http::HeaderValue;
+    #[cfg(feature = "rio-v2")]
+    use super::{
+        DARE_CIPHER_AES_256_GCM, DARE_CIPHER_CHACHA20_POLY1305, MINIO_INTERNAL_ENCRYPTION_SEAL_ALGORITHM, SEALED_KEY_IV_SIZE,
+        SEALED_KEY_SIZE, is_legacy_rustfs_managed_metadata, is_supported_sealed_object_key_cipher,
+    };
+    use super::{
+        DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
+        INTERNAL_ENCRYPTION_IV_HEADER, INTERNAL_ENCRYPTION_KEY_HEADER, INTERNAL_ENCRYPTION_KEY_ID_HEADER, KmsSseDekProvider,
+        MINIO_INTERNAL_ENCRYPTION_ALGORITHM_HEADER, MINIO_INTERNAL_ENCRYPTION_IV_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_CONTEXT_HEADER, MINIO_INTERNAL_ENCRYPTION_KMS_KEY_ID_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER,
+        MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER, MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+        PrepareEncryptionRequest, SSEC_ORIGINAL_SIZE_HEADER, SSEType, SseDekProvider, SsecParams, StorageError,
+        TestSseDekProvider, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+        extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata, reset_sse_dek_provider,
+        resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
+        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
+        verify_ssec_key_match,
+    };
+    use aes_gcm::aead::{Aead, KeyInit};
+    use aes_gcm::{Aes256Gcm, Key, Nonce};
+    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
+    use http::{HeaderMap, HeaderValue};
+    use rustfs_kms::types::ObjectEncryptionContext;
     use rustfs_rio::{DecryptReader, EncryptReader};
+    use rustfs_utils::http::headers::AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT;
+    use s3s::S3ErrorCode;
+    use s3s::dto::{SSECustomerAlgorithm, SSECustomerKey, SSECustomerKeyMD5, ServerSideEncryption};
+    use std::collections::HashMap;
     use std::sync::OnceLock;
     use temp_env::async_with_vars;
     use tokio::sync::Mutex;
