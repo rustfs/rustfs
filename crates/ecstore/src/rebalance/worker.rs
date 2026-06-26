@@ -5,11 +5,11 @@ use super::{
     REBALANCE_MIGRATION_RETRY_BASE_DELAY, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome, Result,
 };
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use crate::core::pools::ListCallback;
 use crate::disk::error::DiskError;
 use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
 };
-use crate::pools::ListCallback;
 use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use rand::RngExt as _;

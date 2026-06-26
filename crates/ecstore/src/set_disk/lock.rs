@@ -417,7 +417,7 @@ impl SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_init::save_format_file;
+    use crate::store::init_format::save_format_file;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 

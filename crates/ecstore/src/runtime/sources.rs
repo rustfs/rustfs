@@ -26,9 +26,8 @@ use crate::{
     bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
     config::{get_global_storage_class, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
-    endpoints::EndpointServerPools,
-    endpoints::SetupType,
     error::Result,
+    layout::endpoints::{EndpointServerPools, SetupType},
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,

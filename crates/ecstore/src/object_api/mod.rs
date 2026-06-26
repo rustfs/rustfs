@@ -21,7 +21,7 @@ use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
     range::HTTPRangeSpec,
 };
-use crate::store_utils::clean_metadata;
+use crate::store::utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};

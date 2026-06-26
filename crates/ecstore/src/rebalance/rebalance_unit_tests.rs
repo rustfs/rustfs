@@ -2408,13 +2408,13 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         ..Default::default()
     };
 
-    let endpoint_pools: crate::endpoints::EndpointServerPools = Vec::new().into();
+    let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
     let store = Arc::new(crate::store::ECStore {
         id: uuid::Uuid::new_v4(),
         disk_map: std::collections::HashMap::new(),
         pools: Vec::new(),
         peer_sys: crate::rpc::S3PeerSys::new(&endpoint_pools),
-        pool_meta: tokio::sync::RwLock::new(crate::pools::PoolMeta::default()),
+        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
         rebalance_meta: tokio::sync::RwLock::new(Some(active_meta)),
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),

@@ -20,8 +20,8 @@ use crate::storage_api_contracts::topology::{
 };
 
 use crate::{
-    endpoints::EndpointServerPools,
     layout::endpoint::{Endpoint, EndpointType},
+    layout::endpoints::EndpointServerPools,
 };
 
 const ENDPOINT_TYPE_LABEL: &str = "endpoint_type";
@@ -434,7 +434,7 @@ mod tests {
     use super::*;
     use std::collections::BTreeSet;
 
-    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
 
     #[test]
     fn topology_snapshot_maps_endpoint_sets_without_local_paths() {

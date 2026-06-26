@@ -23,13 +23,13 @@ use crate::rpc::client::{
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::store::all_local_disk;
-use crate::store_utils::is_reserved_or_invalid_bucket;
+use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
         self, VolumeInfo,
         disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
-    endpoints::{EndpointServerPools, Node},
+    layout::endpoints::{EndpointServerPools, Node},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -1102,7 +1102,7 @@ mod tests {
     use crate::disk::disk_store::LocalDiskWrapper;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::local::LocalDisk;
-    use crate::endpoints::{Endpoints, PoolEndpoints};
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
     use crate::runtime::global::reset_local_disk_test_state;
     use crate::store::init_local_disks;
     use rustfs_filemeta::FileInfo;

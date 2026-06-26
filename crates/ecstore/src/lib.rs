@@ -13,56 +13,33 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate core;
-
 pub mod api;
 mod bucket;
 mod cache_value;
 mod cluster;
 mod config;
+mod core;
 mod data_movement;
-#[path = "data_movement/backpressure.rs"]
-mod data_movement_backpressure;
 mod data_usage;
 mod diagnostics;
 mod disk;
-#[path = "layout/disks_layout_facade.rs"]
-mod disks_layout;
-#[path = "layout/endpoints_facade.rs"]
-mod endpoints;
 mod erasure_codec;
 mod erasure_coding;
 mod error;
 mod io_support;
 pub(crate) mod layout;
 mod object_api;
-#[path = "core/pools.rs"]
-mod pools;
 mod rebalance;
 mod rpc;
 mod runtime;
 mod services;
 mod set_disk;
-#[path = "core/sets.rs"]
-mod sets;
 mod storage_api_contracts;
 mod store;
-#[path = "store/init_format.rs"]
-mod store_init;
-#[path = "store/list_objects.rs"]
-mod store_list_objects;
-#[path = "store/utils.rs"]
-mod store_utils;
 
 // pub mod checksum;
 mod client;
 mod event;
-#[cfg(test)]
-#[path = "core/pools_test.rs"]
-mod pools_test;
-#[cfg(test)]
-#[path = "core/store_test.rs"]
-mod store_test;
 mod tier;
 
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;

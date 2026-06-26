@@ -1313,8 +1313,8 @@ mod tests {
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
+    use crate::layout::endpoints::SetupType;
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime::sources as runtime_sources;
     use crate::set_disk::SetDisks;

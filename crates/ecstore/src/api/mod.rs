@@ -34,11 +34,11 @@ pub mod cache {
 }
 
 pub mod capacity {
-    pub use crate::pools::{
+    pub use crate::core::pools::{
         PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
         path2_bucket_object_with_base_path,
     };
-    pub use crate::store_utils::is_reserved_or_invalid_bucket;
+    pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
 
 pub mod client {
@@ -119,8 +119,8 @@ pub mod global {
 }
 
 pub mod layout {
-    pub use crate::disks_layout::DisksLayout;
-    pub use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
+    pub use crate::layout::disks_layout::DisksLayout;
+    pub use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
 }
 
 pub mod metrics {
@@ -168,7 +168,7 @@ pub mod set_disk {
 }
 
 pub mod store_list {
-    pub use crate::store_list_objects::{ListPathOptions, max_keys_plus_one};
+    pub use crate::store::list_objects::{ListPathOptions, max_keys_plus_one};
 }
 
 pub mod storage {

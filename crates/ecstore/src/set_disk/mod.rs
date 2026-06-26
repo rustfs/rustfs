@@ -56,7 +56,7 @@ use crate::storage_api_contracts::{
     object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
-use crate::store_utils::is_reserved_or_invalid_bucket;
+use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
@@ -72,7 +72,7 @@ use crate::{
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
     // event::name::EventName,
     services::event_notification::{EventArgs, send_event},
-    store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
+    store::init_format::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -4856,7 +4856,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
             }
         };
 
-        let endpoints = crate::endpoints::Endpoints::from(self.set_endpoints.clone());
+        let endpoints = crate::layout::endpoints::Endpoints::from(self.set_endpoints.clone());
         let before_drives = crate::layout::set_heal::formats_to_drives_info(&endpoints, &formats, &errs);
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Metadata.to_string(),
@@ -5784,14 +5784,14 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
-    use crate::endpoints::SetupType;
+    use crate::layout::endpoints::SetupType;
     use crate::object_api::ObjectInfo;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         namespace::NamespaceLocking as _, object::ObjectOperations as _,
     };
-    use crate::store_init::save_format_file;
-    use crate::store_list_objects::ListPathOptions;
+    use crate::store::init_format::save_format_file;
+    use crate::store::list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_filemeta::ReplicationState;
@@ -7147,7 +7147,7 @@ mod tests {
         let err = set_disks
             .list_path(
                 CancellationToken::new(),
-                crate::store_list_objects::ListPathOptions {
+                crate::store::list_objects::ListPathOptions {
                     bucket: "bucket".to_string(),
                     recursive: true,
                     ..Default::default()

@@ -364,16 +364,20 @@ require_source_line \
   "startup IAM shim crate-private module"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
-  "mod disks_layout;" \
-  "ECStore legacy disks-layout compatibility module crate-private visibility"
+  "mod core;" \
+  "ECStore core owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
-  "mod endpoints;" \
-  "ECStore legacy endpoint compatibility module crate-private visibility"
+  "mod data_movement;" \
+  "ECStore data movement owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod cluster;" \
   "ECStore cluster control-plane owner module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "pub(crate) mod layout;" \
+  "ECStore layout owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "pub mod cluster {" \
@@ -388,14 +392,12 @@ for ecstore_private_module in \
   disk \
   error \
   io_support \
-  pools \
   rebalance \
   rpc \
   runtime \
   services \
   set_disk \
   store \
-  store_utils \
   tier; do
   require_source_line \
     "crates/ecstore/src/lib.rs" \
@@ -2989,12 +2991,12 @@ if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
   report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
 fi
 
-rg -n --with-filename '#\[path = "(diagnostics|services|io_support|runtime)/' \
+rg -n --with-filename '#\[path = "(data_movement|layout|core|store|diagnostics|services|io_support|runtime)/' \
   "${ROOT_DIR}/crates/ecstore/src/lib.rs" \
   >"$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" || true
 
 if [[ -s "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" ]]; then
-  report_failure "ECStore root lib must not restore owner path shims for diagnostics/services/io_support/runtime modules: $(paste -sd '; ' "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE")"
+  report_failure "ECStore root lib must not restore owner path shims for data_movement/layout/core/store/diagnostics/services/io_support/runtime modules: $(paste -sd '; ' "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'

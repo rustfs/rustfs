@@ -12,4 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use crate::layout::disks_layout::*;
+pub(crate) mod pools;
+pub(crate) mod sets;
+
+#[cfg(test)]
+mod pools_test;
+#[cfg(test)]
+mod store_test;

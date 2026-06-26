@@ -16,7 +16,7 @@ use crate::error::{Error, Result};
 use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
-    endpoints::EndpointServerPools,
+    layout::endpoints::EndpointServerPools,
     runtime::sources as runtime_sources,
     services::metrics_realtime::{CollectMetricsOpts, MetricType},
 };

@@ -16,6 +16,7 @@ use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
 use crate::disk::{DiskInfo, DiskStore};
 use crate::error::{
@@ -23,7 +24,6 @@ use crate::error::{
 };
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
-use crate::sets::Sets;
 use crate::storage_api_contracts::{
     list::{
         ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
@@ -32,7 +32,7 @@ use crate::storage_api_contracts::{
     object::ObjectOperations as _,
 };
 use crate::store::ECStore;
-use crate::store_utils::is_reserved_or_invalid_bucket;
+use crate::store::utils::is_reserved_or_invalid_bucket;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
@@ -3337,13 +3337,13 @@ mod test {
     // use crate::disk::MetaCacheEntries;
     // use crate::disk::MetaCacheEntry;
     // use crate::disk::WalkDirOptions;
-    // use crate::endpoints::EndpointServerPools;
+    // use crate::layout::endpoints::EndpointServerPools;
     // use crate::error::Error;
     // use crate::metacache::writer::MetacacheReader;
     // use crate::set_disk::SetDisks;
-    // use crate::store_list_objects::ListPathOptions;
-    // use crate::store_list_objects::WalkOptions;
-    // use crate::store_list_objects::WalkVersionsSortOrder;
+    // use crate::store::list_objects::ListPathOptions;
+    // use crate::store::list_objects::WalkOptions;
+    // use crate::store::list_objects::WalkVersionsSortOrder;
     // use futures::future::join_all;
     // use rustfs_lock::namespace_lock::NsLockMap;
     // use tokio::sync::broadcast;

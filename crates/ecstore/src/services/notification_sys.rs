@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::diagnostics::admin_server_info::get_commit_id;
-use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
+use crate::layout::endpoints::EndpointServerPools;
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
 use crate::runtime::sources as runtime_sources;

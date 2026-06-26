@@ -2889,8 +2889,8 @@ mod tests {
     use crate::bucket::metadata_sys;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::is_err_invalid_upload_id;
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime::sources as runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
