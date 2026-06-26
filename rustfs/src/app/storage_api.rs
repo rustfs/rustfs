@@ -14,15 +14,11 @@
 
 //! App-local boundary for storage-layer helper APIs used by S3 use cases.
 
-pub(crate) use crate::storage::ECStore;
-#[cfg(test)]
-pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
-pub(crate) use rustfs_storage_api::{ObjectToDelete, TransitionedObject};
-pub(crate) type EndpointServerPools = crate::storage::EndpointServerPools;
+use rustfs_storage_api as storage_contracts;
 
 #[cfg(test)]
 #[allow(non_snake_case)]
-pub(crate) fn EndpointServerPools(pools: Vec<PoolEndpoints>) -> EndpointServerPools {
+pub(crate) fn EndpointServerPools(pools: Vec<crate::storage::PoolEndpoints>) -> crate::storage::EndpointServerPools {
     crate::storage::EndpointServerPools::from(pools)
 }
 
@@ -54,7 +50,7 @@ pub(crate) mod data_usage {
     }
 
     pub(crate) async fn load_data_usage_from_backend(
-        store: Arc<super::ECStore>,
+        store: Arc<crate::storage::ECStore>,
     ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::StorageError> {
         crate::storage::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
@@ -69,7 +65,7 @@ pub(crate) mod data_usage {
     }
 
     pub(crate) async fn remove_bucket_usage_from_backend(
-        store: Arc<super::ECStore>,
+        store: Arc<crate::storage::ECStore>,
         bucket: &str,
     ) -> Result<(), crate::storage::StorageError> {
         crate::storage::ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
@@ -103,7 +99,7 @@ pub(crate) mod runtime {
         crate::storage::ecstore_config::set_global_storage_class(cfg);
     }
 
-    pub(crate) fn get_global_endpoints_opt() -> Option<super::EndpointServerPools> {
+    pub(crate) fn get_global_endpoints_opt() -> Option<crate::storage::EndpointServerPools> {
         crate::storage::get_global_endpoints_opt()
     }
 
@@ -135,7 +131,7 @@ pub(crate) mod runtime {
         crate::storage::get_global_expiry_state()
     }
 
-    pub(crate) fn new_object_layer_fn() -> Option<Arc<super::ECStore>> {
+    pub(crate) fn new_object_layer_fn() -> Option<Arc<crate::storage::ECStore>> {
         crate::storage::new_object_layer_fn()
     }
 
@@ -172,7 +168,9 @@ pub(crate) mod runtime {
     }
 
     #[cfg(test)]
-    pub(crate) async fn init_local_disks(endpoint_pools: super::EndpointServerPools) -> Result<(), crate::storage::StorageError> {
+    pub(crate) async fn init_local_disks(
+        endpoint_pools: crate::storage::EndpointServerPools,
+    ) -> Result<(), crate::storage::StorageError> {
         crate::storage::init_local_disks(endpoint_pools).await
     }
 }
@@ -348,7 +346,7 @@ pub(crate) mod bucket {
                 version_id: Option<uuid::Uuid>,
                 versioned: bool,
                 suspended: bool,
-                transitioned: &crate::app::storage_api::TransitionedObject,
+                transitioned: &super::super::super::storage_contracts::TransitionedObject,
             ) -> Option<Jentry> {
                 crate::storage::ecstore_bucket::lifecycle::tier_sweeper::transitioned_delete_journal_entry(
                     version_id,
@@ -359,7 +357,7 @@ pub(crate) mod bucket {
             }
 
             pub(crate) fn transitioned_force_delete_journal_entry(
-                transitioned: &crate::app::storage_api::TransitionedObject,
+                transitioned: &super::super::super::storage_contracts::TransitionedObject,
             ) -> Option<Jentry> {
                 crate::storage::ecstore_bucket::lifecycle::tier_sweeper::transitioned_force_delete_journal_entry(transitioned)
             }
@@ -544,7 +542,7 @@ pub(crate) mod bucket {
 
         pub(crate) async fn check_replicate_delete(
             bucket: &str,
-            dobj: &crate::app::storage_api::ObjectToDelete,
+            dobj: &super::super::storage_contracts::ObjectToDelete,
             oi: &crate::storage::StorageObjectInfo,
             del_opts: &crate::storage::StorageObjectOptions,
             gerr: Option<String>,
@@ -721,83 +719,78 @@ pub(crate) mod s3_api {
     }
 }
 
-pub(crate) use crate::storage::{
-    RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader,
-    check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
-    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
-    validate_list_object_unordered_with_delimiter, validate_object_key, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
-};
-pub(crate) use rustfs_storage_api::{
-    BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, HTTPRangeSpec, ListObjectVersionsInfo, ListObjectsV2Info,
-    ListOperations, MakeBucketOptions, MultipartOperations, MultipartUploadResult, NamespaceLocking, ObjectIO, ObjectOperations,
-    StorageAdminApi,
-};
-#[cfg(test)]
-pub(crate) use rustfs_storage_api::{HTTPPreconditions, HealOperations};
-
 pub(crate) mod admin_usecase {
-    pub(crate) use super::{ECStore, EndpointServerPools, StorageAdminApi};
+    pub(crate) use super::storage_contracts::StorageAdminApi;
     pub(crate) use super::{admin, capacity, data_usage};
+    pub(crate) use crate::storage::{ECStore, EndpointServerPools};
 }
 
 pub(crate) mod bucket_usecase {
-    pub(crate) use super::{
-        BucketOperations, BucketOptions, DeleteBucketOptions, ECStore, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
-        process_topic_configurations, validate_list_object_unordered_with_delimiter,
+    pub(crate) use super::storage_contracts::{
+        BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions,
     };
     pub(crate) use super::{access, bucket, data_usage, error, helper, object_utils, request_context, s3_api};
+    pub(crate) use crate::storage::{
+        ECStore, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
+        process_topic_configurations, validate_list_object_unordered_with_delimiter,
+    };
 }
 
 pub(crate) mod object_usecase {
     #[cfg(test)]
-    pub(crate) use super::HTTPPreconditions;
+    pub(crate) use super::storage_contracts::HTTPPreconditions;
+    pub(crate) use super::storage_contracts::{HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectOperations};
     pub(crate) use super::{
-        ECStore, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectOperations, RFC1123, StorageDeletedObject, StorageObjectInfo,
-        StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, bucket, check_preconditions, get_validated_store,
-        has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
-        validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
-        wrap_response_with_cors,
+        access, bucket, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
+        object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
     };
-    pub(crate) use super::{
-        access, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io, object_utils,
-        options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
+    pub(crate) use crate::storage::{
+        ECStore, RFC1123, StorageDeletedObject, StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete,
+        StoragePutObjReader, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
+        parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
+        strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key,
+        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
     };
 }
 
 pub(crate) mod multipart_usecase {
     #[cfg(test)]
-    pub(crate) use super::HTTPPreconditions;
-    pub(crate) use super::{
-        CompletePart, ECStore, HTTPRangeSpec, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectOperations,
-        StorageObjectOptions, StoragePutObjReader, access, bucket, compression, data_usage, error, helper, io, object_utils,
-        options, s3_api, set_disk, sse,
+    pub(crate) use super::storage_contracts::HTTPPreconditions;
+    pub(crate) use super::storage_contracts::{
+        CompletePart, HTTPRangeSpec, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectOperations,
     };
+    pub(crate) use super::{
+        access, bucket, compression, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse,
+    };
+    pub(crate) use crate::storage::{ECStore, StorageObjectOptions, StoragePutObjReader};
 }
 
 pub(crate) mod select_object {
-    pub(crate) use super::ObjectOperations;
-    pub(crate) use super::get_validated_store;
+    pub(crate) use super::storage_contracts::ObjectOperations;
     pub(crate) use super::{options, request_context};
-    pub(crate) use super::{validate_sse_headers_for_read, validate_ssec_for_read};
+    pub(crate) use crate::storage::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 }
 
 pub(crate) mod context {
-    pub(crate) use super::bucket;
-    pub(crate) use super::{ECStore, EndpointServerPools, runtime};
     #[cfg(test)]
-    pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+    pub(crate) use super::EndpointServerPools;
+    pub(crate) use super::bucket;
+    pub(crate) use super::runtime;
+    pub(crate) use crate::storage::{ECStore, EndpointServerPools};
+    #[cfg(test)]
+    pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
 }
 
 #[cfg(test)]
 pub(crate) mod test {
-    pub(crate) use super::{
-        BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, HealOperations, ListOperations,
-        MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, PoolEndpoints, StorageObjectInfo,
-        StorageObjectOptions, StoragePutObjReader,
+    pub(crate) use super::EndpointServerPools;
+    pub(crate) use super::storage_contracts::{
+        BucketOperations, BucketOptions, HealOperations, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO,
+        ObjectOperations,
     };
     pub(crate) use super::{bucket, ecfs, object_utils, runtime};
+    pub(crate) use crate::storage::{
+        ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,
+    };
 }

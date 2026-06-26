@@ -14,12 +14,13 @@
 
 use super::StorageReplicationConfigExt as _;
 use super::{
-    BucketOperations, BucketOptions, StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config,
-    get_bucket_replication_config, resolve_object_store_handle,
+    StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
+    resolve_object_store_handle,
 };
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
+use crate::storage::contract::{BucketOperations, BucketOptions, ObjectToDelete};
 use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -45,8 +46,8 @@ use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
 
+use crate::storage::StorageObjectInfo as ObjectInfo;
 use crate::storage::runtime_sources;
-use crate::storage::{StorageObjectInfo as ObjectInfo, StorageObjectToDelete as ObjectToDelete};
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";

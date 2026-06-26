@@ -15,6 +15,8 @@
 use std::ops::Deref;
 use std::sync::Arc;
 
+use rustfs_storage_api as storage_contracts;
+
 mod ecstore_bucket {
     pub(crate) use crate::storage::ecstore_bucket::{
         bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, quota, replication, target, utils, versioning,
@@ -408,17 +410,6 @@ pub(crate) static ERR_TIER_NAME_NOT_UPPERCASE: AdminErrorRef =
     AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_NAME_NOT_UPPERCASE);
 pub(crate) static ERR_TIER_NOT_FOUND: AdminErrorRef = AdminErrorRef(|| &ecstore_tier::tier_handlers::ERR_TIER_NOT_FOUND);
 
-pub(crate) use crate::storage::StorageObjectOptions;
-pub(crate) use crate::storage::access::{ReqInfo, authorize_request};
-pub(crate) use crate::storage::request_context::{RequestContext, spawn_traced};
-pub(crate) use rustfs_storage_api::{
-    BucketOperations, BucketOptions, CapabilitySnapshotError, CapabilityState, CapabilityStatus, DeleteBucketOptions,
-    HealOperations, ListOperations, MakeBucketOptions, ObjectIO, ObjectOperations, ObservabilitySnapshot,
-    ObservabilitySnapshotProvider, SRBucketDeleteOp, StorageAdminApi, TopologySnapshot, TopologySnapshotProvider,
-};
-#[cfg(test)]
-pub(crate) use rustfs_storage_api::{MemorySamplingState, PlatformSupport, TopologyCapabilities, UserspaceProfilingCapability};
-
 pub(crate) mod data_usage {
     use std::sync::Arc;
 
@@ -430,7 +421,8 @@ pub(crate) mod data_usage {
 }
 
 pub(crate) mod access {
-    pub(crate) use super::{ReqInfo, RequestContext, authorize_request, spawn_traced};
+    pub(crate) use crate::storage::access::{ReqInfo, authorize_request};
+    pub(crate) use crate::storage::request_context::{RequestContext, spawn_traced};
 }
 
 pub(crate) mod bucket {
@@ -457,13 +449,15 @@ pub(crate) mod cluster {
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     };
-    pub(crate) use super::{
+    pub(crate) use super::storage_contracts::{
         CapabilitySnapshotError, CapabilityState, CapabilityStatus, ObservabilitySnapshot, ObservabilitySnapshotProvider,
         TopologySnapshot, TopologySnapshotProvider,
     };
 
     #[cfg(test)]
-    pub(crate) use super::{MemorySamplingState, PlatformSupport, TopologyCapabilities, UserspaceProfilingCapability};
+    pub(crate) use super::storage_contracts::{
+        MemorySamplingState, PlatformSupport, TopologyCapabilities, UserspaceProfilingCapability,
+    };
 }
 
 pub(crate) mod config {
@@ -475,7 +469,7 @@ pub(crate) mod config {
 }
 
 pub(crate) mod contract {
-    pub(crate) use super::{
+    pub(crate) use super::storage_contracts::{
         BucketOperations, BucketOptions, DeleteBucketOptions, HealOperations, ListOperations, MakeBucketOptions, ObjectIO,
         ObjectOperations, SRBucketDeleteOp, StorageAdminApi,
     };
@@ -490,7 +484,7 @@ pub(crate) mod metrics {
 }
 
 pub(crate) mod object {
-    pub(crate) use super::StorageObjectOptions;
+    pub(crate) use crate::storage::StorageObjectOptions;
 }
 
 pub(crate) mod rebalance {
