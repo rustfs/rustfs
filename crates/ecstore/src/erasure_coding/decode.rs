@@ -382,11 +382,11 @@ fn retire_abandoned_readers(errs: &mut [Option<Error>], retire_readers: &mut Vec
     }
 }
 
-fn shard_read_hedge_delay(read_timeout: Duration) -> Duration {
+fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     if read_timeout.is_zero() {
-        Duration::ZERO
+        None
     } else {
-        read_timeout.min(Duration::from_millis(100))
+        Some(read_timeout.min(Duration::from_millis(100)))
     }
 }
 
@@ -479,36 +479,42 @@ where
             let parity_shards = self.total_shards.saturating_sub(self.data_shards);
             loop {
                 let item = if !scheduled_all {
-                    let hedge_sleep = tokio::time::sleep(shard_read_hedge_delay(self.read_timeout));
-                    tokio::pin!(hedge_sleep);
-                    tokio::select! {
-                        item = sets.next() => item,
-                        _ = &mut hedge_sleep => {
-                            for (next_i, next_reader) in reader_iter.by_ref() {
-                                let has_reader = next_reader.is_some();
-                                let recycled_buf = if has_reader {
-                                    Some(self.buffers.take(next_i, shard_size))
-                                } else {
-                                    None
-                                };
-                                let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
-                                scheduled += 1;
-                                active_readers[next_i] = has_reader;
-                                pending += 1;
-                                sets.push(read_shard(
-                                    next_i,
-                                    next_read_cost,
-                                    next_reader,
-                                    recycled_buf,
-                                    shard_size,
-                                    self.data_shards,
-                                    self.read_timeout,
-                                    self.metrics_path,
-                                ));
+                    match shard_read_hedge_delay(self.read_timeout) {
+                        Some(hedge_delay) => {
+                            let hedge_sleep = tokio::time::sleep(hedge_delay);
+                            tokio::pin!(hedge_sleep);
+                            tokio::select! {
+                                item = sets.next() => item,
+                                _ = &mut hedge_sleep => {
+                                    if let Some((next_i, next_reader)) = reader_iter.next() {
+                                        let has_reader = next_reader.is_some();
+                                        let recycled_buf = if has_reader {
+                                            Some(self.buffers.take(next_i, shard_size))
+                                        } else {
+                                            None
+                                        };
+                                        let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
+                                        active_readers[next_i] = has_reader;
+                                        scheduled += 1;
+                                        pending += 1;
+                                        sets.push(read_shard(
+                                            next_i,
+                                            next_read_cost,
+                                            next_reader,
+                                            recycled_buf,
+                                            shard_size,
+                                            self.data_shards,
+                                            self.read_timeout,
+                                            self.metrics_path,
+                                        ));
+                                    } else {
+                                        scheduled_all = true;
+                                    }
+                                    continue;
+                                }
                             }
-                            scheduled_all = true;
-                            continue;
                         }
+                        None => sets.next().await,
                     }
                 } else {
                     sets.next().await
@@ -1694,6 +1700,13 @@ mod tests {
         assert!(bufs[1].is_some());
         assert!(bufs[2].is_none());
         assert!(bufs.iter().filter(|buf| buf.is_some()).count() < DATA_SHARDS);
+    }
+
+    #[test]
+    fn test_zero_read_timeout_disables_scheduled_hedging() {
+        assert_eq!(shard_read_hedge_delay(Duration::ZERO), None);
+        assert_eq!(shard_read_hedge_delay(Duration::from_millis(50)), Some(Duration::from_millis(50)));
+        assert_eq!(shard_read_hedge_delay(Duration::from_secs(60)), Some(Duration::from_millis(100)));
     }
 
     async fn create_reader(
