@@ -15,20 +15,31 @@
 pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
+use crate::app::context::get_global_app_context;
 pub(crate) use crate::app::context::{
-    AppContext, get_global_app_context, publish_server_config, publish_storage_class_config, resolve_action_credentials,
-    resolve_boot_time, resolve_bucket_metadata_handle, resolve_bucket_monitor_handle, resolve_daily_tier_stats,
-    resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle, resolve_kms_runtime_service_manager,
-    resolve_notification_system, resolve_object_store_handle, resolve_object_store_handle_for_context, resolve_oidc_handle,
+    AppContext, publish_server_config, publish_storage_class_config, resolve_action_credentials, resolve_boot_time,
+    resolve_bucket_metadata_handle, resolve_bucket_monitor_handle, resolve_daily_tier_stats, resolve_deployment_id,
+    resolve_endpoints_handle, resolve_iam_handle, resolve_kms_runtime_service_manager, resolve_notification_system,
+    resolve_object_store_handle, resolve_object_store_handle_for_context, resolve_oidc_handle,
     resolve_or_init_kms_runtime_service_manager, resolve_outbound_tls_generation, resolve_outbound_tls_state,
     resolve_ready_iam_handle, resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle,
     resolve_runtime_port, resolve_scanner_metrics_report, resolve_server_config, resolve_tier_config_handle,
     resolve_token_signing_key,
 };
+use crate::app::object_usecase::DefaultObjectUsecase;
+use std::sync::Arc;
 
 #[cfg(test)]
 pub(crate) use crate::app::context::set_test_outbound_tls_generation;
 
 pub(crate) fn default_admin_usecase() -> DefaultAdminUsecase {
     DefaultAdminUsecase::from_global()
+}
+
+pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
+    DefaultObjectUsecase::from_global()
+}
+
+pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
+    get_global_app_context()
 }

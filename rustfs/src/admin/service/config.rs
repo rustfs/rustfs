@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::{
-    AppContext, get_global_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
+    AppContext, current_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
     resolve_object_store_handle, resolve_object_store_handle_for_context,
 };
 use crate::admin::storage_api::StorageAdminApi;
@@ -318,7 +318,7 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
 }
 
 pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<()> {
-    let context = get_global_app_context();
+    let context = current_app_context();
     reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
 }
 
@@ -349,7 +349,7 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
 }
 
 pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
-    let context = get_global_app_context();
+    let context = current_app_context();
     reload_runtime_config_snapshot_for_context(context.as_deref()).await
 }
 

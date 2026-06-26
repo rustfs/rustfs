@@ -27,13 +27,12 @@ use super::storage_api::{AdminReplicationConfigExt as _, AdminVersioningConfigEx
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    resolve_boot_time, resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system,
+    default_object_usecase, resolve_boot_time, resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system,
     resolve_object_store_handle, resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle,
     resolve_server_config,
 };
 use crate::admin::storage_api::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::{ReqInfo, authorize_request, spawn_traced};
-use crate::app::object_usecase::DefaultObjectUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -2271,7 +2270,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
     match route {
         MiscExtRoute::ObjectLambda { bucket, object } => {
             let get_req = build_object_lambda_get_request(req, bucket, object)?;
-            let usecase = DefaultObjectUsecase::from_global();
+            let usecase = default_object_usecase();
             let get_resp = Box::pin(usecase.execute_get_object(get_req)).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
         }
