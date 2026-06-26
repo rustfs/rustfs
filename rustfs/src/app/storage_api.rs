@@ -749,16 +749,27 @@ pub(crate) mod s3_api {
 }
 
 pub(crate) mod admin_usecase {
-    pub(crate) use super::storage_contracts::StorageAdminApi;
+    pub(crate) mod contract {
+        pub(crate) use super::super::storage_contracts::StorageAdminApi;
+    }
+
     pub(crate) use super::{admin, capacity, data_usage};
     pub(crate) use crate::storage::{ECStore, EndpointServerPools};
 }
 
 pub(crate) mod bucket_usecase {
-    pub(crate) use super::storage_contracts::{
-        BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
-        MakeBucketOptions,
-    };
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{
+                BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+            };
+        }
+
+        pub(crate) mod list {
+            pub(crate) use super::super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
+        }
+    }
+
     pub(crate) use super::{access, bucket, data_usage, error, helper, object_utils, request_context, s3_api};
     pub(crate) use crate::storage::{
         ECStore, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
@@ -767,9 +778,25 @@ pub(crate) mod bucket_usecase {
 }
 
 pub(crate) mod object_usecase {
-    #[cfg(test)]
-    pub(crate) use super::storage_contracts::HTTPPreconditions;
-    pub(crate) use super::storage_contracts::{HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectOperations};
+    pub(crate) mod contract {
+        #[cfg(test)]
+        pub(crate) mod http {
+            pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
+        }
+
+        pub(crate) mod namespace {
+            pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+        }
+
+        pub(crate) mod range {
+            pub(crate) use super::super::super::storage_contracts::HTTPRangeSpec;
+        }
+    }
+
     pub(crate) use super::{
         access, bucket, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io,
         object_utils, options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
@@ -784,11 +811,25 @@ pub(crate) mod object_usecase {
 }
 
 pub(crate) mod multipart_usecase {
-    #[cfg(test)]
-    pub(crate) use super::storage_contracts::HTTPPreconditions;
-    pub(crate) use super::storage_contracts::{
-        CompletePart, HTTPRangeSpec, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectOperations,
-    };
+    pub(crate) mod contract {
+        #[cfg(test)]
+        pub(crate) mod http {
+            pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
+        }
+
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::storage_contracts::{CompletePart, MultipartOperations, MultipartUploadResult};
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+        }
+
+        pub(crate) mod range {
+            pub(crate) use super::super::super::storage_contracts::HTTPRangeSpec;
+        }
+    }
+
     pub(crate) use super::{
         access, bucket, compression, data_usage, error, helper, io, object_utils, options, s3_api, set_disk, sse,
     };
@@ -796,7 +837,12 @@ pub(crate) mod multipart_usecase {
 }
 
 pub(crate) mod select_object {
-    pub(crate) use super::storage_contracts::ObjectOperations;
+    pub(crate) mod contract {
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::ObjectOperations;
+        }
+    }
+
     pub(crate) use super::{options, request_context};
     pub(crate) use crate::storage::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
 }
@@ -814,10 +860,28 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
-    pub(crate) use super::storage_contracts::{
-        BucketOperations, BucketOptions, HealOperations, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO,
-        ObjectOperations,
-    };
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions, MakeBucketOptions};
+        }
+
+        pub(crate) mod heal {
+            pub(crate) use super::super::super::storage_contracts::HealOperations;
+        }
+
+        pub(crate) mod list {
+            pub(crate) use super::super::super::storage_contracts::ListOperations;
+        }
+
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::storage_contracts::MultipartOperations;
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+        }
+    }
+
     pub(crate) use super::{bucket, ecfs, object_utils, runtime};
     pub(crate) use crate::storage::{
         ECStore, Endpoint, Endpoints, PoolEndpoints, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader,

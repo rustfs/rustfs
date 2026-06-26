@@ -5,17 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-contract-domain-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/CTX-002`.
-- Based on: rebased onto current `origin/main` after PR #3911 merged.
+- Branch: `overtrue/arch-app-usecase-contract-domain-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/CTX-002`.
+- Based on: stacked on `overtrue/arch-admin-contract-domain-batch` while PR
+  #3911 is pending; rebase onto current `origin/main` after prerequisite PRs
+  merge before opening this PR.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-246; admin code still uses
-  the same storage contracts, now exposed from admin `contract` domain modules
-  instead of its flat root facade; rebase-exposed app usecase compile fixes
-  keep the same stream and data-usage behavior.
-- Rust code changes: segment the admin local `contract` facade into domain
-  modules, migrate admin consumers to domain contract imports, reject flat
-  admin contract consumers in migration guardrails, route
+- Runtime behavior changes: none expected for API-247; app usecase code still
+  uses the same storage contracts, now exposed from usecase `contract` domain
+  modules instead of usecase root facades.
+- Rust code changes: segment app usecase contract exports into domain modules,
+  migrate app consumers to domain contract imports, reject flat app usecase
+  contract consumers in migration guardrails, route
   replication pool, outbound TLS generation, runtime region, KMS encryption
   service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
@@ -5633,19 +5634,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     service config call paths.
   - Verification: focused RustFS compile, formatting, migration/layer guards,
     admin contract root consumer scan, diff hygiene, and Rust risk scan passed;
-    full PR gate passed before PR.
+    full PR gate is planned before PR.
+
+- [x] `API-247` Segment app usecase contract facades by domain module.
+  - Do: split app admin, bucket, object, multipart, select, and test usecase
+    storage contract exports into domain modules, then migrate app consumers to
+    those modules.
+  - Acceptance: app usecase consumers no longer import storage contract symbols
+    from usecase root facades, and migration rules reject regressions.
+  - Must preserve: admin info, bucket metadata/listing, object, multipart,
+    select-object, and app capacity dirty-scope test call paths.
+  - Verification: focused RustFS compile, formatting, migration/layer guards,
+    app usecase contract root consumer scan, diff hygiene, and Rust risk scan
+    passed; full PR gate is planned before PR.
 
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner boundary batches after API-246.
+1. `consumer-migration`: continue larger owner boundary batches after API-247.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-247 segments app usecase contract exports into domain modules instead of root usecase facade exposure. |
+| Migration preservation | pass | Admin info, bucket metadata/listing, object, multipart, select-object, and app capacity dirty-scope test paths keep the same underlying contracts. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, app usecase contract root consumer scan, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-246 segments the admin local contract facade into domain modules instead of flat root contract exposure. |
 | Migration preservation | pass | Bucket metadata, replication, site replication, rebalance, account info, config admin, heal, object zip download, router, and admin service config paths keep the same underlying contracts. |
-| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, admin contract root consumer scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, admin contract root consumer scan, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-245 segments the storage-owner local contract facade into domain modules instead of flat root contract exposure. |
 | Migration preservation | pass | ECFS bucket/object calls, storage RPC bucket/admin calls, S3 list/multipart DTO projections, request option parsing, access checks, and topology snapshot construction keep the same underlying contracts. |
 | Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, storage-owner raw contract/root consumer scans, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
@@ -5922,9 +5938,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 Passed before push:
 
+- Issue #660 API-247 current slice:
+  - Branch freshness check: stacked on `overtrue/arch-admin-contract-domain-batch`
+    while PR #3911 is pending.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - App usecase contract root consumer scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Full PR gate: pending before PR after prerequisite PRs merge and this
+    branch is rebased onto `origin/main`.
+
 - Issue #660 API-246 current slice:
-  - Branch freshness check: rebased onto current `origin/main` after PR #3911
-    merged.
+  - Branch freshness check: stacked on PR #3911 head while PR #3911 is pending.
   - `cargo check -p rustfs --lib`: passed.
   - `cargo fmt --all`: passed.
   - `./scripts/check_architecture_migration_rules.sh`: passed.
@@ -5933,7 +5962,8 @@ Passed before push:
   - Diff-added Rust risk scan: passed.
   - `cargo fmt --all --check`: passed.
   - `git diff --check`: passed.
-  - `make pre-pr`: passed.
+  - Full PR gate: pending before PR after PR #3911 merges and this branch is
+    rebased onto `origin/main`.
 
 - Issue #660 API-245 current slice:
   - Branch freshness check: rebased onto current `origin/main` after PR #3910
