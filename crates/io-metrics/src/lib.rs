@@ -180,6 +180,12 @@ pub use performance::PerformanceMetrics;
 
 static EC_ENCODE_INFLIGHT_BYTES: AtomicU64 = AtomicU64::new(0);
 static GET_OBJECT_BUFFERED_BYTES: AtomicU64 = AtomicU64::new(0);
+const SHARD_READ_COST_LOCAL: &str = "local";
+const SHARD_READ_COST_REMOTE: &str = "remote";
+const SHARD_READ_COST_SAME_NODE: &str = "same_node";
+const SHARD_READ_COST_UNKNOWN: &str = "unknown";
+const LOW_COST_QUORUM_CANDIDATE_FALSE: &str = "false";
+const LOW_COST_QUORUM_CANDIDATE_TRUE: &str = "true";
 
 fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
@@ -608,6 +614,69 @@ pub fn record_get_object_shard_read(
         .record(duration_secs);
 }
 
+/// Record one underlying shard read attempt with bounded locality and error attribution.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_get_object_shard_read_observation(
+    path: &'static str,
+    shard_index: usize,
+    role: &'static str,
+    cost_class: &'static str,
+    outcome: &'static str,
+    error_class: &'static str,
+    bytes: usize,
+    duration_secs: f64,
+    verify_duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    record_get_object_shard_read(path, role, outcome, bytes, duration_secs);
+
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    let shard_index = shard_index.to_string();
+    counter!(
+        "rustfs_io_get_object_shard_read_observed_total",
+        "path" => path,
+        "shard_index" => shard_index.clone(),
+        "role" => role,
+        "cost_class" => cost_class,
+        "outcome" => outcome,
+        "error_class" => error_class
+    )
+    .increment(1);
+    counter!(
+        "rustfs_io_get_object_shard_read_observed_bytes_total",
+        "path" => path,
+        "shard_index" => shard_index.clone(),
+        "role" => role,
+        "cost_class" => cost_class,
+        "outcome" => outcome,
+        "error_class" => error_class
+    )
+    .increment(bytes);
+    histogram!(
+        "rustfs_io_get_object_shard_read_observed_duration_seconds",
+        "path" => path,
+        "shard_index" => shard_index.clone(),
+        "role" => role,
+        "cost_class" => cost_class,
+        "outcome" => outcome,
+        "error_class" => error_class
+    )
+    .record(duration_secs);
+    histogram!(
+        "rustfs_io_get_object_shard_bitrot_verify_duration_seconds",
+        "path" => path,
+        "shard_index" => shard_index,
+        "role" => role,
+        "cost_class" => cost_class,
+        "outcome" => outcome,
+        "error_class" => error_class
+    )
+    .record(verify_duration_secs);
+}
+
 #[inline(always)]
 fn shard_read_fanout_to_f64(value: usize) -> f64 {
     u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
@@ -616,6 +685,48 @@ fn shard_read_fanout_to_f64(value: usize) -> f64 {
 #[inline(always)]
 fn metadata_fanout_count_to_f64(value: usize) -> f64 {
     u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+/// Record per-stripe shard locality shape for GetObject read-path attribution.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_get_object_shard_read_cost_summary(
+    path: &'static str,
+    local: usize,
+    same_node: usize,
+    remote: usize,
+    unknown: usize,
+    low_cost_available: usize,
+    low_cost_successful: usize,
+    read_quorum: usize,
+    low_cost_quorum_candidate: bool,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_shard_read_cost_class_count", "path" => path, "cost_class" => SHARD_READ_COST_LOCAL)
+        .record(shard_read_fanout_to_f64(local));
+    histogram!("rustfs_io_get_object_shard_read_cost_class_count", "path" => path, "cost_class" => SHARD_READ_COST_SAME_NODE)
+        .record(shard_read_fanout_to_f64(same_node));
+    histogram!("rustfs_io_get_object_shard_read_cost_class_count", "path" => path, "cost_class" => SHARD_READ_COST_REMOTE)
+        .record(shard_read_fanout_to_f64(remote));
+    histogram!("rustfs_io_get_object_shard_read_cost_class_count", "path" => path, "cost_class" => SHARD_READ_COST_UNKNOWN)
+        .record(shard_read_fanout_to_f64(unknown));
+    histogram!("rustfs_io_get_object_shard_read_low_cost_available", "path" => path)
+        .record(shard_read_fanout_to_f64(low_cost_available));
+    histogram!("rustfs_io_get_object_shard_read_low_cost_successful", "path" => path)
+        .record(shard_read_fanout_to_f64(low_cost_successful));
+    histogram!("rustfs_io_get_object_shard_read_quorum", "path" => path).record(shard_read_fanout_to_f64(read_quorum));
+    counter!(
+        "rustfs_io_get_object_shard_read_low_cost_quorum_candidate_total",
+        "path" => path,
+        "candidate" => if low_cost_quorum_candidate {
+            LOW_COST_QUORUM_CANDIDATE_TRUE
+        } else {
+            LOW_COST_QUORUM_CANDIDATE_FALSE
+        }
+    )
+    .increment(1);
 }
 
 /// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
@@ -1307,6 +1418,8 @@ mod tests {
         record_get_object_duplex_backpressure_duration(0.005);
         record_get_object_pipeline_failure("decode", "read_quorum");
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+        record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
+        record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
 
         assert!(0.005_f64.is_sign_positive());
     }
@@ -1381,6 +1494,8 @@ mod tests {
         record_get_object_duplex_backpressure_duration(0.005);
         record_get_object_pipeline_failure("decode", "read_quorum");
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+        record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
+        record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
         set_get_stage_metrics_enabled(false);
     }
 
@@ -1419,6 +1534,8 @@ mod tests {
         record_get_object_duplex_backpressure_duration(0.005);
         record_get_object_pipeline_failure("decode", "read_quorum");
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+        record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
+        record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
         assert!(!get_stage_metrics_enabled());
     }
 

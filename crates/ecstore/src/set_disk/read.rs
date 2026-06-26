@@ -20,6 +20,7 @@ use crate::get_diagnostics::{
     GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path,
 };
+use crate::set_disk::shard_source::ShardReadCost;
 use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
@@ -182,6 +183,14 @@ fn classify_metadata_response_error(err: &DiskError) -> &'static str {
 
 fn is_metadata_fanout_ignored_error(err: &DiskError) -> bool {
     OBJECT_OP_IGNORED_ERRS.iter().any(|ignored| ignored == err)
+}
+
+fn shard_read_cost_for_disk(disk: Option<&DiskStore>) -> ShardReadCost {
+    match disk {
+        Some(disk) if disk.is_local() => ShardReadCost::Local,
+        Some(_) => ShardReadCost::Remote,
+        None => ShardReadCost::Unknown,
+    }
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -1381,8 +1390,10 @@ impl SetDisks {
 
             let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
             let mut readers = Vec::with_capacity(disks.len());
+            let mut read_costs = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
+                read_costs.push(shard_read_cost_for_disk(disk_op.as_ref()));
                 match create_bitrot_reader(
                     files[idx].data.as_deref(),
                     disk_op.as_ref(),
@@ -1511,7 +1522,9 @@ impl SetDisks {
             //     part_number, part_offset, part_length, part_size
             // );
             let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-            let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            let (written, err) = erasure
+                .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
+                .await;
             if let Some(decode_stage_start) = decode_stage_start {
                 rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
             }
@@ -1629,8 +1642,10 @@ impl SetDisks {
 
         let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
         let mut readers = Vec::with_capacity(disks.len());
+        let mut read_costs = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
         for (idx, disk_op) in disks.iter().enumerate() {
+            read_costs.push(shard_read_cost_for_disk(disk_op.as_ref()));
             match create_bitrot_reader(
                 files[idx].data.as_deref(),
                 disk_op.as_ref(),
@@ -1698,12 +1713,13 @@ impl SetDisks {
             .await;
         }
 
-        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path_and_read_costs(
             readers,
             erasure.clone(),
             0,
             part_size,
             Some(GET_OBJECT_PATH_CODEC_STREAMING),
+            read_costs,
         );
         let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
         let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;

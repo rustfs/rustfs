@@ -58,6 +58,12 @@ pub(crate) const GET_READER_POLL_READY_ERROR: &str = "ready_error";
 pub(crate) const GET_SHARD_READ_OUTCOME_ERROR: &str = "error";
 pub(crate) const GET_SHARD_READ_OUTCOME_MISSING: &str = "missing";
 pub(crate) const GET_SHARD_READ_OUTCOME_SUCCESS: &str = "success";
+pub(crate) const GET_SHARD_READ_COST_LOCAL: &str = "local";
+pub(crate) const GET_SHARD_READ_COST_REMOTE: &str = "remote";
+pub(crate) const GET_SHARD_READ_COST_SAME_NODE: &str = "same_node";
+pub(crate) const GET_SHARD_READ_COST_UNKNOWN: &str = "unknown";
+pub(crate) const GET_SHARD_READ_ERROR_MISSING: &str = "missing";
+pub(crate) const GET_SHARD_READ_ERROR_NONE: &str = "none";
 pub(crate) const GET_SHARD_ROLE_DATA: &str = "data";
 pub(crate) const GET_SHARD_ROLE_PARITY: &str = "parity";
 
@@ -236,6 +242,12 @@ mod tests {
         assert_eq!(GET_SHARD_READ_OUTCOME_ERROR, "error");
         assert_eq!(GET_SHARD_READ_OUTCOME_MISSING, "missing");
         assert_eq!(GET_SHARD_READ_OUTCOME_SUCCESS, "success");
+        assert_eq!(GET_SHARD_READ_COST_LOCAL, "local");
+        assert_eq!(GET_SHARD_READ_COST_REMOTE, "remote");
+        assert_eq!(GET_SHARD_READ_COST_SAME_NODE, "same_node");
+        assert_eq!(GET_SHARD_READ_COST_UNKNOWN, "unknown");
+        assert_eq!(GET_SHARD_READ_ERROR_MISSING, "missing");
+        assert_eq!(GET_SHARD_READ_ERROR_NONE, "none");
         assert_eq!(GET_SHARD_ROLE_DATA, "data");
         assert_eq!(GET_SHARD_ROLE_PARITY, "parity");
         assert_eq!(GET_METADATA_RESPONSE_CORRUPT, "corrupt");
