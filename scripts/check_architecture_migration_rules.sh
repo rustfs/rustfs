@@ -194,6 +194,7 @@ RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_byp
 RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_contract_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_domain_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_storage_contract_root_consumer_hits.txt"
+RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_facade_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
@@ -1852,6 +1853,19 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS root storage-api consumers must use domain modules from rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage_api::(?:capacity::(?:\{|all_local_disk|disk_drive_path|disk_endpoint)|protocols::(?:access|ecfs|request_context)\b|server::(?:\{|contract\b|ecfs\b|request_context\b|rpc\b|tonic_service\b|apply_cors_headers|ECStore|Endpoint(?:s|ServerPools)?|Error|EventArgs|StorageObjectInfo|TONIC_RPC_PREFIX|is_dist_erasure|read_config|register_event_dispatch_hook|save_config|verify_rpc_signature)|startup::(?:\{|contract\b|concurrency\b|deadlock_detector\b|ecfs\b|DynReplicationPool|ECStore|EndpointServerPools|Error\b|Result\b|get_bucket_notification_config|init_background_replication|init_bucket_metadata_sys|init_ecstore_config|init_global_config_sys|init_local_disks|init_lock_clients|new_global_notification_sys|prewarm_local_disk_id_map|process_lambda_configurations|process_queue_configurations|process_topic_configurations|set_global_endpoints|set_global_region|set_global_rustfs_port|set_workload_admission_snapshot_provider|shutdown_background_services|try_migrate_bucket_metadata|try_migrate_iam_config|try_migrate_server_config|update_erasure_type)|workload::(?:\{|bucket_metadata_runtime_initialized|replication_queue_current_count))' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage_api.rs' || true
+) >"$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS root runtime facade consumers must use consumer-domain modules from rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (
