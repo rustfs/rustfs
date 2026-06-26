@@ -525,14 +525,8 @@ impl SetDisks {
                                     .await;
 
                                 if let Err(err) = &rename_result {
-                                    self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
-                                        .await
-                                        .map_err(DiskError::other)?;
+                                    warn!("failed to rename healed data for {bucket}/{object}: {err}");
                                 } else {
-                                    self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
-                                        .await
-                                        .map_err(DiskError::other)?;
-
                                     if parts_metadata[index].is_remote() {
                                         let rm_data_dir = parts_metadata[index].data_dir.unwrap().to_string();
 
@@ -560,6 +554,9 @@ impl SetDisks {
                                 }
                             }
                         }
+                        self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
+                            .await
+                            .map_err(DiskError::other)?;
 
                         record_capacity_scope_if_needed(None, &out_dated_disks);
 
