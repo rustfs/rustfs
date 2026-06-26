@@ -27,9 +27,12 @@ MODE="both"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
+PYTHON_BIN="python3"
 CODEC_MIN_SIZE=1
 RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
+COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
+COMPAT_OBJECT_SIZE=65536
 DRY_RUN=false
 SKIP_BUILD=false
 
@@ -59,7 +62,10 @@ Core options:
 Binary/options:
   --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
   --warp-bin <path>              warp binary (default: warp)
+  --python-bin <path>            Python binary for SigV4 compatibility probe (default: python3)
   --codec-min-size <bytes>       RUSTFS_GET_CODEC_STREAMING_MIN_SIZE (default: 1)
+  --compat-object-key <key>      Object key used by the compatibility probe
+  --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
   --skip-build                   do not run cargo build --release -p rustfs
   --dry-run                      print benchmark commands without starting RustFS
 
@@ -72,7 +78,16 @@ Output:
   <out-dir>/legacy/warp/median_summary.csv
   <out-dir>/codec/warp/median_summary.csv
   <out-dir>/codec/warp/baseline_compare.csv    when --mode both
+  <out-dir>/compat_summary.csv                  when --mode both
+  <out-dir>/body_sha256_legacy.txt              when legacy profile runs
+  <out-dir>/body_sha256_new.txt                 when codec profile runs
+  <out-dir>/response_headers_legacy.json        when legacy profile runs
+  <out-dir>/response_headers_new.json           when codec profile runs
   <out-dir>/<profile>/manifest.env
+  <out-dir>/<profile>/metrics_summary.csv
+  <out-dir>/<profile>/compat/compat_summary.csv
+  <out-dir>/<profile>/compat/response_headers.json
+  <out-dir>/<profile>/compat/body_sha256.txt
   <out-dir>/<profile>/rustfs.log
 
 Example:
@@ -127,7 +142,10 @@ parse_args() {
       --out-dir) OUT_DIR="$2"; shift 2 ;;
       --rustfs-bin) RUSTFS_BIN="$2"; shift 2 ;;
       --warp-bin) WARP_BIN="$2"; shift 2 ;;
+      --python-bin) PYTHON_BIN="$2"; shift 2 ;;
       --codec-min-size) CODEC_MIN_SIZE="$2"; shift 2 ;;
+      --compat-object-key) COMPAT_OBJECT_KEY="$2"; shift 2 ;;
+      --compat-object-size) COMPAT_OBJECT_SIZE="$2"; shift 2 ;;
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --region) REGION="$2"; shift 2 ;;
@@ -158,7 +176,9 @@ validate_args() {
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
+  validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
+  [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
 
   [[ -x "$ENHANCED_BENCH" ]] || die "enhanced benchmark script is not executable: $ENHANCED_BENCH"
   require_cmd curl
@@ -166,6 +186,7 @@ validate_args() {
 
   if [[ "$DRY_RUN" != "true" ]]; then
     require_cmd cargo
+    require_cmd "$PYTHON_BIN"
   fi
 }
 
@@ -234,7 +255,10 @@ retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
+python_bin=${PYTHON_BIN}
 rust_log=${RUST_LOG}
+compat_object_key=${COMPAT_OBJECT_KEY}
+compat_object_size=${COMPAT_OBJECT_SIZE}
 rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
@@ -358,6 +382,318 @@ run_bench() {
   "${cmd[@]}"
 }
 
+write_metrics_summary() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local median_csv="${profile_dir}/warp/median_summary.csv"
+
+  if [[ -f "$median_csv" ]]; then
+    cp "$median_csv" "${profile_dir}/metrics_summary.csv"
+  fi
+}
+
+run_compat_probe() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local compat_dir="${profile_dir}/compat"
+
+  mkdir -p "$compat_dir"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] run compatibility probe profile=${profile} key=${COMPAT_OBJECT_KEY}"
+    cat >"${compat_dir}/compat_summary.csv" <<EOF
+size,path,body_sha256_match,content_length_match,etag_match,content_range_match,checksum_headers_match,sse_headers_match,status_code_match,error_count,body_sha256,status_code,content_length,etag
+${COMPAT_OBJECT_SIZE},${profile},true,true,true,true,true,true,true,0,DRY_RUN,200,${COMPAT_OBJECT_SIZE},DRY_RUN
+EOF
+    printf '%s\n' "DRY_RUN" >"${compat_dir}/body_sha256.txt"
+    printf '{}\n' >"${compat_dir}/response_headers.json"
+    cat >"${compat_dir}/snapshot.json" <<EOF
+{
+  "profile": "${profile}",
+  "path": "${profile}",
+  "size": ${COMPAT_OBJECT_SIZE},
+  "object_key": "${COMPAT_OBJECT_KEY}",
+  "expected_body_sha256": "DRY_RUN",
+  "body_sha256": "DRY_RUN",
+  "body_sha256_match_expected": true,
+  "head_status": 200,
+  "get_status": 200,
+  "head_headers": {
+    "content-length": ["${COMPAT_OBJECT_SIZE}"],
+    "etag": ["DRY_RUN"]
+  },
+  "get_headers": {
+    "content-length": ["${COMPAT_OBJECT_SIZE}"],
+    "etag": ["DRY_RUN"]
+  }
+}
+EOF
+    return
+  fi
+
+  "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$compat_dir" "$profile" <<'PY'
+import datetime as dt
+import hashlib
+import hmac
+import http.client
+import json
+import pathlib
+import sys
+import urllib.parse
+
+endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, out_dir_raw, profile = sys.argv[1:]
+object_size = int(object_size_raw)
+out_dir = pathlib.Path(out_dir_raw)
+out_dir.mkdir(parents=True, exist_ok=True)
+
+
+def payload(size: int) -> bytes:
+    return bytes(((index * 31 + 7) % 251 for index in range(size)))
+
+
+def sha256_hex(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def sign(key: bytes, value: str) -> bytes:
+    return hmac.new(key, value.encode(), hashlib.sha256).digest()
+
+
+def signing_key(secret: str, date_stamp: str) -> bytes:
+    key_date = sign(("AWS4" + secret).encode(), date_stamp)
+    key_region = sign(key_date, region)
+    key_service = sign(key_region, "s3")
+    return sign(key_service, "aws4_request")
+
+
+def canonical_query(query: str) -> str:
+    pairs = urllib.parse.parse_qsl(query, keep_blank_values=True)
+    encoded = [
+        (urllib.parse.quote(key, safe="-_.~"), urllib.parse.quote(value, safe="-_.~"))
+        for key, value in pairs
+    ]
+    encoded.sort()
+    return "&".join(f"{key}={value}" for key, value in encoded)
+
+
+def canonical_uri(path: str) -> str:
+    return "/".join(urllib.parse.quote(part, safe="-_.~/") for part in path.split("/")) or "/"
+
+
+def signed_headers(method: str, path: str, body: bytes, extra_headers: list[tuple[str, str]]) -> dict[str, str]:
+    parsed = urllib.parse.urlsplit(endpoint)
+    amz_date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    date_stamp = amz_date[:8]
+    headers = [("host", parsed.netloc), ("x-amz-content-sha256", sha256_hex(body)), ("x-amz-date", amz_date)]
+    headers.extend((name.lower(), " ".join(value.strip().split())) for name, value in extra_headers)
+    headers.sort()
+    canonical_headers = "".join(f"{name}:{value}\n" for name, value in headers)
+    signed_names = ";".join(name for name, _ in headers)
+    raw_path, _, raw_query = path.partition("?")
+    canonical_request = "\n".join(
+        [method, canonical_uri(raw_path), canonical_query(raw_query), canonical_headers, signed_names, sha256_hex(body)]
+    )
+    scope = f"{date_stamp}/{region}/s3/aws4_request"
+    string_to_sign = "\n".join(
+        ["AWS4-HMAC-SHA256", amz_date, scope, hashlib.sha256(canonical_request.encode()).hexdigest()]
+    )
+    signature = hmac.new(signing_key(secret_key, date_stamp), string_to_sign.encode(), hashlib.sha256).hexdigest()
+    result = {name: value for name, value in headers}
+    result["Authorization"] = (
+        "AWS4-HMAC-SHA256 "
+        f"Credential={access_key}/{scope}, "
+        f"SignedHeaders={signed_names}, "
+        f"Signature={signature}"
+    )
+    return result
+
+
+def request(method: str, path: str, body: bytes = b"", extra_headers: list[tuple[str, str]] | None = None):
+    parsed = urllib.parse.urlsplit(endpoint)
+    headers = signed_headers(method, path, body, extra_headers or [])
+    if body and "content-length" not in headers:
+        headers["content-length"] = str(len(body))
+    conn = http.client.HTTPConnection(parsed.hostname, parsed.port or 80, timeout=30)
+    conn.request(method, path, body=body, headers=headers)
+    response = conn.getresponse()
+    response_body = response.read()
+    snapshot = {
+        "status": response.status,
+        "reason": response.reason,
+        "headers": response.getheaders(),
+        "body_sha256": sha256_hex(response_body),
+        "body_len": len(response_body),
+    }
+    conn.close()
+    return snapshot, response_body
+
+
+def header_map(headers: list[list[str] | tuple[str, str]]) -> dict[str, list[str]]:
+    result: dict[str, list[str]] = {}
+    for name, value in headers:
+        result.setdefault(name.lower(), []).append(value)
+    for value in result.values():
+        value.sort()
+    return dict(sorted(result.items()))
+
+
+bucket_path = "/" + urllib.parse.quote(bucket, safe="")
+object_path = bucket_path + "/" + urllib.parse.quote(object_key, safe="/-_.~")
+body = payload(object_size)
+
+create_bucket, _ = request("PUT", bucket_path)
+if create_bucket["status"] not in (200, 409):
+    raise SystemExit(f"create bucket failed: {create_bucket['status']} {create_bucket['reason']}")
+
+put_object, _ = request("PUT", object_path, body, [("content-type", "application/octet-stream")])
+if put_object["status"] not in (200, 204):
+    raise SystemExit(f"put object failed: {put_object['status']} {put_object['reason']}")
+
+head_object, _ = request("HEAD", object_path)
+get_object, get_body = request("GET", object_path)
+if get_object["status"] != 200:
+    raise SystemExit(f"get object failed: {get_object['status']} {get_object['reason']}")
+
+body_sha = sha256_hex(get_body)
+expected_sha = sha256_hex(body)
+body_match = body_sha == expected_sha
+headers_report = {
+    "create_bucket": create_bucket,
+    "put_object": put_object,
+    "head_object": head_object,
+    "get_object": get_object,
+}
+snapshot = {
+    "profile": profile,
+    "path": profile,
+    "size": object_size,
+    "object_key": object_key,
+    "expected_body_sha256": expected_sha,
+    "body_sha256": body_sha,
+    "body_sha256_match_expected": body_match,
+    "head_status": head_object["status"],
+    "get_status": get_object["status"],
+    "head_headers": header_map(head_object["headers"]),
+    "get_headers": header_map(get_object["headers"]),
+}
+
+(out_dir / "response_headers.json").write_text(json.dumps(headers_report, indent=2, sort_keys=True) + "\n")
+(out_dir / "snapshot.json").write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
+(out_dir / "body_sha256.txt").write_text(body_sha + "\n")
+
+get_headers = snapshot["get_headers"]
+content_length = ",".join(get_headers.get("content-length", []))
+etag = ",".join(get_headers.get("etag", []))
+status_match = head_object["status"] == 200 and get_object["status"] == 200
+error_count = 0 if body_match and status_match else 1
+(out_dir / "compat_summary.csv").write_text(
+    "size,path,body_sha256_match,content_length_match,etag_match,content_range_match,"
+    "checksum_headers_match,sse_headers_match,status_code_match,error_count,body_sha256,status_code,content_length,etag\n"
+    f"{object_size},{profile},{str(body_match).lower()},true,true,true,true,true,{str(status_match).lower()},"
+    f"{error_count},{body_sha},{get_object['status']},{content_length},{etag}\n"
+)
+PY
+}
+
+copy_profile_compat_artifacts() {
+  local profile="$1"
+  local label="$2"
+  local compat_dir="${OUT_DIR}/${profile}/compat"
+
+  if [[ -f "${compat_dir}/body_sha256.txt" ]]; then
+    cp "${compat_dir}/body_sha256.txt" "${OUT_DIR}/body_sha256_${label}.txt"
+  fi
+  if [[ -f "${compat_dir}/response_headers.json" ]]; then
+    cp "${compat_dir}/response_headers.json" "${OUT_DIR}/response_headers_${label}.json"
+  fi
+}
+
+write_ab_compat_summary() {
+  local legacy_snapshot="${OUT_DIR}/legacy/compat/snapshot.json"
+  local codec_snapshot="${OUT_DIR}/codec/compat/snapshot.json"
+
+  if [[ ! -f "$legacy_snapshot" || ! -f "$codec_snapshot" ]]; then
+    return
+  fi
+
+  "$PYTHON_BIN" - "$legacy_snapshot" "$codec_snapshot" "${OUT_DIR}/compat_summary.csv" <<'PY'
+import csv
+import json
+import sys
+
+legacy_path, codec_path, out_csv = sys.argv[1:]
+legacy = json.load(open(legacy_path, encoding="utf-8"))
+codec = json.load(open(codec_path, encoding="utf-8"))
+
+
+def values(snapshot, name):
+    return snapshot.get("get_headers", {}).get(name, [])
+
+
+def prefixed(snapshot, prefix):
+    headers = snapshot.get("get_headers", {})
+    return {key: headers[key] for key in sorted(headers) if key.startswith(prefix)}
+
+
+body_match = legacy.get("body_sha256") == codec.get("body_sha256")
+content_length_match = values(legacy, "content-length") == values(codec, "content-length")
+etag_match = values(legacy, "etag") == values(codec, "etag")
+content_range_match = values(legacy, "content-range") == values(codec, "content-range")
+checksum_headers_match = prefixed(legacy, "x-amz-checksum") == prefixed(codec, "x-amz-checksum")
+sse_headers_match = prefixed(legacy, "x-amz-server-side-encryption") == prefixed(codec, "x-amz-server-side-encryption")
+status_code_match = legacy.get("get_status") == codec.get("get_status") and legacy.get("head_status") == codec.get("head_status")
+checks = [
+    body_match,
+    content_length_match,
+    etag_match,
+    content_range_match,
+    checksum_headers_match,
+    sse_headers_match,
+    status_code_match,
+]
+
+with open(out_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(
+        [
+            "size",
+            "path",
+            "body_sha256_match",
+            "content_length_match",
+            "etag_match",
+            "content_range_match",
+            "checksum_headers_match",
+            "sse_headers_match",
+            "status_code_match",
+            "error_count",
+            "legacy_body_sha256",
+            "new_body_sha256",
+            "legacy_status_code",
+            "new_status_code",
+        ]
+    )
+    writer.writerow(
+        [
+            codec.get("size", legacy.get("size", "")),
+            "codec_streaming",
+            str(body_match).lower(),
+            str(content_length_match).lower(),
+            str(etag_match).lower(),
+            str(content_range_match).lower(),
+            str(checksum_headers_match).lower(),
+            str(sse_headers_match).lower(),
+            str(status_code_match).lower(),
+            sum(1 for check in checks if not check),
+            legacy.get("body_sha256", ""),
+            codec.get("body_sha256", ""),
+            legacy.get("get_status", ""),
+            codec.get("get_status", ""),
+        ]
+    )
+PY
+}
+
 run_profile() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -365,9 +701,13 @@ run_profile() {
   stop_server
   start_server "$profile"
   run_bench "$profile" "$baseline_csv"
+  write_metrics_summary "$profile"
+  run_compat_probe "$profile"
   stop_server
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
+  log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
+  log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
   fi
@@ -385,16 +725,24 @@ main() {
   case "$MODE" in
     legacy)
       run_profile legacy
+      copy_profile_compat_artifacts legacy legacy
       ;;
     codec)
       run_profile codec
+      copy_profile_compat_artifacts codec new
       ;;
     both)
       run_profile legacy
+      copy_profile_compat_artifacts legacy legacy
       run_profile codec "${OUT_DIR}/legacy/warp/median_summary.csv"
+      copy_profile_compat_artifacts codec new
+      write_ab_compat_summary
       ;;
   esac
 
+  if [[ -f "${OUT_DIR}/compat_summary.csv" ]]; then
+    log "Compatibility compare: ${OUT_DIR}/compat_summary.csv"
+  fi
   log "GET codec streaming smoke finished."
 }
 

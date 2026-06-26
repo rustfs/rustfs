@@ -330,6 +330,7 @@ pub fn record_get_object_response_handoff(
         "buffer_source" => buffer_source.to_string()
     )
     .record(duration_secs);
+    record_get_object_response_handoff_duration("s3_handler", duration_secs);
 }
 
 /// Record I/O queue congestion observation.
@@ -372,6 +373,109 @@ pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str,
         return;
     }
     histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
+}
+
+/// Record GetObject metadata fanout duration.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "metadata_fanout", duration_secs);
+}
+
+/// Record latency until the first metadata response arrives.
+#[inline(always)]
+pub fn record_get_object_first_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_metadata_response", duration_secs);
+}
+
+/// Record latency until the first valid metadata response arrives.
+#[inline(always)]
+pub fn record_get_object_first_valid_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_valid_metadata_response", duration_secs);
+}
+
+/// Record latency of the slowest metadata response in a fanout.
+#[inline(always)]
+pub fn record_get_object_slowest_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "slowest_metadata_response", duration_secs);
+}
+
+/// Record latency until metadata quorum is reached.
+#[inline(always)]
+pub fn record_get_object_quorum_reached_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "quorum_reached", duration_secs);
+}
+
+/// Record one bounded metadata response outcome.
+#[inline(always)]
+pub fn record_get_object_metadata_response(path: &'static str, outcome: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_response_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record aggregate metadata fanout shape for one GetObject metadata read.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_fanout_total_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(total));
+    histogram!("rustfs_io_get_object_metadata_fanout_valid_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(valid));
+    histogram!("rustfs_io_get_object_metadata_fanout_ignored_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(ignored));
+    histogram!("rustfs_io_get_object_metadata_fanout_error_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(errors));
+}
+
+/// Record GetObject reader setup duration.
+#[inline(always)]
+pub fn record_get_object_reader_setup_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "reader_setup", duration_secs);
+}
+
+/// Record latency until the first shard read completes.
+#[inline(always)]
+pub fn record_get_object_first_shard_read_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_shard_read", duration_secs);
+}
+
+/// Record GetObject bitrot verification duration.
+#[inline(always)]
+pub fn record_get_object_bitrot_verify_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "bitrot_verify", duration_secs);
+}
+
+/// Record GetObject reconstruct duration.
+#[inline(always)]
+pub fn record_get_object_reconstruct_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "reconstruct", duration_secs);
+}
+
+/// Record GetObject emit duration.
+#[inline(always)]
+pub fn record_get_object_emit_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "emit", duration_secs);
+}
+
+/// Record GetObject first-byte latency as observed by the caller that owns that boundary.
+#[inline(always)]
+pub fn record_get_object_first_byte_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_byte", duration_secs);
+}
+
+/// Record GetObject full-body latency as observed by the caller that owns that boundary.
+#[inline(always)]
+pub fn record_get_object_full_body_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "full_body", duration_secs);
+}
+
+/// Record GetObject response handoff duration in the shared stage histogram.
+#[inline(always)]
+pub fn record_get_object_response_handoff_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "response_handoff", duration_secs);
 }
 
 /// Record the selected GetObject reader path.
@@ -506,6 +610,11 @@ pub fn record_get_object_shard_read(
 
 #[inline(always)]
 fn shard_read_fanout_to_f64(value: usize) -> f64 {
+    u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+#[inline(always)]
+fn metadata_fanout_count_to_f64(value: usize) -> f64 {
     u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
 }
 
@@ -1177,6 +1286,21 @@ mod tests {
         record_get_object_reader_prefetch("codec_streaming", "stored");
         record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
         record_get_object_metadata_phase_duration(0.002);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
@@ -1237,6 +1361,21 @@ mod tests {
         record_get_object_reader_prefetch("codec_streaming", "stored");
         record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
@@ -1260,6 +1399,21 @@ mod tests {
         record_get_object_reader_prefetch("codec_streaming", "stored");
         record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
         record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
