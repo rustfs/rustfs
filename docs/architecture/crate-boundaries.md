@@ -78,10 +78,15 @@ or config-schema work. First inventory consumers, then decide whether existing
 
 The current decision is recorded in
 [`config-model-boundary-adr.md`](config-model-boundary-adr.md): use the existing
-`rustfs-config` package for the pure server-config model, keep persistence and
-global server-config state in `ecstore`, and preserve the old
-`rustfs_ecstore::config::*` path with a temporary compatibility marker during
-the first extraction.
+`rustfs-config` package for the pure server-config model and global
+server-config snapshot accessors, while ECStore keeps config persistence,
+storage-class global state, default wiring, and startup initialization.
+
+The old `rustfs_ecstore::config::{Config, KV, KVS, register_default_kvs,
+get_global_server_config, set_global_server_config}` compatibility path must
+not be restored after the Phase 1a cleanup. Consumers use
+`rustfs_config::server_config` for the moved model and accessors; ECStore public
+facades must not re-export those symbols.
 
 ## Loss-Prevention Coverage
 

@@ -129,6 +129,7 @@ RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_app_a
 EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_compat_bypass_hits.txt"
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
+LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -2178,6 +2179,22 @@ fi
 
 if [[ -s "$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE" ]]; then
   report_failure "external ECStore API facade imports must stay in local storage_api boundary files: $(paste -sd '; ' "$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_ecstore::config::(?:\{[^}]*\b(?:Config|KV|KVS|register_default_kvs|get_global_server_config|set_global_server_config)\b|(?:Config|KV|KVS|register_default_kvs|get_global_server_config|set_global_server_config)\b)' \
+      crates rustfs fuzz \
+      --glob '*.rs' || true
+    rg -n --with-filename 'pub(?:\([^)]*\))?\s+use\s+(?:crate::config|rustfs_config::server_config)::(?:\{[^}]*\b(?:Config|KV|KVS|register_default_kvs|get_global_server_config|set_global_server_config)\b|(?:Config|KV|KVS|register_default_kvs|get_global_server_config|set_global_server_config)\b)' \
+      crates/ecstore/src crates/ecstore/tests \
+      --glob '*.rs' || true
+  }
+) >"$LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE"
+
+if [[ -s "$LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE" ]]; then
+  report_failure "server-config model and global accessors must stay owned by rustfs_config::server_config, not ECStore compatibility paths: $(paste -sd '; ' "$LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE")"
 fi
 
 (
