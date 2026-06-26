@@ -122,7 +122,6 @@ enum ReadRepairAdmissionOutcome {
 type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
 type ReadRepairAdmissionSubmitter = fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
 
-#[derive(Clone, Copy)]
 struct ReadRepairHealSubmission<'a> {
     bucket: &'a str,
     object: &'a str,
@@ -170,47 +169,40 @@ async fn submit_read_repair_heal_with_submitter(
     submission: ReadRepairHealSubmission<'_>,
     submitter: ReadRepairAdmissionSubmitter,
 ) {
-    let Some(dedup_key) = reserve_read_repair_heal(
-        submission.bucket,
-        submission.object,
-        submission.version_id,
-        submission.pool_index,
-        submission.set_index,
-    )
-    .await
-    else {
+    let ReadRepairHealSubmission {
+        bucket,
+        object,
+        version_id,
+        pool_index,
+        set_index,
+        part_number,
+        reason,
+    } = submission;
+
+    let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
-            bucket = submission.bucket,
-            object = submission.object,
-            part_number = submission.part_number,
-            pool_index = submission.pool_index,
-            set_index = submission.set_index,
-            reason = submission.reason,
-            "Skipped duplicate read-repair heal request"
+            bucket,
+            object, part_number, pool_index, set_index, reason, "Skipped duplicate read-repair heal request"
         );
         return;
     };
 
     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
-        submission.bucket.to_string(),
-        Some(submission.object.to_string()),
+        bucket.to_string(),
+        Some(object.to_string()),
         false,
         Some(HealChannelPriority::Normal),
-        Some(submission.pool_index),
-        Some(submission.set_index),
+        Some(pool_index),
+        Some(set_index),
     );
     request.source = HealRequestSource::ReadRepair;
-    request.object_version_id = submission.version_id.filter(|value| !value.is_empty()).map(str::to_string);
+    request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
     request.recreate_missing = Some(true);
 
     let request_id = request.id.clone();
-    let bucket = submission.bucket.to_string();
-    let object = submission.object.to_string();
-    let part_number = submission.part_number;
-    let pool_index = submission.pool_index;
-    let set_index = submission.set_index;
-    let reason = submission.reason;
+    let bucket = bucket.to_string();
+    let object = object.to_string();
     tokio::spawn(async move {
         match submitter(request).await {
             ReadRepairAdmissionOutcome::Response(result) if result.is_admitted() => {
