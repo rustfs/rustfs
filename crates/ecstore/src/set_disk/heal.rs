@@ -16,6 +16,10 @@ use super::*;
 use crate::storage_api_contracts::NamespaceLocking as _;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
+const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+const LOG_SUBSYSTEM_HEAL: &str = "heal";
+const EVENT_HEAL_OBJECT_RENAME: &str = "heal_object_rename";
+
 impl SetDisks {
     #[tracing::instrument(skip(self, opts), fields(bucket = %bucket, object = %object, version_id = %version_id))]
     pub(super) async fn heal_object(
@@ -513,8 +517,11 @@ impl SetDisks {
                             }
                         }
                         // Rename from tmp location to the actual location.
+                        let mut rename_attempts = 0usize;
+                        let mut rename_successes = 0usize;
                         for (index, outdated_disk) in out_dated_disks.iter().enumerate() {
                             if let Some(disk) = outdated_disk {
+                                rename_attempts += 1;
                                 // record the index of the updated disks
                                 parts_metadata[index].erasure.index = index + 1;
                                 // Attempt a rename now from healed data to final location.
@@ -525,8 +532,22 @@ impl SetDisks {
                                     .await;
 
                                 if let Err(err) = &rename_result {
-                                    warn!("failed to rename healed data for {bucket}/{object}: {err}");
+                                    warn!(
+                                        event = EVENT_HEAL_OBJECT_RENAME,
+                                        component = LOG_COMPONENT_ECSTORE,
+                                        subsystem = LOG_SUBSYSTEM_HEAL,
+                                        bucket,
+                                        object,
+                                        version_id,
+                                        disk_index = index,
+                                        endpoint = %disk.endpoint(),
+                                        tmp_id,
+                                        result = "failed",
+                                        error = %err,
+                                        "Heal object rename failed"
+                                    );
                                 } else {
+                                    rename_successes += 1;
                                     if parts_metadata[index].is_remote() {
                                         let rm_data_dir = parts_metadata[index].data_dir.unwrap().to_string();
 
@@ -557,6 +578,13 @@ impl SetDisks {
                         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                             .await
                             .map_err(DiskError::other)?;
+
+                        if rename_attempts > 0 && rename_successes == 0 {
+                            return Ok((
+                                result,
+                                Some(DiskError::other(format!("all healed data rename attempts failed for {bucket}/{object}"))),
+                            ));
+                        }
 
                         record_capacity_scope_if_needed(None, &out_dated_disks);
 

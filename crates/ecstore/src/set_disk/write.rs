@@ -628,6 +628,10 @@ impl SetDisks {
         let mut delete_errs = Vec::with_capacity(results.len());
         for (index, result) in results.into_iter().enumerate() {
             let key = format!("ddisk-{index}");
+            let already_absent = matches!(
+                errs.get(index).and_then(Option::as_ref),
+                Some(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+            );
             match result {
                 Ok(_) => {
                     tags.insert(key, "<nil>".to_string());
@@ -635,12 +639,21 @@ impl SetDisks {
                 }
                 Err(e) => {
                     tags.insert(key, e.to_string());
-                    delete_errs.push(Some(e));
+                    if already_absent || matches!(&e, DiskError::FileNotFound | DiskError::FileVersionNotFound) {
+                        delete_errs.push(None);
+                    } else {
+                        delete_errs.push(Some(e));
+                    }
                 }
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&delete_errs, OBJECT_OP_IGNORED_ERRS, self.default_write_quorum()) {
+        let write_quorum = if m.is_valid() {
+            m.write_quorum(self.default_write_quorum())
+        } else {
+            self.default_write_quorum()
+        };
+        if let Some(err) = reduce_write_quorum_errs(&delete_errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             return Err(err);
         }
 
