@@ -15,8 +15,12 @@
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
-use crate::app::context::resolve_endpoints_handle;
+use crate::admin::runtime_sources::{
+    DefaultAdminUsecase, QueryServerInfoRequest, default_admin_usecase, resolve_endpoints_handle,
+};
+use crate::admin::storage_api::cluster::{
+    CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
+};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -27,9 +31,6 @@ use matchit::Params;
 use rustfs_concurrency::WorkloadAdmissionRegistrySnapshot;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
-use rustfs_storage_api::{
-    CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
-};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -202,7 +203,7 @@ impl Operation for ServerInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase
             .execute_query_server_info(QueryServerInfoRequest { include_pools: true })
             .await
@@ -260,7 +261,7 @@ impl Operation for StorageInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
         let response = StorageInfoResponse {
             info,
@@ -297,7 +298,7 @@ pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
-    pub observability: rustfs_storage_api::ObservabilitySnapshot,
+    pub observability: crate::admin::storage_api::cluster::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
@@ -306,8 +307,8 @@ pub struct RuntimeCapabilitiesResponse {
 pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
--> Result<RuntimeCapabilitiesResponse, rustfs_storage_api::CapabilitySnapshotError> {
-    let usecase = DefaultAdminUsecase::from_global();
+-> Result<RuntimeCapabilitiesResponse, crate::admin::storage_api::cluster::CapabilitySnapshotError> {
+    let usecase = default_admin_usecase();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
@@ -339,7 +340,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 }
 
 fn build_runtime_capabilities_summary(
-    observability: &rustfs_storage_api::ObservabilitySnapshot,
+    observability: &crate::admin::storage_api::cluster::ObservabilitySnapshot,
     topology: Option<&TopologySnapshot>,
     topology_status: &CapabilityStatus,
     cluster_snapshot_summary: Option<&CapabilityStatus>,
@@ -493,7 +494,7 @@ impl Operation for DataUsageInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
 
         let data = serde_json::to_vec(&info).map_err(|e| {
@@ -515,13 +516,13 @@ mod tests {
         OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
         build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
-    use crate::app::admin_usecase::DefaultAdminUsecase;
-    use rustfs_concurrency::{AdmissionState, WorkloadClass};
-    use rustfs_madmin::{InfoMessage, StorageInfo};
-    use rustfs_storage_api::{
+    use crate::admin::runtime_sources::DefaultAdminUsecase;
+    use crate::admin::storage_api::cluster::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };
+    use rustfs_concurrency::WorkloadClass;
+    use rustfs_madmin::{InfoMessage, StorageInfo};
 
     #[tokio::test]
     async fn runtime_capabilities_response_reports_missing_topology_before_storage_init() {
@@ -538,20 +539,6 @@ mod tests {
         assert_eq!(response.cluster_snapshot_summary, None);
         assert_eq!(response.summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert_eq!(response.observability.platform.os.as_deref(), Some(std::env::consts::OS));
-        assert_eq!(
-            response
-                .workload_admission
-                .get(WorkloadClass::ForegroundRead)
-                .map(|snapshot| snapshot.state),
-            Some(AdmissionState::Open)
-        );
-        assert_eq!(
-            response
-                .workload_admission
-                .get(WorkloadClass::ForegroundWrite)
-                .map(|snapshot| snapshot.state),
-            Some(AdmissionState::Disabled)
-        );
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
     }
 

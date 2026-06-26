@@ -14,16 +14,11 @@
 
 use http::HeaderMap;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
-use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_sys;
-use rustfs_ecstore::api::disk::endpoint::Endpoint;
-use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
-use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 use rustfs_heal::heal::{
     manager::{HealConfig, HealManager},
     storage::{ECStoreHealStorage, HealObjectOptions as ObjectOptions, HealPutObjReader as PutObjReader, HealStorageAPI},
     task::{HealOptions, HealPriority, HealRequest, HealTaskStatus, HealType},
 };
-use rustfs_storage_api::{BucketOperations, ObjectIO as _, ObjectOperations as _};
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
@@ -34,6 +29,14 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use walkdir::WalkDir;
+
+#[path = "heal_integration_test/storage_api.rs"]
+mod storage_api;
+
+use storage_api::integration::{
+    BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, ObjectIO as _, ObjectOperations as _,
+    PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
+};
 
 const HEAL_FORMAT_WAIT_TIMEOUT: Duration = Duration::from_secs(25);
 const HEAL_FORMAT_WAIT_INTERVAL: Duration = Duration::from_millis(250);
@@ -132,7 +135,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_storage_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })

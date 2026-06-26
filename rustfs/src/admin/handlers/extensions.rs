@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_api::cluster::CapabilityStatus;
 use crate::admin::{
     auth::validate_admin_request,
     handlers::{cluster_snapshot, plugins_instances, system},
@@ -31,7 +32,6 @@ use rustfs_extension_schema::{
     OPS_PROFILER_CAPABILITY, OpsDiagnosticsContract, OpsProfilerContract,
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::CapabilityStatus;
 use rustfs_targets::{
     OpsDiagnosticsRegistry, OpsProfilerRegistry, TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus,
     builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
@@ -118,7 +118,8 @@ pub(crate) struct ExtensionInstancesResponse {
     pub next_marker: Option<String>,
 }
 
-async fn build_extension_catalog_response() -> Result<ExtensionCatalogResponse, rustfs_storage_api::CapabilitySnapshotError> {
+async fn build_extension_catalog_response()
+-> Result<ExtensionCatalogResponse, crate::admin::storage_api::cluster::CapabilitySnapshotError> {
     let mut extensions = builtin_extension_schemas();
     let example = example_external_webhook_plugin();
     extensions.push(target_marketplace_extension_schema(&example.manifest));

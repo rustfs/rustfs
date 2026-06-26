@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::ecstore_utils::{deserialize, serialize};
-use super::super::{
-    StorageError,
+use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
+use crate::admin::storage_api::bucket::{
     metadata::{
         BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG, BUCKET_QUOTA_CONFIG_FILE,
         BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
@@ -24,12 +23,14 @@ use super::super::{
     quota::BucketQuota,
     target::BucketTargets,
 };
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+use crate::admin::storage_api::error::StorageError;
 use crate::{
+    admin::runtime_sources::resolve_object_store_handle,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::resolve_object_store_handle,
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -41,7 +42,6 @@ use rustfs_policy::policy::{
     BucketPolicy,
     action::{Action, AdminAction},
 };
-use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::{
     Body, S3Request, S3Response, S3Result,

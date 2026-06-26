@@ -25,13 +25,15 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
+    admin::runtime_sources::{
+        AdminPoolStatus, QueryPoolStatusRequest, default_admin_usecase, resolve_endpoints_handle, resolve_notification_system,
+        resolve_object_store_handle,
+    },
     admin::{
-        EndpointServerPools, PeerRestClient,
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
+        storage_api::runtime::{EndpointServerPools, PeerRestClient},
     },
-    app::admin_usecase::{DefaultAdminUsecase, QueryPoolStatusRequest},
-    app::context::{resolve_endpoints_handle, resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     error::ApiError,
     server::{ADMIN_PREFIX, RemoteAddr},
@@ -52,7 +54,7 @@ struct PoolAdminDiscovery {
 
 #[derive(Debug, Clone, serde::Serialize)]
 struct PoolStatusResponse {
-    pool: crate::app::admin_usecase::AdminPoolStatus,
+    pool: AdminPoolStatus,
     admin_discovery: PoolAdminDiscovery,
 }
 
@@ -211,7 +213,7 @@ macro_rules! log_pool_response_emitted {
     };
 }
 
-fn endpoints_from_context() -> Option<super::super::EndpointServerPools> {
+fn endpoints_from_context() -> Option<crate::admin::storage_api::runtime::EndpointServerPools> {
     resolve_endpoints_handle()
 }
 
@@ -413,7 +415,7 @@ fn parse_pool_idx_by_id(pool: &str, endpoint_count: usize) -> Option<usize> {
 }
 
 fn pool_admin_discovery() -> PoolAdminDiscovery {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     PoolAdminDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
         cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
@@ -498,7 +500,7 @@ impl Operation for ListPools {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let pool_items = usecase.execute_list_pools().await.map_err(S3Error::from)?;
 
         let data = serde_json::to_vec(&pool_items).map_err(|e| {
@@ -597,7 +599,7 @@ impl Operation for StatusPool {
 
         let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load pool status"))?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let pools_status = usecase
             .execute_query_pool_status(QueryPoolStatusRequest {
                 pool: query.pool,
@@ -652,7 +654,7 @@ impl Operation for StatusDecommission {
 
         let query = parse_status_pool_query(&req.uri).map_err(|_| pool_admin_query_parse_error("load decommission status"))?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let data = if query.pool.is_empty() {
             let status = usecase.execute_list_decommission_status().await.map_err(S3Error::from)?;
             serde_json::to_vec(&status)
@@ -1071,14 +1073,14 @@ impl Operation for ClearDecommission {
 #[cfg(test)]
 mod pools_handler_tests {
     use super::{
-        PoolAuditContext, contextualize_admin_pool_api_error, decommission_admin_not_initialized_error_with_audit,
-        decommission_peer_target, has_duplicate_indices, parse_mutation_pool_query, parse_pool_idx_by_id,
-        parse_status_pool_query, pool_admin_missing_credentials_error, pool_admin_missing_credentials_error_with_request,
-        pool_admin_pool_index_error_with_audit, pool_admin_pool_not_found_error_with_audit,
-        pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error, pool_admin_query_parse_error_with_audit,
-        validate_pool_mutation_leader, validate_start_decommission_guards,
+        AdminPoolStatus, PoolAuditContext, contextualize_admin_pool_api_error,
+        decommission_admin_not_initialized_error_with_audit, decommission_peer_target, has_duplicate_indices,
+        parse_mutation_pool_query, parse_pool_idx_by_id, parse_status_pool_query, pool_admin_missing_credentials_error,
+        pool_admin_missing_credentials_error_with_request, pool_admin_pool_index_error_with_audit,
+        pool_admin_pool_not_found_error_with_audit, pool_admin_pool_parse_error_with_audit, pool_admin_query_parse_error,
+        pool_admin_query_parse_error_with_audit, validate_pool_mutation_leader, validate_start_decommission_guards,
     };
-    use crate::admin::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::admin::storage_api::runtime::{Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 
     fn test_pool_endpoints(is_local: bool) -> EndpointServerPools {
         let mut endpoint = Endpoint::try_from("http://127.0.0.1:9000/disk").expect("test endpoint should parse");
@@ -1353,7 +1355,7 @@ mod pools_handler_tests {
     #[test]
     fn test_pool_status_response_exposes_admin_discovery_paths() {
         let response = super::PoolStatusResponse {
-            pool: crate::app::admin_usecase::AdminPoolStatus {
+            pool: AdminPoolStatus {
                 id: 0,
                 cmd_line: "pool-0".to_string(),
                 last_update: time::OffsetDateTime::UNIX_EPOCH,

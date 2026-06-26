@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::ECStore;
+use crate::storage_api::startup::ECStore;
 use crate::{
     server::{ServiceStateManager, ShutdownHandle, wait_for_shutdown},
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},

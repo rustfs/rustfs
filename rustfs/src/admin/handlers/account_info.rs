@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::versioning_sys::BucketVersioningSys;
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_action_credentials, resolve_object_store_handle};
+use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle};
+use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::auth::get_condition_values;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -24,7 +26,6 @@ use matchit::Params;
 use rustfs_policy::policy::BucketPolicy;
 use rustfs_policy::policy::default::DEFAULT_POLICIES;
 use rustfs_policy::policy::{Args, action::Action, action::S3Action};
-use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -69,7 +70,7 @@ impl Operation for AccountInfoHandler {
 
         let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
 
-        let Ok(iam_store) = crate::app::context::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 

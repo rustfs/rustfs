@@ -57,12 +57,17 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 ///
 /// Set to `true` during startup when OTEL metric export is enabled.
 static PUT_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
+static GET_STAGE_METRICS_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable detailed per-stage PUT metrics.
 ///
 /// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
 pub fn set_put_stage_metrics_enabled(enabled: bool) {
     PUT_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+pub fn set_get_stage_metrics_enabled(enabled: bool) {
+    GET_STAGE_METRICS_ENABLED.store(enabled, Ordering::Relaxed);
 }
 
 /// Returns `true` if detailed per-stage PUT metrics are enabled.
@@ -72,6 +77,11 @@ pub fn set_put_stage_metrics_enabled(enabled: bool) {
 #[inline(always)]
 pub fn put_stage_metrics_enabled() -> bool {
     PUT_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
+}
+
+#[inline(always)]
+pub fn get_stage_metrics_enabled() -> bool {
+    GET_STAGE_METRICS_ENABLED.load(Ordering::Relaxed)
 }
 
 // Public modules
@@ -182,6 +192,16 @@ fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
     }
 }
 
+#[inline(always)]
+fn usize_to_f64(value: usize) -> f64 {
+    value as f64
+}
+
+#[inline(always)]
+fn i64_non_negative_to_f64(value: i64) -> f64 {
+    value.max(0) as f64
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TrackedMemoryGauge {
     GetObjectBufferedBytes,
@@ -261,6 +281,58 @@ pub fn record_get_object_completion(total_duration_secs: f64, response_size_byte
     histogram!("rustfs_io_get_object_buffer_size_bytes").record(buffer_size_bytes as f64);
 }
 
+/// Record the streaming strategy chosen for a GetObject response body.
+#[inline(always)]
+pub fn record_get_object_stream_strategy(strategy: &str, buffer_size_bytes: usize, response_size_bytes: i64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_stream_strategy_total", "strategy" => strategy.to_string()).increment(1);
+    histogram!("rustfs_io_get_object_stream_buffer_size_bytes", "strategy" => strategy.to_string())
+        .record(usize_to_f64(buffer_size_bytes));
+    histogram!("rustfs_io_get_object_stream_response_size_bytes", "strategy" => strategy.to_string())
+        .record(i64_non_negative_to_f64(response_size_bytes));
+}
+
+/// Record the response-body handoff shape from a GetObject reader into the S3 streaming body.
+#[inline(always)]
+pub fn record_get_object_response_handoff(
+    strategy: &str,
+    buffer_source: &str,
+    buffer_size_bytes: usize,
+    response_size_bytes: i64,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_response_handoff_total",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_io_get_object_response_handoff_buffer_size_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(usize_to_f64(buffer_size_bytes));
+    histogram!(
+        "rustfs_io_get_object_response_handoff_response_size_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(i64_non_negative_to_f64(response_size_bytes));
+    histogram!(
+        "rustfs_io_get_object_response_handoff_duration_seconds",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(duration_secs);
+    record_get_object_response_handoff_duration("s3_handler", duration_secs);
+}
+
 /// Record I/O queue congestion observation.
 #[inline(always)]
 pub fn record_io_queue_congestion() {
@@ -283,12 +355,358 @@ pub fn record_get_object_io_state(
     load_level: &str,
     buffer_multiplier: f64,
 ) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
     histogram!("rustfs_io_disk_permit_wait_duration_seconds").record(permit_wait_secs);
     gauge!("rustfs_io_queue_utilization_percent").set(queue_utilization_percent);
     gauge!("rustfs_io_queue_permits_in_use").set(permits_in_use as f64);
     gauge!("rustfs_io_queue_permits_available").set(permits_available as f64);
     gauge!("rustfs_io_buffer_multiplier").set(buffer_multiplier);
     counter!("rustfs_io_strategy_selected_total", "level" => load_level.to_string()).increment(1);
+}
+
+/// Record GetObject phase duration for the current read path.
+#[inline(always)]
+pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str, duration_secs: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
+}
+
+/// Record GetObject metadata fanout duration.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "metadata_fanout", duration_secs);
+}
+
+/// Record latency until the first metadata response arrives.
+#[inline(always)]
+pub fn record_get_object_first_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_metadata_response", duration_secs);
+}
+
+/// Record latency until the first valid metadata response arrives.
+#[inline(always)]
+pub fn record_get_object_first_valid_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_valid_metadata_response", duration_secs);
+}
+
+/// Record latency of the slowest metadata response in a fanout.
+#[inline(always)]
+pub fn record_get_object_slowest_metadata_response_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "slowest_metadata_response", duration_secs);
+}
+
+/// Record latency until metadata quorum is reached.
+#[inline(always)]
+pub fn record_get_object_quorum_reached_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "quorum_reached", duration_secs);
+}
+
+/// Record one bounded metadata response outcome.
+#[inline(always)]
+pub fn record_get_object_metadata_response(path: &'static str, outcome: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_response_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record aggregate metadata fanout shape for one GetObject metadata read.
+#[inline(always)]
+pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_fanout_total_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(total));
+    histogram!("rustfs_io_get_object_metadata_fanout_valid_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(valid));
+    histogram!("rustfs_io_get_object_metadata_fanout_ignored_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(ignored));
+    histogram!("rustfs_io_get_object_metadata_fanout_error_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(errors));
+}
+
+/// Record a guarded metadata early-stop hit for GetObject.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_hit(path: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_early_stop_total", "path" => path, "decision" => "hit", "reason" => reason)
+        .increment(1);
+}
+
+/// Record a guarded metadata early-stop miss for GetObject.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_miss(path: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_early_stop_total", "path" => path, "decision" => "miss", "reason" => reason)
+        .increment(1);
+}
+
+/// Record how many trailing metadata responses were skipped by early-stop.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_saved_responses(path: &'static str, saved: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_early_stop_saved_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(saved));
+}
+
+/// Record GetObject reader setup duration.
+#[inline(always)]
+pub fn record_get_object_reader_setup_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "reader_setup", duration_secs);
+}
+
+/// Record latency until the first shard read completes.
+#[inline(always)]
+pub fn record_get_object_first_shard_read_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_shard_read", duration_secs);
+}
+
+/// Record GetObject bitrot verification duration.
+#[inline(always)]
+pub fn record_get_object_bitrot_verify_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "bitrot_verify", duration_secs);
+}
+
+/// Record GetObject reconstruct duration.
+#[inline(always)]
+pub fn record_get_object_reconstruct_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "reconstruct", duration_secs);
+}
+
+/// Record GetObject emit duration.
+#[inline(always)]
+pub fn record_get_object_emit_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "emit", duration_secs);
+}
+
+/// Record GetObject first-byte latency as observed by the caller that owns that boundary.
+#[inline(always)]
+pub fn record_get_object_first_byte_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "first_byte", duration_secs);
+}
+
+/// Record GetObject full-body latency as observed by the caller that owns that boundary.
+#[inline(always)]
+pub fn record_get_object_full_body_latency(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "full_body", duration_secs);
+}
+
+/// Record GetObject response handoff duration in the shared stage histogram.
+#[inline(always)]
+pub fn record_get_object_response_handoff_duration(path: &'static str, duration_secs: f64) {
+    record_get_object_stage_duration(path, "response_handoff", duration_secs);
+}
+
+/// Record the selected GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_path(path: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_reader_path_total", "path" => path).increment(1);
+}
+
+/// Record why the codec streaming reader was not selected.
+#[inline(always)]
+pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
+}
+
+/// Record one decoded reader stripe processed by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_stripe(path: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_reader_stripes_total", "path" => path).increment(1);
+}
+
+/// Record bytes emitted by a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_bytes(path: &'static str, bytes: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_bytes_total", "path" => path).increment(bytes);
+}
+
+/// Record one reader buffer produced by a GetObject read path.
+#[inline(always)]
+pub fn record_get_object_reader_buffer(path: &'static str, role: &'static str, bytes: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_reader_buffer_bytes", "path" => path, "role" => role).record(usize_to_f64(bytes));
+}
+
+/// Record one copy from a GetObject reader's internal buffer into the downstream read buffer.
+#[inline(always)]
+pub fn record_get_object_reader_copy(
+    path: &'static str,
+    bytes: usize,
+    read_buf_remaining_before: usize,
+    output_remaining_before: usize,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes_counter = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_copy_chunks_total", "path" => path).increment(1);
+    counter!("rustfs_io_get_object_reader_copy_bytes_total", "path" => path).increment(bytes_counter);
+    histogram!("rustfs_io_get_object_reader_copy_bytes", "path" => path).record(usize_to_f64(bytes));
+    histogram!("rustfs_io_get_object_reader_copy_read_buf_remaining_bytes", "path" => path)
+        .record(usize_to_f64(read_buf_remaining_before));
+    histogram!("rustfs_io_get_object_reader_copy_output_remaining_bytes", "path" => path)
+        .record(usize_to_f64(output_remaining_before));
+    histogram!("rustfs_io_get_object_reader_copy_duration_seconds", "path" => path).record(duration_secs);
+}
+
+/// Record one downstream poll of the response-facing GetObject reader.
+#[inline(always)]
+pub fn record_get_object_reader_poll(
+    path: &'static str,
+    outcome: &'static str,
+    read_buf_remaining_before: usize,
+    filled_bytes: usize,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let filled_bytes_counter = u64::try_from(filled_bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_poll_total", "path" => path, "outcome" => outcome).increment(1);
+    counter!("rustfs_io_get_object_reader_poll_filled_bytes_total", "path" => path, "outcome" => outcome)
+        .increment(filled_bytes_counter);
+    histogram!("rustfs_io_get_object_reader_poll_read_buf_remaining_bytes", "path" => path, "outcome" => outcome)
+        .record(usize_to_f64(read_buf_remaining_before));
+    histogram!("rustfs_io_get_object_reader_poll_filled_bytes", "path" => path, "outcome" => outcome)
+        .record(usize_to_f64(filled_bytes));
+    histogram!("rustfs_io_get_object_reader_poll_duration_seconds", "path" => path, "outcome" => outcome).record(duration_secs);
+}
+
+/// Record a bounded prefetch outcome for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch(path: &'static str, outcome: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_reader_prefetch_total", "path" => path, "outcome" => outcome).increment(1);
+}
+
+/// Record how long a GetObject reader spent waiting for a prefetch/fill result.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch_wait(path: &'static str, duration_secs: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_reader_prefetch_wait_seconds", "path" => path).record(duration_secs);
+}
+
+/// Record one underlying shard read attempt for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read(
+    path: &'static str,
+    role: &'static str,
+    outcome: &'static str,
+    bytes: usize,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_shard_read_total", "path" => path, "role" => role, "outcome" => outcome).increment(1);
+    counter!("rustfs_io_get_object_shard_read_bytes_total", "path" => path, "role" => role, "outcome" => outcome)
+        .increment(bytes);
+    histogram!("rustfs_io_get_object_shard_read_duration_seconds", "path" => path, "role" => role, "outcome" => outcome)
+        .record(duration_secs);
+}
+
+#[inline(always)]
+fn shard_read_fanout_to_f64(value: usize) -> f64 {
+    u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+#[inline(always)]
+fn metadata_fanout_count_to_f64(value: usize) -> f64 {
+    u32::try_from(value).map(f64::from).unwrap_or(f64::from(u32::MAX))
+}
+
+/// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
+#[inline(always)]
+pub fn record_get_object_shard_read_fanout(
+    path: &'static str,
+    scheduled: usize,
+    completed: usize,
+    successful: usize,
+    failed: usize,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_shard_read_scheduled", "path" => path).record(shard_read_fanout_to_f64(scheduled));
+    histogram!("rustfs_io_get_object_shard_read_completed", "path" => path).record(shard_read_fanout_to_f64(completed));
+    histogram!("rustfs_io_get_object_shard_read_successful", "path" => path).record(shard_read_fanout_to_f64(successful));
+    histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
+}
+
+/// Record GetObject metadata resolution duration.
+#[inline(always)]
+pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "metadata", duration_secs);
+}
+
+/// Record GetObject shard reader setup duration.
+#[inline(always)]
+pub fn record_get_object_shard_reader_setup_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "reader_setup", duration_secs);
+}
+
+/// Record GetObject erasure decode duration.
+#[inline(always)]
+pub fn record_get_object_decode_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "decode", duration_secs);
+}
+
+/// Record GetObject downstream write wait while emitting decoded data.
+#[inline(always)]
+pub fn record_get_object_duplex_backpressure_duration(duration_secs: f64) {
+    record_get_object_stage_duration("legacy_duplex", "duplex_backpressure", duration_secs);
+}
+
+/// Record GetObject read pipeline failures using bounded labels.
+#[inline(always)]
+pub fn record_get_object_pipeline_failure(stage: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_pipeline_failures_total", "path" => "legacy_duplex", "stage" => stage, "reason" => reason)
+        .increment(1);
+}
+
+/// Record GetObject read pipeline failures for an explicit bounded path label.
+#[inline(always)]
+pub fn record_get_object_pipeline_failure_for_path(path: &'static str, stage: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_pipeline_failures_total", "path" => path, "stage" => stage, "reason" => reason).increment(1);
 }
 
 /// Record a zero-copy read operation.
@@ -886,6 +1304,47 @@ mod tests {
     }
 
     #[test]
+    fn test_record_get_object_stage_metrics() {
+        record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_reader_path("codec_streaming");
+        record_get_object_codec_streaming_fallback("range");
+        record_get_object_reader_stripe("codec_streaming");
+        record_get_object_reader_bytes("codec_streaming", 1024);
+        record_get_object_reader_buffer("codec_streaming", "output", 1024);
+        record_get_object_reader_copy("codec_streaming", 512, 8192, 1024, 0.0001);
+        record_get_object_reader_poll("codec_streaming", "ready_data", 8192, 512, 0.0002);
+        record_get_object_reader_prefetch("codec_streaming", "stored");
+        record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
+        record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
+        record_get_object_metadata_phase_duration(0.002);
+        record_get_object_shard_reader_setup_duration(0.003);
+        record_get_object_decode_duration(0.004);
+        record_get_object_duplex_backpressure_duration(0.005);
+        record_get_object_pipeline_failure("decode", "read_quorum");
+        record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+
+        assert!(0.005_f64.is_sign_positive());
+    }
+
+    #[test]
     fn test_record_put_object() {
         record_put_object(200.0, 1024 * 1024, true);
         record_put_object(100.0, 512, false);
@@ -918,6 +1377,88 @@ mod tests {
         record_put_object_stage_duration("set_disk_encode", 5.0);
         // Still disabled
         assert!(!put_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn test_record_get_object_path_and_stage() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_get_stage_metrics_enabled(true);
+        record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_reader_path("codec_streaming");
+        record_get_object_codec_streaming_fallback("range");
+        record_get_object_reader_stripe("codec_streaming");
+        record_get_object_reader_bytes("codec_streaming", 1024);
+        record_get_object_reader_buffer("codec_streaming", "output", 1024);
+        record_get_object_reader_copy("codec_streaming", 512, 8192, 1024, 0.0001);
+        record_get_object_reader_poll("codec_streaming", "ready_data", 8192, 512, 0.0002);
+        record_get_object_reader_prefetch("codec_streaming", "stored");
+        record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
+        record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
+        record_get_object_shard_reader_setup_duration(0.003);
+        record_get_object_decode_duration(0.004);
+        record_get_object_duplex_backpressure_duration(0.005);
+        record_get_object_pipeline_failure("decode", "read_quorum");
+        record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+        set_get_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_get_stage_metrics_disabled_by_default() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_get_stage_metrics_enabled(false);
+        record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_reader_path("codec_streaming");
+        record_get_object_codec_streaming_fallback("range");
+        record_get_object_reader_stripe("codec_streaming");
+        record_get_object_reader_bytes("codec_streaming", 1024);
+        record_get_object_reader_buffer("codec_streaming", "output", 1024);
+        record_get_object_reader_copy("codec_streaming", 512, 8192, 1024, 0.0001);
+        record_get_object_reader_poll("codec_streaming", "ready_data", 8192, 512, 0.0002);
+        record_get_object_reader_prefetch("codec_streaming", "stored");
+        record_get_object_reader_prefetch_wait("codec_streaming", 0.0002);
+        record_get_object_response_handoff("standard", "selected", 8192, 1024, 0.0001);
+        record_get_object_metadata_fanout_duration("legacy_duplex", 0.001);
+        record_get_object_first_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_first_valid_metadata_response_latency("legacy_duplex", 0.001);
+        record_get_object_slowest_metadata_response_latency("legacy_duplex", 0.003);
+        record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
+        record_get_object_metadata_response("legacy_duplex", "valid");
+        record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
+        record_get_object_reader_setup_duration("legacy_duplex", 0.003);
+        record_get_object_first_shard_read_duration("codec_streaming", 0.004);
+        record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
+        record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_emit_duration("codec_streaming", 0.007);
+        record_get_object_first_byte_latency("s3_handler", 0.008);
+        record_get_object_full_body_latency("s3_handler", 0.009);
+        record_get_object_response_handoff_duration("s3_handler", 0.0001);
+        record_get_object_shard_reader_setup_duration(0.003);
+        record_get_object_decode_duration(0.004);
+        record_get_object_duplex_backpressure_duration(0.005);
+        record_get_object_pipeline_failure("decode", "read_quorum");
+        record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
+        assert!(!get_stage_metrics_enabled());
     }
 
     #[test]

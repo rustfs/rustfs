@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use rustfs_storage_api::{
+use crate::storage_api_contracts::topology::{
     CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet,
     TopologySnapshot,
 };

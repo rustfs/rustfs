@@ -13,11 +13,12 @@
 // limitations under the License.
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::api::erasure::{BitrotWriterWrapper, CustomWriter, Erasure};
 use rustfs_utils::HashAlgorithm;
+mod storage_api;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
+use storage_api::single_block_non_inline::{BitrotWriterWrapper, CustomWriter, Erasure};
 
 #[derive(Clone, Debug)]
 struct BenchConfig {

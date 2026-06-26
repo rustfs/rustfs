@@ -38,13 +38,13 @@ use rustfs_config::{
     ENV_SCANNER_CYCLE_MAX_OBJECTS,
 };
 use rustfs_config::{ENV_SCANNER_CYCLE, ENV_SCANNER_SPEED, ENV_SCANNER_START_DELAY_SECS};
-use rustfs_storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
+use crate::storage_api::scan::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
     get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
@@ -124,6 +124,10 @@ enum ScannerCycleWakeReason {
 }
 
 async fn wait_for_next_scanner_cycle(ctx: &CancellationToken, delay: Duration) -> ScannerCycleWakeReason {
+    if dirty_usage_buckets_pending() {
+        return ScannerCycleWakeReason::DirtyUsage;
+    }
+
     let sleep = tokio::time::sleep(delay);
     tokio::pin!(sleep);
 
@@ -1144,9 +1148,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::ObjectIO for MemoryConfigStore {
+    impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         type Error = EcstoreError;
-        type RangeSpec = rustfs_storage_api::HTTPRangeSpec;
+        type RangeSpec = crate::storage_api::scanner_io::HTTPRangeSpec;
         type HeaderMap = http::HeaderMap;
         type ObjectOptions = ObjectOptions;
         type ObjectInfo = ObjectInfo;
@@ -1157,7 +1161,7 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<rustfs_storage_api::HTTPRangeSpec>,
+            _range: Option<crate::storage_api::scanner_io::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> EcstoreResult<GetObjectReader> {
@@ -1619,6 +1623,19 @@ mod tests {
         let reason = tokio::time::timeout(Duration::from_secs(1), wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)))
             .await
             .expect("dirty usage should wake scanner before timer");
+
+        assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_wait_for_next_scanner_cycle_sees_existing_dirty_usage() {
+        crate::scanner_io::clear_dirty_usage_bucket("photos");
+        crate::scanner_io::record_dirty_usage_bucket("photos");
+
+        let ctx = CancellationToken::new();
+        let reason = wait_for_next_scanner_cycle(&ctx, Duration::from_secs(60)).await;
 
         assert_eq!(reason, ScannerCycleWakeReason::DirtyUsage);
         crate::scanner_io::clear_dirty_usage_bucket("photos");

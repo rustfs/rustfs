@@ -25,12 +25,15 @@ mod cluster;
 mod compress;
 mod config;
 mod data_movement;
+mod data_movement_backpressure;
 mod data_usage;
 mod disk;
 mod disks_layout;
 mod endpoints;
+mod erasure_codec;
 mod erasure_coding;
 mod error;
+mod get_diagnostics;
 mod global;
 pub(crate) mod layout;
 mod metrics_realtime;
@@ -58,6 +61,17 @@ mod pools_test;
 #[cfg(test)]
 mod store_test;
 mod tier;
+
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
+use std::sync::Arc;
+
+pub type WorkloadAdmissionSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+
+pub fn set_workload_admission_snapshot_provider(
+    provider: WorkloadAdmissionSnapshotProviderRef,
+) -> std::result::Result<(), WorkloadAdmissionSnapshotProviderRef> {
+    runtime_sources::set_workload_admission_snapshot_provider(provider)
+}
 
 #[cfg(test)]
 mod rio_tests {

@@ -12,10 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::EndpointServerPools;
-use super::super::StorageClassConfig;
-use super::super::TierConfigMgr;
-use super::super::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::context::EndpointServerPools;
+use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::context::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+};
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
     DeploymentIdInterface, EndpointsInterface, ExpiryStateInterface, IamInterface, InternodeMetricsInterface, KmsInterface,
@@ -38,7 +40,11 @@ use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_targets::{EventName, arn::TargetID};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use s3s::dto::SelectObjectContentInput;
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    sync::{Arc, RwLock as StdRwLock},
+    time::SystemTime,
+};
 use tokio::sync::RwLock;
 
 /// Default IAM interface adapter.
@@ -62,22 +68,41 @@ impl IamInterface for IamHandle {
         runtime_sources::ready_iam_handle().is_ok()
     }
 
-    fn oidc(&self) -> Option<Arc<OidcSys>> {
-        runtime_sources::oidc_handle()
-    }
-
     fn token_signing_key(&self) -> Option<String> {
         runtime_sources::token_signing_key()
     }
 }
 
 /// Default OIDC interface adapter.
-#[derive(Default)]
-pub struct OidcHandle;
+pub struct OidcHandle {
+    oidc: StdRwLock<Option<Arc<OidcSys>>>,
+}
+
+impl OidcHandle {
+    pub fn new(oidc: Option<Arc<OidcSys>>) -> Self {
+        Self {
+            oidc: StdRwLock::new(oidc),
+        }
+    }
+}
+
+impl Default for OidcHandle {
+    fn default() -> Self {
+        Self::new(None)
+    }
+}
 
 impl OidcInterface for OidcHandle {
     fn handle(&self) -> Option<Arc<OidcSys>> {
-        runtime_sources::oidc_handle()
+        self.oidc.read().ok().and_then(|oidc| oidc.as_ref().cloned())
+    }
+
+    fn publish_handle(&self, oidc: Arc<OidcSys>) -> bool {
+        let Ok(mut published_oidc) = self.oidc.write() else {
+            return false;
+        };
+        *published_oidc = Some(oidc);
+        true
     }
 }
 
@@ -153,7 +178,7 @@ impl NotifyInterface for NotifyHandle {
 pub struct NotificationSystemHandle;
 
 impl NotificationSystemInterface for NotificationSystemHandle {
-    fn handle(&self) -> Option<&'static super::super::NotificationSys> {
+    fn handle(&self) -> Option<&'static NotificationSys> {
         runtime_sources::notification_system()
     }
 }
@@ -173,7 +198,7 @@ impl BucketMetadataInterface for BucketMetadataHandle {
 pub struct BucketMonitorHandle;
 
 impl BucketMonitorInterface for BucketMonitorHandle {
-    fn handle(&self) -> Option<Arc<super::super::BucketBandwidthMonitor>> {
+    fn handle(&self) -> Option<Arc<BucketBandwidthMonitor>> {
         runtime_sources::bucket_monitor()
     }
 }
@@ -183,7 +208,7 @@ impl BucketMonitorInterface for BucketMonitorHandle {
 pub struct ReplicationPoolHandle;
 
 impl ReplicationPoolInterface for ReplicationPoolHandle {
-    fn handle(&self) -> Option<Arc<super::super::DynReplicationPool>> {
+    fn handle(&self) -> Option<Arc<DynReplicationPool>> {
         runtime_sources::replication_pool()
     }
 }
@@ -193,7 +218,7 @@ impl ReplicationPoolInterface for ReplicationPoolHandle {
 pub struct ReplicationStatsHandle;
 
 impl ReplicationStatsInterface for ReplicationStatsHandle {
-    fn handle(&self) -> Option<Arc<super::super::ReplicationStats>> {
+    fn handle(&self) -> Option<Arc<ReplicationStats>> {
         runtime_sources::replication_stats()
     }
 }
@@ -213,7 +238,7 @@ impl BootTimeInterface for BootTimeHandle {
 pub struct TierStatsHandle;
 
 impl TierStatsInterface for TierStatsHandle {
-    fn daily_all(&self) -> super::super::DailyAllTierStats {
+    fn daily_all(&self) -> DailyAllTierStats {
         runtime_sources::daily_tier_stats()
     }
 }
@@ -224,7 +249,7 @@ pub struct ScannerMetricsHandle;
 
 #[async_trait]
 impl ScannerMetricsInterface for ScannerMetricsHandle {
-    async fn report(&self) -> super::super::ScannerMetricsReport {
+    async fn report(&self) -> ScannerMetricsReport {
         runtime_sources::scanner_metrics_report().await
     }
 }
@@ -360,7 +385,7 @@ impl TierConfigInterface for TierConfigHandle {
 pub struct ExpiryStateHandle;
 
 impl ExpiryStateInterface for ExpiryStateHandle {
-    fn handle(&self) -> Arc<RwLock<super::super::ExpiryState>> {
+    fn handle(&self) -> Arc<RwLock<ExpiryState>> {
         runtime_sources::expiry_state()
     }
 }
@@ -484,7 +509,11 @@ pub fn default_action_credential_interface() -> Arc<dyn ActionCredentialInterfac
 }
 
 pub fn default_oidc_interface() -> Arc<dyn OidcInterface> {
-    Arc::new(OidcHandle)
+    Arc::new(OidcHandle::default())
+}
+
+pub fn oidc_interface(oidc: Option<Arc<OidcSys>>) -> Arc<dyn OidcInterface> {
+    Arc::new(OidcHandle::new(oidc))
 }
 
 pub fn default_region_interface() -> Arc<dyn RegionInterface> {

@@ -17,7 +17,7 @@
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
+use crate::admin::runtime_sources::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};

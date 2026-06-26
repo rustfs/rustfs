@@ -15,11 +15,14 @@
 use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::set_disk::SetDisks;
+use crate::storage_api_contracts::{
+    multipart::{CompletePart, MultipartOperations as _},
+    object::{ObjectIO as _, ObjectOperations as _},
+};
 use crate::store::ECStore;
 use bytes::Bytes;
 use rustfs_filemeta::{FileInfo, FileInfoVersions, ObjectPartInfo};
 use rustfs_rio::{ChecksumType, EtagResolvable, HashReader, HashReaderDetector, Index, TryGetIndex};
-use rustfs_storage_api::{CompletePart, MultipartOperations as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::AMZ_OBJECT_TAGGING;
 use rustfs_utils::path::encode_dir_object;
 use std::collections::{BTreeMap, HashMap};

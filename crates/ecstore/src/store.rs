@@ -46,6 +46,13 @@ use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
 use crate::runtime_sources;
+use crate::storage_api_contracts::{
+    bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
+    object::{DeletedObject, ObjectToDelete},
+    range::HTTPRangeSpec,
+};
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
 use crate::{
@@ -66,14 +73,6 @@ use rustfs_config::server_config::Config;
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::{LocalClient, LockClient, NamespaceLockWrapper};
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
-    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
-};
-use rustfs_storage_api::{
-    HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
-};
 use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
@@ -347,7 +346,7 @@ impl ECStore {
 // }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectIO for ECStore {
+impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -408,7 +407,7 @@ impl BucketOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectOperations for ECStore {
+impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -499,7 +498,7 @@ impl rustfs_storage_api::ObjectOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ListOperations for ECStore {
+impl crate::storage_api_contracts::list::ListOperations for ECStore {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -564,7 +563,7 @@ impl rustfs_storage_api::ListOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::MultipartOperations for ECStore {
+impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -688,7 +687,7 @@ impl rustfs_storage_api::MultipartOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::HealOperations for ECStore {
+impl crate::storage_api_contracts::heal::HealOperations for ECStore {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -725,7 +724,7 @@ impl rustfs_storage_api::HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::NamespaceLocking for ECStore {
+impl crate::storage_api_contracts::namespace::NamespaceLocking for ECStore {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -735,7 +734,7 @@ impl rustfs_storage_api::NamespaceLocking for ECStore {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::StorageAdminApi for ECStore {
+impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
     type BackendInfo = rustfs_madmin::BackendInfo;
     type StorageInfo = rustfs_madmin::StorageInfo;
     type Disk = DiskStore;
@@ -757,7 +756,10 @@ impl rustfs_storage_api::StorageAdminApi for ECStore {
     }
 
     #[instrument(skip(self))]
-    async fn disk_set_inventory(&self, selector: rustfs_storage_api::DiskSetSelector) -> Result<Vec<Option<Self::Disk>>> {
+    async fn disk_set_inventory(
+        &self,
+        selector: crate::storage_api_contracts::admin::DiskSetSelector,
+    ) -> Result<Vec<Option<Self::Disk>>> {
         self.handle_get_disks(selector.pool_idx, selector.set_idx).await
     }
 

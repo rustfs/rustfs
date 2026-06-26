@@ -5,13 +5,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-startup-runtime-sources`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203`.
-- Based on: stacked on PR #3828 head after PR #3827.
+- Branch: `overtrue/arch-admin-contract-domain-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/CTX-002`.
+- Based on: rebased onto current `origin/main` after PR #3911 merged.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none.
-- Rust code changes: route replication pool, outbound TLS generation, runtime
-  region, KMS encryption service, runtime support handles, S3 Select DB,
+- Runtime behavior changes: none expected for API-246; admin code still uses
+  the same storage contracts, now exposed from admin `contract` domain modules
+  instead of its flat root facade; rebase-exposed app usecase compile fixes
+  keep the same stream and data-usage behavior.
+- Rust code changes: segment the admin local `contract` facade into domain
+  modules, migrate admin consumers to domain contract imports, reject flat
+  admin contract consumers in migration guardrails, route
+  replication pool, outbound TLS generation, runtime region, KMS encryption
+  service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
   rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
   consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
@@ -43,8 +49,50 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   source helpers, plus AppContext fallback KMS/IAM/ECStore/config/metrics/TLS
   runtime source helpers, plus startup/root KMS, credentials, region,
   readiness-time, observability, metrics, buffer, and TLS runtime source
-  helpers,
-  through AppContext-first or owner-crate resolver boundaries.
+  helpers, plus server readiness/audit/event/module-switch runtime source
+  helpers, storage request/RPC/SSE runtime source helpers, and admin
+  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports, app-local S3 API response helper imports for bucket/object/multipart usecases, app-local storage helper boundary imports for select/bucket/object/multipart usecases, admin/app test storage helper boundary imports for request context, authorization, object options, and ECFS test harness consumers, app storage IO/compression/set-disk helper boundary imports for object and multipart usecases, app storage error, ETag, and storage-class helper boundary imports for bucket/object/multipart usecases and lifecycle transition tests, app bucket owner facade imports for lifecycle, metadata, object-lock, quota, replication, tagging, target, versioning, and transition test helpers, and app/admin runtime, capacity, data-usage, endpoint, and global facade imports,
+  admin root storage facade consumers for config, bucket metadata, replication,
+  rebalancing, tier, quota, metrics, object zip, site replication, and admin
+  service config paths, through AppContext-first or owner-crate resolver
+  boundaries, plus root/server/startup storage facade consumers for startup
+  storage, bucket metadata, notification, services, readiness, HTTP/layer
+  request context, module switches, event dispatch, cluster/runtime snapshots,
+  capacity, workload admission, table catalog, init, protocol clients, and
+  config tests through a root-local storage_api boundary, plus root/server/startup
+  `rustfs_storage_api` contract imports through the same boundary, app/admin
+  `rustfs_storage_api` contract imports through their local boundaries, app
+  S3 helper forwarding through `app::storage_api`, scanner/heal source and
+  test ECStore plus storage contract imports through crate-local `storage_api`
+  boundaries, and remaining IAM, notify, OBS metrics, Swift, S3 Select, e2e,
+  and fuzz ECStore/storage contract imports through local `storage_api`
+  boundaries, plus storage owner root ECStore facade and storage contract
+  aggregation through `rustfs/src/storage/storage_api.rs`, storage owner
+  submodule storage contract imports through the same owner-local boundary,
+  ECStore internal storage contract imports through the owner-local
+  `storage_api_contracts` boundary, admin system, pool, cluster snapshot,
+  plugin catalog, table catalog, module-switch, and console admin discovery
+  `DefaultAdminUsecase` construction through `admin::runtime_sources`, storage
+  ECFS S3 route app usecase construction through `storage::s3_api`, root
+  storage API consumers through domain modules for startup, server, cluster,
+  table, protocols, capacity, workload, config tests, and error mapping, and
+  admin storage API consumers through admin domain modules for access, bucket,
+  cluster, config, contract, error, metrics, object, rebalance, runtime, and
+  tier boundaries, plus app storage API consumers through app domain modules
+  for admin, bucket, object, multipart, select, context, and test boundaries,
+  plus scanner, heal, IAM, OBS metrics, S3 Select, Swift, e2e, and related test
+  storage API consumers through external crate-local domain modules, plus
+  residual notify crate-boundary consumers, ECStore test/bench storage API
+  domain modules, and local ECStore type aliases for admin config and storage
+  RPC paths, plus external/test local storage API contract imports through
+  local `storage_contracts` aliases and consumer-domain modules instead of
+  root re-exports, plus RustFS storage owner, admin, and app local storage API
+  contract imports through local `storage_contracts` aliases and domain-module
+  exports instead of root re-exports, plus RustFS app/admin storage helper
+  imports through domain-module exports instead of root re-exports, plus
+  ECStore owner-local `storage_api_contracts` consumers import bucket, list,
+  multipart, object, admin, topology, range, namespace, heal, lifecycle, and
+  error contracts through domain modules instead of the flat root facade.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -53,9 +101,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   and storage owner thin bridge regressions, plus app context and notify
   event-bridge thin module regressions, plus IAM runtime-source bypasses;
   accept the reviewed AppContext resolver reverse dependencies in the layer
-  baseline.
-- Docs changes: record the API-136 through API-203 owner facade and lifecycle
-  runtime-source cleanup.
+  baseline, and block direct admin AppContext resolver consumers outside the
+  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, reject app/admin runtime/data-usage root facade regressions, reject admin root storage facade regressions from migrated admin consumers, reject root/server/startup direct storage facade regressions from migrated outer consumers, reject root/server/startup direct storage contract imports from migrated outer consumers, reject app/admin direct storage contract imports from migrated owner consumers, keep app S3 helper imports routed through `app::storage_api`, reject scanner/heal direct ECStore or storage contract imports outside their local `storage_api` boundaries, reject external runtime/test/fuzz ECStore or storage contract imports outside their local `storage_api` boundaries, reject storage owner direct ECStore/storage-api imports outside the owner-local `storage_api` boundary, reject ECStore internal direct storage-api imports outside the owner-local `storage_api_contracts` boundary, reject direct storage ECFS app usecase construction outside the storage S3 API boundary, reject flat root `storage_api` imports outside the new root-local domain modules, reject flat admin `storage_api` imports outside the new admin domain modules, reject flat app `storage_api` imports outside the new app consumer-domain modules, reject flat external crate-local `storage_api` imports outside the new consumer-domain modules, reject residual flat local `storage_api` imports from notify, ECStore tests/benches, and remaining RustFS app storage API type references, reject external/test local storage API root contract re-exports, reject RustFS local storage API root contract re-exports, reject RustFS app/admin storage helper root re-exports, and reject ECStore storage_api_contracts root re-exports or root consumers.
+- Docs changes: record the API-136 through API-242 owner facade,
+  runtime-source, ECFS usecase, root storage API domain-boundary, and admin
+  storage API domain-boundary cleanup, and app storage API consumer-domain
+  cleanup, plus external crate-local and residual local storage API
+  consumer-domain cleanup, external/test storage contract root re-export
+  cleanup, RustFS local storage contract root re-export cleanup, RustFS
+  app/admin storage helper root re-export cleanup, and ECStore
+  storage_api_contracts domain segmentation.
 
 ## Phase 0 Tasks
 
@@ -1444,6 +1499,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     metadata, object store, endpoints, tier config, server config, and buffer
     config.
   - Acceptance: context wins when present and global fallback works when absent.
+  - Cleanup update: retire the admin OIDC resolver's legacy global fallback by
+    publishing the initialized OIDC handle into AppContext and removing the
+    CTX-002 compatibility source/register entries.
   - Verification: focused resolver compatibility test, formatting, compile
     checks, migration guards, diff hygiene, Rust risk scan, and full
     `make pre-commit`.
@@ -4920,14 +4978,800 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     global scan, migration/layer guards, fast PR gate, and full PR gate before
     PR.
 
+- [x] `API-204` Centralize server and storage runtime source readers.
+  - Do: route server audit/event/module-switch/readiness/KMS health reads,
+    startup bucket replication-pool reads, and storage request/RPC/SSE runtime
+    reads through owner runtime-source boundaries.
+  - Acceptance: the migrated server/startup/storage files no longer import
+    AppContext resolvers directly, and migration rules reject reintroducing
+    those direct resolver reads outside the owner runtime-source modules.
+  - Must preserve: audit/notify module switch behavior, public health KMS
+    readiness behavior, dependency readiness cache behavior, bucket metadata
+    replication resync startup, buffer profile lookup, object-store lookup,
+    internode metrics recording, local-node naming, request credential/notify
+    dispatch, performance metrics, encryption service lookup, region lookup,
+    and IAM authorization behavior.
+  - Verification: focused RustFS storage/server compile and tests, formatting,
+    migration/layer guards, diff hygiene, residual direct AppContext scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-205` Centralize admin runtime source readers.
+  - Do: route admin handler, router, auth, console, and service runtime
+    AppContext resolver consumers through the admin runtime-source boundary.
+  - Acceptance: admin consumers no longer import AppContext resolvers directly,
+    and migration rules reject new direct admin AppContext resolver consumers
+    outside `rustfs/src/admin/runtime_sources.rs`.
+  - Must preserve: admin auth/authorization, IAM readiness errors, KMS manager
+    fallback, OIDC console behavior, replication status, site replication peer
+    TLS behavior, dynamic config publication, object-store reads, region
+    rendering, scanner reports, and bucket metadata/admin storage behavior.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-206` Centralize root, app, and storage RPC runtime source readers.
+  - Do: route root auth/init/config/protocol/workload consumers, app usecase
+    consumers, and storage node-service runtime resolver consumers through
+    root, app, or storage runtime-source boundaries.
+  - Acceptance: migrated root/app/storage consumers no longer import AppContext
+    resolvers directly, and migration rules reject reintroducing those direct
+    resolver reads outside the owner runtime-source modules.
+  - Must preserve: request credential lookup, IAM readiness checks, update and
+    notification startup behavior, runtime region and buffer config lookup,
+    workload admission replication status, S3 Select DB lookup, app-context
+    object-store/notification resolution, and node-service IAM/lock behavior.
+  - Verification: focused RustFS compile/tests, formatting, migration and layer
+    guards, diff hygiene, residual direct AppContext scan, Rust risk scan, fast
+    PR gate, and full PR gate before PR.
+
+- [x] `API-207` Close remaining admin grouped AppContext imports.
+  - Do: route grouped admin handler AppContext resolver imports through the
+    admin runtime-source boundary and extend migration rules to catch grouped
+    `app::context` imports.
+  - Acceptance: admin handlers no longer import AppContext resolvers directly,
+    including grouped `crate::{ app::context::... }` imports, and migration
+    rules reject reintroducing them.
+  - Must preserve: admin credential checks, STS OIDC/token-signing lookups,
+    pool/rebalance notification and object-store behavior, tier stats/config
+    behavior, and bucket metadata object-store access.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct AppContext scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-208` Remove app usecase storage wildcard imports.
+  - Do: replace broad `crate::storage::*` imports in bucket, object, and
+    multipart app usecases with explicit storage owner imports.
+  - Acceptance: app usecases no longer import storage owner APIs through a
+    wildcard, and migration rules reject reintroducing storage wildcard imports
+    in app usecase files.
+  - Must preserve: bucket listing and notification behavior, object
+    precondition/SSE/object-lock/CORS behavior, multipart SSE and object-lock
+    behavior, and existing storage owner call sites.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual wildcard scan, Rust risk scan, fast PR
+    gate, and full PR gate before PR.
+
+- [x] `API-209` Remove app DTO and ECFS wildcard imports.
+  - Do: replace broad `s3s::dto::*` imports in app select, bucket, object, and
+    multipart usecases, replace the object usecase ECFS wildcard with the
+    explicit owner type, and narrow the matching layer baseline entry.
+  - Acceptance: app consumers no longer import S3 DTOs or ECFS owner APIs
+    through wildcards, and migration rules reject reintroducing those wildcard
+    imports in app-layer files.
+  - Must preserve: select-object request validation and event streaming, bucket
+    DTO mapping/list output behavior, object CRUD/copy/delete/restore DTO
+    mapping, multipart upload/copy checksum behavior, and existing ECFS FS test
+    harness usage.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual wildcard scan, Rust risk scan, fast PR
+    gate, and full PR gate before PR.
+
+- [x] `API-210` Route app S3 API helper imports through app boundary.
+  - Do: add an app-local S3 API helper boundary and route bucket, object, and
+    multipart usecases through it instead of direct `crate::storage::s3_api`
+    imports.
+  - Acceptance: app usecase files no longer import storage S3 API helpers
+    directly, layer baseline records the reviewed app boundary, and migration
+    rules reject direct usecase bypasses.
+  - Must preserve: bucket list response mapping, multipart list/part-number
+    parsing, object list-parts parameter parsing, owner/initiator response
+    metadata, and existing storage S3 API helper behavior.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct S3 API scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-211` Route app storage helper imports through app boundary.
+  - Do: add an app-local storage helper boundary and route select, bucket,
+    object, and multipart usecases through it instead of direct storage helper
+    imports for access, helper, options, SSE, request-context, concurrency,
+    prefix, timeout, and storage object helper types.
+  - Acceptance: app select/usecase files no longer import the migrated storage
+    helper APIs directly, layer baseline records the reviewed app boundary, and
+    migration rules reject direct storage helper bypasses.
+  - Must preserve: select-object preflight and traced execution, bucket request
+    authorization/background metadata updates, multipart SSE/options parsing,
+    object SSE/concurrency/prefix/timeout behavior, and existing storage helper
+    implementations.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual direct storage helper scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-212` Route app/admin storage helper imports through local boundaries.
+  - Do: add an admin-local storage helper boundary, route admin router,
+    console, heal, metrics, and object-zip handlers through it, and route app
+    integration tests through the existing app storage boundary.
+  - Acceptance: the completed app/admin consumers no longer import migrated
+    storage helper APIs directly, and migration rules reject direct bypasses.
+  - Must preserve: admin authorization and request tracing, console request
+    context propagation, admin object zip storage options, and app lifecycle and
+    capacity dirty-scope test harness behavior.
+  - Verification: focused RustFS admin/app compile/tests, formatting, migration
+    and layer guards, diff hygiene, residual direct storage helper scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-213` Route app storage IO helper imports through app boundary.
+  - Do: extend the app-local storage helper boundary for compression, reader,
+    write-plan, and set-disk helpers, then route object and multipart usecases
+    through it instead of app-level compatibility aliases.
+  - Acceptance: app object and multipart usecases no longer consume the
+    migrated storage IO/compression/set-disk helpers through `super::` aliases,
+    the app root no longer re-exports those helpers, and migration rules reject
+    reintroducing the completed bypasses.
+  - Must preserve: object compression metadata, hash-reader checksum handling,
+    multipart SSE-C/SSE-S3 write-encryption planning, valid-storage-class
+    checks, lock-acquire timeout reads, and test-only reader wrappers.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated helper scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-214` Route app storage error helpers through app boundary.
+  - Do: extend the app-local storage helper boundary for storage errors, error
+    classification helpers, ETag conversion, and storage-class constants, then
+    route bucket, object, multipart, and lifecycle transition test consumers
+    through it instead of app root compatibility aliases.
+  - Acceptance: completed app consumers no longer import the migrated storage
+    error, ETag, or storage-class helpers from the app root, the app root no
+    longer exposes those helper aliases, and migration rules reject
+    reintroducing the bypasses.
+  - Must preserve: bucket config-not-found handling, multipart upload-not-found
+    and version-not-found classification, object delete/copy error mapping,
+    list response ETag conversion, storage-class response projection, and
+    lifecycle transition test ETag formatting.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated helper scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-215` Route app bucket owner facades through storage_api boundary.
+  - Do: move app-facing lifecycle, metadata, object-lock, quota, replication,
+    tagging, target, versioning, and transition test helper facades behind
+    `storage_api::bucket`, then route bucket, object, multipart, context, and
+    app integration-test consumers through that boundary.
+  - Acceptance: app root no longer exposes the migrated bucket owner facade
+    modules or object-info/object-options compatibility aliases, and migration
+    rules reject consumers that reintroduce root-level bypasses.
+  - Must preserve: bucket metadata CRUD, lifecycle transition enqueueing and
+    restore validation, object-lock deletion checks, quota checks, replication
+    scheduling/decision helpers, XML serialization, target validation, and
+    bucket metadata runtime-source lookup.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated helper scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-216` Route app runtime/global facades through storage_api boundary.
+  - Do: move app/admin-facing admin info, capacity, data-usage, endpoint,
+    runtime global, storage-class, scanner metric, tier, replication, and
+    notification facades behind local `storage_api` modules, then route app
+    usecases, context modules, tests, admin quota, admin config service, and
+    storage node-service consumers through those boundaries.
+  - Acceptance: app root no longer exposes the migrated runtime/global facade
+    aliases or wrappers, admin root no longer exposes the migrated data-usage
+    wrapper, and migration rules reject root-level regressions for the
+    completed app/admin runtime/data-usage paths.
+  - Must preserve: admin server info and capacity math, data-usage memory
+    overlay and bucket accounting, object-store resolver publication,
+    AppContext fallback runtime sources, lifecycle test disk initialization,
+    tier warm-backend test contracts, scanner metrics report collection, and
+    admin quota current-usage reads.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated facade scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-217` Route admin storage facades through storage_api boundary.
+  - Do: move admin-facing ECStore bucket/config/rebalance/tier/metrics/error
+    facades from the admin root module into `admin::storage_api`, then route
+    admin handlers, router, and config/site-replication services through that
+    boundary.
+  - Acceptance: admin root no longer exposes the migrated storage facade
+    modules, aliases, constants, or wrappers, and migration rules reject
+    root-level regressions for completed admin storage facade consumers.
+  - Must preserve: admin config IO/default initialization, bucket metadata and
+    target management, replication/resync DTO handling, rebalance status
+    projection, quota usage reads, tier admin contracts, metrics collection,
+    object-zip error mapping, and site-replication metadata serialization.
+  - Verification: focused RustFS admin compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated facade scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-218` Route root/server/startup storage facades through storage_api boundary.
+  - Do: add a root-local `storage_api` boundary for storage owner symbols used
+    by startup, server, capacity, cluster/runtime snapshot, table catalog,
+    protocol client, init, workload admission, and config-test consumers, then
+    route those outer runtime modules through it.
+  - Acceptance: root/server/startup consumers no longer import storage owner
+    facades directly, and migration rules reject direct `crate::storage`
+    regressions outside storage/app/admin owner boundaries.
+  - Must preserve: startup storage initialization, bucket metadata migration,
+    notification initialization, readiness gating, RPC request context,
+    module switch persistence, event dispatch, cluster/runtime snapshots,
+    capacity disk refresh, workload admission snapshots, table catalog object
+    contracts, and config test layout coverage.
+  - Verification: focused RustFS compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated facade scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-219` Route root/server/startup storage contracts through storage_api boundary.
+  - Do: re-export the remaining root/server/startup `rustfs_storage_api`
+    DTOs and traits from the root-local `storage_api` boundary, then route
+    cluster/runtime snapshots, bucket metadata startup, table catalog,
+    readiness, error mapping, and event tests through that boundary.
+  - Acceptance: migrated outer runtime consumers no longer import
+    `rustfs_storage_api` directly, and migration rules reject direct contract
+    import regressions outside storage/app/admin owner boundaries.
+  - Must preserve: cluster and runtime topology snapshots, bucket metadata
+    list contracts, HTTP range error mapping, table catalog object/list/lock
+    contracts, readiness storage inventory checks, and event transition test
+    DTO shape.
+  - Verification: focused RustFS compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated contract scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-220` Route app/admin storage contracts through local storage_api boundaries.
+  - Do: re-export app and admin `rustfs_storage_api` DTOs and traits from
+    their local `storage_api` boundaries, then route app usecases/tests and
+    admin handlers/router/services through those boundaries.
+  - Acceptance: migrated app/admin consumers no longer import
+    `rustfs_storage_api` directly, and migration rules reject direct contract
+    import regressions outside their owner boundaries.
+  - Must preserve: app bucket/object/multipart/select contract types, app
+    capacity and transition test contracts, admin storage/admin/list/object
+    traits, cluster snapshot DTOs, heal/config/bucket metadata, replication,
+    rebalance, site replication, extension, object zip, and system admin
+    contract behavior.
+  - Verification: focused RustFS compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual migrated contract scan, Rust risk
+    scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-221` Fold app S3 helper forwarding into app storage_api boundary.
+  - Do: move the app-local S3 response/parameter helper forwarding surface
+    into `app::storage_api`, remove the standalone app `s3_api` forwarding
+    module, and route bucket/object/multipart usecases through the storage
+    boundary.
+  - Acceptance: app usecases consume S3 helper forwarding through
+    `app::storage_api`, and migration rules reject direct storage S3 helper
+    and legacy app `s3_api` bypasses.
+  - Must preserve: list-buckets, list-objects, list-object-versions, multipart
+    upload/list-parts response builders, query parsers, upload part-number
+    parsing, and RustFS owner metadata helper behavior.
+  - Verification: focused RustFS app compile/tests, formatting, migration and
+    layer guards, diff hygiene, residual app S3 helper scan, Rust risk scan,
+    fast PR gate, and full PR gate before PR.
+
+- [x] `API-222` Route scanner and heal storage imports through local storage_api boundaries.
+  - Do: move scanner and heal source/test ECStore and `rustfs_storage_api`
+    imports into crate-local `storage_api` boundary modules, then route
+    scanner runtime, scanner lifecycle integration tests, heal runtime, and
+    heal integration tests through those local boundaries.
+  - Acceptance: migrated scanner/heal consumers no longer import ECStore or
+    storage contract symbols directly, and migration rules reject direct
+    scanner/heal bypasses outside the reviewed boundary modules.
+  - Must preserve: scanner lifecycle, tier transition, replication heal queue,
+    bucket scanner IO, heal local disk/indexing, bucket/object heal storage,
+    endpoint setup, and heal transient-object test behavior.
+  - Verification: focused scanner/heal compile coverage, formatting,
+    migration and layer guards, diff hygiene, residual scanner/heal boundary
+    scan, Rust risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-223` Route remaining external storage imports through local storage_api boundaries.
+  - Do: move IAM, notify, OBS metrics, Swift, S3 Select, e2e, and fuzz ECStore
+    plus `rustfs_storage_api` imports into local boundary modules, then route
+    callers through those boundaries.
+  - Acceptance: migrated external runtime/test/fuzz consumers no longer import
+    ECStore or storage contract symbols directly, and migration rules reject
+    direct bypasses outside the reviewed boundary modules.
+  - Must preserve: IAM config/error/notification behavior, notify config
+    persistence, OBS capacity/data-usage metrics, Swift bucket/object/range
+    operations, S3 Select object reads, e2e RPC/disk/bucket-target helpers, and
+    fuzz validation semantics.
+  - Verification: focused external crate and fuzz compile coverage, formatting,
+    migration and layer guards, diff hygiene, residual external boundary scan,
+    Rust risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-224` Move storage owner root storage aggregation into storage_api boundary.
+  - Do: move the storage owner root ECStore facade modules, storage contract
+    aliases, and wrapper functions from `rustfs/src/storage/mod.rs` into
+    `rustfs/src/storage/storage_api.rs`, then re-export the same owner symbols
+    from the storage module root.
+  - Acceptance: `rustfs/src/storage/mod.rs` no longer imports ECStore or
+    `rustfs_storage_api` directly, and migration rules reject direct storage
+    source bypasses outside the reviewed owner-local boundary.
+  - Must preserve: storage owner public crate-local symbol paths, startup
+    storage initialization, disk RPC helper traits, bucket metadata helpers,
+    replication/tier/global accessors, object IO aliases, and root/app/admin
+    callers.
+  - Verification: focused RustFS test compile coverage, formatting, migration
+    and layer guards, diff hygiene, residual storage owner boundary scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-225` Route storage owner contract imports through storage_api boundary.
+  - Do: expose the remaining storage contract traits and DTOs from
+    `rustfs/src/storage/storage_api.rs`, then route storage owner submodules
+    through the owner-local boundary instead of direct `rustfs_storage_api`
+    imports.
+  - Acceptance: `rustfs/src/storage` submodules no longer import
+    `rustfs_storage_api` directly, and migration rules reject storage owner
+    direct ECStore/storage-api bypasses outside the reviewed owner-local
+    boundary.
+  - Must preserve: S3 object handlers, bucket/object-lock option parsing,
+    access-policy condition checks, prefix probing, node RPC bucket/admin
+    operations, and bucket/multipart response helper tests.
+  - Verification: focused RustFS test compile coverage, formatting, migration
+    and layer guards, diff hygiene, residual storage owner import scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-226` Route ECStore storage contracts through storage_api_contracts boundary.
+  - Do: expose ECStore-used storage contract DTOs and traits from
+    `crates/ecstore/src/storage_api_contracts.rs`, then route ECStore internal
+    modules through that owner-local boundary instead of direct
+    `rustfs_storage_api` imports.
+  - Acceptance: ECStore internal modules no longer import
+    `rustfs_storage_api` directly, and migration rules reject direct ECStore
+    storage-api bypasses outside the reviewed owner-local boundary.
+  - Must preserve: ECStore object/list/multipart/heal/admin trait impls,
+    set-disk and sets storage behavior, lifecycle/tier/replication DTO usage,
+    config storage locking, peer S3 client bucket operations, range helpers,
+    and error-code mapping.
+  - Verification: focused ECStore compile coverage, formatting, migration and
+    layer guards, diff hygiene, residual ECStore storage contract scan, Rust
+    risk scan, fast PR gate, and full PR gate before PR.
+
+- [x] `API-227` Normalize local storage-api boundary contract aliases.
+  - Do: replace raw fully qualified `rustfs_storage_api::...` paths inside
+    completed RustFS/app/admin/storage and external crate `storage_api`
+    boundaries with imported local aliases, and guard against regressions.
+  - Acceptance: completed local storage-api boundary files no longer keep raw
+    fully qualified storage contract paths internally; direct imports remain
+    only at the boundary edge.
+  - Must preserve: RustFS storage owner peer S3 bucket operations, topology
+    snapshots, app lifecycle/replication helper signatures, IAM config object
+    contract aliases, Swift object aliases, and S3 Select object aliases.
+  - Verification: RustFS test compile coverage, explicit IAM/S3 Select/Swift
+    compile coverage, formatting, migration and layer guards, diff hygiene,
+    residual raw-path scan, Rust risk scan, and full PR gate before PR.
+
+- [x] `API-228` Route ECStore integration test API imports through a test boundary.
+  - Do: add `crates/ecstore/tests/storage_api.rs` as the integration-test
+    boundary for ECStore and storage-api symbols, then route ECStore contract,
+    MinIO fixture, and legacy bitrot tests through it.
+  - Acceptance: ECStore integration tests no longer import
+    `rustfs_ecstore::api` or `rustfs_storage_api` directly outside the
+    reviewed test boundary, and migration rules reject new bypasses.
+  - Must preserve: ECStore storage-api compatibility proofs, MinIO-generated
+    rio-v2 fixture reads, legacy bitrot reads, endpoint/disk creation, object
+    reader aliases, and storage contract trait bounds.
+  - Verification: focused ECStore integration tests, formatting, migration and
+    layer guards, diff hygiene, residual ECStore test API scan, Rust risk scan,
+    and full PR gate before PR.
+
+- [x] `API-229` Route ECStore bench API imports through a bench boundary.
+  - Do: add `crates/ecstore/benches/storage_api/mod.rs` as the benchmark boundary
+    for ECStore erasure symbols, then route all ECStore benchmark facade
+    imports through it.
+  - Acceptance: ECStore benchmark crates no longer import
+    `rustfs_ecstore::api` directly outside the reviewed bench boundary, and
+    migration rules reject new bypasses.
+  - Must preserve: erasure SIMD, comparison, streaming decode, and single-block
+    non-inline benchmark behavior and direct erasure symbol usage.
+  - Verification: focused ECStore bench compile coverage, formatting,
+    migration and layer guards, diff hygiene, residual ECStore bench API scan,
+    Rust risk scan, and full PR gate before PR.
+
+- [x] `API-230` Route admin usecase construction through runtime boundary.
+  - Do: expose admin usecase construction and required admin DTO types from
+    `rustfs/src/admin/runtime_sources.rs`, then route system, pool, cluster
+    snapshot, plugin catalog, table catalog, module-switch, and console admin
+    discovery paths through that boundary.
+  - Acceptance: migrated admin handler sources no longer import
+    `crate::app::admin_usecase` directly, and the server-info route guard
+    requires the admin runtime-source constructor.
+  - Must preserve: admin authentication and authorization checks, admin
+    discovery route values, storage/data-usage/pool/decommission responses,
+    cluster snapshot collection, plugin catalog payloads, table catalog config
+    payloads, module switch responses, and console config discovery.
+  - Verification: focused admin tests, formatting, migration and layer guards,
+    diff hygiene, residual admin usecase import scan, Rust risk scan, and full
+    PR gate passed before PR.
+
+- [x] `API-231` Route admin object-usecase and AppContext globals through runtime boundary.
+  - Do: expose admin object-usecase construction and current AppContext lookup
+    from `rustfs/src/admin/runtime_sources.rs`, then route misc extension object
+    lambda and admin service reload paths through those boundary helpers.
+  - Acceptance: admin production sources no longer import
+    `crate::app::object_usecase` or `get_global_app_context` directly outside
+    `rustfs/src/admin/runtime_sources.rs`.
+  - Must preserve: object-lambda request execution, listen-notification bucket
+    validation, dynamic config reloads, runtime config snapshot publication, and
+    site-replication state reload/normalization behavior.
+  - Verification: focused admin router/service checks, formatting, migration
+    and layer guards, diff hygiene, residual admin global-entry scan, Rust risk
+    scan, and full PR gate before PR.
+
+- [x] `API-232` Route app usecase AppContext lookup through runtime boundary.
+  - Do: expose current AppContext lookup from `rustfs/src/app/runtime_sources.rs`,
+    then route bucket, multipart, admin, and object usecase constructors and
+    object buffer config fallback through that boundary.
+  - Acceptance: app usecase files no longer import `get_global_app_context`
+    directly; direct global AppContext lookup remains confined to context
+    internals and `rustfs/src/app/runtime_sources.rs`.
+  - Must preserve: bucket, multipart, admin, and object usecase construction,
+    object buffer config fallback, and explicit test constructors without
+    context.
+  - Verification: focused app/admin tests, formatting, migration and layer
+    guards, diff hygiene, residual app global-entry scan, Rust risk scan, and
+    full PR gate before PR.
+
+- [x] `API-233` Route storage ECFS app usecase construction through S3 API boundary.
+  - Do: expose bucket, multipart, and object usecase constructors from
+    `rustfs/src/storage/s3_api/mod.rs`, then route ECFS S3 bucket,
+    multipart, and object routes through those boundary helpers.
+  - Acceptance: `rustfs/src/storage/ecfs.rs` no longer imports app usecase
+    modules directly or calls `Default*Usecase::from_global()` directly, and
+    migration rules reject new direct construction.
+  - Must preserve: all ECFS S3 route request forwarding, metrics recording,
+    boxing behavior for recursive async route handlers, and AppContext-backed
+    usecase construction.
+  - Verification: focused storage ECFS checks, formatting, migration and layer
+    guards, diff hygiene, residual ECFS usecase-construction scan, Rust risk
+    scan, and full PR gate before PR.
+
+- [x] `API-234` Wrap runtime AppContext entrypoints behind owner sources.
+  - Do: replace storage RPC use of the re-exported global AppContext getter
+    with an owner-local `current_app_context()` helper, and route startup
+    replication-pool/TLS-generation reads through the root runtime-source
+    entrypoints.
+  - Acceptance: storage consumers no longer call or re-export
+    `get_global_app_context`, startup runtime sources no longer directly
+    reference `crate::app::context`, and migration rules reject both bypasses.
+  - Must preserve: node RPC server context fallback, object-store resolution,
+    startup bucket replication resync, TLS generation increments, outbound TLS
+    publication, and runtime-source visibility.
+  - Verification: focused storage RPC/startup TLS checks, formatting,
+    migration and layer guards, diff hygiene, residual AppContext entrypoint
+    scans, Rust risk scan, and full PR gate before PR.
+
+- [x] `API-235` Route server runtime-source reads through root entrypoints.
+  - Do: expose the server-needed AppContext resolver entrypoints from
+    `rustfs/src/runtime_sources.rs`, then route server runtime-source helpers
+    through those entrypoints instead of directly importing app context.
+  - Acceptance: `rustfs/src/server/runtime_sources.rs` no longer imports
+    `crate::app::context`, server consumers continue using the server-local
+    runtime-source helpers, and migration rules reject direct server
+    runtime-source AppContext imports.
+  - Must preserve: audit/event server config reads, module-switch object-store
+    lookup, readiness IAM/object-store/endpoints/lock-client checks, KMS
+    runtime lookup, and notify interface dispatch.
+  - Verification: focused server checks, formatting, migration and layer
+    guards, diff hygiene, residual server AppContext entrypoint scan, Rust risk
+    scan, and full PR gate before PR.
+
+- [x] `API-236` Route owner runtime-source AppContext reads through root entrypoints.
+  - Do: expose the remaining admin/app/storage AppContext resolver entrypoints
+    from `rustfs/src/runtime_sources.rs`, then route owner runtime-source
+    helpers through that root boundary instead of direct app-context imports.
+  - Acceptance: `rustfs/src/admin/runtime_sources.rs`,
+    `rustfs/src/app/runtime_sources.rs`, and
+    `rustfs/src/storage/runtime_sources.rs` no longer import
+    `crate::app::context`, and migration rules reject new owner runtime-source
+    AppContext bypasses.
+  - Must preserve: admin/object usecase construction, app usecase explicit
+    context fallback, storage RPC/storage helper runtime reads, IAM/KMS/TLS
+    resolver semantics, notification dispatch, and test-only TLS generation
+    hooks.
+  - Verification: focused admin/app/storage checks, formatting, migration and
+    layer guards, diff hygiene, residual owner runtime-source AppContext scan,
+    Rust risk scan, and full PR gate before PR.
+
+- [x] `API-237` Segment root storage API boundary by outer runtime domain.
+  - Do: replace the flat root-local `storage_api` re-export surface with
+    domain modules for startup, server, cluster, table, protocols, capacity,
+    workload, config tests, and error mapping, then migrate root/server/startup
+    consumers to those modules.
+  - Acceptance: root consumers no longer import flat `crate::storage_api`
+    symbols or legacy nested helper modules directly, storage contracts are
+    still imported once through the root boundary, and migration rules reject
+    flat root `storage_api` bypasses.
+  - Must preserve: startup storage/bootstrap behavior, notification config
+    wiring, HTTP/gRPC request context handling, readiness checks, cluster and
+    topology snapshots, table catalog object I/O contracts, workload admission,
+    capacity reporting, protocol request setup, config tests, and error mapping.
+  - Verification: focused RustFS compile, formatting, migration and layer
+    guards, diff hygiene, residual flat root storage-api scan, Rust risk scan,
+    and full PR gate passed before PR.
+
+- [x] `API-238` Segment admin storage API boundary by admin consumer domain.
+  - Do: add admin-local domain modules for access, bucket, cluster, config,
+    contract, error, metrics, object, rebalance, runtime, and tier symbols,
+    then migrate admin handlers, services, router, and console consumers away
+    from flat `admin::storage_api` imports.
+  - Acceptance: admin consumers no longer import flat storage facade symbols,
+    storage contracts, config helpers, bucket helper modules, runtime handles,
+    rebalance types, tier errors, or request helpers directly from the admin
+    storage API root; migration rules reject the old flat paths.
+  - Must preserve: admin route contracts, authorization flow, config
+    persistence, bucket metadata operations, site replication serialization,
+    remote-target validation, quota/heal/object-zip behavior, metrics
+    collection, rebalance response mapping, tier error behavior, and admin test
+    fixtures.
+  - Verification: focused RustFS compile, formatting, migration and layer
+    guards, diff hygiene, residual flat admin storage-api scan, Rust risk scan,
+    and full PR gate passed before PR.
+
+- [x] `API-239` Segment app storage API boundary by app consumer domain.
+  - Do: add app-local consumer-domain modules for admin, bucket, object,
+    multipart, select, context, and test storage API consumers, then migrate app
+    usecases, context modules, and app tests away from flat `app::storage_api`
+    imports.
+  - Acceptance: app consumers no longer import flat storage facade symbols,
+    storage contracts, runtime handles, request helpers, S3 helpers, bucket
+    helpers, IO helpers, SSE helpers, or test harness symbols directly from the
+    app storage API root; migration rules reject the old flat paths.
+  - Must preserve: app admin info/capacity behavior, bucket/object/multipart S3
+    contracts, select object reads, AppContext runtime handles, test disk
+    setup, lifecycle transition test helpers, and capacity dirty-scope fixtures.
+  - Verification: focused RustFS compile, formatting, migration and layer
+    guards, diff hygiene, residual flat app storage-api scan, Rust risk scan,
+    and full PR gate passed before PR.
+
+- [x] `API-240` Segment external storage API boundaries by consumer domain.
+  - Do: add scanner, heal, IAM, OBS metrics, S3 Select, Swift, e2e, and related
+    test consumer-domain modules, then migrate those consumers away from flat
+    local `storage_api` imports.
+  - Acceptance: external crate-local consumers no longer import flat storage
+    facade symbols, storage contracts, ECStore helpers, runtime handles, or test
+    fixtures directly from local storage API roots; migration rules reject the
+    old flat paths.
+  - Must preserve: scanner data usage and lifecycle scan behavior, heal storage
+    and status fixtures, IAM object-store/runtime notification semantics, OBS
+    metrics collection, S3 Select object reads, Swift account/container/object
+    large-object/versioning behavior, and e2e RPC helper semantics.
+  - Verification: focused external crate compile, formatting, migration and
+    layer guards, diff hygiene, residual flat external storage-api scan, Rust
+    risk scan, and full PR gate passed before PR.
+
+- [x] `API-241` Segment residual storage API boundaries by consumer domain.
+  - Do: add residual notify crate-boundary, ECStore test/bench consumer-domain
+    modules, and local ECStore aliases for the remaining RustFS app storage API
+    type references.
+  - Acceptance: notify, ECStore tests/benches, admin config, and storage RPC no
+    longer import flat local storage API symbols for migrated residual
+    consumers; migration rules reject the old flat paths.
+  - Must preserve: notify config persistence, ECStore compatibility tests,
+    bitrot read tests, generated MinIO read fixtures, benchmark setup, admin
+    runtime config store resolution, and storage RPC object-store fallback.
+  - Verification: focused notify/ECStore/RustFS compile, formatting, migration
+    and layer guards, diff hygiene, residual flat local storage-api scan, Rust
+    risk scan, and full PR gate before PR.
+
+- [x] `API-242` Segment external storage API contract imports by domain module.
+  - Do: replace external/test local storage API root contract re-exports with
+    local `storage_contracts` aliases and consumer-domain module exports.
+  - Acceptance: ECStore tests, heal source/tests, IAM, OBS metrics, Swift, S3
+    Select, and scanner source/tests no longer expose storage-api contracts from
+    their local `storage_api` roots; migration rules reject root re-export
+    regressions.
+  - Must preserve: ECStore compatibility/read fixtures, heal storage/status
+    behavior, IAM object-store operations, OBS metrics collection, Swift object
+    and bucket behavior, S3 Select object reads, scanner lifecycle/tier
+    behavior, and test harness setup.
+  - Verification: focused external/test crate compile, formatting, migration
+    and layer guards, diff hygiene, external root storage-api re-export scan,
+    Rust risk scan, and full PR gate before PR.
+
+- [x] `API-243` Segment RustFS storage API root exports by domain module.
+  - Do: replace RustFS storage owner, admin, and app local storage API root
+    contract re-exports with local `storage_contracts` aliases and domain-module
+    exports, and move app/admin storage helper root re-exports into their
+    consumer-domain modules.
+  - Acceptance: RustFS storage owner, admin, app, and root storage API
+    boundaries no longer expose storage-api contracts from their roots, and
+    app/admin boundaries no longer expose storage helpers from their roots;
+    migration rules reject both root re-export regressions.
+  - Must preserve: storage ECFS, RPC, S3 output mapping, admin handlers, app
+    usecases, AppContext/test fixtures, and storage contract call paths.
+  - Verification: focused RustFS compile, formatting, migration and layer
+    guards, diff hygiene, RustFS root storage-api/helper re-export scans, Rust
+    risk scan, and full PR gate before PR.
+
+- [x] `API-244` Segment ECStore storage_api_contracts by domain module.
+  - Do: split the ECStore owner-local `storage_api_contracts` facade into
+    bucket, list, multipart, object, admin, topology, range, namespace, heal,
+    lifecycle, and error modules, then migrate ECStore internal consumers to
+    those modules.
+  - Acceptance: ECStore no longer exposes `rustfs_storage_api` contracts from
+    the `storage_api_contracts` root, ECStore internal consumers no longer
+    import contract symbols from the flat root facade, and migration rules
+    reject both regressions.
+  - Must preserve: object/list/multipart/heal/admin trait impls, set-disk/sets
+    behavior, lifecycle/tier/replication DTOs, config storage, peer S3 client,
+    range helpers, topology snapshots, and error mappings.
+  - Verification: focused ECStore compile, formatting, migration and layer
+    guards, ECStore root contract re-export/root consumer scans, diff hygiene,
+    Rust risk scan, and full PR gate passed before PR.
+
+- [x] `API-245` Segment storage-owner contract facade by domain module.
+  - Do: split the storage-owner local `contract` facade into admin, bucket,
+    list, multipart, object, range, and topology modules, then migrate storage
+    owner consumers to those modules.
+  - Acceptance: `rustfs/src/storage/storage_api.rs` no longer uses raw
+    storage contract paths internally, storage owner consumers no longer import
+    contract symbols from the flat `contract` root, and migration rules reject
+    both regressions.
+  - Must preserve: ECFS bucket/object calls, storage RPC bucket/admin calls,
+    S3 list/multipart DTO projections, request option parsing, access checks,
+    and topology snapshot construction.
+  - Verification: focused RustFS compile, formatting, migration/layer guards,
+    storage-owner raw contract/root consumer scans, diff hygiene, and Rust risk
+    scan passed; full PR gate passed before PR.
+
+- [x] `API-246` Segment admin contract facade by domain module.
+  - Do: split the admin local `contract` facade into admin, bucket, heal, list,
+    and object modules, then migrate admin consumers to those modules.
+  - Acceptance: admin handlers, router, and service code no longer import
+    storage contract symbols from the flat `contract` root, and migration rules
+    reject regressions.
+  - Must preserve: bucket metadata, replication, site replication, rebalance,
+    account info, config admin, heal, object zip download, router, and admin
+    service config call paths.
+  - Verification: focused RustFS compile, formatting, migration/layer guards,
+    admin contract root consumer scan, diff hygiene, and Rust risk scan passed;
+    full PR gate passed before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue reducing direct global reads behind AppContext resolver boundaries.
+1. `consumer-migration`: continue larger owner boundary batches after API-246.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-246 segments the admin local contract facade into domain modules instead of flat root contract exposure. |
+| Migration preservation | pass | Bucket metadata, replication, site replication, rebalance, account info, config admin, heal, object zip download, router, and admin service config paths keep the same underlying contracts. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, admin contract root consumer scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-245 segments the storage-owner local contract facade into domain modules instead of flat root contract exposure. |
+| Migration preservation | pass | ECFS bucket/object calls, storage RPC bucket/admin calls, S3 list/multipart DTO projections, request option parsing, access checks, and topology snapshot construction keep the same underlying contracts. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, storage-owner raw contract/root consumer scans, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
+| Quality/architecture | pass | API-244 segments ECStore storage_api_contracts into domain modules instead of a flat root facade. |
+| Migration preservation | pass | ECStore object/list/multipart/heal/admin trait impls, lifecycle/tier/replication DTOs, config storage, peer S3 client, range helpers, topology snapshots, and error mappings keep the same contracts. |
+| Testing/verification | pass | Focused ECStore compile, formatting, migration/layer guards, ECStore root contract re-export/root consumer scans, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-243 removes RustFS local storage API root contract/helper re-exports and keeps exposure inside domain modules. |
+| Migration preservation | pass | Storage ECFS/RPC/S3 helpers, admin handlers, app usecases, AppContext fixtures, and test harness consumers keep the same underlying storage contracts and helpers. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, root storage-api/helper re-export scans, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-242 removes external/test local storage API root contract re-exports and keeps contract exposure inside consumer-domain modules. |
+| Migration preservation | pass | ECStore tests, heal, IAM, OBS metrics, Swift, S3 Select, and scanner consumers keep the same storage-api contracts and call paths. |
+| Testing/verification | pass | Focused external/test compile, formatting, migration/layer guards, external root storage-api re-export scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-241 segments residual local storage API imports into notify, ECStore test/bench, and RustFS local type boundaries. |
+| Migration preservation | pass | Notify config, ECStore contract/bitrot/read fixtures, benchmark setup, admin config, and storage RPC consumers keep the same owner symbols and call paths. |
+| Testing/verification | pass | Focused compile, formatting, migration/layer guards, residual flat local storage-api scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-240 segments external crate-local storage API boundaries into consumer domain modules instead of flat re-export surfaces. |
+| Migration preservation | pass | Scanner, heal, IAM, OBS metrics, S3 Select, Swift, e2e, and related test consumers keep the same owner symbols and call paths. |
+| Testing/verification | pass | Focused external crate compile, formatting, migration/layer guards, residual flat external storage-api scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-239 segments the app-local storage API boundary into app consumer domain modules instead of a flat re-export surface. |
+| Migration preservation | pass | App admin, bucket, object, multipart, select, context, lifecycle-transition, and capacity dirty-scope consumers keep the same owner symbols and call paths. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration/layer guards, residual flat app storage-api scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-238 segments the admin-local storage API boundary into admin consumer domain modules instead of a flat re-export surface. |
+| Migration preservation | pass | Admin handlers, services, router, console paths, config persistence, bucket metadata, replication, quota, heal, metrics, rebalance, tier, and object zip consumers keep the same owner symbols and call paths. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration/layer guards, residual flat admin storage-api scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-237 segments the root-local storage API boundary into domain modules instead of a flat re-export surface. |
+| Migration preservation | pass | Startup, server, cluster, table catalog, protocol, capacity, workload, config-test, and error-mapping consumers keep the same owner symbols and call paths. |
+| Testing/verification | pass | RustFS focused compile, formatting, migration/layer guards, residual flat root storage-api scan, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-236 makes admin, app, and storage runtime sources consume root runtime-source entrypoints instead of importing app context directly. |
+| Migration preservation | pass | Admin/object usecase construction, app explicit-context fallback, storage runtime reads, IAM/KMS/TLS resolver behavior, notification dispatch, and test TLS hooks keep the same semantics. |
+| Testing/verification | pass | Focused admin/app/storage checks, formatting, migration/layer guards, residual owner runtime-source AppContext scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-235 makes server runtime sources consume root runtime-source entrypoints instead of importing app context directly. |
+| Migration preservation | pass | Server audit/event config reads, readiness checks, object-store lookups, KMS lookup, lock-client checks, and notify dispatch keep the same resolver semantics. |
+| Testing/verification | pass | Focused server checks, formatting, migration/layer guards, residual server AppContext scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-234 removes the storage runtime-source re-export of the global AppContext getter and keeps startup AppContext reads behind root runtime-source entrypoints. |
+| Migration preservation | pass | Node RPC context fallback, object-store lookup, startup replication resync, and TLS generation math keep the same runtime handles and fallback behavior. |
+| Testing/verification | pass | Focused storage RPC/startup TLS checks, formatting, migration/layer guards, residual entrypoint scans, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-233 moves ECFS S3 route bucket, multipart, and object usecase construction behind the storage S3 API boundary without introducing storage infra reverse dependencies. |
+| Migration preservation | pass | ECFS request forwarding, metrics recording, boxed recursive async handlers, and AppContext-backed usecase construction keep the same behavior. |
+| Testing/verification | pass | Focused storage ECFS tests, formatting, migration/layer guards, residual ECFS construction scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-232 moves app usecase AppContext lookup behind the app runtime-source boundary instead of importing the global context getter in each usecase file. |
+| Migration preservation | pass | Bucket, multipart, admin, and object usecase constructors plus object buffer config fallback keep the same AppContext-first behavior. |
+| Testing/verification | pass | Focused app/admin tests, formatting, migration/layer guards, residual app global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-231 moves admin misc object-usecase construction and AppContext lookup behind the admin runtime-source boundary instead of keeping direct global entry points in router/service files. |
+| Migration preservation | pass | Object-lambda get execution, listen-notification bucket validation, dynamic config reload, runtime config snapshot reload, and site-replication normalization still use the same runtime handles. |
+| Testing/verification | pass | Focused admin router/service checks, formatting, migration/layer guards, residual admin global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-230 moves admin handler `DefaultAdminUsecase` construction behind the admin runtime-source boundary instead of letting each handler import the app usecase directly. |
+| Migration preservation | pass | Admin auth checks, discovery URLs, system info, pool/decommission, cluster snapshot, plugin catalog, table catalog, module-switch, and console responses keep the same usecase implementation. |
+| Testing/verification | pass | Focused admin tests, formatting, migration/layer guards, direct app-usecase import scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
+| Quality/architecture | pass | CTX-002 cleanup makes OIDC resolution AppContext-owned and removes the unused IAM-to-OIDC shortcut instead of keeping a hidden global bypass. |
+| Migration preservation | pass | Startup still treats OIDC initialization as non-fatal and publishes the initialized handle when available; admin OIDC, STS, and console consumers keep the same response behavior. |
+| Testing/verification | pass | Focused app::context tests, formatting, compatibility marker scan, and Rust risk scan passed; full PR gate is planned before PR. |
+| Quality/architecture | pass | API-229 routes ECStore benchmark erasure facade imports through a bench-local storage_api boundary. |
+| Migration preservation | pass | Erasure SIMD, comparison, streaming decode, and single-block non-inline benchmarks keep the same erasure implementations and behavior. |
+| Testing/verification | pass | Focused ECStore bench compile coverage, migration guard, residual bench API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-228 routes ECStore integration-test ECStore/storage-api symbols through a test-local storage_api boundary. |
+| Migration preservation | pass | Contract proofs, MinIO rio-v2 fixture reads, legacy bitrot reads, disk setup, object reader aliases, and trait bounds keep the same ECStore/storage-api implementations. |
+| Testing/verification | pass | Focused ECStore integration tests, migration guard, residual ECStore test API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-227 normalizes completed local storage-api boundary internals to use imported local aliases instead of raw fully qualified contract paths. |
+| Migration preservation | pass | Storage owner peer S3 operations, topology snapshots, app lifecycle/replication helpers, IAM config aliases, Swift aliases, and S3 Select aliases keep the same storage-api contracts. |
+| Testing/verification | pass | RustFS test compile coverage, explicit IAM/S3 Select/Swift compile coverage, migration/layer guards, residual raw-path scan, formatting, and diff hygiene passed; full PR gate is planned before PR. |
+| Quality/architecture | pass | API-226 routes ECStore internal storage contract imports through the owner-local storage_api_contracts boundary. |
+| Migration preservation | pass | Object/list/multipart/heal/admin trait impls, set-disk/sets behavior, lifecycle/tier/replication DTOs, config storage, peer S3 client, range helpers, and error mappings keep the same storage contracts. |
+| Testing/verification | pass | Focused ECStore/RustFS compile coverage, ECStore lib tests, migration/layer guards, residual import scan, Rust risk scan, formatting, and diff hygiene passed; full PR gate is planned before PR. |
+| Quality/architecture | pass | API-225 routes remaining storage owner submodule storage contract imports through the owner-local storage_api boundary. |
+| Migration preservation | pass | S3 handlers, options, access checks, prefix probing, RPC, and S3 API helper tests keep the same storage contract implementations. |
+| Testing/verification | pass | Focused RustFS test compile coverage, migration guard, residual import scan, Rust risk scan, formatting, layer guard, fast PR gate, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-224 moves the storage owner root ECStore facade and storage contract aggregation into the owner-local storage_api boundary. |
+| Migration preservation | pass | Storage owner crate-local exports and root/app/admin callers keep the same symbols and ECStore/storage implementations. |
+| Testing/verification | pass | Focused RustFS test compile coverage, formatting, migration and layer guards, residual scan, Rust risk scan, fast PR gate, and full PR gate passed before PR. |
+| Quality/architecture | pass | API-223 moves the remaining external runtime/test/fuzz ECStore and storage contract imports behind local storage_api boundaries. |
+| Migration preservation | pass | IAM, notify, OBS metrics, Swift, S3 Select, e2e, and fuzz callers keep the same ECStore/storage implementations and behavior. |
+| Testing/verification | pass | Focused external crate/fuzz compile coverage, formatting, migration/layer guards, residual boundary scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-222 routes scanner and heal ECStore/storage contract imports through crate-local storage_api boundaries. |
+| Migration preservation | pass | Scanner lifecycle/tier/replication IO and heal disk/object/bucket test contracts keep the same ECStore and storage-api implementations. |
+| Testing/verification | pass | Focused scanner/heal compile coverage, formatting, migration/layer guards, residual boundary scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-221 folds app S3 helper forwarding into app storage_api and removes the standalone app s3_api forwarding module. |
+| Migration preservation | pass | Bucket/object/multipart list and multipart helper parsers/builders keep the same storage S3 API implementations and owner metadata helper. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual app S3 helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-220 routes app/admin storage contract DTO and trait imports through their local storage_api boundaries. |
+| Migration preservation | pass | App usecase/test contracts and admin handler/router/service contracts keep the same rustfs_storage_api DTOs and traits. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual migrated contract scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-219 routes root/server/startup storage contract DTO and trait imports through the root-local storage_api boundary. |
+| Migration preservation | pass | Cluster/runtime snapshots, metadata startup, table catalog, readiness, error mapping, and event tests keep the same rustfs_storage_api contracts. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual migrated contract scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-218 adds a root-local storage_api boundary and routes root/server/startup storage facade consumers through it. |
+| Migration preservation | pass | Startup storage, metadata migration, notification, readiness, HTTP request context, module switches, event dispatch, snapshots, capacity, workload admission, table catalog, and config tests keep the same storage implementations. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-217 moves admin storage facade ownership behind admin storage_api and removes the admin root compatibility surface. |
+| Migration preservation | pass | Config IO/defaults, bucket metadata/targets, replication/resync, rebalance, quota, tier, metrics, object zip, and site replication keep the same storage implementations. |
+| Testing/verification | pass | Focused RustFS admin compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-216 removes app root runtime/global facades and routes app/admin data-usage and runtime consumers through local storage_api boundaries. |
+| Migration preservation | pass | Admin info/capacity, data-usage accounting, AppContext fallback runtime sources, lifecycle test disk initialization, tier warm-backend tests, and scanner metrics keep the same storage implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-215 consolidates bucket owner facades under app storage_api and removes the app root compatibility modules. |
+| Migration preservation | pass | Lifecycle, metadata, object-lock, quota, replication, tagging, target, versioning, and transition test helpers keep the same storage implementations. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual migrated facade scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-214 moves app storage error, ETag, and storage-class helpers behind the app storage_api boundary and removes the matching app root aliases. |
+| Migration preservation | pass | Bucket config handling, multipart/object not-found classification, object delete/copy mapping, list ETag conversion, storage-class response projection, and lifecycle transition test formatting keep the same storage implementations. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual migrated helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-213 removes app root IO/compression/set-disk compatibility aliases and routes object/multipart usecases through the app storage_api boundary. |
+| Migration preservation | pass | Object compression metadata, hash-reader checksum handling, multipart write-encryption planning, storage-class checks, lock timeouts, and test reader wrappers keep the same storage implementations. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual migrated helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-212 routes completed app/admin storage helper consumers through local storage_api boundaries and adds a direct-bypass guard. |
+| Migration preservation | pass | Admin authorization/tracing, console request context propagation, object-zip storage options, and app lifecycle/capacity test harness behavior keep the same storage implementations. |
+| Testing/verification | pass | Focused admin/app compile/tests, formatting, migration/layer guards, residual direct storage helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-211 routes app select/usecase storage helper imports through an app-local storage_api boundary and adds a direct-bypass guard. |
+| Migration preservation | pass | Select preflight, bucket authorization/background work, multipart SSE/options parsing, and object SSE/concurrency/prefix/timeout paths keep the same storage helper implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual direct storage helper scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-210 routes app usecase S3 API helper imports through an app-local boundary and adds a direct-bypass guard. |
+| Migration preservation | pass | Bucket list response mapping, multipart list/part-number parsing, object list-parts parsing, and S3 owner metadata keep the same storage helper implementations. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual direct S3 API scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-209 removes app-layer S3 DTO and ECFS wildcard imports and adds a regression guard for the completed boundary. |
+| Migration preservation | pass | Select-object streaming, bucket DTO mapping, object CRUD/copy/delete/restore DTO handling, multipart checksum/copy behavior, and ECFS FS test harness usage keep the same call paths. |
+| Testing/verification | pass | Focused RustFS app compile/tests, formatting, migration/layer guards, residual wildcard scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-208 removes broad storage wildcard imports from app bucket, object, and multipart usecases and adds a regression guard. |
+| Migration preservation | pass | Bucket listing/notification, object precondition/SSE/object-lock/CORS, and multipart SSE/object-lock behavior keep the same storage owner call sites. |
+| Testing/verification | pass | Focused app compile/tests, formatting, migration/layer guards, residual wildcard scan, Rust risk scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-207 closes the remaining grouped admin AppContext imports behind the admin runtime-source boundary and tightens guard coverage. |
+| Migration preservation | pass | Admin credentials, STS, pool/rebalance, tier, and bucket metadata resolver behavior preserve existing AppContext fallback semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-206 keeps root, app usecase, and storage node-service AppContext resolver consumers behind owner runtime-source boundaries and adds regression guards. |
+| Migration preservation | pass | Request credentials, IAM readiness, startup notify/region, buffer config, workload admission, S3 Select, app-context object-store/notify, and node-service IAM/lock behavior preserve existing semantics. |
+| Testing/verification | pass | Focused RustFS compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
+| Quality/architecture | pass | API-205 keeps direct admin AppContext resolver consumers behind the admin runtime-source boundary and adds a guard against regressions. |
+| Migration preservation | pass | Admin auth, IAM readiness, KMS manager fallback, site replication TLS, config publication, and object-store resolver behavior preserve existing semantics. |
+| Testing/verification | pass | Focused admin compile/tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-199 keeps RustFS test tier-config and TLS-generation mutation behind AppContext-owned runtime-source helpers and retires the stale tier-config test compat shim. |
 | Migration preservation | pass | Lifecycle transition tier registration and site replication peer-client generation-cache behavior preserve existing semantics. |
 | Testing/verification | pass | Focused RustFS tests, formatting, migration/layer guards, residual scan, fast PR gate, and full PR gate are planned before PR. |
@@ -5077,6 +5921,307 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-246 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3911
+    merged.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin contract root consumer scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-245 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3910
+    merged.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Storage-owner raw contract path scan: passed; no raw
+    `rustfs_storage_api::Type` contract paths remain in the owner boundary.
+  - Storage-owner root contract consumer scan: passed; storage consumers now
+    import contract symbols through domain modules.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed; nextest ran 6776 tests with 6776 passed and
+    112 skipped, and doctests passed.
+
+- Issue #660 API-244 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3909
+    merged.
+  - `cargo check -p rustfs-ecstore`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECStore storage_api_contracts root re-export scan: passed; no root
+    `rustfs_storage_api` contract re-exports remain in the facade.
+  - ECStore storage_api_contracts root consumer scan: passed; internal
+    consumers import through domain modules.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed, including 6771 nextest tests passed, 112 skipped,
+    and doctests passed.
+
+- Issue #660 API-243 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3908
+    merged.
+  - `cargo check --tests --benches -p rustfs -F rustfs-protocols/swift`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - RustFS storage-api root re-export scan: passed; storage owner, admin, app,
+    and root storage API boundaries no longer expose `rustfs_storage_api`
+    contracts from their roots.
+  - RustFS app/admin storage helper root re-export scan: passed; app/admin
+    storage API boundaries now expose storage helpers from domain modules.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-242 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3905
+    merged.
+  - `cargo check --tests --benches -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-obs -p rustfs-s3select-api -p rustfs-protocols -p rustfs-ecstore -p e2e_test -F rustfs-protocols/swift`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - External storage-api root re-export scan: passed; ECStore tests, heal
+    source/tests, IAM, OBS metrics, Swift, S3 Select, and scanner source/tests
+    now expose storage-api contracts from consumer-domain modules through local
+    `storage_contracts` aliases.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-241 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3897
+    and PR #3900 merged on top of PR #3903.
+  - `cargo check --tests --benches -p rustfs-ecstore -p rustfs-notify -p rustfs`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Flat residual local storage-api scan: passed; notify, ECStore tests/benches,
+    admin config, and storage RPC residual consumers now use local
+    consumer-domain modules or aliases instead of flat imports.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed, including 6759 nextest tests passed, 112 skipped,
+    and doctests passed.
+
+- Issue #660 API-240 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3902
+    merged.
+  - `cargo check --tests -p rustfs-scanner -p rustfs-heal -p rustfs-iam -p rustfs-obs -p rustfs-s3select-api -p rustfs-protocols -p e2e_test -F rustfs-protocols/swift`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Flat external storage-api residual scan: passed; scanner, heal, IAM, OBS
+    metrics, S3 Select, Swift, e2e, and related test consumers now use
+    `storage_api` consumer-domain modules instead of flat imports.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-239 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3901
+    merged.
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Flat app storage-api residual scan: passed; app consumers now use
+    `storage_api` consumer-domain modules instead of flat imports.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-238 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3899 merged.
+  - `cargo check -p rustfs`: passed.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-237 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3899 merged.
+  - `cargo check -p rustfs`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Flat root storage-api residual scan: passed; root consumers now use
+    `storage_api` domain modules instead of flat imports or legacy helper
+    modules.
+  - Diff-added Rust risk scan: passed; matches were import aliases only, with
+    no new production unwrap/expect, numeric cast, String error, Box dyn Error,
+    print macro, or relaxed atomic ordering lines.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-236 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
+  - `cargo test -p rustfs admin::router --lib`: passed, 61 passed.
+  - `cargo test -p rustfs app::bucket_usecase --lib`: passed, 64 passed.
+  - `cargo test -p rustfs app::object_usecase --lib`: passed, 102 passed
+    and 2 ignored.
+  - `cargo test -p rustfs storage::rpc --lib`: passed, 115 passed and 9
+    ignored.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after deleting the stale
+    storage runtime-source AppContext baseline.
+  - Owner runtime-source AppContext residual scan: passed; admin, app, and
+    storage runtime sources no longer import `crate::app::context`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
+
+- Issue #660 API-235 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
+  - `cargo test -p rustfs server:: --lib`: passed, 151 passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after deleting the stale
+    server runtime-source AppContext baseline.
+  - Server AppContext entrypoint residual scan: passed; server runtime sources
+    no longer import `crate::app::context`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
+
+- Issue #660 API-234 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
+  - `cargo test -p rustfs storage::rpc --lib`: passed, 115 passed and 9
+    ignored.
+  - `cargo test -p rustfs startup_tls_material --lib`: passed, 3 passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext entrypoint residual scans: passed; storage consumers no longer
+    call or re-export `get_global_app_context`, and startup runtime sources no
+    longer reference `crate::app::context` directly.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
+
+- Issue #660 API-233 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
+  - `cargo test -p rustfs storage::ecfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - ECFS usecase-construction residual scan: passed; remaining
+    `Default*Usecase::from_global()` references are confined to
+    `rustfs/src/storage/s3_api/mod.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, Box dyn Error, print macro, or relaxed atomic ordering lines.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
+
+- Issue #660 API-232 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-231
+    merged.
+  - `cargo test -p rustfs app::bucket_usecase --lib`: passed.
+  - `cargo test -p rustfs app::multipart_usecase --lib`: passed.
+  - `cargo test -p rustfs app::admin_usecase --lib`: passed.
+  - `cargo test -p rustfs app::object_usecase --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - App usecase global-entry residual scan: passed; remaining
+    `get_global_app_context` references are confined to
+    `rustfs/src/app/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
+  - Full PR gate: passed before PR.
+
+- Issue #660 API-231 current slice:
+  - Branch freshness check: stacked on API-230 PR #3894 while CI is pending.
+  - `cargo test -p rustfs admin::router --lib`: passed.
+  - `cargo test -p rustfs admin::service::config --lib`: passed.
+  - `cargo test -p rustfs admin::service::site_replication --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin global-entry residual scan: passed; remaining
+    `get_global_app_context`, `crate::app::object_usecase`, and
+    `DefaultObjectUsecase::from_global()` references are confined to
+    `rustfs/src/admin/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
+
+- Issue #660 API-230 current slice:
+  - Branch freshness check: based on CTX-002 PR #3893 head while #3893 was
+    pending, then rebased onto latest `origin/main` after #3893 merged.
+  - `cargo test -p rustfs admin::handlers::system --lib`: passed.
+  - `cargo test -p rustfs admin::handlers::pools --lib`: passed.
+  - `cargo test -p rustfs admin::route_registration_test::test_phase5_admin_info_contract --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin usecase import residual scan: passed; remaining
+    `crate::app::admin_usecase` and `DefaultAdminUsecase::from_global()`
+    references are confined to `rustfs/src/admin/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
 
 - Issue #660 API-187 current slice:
   - `cargo check -p rustfs-ecstore --tests`: passed.
@@ -7586,6 +8731,6 @@ Notes:
 ## Handoff Notes
 
 - Continue with larger consumer-migration batches outside the cleaned
-  app/storage/admin/scanner/heal/Swift/runtime/obs/notify/S3 Select/IAM/test
-  and fuzz boundaries; keep ECStore-owned behavior in ECStore until concrete
-  behavior is isolated enough for a pure-move slice.
+  app/storage/admin/scanner/heal/Swift/runtime/obs/notify/S3 Select/IAM/test,
+  fuzz, and storage owner root boundaries; keep ECStore-owned behavior in
+  ECStore until concrete behavior is isolated enough for a pure-move slice.

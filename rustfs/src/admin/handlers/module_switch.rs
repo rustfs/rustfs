@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::{
     auth::validate_admin_request,
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{
     ADMIN_PREFIX, ModuleSwitchSnapshot, ModuleSwitchSource, PersistedModuleSwitches, RemoteAddr, current_module_switch_snapshot,
@@ -78,7 +78,7 @@ struct ModuleSwitchDiscovery {
 
 impl From<ModuleSwitchSnapshot> for ModuleSwitchesResponse {
     fn from(value: ModuleSwitchSnapshot) -> Self {
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         Self {
             notify_enabled: value.notify_enabled,
             audit_enabled: value.audit_enabled,

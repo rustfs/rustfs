@@ -12,12 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storageclass;
-use super::super::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
-use crate::app::context::{
-    AppContext, get_global_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
+use crate::admin::runtime_sources::{
+    AppContext, current_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
     resolve_object_store_handle, resolve_object_store_handle_for_context,
 };
+use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::runtime::ECStore;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
@@ -27,7 +28,6 @@ use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR};
 use rustfs_config::{DEFAULT_DELIMITER, ENABLE_KEY, EnableState};
 use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
 use rustfs_iam::oidc::load_oidc_provider_configs_from_server_config;
-use rustfs_storage_api::StorageAdminApi;
 use rustfs_targets::config::{
     validate_amqp_config, validate_kafka_config, validate_mqtt_config, validate_mysql_config, validate_nats_config,
     validate_postgres_config, validate_pulsar_config, validate_redis_config, validate_webhook_config,
@@ -67,7 +67,7 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequest, message.into())
 }
 
-fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<crate::app::ECStore>> {
+fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<ECStore>> {
     resolve_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 
@@ -316,7 +316,7 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
 }
 
 pub async fn reload_dynamic_config_runtime_state(sub_system: &str) -> S3Result<()> {
-    let context = get_global_app_context();
+    let context = current_app_context();
     reload_dynamic_config_runtime_state_for_context(context.as_deref(), sub_system).await
 }
 
@@ -347,7 +347,7 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
 }
 
 pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
-    let context = get_global_app_context();
+    let context = current_app_context();
     reload_runtime_config_snapshot_for_context(context.as_deref()).await
 }
 
@@ -381,8 +381,8 @@ pub async fn signal_config_snapshot_reload() {
 
 #[cfg(test)]
 mod tests {
-    use super::super::super::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use super::*;
+    use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
@@ -438,7 +438,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        super::super::super::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -452,7 +452,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        super::super::super::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -467,7 +467,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        super::super::super::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -484,7 +484,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        super::super::super::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");

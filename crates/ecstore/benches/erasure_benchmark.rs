@@ -44,11 +44,12 @@
 //! - SIMD optimization for different shard sizes
 
 use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_main};
-use rustfs_ecstore::api::erasure::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
 use rustfs_utils::HashAlgorithm;
+mod storage_api;
 use std::hint::black_box;
 use std::io::Cursor;
 use std::time::Duration;
+use storage_api::erasure::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
 use tokio::runtime::Runtime;
 
 /// Benchmark configuration structure

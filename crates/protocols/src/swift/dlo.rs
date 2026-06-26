@@ -18,6 +18,7 @@
 //! Segments are discovered at download time using lexicographic ordering
 //! based on a container metadata manifest pointer.
 
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, container, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;
@@ -300,7 +301,7 @@ async fn create_dlo_stream(
 
             async move {
                 let range_spec = if byte_start > 0 || byte_end < segment.size as u64 - 1 {
-                    Some(rustfs_storage_api::HTTPRangeSpec {
+                    Some(HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
                         end: byte_end as i64,

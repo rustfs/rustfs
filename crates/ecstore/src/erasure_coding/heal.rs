@@ -19,7 +19,7 @@ use crate::erasure_coding::decode::ParallelReader;
 use crate::erasure_coding::encode::MultiWriter;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
-use tracing::info;
+use tracing::{info, warn};
 
 impl super::Erasure {
     pub async fn heal<R>(
@@ -60,10 +60,14 @@ impl super::Erasure {
             // We need at least data_shards available shards (data + parity combined)
             let available_shards = errs.iter().filter(|e| e.is_none()).count();
             if available_shards < self.data_shards {
-                return Err(Error::other(format!(
-                    "can not reconstruct data: not enough available shards (need {}, have {}) {errs:?}",
-                    self.data_shards, available_shards
-                )));
+                warn!(
+                    required_data_shards = self.data_shards,
+                    available_shards,
+                    total_shards = errs.len(),
+                    errors = ?errs,
+                    "Erasure heal read quorum unavailable"
+                );
+                return Err(Error::ErasureReadQuorum);
             }
 
             if self.parity_shards > 0 {
@@ -192,5 +196,37 @@ mod tests {
             .into_inline_data()
             .expect("inline writer should retain data");
         assert_eq!(healed, encoded[missing_data].to_vec());
+    }
+
+    #[tokio::test]
+    async fn heal_returns_read_quorum_when_available_shards_are_insufficient() {
+        let erasure = Erasure::new(3, 2, 64);
+        let data = b"heal should fail before decode when too few shards are readable";
+        let encoded = erasure.encode_data(data).expect("encode should succeed");
+
+        let readers = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, shard)| {
+                if index < 2 {
+                    Some(BitrotReader::new(
+                        Cursor::new(shard.to_vec()),
+                        erasure.shard_size(),
+                        HashAlgorithm::None,
+                        false,
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>();
+        let mut writers = (0..erasure.total_shard_count()).map(|_| None).collect::<Vec<_>>();
+
+        let err = erasure
+            .heal(&mut writers, readers, data.len(), &[])
+            .await
+            .expect_err("heal should fail when available shards are below data shards");
+
+        assert!(matches!(err, Error::ErasureReadQuorum));
     }
 }

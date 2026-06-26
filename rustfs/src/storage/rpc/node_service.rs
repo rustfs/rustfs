@@ -23,9 +23,11 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::app::context::{
-    AppContext, get_global_app_context, resolve_iam_handle, resolve_lock_client, resolve_object_store_handle_for_context,
+use crate::storage::contract::{
+    admin::StorageAdminApi,
+    bucket::{BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
+use crate::storage::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
@@ -42,7 +44,6 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
 };
-use rustfs_storage_api::{BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use serde::Deserialize;
 use std::{collections::HashMap, io::Cursor, pin::Pin, sync::Arc};
 use tokio::spawn;
@@ -175,7 +176,7 @@ mod metrics;
 
 pub struct NodeService {
     local_peer: LocalPeerS3Client,
-    context: Option<Arc<AppContext>>,
+    context: Option<Arc<runtime_sources::AppContext>>,
 }
 
 impl std::fmt::Debug for NodeService {
@@ -188,19 +189,19 @@ impl std::fmt::Debug for NodeService {
 }
 
 pub fn make_server() -> NodeService {
-    let context = get_global_app_context();
+    let context = runtime_sources::current_app_context();
     make_server_for_context(context)
 }
 
-pub fn make_server_for_context(context: Option<Arc<AppContext>>) -> NodeService {
+pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>) -> NodeService {
     let local_peer = LocalPeerS3Client::new(None, None);
     NodeService { local_peer, context }
 }
 
 impl NodeService {
-    fn resolve_object_store(&self) -> Option<Arc<crate::app::ECStore>> {
-        let context = self.context.clone().or_else(get_global_app_context);
-        resolve_object_store_handle_for_context(context.as_deref())
+    fn resolve_object_store(&self) -> Option<Arc<ECStore>> {
+        let context = self.context.clone().or_else(runtime_sources::current_app_context);
+        runtime_sources::object_store_handle_for_context(context.as_deref())
     }
 
     async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
@@ -213,7 +214,7 @@ impl NodeService {
 
     /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        resolve_lock_client()
+        runtime_sources::lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
@@ -672,7 +673,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -701,7 +702,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -740,7 +741,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -768,7 +769,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -800,7 +801,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -830,7 +831,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -866,7 +867,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -897,7 +898,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = resolve_iam_handle() else {
+        let Some(iam_sys) = runtime_sources::iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1600,6 +1601,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "{}".to_string(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;
@@ -1621,6 +1623,7 @@ mod tests {
             dst_volume: "dst-volume".to_string(),
             dst_path: "dst-path".to_string(),
             file_info: "invalid json".to_string(),
+            file_info_bin: Vec::new().into(),
         });
 
         let response = service.rename_data(request).await;

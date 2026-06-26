@@ -934,7 +934,7 @@ impl Default for Event {
     }
 }
 
-pub use rustfs_storage_api::ExpirationOptions;
+pub use crate::storage_api_contracts::lifecycle::ExpirationOptions;
 
 #[derive(Debug, Clone)]
 pub struct TransitionOptions {

@@ -21,6 +21,7 @@ use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
 use crate::runtime_sources;
+use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
@@ -38,7 +39,6 @@ use rustfs_protos::proto_gen::node_service::node_service_client::NodeServiceClie
 use rustfs_protos::proto_gen::node_service::{
     DeleteBucketRequest, GetBucketInfoRequest, HealBucketRequest, ListBucketRequest, MakeBucketRequest,
 };
-use rustfs_storage_api::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use std::{collections::HashMap, fmt::Debug, sync::Arc, time::Duration};
 use tokio::{net::TcpStream, sync::RwLock, time};
 use tokio_util::sync::CancellationToken;

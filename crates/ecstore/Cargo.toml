@@ -44,6 +44,7 @@ rustfs-storage-api.workspace = true
 rustfs-tls-runtime.workspace = true
 rustfs-checksums.workspace = true
 rustfs-config = { workspace = true, features = ["constants", "notify", "audit", "server-config-model"] }
+rustfs-concurrency.workspace = true
 rustfs-credentials = { workspace = true }
 rustfs-common.workspace = true
 rustfs-policy.workspace = true

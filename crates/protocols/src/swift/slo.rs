@@ -18,6 +18,7 @@
 //! Large files (>5GB) are split into segments, and a manifest defines
 //! how segments are assembled on download.
 
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;
@@ -420,7 +421,7 @@ async fn create_slo_stream(
 
                 // Fetch segment with range
                 let range_spec = if byte_start > 0 || byte_end < segment.size_bytes - 1 {
-                    Some(rustfs_storage_api::HTTPRangeSpec {
+                    Some(HTTPRangeSpec {
                         is_suffix_length: false,
                         start: byte_start as i64,
                         end: byte_end as i64,

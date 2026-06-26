@@ -15,7 +15,7 @@
 use super::*;
 use crate::layout::pool_space::{ServerPoolsAvailableSpace, build_server_pools_available_space};
 use crate::runtime_sources;
-use rustfs_storage_api::{NamespaceLocking as _, ObjectOperations as _, StorageAdminApi};
+use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, object::ObjectOperations as _};
 pub(in crate::store) mod support;
 use support::{
     LatestObjectInfoCandidate, PoolErr, PoolObjInfo, RebalanceDeletePoolResult, pool_lookup_not_found_error,

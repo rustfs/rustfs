@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::{all_local_disk, disk_drive_path, disk_endpoint};
+use crate::storage_api::capacity::{all_local_disk, disk_drive_path, disk_endpoint};
 use rustfs_io_metrics::capacity_metrics::{
     record_capacity_cache_hit, record_capacity_cache_miss, record_capacity_cache_served, record_capacity_refresh_request,
     record_capacity_scan_mode,

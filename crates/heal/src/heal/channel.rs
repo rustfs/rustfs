@@ -21,7 +21,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use rustfs_common::heal_channel::{
     HealAdmissionResult, HealChannelCommand, HealChannelPriority, HealChannelReceiver, HealChannelRequest, HealChannelResponse,
-    HealScanMode, publish_heal_response,
+    HealRequestSource, HealScanMode, publish_heal_response,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::Serialize;
@@ -460,11 +460,19 @@ impl HealChannelProcessor {
             HealChannelPriority::Critical => HealPriority::Urgent,
         };
 
+        let recreate_missing = request.recreate_missing.unwrap_or(match request.source {
+            HealRequestSource::Scanner => false,
+            HealRequestSource::Admin
+            | HealRequestSource::AutoHeal
+            | HealRequestSource::Internal
+            | HealRequestSource::ReadRepair => true,
+        });
+
         // Build HealOptions with all available fields
         let options = HealOptions {
             scan_mode: request.scan_mode.unwrap_or(HealScanMode::Normal),
             remove_corrupted: request.remove_corrupted.unwrap_or(false),
-            recreate_missing: request.recreate_missing.unwrap_or(true),
+            recreate_missing,
             update_parity: request.update_parity.unwrap_or(true),
             recursive,
             dry_run: request.dry_run.unwrap_or(false),
@@ -558,13 +566,13 @@ mod tests {
         async fn format_disk(&self, _endpoint: &Endpoint) -> crate::Result<()> {
             Ok(())
         }
-        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<rustfs_storage_api::BucketInfo>> {
+        async fn get_bucket_info(&self, _bucket: &str) -> crate::Result<Option<crate::heal::storage_api::status::BucketInfo>> {
             Ok(None)
         }
         async fn heal_bucket_metadata(&self, _bucket: &str) -> crate::Result<()> {
             Ok(())
         }
-        async fn list_buckets(&self) -> crate::Result<Vec<rustfs_storage_api::BucketInfo>> {
+        async fn list_buckets(&self) -> crate::Result<Vec<crate::heal::storage_api::status::BucketInfo>> {
             Ok(vec![])
         }
         async fn object_exists(&self, _bucket: &str, _object: &str) -> crate::Result<bool> {
@@ -723,6 +731,111 @@ mod tests {
         assert_eq!(heal_request.options.scan_mode, HealScanMode::Deep);
         assert!(heal_request.options.remove_corrupted);
         assert!(heal_request.options.recreate_missing);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_scanner_defaults_recreate_missing_false() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        let channel_request = HealChannelRequest {
+            id: "test-id".to_string(),
+            bucket: "test-bucket".to_string(),
+            object_prefix: Some("test-object".to_string()),
+            object_version_id: None,
+            disk: None,
+            priority: HealChannelPriority::Low,
+            scan_mode: None,
+            remove_corrupted: None,
+            recreate_missing: None,
+            update_parity: None,
+            recursive: Some(false),
+            dry_run: None,
+            timeout_seconds: None,
+            pool_index: None,
+            set_index: None,
+            force_start: false,
+            source: HealRequestSource::Scanner,
+        };
+
+        let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+        assert!(!heal_request.options.recreate_missing);
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_non_scanner_defaults_recreate_missing_true() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        for source in [
+            HealRequestSource::Admin,
+            HealRequestSource::AutoHeal,
+            HealRequestSource::Internal,
+            HealRequestSource::ReadRepair,
+        ] {
+            let channel_request = HealChannelRequest {
+                id: format!("test-id-{source:?}"),
+                bucket: "test-bucket".to_string(),
+                object_prefix: Some("test-object".to_string()),
+                object_version_id: None,
+                disk: None,
+                priority: HealChannelPriority::Normal,
+                scan_mode: None,
+                remove_corrupted: None,
+                recreate_missing: None,
+                update_parity: None,
+                recursive: Some(false),
+                dry_run: None,
+                timeout_seconds: None,
+                pool_index: None,
+                set_index: None,
+                force_start: false,
+                source,
+            };
+
+            let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+            assert!(heal_request.options.recreate_missing);
+        }
+    }
+
+    #[tokio::test]
+    async fn test_convert_to_heal_request_keeps_explicit_recreate_missing() {
+        let heal_manager = create_test_heal_manager();
+        let processor = HealChannelProcessor::new(heal_manager);
+
+        for (source, recreate_missing) in [
+            (HealRequestSource::Scanner, true),
+            (HealRequestSource::Admin, false),
+            (HealRequestSource::AutoHeal, false),
+            (HealRequestSource::Internal, false),
+            (HealRequestSource::ReadRepair, false),
+        ] {
+            let channel_request = HealChannelRequest {
+                id: format!("test-id-{source:?}-{recreate_missing}"),
+                bucket: "test-bucket".to_string(),
+                object_prefix: Some("test-object".to_string()),
+                object_version_id: None,
+                disk: None,
+                priority: HealChannelPriority::Normal,
+                scan_mode: None,
+                remove_corrupted: None,
+                recreate_missing: Some(recreate_missing),
+                update_parity: None,
+                recursive: Some(false),
+                dry_run: None,
+                timeout_seconds: None,
+                pool_index: None,
+                set_index: None,
+                force_start: false,
+                source,
+            };
+
+            let heal_request = processor.convert_to_heal_request(channel_request).unwrap();
+
+            assert_eq!(heal_request.options.recreate_missing, recreate_missing);
+        }
     }
 
     #[tokio::test]

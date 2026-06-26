@@ -16,13 +16,13 @@ use crate::{Error, Result};
 use async_trait::async_trait;
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::{
-    BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
-    ObjectOperations as _, StorageAdminApi,
-};
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
+use super::storage_api::storage::{
+    BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
+    ObjectOperations as _, StorageAdminApi,
+};
 use super::{DiskStore, ECStore, Endpoint, StorageError};
 pub use super::{HealObjectInfo, HealObjectOptions, HealPutObjReader};
 
@@ -937,7 +937,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self.ecstore.heal_object(bucket, object, version_id_str, opts).await {
             Ok((result, ecstore_error)) => {
-                let error = ecstore_error.map(Error::other);
+                let error = ecstore_error.map(Error::Storage);
                 debug!(
                     target: "rustfs::heal::storage",
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
@@ -968,7 +968,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }
@@ -1014,7 +1014,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }
@@ -1033,7 +1033,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self.ecstore.heal_format(dry_run).await {
             Ok((result, ecstore_error)) => {
-                let error = ecstore_error.map(Error::other);
+                let error = ecstore_error.map(Error::Storage);
                 debug!(
                     target: "rustfs::heal::storage",
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
@@ -1058,7 +1058,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }

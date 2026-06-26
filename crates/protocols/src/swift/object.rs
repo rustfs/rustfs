@@ -51,11 +51,11 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
+use super::storage_api::object::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;
 use rustfs_rio::HashReader;
-use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectIO as _, ObjectOperations as _};
 use std::collections::HashMap;
 use tracing::debug;
 use tracing::error;
@@ -533,7 +533,7 @@ pub async fn get_object(
     container: &str,
     object: &str,
     credentials: &Credentials,
-    range: Option<rustfs_storage_api::HTTPRangeSpec>,
+    range: Option<HTTPRangeSpec>,
 ) -> SwiftResult<SwiftGetObjectReader> {
     // 1. Validate account access and get project_id
     let project_id = validate_account_access(account, credentials)?;
@@ -1028,9 +1028,7 @@ pub fn parse_copy_from_header(copy_from: &str) -> SwiftResult<(String, String)> 
 /// assert_eq!(range.end, 1023);
 /// ```
 #[allow(dead_code)] // Handler integration: Range header
-pub fn parse_range_header(range_str: &str) -> SwiftResult<rustfs_storage_api::HTTPRangeSpec> {
-    use rustfs_storage_api::HTTPRangeSpec;
-
+pub fn parse_range_header(range_str: &str) -> SwiftResult<HTTPRangeSpec> {
     if !range_str.starts_with("bytes=") {
         return Err(SwiftError::BadRequest("Range header must start with 'bytes='".to_string()));
     }

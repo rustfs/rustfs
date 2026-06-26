@@ -12,30 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{
-    AppWarmBackend, ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, TierConfig, TierType, WarmBackendGetOpts,
+use super::storage_api::test::bucket::{
+    lifecycle,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
-    object_api_utils::to_s3s_etag,
     transition_api::{ReadCloser, ReaderImpl},
+};
+use super::storage_api::test::ecfs::FS;
+use super::storage_api::test::object_utils::to_s3s_etag;
+use super::storage_api::test::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
+use super::storage_api::test::{
+    BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
+    ObjectOperations as _,
+};
+use super::storage_api::test::{
+    ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
+    StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
-use crate::app::context::resolve_tier_config_handle;
-use crate::storage::ecfs::FS;
-use crate::storage::{
-    StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-};
+use crate::app::runtime_sources::resolve_tier_config_handle;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
 use http::{Extensions, HeaderMap, HeaderValue, Method, Uri, header::IF_NONE_MATCH};
 use rustfs_config::{ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
-    ObjectOperations as _,
-};
 use rustfs_utils::http::{SUFFIX_FORCE_DELETE, insert_header};
 use s3s::{S3Request, dto::*};
 use serial_test::serial;
@@ -107,7 +109,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    super::init_local_disks(endpoint_pools.clone()).await.unwrap();
+    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
+        .await
+        .unwrap();
 
     let server_addr: std::net::SocketAddr = "127.0.0.1:9003".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
@@ -124,7 +128,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     let buckets = buckets_list.into_iter().map(|v| v.name).collect();
     metadata_sys::init_bucket_metadata_sys(ecstore.clone(), buckets).await;
 
-    super::lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
+    lifecycle::bucket_lifecycle_ops::init_background_expiry(ecstore.clone()).await;
 
     let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone()));
 
@@ -925,7 +929,7 @@ async fn delete_transitioned_object_removes_remote_tier_copy_via_usecase() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
         .await
         .expect("Failed to enqueue transitioned object");
 
@@ -982,7 +986,7 @@ async fn lifecycle_transition_marks_dirty_disks_for_capacity_manager() {
         .expect("Failed to set lifecycle configuration");
     let _ = upload_test_object(&ecstore, bucket.as_str(), object, payload).await;
 
-    super::lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
+    lifecycle::bucket_lifecycle_ops::enqueue_transition_for_existing_objects(ecstore.clone(), bucket.as_str())
         .await
         .expect("Failed to enqueue transitioned object");
 

@@ -1227,9 +1227,9 @@ fn test_phase5_admin_info_contract() {
     let server_info_impl_block = &system_src[server_info_impl_start..];
 
     assert!(
-        server_info_impl_block.contains("DefaultAdminUsecase::from_global()")
+        server_info_impl_block.contains("default_admin_usecase()")
             && server_info_impl_block.contains("execute_query_server_info(QueryServerInfoRequest { include_pools: true })"),
-        "admin server info path must be served through DefaultAdminUsecase::execute_query_server_info"
+        "admin server info path must be served through admin runtime-source DefaultAdminUsecase::execute_query_server_info"
     );
 }
 

@@ -14,34 +14,12 @@
 
 use futures::FutureExt;
 use rustfs_config::ENV_TEST_FORCE_IMMEDIATE_TRANSITION_ENQUEUE_TIMEOUT;
-use rustfs_ecstore::api::bucket::lifecycle::{
-    bucket_lifecycle_ops::{enqueue_transition_for_existing_objects, init_background_expiry},
-    lifecycle::TransitionOptions,
-};
-use rustfs_ecstore::api::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
-use rustfs_ecstore::api::bucket::metadata_sys::{
-    get as get_bucket_metadata, init_bucket_metadata_sys, update as update_bucket_metadata,
-};
-use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
-use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
-use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
-use rustfs_ecstore::api::disk::{DiskAPI as _, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
-use rustfs_ecstore::api::global::get_global_tier_config_mgr;
-use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
-use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
-use rustfs_ecstore::api::tier::tier_config::{TierConfig, TierMinIO, TierType};
-use rustfs_ecstore::api::tier::warm_backend::{
-    WarmBackend as ScannerWarmBackend, WarmBackendGetOpts, build_transition_put_options,
-};
 use rustfs_filemeta::FileMeta;
 use rustfs_scanner::scanner_folder::ScannerItem;
 use rustfs_scanner::scanner_io::ScannerIODisk;
 use rustfs_scanner::{
     ScannerObjectInfo as ObjectInfo, ScannerObjectOptions as ObjectOptions, ScannerPutObjReader as PutObjReader,
     scanner::init_data_scanner,
-};
-use rustfs_storage_api::{
-    BucketOperations, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _, ObjectOperations as _,
 };
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::RestoreRequest;
@@ -60,6 +38,17 @@ use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
+
+mod storage_api;
+
+use storage_api::lifecycle::{
+    BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskAPI as _, DiskOption,
+    ECStore, Endpoint, EndpointServerPools, Endpoints, ListOperations as _, MakeBucketOptions, MultipartOperations as _,
+    ObjectIO as _, ObjectOperations as _, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerWarmBackend,
+    TierConfig, TierMinIO, TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options,
+    enqueue_transition_for_existing_objects, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
+    init_bucket_metadata_sys, init_local_disks, new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
+};
 
 static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>)> = OnceLock::new();
 static INIT: Once = Once::new();
@@ -134,7 +123,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     // init bucket metadata system
     let buckets_list = ecstore
-        .list_bucket(&rustfs_storage_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -200,7 +189,7 @@ async fn setup_isolated_test_env(init_expiry: bool) -> (Vec<PathBuf>, Arc<ECStor
         .unwrap();
 
     let buckets_list = ecstore
-        .list_bucket(&rustfs_storage_api::BucketOptions {
+        .list_bucket(&BucketOptions {
             no_metadata: true,
             ..Default::default()
         })
@@ -1021,7 +1010,7 @@ mod serial_tests {
                 multipart_bucket.as_str(),
                 multipart_object,
                 &upload.upload_id,
-                vec![rustfs_storage_api::CompletePart {
+                vec![CompletePart {
                     part_num: 1,
                     etag: part.etag.clone(),
                     ..Default::default()
@@ -1166,12 +1155,12 @@ mod serial_tests {
                 object_name,
                 &upload.upload_id,
                 vec![
-                    rustfs_storage_api::CompletePart {
+                    CompletePart {
                         part_num: 1,
                         etag: uploaded_part1.etag.clone(),
                         ..Default::default()
                     },
-                    rustfs_storage_api::CompletePart {
+                    CompletePart {
                         part_num: 2,
                         etag: uploaded_part2.etag.clone(),
                         ..Default::default()

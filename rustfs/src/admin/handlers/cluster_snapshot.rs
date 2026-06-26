@@ -12,17 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_api::cluster::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use crate::admin::{
     auth::validate_admin_request,
-    ecstore_cluster::{
+    router::{AdminOperation, Operation, S3Router},
+    runtime_sources::default_admin_usecase,
+    storage_api::cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
     },
-    router::{AdminOperation, Operation, S3Router},
     system,
 };
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
@@ -34,7 +35,6 @@ use matchit::Params;
 use rustfs_concurrency::AdmissionState as WorkloadAdmissionState;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{CapabilityState, CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use serde::Serialize;
@@ -103,7 +103,7 @@ pub struct GetClusterSnapshotHandler {}
 impl Operation for GetClusterSnapshotHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_cluster_snapshot_request(&req).await?;
-        let snapshot = DefaultAdminUsecase::from_global()
+        let snapshot = default_admin_usecase()
             .execute_collect_cluster_read_only_snapshot()
             .await
             .map(ClusterSnapshotView::from);
@@ -112,7 +112,7 @@ impl Operation for GetClusterSnapshotHandler {
 }
 
 pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapshotDiscoveryResponse {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     let path = usecase.cluster_snapshot_route().to_string();
     let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
 
@@ -590,7 +590,9 @@ fn summarize_named_capability_statuses<const N: usize>(
 #[cfg(test)]
 mod tests {
     use super::{ClusterSnapshotResponse, ClusterSnapshotSummary, ClusterSnapshotView};
-    use crate::admin::ecstore_cluster::{
+    use crate::admin::storage_api::cluster::CapabilityState;
+    use crate::admin::storage_api::cluster::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
+    use crate::admin::storage_api::cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
@@ -598,8 +600,6 @@ mod tests {
     use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
     use crate::server::{DependencyReadiness, ReadinessDegradedReason};
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadClass};
-    use rustfs_storage_api::CapabilityState;
-    use rustfs_storage_api::{CapabilityStatus, ObservabilitySnapshot, TopologySnapshot};
 
     #[test]
     fn cluster_snapshot_handler_requires_server_info_admin_permission() {

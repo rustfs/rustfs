@@ -12,13 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::DailyAllTierStats;
-use super::super::EndpointServerPools;
-use super::super::ScannerMetricsReport;
-use super::super::StorageClassConfig;
-use super::super::TierConfigMgr;
-use super::super::metadata_sys::BucketMetadataSys;
-use super::super::{BucketBandwidthMonitor, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats};
+use super::super::storage_api::context::EndpointServerPools;
+use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::context::runtime::{
+    BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+};
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
 use rustfs_config::server_config::Config;
@@ -40,9 +39,6 @@ pub trait IamInterface: Send + Sync {
     #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
-    fn oidc(&self) -> Option<Arc<OidcSys>> {
-        None
-    }
     fn token_signing_key(&self) -> Option<String> {
         None
     }
@@ -51,6 +47,9 @@ pub trait IamInterface: Send + Sync {
 /// OIDC interface for admin and runtime consumers.
 pub trait OidcInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<OidcSys>>;
+    fn publish_handle(&self, _oidc: Arc<OidcSys>) -> bool {
+        false
+    }
 }
 
 /// KMS interface for application-layer use-cases.

@@ -12,16 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{
-    DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-    StorageError, decode_rebalance_stop_propagation_record,
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::rebalance::{
+    DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
+    decode_rebalance_stop_propagation_record,
 };
+use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
+    admin::runtime_sources::{resolve_notification_system, resolve_object_store_handle},
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
     },
-    app::context::{resolve_notification_system, resolve_object_store_handle},
     auth::{check_key_valid, get_session_token},
     server::{ADMIN_PREFIX, RemoteAddr},
 };
@@ -29,7 +33,6 @@ use http::{HeaderMap, HeaderValue, StatusCode, Uri};
 use hyper::Method;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
-use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
 use rustfs_utils::{
     MaskedAccessKey,
     http::{AMZ_REQUEST_ID, REQUEST_ID_HEADER},
@@ -296,7 +299,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &super::super::RebalanceStats,
+    ps: &crate::admin::storage_api::rebalance::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -339,7 +342,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[super::super::RebalanceStats],
+    pool_stats: &[crate::admin::storage_api::rebalance::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -895,10 +898,6 @@ mod offsetdatetime_rfc3339 {
 
 #[cfg(test)]
 mod rebalance_handler_tests {
-    use super::super::super::{
-        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
-        RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
-    };
     use super::build_rebalance_pool_progress;
     use super::calculate_rebalance_progress;
     use super::{
@@ -906,6 +905,10 @@ mod rebalance_handler_tests {
         build_rebalance_admin_status, build_rebalance_pool_statuses, build_rebalance_stop_propagation_status,
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
+    };
+    use crate::admin::storage_api::rebalance::{
+        DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
+        RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };
     use time::OffsetDateTime;
 

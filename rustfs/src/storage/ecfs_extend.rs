@@ -17,15 +17,17 @@ use super::{
     StorageError, add_object_lock_years, get_bucket_cors_config, get_bucket_object_lock_config, get_bucket_replication_config,
     resolve_object_store_handle,
 };
-use crate::app::context::resolve_buffer_config;
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
+use crate::storage::contract::{
+    bucket::{BucketOperations, BucketOptions},
+    object::ObjectToDelete,
+};
 use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
-use rustfs_storage_api::{BucketOperations, BucketOptions};
 use rustfs_targets::EventName;
 use rustfs_targets::arn::{TargetID, TargetIDError};
 use rustfs_utils::http::{
@@ -47,7 +49,8 @@ use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
 
-use crate::storage::{StorageObjectInfo as ObjectInfo, StorageObjectToDelete as ObjectToDelete};
+use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::runtime_sources;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
@@ -263,7 +266,7 @@ pub(crate) fn get_adaptive_buffer_size_with_profile(file_size: i64, profile: Opt
 pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     let buffer_size = if is_buffer_profile_enabled() {
         // Use the AppContext-owned profile when available, with global fallback during migration.
-        let config = resolve_buffer_config();
+        let config = runtime_sources::buffer_config();
         config.get_buffer_size(file_size)
     } else {
         // Opt-out mode: Use GeneralPurpose profile for consistent behavior

@@ -12,16 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
-use crate::app::admin_usecase::DefaultAdminUsecase;
-use crate::app::context::resolve_oidc_handle;
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_probe_readiness};
+use crate::admin::runtime_sources::{default_admin_usecase, resolve_oidc_handle};
+use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
     CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
     RequestContextLayer, VERSION,
 };
-use crate::storage::request_context::RequestContext;
 use crate::version::build;
 use axum::{
     Json, Router,
@@ -136,7 +135,6 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let oidc = resolve_oidc_handle()
             .map(|sys| {
                 sys.list_visible_providers()
@@ -225,7 +223,7 @@ struct ApiDiscovery {
 }
 
 fn console_api_discovery() -> ApiDiscovery {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     ApiDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
         cluster_snapshot: usecase.cluster_snapshot_route().to_string(),
@@ -597,11 +595,7 @@ async fn health_check(method: Method, uri: Uri) -> Response {
     } else {
         HealthProbe::Liveness
     };
-    let readiness_report = if probe == HealthProbe::Readiness {
-        Some(collect_dependency_readiness().await)
-    } else {
-        None
-    };
+    let readiness_report = collect_probe_readiness(probe).await;
     let uptime = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

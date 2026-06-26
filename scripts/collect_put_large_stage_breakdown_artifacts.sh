@@ -30,6 +30,7 @@ AWSCURL_BIN="awscurl"
 CURL_BIN="curl"
 JQ_BIN="jq"
 DRY_RUN=false
+AWSCURL_AVAILABLE=true
 
 usage() {
   cat <<'USAGE'
@@ -183,7 +184,19 @@ resolve_pid() {
     echo "$RUSTFS_PID"
     return
   fi
-  pidof rustfs 2>/dev/null | awk '{print $1}' || true
+  if command -v pidof >/dev/null 2>&1; then
+    pidof rustfs 2>/dev/null | awk '{print $1}' && return 0
+  fi
+
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f 'rustfs server' 2>/dev/null | head -n 1 && return 0
+  fi
+
+  if command -v ps >/dev/null 2>&1; then
+    ps -ef 2>/dev/null | awk '/[r]ustfs server/ {print $2; exit}' && return 0
+  fi
+
+  true
 }
 
 health_url() {
@@ -281,6 +294,11 @@ capture_admin_metrics_sample() {
 
   if [[ "$DRY_RUN" == "true" ]]; then
     echo "dry run" > "$file"
+    return
+  fi
+
+  if [[ "$AWSCURL_AVAILABLE" != "true" ]]; then
+    echo "awscurl unavailable; signed admin metrics skipped" > "$file"
     return
   fi
 
@@ -450,7 +468,12 @@ main() {
     require_cmd date
   fi
   if [[ "$DRY_RUN" != "true" && -n "$ACCESS_KEY" && -n "$SECRET_KEY" ]]; then
-    require_cmd "$AWSCURL_BIN"
+    if command -v "$AWSCURL_BIN" >/dev/null 2>&1; then
+      AWSCURL_AVAILABLE=true
+    else
+      AWSCURL_AVAILABLE=false
+      echo "WARN: ${AWSCURL_BIN} not found; signed admin metrics snapshots will be skipped" >&2
+    fi
   fi
 
   setup_output

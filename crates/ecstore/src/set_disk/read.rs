@@ -13,9 +13,569 @@
 // limitations under the License.
 
 use super::*;
+use crate::get_diagnostics::{
+    GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
+    GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
+    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT,
+    GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED,
+    GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
+    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE,
+    GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path,
+};
+use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
-use std::future::Future;
+use std::{
+    collections::HashMap,
+    future::Future,
+    pin::Pin,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
+use tokio::io::AsyncRead;
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
+
+const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
+const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
+
+static READ_REPAIR_HEAL_CACHE: OnceLock<RwLock<HashMap<ReadRepairHealCacheKey, Instant>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataFanoutObservation {
+    outcome: &'static str,
+    elapsed: Duration,
+    valid: bool,
+    ignored: bool,
+}
+
+impl MetadataFanoutObservation {
+    fn from_file_info(file_info: &FileInfo, elapsed: Duration) -> Self {
+        if file_info.is_valid() {
+            Self {
+                outcome: GET_METADATA_RESPONSE_VALID,
+                elapsed,
+                valid: true,
+                ignored: false,
+            }
+        } else {
+            Self {
+                outcome: GET_METADATA_RESPONSE_ERROR,
+                elapsed,
+                valid: false,
+                ignored: false,
+            }
+        }
+    }
+
+    fn from_error(err: &DiskError, elapsed: Duration) -> Self {
+        Self {
+            outcome: classify_metadata_response_error(err),
+            elapsed,
+            valid: false,
+            ignored: is_metadata_fanout_ignored_error(err),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataFanoutDiagnostics {
+    fanout_duration: Duration,
+    observations: Vec<MetadataFanoutObservation>,
+}
+
+impl MetadataFanoutDiagnostics {
+    fn new(fanout_duration: Duration, observations: Vec<MetadataFanoutObservation>) -> Self {
+        Self {
+            fanout_duration,
+            observations,
+        }
+    }
+
+    fn total_responses(&self) -> usize {
+        self.observations.len()
+    }
+
+    fn valid_responses(&self) -> usize {
+        self.observations.iter().filter(|observation| observation.valid).count()
+    }
+
+    fn ignored_responses(&self) -> usize {
+        self.observations.iter().filter(|observation| observation.ignored).count()
+    }
+
+    fn error_responses(&self) -> usize {
+        self.total_responses().saturating_sub(self.valid_responses())
+    }
+
+    fn first_response_latency(&self) -> Option<Duration> {
+        self.observations.iter().map(|observation| observation.elapsed).min()
+    }
+
+    fn first_valid_response_latency(&self) -> Option<Duration> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.valid)
+            .map(|observation| observation.elapsed)
+            .min()
+    }
+
+    fn slowest_response_latency(&self) -> Option<Duration> {
+        self.observations.iter().map(|observation| observation.elapsed).max()
+    }
+
+    fn quorum_candidate_latency(&self, read_quorum: usize) -> Option<Duration> {
+        if read_quorum == 0 {
+            return Some(Duration::ZERO);
+        }
+
+        let mut valid_latencies = self
+            .observations
+            .iter()
+            .filter(|observation| observation.valid)
+            .map(|observation| observation.elapsed)
+            .collect::<Vec<_>>();
+        valid_latencies.sort_unstable();
+        valid_latencies.get(read_quorum.saturating_sub(1)).copied()
+    }
+
+    fn record(&self, path: &'static str) {
+        rustfs_io_metrics::record_get_object_metadata_fanout_duration(path, self.fanout_duration.as_secs_f64());
+        if let Some(latency) = self.first_response_latency() {
+            rustfs_io_metrics::record_get_object_first_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        if let Some(latency) = self.first_valid_response_latency() {
+            rustfs_io_metrics::record_get_object_first_valid_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        if let Some(latency) = self.slowest_response_latency() {
+            rustfs_io_metrics::record_get_object_slowest_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        rustfs_io_metrics::record_get_object_metadata_fanout_shape(
+            path,
+            self.total_responses(),
+            self.valid_responses(),
+            self.ignored_responses(),
+            self.error_responses(),
+        );
+        for observation in &self.observations {
+            rustfs_io_metrics::record_get_object_metadata_response(path, observation.outcome);
+        }
+    }
+
+    fn record_quorum_candidate_latency(&self, path: &'static str, read_quorum: usize) {
+        if let Some(latency) = self.quorum_candidate_latency(read_quorum) {
+            rustfs_io_metrics::record_get_object_quorum_reached_latency(path, latency.as_secs_f64());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct MetadataEarlyStopDecision {
+    reason: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct MetadataQuorumAccumulator {
+    total_disks: usize,
+    default_parity_count: usize,
+    allow_early_stop: bool,
+    valid_responses: usize,
+    not_found_responses: usize,
+    version_not_found_responses: usize,
+    ignored_errors: usize,
+    hard_errors: usize,
+    candidate: Option<FileInfo>,
+    candidate_votes: usize,
+    conflicting_metadata: bool,
+    delete_marker_seen: bool,
+}
+
+impl MetadataQuorumAccumulator {
+    fn new(total_disks: usize, default_parity_count: usize, allow_early_stop: bool) -> Self {
+        Self {
+            total_disks,
+            default_parity_count,
+            allow_early_stop,
+            valid_responses: 0,
+            not_found_responses: 0,
+            version_not_found_responses: 0,
+            ignored_errors: 0,
+            hard_errors: 0,
+            candidate: None,
+            candidate_votes: 0,
+            conflicting_metadata: false,
+            delete_marker_seen: false,
+        }
+    }
+
+    fn observe_file_info(&mut self, file_info: &FileInfo) {
+        if !file_info.is_valid() {
+            self.hard_errors = self.hard_errors.saturating_add(1);
+            return;
+        }
+
+        self.valid_responses = self.valid_responses.saturating_add(1);
+        if file_info.deleted {
+            self.delete_marker_seen = true;
+            return;
+        }
+
+        match &self.candidate {
+            Some(candidate) if metadata_early_stop_candidate_matches(candidate, file_info) => {
+                self.candidate_votes = self.candidate_votes.saturating_add(1);
+            }
+            Some(_) => {
+                self.conflicting_metadata = true;
+            }
+            None => {
+                self.candidate = Some(file_info.clone());
+                self.candidate_votes = 1;
+            }
+        }
+    }
+
+    fn observe_error(&mut self, err: &DiskError) {
+        match err {
+            DiskError::FileNotFound | DiskError::VolumeNotFound => {
+                self.not_found_responses = self.not_found_responses.saturating_add(1);
+            }
+            DiskError::FileVersionNotFound => {
+                self.version_not_found_responses = self.version_not_found_responses.saturating_add(1);
+            }
+            _ if is_metadata_fanout_ignored_error(err) => {
+                self.ignored_errors = self.ignored_errors.saturating_add(1);
+            }
+            _ => {
+                self.hard_errors = self.hard_errors.saturating_add(1);
+            }
+        }
+    }
+
+    fn early_stop_decision(&self) -> Option<MetadataEarlyStopDecision> {
+        if !self.allow_early_stop {
+            return None;
+        }
+        if self.conflicting_metadata
+            || self.delete_marker_seen
+            || self.not_found_responses > 0
+            || self.version_not_found_responses > 0
+            || self.hard_errors > 0
+        {
+            return None;
+        }
+        if self
+            .candidate
+            .as_ref()
+            .and_then(|candidate| self.candidate_read_quorum(candidate))
+            .is_some_and(|read_quorum| self.candidate_votes >= read_quorum)
+        {
+            return Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM,
+            });
+        }
+        None
+    }
+
+    fn final_miss_reason(&self) -> &'static str {
+        if !self.allow_early_stop {
+            return GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST;
+        }
+        if self.conflicting_metadata {
+            return GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA;
+        }
+        if self.delete_marker_seen {
+            return GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER;
+        }
+        let missing_response_quorum = self.missing_response_quorum();
+        if self.version_not_found_responses >= missing_response_quorum {
+            return GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND;
+        }
+        if self.not_found_responses >= missing_response_quorum {
+            return GET_METADATA_EARLY_STOP_REASON_NOT_FOUND;
+        }
+        if self.hard_errors > 0 {
+            return GET_METADATA_EARLY_STOP_REASON_ERROR;
+        }
+        if self.ignored_errors > 0 {
+            return GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM;
+        }
+        GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM
+    }
+
+    fn candidate_read_quorum(&self, candidate: &FileInfo) -> Option<usize> {
+        if self.default_parity_count == 0 {
+            return Some(self.total_disks);
+        }
+        if candidate.deleted || candidate.size == 0 || candidate.erasure.parity_blocks >= self.total_disks {
+            return None;
+        }
+        Some(self.total_disks.saturating_sub(candidate.erasure.parity_blocks))
+    }
+
+    fn missing_response_quorum(&self) -> usize {
+        if self.default_parity_count == 0 {
+            self.total_disks
+        } else {
+            self.total_disks / 2
+        }
+    }
+}
+
+fn metadata_early_stop_candidate_matches(left: &FileInfo, right: &FileInfo) -> bool {
+    left.volume == right.volume
+        && left.name == right.name
+        && left.version_id == right.version_id
+        && left.is_latest == right.is_latest
+        && left.deleted == right.deleted
+        && left.mark_deleted == right.mark_deleted
+        && left.size == right.size
+        && left.mod_time == right.mod_time
+        && left.mode == right.mode
+        && left.metadata == right.metadata
+        && left.parts == right.parts
+        && left.checksum == right.checksum
+        && left.versioned == right.versioned
+        && left.erasure.algorithm == right.erasure.algorithm
+        && left.erasure.data_blocks == right.erasure.data_blocks
+        && left.erasure.parity_blocks == right.erasure.parity_blocks
+        && left.erasure.block_size == right.erasure.block_size
+        && left.erasure.distribution == right.erasure.distribution
+}
+
+fn classify_metadata_response_error(err: &DiskError) -> &'static str {
+    match err {
+        DiskError::FileNotFound | DiskError::VolumeNotFound => GET_METADATA_RESPONSE_NOT_FOUND,
+        DiskError::FileVersionNotFound => GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+        DiskError::DiskNotFound => GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+        DiskError::FileCorrupt | DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::OutdatedXLMeta => {
+            GET_METADATA_RESPONSE_CORRUPT
+        }
+        DiskError::Timeout => GET_METADATA_RESPONSE_TIMEOUT,
+        DiskError::FaultyDisk | DiskError::FaultyRemoteDisk => GET_METADATA_RESPONSE_IGNORED,
+        _ => GET_METADATA_RESPONSE_ERROR,
+    }
+}
+
+fn is_metadata_fanout_ignored_error(err: &DiskError) -> bool {
+    OBJECT_OP_IGNORED_ERRS.iter().any(|ignored| ignored == err)
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ReadRepairHealCacheKey {
+    bucket: String,
+    object: String,
+    version_id: Option<String>,
+    pool_index: usize,
+    set_index: usize,
+}
+
+impl ReadRepairHealCacheKey {
+    fn new(bucket: &str, object: &str, version_id: Option<&str>, pool_index: usize, set_index: usize) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: version_id.filter(|value| !value.is_empty()).map(str::to_string),
+            pool_index,
+            set_index,
+        }
+    }
+}
+
+fn resolved_read_repair_version_id(fi: &FileInfo, requested_version_id: Option<&str>) -> Option<String> {
+    fi.version_id
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| requested_version_id.filter(|value| !value.is_empty()).map(str::to_string))
+}
+
+async fn reserve_read_repair_heal(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    pool_index: usize,
+    set_index: usize,
+) -> Option<ReadRepairHealCacheKey> {
+    let key = ReadRepairHealCacheKey::new(bucket, object, version_id, pool_index, set_index);
+    let now = Instant::now();
+    let cache = READ_REPAIR_HEAL_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    {
+        let cache = cache.read().await;
+        if cache
+            .get(&key)
+            .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL)
+        {
+            return None;
+        }
+    }
+
+    let mut cache = cache.write().await;
+    if cache
+        .get(&key)
+        .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL)
+    {
+        return None;
+    }
+
+    if cache.len() >= READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES {
+        cache.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL);
+    }
+    if cache.len() >= READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES
+        && let Some(oldest_key) = cache.iter().min_by_key(|(_, seen_at)| **seen_at).map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(key.clone(), now);
+    Some(key)
+}
+
+async fn release_read_repair_heal_reservation(key: &ReadRepairHealCacheKey) {
+    if let Some(cache) = READ_REPAIR_HEAL_CACHE.get() {
+        cache.write().await.remove(key);
+    }
+}
+
+fn record_read_repair_dedup(reason: &'static str) {
+    counter!("rustfs_heal_read_repair_dedup_total", "reason" => reason.to_string()).increment(1);
+}
+
+enum ReadRepairAdmissionOutcome {
+    Response(HealAdmissionResult),
+    Failed(String),
+}
+
+type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
+type ReadRepairAdmissionSubmitter = fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
+
+struct ReadRepairHealSubmission<'a> {
+    bucket: &'a str,
+    object: &'a str,
+    version_id: Option<&'a str>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: Option<usize>,
+    reason: &'static str,
+}
+
+fn send_read_repair_heal_request(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    Box::pin(async {
+        match send_heal_request_with_admission(request).await {
+            Ok(result) => ReadRepairAdmissionOutcome::Response(result),
+            Err(err) => ReadRepairAdmissionOutcome::Failed(err),
+        }
+    })
+}
+
+async fn submit_read_repair_heal(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: Option<usize>,
+    reason: &'static str,
+) {
+    submit_read_repair_heal_with_submitter(
+        ReadRepairHealSubmission {
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            reason,
+        },
+        send_read_repair_heal_request,
+    )
+    .await;
+}
+
+async fn submit_read_repair_heal_with_submitter(
+    submission: ReadRepairHealSubmission<'_>,
+    submitter: ReadRepairAdmissionSubmitter,
+) {
+    let ReadRepairHealSubmission {
+        bucket,
+        object,
+        version_id,
+        pool_index,
+        set_index,
+        part_number,
+        reason,
+    } = submission;
+
+    let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
+        record_read_repair_dedup("duplicate");
+        debug!(
+            bucket,
+            object, part_number, pool_index, set_index, reason, "Skipped duplicate read-repair heal request"
+        );
+        return;
+    };
+
+    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+        bucket.to_string(),
+        Some(object.to_string()),
+        false,
+        Some(HealChannelPriority::Normal),
+        Some(pool_index),
+        Some(set_index),
+    );
+    request.source = HealRequestSource::ReadRepair;
+    request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
+    request.recreate_missing = Some(true);
+
+    let request_id = request.id.clone();
+    let bucket = bucket.to_string();
+    let object = object.to_string();
+    tokio::spawn(async move {
+        match submitter(request).await {
+            ReadRepairAdmissionOutcome::Response(result) if result.is_admitted() => {
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    admission = result.result_label(),
+                    "Read-repair heal request admitted"
+                );
+            }
+            ReadRepairAdmissionOutcome::Response(result) => {
+                release_read_repair_heal_reservation(&dedup_key).await;
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    admission = result.result_label(),
+                    drop_reason = result.reason_label(),
+                    "Read-repair heal request not admitted"
+                );
+            }
+            ReadRepairAdmissionOutcome::Failed(err) => {
+                release_read_repair_heal_reservation(&dedup_key).await;
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    error = %err,
+                    "Read-repair heal request could not be submitted"
+                );
+            }
+        }
+    });
+}
 
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
@@ -98,6 +658,55 @@ where
 }
 
 impl SetDisks {
+    async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
+        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
+    }
+
+    async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+        let key = GetObjectMetadataCacheKey::new(bucket, object);
+        let cache = self.get_object_metadata_cache.read().await;
+        cache
+            .get(&key)
+            .filter(|entry| {
+                entry.is_fresh() && entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum
+            })
+            .cloned()
+    }
+
+    async fn cache_get_object_fileinfo(
+        &self,
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        parts_metadata: &[FileInfo],
+        online_disks: &[Option<DiskStore>],
+        read_quorum: usize,
+    ) {
+        if fi.deleted || !fi.is_valid() {
+            return;
+        }
+
+        let key = GetObjectMetadataCacheKey::new(bucket, object);
+        let mut cache = self.get_object_metadata_cache.write().await;
+        if cache.len() >= GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+            cache.retain(|_, entry| entry.is_fresh());
+            if cache.len() >= GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+                cache.clear();
+            }
+        }
+
+        cache.insert(
+            key,
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                fi: fi.clone(),
+                parts_metadata: parts_metadata.to_vec(),
+                online_disks: online_disks.to_vec(),
+                read_quorum,
+            },
+        );
+    }
+
     pub(super) async fn read_parts(
         disks: &[Option<DiskStore>],
         bucket: &str,
@@ -239,8 +848,116 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>)> {
+        let (ress, errors, _) = Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            false,
+            0,
+        )
+        .await?;
+        Ok((ress, errors))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_observed(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            true,
+            default_parity_count,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_inner(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        observe: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let early_stop_enabled = observe && is_get_metadata_early_stop_enabled();
+        let allow_early_stop = early_stop_enabled && version_id.is_empty() && !healing && !incl_free_versions;
+        if allow_early_stop {
+            return Self::read_all_fileinfo_early_stop(
+                disks,
+                org_bucket,
+                bucket,
+                object,
+                version_id,
+                read_data,
+                healing,
+                incl_free_versions,
+                default_parity_count,
+            )
+            .await;
+        }
+        if early_stop_enabled {
+            rustfs_io_metrics::record_get_object_metadata_early_stop_miss(
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
+            );
+            rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(GET_OBJECT_PATH_LEGACY_DUPLEX, 0);
+        }
+
+        Self::read_all_fileinfo_full_wait(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            observe,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_full_wait(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        observe: bool,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let fanout_start = observe.then(Instant::now);
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
+        let mut observations = observe.then(|| Vec::with_capacity(disks.len()));
         let opts = Arc::new(ReadOptions {
             incl_free_versions,
             read_data,
@@ -258,11 +975,14 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             tokio::spawn(async move {
-                if let Some(disk) = disk {
+                let response_start = observe.then(Instant::now);
+                let result = if let Some(disk) = disk {
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
-                }
+                };
+                let elapsed = response_start.map(|start| start.elapsed());
+                (result, elapsed)
             })
         });
 
@@ -271,23 +991,129 @@ impl SetDisks {
 
         for result in results {
             match result {
-                Ok(res) => match res {
+                Ok((res, elapsed)) => match res {
                     Ok(file_info) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
+                        }
                         ress.push(file_info);
                         errors.push(None);
                     }
                     Err(e) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_error(&e, elapsed));
+                        }
                         ress.push(FileInfo::default());
                         errors.push(Some(e));
                     }
                 },
                 Err(_) => {
+                    let err = DiskError::Unexpected;
+                    if let (Some(observations), Some(fanout_start)) = (&mut observations, fanout_start) {
+                        observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    }
                     ress.push(FileInfo::default());
-                    errors.push(Some(DiskError::Unexpected));
+                    errors.push(Some(err));
                 }
             }
         }
-        Ok((ress, errors))
+        let diagnostics = match (fanout_start, observations) {
+            (Some(fanout_start), Some(observations)) => MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations),
+            _ => MetadataFanoutDiagnostics::default(),
+        };
+        Ok((ress, errors, diagnostics))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_early_stop(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        default_parity_count: usize,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let fanout_start = Instant::now();
+        let mut ress = vec![FileInfo::default(); disks.len()];
+        let mut errors = vec![None; disks.len()];
+        let mut observations = Vec::with_capacity(disks.len());
+        let mut accumulator = MetadataQuorumAccumulator::new(disks.len(), default_parity_count, true);
+        let opts = Arc::new(ReadOptions {
+            incl_free_versions,
+            read_data,
+            healing,
+        });
+        let org_bucket = Arc::new(org_bucket.to_string());
+        let bucket = Arc::new(bucket.to_string());
+        let object = Arc::new(object.to_string());
+        let version_id = Arc::new(version_id.to_string());
+        let mut join_set = JoinSet::new();
+
+        for (index, disk) in disks.iter().cloned().enumerate() {
+            let opts = opts.clone();
+            let org_bucket = org_bucket.clone();
+            let bucket = bucket.clone();
+            let object = object.clone();
+            let version_id = version_id.clone();
+            join_set.spawn(async move {
+                let response_start = Instant::now();
+                let result = if let Some(disk) = disk {
+                    disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
+                } else {
+                    Err(DiskError::DiskNotFound)
+                };
+                (index, result, response_start.elapsed())
+            });
+        }
+
+        while let Some(result) = join_set.join_next().await {
+            match result {
+                Ok((index, res, elapsed)) => match res {
+                    Ok(file_info) => {
+                        observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
+                        accumulator.observe_file_info(&file_info);
+                        if let Some(slot) = ress.get_mut(index) {
+                            *slot = file_info;
+                        }
+                    }
+                    Err(err) => {
+                        observations.push(MetadataFanoutObservation::from_error(&err, elapsed));
+                        accumulator.observe_error(&err);
+                        if let Some(slot) = errors.get_mut(index) {
+                            *slot = Some(err);
+                        }
+                    }
+                },
+                Err(_) => {
+                    let err = DiskError::Unexpected;
+                    observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    accumulator.observe_error(&err);
+                }
+            }
+
+            if let Some(decision) = accumulator.early_stop_decision() {
+                let saved_responses = join_set.len();
+                join_set.abort_all();
+                rustfs_io_metrics::record_get_object_metadata_early_stop_hit(GET_OBJECT_PATH_LEGACY_DUPLEX, decision.reason);
+                rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    saved_responses,
+                );
+                let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+                return Ok((ress, errors, diagnostics));
+            }
+        }
+
+        rustfs_io_metrics::record_get_object_metadata_early_stop_miss(
+            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            accumulator.final_miss_reason(),
+        );
+        rustfs_io_metrics::record_get_object_metadata_early_stop_saved_responses(GET_OBJECT_PATH_LEGACY_DUPLEX, 0);
+        let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
+        Ok((ress, errors, diagnostics))
     }
 
     pub async fn read_version_optimized(
@@ -617,6 +1443,11 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
+        if use_metadata_cache && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await {
+            return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+        }
+
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
@@ -624,8 +1455,19 @@ impl SetDisks {
         let vid = opts.version_id.clone().unwrap_or_default();
 
         // TODO: optimize concurrency and break once enough slots are available
-        let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions).await?;
+        let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
+            &disks,
+            "",
+            bucket,
+            object,
+            vid.as_str(),
+            read_data,
+            false,
+            opts.incl_free_versions,
+            self.default_parity_count,
+        )
+        .await?;
+        metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -640,25 +1482,32 @@ impl SetDisks {
                 return Err(e);
             }
         };
+        let read_quorum =
+            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, read_quorum);
 
-        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize) {
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
+        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum);
 
-        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
+        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum)?;
         if errs.iter().any(|err| err.is_some()) {
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    fi.volume.to_string(),             // bucket
-                    Some(fi.name.to_string()),         // object_prefix
-                    false,                             // force_start
-                    Some(HealChannelPriority::Normal), // priority
-                    Some(self.pool_index),             // pool_index
-                    Some(self.set_index),              // set_index
-                ))
+            let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
+            submit_read_repair_heal(
+                &fi.volume,
+                &fi.name,
+                version_id.as_deref(),
+                self.pool_index,
+                self.set_index,
+                None,
+                "metadata_read_error",
+            )
+            .await;
+        } else if use_metadata_cache {
+            self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
                 .await;
         }
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
@@ -733,19 +1582,56 @@ impl SetDisks {
         let total_size = fi.size as usize;
 
         if offset > total_size {
-            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation failed"
+            );
             return Err(Error::other("offset out of range"));
         }
 
         let length = if length < 0 { total_size - offset } else { length as usize };
 
         let Some(end_offset_exclusive) = offset.checked_add(length) else {
-            error!("get_object_with_fileinfo offset overflow: {}, length: {}", offset, length);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation overflow"
+            );
             return Err(Error::other("offset out of range"));
         };
 
         if end_offset_exclusive > total_size {
-            error!("get_object_with_fileinfo offset out of range: {}, total_size: {}", offset, total_size);
+            let reason = GetObjectFailureReason::RangeOrLengthInvalid;
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, reason);
+            error!(
+                bucket,
+                object,
+                offset,
+                total_size,
+                requested_length = length,
+                end_offset_exclusive,
+                stage = GET_STAGE_RANGE,
+                reason = reason.as_str(),
+                state = "range_or_length_invalid",
+                "GetObject range validation failed"
+            );
             return Err(Error::other("offset out of range"));
         }
 
@@ -825,6 +1711,7 @@ impl SetDisks {
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
+            let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -856,14 +1743,55 @@ impl SetDisks {
                     }
                 }
             }
+            if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(
+                    reader_setup_stage_start.elapsed().as_secs_f64(),
+                );
+            }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
                 if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
-                    error!("create_bitrot_reader reduce_read_quorum_errs {:?}", &errors);
+                    let reason = classify_disk_error(&read_err);
+                    error!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        part_number,
+                        part_offset,
+                        part_length,
+                        read_offset,
+                        till_offset,
+                        total_shards = erasure.data_shards + erasure.parity_shards,
+                        available_shards = nil_count,
+                        data_shards = erasure.data_shards,
+                        stage = GET_STAGE_READER_SETUP,
+                        reason = reason.as_str(),
+                        errors = ?errors,
+                        "Create bitrot reader failed read quorum"
+                    );
+                    record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
                     return Err(to_object_err(read_err.into(), vec![bucket, object]));
                 }
-                error!("create_bitrot_reader not enough disks to read: {:?}", &errors);
+                let reason = GetObjectFailureReason::ReadQuorum;
+                error!(
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_offset,
+                    part_length,
+                    read_offset,
+                    till_offset,
+                    total_shards = erasure.data_shards + erasure.parity_shards,
+                    available_shards = nil_count,
+                    data_shards = erasure.data_shards,
+                    stage = GET_STAGE_READER_SETUP,
+                    reason = reason.as_str(),
+                    errors = ?errors,
+                    "Create bitrot reader did not have enough disks"
+                );
+                record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
                 return Err(Error::other(format!("not enough disks to read: {errors:?}")));
             }
 
@@ -873,7 +1801,7 @@ impl SetDisks {
             let available_shards = nil_count;
             let missing_shards = total_shards - available_shards;
 
-            info!(
+            debug!(
                 bucket,
                 object,
                 part_number,
@@ -887,7 +1815,7 @@ impl SetDisks {
 
             if missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
-                info!(
+                debug!(
                     bucket,
                     object,
                     part_number,
@@ -897,34 +1825,28 @@ impl SetDisks {
                     set_index,
                     "Detected missing shards during read, triggering background heal"
                 );
-                if let Err(e) =
-                    rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                        bucket.to_string(),
-                        Some(object.to_string()),
-                        false,
-                        Some(HealChannelPriority::Normal),
-                        Some(pool_index),
-                        Some(set_index),
-                    ))
-                    .await
-                {
-                    warn!(
-                        bucket,
-                        object,
-                        part_number,
-                        error = %e,
-                        "Failed to enqueue heal request for missing shards"
-                    );
-                } else {
-                    warn!(bucket, object, part_number, "Successfully enqueued heal request for missing shards");
-                }
+                let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                submit_read_repair_heal(
+                    bucket,
+                    object,
+                    version_id.as_deref(),
+                    pool_index,
+                    set_index,
+                    Some(part_number),
+                    "missing_shards",
+                )
+                .await;
             }
 
             // debug!(
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
+            let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
             let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
+            if let Some(decode_stage_start) = decode_stage_start {
+                rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
+            }
             debug!(
                 bucket,
                 object,
@@ -940,27 +1862,24 @@ impl SetDisks {
                 if written == part_length {
                     match de_err {
                         DiskError::FileNotFound | DiskError::FileCorrupt => {
-                            error!("erasure.decode err 111 {:?}", &de_err);
-                            if let Err(e) = rustfs_common::heal_channel::send_heal_request(
-                                rustfs_common::heal_channel::create_heal_request_with_options(
-                                    bucket.to_string(),
-                                    Some(object.to_string()),
-                                    false,
-                                    Some(HealChannelPriority::Normal),
-                                    Some(pool_index),
-                                    Some(set_index),
-                                ),
+                            debug!(
+                                bucket,
+                                object,
+                                part_number,
+                                error = ?de_err,
+                                "Recoverable decode error triggered read repair"
+                            );
+                            let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                            submit_read_repair_heal(
+                                bucket,
+                                object,
+                                version_id.as_deref(),
+                                pool_index,
+                                set_index,
+                                Some(part_number),
+                                "decode_error",
                             )
-                            .await
-                            {
-                                warn!(
-                                    bucket,
-                                    object,
-                                    part_number,
-                                    error = %e,
-                                    "Failed to enqueue heal request after decode error"
-                                );
-                            }
+                            .await;
                             has_err = false;
                         }
                         _ => {}
@@ -968,7 +1887,21 @@ impl SetDisks {
                 }
 
                 if has_err {
-                    error!("erasure.decode err {} {:?}", written, &de_err);
+                    let reason = classify_disk_error(&de_err);
+                    error!(
+                        bucket,
+                        object,
+                        part_index = current_part,
+                        part_number,
+                        part_offset,
+                        part_length,
+                        bytes_written = written,
+                        stage = GET_STAGE_DECODE,
+                        reason = reason.as_str(),
+                        error = ?de_err,
+                        "Erasure decode failed during GetObject"
+                    );
+                    record_get_object_pipeline_failure(GET_STAGE_DECODE, reason);
                     return Err(de_err.into());
                 }
             }
@@ -985,11 +1918,943 @@ impl SetDisks {
 
         Ok(())
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn get_object_decode_reader_with_fileinfo(
+        bucket: &str,
+        object: &str,
+        fi: FileInfo,
+        files: Vec<FileInfo>,
+        disks: &[Option<DiskStore>],
+        set_index: usize,
+        pool_index: usize,
+        skip_verify_bitrot: bool,
+    ) -> Result<Box<dyn AsyncRead + Unpin + Send + Sync>> {
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+        if fi.parts.len() != 1 {
+            return Err(Error::other("codec streaming reader only supports single-part plain objects"));
+        }
+
+        let erasure = erasure_coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        let part = &fi.parts[0];
+        let part_number = part.number;
+        let part_size = part.size;
+        let part_length = usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
+        if part_length > part_size {
+            return Err(Error::other("codec streaming reader part length exceeds part size"));
+        }
+
+        let checksum_info = fi.erasure.get_checksum_info(part_number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+        {
+            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
+        let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+        let till_offset = erasure.shard_file_offset(0, part_length, part_size);
+
+        let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+        let mut readers = Vec::with_capacity(disks.len());
+        let mut errors = Vec::with_capacity(disks.len());
+        for (idx, disk_op) in disks.iter().enumerate() {
+            match create_bitrot_reader(
+                files[idx].data.as_deref(),
+                disk_op.as_ref(),
+                bucket,
+                &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                0,
+                till_offset,
+                erasure.shard_size(),
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_zero_copy,
+            )
+            .await
+            {
+                Ok(Some(reader)) => {
+                    readers.push(Some(reader));
+                    errors.push(None);
+                }
+                Ok(None) => {
+                    readers.push(None);
+                    errors.push(Some(DiskError::DiskNotFound));
+                }
+                Err(e) => {
+                    readers.push(None);
+                    errors.push(Some(e));
+                }
+            }
+        }
+        if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                GET_STAGE_READER_SETUP,
+                reader_setup_stage_start.elapsed().as_secs_f64(),
+            );
+        }
+
+        let available_shards = errors.iter().filter(|err| err.is_none()).count();
+        if available_shards < erasure.data_shards {
+            if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                let reason = classify_disk_error(&read_err);
+                record_get_object_pipeline_failure_for_path(GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_READER_SETUP, reason);
+                return Err(to_object_err(read_err.into(), vec![bucket, object]));
+            }
+            record_get_object_pipeline_failure_for_path(
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                GET_STAGE_READER_SETUP,
+                GetObjectFailureReason::ReadQuorum,
+            );
+            return Err(Error::other(format!("not enough disks to read: {errors:?}")));
+        }
+
+        let total_shards = erasure.data_shards + erasure.parity_shards;
+        let missing_shards = total_shards.saturating_sub(available_shards);
+        if missing_shards > 0 {
+            let version_id = fi.version_id.as_ref().map(ToString::to_string);
+            submit_read_repair_heal(
+                bucket,
+                object,
+                version_id.as_deref(),
+                pool_index,
+                set_index,
+                Some(part_number),
+                "missing_shards_streaming",
+            )
+            .await;
+        }
+
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
+            readers,
+            erasure.clone(),
+            0,
+            part_size,
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
+        let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
+        let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
+        Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))
+    }
+}
+
+fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
+    read_data
+        && !opts.no_lock
+        && opts.version_id.is_none()
+        && !opts.versioned
+        && !opts.version_suspended
+        && !opts.incl_free_versions
+        && !opts.delete_marker
+        && opts.part_number.is_none()
+        && !opts.data_movement
+        && !opts.raw_data_movement_read
+        && !bucket.starts_with(RUSTFS_META_BUCKET)
+}
+
+#[cfg(test)]
+mod metadata_cache_tests {
+    use super::*;
+    use rustfs_common::heal_channel::HealAdmissionDropReason;
+    use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted)
+        })
+    }
+
+    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+        })
+    }
+
+    async fn new_metadata_cache_test_set() -> Arc<SetDisks> {
+        SetDisks::new(
+            "metadata-cache-test".to_string(),
+            Arc::new(RwLock::new(Vec::new())),
+            4,
+            2,
+            0,
+            0,
+            Vec::new(),
+            FormatV3::new(1, 4),
+            Vec::new(),
+        )
+        .await
+    }
+
+    fn valid_test_fileinfo(object: &str) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi
+    }
+
+    #[test]
+    fn get_object_metadata_cache_request_eligibility_is_conservative() {
+        let opts = ObjectOptions::default();
+        assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, false));
+        assert!(!is_get_object_metadata_cache_request_eligible(RUSTFS_META_BUCKET, &opts, true));
+
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            version_id: Some("version".to_string()),
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            version_suspended: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            incl_free_versions: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            part_number: Some(1),
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            data_movement: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+
+        opts = ObjectOptions {
+            raw_data_movement_read: true,
+            ..Default::default()
+        };
+        assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+    }
+
+    #[tokio::test]
+    async fn read_repair_heal_dedupes_same_object_version() {
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_some());
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_none());
+        assert!(
+            reserve_read_repair_heal(&bucket, "object", Some("version-2"), 0, 0)
+                .await
+                .is_some()
+        );
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 1).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_repair_heal_reservation_can_be_released_after_rejection() {
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        let key = reserve_read_repair_heal(&bucket, "object", None, 0, 0)
+            .await
+            .expect("first reservation should be accepted");
+
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_none());
+        release_read_repair_heal_reservation(&key).await;
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_does_not_wait_for_slow_admission() {
+        SLOW_READ_REPAIR_SUBMITTER_CALLS.store(0, Ordering::Relaxed);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        let started = Instant::now();
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
+            slow_read_repair_submitter,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "read-repair submission should not wait for admission response"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while SLOW_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background read-repair submitter should be called");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_releases_reservation_after_policy_drop() {
+        DROPPED_READ_REPAIR_SUBMITTER_CALLS.store(0, Ordering::Relaxed);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
+            dropped_read_repair_submitter,
+        )
+        .await;
+
+        let released_key = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(key) = reserve_read_repair_heal(&bucket, "object", None, 0, 0).await {
+                    break key;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("read-repair reservation should be released after policy drop");
+
+        assert_eq!(DROPPED_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed), 1);
+        release_read_repair_heal_reservation(&released_key).await;
+    }
+
+    #[test]
+    fn resolved_read_repair_version_prefers_selected_fileinfo_version() {
+        let mut fi = valid_test_fileinfo("object");
+        fi.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+
+        assert_eq!(
+            resolved_read_repair_version_id(&fi, Some("00000000-0000-0000-0000-000000000002")).as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+
+        fi.version_id = None;
+        assert_eq!(
+            resolved_read_repair_version_id(&fi, Some("00000000-0000-0000-0000-000000000002")).as_deref(),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_hit_returns_stored_metadata() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+        let parts_metadata = vec![fi.clone()];
+        let online_disks = Vec::new();
+
+        set.cache_get_object_fileinfo("bucket", "object", &fi, &parts_metadata, &online_disks, 0)
+            .await;
+
+        let cached = set
+            .cached_get_object_fileinfo("bucket", "object")
+            .await
+            .expect("fresh cache entry should be returned");
+        assert_eq!(cached.fi.name, "object");
+        assert_eq!(cached.parts_metadata.len(), 1);
+        assert_eq!(cached.online_disks.len(), 0);
+        assert_eq!(cached.read_quorum, 0);
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_rejects_deleted_and_invalid_fileinfo() {
+        let set = new_metadata_cache_test_set().await;
+
+        let mut deleted = valid_test_fileinfo("deleted-object");
+        deleted.deleted = true;
+        set.cache_get_object_fileinfo("bucket", "deleted-object", &deleted, &[deleted.clone()], &[], 0)
+            .await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "deleted-object").await.is_none(),
+            "deleted metadata must not be cached"
+        );
+
+        let invalid = FileInfo::default();
+        set.cache_get_object_fileinfo("bucket", "invalid-object", &invalid, std::slice::from_ref(&invalid), &[], 0)
+            .await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "invalid-object").await.is_none(),
+            "invalid metadata must not be cached"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_requires_cached_read_quorum() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.get_object_metadata_cache.write().await.insert(
+            GetObjectMetadataCacheKey::new("bucket", "object"),
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now(),
+                fi: fi.clone(),
+                parts_metadata: vec![fi],
+                online_disks: vec![None],
+                read_quorum: 1,
+            },
+        );
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "cache hit must be rejected when cached online disks cannot satisfy read quorum"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_rejects_stale_entries() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.get_object_metadata_cache.write().await.insert(
+            GetObjectMetadataCacheKey::new("bucket", "object"),
+            GetObjectMetadataCacheEntry {
+                created_at: Instant::now() - GET_OBJECT_METADATA_CACHE_TTL - Duration::from_millis(1),
+                fi: fi.clone(),
+                parts_metadata: vec![fi],
+                online_disks: Vec::new(),
+                read_quorum: 0,
+            },
+        );
+
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "stale cache entry must not be returned"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_invalidation_removes_object_entry() {
+        let set = new_metadata_cache_test_set().await;
+        let fi = valid_test_fileinfo("object");
+
+        set.cache_get_object_fileinfo("bucket", "object", &fi, std::slice::from_ref(&fi), &[], 0)
+            .await;
+        assert!(set.cached_get_object_fileinfo("bucket", "object").await.is_some());
+
+        set.invalidate_get_object_metadata_cache("bucket", "object").await;
+        assert!(
+            set.cached_get_object_fileinfo("bucket", "object").await.is_none(),
+            "explicit invalidation must remove the cached object metadata"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_object_metadata_cache_prunes_when_capacity_is_reached() {
+        let set = new_metadata_cache_test_set().await;
+        let stale_fi = valid_test_fileinfo("stale-object");
+        let fresh_fi = valid_test_fileinfo("fresh-object");
+        {
+            let mut cache = set.get_object_metadata_cache.write().await;
+            for idx in 0..GET_OBJECT_METADATA_CACHE_MAX_ENTRIES {
+                cache.insert(
+                    GetObjectMetadataCacheKey::new("bucket", &format!("stale-object-{idx}")),
+                    GetObjectMetadataCacheEntry {
+                        created_at: Instant::now() - GET_OBJECT_METADATA_CACHE_TTL - Duration::from_millis(1),
+                        fi: stale_fi.clone(),
+                        parts_metadata: vec![stale_fi.clone()],
+                        online_disks: Vec::new(),
+                        read_quorum: 0,
+                    },
+                );
+            }
+        }
+
+        set.cache_get_object_fileinfo("bucket", "fresh-object", &fresh_fi, std::slice::from_ref(&fresh_fi), &[], 0)
+            .await;
+
+        let cache = set.get_object_metadata_cache.read().await;
+        assert_eq!(cache.len(), 1);
+        assert!(cache.contains_key(&GetObjectMetadataCacheKey::new("bucket", "fresh-object")));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn metadata_fanout_test_fileinfo(object: &str) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi
+    }
+
+    fn codec_streaming_test_fileinfo(size: i64, part_count: usize) -> FileInfo {
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = size;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+
+        let size = usize::try_from(size).expect("test object size should fit usize");
+        let part_count = part_count.max(1);
+        let part_size = size.div_ceil(part_count);
+        for index in 0..part_count {
+            let remaining = size.saturating_sub(index * part_size);
+            let current_part_size = remaining.min(part_size);
+            fi.add_object_part(
+                index + 1,
+                format!("etag-{index}"),
+                current_part_size,
+                None,
+                i64::try_from(current_part_size).expect("test part size should fit i64"),
+                None,
+                None,
+            );
+        }
+
+        fi
+    }
+
+    #[test]
+    fn metadata_fanout_diagnostics_classifies_response_outcomes() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let invalid = FileInfo::default();
+
+        let observations = vec![
+            MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(3)),
+            MetadataFanoutObservation::from_file_info(&invalid, Duration::from_millis(4)),
+            MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(5)),
+            MetadataFanoutObservation::from_error(&DiskError::FileVersionNotFound, Duration::from_millis(6)),
+            MetadataFanoutObservation::from_error(&DiskError::DiskNotFound, Duration::from_millis(7)),
+            MetadataFanoutObservation::from_error(&DiskError::FileCorrupt, Duration::from_millis(8)),
+            MetadataFanoutObservation::from_error(&DiskError::Timeout, Duration::from_millis(9)),
+            MetadataFanoutObservation::from_error(&DiskError::FaultyDisk, Duration::from_millis(10)),
+            MetadataFanoutObservation::from_error(&DiskError::Unexpected, Duration::from_millis(11)),
+        ];
+        let diagnostics = MetadataFanoutDiagnostics::new(Duration::from_millis(12), observations);
+        let outcomes = diagnostics
+            .observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes,
+            vec![
+                GET_METADATA_RESPONSE_VALID,
+                GET_METADATA_RESPONSE_ERROR,
+                GET_METADATA_RESPONSE_NOT_FOUND,
+                GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+                GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+                GET_METADATA_RESPONSE_CORRUPT,
+                GET_METADATA_RESPONSE_TIMEOUT,
+                GET_METADATA_RESPONSE_IGNORED,
+                GET_METADATA_RESPONSE_ERROR,
+            ]
+        );
+        assert_eq!(diagnostics.total_responses(), 9);
+        assert_eq!(diagnostics.valid_responses(), 1);
+        assert_eq!(diagnostics.error_responses(), 8);
+    }
+
+    #[test]
+    fn metadata_fanout_diagnostics_tracks_ignored_errors_without_hiding_outcomes() {
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(15),
+            vec![
+                MetadataFanoutObservation::from_error(&DiskError::DiskNotFound, Duration::from_millis(1)),
+                MetadataFanoutObservation::from_error(&DiskError::FaultyRemoteDisk, Duration::from_millis(2)),
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(3)),
+            ],
+        );
+
+        assert_eq!(diagnostics.ignored_responses(), 2);
+        assert_eq!(diagnostics.error_responses(), 3);
+        assert_eq!(diagnostics.observations[0].outcome, GET_METADATA_RESPONSE_DISK_NOT_FOUND);
+        assert_eq!(diagnostics.observations[1].outcome, GET_METADATA_RESPONSE_IGNORED);
+        assert_eq!(diagnostics.observations[2].outcome, GET_METADATA_RESPONSE_NOT_FOUND);
+    }
+
+    #[test]
+    fn metadata_fanout_quorum_candidate_latency_ignores_slow_trailing_valid_response() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(250),
+            vec![
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(2)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(5)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(7)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(250)),
+            ],
+        );
+
+        assert_eq!(diagnostics.first_response_latency(), Some(Duration::from_millis(2)));
+        assert_eq!(diagnostics.first_valid_response_latency(), Some(Duration::from_millis(5)));
+        assert_eq!(diagnostics.slowest_response_latency(), Some(Duration::from_millis(250)));
+        assert_eq!(diagnostics.quorum_candidate_latency(2), Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn metadata_fanout_quorum_candidate_latency_requires_enough_valid_responses() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(8),
+            vec![
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(5)),
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(6)),
+            ],
+        );
+
+        assert_eq!(diagnostics.quorum_candidate_latency(0), Some(Duration::ZERO));
+        assert_eq!(diagnostics.quorum_candidate_latency(1), Some(Duration::from_millis(5)));
+        assert_eq!(diagnostics.quorum_candidate_latency(2), None);
+    }
+
+    #[test]
+    fn metadata_fanout_counts_delete_marker_and_conflicting_versions_as_valid_observations_only() {
+        let mut latest = metadata_fanout_test_fileinfo("object");
+        latest.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+
+        let mut historical = metadata_fanout_test_fileinfo("object");
+        historical.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        let mut delete_marker = metadata_fanout_test_fileinfo("object");
+        delete_marker.deleted = true;
+        delete_marker.version_id =
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse"));
+
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(9),
+            vec![
+                MetadataFanoutObservation::from_file_info(&latest, Duration::from_millis(3)),
+                MetadataFanoutObservation::from_file_info(&historical, Duration::from_millis(4)),
+                MetadataFanoutObservation::from_file_info(&delete_marker, Duration::from_millis(5)),
+            ],
+        );
+
+        assert_eq!(diagnostics.total_responses(), 3);
+        assert_eq!(diagnostics.valid_responses(), 3);
+        assert_eq!(diagnostics.error_responses(), 0);
+        assert!(
+            diagnostics
+                .observations
+                .iter()
+                .all(|observation| observation.outcome == GET_METADATA_RESPONSE_VALID)
+        );
+    }
+
+    fn metadata_early_stop_accumulator() -> MetadataQuorumAccumulator {
+        MetadataQuorumAccumulator::new(4, 2, true)
+    }
+
+    fn metadata_early_stop_candidate(object: &str, disk_index: usize) -> FileInfo {
+        let mut fi = metadata_fanout_test_fileinfo(object);
+        fi.erasure.index = disk_index;
+        fi.add_object_part(1, "part-etag-1".to_string(), 1, None, 1, None, None);
+        fi
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_hits_all_valid_same_version() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
+        assert!(accumulator.early_stop_decision().is_none());
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+
+        assert_eq!(
+            accumulator.early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM
+            })
+        );
+        assert_eq!(accumulator.valid_responses, 2);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_hits_quorum_valid_with_slow_trailing_disk() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+
+        assert!(accumulator.early_stop_decision().is_some());
+        assert_eq!(accumulator.candidate_votes, 2);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_partial_result_remains_quorum_compatible() {
+        let first = metadata_early_stop_candidate("object", 1);
+        let second = metadata_early_stop_candidate("object", 2);
+        let parts_metadata = vec![first.clone(), second, FileInfo::default(), FileInfo::default()];
+        let errs = vec![None, None, None, None];
+
+        let (read_quorum, _) = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+            .expect("partial early-stop metadata should preserve read quorum");
+        let read_quorum = usize::try_from(read_quorum).expect("read quorum should be non-negative");
+        let selected = SetDisks::pick_valid_fileinfo(&parts_metadata, None, Some("etag-1".to_string()), read_quorum)
+            .expect("partial early-stop metadata should preserve selected FileInfo");
+
+        assert_eq!(read_quorum, 2);
+        assert_eq!(selected.name, first.name);
+        assert_eq!(selected.get_etag(), first.get_etag());
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_conflicting_versions() {
+        let mut accumulator = metadata_early_stop_accumulator();
+        let first = metadata_early_stop_candidate("object", 1);
+        let mut second = metadata_early_stop_candidate("object", 2);
+        second.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_explicit_version_quorum() {
+        let mut accumulator = MetadataQuorumAccumulator::new(4, 2, false);
+
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_delete_marker_latest() {
+        let mut accumulator = metadata_early_stop_accumulator();
+        let mut deleted = metadata_early_stop_candidate("object", 1);
+        deleted.deleted = true;
+
+        accumulator.observe_file_info(&deleted);
+        accumulator.observe_file_info(&deleted);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_object_not_found_quorum() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_error(&DiskError::FileNotFound);
+        accumulator.observe_error(&DiskError::VolumeNotFound);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_NOT_FOUND);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_version_not_found_quorum() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_error(&DiskError::FileVersionNotFound);
+        accumulator.observe_error(&DiskError::FileVersionNotFound);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_insufficient_quorum() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_mixed_corrupt_and_valid() {
+        let mut accumulator = metadata_early_stop_accumulator();
+
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 1));
+        accumulator.observe_error(&DiskError::FileCorrupt);
+        accumulator.observe_file_info(&metadata_early_stop_candidate("object", 2));
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_ERROR);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_uses_same_gate_for_head_and_get() {
+        let mut get_accumulator = metadata_early_stop_accumulator();
+        let mut head_accumulator = metadata_early_stop_accumulator();
+
+        for disk_index in [1, 2] {
+            let fi = metadata_early_stop_candidate("object", disk_index);
+            get_accumulator.observe_file_info(&fi);
+            head_accumulator.observe_file_info(&fi);
+        }
+
+        assert_eq!(get_accumulator.early_stop_decision(), head_accumulator.early_stop_decision());
+        assert_eq!(get_accumulator.final_miss_reason(), head_accumulator.final_miss_reason());
+    }
+
+    #[test]
+    fn metadata_early_stop_gate_defaults_to_disabled() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
+            assert!(!is_get_metadata_early_stop_enabled());
+        });
+    }
+
+    fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {
+        ObjectInfo::from_file_info(fi, "bucket", "object", false)
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_is_conservative() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Use
+                );
+
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, false),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled)
+                );
+
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: 1,
+                });
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&range, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range)
+                );
+
+                let multipart_fi = codec_streaming_test_fileinfo(1024, 2);
+                let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &multipart_object_info, &multipart_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
+                );
+
+                let mut encrypted_fi = fi.clone();
+                encrypted_fi
+                    .metadata
+                    .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+                let encrypted = codec_streaming_test_object_info(&encrypted_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &encrypted, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
+                );
+
+                let mut compressed_fi = fi.clone();
+                insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
+                let compressed = codec_streaming_test_object_info(&compressed_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &compressed, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
+                );
+
+                let small_fi = codec_streaming_test_fileinfo(0, 1);
+                let small_object_info = codec_streaming_test_object_info(&small_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &small_object_info, &small_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
+                );
+
+                let mut remote_fi = fi;
+                remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+                let remote = codec_streaming_test_object_info(&remote_fi);
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &remote, &remote_fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_fallback_metric_labels_are_stable() {
+        assert_eq!(GetCodecStreamingFallbackReason::Disabled.as_str(), "disabled");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::LockOptimizationDisabled.as_str(),
+            "lock_optimization_disabled"
+        );
+        assert_eq!(GetCodecStreamingFallbackReason::Range.as_str(), "range");
+        assert_eq!(GetCodecStreamingFallbackReason::BelowMinSize.as_str(), "below_min_size");
+        assert_eq!(GetCodecStreamingFallbackReason::Encrypted.as_str(), "encrypted");
+        assert_eq!(GetCodecStreamingFallbackReason::Compressed.as_str(), "compressed");
+        assert_eq!(GetCodecStreamingFallbackReason::Remote.as_str(), "remote");
+        assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
+        assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_defaults_to_disabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
+                );
+            },
+        );
+    }
 
     #[tokio::test]
     async fn collect_read_multiple_results_fails_early_when_quorum_is_impossible() {

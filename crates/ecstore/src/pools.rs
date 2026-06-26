@@ -27,6 +27,7 @@ use crate::bucket::{
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
 use crate::data_movement;
+use crate::data_movement_backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -39,6 +40,13 @@ use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
+use crate::storage_api_contracts::{
+    admin::StorageAdminApi,
+    bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
+    heal::HealOperations as _,
+    namespace::NamespaceLocking as _,
+    object::{ObjectIO as _, ObjectOperations as _},
+};
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
@@ -49,10 +57,6 @@ use rmp_serde::Serializer;
 use rustfs_common::defer;
 use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::{FileInfoVersions, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _,
-    ObjectOperations as _, StorageAdminApi,
-};
 use rustfs_utils::path::{encode_dir_object, path_join, path_to_bucket_object, path_to_bucket_object_with_base_path};
 use s3s::dto::{BucketLifecycleConfiguration, DefaultRetention, ReplicationConfiguration};
 use serde::{Deserialize, Serialize};
@@ -750,6 +754,44 @@ fn apply_decommission_status_space_info(mut pool_info: PoolStatus, space_info: P
     }
 
     pool_info
+}
+
+fn should_replace_pool_status_for_status_refresh(
+    current: Option<&PoolStatus>,
+    persisted: &PoolStatus,
+    has_active_worker: bool,
+) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+
+    !has_active_worker && persisted.last_update > current.last_update
+}
+
+fn merge_pool_status_refresh(current: &mut PoolMeta, persisted: PoolMeta, active_workers: &[bool]) {
+    if persisted.pools.is_empty() {
+        return;
+    }
+
+    if current.pools.is_empty() {
+        *current = persisted;
+        return;
+    }
+
+    for (idx, persisted_pool) in persisted.pools.into_iter().enumerate() {
+        if persisted_pool.id != idx {
+            continue;
+        }
+
+        let has_active_worker = active_workers.get(idx).copied().unwrap_or(false);
+        if idx < current.pools.len() {
+            if should_replace_pool_status_for_status_refresh(current.pools.get(idx), &persisted_pool, has_active_worker) {
+                current.pools[idx] = persisted_pool;
+            }
+        } else if idx == current.pools.len() && !has_active_worker {
+            current.pools.push(persisted_pool);
+        }
+    }
 }
 
 fn resolve_start_decommission_pool_meta_reload_result(result: Result<()>) -> Result<()> {
@@ -2217,6 +2259,26 @@ impl ECStore {
         Ok(apply_decommission_status_space_info(pool_info, space_info))
     }
 
+    #[tracing::instrument(skip_all)]
+    pub async fn refresh_pool_status_meta(&self) -> Result<()> {
+        let pool = self
+            .pools
+            .first()
+            .cloned()
+            .ok_or_else(|| Error::other("refresh_pool_status_meta: no pools available"))?;
+        let mut persisted = PoolMeta::default();
+        persisted.load(pool, self.pools.clone()).await?;
+
+        let active_workers = {
+            let cancelers = self.decommission_cancelers.read().await;
+            cancelers.iter().map(Option::is_some).collect::<Vec<_>>()
+        };
+
+        let mut pool_meta = self.pool_meta.write().await;
+        merge_pool_status_refresh(&mut pool_meta, persisted, &active_workers);
+        Ok(())
+    }
+
     async fn get_decommission_pool_space_info(&self, idx: usize) -> Result<PoolSpaceInfo> {
         if let Some(sets) = self.pools.get(idx) {
             let mut info = sets.storage_info_snapshot().await;
@@ -3054,7 +3116,40 @@ impl ECStore {
                     let callback_rx = callback_rx.clone();
 
                     Box::pin(async move {
-                        let worker_permit = match workers.clone().acquire_owned().await {
+                        if callback_rx.is_cancelled() {
+                            return;
+                        }
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
+
+                        if let Err(err) = data_movement_backpressure::wait_for_data_movement_admission(
+                            DataMovementOperation::Decommission,
+                            idx,
+                            &callback_rx,
+                        )
+                        .await
+                        {
+                            if matches!(err, Error::OperationCanceled) {
+                                return;
+                            }
+                            error!("decommission_pool: data movement admission failed: {err}");
+                            let mut first_err = entry_error.lock().await;
+                            if first_err.is_none() {
+                                *first_err = Some(err);
+                                callback_rx.cancel();
+                            }
+                            return;
+                        }
+
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
+
+                        let worker_permit = match tokio::select! {
+                            _ = callback_rx.cancelled() => return,
+                            permit = workers.clone().acquire_owned() => permit,
+                        } {
                             Ok(permit) => permit,
                             Err(err) => {
                                 let err = Error::other(format!("decommission entry worker permit acquire failed: {err}"));
@@ -3067,6 +3162,9 @@ impl ECStore {
                                 return;
                             }
                         };
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
                         let entry_rx = callback_rx.clone();
                         if let Err(err) = this
                             .decommission_entry(
@@ -4808,22 +4906,23 @@ mod pools_tests {
         ensure_local_decommission_pool_leaders, ensure_valid_decommission_pool_index, first_resumable_decommission_queue_indices,
         get_by_index, has_active_decommission_canceler, is_decommission_active, is_decommission_cancel_requested,
         load_decommission_entry_versions, local_decommission_queue_prefix, mark_decommission_bucket_done,
-        missing_decommission_worker_prefix, observe_decommission_terminal_reload_result, pool_meta_has_active_decommission,
-        require_decommission_store, resolve_decommission_bucket_done_save_result, resolve_decommission_bucket_state,
-        resolve_decommission_check_after_list_result, resolve_decommission_entry_cleanup_delete_result,
-        resolve_decommission_entry_exact_versions, resolve_decommission_entry_reload_result,
-        resolve_decommission_listing_worker_result, resolve_decommission_optional_bucket_config_result,
-        resolve_decommission_pool_meta_reload_result, resolve_decommission_preflight_heal_result,
-        resolve_decommission_progress_save_result, resolve_decommission_spawn_failure_result,
-        resolve_decommission_terminal_mark_after_error_result, resolve_decommission_terminal_mark_result,
-        resolve_decommission_update_after_result, resolve_start_decommission_pool_meta_reload_result,
-        rollback_start_decommission_pool_meta, run_decommission_buckets_bounded, should_cleanup_decommission_source_entry,
-        should_continue_decommission_queue, should_count_decommission_version_complete,
-        should_preserve_decommission_canceled_state, should_reject_decommission_cancel_as_terminal,
-        should_retry_decommission_cancel_reload, should_skip_canceled_decommission_routine, split_decommission_buckets,
-        take_and_cancel_decommission_canceler, take_decommission_canceler, touch_decommission_progress,
-        track_decommission_current_object, track_decommission_current_object_stage, validate_start_decommission_request,
-        wait_decommission_worker_drain, with_decommission_entry_context,
+        merge_pool_status_refresh, missing_decommission_worker_prefix, observe_decommission_terminal_reload_result,
+        pool_meta_has_active_decommission, require_decommission_store, resolve_decommission_bucket_done_save_result,
+        resolve_decommission_bucket_state, resolve_decommission_check_after_list_result,
+        resolve_decommission_entry_cleanup_delete_result, resolve_decommission_entry_exact_versions,
+        resolve_decommission_entry_reload_result, resolve_decommission_listing_worker_result,
+        resolve_decommission_optional_bucket_config_result, resolve_decommission_pool_meta_reload_result,
+        resolve_decommission_preflight_heal_result, resolve_decommission_progress_save_result,
+        resolve_decommission_spawn_failure_result, resolve_decommission_terminal_mark_after_error_result,
+        resolve_decommission_terminal_mark_result, resolve_decommission_update_after_result,
+        resolve_start_decommission_pool_meta_reload_result, rollback_start_decommission_pool_meta,
+        run_decommission_buckets_bounded, should_cleanup_decommission_source_entry, should_continue_decommission_queue,
+        should_count_decommission_version_complete, should_preserve_decommission_canceled_state,
+        should_reject_decommission_cancel_as_terminal, should_retry_decommission_cancel_reload,
+        should_skip_canceled_decommission_routine, split_decommission_buckets, take_and_cancel_decommission_canceler,
+        take_decommission_canceler, touch_decommission_progress, track_decommission_current_object,
+        track_decommission_current_object_stage, validate_start_decommission_request, wait_decommission_worker_drain,
+        with_decommission_entry_context,
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
@@ -4908,6 +5007,131 @@ mod pools_tests {
         let decommission = status.decommission.expect("active decommission info should remain present");
         assert_eq!(decommission.total_size, 100);
         assert_eq!(decommission.current_size, 25);
+    }
+
+    #[test]
+    fn test_merge_pool_status_refresh_uses_persisted_terminal_decommission() {
+        let older = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let newer = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let mut current = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: older,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(older),
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let persisted = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: newer,
+                decommission: Some(PoolDecommissionInfo {
+                    complete: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        merge_pool_status_refresh(&mut current, persisted, &[false]);
+
+        let info = current.pools[0]
+            .decommission
+            .as_ref()
+            .expect("decommission info should be present");
+        assert!(info.complete);
+        assert!(!info.failed);
+        assert!(!info.canceled);
+    }
+
+    #[test]
+    fn test_merge_pool_status_refresh_keeps_newer_local_active_progress() {
+        let older = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let newer = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let mut current = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: newer,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(older),
+                    items_decommissioned: 10,
+                    bytes_done: 1_024,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let persisted = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: older,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(older),
+                    items_decommissioned: 1,
+                    bytes_done: 128,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        merge_pool_status_refresh(&mut current, persisted, &[true]);
+
+        let info = current.pools[0]
+            .decommission
+            .as_ref()
+            .expect("local decommission info should remain present");
+        assert_eq!(info.items_decommissioned, 10);
+        assert_eq!(info.bytes_done, 1_024);
+    }
+
+    #[test]
+    fn test_merge_pool_status_refresh_keeps_newer_local_active_over_older_terminal() {
+        let older = OffsetDateTime::from_unix_timestamp(1_000).expect("test timestamp should be valid");
+        let newer = OffsetDateTime::from_unix_timestamp(2_000).expect("test timestamp should be valid");
+        let mut current = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: newer,
+                decommission: Some(PoolDecommissionInfo {
+                    start_time: Some(older),
+                    items_decommissioned: 10,
+                    bytes_done: 1_024,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+        let persisted = PoolMeta {
+            pools: vec![PoolStatus {
+                id: 0,
+                cmd_line: "pool-0".to_string(),
+                last_update: older,
+                decommission: Some(PoolDecommissionInfo {
+                    failed: true,
+                    ..Default::default()
+                }),
+            }],
+            ..Default::default()
+        };
+
+        merge_pool_status_refresh(&mut current, persisted, &[true]);
+
+        let info = current.pools[0]
+            .decommission
+            .as_ref()
+            .expect("local active decommission info should remain present");
+        assert!(!info.failed);
+        assert_eq!(info.items_decommissioned, 10);
+        assert_eq!(info.bytes_done, 1_024);
     }
 
     #[test]

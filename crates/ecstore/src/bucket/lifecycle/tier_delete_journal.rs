@@ -24,9 +24,13 @@ use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::{
+    list::ListOperations as _,
+    object::{DeletedObject, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
+};
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ListOperations as _, ObjectIO, ObjectOperations, ObjectToDelete};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_LIFECYCLE: &str = "lifecycle";

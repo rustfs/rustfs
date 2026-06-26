@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::app::context::resolve_internode_metrics;
+use crate::storage::runtime_sources;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC,
 };
@@ -35,6 +35,14 @@ fn encode_msgpack<T: serde::Serialize>(value: &T, value_name: &str) -> std::resu
     value
         .serialize(&mut serializer)
         .map_err(|err| DiskError::other(format!("encode {value_name} msgpack failed: {err}")))?;
+    Ok(serializer.into_inner())
+}
+
+fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std::result::Result<Vec<u8>, DiskError> {
+    let mut serializer = rmp_serde::Serializer::new(Vec::new()).with_struct_map();
+    value
+        .serialize(&mut serializer)
+        .map_err(|err| DiskError::other(format!("encode {value_name} named msgpack failed: {err}")))?;
     Ok(serializer.into_inner())
 }
 
@@ -629,12 +637,13 @@ impl NodeService {
     ) -> Result<Response<RenameDataResponse>, Status> {
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await {
-            let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
+            let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
                     return Ok(Response::new(RenameDataResponse {
                         success: false,
                         rename_data_resp: String::new(),
+                        rename_data_resp_bin: Vec::new().into(),
                         error: Some(DiskError::other(format!("decode FileInfo failed: {err}")).into()),
                     }));
                 }
@@ -644,25 +653,33 @@ impl NodeService {
                 .await
             {
                 Ok(rename_data_resp) => {
-                    let rename_data_resp = match serde_json::to_string(&rename_data_resp) {
-                        Ok(file_info) => file_info,
-                        Err(err) => {
-                            return Ok(Response::new(RenameDataResponse {
-                                success: false,
-                                rename_data_resp: String::new(),
-                                error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
-                            }));
-                        }
-                    };
-                    Ok(Response::new(RenameDataResponse {
-                        success: true,
-                        rename_data_resp,
-                        error: None,
-                    }))
+                    let rename_data_resp_json = serde_json::to_string(&rename_data_resp);
+                    let rename_data_resp_bin = encode_msgpack_named(&rename_data_resp, "RenameDataResp");
+                    match (rename_data_resp_json, rename_data_resp_bin) {
+                        (Ok(rename_data_resp), Ok(rename_data_resp_bin)) => Ok(Response::new(RenameDataResponse {
+                            success: true,
+                            rename_data_resp,
+                            rename_data_resp_bin: rename_data_resp_bin.into(),
+                            error: None,
+                        })),
+                        (Err(err), _) => Ok(Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                        (_, Err(err)) => Ok(Response::new(RenameDataResponse {
+                            success: false,
+                            rename_data_resp: String::new(),
+                            rename_data_resp_bin: Vec::new().into(),
+                            error: Some(DiskError::other(format!("encode data failed: {err}")).into()),
+                        })),
+                    }
                 }
                 Err(err) => Ok(Response::new(RenameDataResponse {
                     success: false,
                     rename_data_resp: String::new(),
+                    rename_data_resp_bin: Vec::new().into(),
                     error: Some(err.into()),
                 })),
             }
@@ -670,6 +687,7 @@ impl NodeService {
             Ok(Response::new(RenameDataResponse {
                 success: false,
                 rename_data_resp: String::new(),
+                rename_data_resp_bin: Vec::new().into(),
                 error: Some(DiskError::other("can not find disk".to_string()).into()),
             }))
         }
@@ -934,7 +952,7 @@ impl NodeService {
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         let data_len = request.data.len();
-        let metrics = resolve_internode_metrics();
+        let metrics = runtime_sources::internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_WRITE_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
@@ -974,7 +992,7 @@ impl NodeService {
         debug!("read all");
 
         let request = request.into_inner();
-        let metrics = resolve_internode_metrics();
+        let metrics = runtime_sources::internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_READ_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,

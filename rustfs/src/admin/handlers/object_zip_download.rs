@@ -13,12 +13,16 @@
 // limitations under the License.
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
-use crate::app::context::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
+use crate::admin::storage_api::access::{ReqInfo, authorize_request};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
+use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
-use crate::storage::access::{ReqInfo, authorize_request};
 use aes_gcm::{
     Aes256Gcm, Key, Nonce,
     aead::{Aead, KeyInit},
@@ -31,7 +35,6 @@ use matchit::Params;
 use rand::RngExt;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_storage_api::{BucketOperations, ListOperations as _, ObjectIO as _, ObjectOperations as _, bucket::BucketOptions};
 use rustfs_trusted_proxies::{ClientInfo, ValidationMode};
 use rustfs_utils::{base64_decode_url_safe_no_pad, base64_encode_url_safe_no_pad};
 use s3s::{Body, S3Request, S3Response, S3Result, dto::StreamingBlob, header::CONTENT_TYPE, s3_error};
@@ -46,8 +49,6 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_util::io::ReaderStream;
 use url::form_urlencoded;
 use uuid::Uuid;
-
-use crate::storage::StorageObjectOptions as ObjectOptions;
 
 const OBJECT_ZIP_DOWNLOAD_TOKEN_TTL: Duration = Duration::minutes(5);
 const ZIP_STREAM_BUFFER_SIZE: usize = 1024 * 1024;
@@ -647,7 +648,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: super::super::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 

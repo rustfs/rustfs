@@ -14,13 +14,18 @@
 
 //! Admin application use-case contracts.
 
-use super::ECStore;
-use super::EndpointServerPools;
-use super::get_server_info;
-use super::{PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free};
-use super::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
-use crate::app::context::{
-    AppContext, get_global_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
+use super::storage_api::admin_usecase::StorageAdminApi;
+use super::storage_api::admin_usecase::admin::get_server_info;
+use super::storage_api::admin_usecase::capacity::{
+    PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
+};
+use super::storage_api::admin_usecase::data_usage::{
+    apply_bucket_usage_memory_overlay, load_data_usage_from_backend, refresh_versioned_bucket_usage_from_object_layer,
+    replace_bucket_usage_memory_from_info,
+};
+use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
+use crate::app::runtime_sources::{
+    AppContext, current_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
 };
 use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{ClusterReadOnlySnapshot, collect_cluster_read_only_snapshot};
@@ -28,7 +33,6 @@ use crate::error::ApiError;
 use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
-use rustfs_storage_api::StorageAdminApi;
 use s3s::S3ErrorCode;
 use std::sync::Arc;
 use tracing::{debug, error, info, warn};
@@ -180,7 +184,7 @@ impl DefaultAdminUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
@@ -205,6 +209,20 @@ impl DefaultAdminUsecase {
         Self::app_error(code, message)
     }
 
+    async fn refresh_rebalance_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
+        store.refresh_rebalance_status_meta().await.map_err(|err| {
+            error!("refresh rebalance metadata for pool status failed: {:?}", err);
+            ApiError::from(err)
+        })
+    }
+
+    async fn refresh_pool_status_snapshot(store: &ECStore) -> AdminUsecaseResult<()> {
+        store.refresh_pool_status_meta().await.map_err(|err| {
+            error!("refresh pool metadata for pool status failed: {:?}", err);
+            ApiError::from(err)
+        })
+    }
+
     pub async fn execute_query_server_info(&self, req: QueryServerInfoRequest) -> AdminUsecaseResult<QueryServerInfoResponse> {
         let info = get_server_info(req.include_pools).await;
         Ok(QueryServerInfoResponse { info })
@@ -227,6 +245,8 @@ impl DefaultAdminUsecase {
             error!("load_data_usage_from_backend failed {:?}", e);
             Self::app_error(S3ErrorCode::InternalError, "load_data_usage_from_backend failed")
         })?;
+        refresh_versioned_bucket_usage_from_object_layer(store.clone(), &mut info).await;
+        replace_bucket_usage_memory_from_info(&info).await;
         apply_bucket_usage_memory_overlay(&mut info).await;
 
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
@@ -310,6 +330,8 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error_default(S3ErrorCode::NotImplemented));
         }
 
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
+
         let mut pool_statuses = Vec::new();
         for (idx, _) in endpoints.as_ref().iter().enumerate() {
             let state = store.status(idx).await.map_err(ApiError::from)?;
@@ -324,6 +346,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
         let pool_statuses = self.execute_list_pool_statuses().await?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
         let mut items = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
             let rebalance_status = store.pool_rebalance_status(status.id).await;
@@ -362,7 +385,9 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
         let status = store.status(idx).await.map_err(ApiError::from)?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
         let rebalance_status = store.pool_rebalance_status(idx).await;
         Ok(Self::pool_list_item_from_status(status, rebalance_status))
     }
@@ -372,6 +397,7 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
         let pool_statuses = self.execute_list_pool_statuses().await?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
         let mut pools = Vec::with_capacity(pool_statuses.len());
         for status in pool_statuses {
             let rebalance_status = store.pool_rebalance_status(status.id).await;
@@ -398,7 +424,9 @@ impl DefaultAdminUsecase {
             return Err(Self::app_error(S3ErrorCode::InternalError, "Not init"));
         };
 
+        Self::refresh_pool_status_snapshot(store.as_ref()).await?;
         let status = store.status(idx).await.map_err(ApiError::from)?;
+        Self::refresh_rebalance_status_snapshot(store.as_ref()).await?;
         let rebalance_status = store.pool_rebalance_status(idx).await;
         Ok(Self::decommission_pool_status_from_status(status, rebalance_status))
     }
@@ -574,7 +602,7 @@ impl DefaultAdminUsecase {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{PoolDecommissionInfo, PoolStatus};
+    use super::super::storage_api::admin_usecase::capacity::{PoolDecommissionInfo, PoolStatus};
     use super::*;
     use time::OffsetDateTime;
 

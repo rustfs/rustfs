@@ -172,6 +172,7 @@ impl SizeSummary {
     pub fn actions_accounting(&mut self, oi: &ObjectInfo, size: i64, actual_size: i64) {
         if oi.delete_marker {
             self.delete_markers += 1;
+            return;
         }
 
         if oi.version_id.is_some_and(|v| !v.is_nil()) && size == actual_size {
@@ -180,7 +181,7 @@ impl SizeSummary {
 
         self.total_size += if size > 0 { size as usize } else { 0 };
 
-        if oi.delete_marker || oi.transitioned_object.free_version {
+        if oi.transitioned_object.free_version {
             return;
         }
 
@@ -1063,6 +1064,22 @@ mod tests {
 
         assert_eq!(summary1.total_size, 300);
         assert_eq!(summary1.versions, 15);
+    }
+
+    #[test]
+    fn size_summary_counts_delete_markers_separately_from_versions() {
+        let mut summary = SizeSummary::new();
+        let marker = ObjectInfo {
+            delete_marker: true,
+            version_id: Some(uuid::Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        summary.actions_accounting(&marker, 0, 0);
+
+        assert_eq!(summary.delete_markers, 1);
+        assert_eq!(summary.versions, 0);
+        assert_eq!(summary.total_size, 0);
     }
 
     #[test]

@@ -26,9 +26,9 @@ use tokio::io::BufReader;
 
 use crate::error::ErrorResponse;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
+use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::ObjectPartInfo;
 use rustfs_rio::HashReader;
-use rustfs_storage_api::HTTPRangeSpec;
 use s3s::S3ErrorCode;
 
 //#[derive(Clone)]

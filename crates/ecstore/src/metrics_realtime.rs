@@ -14,6 +14,7 @@
 
 use crate::admin_server_info::get_local_server_property;
 use crate::runtime_sources;
+use crate::storage_api_contracts::admin::StorageAdminApi;
 use chrono::Utc;
 use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -29,7 +30,6 @@ use rustfs_madmin::metrics::{
     ScannerSourceCycleSnapshot as MadminScannerSourceCycleSnapshot, ScannerSourceWorkSnapshot as MadminScannerSourceWorkSnapshot,
     ScannerUsageFreshnessSnapshot as MadminScannerUsageFreshnessSnapshot, TimedAction as MadminTimedAction,
 };
-use rustfs_storage_api::StorageAdminApi;
 use rustfs_utils::os::get_drive_stats;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};

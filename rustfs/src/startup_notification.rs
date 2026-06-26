@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::init::add_bucket_notification_configuration;
-use crate::storage::{EndpointServerPools, Result as StorageResult, new_global_notification_sys};
+use crate::storage_api::startup::{EndpointServerPools, Result as StorageResult, new_global_notification_sys};
 use std::{
     future::Future,
     io::{Error, Result},
@@ -76,7 +76,7 @@ fn log_embedded_optional_service_skipped(service: &str, err: impl std::fmt::Disp
 #[cfg(test)]
 mod tests {
     use super::init_notification_system_with;
-    use crate::storage::Error as EcstoreError;
+    use crate::storage_api::startup::Error as EcstoreError;
 
     #[tokio::test]
     async fn notification_system_returns_source_error() {

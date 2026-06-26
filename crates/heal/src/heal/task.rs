@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::heal::{
-    DiskError, ErasureSetHealer,
+    DiskError, EcstoreError, ErasureSetHealer,
     progress::HealProgress,
     storage::{HealStorageAPI, next_heal_listing_token},
 };
@@ -41,7 +41,6 @@ const EVENT_HEAL_TASK_STATE: &str = "heal_task_state";
 const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
 const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
 const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
-const EVENT_HEAL_OBJECT_CLEANUP: &str = "heal_object_cleanup";
 const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
 const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
 const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
@@ -97,8 +96,17 @@ impl HealType {
     }
 }
 
+fn is_object_level_not_found_error(err: &Error) -> bool {
+    match err {
+        Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
+        Error::Storage(EcstoreError::FileNotFound | EcstoreError::FileVersionNotFound) => true,
+        Error::Other(message) => matches!(message.as_str(), "File not found" | "File version not found"),
+        _ => false,
+    }
+}
+
 pub(crate) fn is_missing_object_dir_heal_result(object: &str, err: &Error) -> bool {
-    object.ends_with(SLASH_SEPARATOR) && matches!(err, Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound))
+    object.ends_with(SLASH_SEPARATOR) && is_object_level_not_found_error(err)
 }
 
 /// Heal priority
@@ -437,6 +445,31 @@ impl HealTask {
         }
     }
 
+    fn is_object_not_found_heal_error(err: &Error) -> bool {
+        match err {
+            Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
+            Error::Storage(
+                EcstoreError::FileNotFound
+                | EcstoreError::FileVersionNotFound
+                | EcstoreError::ObjectNotFound(_, _)
+                | EcstoreError::VersionNotFound(_, _, _),
+            ) => true,
+            Error::Other(message) | Error::IO(message) => {
+                message.contains("File not found")
+                    || message.contains("file not found")
+                    || message.contains("File version not found")
+                    || message.contains("file version not found")
+                    || message.contains("Object not found")
+                    || message.contains("object not found")
+            }
+            _ => false,
+        }
+    }
+
+    fn should_return_typed_heal_error(err: &Error) -> bool {
+        matches!(err, Error::Storage(_) | Error::Disk(_))
+    }
+
     async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
             return false;
@@ -456,6 +489,30 @@ impl HealTask {
         );
         let mut progress = self.progress.write().await;
         progress.update_progress(3, 3, 0, 0);
+        true
+    }
+
+    async fn skip_scanner_synthetic_object_dir_missing(&self, bucket: &str, object: &str, err: &Error) -> bool {
+        if self.source != HealRequestSource::Scanner || !is_missing_object_dir_heal_result(object, err) {
+            return false;
+        }
+
+        debug!(
+            target: "rustfs::heal::task",
+            event = EVENT_HEAL_OBJECT_RESULT,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            task_id = %self.id,
+            bucket,
+            object,
+            source = self.source.as_str(),
+            result = "synthetic_object_dir_missing",
+            error = %err,
+            "Heal recreate skipped scanner synthetic object-dir candidate after object-level not-found"
+        );
+        let mut progress = self.progress.write().await;
+        progress.set_current_object(Some(format!("skipped: {bucket}/{object}")));
+        progress.update_progress(4, 4, 0, 0);
         true
     }
 
@@ -660,13 +717,36 @@ impl HealTask {
             "Heal object stage entered"
         );
         self.check_control_flags().await?;
-        let object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
+        let mut object_exists = match self.await_with_control(self.storage.object_exists(bucket, object)).await {
             Ok(exists) => exists,
             Err(err @ Error::TransientSkip { .. }) => {
                 return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
             }
             Err(err) => return Err(err),
         };
+
+        let canonicalized_object = if !object_exists {
+            match self.canonicalize_scanner_missing_object_dir(bucket, object).await {
+                Ok(canonicalized_object) => canonicalized_object,
+                Err(err @ Error::TransientSkip { .. }) => {
+                    return self.skip_due_to_transient_object_exists(bucket, object, &err).await;
+                }
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
+        let object = if let Some(canonicalized_object) = canonicalized_object.as_deref() {
+            object_exists = true;
+            {
+                let mut progress = self.progress.write().await;
+                progress.set_current_object(Some(format!("{bucket}/{canonicalized_object}")));
+            }
+            canonicalized_object
+        } else {
+            object
+        };
+
         if !object_exists {
             warn!(
                 target: "rustfs::heal::task",
@@ -692,6 +772,18 @@ impl HealTask {
                     "Heal object recreate requested"
                 );
                 return self.recreate_missing_object(bucket, object, version_id).await;
+            } else if self.source == HealRequestSource::Scanner {
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_STAGE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    stage = "scanner_missing_probe",
+                    "Heal scanner missing object will be checked by storage layer"
+                );
             } else {
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Object not found: {bucket}/{object}"),
@@ -742,9 +834,7 @@ impl HealTask {
                         return Ok(());
                     }
 
-                    // Check if this is a "File not found" error during delete operations
-                    let error_msg = format!("{e}");
-                    if error_msg.contains("File not found") || error_msg.contains("not found") {
+                    if Self::is_object_not_found_heal_error(&e) {
                         debug!(
                             target: "rustfs::heal::task",
                             event = EVENT_HEAL_OBJECT_RESULT,
@@ -776,40 +866,13 @@ impl HealTask {
                         "Heal object operation failed"
                     );
 
-                    // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                    if self.options.remove_corrupted {
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_CLEANUP,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            action = "delete_corrupted_object",
-                            dry_run = self.options.dry_run,
-                            "Heal object cleanup requested"
-                        );
-                        if !self.options.dry_run {
-                            self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                            debug!(
-                                target: "rustfs::heal::task",
-                                event = EVENT_HEAL_OBJECT_CLEANUP,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_OBJECT,
-                                task_id = %self.id,
-                                bucket,
-                                object,
-                                action = "delete_corrupted_object",
-                                result = "deleted",
-                                "Heal corrupted object deleted"
-                            );
-                        }
-                    }
-
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(3, 3, 0, 0);
+                    }
+
+                    if Self::should_return_typed_heal_error(&e) {
+                        return Err(e);
                     }
 
                     return Err(Error::TaskExecutionFailed {
@@ -858,9 +921,7 @@ impl HealTask {
                     return Ok(());
                 }
 
-                // Check if this is a "File not found" error during delete operations
-                let error_msg = format!("{e}");
-                if error_msg.contains("File not found") || error_msg.contains("not found") {
+                if Self::is_object_not_found_heal_error(&e) {
                     debug!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_OBJECT_RESULT,
@@ -892,46 +953,53 @@ impl HealTask {
                     "Heal object operation failed"
                 );
 
-                // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                if self.options.remove_corrupted {
-                    debug!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_CLEANUP,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        action = "delete_corrupted_object",
-                        dry_run = self.options.dry_run,
-                        "Heal object cleanup requested"
-                    );
-                    if !self.options.dry_run {
-                        self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_CLEANUP,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            action = "delete_corrupted_object",
-                            result = "deleted",
-                            "Heal corrupted object deleted"
-                        );
-                    }
-                }
-
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
                 }
 
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal object {bucket}/{object}: {e}"),
-                })
+                if Self::should_return_typed_heal_error(&e) {
+                    Err(e)
+                } else {
+                    Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal object {bucket}/{object}: {e}"),
+                    })
+                }
             }
+        }
+    }
+
+    async fn canonicalize_scanner_missing_object_dir(&self, bucket: &str, object: &str) -> Result<Option<String>> {
+        if self.source != HealRequestSource::Scanner {
+            return Ok(None);
+        }
+
+        let Some(candidate) = object.strip_suffix(SLASH_SEPARATOR) else {
+            return Ok(None);
+        };
+        if candidate.is_empty() {
+            return Ok(None);
+        }
+
+        match self.await_with_control(self.storage.object_exists(bucket, candidate)).await {
+            Ok(true) => {
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_STAGE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object = %candidate,
+                    canonicalized_from = %object,
+                    stage = "canonicalize_scanner_object_dir",
+                    result = "canonicalized",
+                    "Heal scanner object-dir candidate canonicalized"
+                );
+                Ok(Some(candidate.to_string()))
+            }
+            Ok(false) => Ok(None),
+            Err(err) => Err(err),
         }
     }
 
@@ -969,6 +1037,10 @@ impl HealTask {
         {
             Ok((result, error)) => {
                 if let Some(e) = error {
+                    if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                        return Ok(());
+                    }
+
                     error!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_OBJECT_RESULT,
@@ -1010,6 +1082,10 @@ impl HealTask {
             Err(Error::TaskCancelled) => Err(Error::TaskCancelled),
             Err(Error::TaskTimeout) => Err(Error::TaskTimeout),
             Err(e) => {
+                if self.skip_scanner_synthetic_object_dir_missing(bucket, object, &e).await {
+                    return Ok(());
+                }
+
                 error!(
                     target: "rustfs::heal::task",
                     event = EVENT_HEAL_OBJECT_RESULT,
@@ -2129,19 +2205,51 @@ mod tests {
     use super::*;
     use crate::heal::storage::{DiskStatus, HealObjectInfo};
     use rustfs_madmin::heal_commands::HealResultItem;
-    use rustfs_storage_api::BucketInfo;
+    use std::collections::HashMap;
     use std::sync::Mutex;
 
+    use super::super::storage_api::status::BucketInfo;
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,
         healed_objects: Mutex<Vec<String>>,
+        heal_object_calls: Mutex<Vec<String>>,
+        heal_object_version_ids: Mutex<Vec<Option<String>>>,
         bucket_heal_opts: Mutex<Vec<HealOpts>>,
         object_heal_opts: Mutex<Vec<HealOpts>>,
+        object_exists: Mutex<Option<bool>>,
+        object_exists_by_name: Mutex<HashMap<String, MockObjectExists>>,
+        heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
+        deleted_objects: Mutex<Vec<String>>,
         format_no_heal_required: Mutex<bool>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
         include_object_dir_candidate: Mutex<bool>,
+    }
+
+    enum MockHealObjectOutcome {
+        OkWithOtherError(&'static str),
+        ErrOther(&'static str),
+    }
+
+    #[derive(Clone, Copy)]
+    enum MockObjectExists {
+        Exists(bool),
+        TransientSkip(&'static str),
+        OtherError(&'static str),
+    }
+
+    #[test]
+    fn test_missing_object_dir_heal_result_matches_only_object_level_not_found() {
+        assert!(is_missing_object_dir_heal_result("x.rnd/", &Error::Disk(DiskError::FileNotFound)));
+        assert!(is_missing_object_dir_heal_result("x.rnd/", &Error::Disk(DiskError::FileVersionNotFound)));
+        assert!(is_missing_object_dir_heal_result("x.rnd/", &Error::Storage(EcstoreError::FileNotFound)));
+        assert!(is_missing_object_dir_heal_result(
+            "x.rnd/",
+            &Error::Other("File version not found".to_string())
+        ));
+        assert!(!is_missing_object_dir_heal_result("x.rnd/", &Error::Other("Disk not found".to_string())));
+        assert!(!is_missing_object_dir_heal_result("x.rnd", &Error::Disk(DiskError::FileNotFound)));
     }
 
     #[async_trait::async_trait]
@@ -2158,7 +2266,8 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
+        async fn delete_object(&self, _bucket: &str, object: &str) -> Result<()> {
+            self.deleted_objects.lock().unwrap().push(object.to_string());
             Ok(())
         }
 
@@ -2196,8 +2305,15 @@ mod tests {
             }])
         }
 
-        async fn object_exists(&self, _bucket: &str, _object: &str) -> Result<bool> {
-            Ok(true)
+        async fn object_exists(&self, _bucket: &str, object: &str) -> Result<bool> {
+            if let Some(result) = self.object_exists_by_name.lock().unwrap().get(object).copied() {
+                return match result {
+                    MockObjectExists::Exists(exists) => Ok(exists),
+                    MockObjectExists::TransientSkip(message) => Err(Error::transient_skip(message)),
+                    MockObjectExists::OtherError(message) => Err(Error::other(message)),
+                };
+            }
+            Ok(self.object_exists.lock().unwrap().unwrap_or(true))
         }
 
         async fn get_object_size(&self, _bucket: &str, _object: &str) -> Result<Option<u64>> {
@@ -2212,9 +2328,23 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-            _version_id: Option<&str>,
+            version_id: Option<&str>,
             opts: &HealOpts,
         ) -> Result<(HealResultItem, Option<Error>)> {
+            self.heal_object_calls.lock().unwrap().push(object.to_string());
+            self.heal_object_version_ids
+                .lock()
+                .unwrap()
+                .push(version_id.map(ToString::to_string));
+            self.object_heal_opts.lock().unwrap().push(*opts);
+            if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
+                return match outcome {
+                    MockHealObjectOutcome::OkWithOtherError(message) => {
+                        Ok((HealResultItem::default(), Some(Error::other(message))))
+                    }
+                    MockHealObjectOutcome::ErrOther(message) => Err(Error::other(message)),
+                };
+            }
             if bucket == RUSTFS_META_BUCKET && object == format!("{BUCKET_META_PREFIX}/{DATA_USAGE_CACHE_NAME}") {
                 return Ok((
                     HealResultItem::default(),
@@ -2227,7 +2357,6 @@ mod tests {
                 return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
             }
             self.healed_objects.lock().unwrap().push(object.to_string());
-            self.object_heal_opts.lock().unwrap().push(*opts);
             Ok((
                 HealResultItem {
                     object_size: 1,
@@ -2526,6 +2655,528 @@ mod tests {
         let progress = task.get_progress().await;
         assert_eq!(progress.objects_scanned, 2);
         assert_eq!(progress.objects_failed, 0);
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_scanner_synthetic_object_dir_skips_ok_not_found_error() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner synthetic object-dir missing result should be skipped");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_missing_object_dir_canonicalizes_existing_plain_object() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(false));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::Exists(true));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: Some("version-a".to_string()),
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner object-dir candidate should heal the existing plain object");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+        assert_eq!(
+            storage.heal_object_version_ids.lock().unwrap().as_slice(),
+            [Some("version-a".to_string())]
+        );
+        assert_eq!(storage.healed_objects.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_existing_trailing_slash_object_is_not_canonicalized() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(true));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::Exists(true));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("existing trailing-slash object should keep its exact key");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_admin_missing_object_dir_does_not_canonicalize_plain_object() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(false));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::Exists(true));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("admin object-dir request must not be canonicalized");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_canonicalizes_only_one_trailing_slash() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd//".to_string(), MockObjectExists::Exists(false));
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(true));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::Exists(true));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd//".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner canonicalization should remove only one trailing slash");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_trimmed_object_exists_error_is_not_recreated() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(false));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::OtherError("backend unavailable"));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("trimmed object_exists error must not be treated as missing");
+
+        assert!(matches!(err, Error::Other(_)));
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_trimmed_object_exists_transient_skip_is_not_recreated() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("x.rnd/".to_string(), MockObjectExists::Exists(false));
+        object_exists_by_name.insert("x.rnd".to_string(), MockObjectExists::TransientSkip("backend busy"));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("trimmed object_exists transient skip should complete without recreate");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_empty_trimmed_object_keeps_existing_skip_behavior() {
+        let mut object_exists_by_name = HashMap::new();
+        object_exists_by_name.insert("/".to_string(), MockObjectExists::Exists(false));
+        let storage = Arc::new(MockStorage {
+            object_exists_by_name: Mutex::new(object_exists_by_name),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("empty canonical object must keep existing scanner skip behavior");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["/".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_scanner_synthetic_object_dir_skips_err_not_found() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage);
+
+        task.execute()
+            .await
+            .expect("scanner synthetic object-dir missing error should be skipped");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_scanner_non_dir_not_found_fails() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage);
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("scanner non-dir missing object should still fail recreate");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_missing_object_without_recreate_probes_storage() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: false,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner missing object should be checked by storage");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+        assert!(!storage.object_heal_opts.lock().unwrap()[0].recreate);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_missing_object_without_recreate_treats_not_found_as_stale() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: false,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner confirmed-not-found object should be treated as stale");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_scanner_synthetic_object_dir_disk_not_found_fails() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("Disk not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage);
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("scanner synthetic object-dir disk-not-found should not be skipped");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_admin_synthetic_object_dir_not_found_fails() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, storage);
+
+        let err = task
+            .execute()
+            .await
+            .expect_err("admin object-dir not-found recreate should not be skipped");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_heal_recreate_existing_trailing_slash_object_records_normal_result() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(true)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd/".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage);
+
+        task.execute()
+            .await
+            .expect("existing trailing-slash object should follow normal heal path");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        let result_items = task.get_result_items().await;
+        assert_eq!(result_items.len(), 1);
+        assert_eq!(result_items[0].object_size, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heal_failure_with_remove_corrupted_does_not_delete_object() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(true)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError(
+                "can not reconstruct data: not enough available shards (need 12, have 11)",
+            ))),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                remove_corrupted: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task.execute().await.expect_err("heal failure should still be reported");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(storage.deleted_objects.lock().unwrap().is_empty());
+        assert!(storage.object_heal_opts.lock().unwrap()[0].remove);
     }
 
     #[tokio::test]

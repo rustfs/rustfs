@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::config::RustFSBufferConfig;
-use crate::storage::{set_global_region, set_global_rustfs_port};
+use crate::runtime_sources::{resolve_outbound_tls_generation, resolve_replication_pool_handle};
+use crate::storage_api::startup::{DynReplicationPool, set_global_region, set_global_rustfs_port};
 use rustfs_kms::KmsServiceManager;
 use rustfs_obs::{GlobalError as ObservabilityError, OtelGuard};
 use rustfs_tls_runtime::{OutboundTlsMaterial, TlsGeneration};
@@ -71,8 +72,16 @@ pub(crate) fn init_metrics_runtime(ctx: CancellationToken) {
     rustfs_obs::init_metrics_runtime(ctx);
 }
 
+pub(crate) fn replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
+    resolve_replication_pool_handle()
+}
+
 pub(crate) fn set_put_stage_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_put_stage_metrics_enabled(enabled);
+}
+
+pub(crate) fn set_get_stage_metrics_enabled(enabled: bool) {
+    rustfs_io_metrics::set_get_stage_metrics_enabled(enabled);
 }
 
 pub(crate) fn init_tls_metrics() {
@@ -80,7 +89,7 @@ pub(crate) fn init_tls_metrics() {
 }
 
 pub(crate) fn current_outbound_tls_generation() -> u64 {
-    crate::app::context::resolve_outbound_tls_generation().0
+    resolve_outbound_tls_generation().0
 }
 
 pub(crate) async fn publish_outbound_tls_state(generation: TlsGeneration, outbound: &OutboundTlsMaterial) {
