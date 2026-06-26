@@ -12,14 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_probe_readiness};
 use crate::admin::runtime_sources::{default_admin_usecase, resolve_oidc_handle};
 use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
-    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, LICENSE, RUSTFS_ADMIN_PREFIX,
-    RequestContextLayer, VERSION,
+    CONSOLE_PREFIX, FAVICON_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, HeaderMapCarrier, HealthProbe, LICENSE, RUSTFS_ADMIN_PREFIX,
+    RequestContextLayer, VERSION, build_health_response_parts, collect_probe_readiness,
 };
 use crate::version::build;
 use axum::{
