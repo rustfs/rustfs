@@ -16,7 +16,7 @@ use crate::runtime_sources::{
     NotifyInterface, resolve_endpoints_handle, resolve_iam_ready, resolve_kms_runtime_service_manager,
     resolve_lock_clients_handle, resolve_notify_interface, resolve_object_store_handle, resolve_server_config,
 };
-use crate::storage_api::server::{ECStore, EndpointServerPools};
+use crate::storage_api::server::runtime_sources::{ECStore, EndpointServerPools};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use std::collections::HashMap;

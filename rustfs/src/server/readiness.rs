@@ -15,10 +15,10 @@
 use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage_api::server::contract::admin::StorageAdminApi;
-use crate::storage_api::server::{Endpoint, EndpointServerPools, is_dist_erasure};
+use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
+use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
-use crate::storage_api::server::{Endpoints, PoolEndpoints};
+use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
