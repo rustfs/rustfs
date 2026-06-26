@@ -745,10 +745,41 @@ struct HealQueueContext<'a> {
 
 impl HealManager {
     fn classify_full_admission(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
-        if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
+        if matches!(
+            request.source,
+            HealRequestSource::Scanner | HealRequestSource::AutoHeal | HealRequestSource::ReadRepair
+        ) {
+            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
+        } else if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
         } else {
             HealAdmissionResult::Full
+        }
+    }
+
+    fn classify_pressure_admission(
+        request: &HealRequest,
+        queue_len: usize,
+        queue_capacity: usize,
+    ) -> Option<HealAdmissionResult> {
+        if request.force_start || queue_capacity == 0 {
+            return None;
+        }
+
+        let queue_usage_pct = queue_len.saturating_mul(100) / queue_capacity;
+        if queue_usage_pct < 80 {
+            return None;
+        }
+
+        match request.source {
+            HealRequestSource::ReadRepair => Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)),
+            HealRequestSource::Scanner if request.priority == HealPriority::Low => {
+                Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+            }
+            HealRequestSource::AutoHeal if queue_usage_pct >= 95 => {
+                Some(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+            }
+            _ => None,
         }
     }
 
@@ -757,6 +788,204 @@ impl HealManager {
             HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped)
         } else {
             HealAdmissionResult::Merged
+        }
+    }
+
+    fn can_displace_queued_work(request: &HealRequest) -> bool {
+        matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
+    }
+
+    fn admit_request_to_queue(
+        queue: &mut PriorityHealQueue,
+        request: HealRequest,
+        config: &HealConfig,
+        context: &'static str,
+    ) -> HealAdmissionResult {
+        let queue_len = queue.len();
+        publish_heal_queue_length(queue);
+        let queue_capacity = config.queue_size;
+
+        if queue_len >= queue_capacity && !request.force_start {
+            if Self::can_displace_queued_work(&request) && queue.can_displace_lower_priority(request.priority) {
+                let request_id = request.id.clone();
+                let priority = request.priority;
+                let source = request.source;
+                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
+                    publish_heal_queue_length(queue);
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request_id,
+                        priority = ?priority,
+                        source = source.as_str(),
+                        context,
+                        displaced_request_id = %displaced.id,
+                        displaced_priority = ?displaced.priority,
+                        queue_len,
+                        queue_capacity,
+                        result = "accepted_by_displacement",
+                        "Heal queue request accepted by displacement"
+                    );
+                    return HealAdmissionResult::Accepted;
+                }
+
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request_id,
+                    priority = ?priority,
+                    source = source.as_str(),
+                    context,
+                    queue_len,
+                    queue_capacity,
+                    result = "full_no_displacement_candidate",
+                    "Heal queue request rejected without displacement"
+                );
+                return HealAdmissionResult::Full;
+            }
+
+            let admission = Self::classify_full_admission(&request, config);
+            match admission {
+                HealAdmissionResult::Dropped(reason) => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        source = request.source.as_str(),
+                        context,
+                        queue_len,
+                        queue_capacity,
+                        reason = reason.as_str(),
+                        result = "dropped_full",
+                        "Heal queue request dropped"
+                    );
+                }
+                HealAdmissionResult::Full => {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request.id,
+                        priority = ?request.priority,
+                        source = request.source.as_str(),
+                        context,
+                        queue_len,
+                        queue_capacity,
+                        result = "rejected_full",
+                        "Heal queue request rejected"
+                    );
+                }
+                HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
+            }
+            return admission;
+        }
+
+        if let Some(admission) = Self::classify_pressure_admission(&request, queue_len, queue_capacity) {
+            if let HealAdmissionResult::Dropped(reason) = admission {
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request.id,
+                    priority = ?request.priority,
+                    source = request.source.as_str(),
+                    context,
+                    queue_len,
+                    queue_capacity,
+                    queue_usage_pct = if queue_capacity == 0 { 0 } else { queue_len.saturating_mul(100) / queue_capacity },
+                    reason = reason.as_str(),
+                    result = "dropped_pressure",
+                    "Heal queue request dropped under pressure"
+                );
+            }
+            return admission;
+        }
+
+        if queue_capacity > 0 {
+            let capacity_threshold = queue_capacity.saturating_mul(80) / 100;
+            if queue_len >= capacity_threshold {
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    queue_len,
+                    queue_capacity,
+                    queue_usage_pct = queue_len.saturating_mul(100) / queue_capacity,
+                    context,
+                    result = "queue_pressure_high",
+                    "Heal queue pressure high"
+                );
+            }
+        }
+
+        let request_id = request.id.clone();
+        let priority = request.priority;
+        let source = request.source;
+
+        match queue.push(request) {
+            QueuePushOutcome::Accepted => {
+                publish_heal_queue_length(queue);
+                if matches!(priority, HealPriority::High | HealPriority::Urgent) {
+                    let stats = queue.get_priority_stats();
+                    debug!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        request_id = %request_id,
+                        priority = ?priority,
+                        source = source.as_str(),
+                        context,
+                        queue_len = queue_len + 1,
+                        urgent = *stats.get(&HealPriority::Urgent).unwrap_or(&0),
+                        high = *stats.get(&HealPriority::High).unwrap_or(&0),
+                        normal = *stats.get(&HealPriority::Normal).unwrap_or(&0),
+                        low = *stats.get(&HealPriority::Low).unwrap_or(&0),
+                        result = "accepted",
+                        "Heal queue snapshot recorded"
+                    );
+                }
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request_id,
+                    priority = ?priority,
+                    source = source.as_str(),
+                    context,
+                    queue_len = queue_len + 1,
+                    result = "accepted",
+                    "Heal queue request accepted"
+                );
+                HealAdmissionResult::Accepted
+            }
+            QueuePushOutcome::Merged => {
+                debug!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_QUEUE_ADMISSION,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    request_id = %request_id,
+                    priority = ?priority,
+                    source = source.as_str(),
+                    context,
+                    queue_len,
+                    result = "merged_duplicate",
+                    "Heal queue request merged"
+                );
+                HealAdmissionResult::Merged
+            }
         }
     }
 
@@ -837,7 +1066,18 @@ impl HealManager {
         self.start_scheduler().await?;
 
         // start auto disk scanner to heal unformatted disks
-        self.start_auto_disk_scanner().await?;
+        if self.config.read().await.enable_auto_heal {
+            self.start_auto_disk_scanner().await?;
+        } else {
+            info!(
+                target: "rustfs::heal::manager",
+                event = EVENT_HEAL_AUTO_SCAN_STATE,
+                component = LOG_COMPONENT_HEAL,
+                subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                state = "disabled",
+                "Heal auto disk scanner disabled"
+            );
+        }
 
         info!(
             target: "rustfs::heal::manager",
@@ -997,10 +1237,6 @@ impl HealManager {
 
         let mut queue = self.heal_queue.lock().await;
 
-        let queue_len = queue.len();
-        publish_heal_queue_length(&queue);
-        let queue_capacity = config.queue_size;
-
         let queued_duplicate = (!request.force_start)
             .then(|| queue.request_for_dedup_key(&dedup_key).map(|queued| queued.id.clone()))
             .flatten();
@@ -1042,145 +1278,15 @@ impl HealManager {
             return Ok(admission);
         }
 
-        if queue_len >= queue_capacity && !request.force_start {
-            if queue.can_displace_lower_priority(request.priority) {
-                let request_id = request.id.clone();
-                let priority = request.priority;
-                if let Some(displaced) = queue.push_displacing_lower_priority(request) {
-                    publish_heal_queue_length(&queue);
-                    warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request_id,
-                        priority = ?priority,
-                        displaced_request_id = %displaced.id,
-                        displaced_priority = ?displaced.priority,
-                        queue_len,
-                        queue_capacity,
-                        result = "accepted_by_displacement",
-                        "Heal queue request accepted by displacement"
-                    );
-                    drop(queue);
-                    if config.event_driven_scheduler_enable {
-                        self.notify.notify_one();
-                    }
-                    return Ok(HealAdmissionResult::Accepted);
-                }
-
-                warn!(
-                    target: "rustfs::heal::manager",
-                    event = EVENT_HEAL_QUEUE_ADMISSION,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_MANAGER,
-                    request_id = %request_id,
-                    priority = ?priority,
-                    queue_len,
-                    queue_capacity,
-                    result = "full_no_displacement_candidate",
-                    "Heal queue request rejected without displacement"
-                );
-                return Ok(HealAdmissionResult::Full);
-            }
-
-            let admission = Self::classify_full_admission(&request, &config);
-            match admission {
-                HealAdmissionResult::Dropped(reason) => {
-                    warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        priority = ?request.priority,
-                        queue_len,
-                        queue_capacity,
-                        reason = reason.as_str(),
-                        result = "dropped_full",
-                        "Heal queue request dropped"
-                    );
-                }
-                HealAdmissionResult::Full => {
-                    warn!(
-                        target: "rustfs::heal::manager",
-                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                        request_id = %request.id,
-                        priority = ?request.priority,
-                        queue_len,
-                        queue_capacity,
-                        result = "rejected_full",
-                        "Heal queue request rejected"
-                    );
-                }
-                HealAdmissionResult::Accepted | HealAdmissionResult::Merged => {}
-            }
-            return Ok(admission);
-        }
-
-        // Warn when queue is getting full (>80% capacity)
-        let capacity_threshold = (queue_capacity as f64 * 0.8) as usize;
-        if queue_len >= capacity_threshold {
-            warn!(
-                target: "rustfs::heal::manager",
-                event = EVENT_HEAL_QUEUE_ADMISSION,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_MANAGER,
-                queue_len,
-                queue_capacity,
-                queue_usage_pct = (queue_len * 100) / queue_capacity,
-                result = "queue_pressure_high",
-                "Heal queue pressure high"
-            );
-        }
-
-        let request_id = request.id.clone();
-        let priority = request.priority;
-
-        let push_outcome = queue.push(request);
-        debug_assert_eq!(push_outcome, QueuePushOutcome::Accepted);
-        publish_heal_queue_length(&queue);
-
-        // Log queue statistics periodically (when adding high/urgent priority items)
-        if matches!(priority, HealPriority::High | HealPriority::Urgent) {
-            let stats = queue.get_priority_stats();
-            debug!(
-                target: "rustfs::heal::manager",
-                event = EVENT_HEAL_QUEUE_ADMISSION,
-                component = LOG_COMPONENT_HEAL,
-                subsystem = LOG_SUBSYSTEM_MANAGER,
-                request_id = %request_id,
-                priority = ?priority,
-                queue_len = queue_len + 1,
-                urgent = *stats.get(&HealPriority::Urgent).unwrap_or(&0),
-                high = *stats.get(&HealPriority::High).unwrap_or(&0),
-                normal = *stats.get(&HealPriority::Normal).unwrap_or(&0),
-                low = *stats.get(&HealPriority::Low).unwrap_or(&0),
-                result = "accepted",
-                "Heal queue snapshot recorded"
-            );
-        }
-
+        let admission = Self::admit_request_to_queue(&mut queue, request, &config, "submit");
+        let should_notify = matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
         drop(queue);
 
-        debug!(
-            target: "rustfs::heal::manager",
-            event = EVENT_HEAL_QUEUE_ADMISSION,
-            component = LOG_COMPONENT_HEAL,
-            subsystem = LOG_SUBSYSTEM_MANAGER,
-            request_id = %request_id,
-            priority = ?priority,
-            queue_len = queue_len + 1,
-            result = "accepted",
-            "Heal queue request accepted"
-        );
-        if config.event_driven_scheduler_enable {
+        if should_notify {
             self.notify.notify_one();
         }
 
-        Ok(HealAdmissionResult::Accepted)
+        Ok(admission)
     }
 
     /// Get task status
@@ -1953,11 +2059,15 @@ impl HealManager {
                                 HealPriority::Normal,
                             );
                             req.source = HealRequestSource::AutoHeal;
+                            let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
-                            if matches!(queue.push(req), QueuePushOutcome::Accepted) {
-                                publish_heal_queue_length(&queue);
-                                let config = config.read().await;
-                                if config.event_driven_scheduler_enable {
+                            let admission = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");
+                            let should_notify =
+                                matches!(admission, HealAdmissionResult::Accepted) && config.event_driven_scheduler_enable;
+                            drop(queue);
+                            drop(config);
+                            if matches!(admission, HealAdmissionResult::Accepted) {
+                                if should_notify {
                                     notify.notify_one();
                                 }
                                 enqueued_count += 1;
@@ -1971,6 +2081,23 @@ impl HealManager {
                                     bucket_count = buckets.len(),
                                     result = "enqueued",
                                     "Heal auto-scan task enqueued"
+                                );
+                            } else {
+                                if matches!(admission, HealAdmissionResult::Merged) {
+                                    skipped_duplicate_count += 1;
+                                }
+                                debug!(
+                                    target: "rustfs::heal::manager",
+                                    event = EVENT_HEAL_AUTO_SCAN_ENQUEUE,
+                                    component = LOG_COMPONENT_HEAL,
+                                    subsystem = LOG_SUBSYSTEM_DISK_SCANNER,
+                                    endpoint = %ep,
+                                    set_disk_id,
+                                    bucket_count = buckets.len(),
+                                    admission = admission.result_label(),
+                                    reason = admission.reason_label(),
+                                    result = "not_enqueued",
+                                    "Heal auto-scan task not enqueued"
                                 );
                             }
                         }
@@ -2070,6 +2197,7 @@ impl HealManager {
                 let manager_cancel_token = cancel_token.clone();
                 let task_type_label_for_spawn = task_type_label.clone();
                 let task_set_label_for_spawn = task_set_label.clone();
+                let config_for_spawn = config.clone();
 
                 // start heal task
                 tokio::spawn(async move {
@@ -2181,6 +2309,7 @@ impl HealManager {
                         let retry_notify = notify_clone.clone();
                         let retry_cancel_token = CancellationToken::new();
                         let retry_manager_cancel_token = manager_cancel_token.clone();
+                        let retry_config = config_for_spawn.clone();
                         retrying_heals_clone.lock().await.insert(
                             retry_request_id.clone(),
                             RetryingHeal {
@@ -2238,10 +2367,11 @@ impl HealManager {
                             }
 
                             let mut queue = retry_heal_queue.lock().await;
-                            let outcome = queue.push(retry_request);
-                            publish_heal_queue_length(&queue);
-                            match outcome {
-                                QueuePushOutcome::Accepted => {
+                            let admission = Self::admit_request_to_queue(&mut queue, retry_request, &retry_config, "retry");
+                            let should_notify =
+                                matches!(admission, HealAdmissionResult::Accepted) && retry_config.event_driven_scheduler_enable;
+                            match admission {
+                                HealAdmissionResult::Accepted => {
                                     info!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -2256,9 +2386,11 @@ impl HealManager {
                                         "Heal retry admission decided"
                                     );
                                     drop(queue);
-                                    retry_notify.notify_one();
+                                    if should_notify {
+                                        retry_notify.notify_one();
+                                    }
                                 }
-                                QueuePushOutcome::Merged => {
+                                HealAdmissionResult::Merged => {
                                     info!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -2268,6 +2400,33 @@ impl HealManager {
                                         priority = ?retry_priority,
                                         retry_attempt,
                                         result = "retry_merged_duplicate",
+                                        "Heal retry admission decided"
+                                    );
+                                }
+                                HealAdmissionResult::Full => {
+                                    warn!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        request_id = %retry_request_id,
+                                        priority = ?retry_priority,
+                                        retry_attempt,
+                                        result = "retry_rejected_full",
+                                        "Heal retry admission decided"
+                                    );
+                                }
+                                HealAdmissionResult::Dropped(reason) => {
+                                    debug!(
+                                        target: "rustfs::heal::manager",
+                                        event = EVENT_HEAL_QUEUE_ADMISSION,
+                                        component = LOG_COMPONENT_HEAL,
+                                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                                        request_id = %retry_request_id,
+                                        priority = ?retry_priority,
+                                        retry_attempt,
+                                        reason = reason.as_str(),
+                                        result = "retry_dropped",
                                         "Heal retry admission decided"
                                     );
                                 }
@@ -2506,6 +2665,18 @@ mod tests {
         async fn get_disk_for_resume(&self, _set_disk_id: &str) -> Result<DiskStore> {
             Err(Error::other("not implemented in tests"))
         }
+    }
+
+    fn bucket_request(bucket: &str, priority: HealPriority, source: HealRequestSource) -> HealRequest {
+        let mut request = HealRequest::new(
+            HealType::Bucket {
+                bucket: bucket.to_string(),
+            },
+            HealOptions::default(),
+            priority,
+        );
+        request.source = source;
+        request
     }
 
     #[test]
@@ -3811,6 +3982,108 @@ mod tests {
                 .expect("high priority request should remain queued"),
             HealTaskStatus::Pending
         );
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_drops_read_repair_under_pressure() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 10,
+                ..HealConfig::default()
+            }),
+        );
+
+        for index in 0..8 {
+            assert_eq!(
+                manager
+                    .submit_heal_request(bucket_request(
+                        &format!("queued-{index}"),
+                        HealPriority::Normal,
+                        HealRequestSource::Internal,
+                    ))
+                    .await
+                    .expect("seed request should be accepted"),
+                HealAdmissionResult::Accepted
+            );
+        }
+
+        let admission = manager
+            .submit_heal_request(bucket_request("read-repair", HealPriority::Normal, HealRequestSource::ReadRepair))
+            .await
+            .expect("read repair admission should return a result");
+
+        assert_eq!(admission, HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped));
+        assert_eq!(manager.get_queue_length().await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_drops_low_scanner_under_pressure() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 10,
+                ..HealConfig::default()
+            }),
+        );
+
+        for index in 0..8 {
+            assert_eq!(
+                manager
+                    .submit_heal_request(bucket_request(
+                        &format!("queued-{index}"),
+                        HealPriority::Normal,
+                        HealRequestSource::Internal,
+                    ))
+                    .await
+                    .expect("seed request should be accepted"),
+                HealAdmissionResult::Accepted
+            );
+        }
+
+        let admission = manager
+            .submit_heal_request(bucket_request("scanner", HealPriority::Low, HealRequestSource::Scanner))
+            .await
+            .expect("scanner admission should return a result");
+
+        assert_eq!(admission, HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped));
+        assert_eq!(manager.get_queue_length().await, 8);
+    }
+
+    #[tokio::test]
+    async fn test_submit_heal_request_accepts_admin_high_under_pressure() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 10,
+                ..HealConfig::default()
+            }),
+        );
+
+        for index in 0..8 {
+            assert_eq!(
+                manager
+                    .submit_heal_request(bucket_request(
+                        &format!("queued-{index}"),
+                        HealPriority::Normal,
+                        HealRequestSource::Internal,
+                    ))
+                    .await
+                    .expect("seed request should be accepted"),
+                HealAdmissionResult::Accepted
+            );
+        }
+
+        let admission = manager
+            .submit_heal_request(bucket_request("admin", HealPriority::High, HealRequestSource::Admin))
+            .await
+            .expect("admin admission should return a result");
+
+        assert_eq!(admission, HealAdmissionResult::Accepted);
+        assert_eq!(manager.get_queue_length().await, 9);
     }
 
     #[tokio::test]
