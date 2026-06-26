@@ -50,6 +50,7 @@ mod metrics_realtime;
 #[path = "services/notification_sys.rs"]
 mod notification_sys;
 mod object_api;
+#[path = "core/pools.rs"]
 mod pools;
 mod rebalance;
 #[path = "io_support/rio.rs"]
@@ -58,6 +59,7 @@ mod rpc;
 #[path = "runtime/sources.rs"]
 mod runtime_sources;
 mod set_disk;
+#[path = "core/sets.rs"]
 mod sets;
 mod storage_api_contracts;
 mod store;
@@ -74,8 +76,10 @@ mod event;
 #[path = "services/event_notification.rs"]
 mod event_notification;
 #[cfg(test)]
+#[path = "core/pools_test.rs"]
 mod pools_test;
 #[cfg(test)]
+#[path = "core/store_test.rs"]
 mod store_test;
 mod tier;
 
