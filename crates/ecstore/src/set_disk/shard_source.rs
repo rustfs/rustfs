@@ -38,6 +38,9 @@ impl ShardReadCost {
     pub(crate) const fn is_low_cost(self) -> bool {
         matches!(self, Self::Local | Self::SameNode)
     }
+    pub(crate) const fn is_remote(self) -> bool {
+        matches!(self, Self::Remote)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
