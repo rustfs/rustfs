@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_api::bucket::metadata_sys;
-use super::storage_api::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
-use super::storage_api::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
+use super::storage_api::test::bucket::metadata_sys;
+use super::storage_api::test::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
+use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};
 use serial_test::serial;
@@ -30,7 +30,7 @@ use tokio::fs;
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use super::storage_api::test::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 
 static CAPACITY_DIRTY_SCOPE_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, TempDir)> = OnceLock::new();
 static CAPACITY_DIRTY_SCOPE_INIT: Once = Once::new();
@@ -78,7 +78,7 @@ async fn setup_capacity_dirty_scope_env() -> (Vec<PathBuf>, Arc<ECStore>) {
     };
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-    super::storage_api::runtime::init_local_disks(endpoint_pools.clone())
+    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 

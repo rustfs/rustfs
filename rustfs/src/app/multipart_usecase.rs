@@ -14,45 +14,45 @@
 
 //! Multipart application use-case contracts.
 
-use super::storage_api::ECStore;
+use super::storage_api::multipart_usecase::ECStore;
 #[cfg(test)]
-use super::storage_api::HTTPPreconditions;
-use super::storage_api::access::has_bypass_governance_header;
-use super::storage_api::bucket::quota::checker::QuotaChecker;
-use super::storage_api::bucket::{
+use super::storage_api::multipart_usecase::HTTPPreconditions;
+use super::storage_api::multipart_usecase::access::has_bypass_governance_header;
+use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
+use super::storage_api::multipart_usecase::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
     replication::{get_must_replicate_options, must_replicate, schedule_replication},
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::compression::is_disk_compressible;
-use super::storage_api::data_usage::record_bucket_object_write_memory;
-use super::storage_api::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
-use super::storage_api::helper::OperationHelper;
+use super::storage_api::multipart_usecase::compression::is_disk_compressible;
+use super::storage_api::multipart_usecase::data_usage::record_bucket_object_write_memory;
+use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
+use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
-use super::storage_api::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
-use super::storage_api::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
-use super::storage_api::object_utils::to_s3s_etag;
-use super::storage_api::options::{
+use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
+use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
+use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
+use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts, get_content_sha256_with_query, get_opts,
     parse_copy_source_range, put_opts, validate_archive_content_encoding,
 };
-use super::storage_api::s3_api::multipart::{
+use super::storage_api::multipart_usecase::s3_api::multipart::{
     ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
     parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
 };
-use super::storage_api::set_disk::is_valid_storage_class;
-use super::storage_api::sse::{
+use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
+use super::storage_api::multipart_usecase::sse::{
     DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
     build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error,
     mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
 };
-use super::storage_api::{
+use super::storage_api::multipart_usecase::{
     CompletePart, HTTPRangeSpec, MultipartOperations as _, MultipartUploadResult, ObjectIO as _, ObjectOperations as _,
 };
-use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::app::runtime_sources::{AppContext, current_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::record_capacity_write;

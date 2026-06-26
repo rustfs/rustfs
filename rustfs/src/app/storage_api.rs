@@ -736,3 +736,68 @@ pub(crate) use rustfs_storage_api::{
 };
 #[cfg(test)]
 pub(crate) use rustfs_storage_api::{HTTPPreconditions, HealOperations};
+
+pub(crate) mod admin_usecase {
+    pub(crate) use super::{ECStore, EndpointServerPools, StorageAdminApi};
+    pub(crate) use super::{admin, capacity, data_usage};
+}
+
+pub(crate) mod bucket_usecase {
+    pub(crate) use super::{
+        BucketOperations, BucketOptions, DeleteBucketOptions, ECStore, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations,
+        MakeBucketOptions, StorageObjectInfo, get_validated_store, process_lambda_configurations, process_queue_configurations,
+        process_topic_configurations, validate_list_object_unordered_with_delimiter,
+    };
+    pub(crate) use super::{access, bucket, data_usage, error, helper, object_utils, request_context, s3_api};
+}
+
+pub(crate) mod object_usecase {
+    #[cfg(test)]
+    pub(crate) use super::HTTPPreconditions;
+    pub(crate) use super::{
+        ECStore, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectOperations, RFC1123, StorageDeletedObject, StorageObjectInfo,
+        StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, bucket, check_preconditions, get_validated_store,
+        has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
+        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_object_lock_enabled,
+        validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        wrap_response_with_cors,
+    };
+    pub(crate) use super::{
+        access, compression, concurrency, data_usage, deadlock_detector, ecfs, error, head_prefix, helper, io, object_utils,
+        options, request_context, s3_api, set_disk, sse, storage_class, timeout_wrapper,
+    };
+}
+
+pub(crate) mod multipart_usecase {
+    #[cfg(test)]
+    pub(crate) use super::HTTPPreconditions;
+    pub(crate) use super::{
+        CompletePart, ECStore, HTTPRangeSpec, MultipartOperations, MultipartUploadResult, ObjectIO, ObjectOperations,
+        StorageObjectOptions, StoragePutObjReader, access, bucket, compression, data_usage, error, helper, io, object_utils,
+        options, s3_api, set_disk, sse,
+    };
+}
+
+pub(crate) mod select_object {
+    pub(crate) use super::ObjectOperations;
+    pub(crate) use super::get_validated_store;
+    pub(crate) use super::{options, request_context};
+    pub(crate) use super::{validate_sse_headers_for_read, validate_ssec_for_read};
+}
+
+pub(crate) mod context {
+    pub(crate) use super::bucket;
+    pub(crate) use super::{ECStore, EndpointServerPools, runtime};
+    #[cfg(test)]
+    pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+}
+
+#[cfg(test)]
+pub(crate) mod test {
+    pub(crate) use super::{
+        BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, HealOperations, ListOperations,
+        MakeBucketOptions, MultipartOperations, ObjectIO, ObjectOperations, PoolEndpoints, StorageObjectInfo,
+        StorageObjectOptions, StoragePutObjReader,
+    };
+    pub(crate) use super::{bucket, ecfs, object_utils, runtime};
+}

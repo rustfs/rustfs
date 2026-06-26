@@ -185,6 +185,7 @@ RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_byp
 RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_contract_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_domain_bypass_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
+RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_contract_bypass_hits.txt"
 RUSTFS_STORAGE_DIRECT_APP_CONTEXT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_direct_app_context_bypass_hits.txt"
@@ -1643,12 +1644,14 @@ fi
   {
     rg -n --with-filename \
       'use super::(?:\{[^}]*\b(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b|(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|AppWarmBackend|WarmBackendGetOpts|TierConfig|TierType|PoolStatus|PoolDecommissionInfo|RebalStatus)\b)' \
-      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
-      -g '!storage_api.rs' || true
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!rustfs/src/app/storage_api.rs' || true
     rg -n --with-filename \
       'super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)|super::super::(?:get_server_info|get_total_usable_capacity|get_total_usable_capacity_free|apply_bucket_usage_memory_overlay|load_data_usage_from_backend|record_bucket_object_delete_memory|record_bucket_object_write_memory|remove_bucket_usage_from_backend|get_global_|global_rustfs_port|new_object_layer_fn|set_object_store_resolver|set_global_storage_class|collect_scanner_metrics_report|init_local_disks)' \
-      rustfs/src/app/*.rs rustfs/src/app/context/*.rs \
-      -g '!storage_api.rs' || true
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!rustfs/src/app/storage_api.rs' || true
     rg -n --with-filename \
       'crate::app::(?:ECStore|EndpointServerPools|Endpoint|Endpoints|PoolEndpoints|StorageClassConfig|TierConfigMgr|DailyAllTierStats|ScannerMetricsReport|ReplicationStats|DynReplicationPool|NotificationSys|BucketBandwidthMonitor|ExpiryState|get_global_|set_object_store_resolver)' \
       rustfs/src --glob '*.rs' || true
@@ -1746,6 +1749,19 @@ fi
 
 if [[ -s "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app storage contracts must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '(?:crate::app|super)::storage_api::(?:ECStore|Endpoint|EndpointServerPools|Endpoints|PoolEndpoints|HTTPPreconditions|HealOperations|BucketOperations|BucketOptions|CompletePart|DeleteBucketOptions|HTTPRangeSpec|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|MakeBucketOptions|MultipartOperations|MultipartUploadResult|NamespaceLocking|ObjectIO|ObjectOperations|StorageAdminApi|StorageObjectInfo|StorageObjectOptions|StoragePutObjReader|access|admin|bucket|capacity|compression|concurrency|data_usage|deadlock_detector|ecfs|error|head_prefix|helper|io|object_utils|options|request_context|runtime|s3_api|set_disk|sse|storage_class|timeout_wrapper)\b|use super::storage_api::\{' \
+    rustfs/src/app \
+    --glob '*.rs' \
+    --glob '!rustfs/src/app/storage_api.rs' || true
+) >"$RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS app storage-api consumers must use app domain modules from rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE")"
 fi
 
 (
