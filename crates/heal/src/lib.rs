@@ -18,7 +18,7 @@ pub mod heal;
 pub use error::{Error, Result};
 pub use heal::{
     HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
-    channel::HealChannelProcessor,
+    channel::HealChannelProcessor, progress::HealProgress,
 };
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -150,6 +150,14 @@ pub async fn current_heal_operations_snapshot() -> HealOperationsSnapshot {
             active_tasks: current_heal_active_tasks(),
             ..Default::default()
         }
+    }
+}
+
+pub async fn current_heal_progress_snapshot() -> Option<HealProgress> {
+    if let Some(manager) = get_heal_manager() {
+        manager.active_progress_snapshot().await
+    } else {
+        None
     }
 }
 

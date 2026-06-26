@@ -1685,6 +1685,23 @@ impl HealManager {
         }
     }
 
+    pub async fn active_progress_snapshot(&self) -> Option<HealProgress> {
+        let active_heals = self.active_heals.lock().await;
+        if active_heals.is_empty() {
+            return None;
+        }
+
+        let mut snapshot = HealProgress::default();
+        for task in active_heals.values() {
+            let progress = task.get_progress().await;
+            snapshot.objects_scanned = snapshot.objects_scanned.saturating_add(progress.objects_scanned);
+            snapshot.objects_healed = snapshot.objects_healed.saturating_add(progress.objects_healed);
+            snapshot.objects_failed = snapshot.objects_failed.saturating_add(progress.objects_failed);
+            snapshot.bytes_processed = snapshot.bytes_processed.saturating_add(progress.bytes_processed);
+        }
+        Some(snapshot)
+    }
+
     /// Start scheduler
     async fn start_scheduler(&self) -> Result<()> {
         let config = self.config.clone();
@@ -3419,6 +3436,43 @@ mod tests {
         assert_eq!(snapshot.active_by_priority.high, 1);
         assert_eq!(snapshot.active_by_source.admin, 1);
         assert_eq!(snapshot.active_by_source.scanner, 0);
+    }
+
+    #[tokio::test]
+    async fn test_active_progress_snapshot_sums_active_task_progress() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(storage, None);
+
+        let first = Arc::new(HealTask::from_request(
+            HealRequest::bucket("bucket-a".to_string()),
+            manager.storage.clone(),
+        ));
+        {
+            let mut progress = first.progress.write().await;
+            progress.update_progress(7, 3, 1, 4096);
+        }
+
+        let second = Arc::new(HealTask::from_request(
+            HealRequest::bucket("bucket-b".to_string()),
+            manager.storage.clone(),
+        ));
+        {
+            let mut progress = second.progress.write().await;
+            progress.update_progress(11, 5, 2, 2048);
+        }
+
+        manager.active_heals.lock().await.insert(first.id.clone(), first);
+        manager.active_heals.lock().await.insert(second.id.clone(), second);
+
+        let progress = manager
+            .active_progress_snapshot()
+            .await
+            .expect("active progress should exist");
+
+        assert_eq!(progress.objects_scanned, 18);
+        assert_eq!(progress.objects_healed, 8);
+        assert_eq!(progress.objects_failed, 3);
+        assert_eq!(progress.bytes_processed, 6144);
     }
 
     #[tokio::test]
