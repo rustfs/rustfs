@@ -5,17 +5,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-external-storage-api-boundary-phase`
+- Branch: `overtrue/arch-ecstore-cluster-control-plane-layout`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
-- Current baseline also includes API-255 from PR #3923.
-- Current phase PR: API-256 external storage API boundary guard closure.
-- Based on: current `origin/main` after PR #3923 merged.
-- PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-256; this is a
-  loss-prevention guard and documentation closure for the completed external
-  storage API boundary migration.
-- Rust code changes: none expected.
-- CI/script changes: lock completed owner and test/fuzz boundaries against
+- Current baseline also includes API-255 from PR #3923, API-256 from PR
+  #3925, and CFG-009 from PR #3927.
+- Current phase PR: E-028/E-CLUSTER-001 ECStore cluster control-plane owner layout.
+- Based on: E-027 branch while PR #3930 is pending; rebase onto `origin/main`
+  after E-017 through E-027 merge before opening this PR.
+- PR type for this branch: `pure-move`.
+- Runtime behavior changes: none expected for E-028; production changes are a
+  module file move that keeps the existing `cluster` facade paths.
+- Rust code changes: move ECStore cluster control-plane implementation under
+  the `cluster/control_plane` owner module without function-body changes.
+- CI/script changes: reject restoring ECStore root `store.rs`, `set_disk.rs`,
+  `store_list_objects.rs`, `store_utils.rs`, `store_init.rs`,
+  `disks_layout.rs`, `endpoints.rs`, `storage_api_contracts.rs`,
+  `batch_processor.rs`, `event_notification.rs`, `metrics_realtime.rs`, or
+  `notification_sys.rs`, `data_movement.rs`, or
+  `data_movement_backpressure.rs`, `admin_server_info.rs`, `data_usage.rs`,
+  `get_diagnostics.rs`, `global.rs`, `runtime_sources.rs`, `bitrot.rs`,
+  `compress.rs`, `rio.rs`, `error.rs`, `rebalance.rs`, `pools.rs`,
+  `sets.rs`, `pools_test.rs`, or `store_test.rs`;
+  lock completed config model ownership against restoring
+  old `rustfs_ecstore::config` model/accessor compatibility paths, and lock
+  ECStore public facades against re-exporting the moved server-config symbols;
+  retain the existing completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
   regressions, plus external runtime, test, fuzz, and storage-owner module
@@ -42,9 +56,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   `rustfs/src/storage` after API-253, reject restoring storage owner root
   wildcard re-exports after API-254, reject direct storage owner paths from the
   root/app/admin storage facades after API-255, reject restoring storage
-  root SSE re-exports after API-255, and reject direct external
+  root SSE re-exports after API-255, reject direct external
   `rustfs_ecstore::api` facade imports outside local `storage_api` boundary
-  files after API-256.
+  files after API-256, and reject restoring old ECStore server-config model or
+  global accessor compatibility paths after CFG-009, reject restoring ECStore
+  root `store.rs` or `set_disk.rs` after E-017, reject restoring ECStore root
+  store support modules after E-018, reject restoring ECStore root
+  `store_init.rs` after E-019, reject restoring ECStore root layout facade
+  and storage API contract support modules after E-020, and reject restoring
+  ECStore root service runtime modules after E-021, and reject restoring
+  ECStore root data movement modules after E-022, and reject restoring ECStore
+  root usage and diagnostics modules after E-023, and reject restoring ECStore
+  root runtime global modules after E-024, and reject restoring ECStore root
+  I/O support modules after E-025, and reject restoring ECStore root error and
+  rebalance facade modules after E-026, and reject restoring ECStore root core
+  runtime/test modules after E-027, and keep the ECStore cluster root module as
+  a re-export-only owner facade after E-028.
 
 ## Phase 0 Tasks
 
@@ -1415,6 +1442,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     storage-class global state, default registration wiring, and startup
     initialization; global server-config reads and writes keep the same
     `std::sync::RwLock<Option<Config>>` clone semantics.
+- [x] `CFG-009` Close config model ownership guard coverage.
+  - Do: add one phase-level migration rule that rejects the removed
+    `rustfs_ecstore::config::{Config, KV, KVS, register_default_kvs,
+    get_global_server_config, set_global_server_config}` compatibility path and
+    rejects ECStore public facades re-exporting the moved server-config model
+    or global accessor symbols.
+  - Acceptance: moved server-config model symbols and global accessors stay
+    owned by `rustfs_config::server_config`; ECStore keeps persistence,
+    storage-class global state, default wiring, and startup initialization only.
+  - Must preserve: no Rust runtime behavior, config serialization, persisted
+    server-config shape, storage-class behavior, startup initialization, or
+    public API behavior change.
+  - Verification: architecture migration guard, shell syntax check, config
+    model residual scans, diff hygiene, full PR gate, and three-expert review
+    passed.
 
 ## Phase 1b Context Foundation Tasks
 
@@ -3861,6 +3903,203 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `E-017/E-STORE-001` Move ECStore store and set-disk roots into directory modules.
+  - Do: move `crates/ecstore/src/store.rs` to
+    `crates/ecstore/src/store/mod.rs` and `crates/ecstore/src/set_disk.rs` to
+    `crates/ecstore/src/set_disk/mod.rs` while preserving the existing module
+    names, submodule wiring, and public crate paths.
+  - Acceptance: `crate::store` and `crate::set_disk` continue to resolve
+    through the same module names, existing submodules stay under their owner
+    directories, and migration rules reject restoring the old root files.
+  - Must preserve: ECStore object/list/multipart/bucket/heal/rebalance
+    orchestration, set-disk read/write/heal/lock/multipart/metadata flows,
+    public API re-exports, object placement, quorum behavior, reader behavior,
+    and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-018/E-STORE-002` Move ECStore store support modules under the store owner.
+  - Do: move `crates/ecstore/src/store_list_objects.rs` to
+    `crates/ecstore/src/store/list_objects.rs`,
+    `crates/ecstore/src/store_utils.rs` to
+    `crates/ecstore/src/store/utils.rs` while preserving the existing crate
+    module names through path declarations.
+  - Acceptance: `crate::store_list_objects` and `crate::store_utils` continue
+    to resolve through the same module names, and migration rules reject
+    restoring the old root files.
+  - Must preserve: list object traversal, version marker handling, listing
+    quorum behavior, bucket-name utility behavior, public API re-exports,
+    set-disk list path call sites, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-019/E-STORE-003` Move ECStore store init support module under the store owner.
+  - Do: move `crates/ecstore/src/store_init.rs` to
+    `crates/ecstore/src/store/init_format.rs` while preserving the existing
+    crate module name through a path declaration.
+  - Acceptance: `crate::store_init` continues to resolve through the same
+    module name, and migration rules reject restoring the old root file.
+  - Must preserve: disk initialization, format quorum loading, MinIO format
+    migration, format write/read helpers, store initialization call sites,
+    set-disk format helpers, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-020/E-LAYOUT-001` Move ECStore layout facade and contract support modules under owners.
+  - Do: move `crates/ecstore/src/disks_layout.rs` to
+    `crates/ecstore/src/layout/disks_layout_facade.rs`,
+    `crates/ecstore/src/endpoints.rs` to
+    `crates/ecstore/src/layout/endpoints_facade.rs`, and
+  `crates/ecstore/src/storage_api_contracts.rs` to
+  `crates/ecstore/src/storage_api_contracts/mod.rs` while preserving the
+  existing crate module names; harden the pool-level list-object test against
+  parallel global lock-state pollution.
+  - Acceptance: `crate::disks_layout`, `crate::endpoints`, and
+    `crate::storage_api_contracts` continue to resolve through the same module
+    names, and migration rules reject restoring the old root files.
+  - Must preserve: disk layout facade re-exports, endpoint pool facade
+    re-exports, storage API contract domain aliases, ECStore internal contract
+    imports, pool-level list-object behavior, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-021/E-SERVICES-001` Move ECStore service runtime modules under the services owner.
+  - Do: move `crates/ecstore/src/batch_processor.rs`,
+    `crates/ecstore/src/event_notification.rs`,
+    `crates/ecstore/src/metrics_realtime.rs`, and
+    `crates/ecstore/src/notification_sys.rs` under
+    `crates/ecstore/src/services/` while preserving the existing crate module
+    names through path declarations; harden the pool-level list-object test
+    against parallel global setup-state pollution.
+  - Acceptance: `crate::batch_processor`, `crate::event_notification`,
+    `crate::metrics_realtime`, and `crate::notification_sys` continue to
+    resolve through the same module names, and migration rules reject restoring
+    the old root files.
+  - Must preserve: batch job serialization/status behavior, notification event
+    registration/dispatch, realtime metrics snapshots, notification system
+    lifecycle, peer event behavior, pool-level list-object behavior, and all
+    runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-022/E-DATA-MOVEMENT-001` Move ECStore data movement modules under their owner.
+  - Do: move `crates/ecstore/src/data_movement.rs` to
+    `crates/ecstore/src/data_movement/mod.rs` and
+    `crates/ecstore/src/data_movement_backpressure.rs` to
+    `crates/ecstore/src/data_movement/backpressure.rs` while preserving the
+    existing crate module names.
+  - Acceptance: `crate::data_movement` and
+    `crate::data_movement_backpressure` continue to resolve through the same
+    module names, and migration rules reject restoring the old root files.
+  - Must preserve: decommission/rebalance data movement copy semantics,
+    overwrite-resume behavior, checksum propagation, abort flags, backpressure
+    admission policy, metrics, cancellation behavior, and all runtime side
+    effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-023/E-USAGE-DIAGNOSTICS-001` Move ECStore usage and diagnostics modules under owners.
+  - Do: move `crates/ecstore/src/data_usage.rs` to
+    `crates/ecstore/src/data_usage/mod.rs`,
+    `crates/ecstore/src/admin_server_info.rs` to
+    `crates/ecstore/src/diagnostics/admin_server_info.rs`, and
+    `crates/ecstore/src/get_diagnostics.rs` to
+    `crates/ecstore/src/diagnostics/get.rs` while preserving the existing
+    crate module names.
+  - Acceptance: `crate::data_usage`, `crate::admin_server_info`, and
+    `crate::get_diagnostics` continue to resolve through the same module names,
+    and migration rules reject restoring the old root files.
+  - Must preserve: usage cache paths, local usage snapshots, bucket usage
+    aggregation, server info assembly, GET diagnostic labels, diagnostics error
+    classification, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-024/E-RUNTIME-001` Move ECStore runtime global modules under the runtime owner.
+  - Do: move `crates/ecstore/src/global.rs` to
+    `crates/ecstore/src/runtime/global.rs` and
+    `crates/ecstore/src/runtime_sources.rs` to
+    `crates/ecstore/src/runtime/sources.rs` while preserving the existing
+    crate module names through path declarations.
+  - Acceptance: `crate::global` and `crate::runtime_sources` continue to
+    resolve through the same module names, and migration rules reject restoring
+    the old root files.
+  - Must preserve: process-global state ownership, setup-type flags, endpoint
+    globals, object-store publication, lock-client publication, runtime source
+    adapters, test reset helpers, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-025/E-IO-001` Move ECStore I/O support modules under the IO owner.
+  - Do: move `crates/ecstore/src/bitrot.rs`,
+    `crates/ecstore/src/compress.rs`, and `crates/ecstore/src/rio.rs` under
+    `crates/ecstore/src/io_support/` while preserving the existing crate module
+    names through path declarations.
+  - Acceptance: `crate::bitrot`, `crate::compress`, and `crate::rio` continue
+    to resolve through the same module names, and migration rules reject
+    restoring the old root files.
+  - Must preserve: bitrot reader construction, disk compression matching,
+    compression config defaults/env handling, RIO backend selection, encryption
+    and compression metadata behavior, reader wrappers, and all runtime side
+    effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-026/E-CORE-001` Move ECStore error and rebalance facades under owners.
+  - Do: move `crates/ecstore/src/error.rs` to
+    `crates/ecstore/src/error/mod.rs` and `crates/ecstore/src/rebalance.rs` to
+    `crates/ecstore/src/rebalance/mod.rs` while preserving the existing crate
+    module names through directory module resolution.
+  - Acceptance: `crate::error` and `crate::rebalance` continue to resolve
+    through the same module names, and migration rules reject restoring the old
+    root files.
+  - Must preserve: storage error variants/conversions/classifiers, S3 error
+    mapping, rebalance metadata exports, rebalance orchestration constants,
+    rebalance tests, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-027/E-CORE-001` Move ECStore core runtime and test harness modules under owner.
+  - Do: move `crates/ecstore/src/pools.rs` and
+    `crates/ecstore/src/sets.rs` under `crates/ecstore/src/core/`, and move
+    the root ECStore core harness files `pools_test.rs` and `store_test.rs`
+    under the same owner while preserving crate module names through path
+    declarations.
+  - Acceptance: `crate::pools`, `crate::sets`, and the existing test modules
+    continue to resolve through the same module names, and migration rules
+    reject restoring the old root files.
+  - Must preserve: pool orchestration, set routing, ECStore object API
+    behavior, test harness setup/teardown, lock/setup isolation, and all
+    runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
+- [x] `E-028/E-CLUSTER-001` Move ECStore cluster control-plane implementation under owner.
+  - Do: move `crates/ecstore/src/cluster/mod.rs` implementation into
+    `crates/ecstore/src/cluster/control_plane.rs` and keep
+    `cluster/mod.rs` as a re-export-only facade.
+  - Acceptance: `rustfs_ecstore::api::cluster::*` and existing
+    `crate::cluster::*` consumers keep the same symbols, and migration rules
+    reject restoring control-plane implementation declarations to the cluster
+    root module.
+  - Must preserve: topology snapshots, membership grouping, pool-state
+    reporting, local-node storage projection, peer-health unknown status,
+    read-only facade behavior, and all cluster tests.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `API-129` Route RustFS internal ECStore consumers through owner boundary.
   - Do: expose crate-local ECStore facade module aliases from
     `rustfs/src/storage/mod.rs` and migrate RustFS startup, server, capacity,
@@ -5709,12 +5948,51 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 1. `consumer-migration`: move to the next phase-level cleanup batch from the
    current handoff, keeping behavior-owned ECStore internals in ECStore until a
-   pure-move slice is concrete.
+   pure-move slice is concrete and verified.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | E-028 moves the ECStore cluster control-plane implementation into an owner submodule and leaves the root module as a facade. |
+| Migration preservation | pass | `crate::cluster::*` and `rustfs_ecstore::api::cluster::*` stay stable through root re-exports; the moved implementation is a 100% rename. |
+| Testing/verification | pass | ECStore cluster tests, ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-027 moves ECStore pools, sets, and root core test harness modules under the core owner directory and extends the root-file guard. |
+| Migration preservation | pass | `crate::pools`, `crate::sets`, `pools_test`, and `store_test` stay stable through path declarations; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-026 moves ECStore error and rebalance facades under owner directories and extends the root-file guard. |
+| Migration preservation | pass | `crate::error` and `crate::rebalance` stay stable through directory module resolution; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-025 moves ECStore I/O support modules under the `io_support` owner directory and extends the root-file guard. |
+| Migration preservation | pass | `crate::bitrot`, `crate::compress`, and `crate::rio` stay stable through path declarations; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-024 moves ECStore runtime global state and runtime-source adapters under the `runtime` owner directory and extends the root-file guard. |
+| Migration preservation | pass | `crate::global` and `crate::runtime_sources` stay stable through path declarations; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-023 moves ECStore usage and diagnostics/status modules under owner directories and extends the root-file guard. |
+| Migration preservation | pass | `crate::data_usage`, `crate::admin_server_info`, and `crate::get_diagnostics` stay stable through directory module resolution or path declarations; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-022 moves ECStore data movement modules under the `data_movement` owner directory and extends the root-file guard. |
+| Migration preservation | pass | `crate::data_movement` and `crate::data_movement_backpressure` stay stable through directory module resolution and a path declaration; moved files are 100% renames. |
+| Testing/verification | pass | ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-021 moves ECStore service runtime modules under the `services` owner directory, extends the root-file guard, and keeps setup-state test hardening local to `sets` coverage. |
+| Migration preservation | pass | `crate::batch_processor`, `crate::event_notification`, `crate::metrics_realtime`, and `crate::notification_sys` stay stable through path declarations; moved files are 100% renames and the `sets` test restores setup state. |
+| Testing/verification | pass | ECStore target test, default ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-020 moves ECStore disk-layout/endpoints facade shims and storage API contracts under owner directories, extends the root-file guard, and keeps test hardening local to `sets` coverage. |
+| Migration preservation | pass | `crate::disks_layout`, `crate::endpoints`, and `crate::storage_api_contracts` stay stable through module path declarations or directory module resolution; the `sets` test now owns its lock clients and resource names. |
+| Testing/verification | pass | ECStore target test, default ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-019 moves ECStore store init format support under the store owner directory and extends the existing root support guard. |
+| Migration preservation | pass | `crate::store_init` stays stable through a path declaration, and the moved file is a 100% rename with no function-body changes. |
+| Testing/verification | pass | ECStore tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-018 moves ECStore store list/object utility support modules under the store owner directory and guards against restoring the old root files. |
+| Migration preservation | pass | `crate::store_list_objects` and `crate::store_utils` module names stay stable through path declarations, while both moved files are 100% renames. |
+| Testing/verification | pass | ECStore compile/tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
+| Quality/architecture | pass | E-017 moves ECStore store and set-disk root owners into directory modules and adds a guard against restoring the old root files. |
+| Migration preservation | pass | `crate::store` and `crate::set_disk` module names stay stable, and the staged Rust diff is two 100% renames with no added Rust lines. |
+| Testing/verification | pass | ECStore compile/tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, branch freshness, and pre-commit passed. |
+| Quality/architecture | pass | CFG-009 closes the completed config model ownership phase with one guard over old ECStore config compatibility paths and ECStore facade re-exports. |
+| Migration preservation | pass | The slice only adds guard/documentation coverage; ECStore still owns persistence, storage-class state, default wiring, and startup initialization. |
+| Testing/verification | pass | Shell syntax, architecture migration guard, config residual scans, diff hygiene, script/docs risk review, and full PR gate passed. |
 | Quality/architecture | pass | API-256 closes external ECStore facade import coverage with one aggregate guard over runtime, test, e2e, and fuzz storage API boundaries. |
 | Migration preservation | pass | The slice only adds guard/documentation coverage and does not move runtime symbols or alter external storage behavior. |
 | Testing/verification | pass | Shell syntax, architecture migration guard, diff hygiene, script/docs risk review, and full PR gate passed. |
