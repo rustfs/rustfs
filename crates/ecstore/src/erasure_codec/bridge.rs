@@ -221,17 +221,17 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
 
 #[derive(Clone)]
 pub(crate) enum CodecStreamingDecodeEngine {
-    Legacy(LegacyEcDecodeEngine),
-    Rustfs(RustfsCodecDecodeEngine),
+    Legacy(Box<LegacyEcDecodeEngine>),
+    Rustfs(Box<RustfsCodecDecodeEngine>),
 }
 
 impl CodecStreamingDecodeEngine {
     pub(crate) fn legacy(erasure: Erasure) -> Self {
-        Self::Legacy(LegacyEcDecodeEngine::new(erasure))
+        Self::Legacy(Box::new(LegacyEcDecodeEngine::new(erasure)))
     }
 
     pub(crate) fn rustfs(erasure: &Erasure) -> io::Result<Self> {
-        RustfsCodecDecodeEngine::new(erasure).map(Self::Rustfs)
+        RustfsCodecDecodeEngine::new(erasure).map(Box::new).map(Self::Rustfs)
     }
 }
 
