@@ -25,7 +25,8 @@ use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::disk::error_reduce::{
-    BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, count_errs, reduce_read_quorum_errs, reduce_write_quorum_errs,
+    BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
+    reduce_write_quorum_errs,
 };
 use crate::disk::{
     self, CHECK_PART_DISK_NOT_FOUND, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
@@ -155,6 +156,9 @@ const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
 const COMPLETE_MULTIPART_PART_MISSING: &str = "part_missing";
 const COMPLETE_MULTIPART_PART_READ_QUORUM_UNAVAILABLE: &str = "read_quorum_unavailable";
 const COMPLETE_MULTIPART_PART_ERROR: &str = "part_error";
+const MULTIPART_WRITE_QUORUM_UPLOAD_METADATA: &str = "upload_metadata";
+const MULTIPART_WRITE_QUORUM_WRITER_SETUP: &str = "writer_setup";
+const MULTIPART_WRITE_QUORUM_RENAME_PART: &str = "rename_part";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
@@ -513,6 +517,47 @@ fn record_lock_release(bucket: &str, object: &str, lock_id: &str, lock_type: &st
         lock_id = %lock_id,
         lock_type = %lock_type,
         "Lock released for deadlock tracking"
+    );
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct MultipartWriteQuorumContext<'a> {
+    stage: &'static str,
+    bucket: &'a str,
+    object: &'a str,
+    upload_id: &'a str,
+    part_number: Option<usize>,
+}
+
+fn log_multipart_write_quorum_failure(
+    context: MultipartWriteQuorumContext<'_>,
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+    returned_error: &DiskError,
+) {
+    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+    runtime_sources::record_erasure_write_quorum_failure(context.stage, summary.dominant_error_label);
+    warn!(
+        target: "rustfs_ecstore::set_disk",
+        event = EVENT_SET_DISK_MULTIPART,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_SET_DISK,
+        op = "upload_part",
+        state = "write_quorum_unavailable",
+        stage = context.stage,
+        bucket = %context.bucket,
+        object = %context.object,
+        upload_id = %context.upload_id,
+        part_number = context.part_number,
+        required = summary.required,
+        achieved = summary.achieved,
+        failed = summary.failed,
+        total = summary.total,
+        offline_disks = summary.offline_disks,
+        retryable_failures = summary.retryable_failures,
+        dominant_error = summary.dominant_error_label,
+        returned_error = %returned_error,
+        "Set disk multipart write quorum unavailable"
     );
 }
 
@@ -3726,6 +3771,18 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let nil_count = errors.iter().filter(|&e| e.is_none()).count();
         if nil_count < write_quorum {
             if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+                log_multipart_write_quorum_failure(
+                    MultipartWriteQuorumContext {
+                        stage: MULTIPART_WRITE_QUORUM_WRITER_SETUP,
+                        bucket,
+                        object,
+                        upload_id,
+                        part_number: Some(part_id),
+                    },
+                    &errors,
+                    write_quorum,
+                    &write_err,
+                );
                 return Err(to_object_err(write_err.into(), vec![bucket, object]));
             }
 
@@ -3827,6 +3884,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 &part_path,
                 part_info_buff.into(),
                 write_quorum,
+                Some(MultipartWriteQuorumContext {
+                    stage: MULTIPART_WRITE_QUORUM_RENAME_PART,
+                    bucket,
+                    object,
+                    upload_id,
+                    part_number: Some(part_id),
+                }),
             )
             .await?;
 

@@ -367,6 +367,7 @@ fn is_confirmed_missing_part_error(err: Option<&str>) -> bool {
     };
 
     err.contains("file not found")
+        || err.contains("No such file or directory")
         || err.contains("Specified part could not be found")
         || (err.starts_with("part.") && err.ends_with(" not found"))
 }
@@ -2530,6 +2531,30 @@ mod tests {
 
         assert_eq!(resolved.number, 1);
         assert_eq!(resolved.error.as_deref(), Some("part.1 not found"));
+    }
+
+    #[test]
+    fn resolve_read_part_treats_os_not_found_as_confirmed_missing() {
+        let responses = vec![
+            Some(vec![ObjectPartInfo {
+                number: 9999,
+                error: Some("No such file or directory (os error 2)".to_string()),
+                ..Default::default()
+            }]),
+            Some(vec![ObjectPartInfo {
+                number: 9999,
+                error: Some("No such file or directory (os error 2)".to_string()),
+                ..Default::default()
+            }]),
+            Some(vec![read_part_test_part(1, "stale-etag")]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.9999.meta", 9999, 0, 1, &responses, 2)
+            .expect("OS not-found quorum should resolve as a missing part");
+
+        assert_eq!(resolved.number, 9999);
+        assert_eq!(resolved.error.as_deref(), Some("part.9999 not found"));
     }
 
     #[test]
