@@ -140,6 +140,7 @@ ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_runtime_gl
 ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_module_hits.txt"
 ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
 ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
+ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -2934,6 +2935,14 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore core runtime modules must stay under the core owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename 'pub (struct|enum|fn) Cluster|pub fn (topology|membership|pool_state|local_node_storage|peer_health)_snapshot' \
+  "${ROOT_DIR}/crates/ecstore/src/cluster/mod.rs" \
+  >"$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore cluster root module must only re-export control-plane owner symbols: $(paste -sd '; ' "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
