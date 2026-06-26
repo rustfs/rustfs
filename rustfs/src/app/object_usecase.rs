@@ -15,12 +15,14 @@
 //! Object application use-case contracts.
 
 // Performance metrics recording (with zero-copy-metrics integration)
-use super::storage_api::ECStore;
+use super::storage_api::object_usecase::ECStore;
 #[cfg(test)]
-use super::storage_api::HTTPPreconditions;
-use super::storage_api::access::{PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut};
-use super::storage_api::bucket::quota::checker::QuotaChecker;
-use super::storage_api::bucket::{
+use super::storage_api::object_usecase::HTTPPreconditions;
+use super::storage_api::object_usecase::access::{
+    PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
+};
+use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
+use super::storage_api::object_usecase::bucket::{
     ReplicationConfigExt as _, VersioningConfigExt as _,
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
@@ -43,38 +45,38 @@ use super::storage_api::bucket::{
     validate_restore_request,
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
-use super::storage_api::concurrency::{
+use super::storage_api::object_usecase::compression::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+use super::storage_api::object_usecase::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
 };
-use super::storage_api::data_usage::{record_bucket_object_delete_memory, record_bucket_object_write_memory};
-use super::storage_api::deadlock_detector;
-use super::storage_api::ecfs::FS;
-use super::storage_api::error::{
+use super::storage_api::object_usecase::data_usage::{record_bucket_object_delete_memory, record_bucket_object_write_memory};
+use super::storage_api::object_usecase::deadlock_detector;
+use super::storage_api::object_usecase::ecfs::FS;
+use super::storage_api::object_usecase::error::{
     DiskError, Error as EcstoreError, StorageError, is_all_buckets_not_found, is_err_bucket_not_found, is_err_object_not_found,
     is_err_version_not_found,
 };
-use super::storage_api::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
-use super::storage_api::object_utils::to_s3s_etag;
-use super::storage_api::options::{
+use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+use super::storage_api::object_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
+use super::storage_api::object_usecase::object_utils::to_s3s_etag;
+use super::storage_api::object_usecase::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
 };
-use super::storage_api::request_context::{self, spawn_traced};
-use super::storage_api::s3_api::multipart::parse_list_parts_params;
-use super::storage_api::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
-use super::storage_api::sse::{
+use super::storage_api::object_usecase::request_context::{self, spawn_traced};
+use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
+use super::storage_api::object_usecase::set_disk::{get_lock_acquire_timeout, is_valid_storage_class};
+use super::storage_api::object_usecase::sse::{
     DecryptionRequest, EncryptionRequest, SSEType, apply_bucket_default_lock_retention, build_ssec_read_headers,
     encryption_material_to_metadata, extract_server_side_encryption_from_headers, extract_ssec_params_from_headers,
     extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error, sse_decryption, sse_encryption,
 };
-use super::storage_api::storage_class as storageclass;
-use super::storage_api::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
-use super::storage_api::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
-use super::storage_api::{
+use super::storage_api::object_usecase::storage_class as storageclass;
+use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+use super::storage_api::object_usecase::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
+use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,
     strip_managed_encryption_metadata, validate_bucket_object_lock_enabled, validate_object_key, validate_sse_headers_for_read,
@@ -162,7 +164,7 @@ use tokio_util::io::{ReaderStream, StreamReader};
 use tracing::{debug, error, instrument, warn};
 use uuid::Uuid;
 
-use super::storage_api::{
+use super::storage_api::object_usecase::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
@@ -786,7 +788,7 @@ fn should_buffer_get_object_in_memory_with_threshold(
 #[cfg(test)]
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
-    use crate::app::storage_api::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use crate::app::storage_api::object_usecase::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
     use std::sync::Arc;
 
     #[test]

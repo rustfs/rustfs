@@ -26,12 +26,12 @@ pub use global::*;
 pub use handles::*;
 pub use interfaces::*;
 
-use super::storage_api::bucket::metadata_sys::BucketMetadataSys;
-use super::storage_api::runtime::{
+use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
+use super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
     ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
 };
-use super::storage_api::{ECStore, EndpointServerPools};
+use super::storage_api::context::{ECStore, EndpointServerPools};
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
@@ -566,8 +566,8 @@ fn resolve_buffer_config_with(
 
 #[cfg(test)]
 mod tests {
-    use super::super::storage_api::runtime::init_local_disks;
-    use super::super::storage_api::{Endpoint, Endpoints, PoolEndpoints};
+    use super::super::storage_api::context::runtime::init_local_disks;
+    use super::super::storage_api::context::{Endpoint, Endpoints, PoolEndpoints};
     use super::*;
     use crate::app::context::global::AppContextTestInterfaces;
     use crate::app::context::handles::{

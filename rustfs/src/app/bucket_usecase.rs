@@ -14,12 +14,12 @@
 
 //! Bucket application use-case contracts.
 
-use super::storage_api::ECStore;
-use super::storage_api::StorageObjectInfo as ObjectInfo;
-use super::storage_api::access::{ReqInfo, authorize_request, req_info_ref};
+use super::storage_api::bucket_usecase::ECStore;
+use super::storage_api::bucket_usecase::StorageObjectInfo as ObjectInfo;
+use super::storage_api::bucket_usecase::access::{ReqInfo, authorize_request, req_info_ref};
 #[cfg(test)]
-use super::storage_api::bucket::target::BucketTarget;
-use super::storage_api::bucket::{
+use super::storage_api::bucket_usecase::bucket::target::BucketTarget;
+use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
@@ -37,20 +37,20 @@ use super::storage_api::bucket::{
     utils::serialize,
     versioning_sys::BucketVersioningSys,
 };
-use super::storage_api::data_usage::remove_bucket_usage_from_backend;
-use super::storage_api::error::StorageError;
-use super::storage_api::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::object_utils::to_s3s_etag;
-use super::storage_api::s3_api::bucket::{
+use super::storage_api::bucket_usecase::data_usage::remove_bucket_usage_from_backend;
+use super::storage_api::bucket_usecase::error::StorageError;
+use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
+use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
+use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params, parse_list_objects_v2_params,
     rustfs_owner,
 };
-use super::storage_api::{
+use super::storage_api::bucket_usecase::{
     BucketOperations, BucketOptions, DeleteBucketOptions, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
     ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as _, MakeBucketOptions,
 };
-use super::storage_api::{
+use super::storage_api::bucket_usecase::{
     get_validated_store, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
     request_context, validate_list_object_unordered_with_delimiter,
 };
