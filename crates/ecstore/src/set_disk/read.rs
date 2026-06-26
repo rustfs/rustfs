@@ -438,7 +438,7 @@ fn resolve_read_part_from_responses(
         return Ok(found);
     }
 
-    if present_count == 0 && missing_count >= read_quorum {
+    if missing_count >= read_quorum {
         return Ok(ObjectPartInfo {
             number: part_number,
             error: Some(format!("part.{part_number} not found")),
@@ -2527,6 +2527,22 @@ mod tests {
 
         let resolved = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
             .expect("missing quorum should resolve as a confirmed missing part");
+
+        assert_eq!(resolved.number, 1);
+        assert_eq!(resolved.error.as_deref(), Some("part.1 not found"));
+    }
+
+    #[test]
+    fn resolve_read_part_returns_missing_when_missing_quorum_beats_stale_present_part() {
+        let responses = vec![
+            Some(vec![read_part_test_missing(1)]),
+            Some(vec![read_part_test_missing(1)]),
+            Some(vec![read_part_test_part(1, "stale-etag")]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("confirmed missing quorum should resolve as a missing part despite stale metadata");
 
         assert_eq!(resolved.number, 1);
         assert_eq!(resolved.error.as_deref(), Some("part.1 not found"));
