@@ -273,6 +273,7 @@ pub enum HealRequestSource {
     Admin,
     Scanner,
     AutoHeal,
+    ReadRepair,
 }
 
 impl HealRequestSource {
@@ -282,6 +283,7 @@ impl HealRequestSource {
             Self::Admin => "admin",
             Self::Scanner => "scanner",
             Self::AutoHeal => "auto_heal",
+            Self::ReadRepair => "read_repair",
         }
     }
 }
@@ -680,6 +682,7 @@ mod tests {
         assert_eq!(HealRequestSource::Admin.as_str(), "admin");
         assert_eq!(HealRequestSource::AutoHeal.as_str(), "auto_heal");
         assert_eq!(HealRequestSource::Internal.as_str(), "internal");
+        assert_eq!(HealRequestSource::ReadRepair.as_str(), "read_repair");
 
         let request = HealChannelRequest::default();
         assert_eq!(request.source, HealRequestSource::Internal);

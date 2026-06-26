@@ -133,6 +133,17 @@ pub const ENV_HEAL_SET_BULKHEAD_ENABLE: &str = "RUSTFS_HEAL_SET_BULKHEAD_ENABLE"
 /// Environment variable that toggles page-level parallel object healing for erasure-set repair.
 pub const ENV_HEAL_PAGE_PARALLEL_ENABLE: &str = "RUSTFS_HEAL_PAGE_PARALLEL_ENABLE";
 
+/// Environment variable that toggles foreground read pressure gating for background heal work.
+pub const ENV_HEAL_MAINLINE_THROTTLE_ENABLE: &str = "RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE";
+
+/// Environment variable that controls the foreground read permit utilization percentage
+/// at which background heal work pauses starting new tasks.
+pub const ENV_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: &str = "RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT";
+
+/// Environment variable that controls how soon the heal scheduler rechecks foreground
+/// pressure after delaying background work.
+pub const ENV_HEAL_MAINLINE_MAX_SLEEP_MS: &str = "RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS";
+
 /// Default behavior is to merge duplicate low-priority requests.
 pub const DEFAULT_HEAL_LOW_PRIORITY_MERGE_ENABLE: bool = true;
 
@@ -150,3 +161,12 @@ pub const DEFAULT_HEAL_SET_BULKHEAD_ENABLE: bool = true;
 
 /// Default behavior is to keep erasure-set page parallelism enabled.
 pub const DEFAULT_HEAL_PAGE_PARALLEL_ENABLE: bool = true;
+
+/// Default behavior is to pause best-effort heal task starts when foreground reads are saturated.
+pub const DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE: bool = true;
+
+/// Default foreground read permit utilization threshold for pausing best-effort heal task starts.
+pub const DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: usize = 80;
+
+/// Default foreground pressure recheck delay for heal scheduler, in milliseconds.
+pub const DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS: u64 = 250;
