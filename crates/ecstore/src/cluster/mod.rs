@@ -13,6 +13,7 @@
 // limitations under the License.
 
 mod control_plane;
+pub(crate) mod rpc;
 
 pub use control_plane::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage,
