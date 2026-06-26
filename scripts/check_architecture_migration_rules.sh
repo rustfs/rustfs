@@ -141,6 +141,9 @@ ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_mod
 ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
 ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
 ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
+ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_support_module_hits.txt"
+ECSTORE_ROOT_RPC_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_impl_hits.txt"
+ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE="${TMP_DIR}/ecstore_old_metadata_owner_path_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -2943,6 +2946,49 @@ rg -n --with-filename 'pub (struct|enum|fn) Cluster|pub fn (topology|membership|
 
 if [[ -s "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE" ]]; then
   report_failure "ECStore cluster root module must only re-export control-plane owner symbols: $(paste -sd '; ' "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/rpc/client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/client.rs'
+    [[ -e crates/ecstore/src/rpc/context_propagation.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/context_propagation.rs'
+    [[ -e crates/ecstore/src/rpc/http_auth.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/http_auth.rs'
+    [[ -e crates/ecstore/src/rpc/internode_data_transport.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/internode_data_transport.rs'
+    [[ -e crates/ecstore/src/rpc/peer_rest_client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/peer_rest_client.rs'
+    [[ -e crates/ecstore/src/rpc/peer_s3_client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/peer_s3_client.rs'
+    [[ -e crates/ecstore/src/rpc/remote_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_disk.rs'
+    [[ -e crates/ecstore/src/rpc/remote_locker.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_locker.rs'
+    [[ -e crates/ecstore/src/rpc/runtime_sources.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/runtime_sources.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore RPC support modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename '^(pub(?:\(crate\))? )?(struct|enum|fn|trait) |^mod ' \
+  "${ROOT_DIR}/crates/ecstore/src/rpc/mod.rs" \
+  >"$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore root rpc module must only re-export cluster/rpc owner symbols: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/bucket/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata.rs'
+    [[ -e crates/ecstore/src/bucket/metadata_sys.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_sys.rs'
+    [[ -e crates/ecstore/src/bucket/metadata_test.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_test.rs'
+    [[ -e crates/ecstore/src/set_disk/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/set_disk/metadata.rs'
+    true
+  }
+) >"$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE"
+
+if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
+  report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
