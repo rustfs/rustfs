@@ -13,29 +13,77 @@
 // limitations under the License.
 
 use crate::disk::error::Error;
+use crate::get_diagnostics::{
+    GET_SHARD_READ_COST_LOCAL, GET_SHARD_READ_COST_REMOTE, GET_SHARD_READ_COST_SAME_NODE, GET_SHARD_READ_COST_UNKNOWN,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ShardReadCost {
+    Local,
+    SameNode,
+    Remote,
+    Unknown,
+}
+
+impl ShardReadCost {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Local => GET_SHARD_READ_COST_LOCAL,
+            Self::SameNode => GET_SHARD_READ_COST_SAME_NODE,
+            Self::Remote => GET_SHARD_READ_COST_REMOTE,
+            Self::Unknown => GET_SHARD_READ_COST_UNKNOWN,
+        }
+    }
+
+    pub(crate) const fn is_low_cost(self) -> bool {
+        matches!(self, Self::Local | Self::SameNode)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ShardSlot {
     index: usize,
+    read_cost: ShardReadCost,
     data: Option<Vec<u8>>,
     error: Option<Error>,
 }
 
 impl ShardSlot {
     pub(crate) fn new(index: usize, data: Option<Vec<u8>>, error: Option<Error>) -> Self {
-        Self { index, data, error }
+        Self::with_read_cost(index, ShardReadCost::Unknown, data, error)
+    }
+
+    pub(crate) fn with_read_cost(index: usize, read_cost: ShardReadCost, data: Option<Vec<u8>>, error: Option<Error>) -> Self {
+        Self {
+            index,
+            read_cost,
+            data,
+            error,
+        }
     }
 
     pub(crate) fn data(index: usize, data: Vec<u8>) -> Self {
         Self::new(index, Some(data), None)
     }
 
+    pub(crate) fn data_with_read_cost(index: usize, read_cost: ShardReadCost, data: Vec<u8>) -> Self {
+        Self::with_read_cost(index, read_cost, Some(data), None)
+    }
+
     pub(crate) fn missing(index: usize, error: Error) -> Self {
         Self::new(index, None, Some(error))
     }
 
+    pub(crate) fn missing_with_read_cost(index: usize, read_cost: ShardReadCost, error: Error) -> Self {
+        Self::with_read_cost(index, read_cost, None, Some(error))
+    }
+
     pub(crate) fn index(&self) -> usize {
         self.index
+    }
+
+    pub(crate) fn read_cost(&self) -> ShardReadCost {
+        self.read_cost
     }
 
     pub(crate) fn has_data(&self) -> bool {
@@ -63,12 +111,27 @@ impl StripeReadState {
     }
 
     pub(crate) fn from_parts(shards: Vec<Option<Vec<u8>>>, errors: Vec<Option<Error>>, read_quorum: usize) -> Self {
+        Self::from_parts_with_read_costs(shards, errors, &[], read_quorum)
+    }
+
+    pub(crate) fn from_parts_with_read_costs(
+        shards: Vec<Option<Vec<u8>>>,
+        errors: Vec<Option<Error>>,
+        read_costs: &[ShardReadCost],
+        read_quorum: usize,
+    ) -> Self {
         let slot_count = shards.len().max(errors.len());
         let mut slots = Vec::with_capacity(slot_count);
         let mut shards = shards.into_iter();
         let mut errors = errors.into_iter();
         for index in 0..slot_count {
-            slots.push(ShardSlot::new(index, shards.next().flatten(), errors.next().flatten()));
+            let read_cost = read_costs.get(index).copied().unwrap_or(ShardReadCost::Unknown);
+            slots.push(ShardSlot::with_read_cost(
+                index,
+                read_cost,
+                shards.next().flatten(),
+                errors.next().flatten(),
+            ));
         }
         Self::new(slots, read_quorum)
     }
@@ -125,9 +188,9 @@ mod tests {
     fn stripe_read_state_tracks_decode_quorum() {
         let state = StripeReadState::new(
             vec![
-                ShardSlot::data(0, vec![1]),
-                ShardSlot::missing(1, Error::FileNotFound),
-                ShardSlot::data(2, vec![2]),
+                ShardSlot::data_with_read_cost(0, ShardReadCost::Local, vec![1]),
+                ShardSlot::missing_with_read_cost(1, ShardReadCost::Remote, Error::FileNotFound),
+                ShardSlot::data_with_read_cost(2, ShardReadCost::SameNode, vec![2]),
             ],
             2,
         );
@@ -135,6 +198,8 @@ mod tests {
         assert_eq!(state.available_shards(), 2);
         assert!(state.can_decode());
         assert_eq!(state.slots()[1].index(), 1);
+        assert_eq!(state.slots()[0].read_cost(), ShardReadCost::Local);
+        assert!(state.slots()[2].read_cost().is_low_cost());
     }
 
     #[test]
@@ -155,6 +220,21 @@ mod tests {
         assert!(state.can_decode());
         assert_eq!(state.slots()[1].index(), 1);
         assert_eq!(state.slots()[1].error(), Some(&Error::FileNotFound));
+    }
+
+    #[test]
+    fn stripe_read_state_preserves_read_cost_hints() {
+        let state = StripeReadState::from_parts_with_read_costs(
+            vec![Some(vec![1]), None, Some(vec![3])],
+            vec![None, Some(Error::FileNotFound)],
+            &[ShardReadCost::Local, ShardReadCost::Remote, ShardReadCost::Unknown],
+            2,
+        );
+
+        assert_eq!(state.slots()[0].read_cost(), ShardReadCost::Local);
+        assert_eq!(state.slots()[1].read_cost(), ShardReadCost::Remote);
+        assert_eq!(state.slots()[2].read_cost(), ShardReadCost::Unknown);
+        assert_eq!(ShardReadCost::SameNode.as_str(), GET_SHARD_READ_COST_SAME_NODE);
     }
 
     #[test]

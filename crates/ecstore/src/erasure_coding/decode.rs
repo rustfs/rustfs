@@ -17,12 +17,12 @@ use crate::disk::error_reduce::reduce_errs;
 use crate::erasure_codec::workspace::ShardBufferPool;
 use crate::erasure_coding::{BitrotReader, Erasure};
 use crate::get_diagnostics::{
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_OUTCOME_ERROR, GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS,
-    GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT, GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ,
-    GET_STAGE_STRIPE_READ_FIRST_SHARD, GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error,
-    record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_ERROR_MISSING, GET_SHARD_READ_ERROR_NONE, GET_SHARD_READ_OUTCOME_ERROR,
+    GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS, GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT,
+    GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GET_STAGE_STRIPE_READ_FIRST_SHARD,
+    GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error, record_get_object_pipeline_failure,
 };
-use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
+use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeReadState};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
 use std::future::Future;
@@ -35,7 +35,30 @@ use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
 use tracing::error;
 
-type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, Result<Vec<u8>, Error>)> + Send + 'a>>;
+type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>)> + Send + 'a>>;
+
+#[derive(Default)]
+struct ShardReadCostCounts {
+    local: usize,
+    same_node: usize,
+    remote: usize,
+    unknown: usize,
+}
+
+impl ShardReadCostCounts {
+    fn record(&mut self, cost: ShardReadCost) {
+        match cost {
+            ShardReadCost::Local => self.local += 1,
+            ShardReadCost::SameNode => self.same_node += 1,
+            ShardReadCost::Remote => self.remote += 1,
+            ShardReadCost::Unknown => self.unknown += 1,
+        }
+    }
+
+    fn low_cost(&self) -> usize {
+        self.local + self.same_node
+    }
+}
 
 fn shard_role(index: usize, data_shards: usize) -> &'static str {
     if index < data_shards {
@@ -47,6 +70,7 @@ fn shard_role(index: usize, data_shards: usize) -> &'static str {
 
 fn read_shard<'a, R>(
     index: usize,
+    read_cost: ShardReadCost,
     reader: &'a mut Option<BitrotReader<R>>,
     recycled_buf: Option<Vec<u8>>,
     shard_size: usize,
@@ -66,36 +90,56 @@ where
                 Ok(n) => {
                     buf.truncate(n);
                     if let Some(path) = metrics_path {
-                        rustfs_io_metrics::record_get_object_shard_read(
+                        rustfs_io_metrics::record_get_object_shard_read_observation(
                             path,
+                            index,
                             role,
+                            read_cost.as_str(),
                             GET_SHARD_READ_OUTCOME_SUCCESS,
+                            GET_SHARD_READ_ERROR_NONE,
                             n,
                             read_start.elapsed().as_secs_f64(),
+                            reader.last_verify_duration().as_secs_f64(),
                         );
                     }
-                    (index, Ok(buf))
+                    (index, read_cost, Ok(buf))
                 }
                 Err(e) => {
+                    let verify_duration_secs = reader.last_verify_duration().as_secs_f64();
+                    let error_class = classify_io_error(&e).as_str();
                     if let Some(path) = metrics_path {
-                        rustfs_io_metrics::record_get_object_shard_read(
+                        rustfs_io_metrics::record_get_object_shard_read_observation(
                             path,
+                            index,
                             role,
+                            read_cost.as_str(),
                             GET_SHARD_READ_OUTCOME_ERROR,
+                            error_class,
                             0,
                             read_start.elapsed().as_secs_f64(),
+                            verify_duration_secs,
                         );
                     }
-                    (index, Err(Error::from(e)))
+                    (index, read_cost, Err(Error::from(e)))
                 }
             }
         })
     } else {
         Box::pin(async move {
             if let Some(path) = metrics_path {
-                rustfs_io_metrics::record_get_object_shard_read(path, role, GET_SHARD_READ_OUTCOME_MISSING, 0, 0.0);
+                rustfs_io_metrics::record_get_object_shard_read_observation(
+                    path,
+                    index,
+                    role,
+                    read_cost.as_str(),
+                    GET_SHARD_READ_OUTCOME_MISSING,
+                    GET_SHARD_READ_ERROR_MISSING,
+                    0,
+                    0.0,
+                    0.0,
+                );
             }
-            (index, Err(Error::FileNotFound))
+            (index, read_cost, Err(Error::FileNotFound))
         })
     }
 }
@@ -110,6 +154,7 @@ pub(crate) struct ParallelReader<R> {
     data_shards: usize,
     total_shards: usize,
     metrics_path: Option<&'static str>,
+    read_costs: Vec<ShardReadCost>,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -132,10 +177,24 @@ where
         total_length: usize,
         metrics_path: Option<&'static str>,
     ) -> Self {
+        let read_costs = vec![ShardReadCost::Unknown; readers.len()];
+        Self::new_with_metrics_path_and_read_costs(readers, e, offset, total_length, metrics_path, read_costs)
+    }
+
+    pub fn new_with_metrics_path_and_read_costs(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+        mut read_costs: Vec<ShardReadCost>,
+    ) -> Self {
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
         let offset = (offset / e.block_size) * shard_size;
+        read_costs.resize(readers.len(), ShardReadCost::Unknown);
+        read_costs.truncate(readers.len());
 
         // Ensure offset does not exceed shard_file_size
 
@@ -147,6 +206,7 @@ where
             data_shards: e.data_shards,
             total_shards: e.data_shards + e.parity_shards,
             metrics_path,
+            read_costs,
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
@@ -174,6 +234,21 @@ where
 
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
+        let low_cost_available = self
+            .readers
+            .iter()
+            .enumerate()
+            .filter(|(index, reader)| {
+                reader.is_some()
+                    && self
+                        .read_costs
+                        .get(*index)
+                        .copied()
+                        .unwrap_or(ShardReadCost::Unknown)
+                        .is_low_cost()
+            })
+            .count();
+        let mut successful_costs = ShardReadCostCounts::default();
 
         self.buffers.ensure_slots(num_readers);
 
@@ -191,8 +266,17 @@ where
                     } else {
                         None
                     };
+                    let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
                     scheduled += 1;
-                    sets.push(read_shard(i, reader, recycled_buf, shard_size, self.data_shards, self.metrics_path));
+                    sets.push(read_shard(
+                        i,
+                        read_cost,
+                        reader,
+                        recycled_buf,
+                        shard_size,
+                        self.data_shards,
+                        self.metrics_path,
+                    ));
                 }
             }
 
@@ -201,7 +285,7 @@ where
             let mut failed = 0usize;
             let mut first_shard_recorded = false;
             let mut quorum_recorded = false;
-            while let Some((i, result)) = sets.next().await {
+            while let Some((i, read_cost, result)) = sets.next().await {
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = self.metrics_path {
@@ -217,6 +301,7 @@ where
                 match result {
                     Ok(v) => {
                         shards[i] = Some(v);
+                        successful_costs.record(read_cost);
                         success += 1;
                     }
                     Err(e) => {
@@ -229,9 +314,11 @@ where
                             } else {
                                 None
                             };
+                            let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
                             scheduled += 1;
                             sets.push(read_shard(
                                 next_i,
+                                next_read_cost,
                                 next_reader,
                                 recycled_buf,
                                 shard_size,
@@ -266,6 +353,20 @@ where
             }
         }
 
+        if let Some(path) = self.metrics_path {
+            rustfs_io_metrics::record_get_object_shard_read_cost_summary(
+                path,
+                successful_costs.local,
+                successful_costs.same_node,
+                successful_costs.remote,
+                successful_costs.unknown,
+                low_cost_available,
+                successful_costs.low_cost(),
+                self.data_shards,
+                low_cost_available >= self.data_shards,
+            );
+        }
+
         (shards, errs)
     }
 
@@ -292,7 +393,7 @@ where
     async fn read_next_stripe(&mut self) -> StripeReadState {
         let read_quorum = self.data_shards;
         let (shards, errors) = ParallelReader::read(self).await;
-        StripeReadState::from_parts(shards, errors, read_quorum)
+        StripeReadState::from_parts_with_read_costs(shards, errors, &self.read_costs, read_quorum)
     }
 }
 
@@ -442,6 +543,39 @@ impl Erasure {
         W: AsyncWrite + Send + Sync + Unpin,
         R: AsyncRead + Unpin + Send + Sync,
     {
+        self.decode_inner(writer, readers, offset, length, total_length, None).await
+    }
+
+    pub(crate) async fn decode_with_read_costs<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        offset: usize,
+        length: usize,
+        total_length: usize,
+        read_costs: Vec<ShardReadCost>,
+    ) -> (usize, Option<std::io::Error>)
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: AsyncRead + Unpin + Send + Sync,
+    {
+        self.decode_inner(writer, readers, offset, length, total_length, Some(read_costs))
+            .await
+    }
+
+    async fn decode_inner<W, R>(
+        &self,
+        writer: &mut W,
+        readers: Vec<Option<BitrotReader<R>>>,
+        offset: usize,
+        length: usize,
+        total_length: usize,
+        read_costs: Option<Vec<ShardReadCost>>,
+    ) -> (usize, Option<std::io::Error>)
+    where
+        W: AsyncWrite + Send + Sync + Unpin,
+        R: AsyncRead + Unpin + Send + Sync,
+    {
         if readers.len() != self.data_shards + self.parity_shards {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));
@@ -464,13 +598,24 @@ impl Erasure {
 
         let mut written = 0;
 
-        let mut reader = ParallelReader::new_with_metrics_path(
-            readers,
-            self.clone(),
-            offset,
-            total_length,
-            Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
-        );
+        let mut reader = if let Some(read_costs) = read_costs {
+            ParallelReader::new_with_metrics_path_and_read_costs(
+                readers,
+                self.clone(),
+                offset,
+                total_length,
+                Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+                read_costs,
+            )
+        } else {
+            ParallelReader::new_with_metrics_path(
+                readers,
+                self.clone(),
+                offset,
+                total_length,
+                Some(GET_OBJECT_PATH_LEGACY_DUPLEX),
+            )
+        };
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;

@@ -95,12 +95,12 @@ impl Drop for GetObjectGuard {
         // `elapsed()` method remains meaningful for tests and callers.
         let duration_secs = self.start_time.elapsed().as_secs_f64();
         // Use the caller-set status, or "unknown" if the result was never set
-        // (e.g., the future was cancelled or the guard dropped without explicit completion).
+        // (e.g., the future was canceled or the guard dropped without explicit completion).
         let status = self.result.unwrap_or("unknown");
         record_get_object_request_result(status, duration_secs);
 
         if let Err(previous) =
-            ACTIVE_GET_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+            ACTIVE_GET_REQUESTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
         {
             debug_assert_eq!(
                 previous, 0,
@@ -160,7 +160,7 @@ impl Drop for PutObjectGuard {
         record_put_object_request_result(status, duration_secs);
 
         if let Err(previous) =
-            ACTIVE_PUT_REQUESTS.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
+            ACTIVE_PUT_REQUESTS.try_update(Ordering::Relaxed, Ordering::Relaxed, |current| current.checked_sub(1))
         {
             debug_assert_eq!(
                 previous, 0,
