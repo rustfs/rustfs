@@ -641,9 +641,16 @@ impl Default for ConcurrencyManager {
 // ============================================
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod integration_tests {
-    use super::*;
+    use super::super::io_schedule::{IoLoadLevel, IoPriority};
+    use super::super::request_guard::GetObjectGuard;
+    use super::ConcurrencyManager;
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+    use rustfs_config::MI_B;
+    use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial]

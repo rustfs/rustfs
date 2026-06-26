@@ -1212,26 +1212,33 @@ impl Node for NodeService {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::*;
-    use Request;
+    use super::{
+        CollectMetricsOpts, Error, MetricType, Node as _, NodeService, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
+        background_rebalance_start_error_message, make_server, stop_rebalance_response,
+    };
+    use bytes::Bytes;
+    use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
         DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
         DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
         GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
-        GetMetacacheListingRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
-        GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest,
-        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
-        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
-        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-        WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
+        MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
+        ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
+        RenamePartRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
     };
+    use std::collections::HashMap;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
 
     fn create_test_node_service() -> NodeService {
         make_server()
