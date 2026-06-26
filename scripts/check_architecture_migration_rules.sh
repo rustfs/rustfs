@@ -193,6 +193,7 @@ RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_
 RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_contract_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_domain_bypass_hits.txt"
+RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_storage_contract_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
@@ -1851,6 +1852,40 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS root storage-api consumers must use domain modules from rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n -U --with-filename \
+      'storage_api::cluster::\{[^}]*?(CapabilitySnapshotError|CapabilityState|CapabilityStatus|DiskCapabilities|MemorySamplingState|ObservabilitySnapshot|ObservabilitySnapshotProvider|PlatformSupport|TopologyCapabilities|TopologySnapshot|TopologySnapshotProvider|UserspaceProfilingCapability)' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+    rg -n --with-filename \
+      'storage_api::cluster::(?:CapabilitySnapshotError|CapabilityState|CapabilityStatus|DiskCapabilities|MemorySamplingState|ObservabilitySnapshot|ObservabilitySnapshotProvider|PlatformSupport|TopologyCapabilities|TopologySnapshot|TopologySnapshotProvider|UserspaceProfilingCapability)\b|storage_api::server::(?:StorageAdminApi|TransitionedObject)\b|storage_api::startup::(?:BucketOperations|BucketOptions)\b|storage_api::table::(?:HTTPPreconditions|HTTPRangeSpec|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|NamespaceLocking|ObjectIO|ObjectInfoOrErr|ObjectOperations|WalkOptions)\b|storage_api::error::HTTPRangeError\b' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+    rg -n -U --with-filename \
+      'storage_api::(?:server::\{[^}]*?(StorageAdminApi|TransitionedObject)|startup::\{[^}]*?(BucketOperations|BucketOptions)|table::\{[^}]*?(HTTPPreconditions|HTTPRangeSpec|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|NamespaceLocking|ObjectIO|ObjectInfoOrErr|ObjectOperations|WalkOptions)|error::\{[^}]*?HTTPRangeError)' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+  }
+) >"$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS root storage consumers must import storage contracts from domain modules, not root storage_api facades: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (

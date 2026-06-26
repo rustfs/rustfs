@@ -22,15 +22,28 @@ pub(crate) mod capacity {
 }
 
 pub(crate) mod cluster {
-    pub(crate) use super::storage_contracts::{
-        CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, MemorySamplingState, ObservabilitySnapshot,
-        ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
-        UserspaceProfilingCapability,
-    };
+    pub(crate) mod contract {
+        pub(crate) mod capability {
+            #[cfg(test)]
+            pub(crate) use super::super::super::storage_contracts::CapabilityState;
+            pub(crate) use super::super::super::storage_contracts::{
+                CapabilitySnapshotError, CapabilityStatus, MemorySamplingState, PlatformSupport, UserspaceProfilingCapability,
+            };
+        }
+
+        pub(crate) mod observability {
+            pub(crate) use super::super::super::storage_contracts::{ObservabilitySnapshot, ObservabilitySnapshotProvider};
+        }
+
+        pub(crate) mod topology {
+            pub(crate) use super::super::super::storage_contracts::{
+                DiskCapabilities, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
+            };
+        }
+    }
+
     pub(crate) use crate::storage::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 
-    #[cfg(test)]
-    pub(crate) use super::storage_contracts::CapabilityState;
     #[cfg(test)]
     pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
 
@@ -48,7 +61,12 @@ pub(crate) mod config_test {
 }
 
 pub(crate) mod error {
-    pub(crate) use super::storage_contracts::HTTPRangeError;
+    pub(crate) mod contract {
+        pub(crate) mod range {
+            pub(crate) use super::super::super::storage_contracts::HTTPRangeError;
+        }
+    }
+
     pub(crate) use crate::storage::{QuotaError, StorageError};
 }
 
@@ -67,14 +85,22 @@ pub(crate) mod protocols {
 }
 
 pub(crate) mod server {
-    pub(crate) use super::storage_contracts::StorageAdminApi;
+    pub(crate) mod contract {
+        pub(crate) mod admin {
+            pub(crate) use super::super::super::storage_contracts::StorageAdminApi;
+        }
+
+        #[cfg(test)]
+        pub(crate) mod lifecycle {
+            pub(crate) use super::super::super::storage_contracts::TransitionedObject;
+        }
+    }
+
     pub(crate) use crate::storage::{
         ECStore, Endpoint, EndpointServerPools, Error, EventArgs, StorageObjectInfo, TONIC_RPC_PREFIX, apply_cors_headers,
         is_dist_erasure, read_config, register_event_dispatch_hook, save_config, verify_rpc_signature,
     };
 
-    #[cfg(test)]
-    pub(crate) use super::storage_contracts::TransitionedObject;
     #[cfg(test)]
     pub(crate) use crate::storage::{Endpoints, PoolEndpoints};
 
@@ -98,7 +124,12 @@ pub(crate) mod server {
 }
 
 pub(crate) mod startup {
-    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions};
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::storage_contracts::{BucketOperations, BucketOptions};
+        }
+    }
+
     pub(crate) use crate::storage::{
         DynReplicationPool, ECStore, EndpointServerPools, Result, get_bucket_notification_config, init_background_replication,
         init_bucket_metadata_sys, init_ecstore_config, init_global_config_sys, init_local_disks, init_lock_clients,
@@ -125,10 +156,30 @@ pub(crate) mod startup {
 }
 
 pub(crate) mod table {
-    pub(crate) use super::storage_contracts::{
-        HTTPPreconditions, HTTPRangeSpec, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, NamespaceLocking, ObjectIO,
-        ObjectInfoOrErr, ObjectOperations, WalkOptions,
-    };
+    pub(crate) mod contract {
+        pub(crate) mod http {
+            pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
+        }
+
+        pub(crate) mod list {
+            pub(crate) use super::super::super::storage_contracts::{
+                ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr, WalkOptions,
+            };
+        }
+
+        pub(crate) mod namespace {
+            pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::storage_contracts::{ObjectIO, ObjectOperations};
+        }
+
+        pub(crate) mod range {
+            pub(crate) use super::super::super::storage_contracts::HTTPRangeSpec;
+        }
+    }
+
     pub(crate) use crate::storage::{
         BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
         BUCKET_TABLE_RESERVED_PREFIX, Error, RUSTFS_META_BUCKET, StorageDeletedObject, StorageError, StorageGetObjectReader,
