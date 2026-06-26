@@ -16,6 +16,7 @@ mod audit;
 mod compress;
 pub mod cors;
 mod event;
+mod health;
 mod http;
 mod hybrid;
 mod layer;
@@ -43,6 +44,12 @@ pub use service_state::wait_for_shutdown;
 
 // Items only used within the library crate (admin handlers, server/http.rs, etc.).
 pub(crate) use event::convert_ecstore_object_info;
+#[cfg(test)]
+pub(crate) use health::{
+    HealthPayloadContext, HealthReadinessSource, build_component_details, build_health_payload, health_check_state,
+    readiness_source_for_probe,
+};
+pub(crate) use health::{HealthProbe, build_health_response_parts, collect_probe_readiness, probe_from_path};
 pub(crate) use http::HeaderMapCarrier;
 pub(crate) use http::active_http_requests;
 pub(crate) use layer::RequestContextLayer;
