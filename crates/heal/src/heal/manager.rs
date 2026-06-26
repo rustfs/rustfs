@@ -745,16 +745,19 @@ struct HealQueueContext<'a> {
 
 impl HealManager {
     fn classify_full_admission(request: &HealRequest, config: &HealConfig) -> HealAdmissionResult {
-        if matches!(
+        let best_effort_source = matches!(
             request.source,
             HealRequestSource::Scanner | HealRequestSource::AutoHeal | HealRequestSource::ReadRepair
-        ) {
-            HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
-        } else if request.priority == HealPriority::Low && config.low_priority_drop_when_full {
+        );
+        if best_effort_source || (request.priority == HealPriority::Low && config.low_priority_drop_when_full) {
             HealAdmissionResult::Dropped(HealAdmissionDropReason::QueueFull)
         } else {
             HealAdmissionResult::Full
         }
+    }
+
+    fn queue_usage_pct(queue_len: usize, queue_capacity: usize) -> usize {
+        queue_len.saturating_mul(100).checked_div(queue_capacity).unwrap_or(0)
     }
 
     fn classify_pressure_admission(
@@ -766,7 +769,7 @@ impl HealManager {
             return None;
         }
 
-        let queue_usage_pct = queue_len.saturating_mul(100) / queue_capacity;
+        let queue_usage_pct = Self::queue_usage_pct(queue_len, queue_capacity);
         if queue_usage_pct < 80 {
             return None;
         }
@@ -901,7 +904,7 @@ impl HealManager {
                     context,
                     queue_len,
                     queue_capacity,
-                    queue_usage_pct = if queue_capacity == 0 { 0 } else { queue_len.saturating_mul(100) / queue_capacity },
+                    queue_usage_pct = Self::queue_usage_pct(queue_len, queue_capacity),
                     reason = reason.as_str(),
                     result = "dropped_pressure",
                     "Heal queue request dropped under pressure"
@@ -920,7 +923,7 @@ impl HealManager {
                     subsystem = LOG_SUBSYSTEM_MANAGER,
                     queue_len,
                     queue_capacity,
-                    queue_usage_pct = queue_len.saturating_mul(100) / queue_capacity,
+                    queue_usage_pct = Self::queue_usage_pct(queue_len, queue_capacity),
                     context,
                     result = "queue_pressure_high",
                     "Heal queue pressure high"
