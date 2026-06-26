@@ -15,8 +15,6 @@
 //! Multipart application use-case contracts.
 
 use super::storage_api::multipart_usecase::ECStore;
-#[cfg(test)]
-use super::storage_api::multipart_usecase::HTTPPreconditions;
 use super::storage_api::multipart_usecase::access::has_bypass_governance_header;
 use super::storage_api::multipart_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::multipart_usecase::bucket::{
@@ -27,6 +25,11 @@ use super::storage_api::multipart_usecase::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::multipart_usecase::compression::is_disk_compressible;
+#[cfg(test)]
+use super::storage_api::multipart_usecase::contract::http::HTTPPreconditions;
+use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, MultipartOperations as _, MultipartUploadResult};
+use super::storage_api::multipart_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
+use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::record_bucket_object_write_memory;
 use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::multipart_usecase::helper::OperationHelper;
@@ -48,9 +51,6 @@ use super::storage_api::multipart_usecase::sse::{
     build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
     extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in, map_get_object_reader_error,
     mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
-};
-use super::storage_api::multipart_usecase::{
-    CompletePart, HTTPRangeSpec, MultipartOperations as _, MultipartUploadResult, ObjectIO as _, ObjectOperations as _,
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};

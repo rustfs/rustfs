@@ -14,11 +14,11 @@
 
 //! Admin application use-case contracts.
 
-use super::storage_api::admin_usecase::StorageAdminApi;
 use super::storage_api::admin_usecase::admin::get_server_info;
 use super::storage_api::admin_usecase::capacity::{
     PoolDecommissionInfo, PoolStatus, RebalStatus, get_total_usable_capacity, get_total_usable_capacity_free,
 };
+use super::storage_api::admin_usecase::contract::StorageAdminApi;
 use super::storage_api::admin_usecase::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{

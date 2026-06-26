@@ -184,6 +184,7 @@ RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_so
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
 RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_wildcard_hits.txt"
+RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_contract_root_consumer_hits.txt"
 RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits.txt"
 RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s3_api_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_api_bypass_hits.txt"
@@ -1875,6 +1876,31 @@ fi
 
 if [[ -s "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app storage contracts must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      'storage_api::(?:admin_usecase|bucket_usecase|object_usecase|multipart_usecase|select_object)::(?:StorageAdminApi|BucketOperations|BucketOptions|DeleteBucketOptions|MakeBucketOptions|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|HTTPPreconditions|HTTPRangeSpec|NamespaceLocking|ObjectIO|ObjectOperations|CompletePart|MultipartOperations|MultipartUploadResult)\b' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n -U --with-filename \
+      'storage_api::test::\{[^}]*?(BucketOperations|BucketOptions|HealOperations|ListOperations|MakeBucketOptions|MultipartOperations|ObjectIO|ObjectOperations)' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n --with-filename \
+      'storage_api::test::(?:BucketOperations|BucketOptions|HealOperations|ListOperations|MakeBucketOptions|MultipartOperations|ObjectIO|ObjectOperations)\b' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+  }
+) >"$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase modules must import storage contracts from domain modules, not usecase root facades: $(paste -sd '; ' "$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (
