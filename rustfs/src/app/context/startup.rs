@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_api::ECStore;
+use super::super::storage_api::context::ECStore;
 use super::global::{AppContext, get_global_app_context, init_global_app_context};
 use super::runtime_sources;
 use rustfs_kms::KmsServiceManager;

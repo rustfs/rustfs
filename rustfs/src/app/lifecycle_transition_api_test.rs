@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_api::bucket::{
+use super::storage_api::test::bucket::{
     lifecycle,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
     metadata_sys,
     transition_api::{ReadCloser, ReaderImpl},
 };
-use super::storage_api::ecfs::FS;
-use super::storage_api::object_utils::to_s3s_etag;
-use super::storage_api::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
-use super::storage_api::{
+use super::storage_api::test::ecfs::FS;
+use super::storage_api::test::object_utils::to_s3s_etag;
+use super::storage_api::test::runtime::{AppWarmBackend, TierConfig, TierType, WarmBackendGetOpts};
+use super::storage_api::test::{
     BucketOperations, BucketOptions, ListOperations as _, MakeBucketOptions, MultipartOperations as _, ObjectIO as _,
     ObjectOperations as _,
 };
-use super::storage_api::{
+use super::storage_api::test::{
     ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, StorageObjectInfo as ObjectInfo,
     StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
 };
@@ -109,7 +109,7 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>) {
 
     let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-    super::storage_api::runtime::init_local_disks(endpoint_pools.clone())
+    super::storage_api::test::runtime::init_local_disks(endpoint_pools.clone())
         .await
         .unwrap();
 

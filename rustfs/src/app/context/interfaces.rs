@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::storage_api::EndpointServerPools;
-use super::super::storage_api::bucket::metadata_sys::BucketMetadataSys;
-use super::super::storage_api::runtime::{
+use super::super::storage_api::context::EndpointServerPools;
+use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
+use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
     ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
 };
