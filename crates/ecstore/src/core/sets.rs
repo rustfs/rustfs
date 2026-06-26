@@ -1090,9 +1090,36 @@ async fn init_storage_disks_with_errors(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::endpoints::SetupType;
     use crate::layout::endpoint::Endpoint;
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::list::ListOperations as _;
+    use rustfs_lock::client::local::LocalClient;
+    use serial_test::serial;
+
+    struct SetupTypeGuard {
+        previous: SetupType,
+    }
+
+    impl SetupTypeGuard {
+        async fn switch_to(next: SetupType) -> Self {
+            let previous = runtime_sources::current_setup_type().await;
+            runtime_sources::set_setup_type(next).await;
+            Self { previous }
+        }
+    }
+
+    impl Drop for SetupTypeGuard {
+        fn drop(&mut self) {
+            let previous = self.previous.clone();
+            let handle = tokio::runtime::Handle::current();
+            tokio::task::block_in_place(|| {
+                handle.block_on(async move {
+                    runtime_sources::set_setup_type(previous).await;
+                });
+            });
+        }
+    }
 
     #[test]
     fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {
@@ -1203,8 +1230,10 @@ mod tests {
         assert_eq!(result, (Some(3), Some(1), Some(0)));
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
     async fn sets_list_objects_v2_lists_objects_within_the_pool() {
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::Erasure).await;
         let format = FormatV3::new(1, 2);
         let mut endpoints = Vec::new();
         let mut disks = Vec::new();
@@ -1247,7 +1276,7 @@ mod tests {
             0,
             endpoints.clone(),
             format.clone(),
-            Vec::new(),
+            vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
         )
         .await;
 
@@ -1272,23 +1301,26 @@ mod tests {
             exit_signal: None,
         });
 
-        sets.make_bucket("bucket", &MakeBucketOptions::default())
+        let bucket = format!("bucket-{}", Uuid::new_v4().simple());
+        let object = format!("object-{}", Uuid::new_v4().simple());
+
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
 
         let mut reader = PutObjReader::from_vec(b"hello".to_vec());
-        sets.put_object("bucket", "object", &mut reader, &ObjectOptions::default())
+        sets.put_object(&bucket, &object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
 
         let result = sets
             .clone()
-            .list_objects_v2("bucket", "", None, None, 1000, false, None, false)
+            .list_objects_v2(&bucket, "", None, None, 1000, false, None, false)
             .await
             .expect("pool-level listing should succeed");
 
         assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].name, "object");
+        assert_eq!(result.objects[0].name, object);
     }
 
     #[tokio::test]
