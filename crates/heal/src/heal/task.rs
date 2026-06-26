@@ -41,7 +41,6 @@ const EVENT_HEAL_TASK_STATE: &str = "heal_task_state";
 const EVENT_HEAL_OBJECT_STAGE: &str = "heal_object_stage";
 const EVENT_HEAL_OBJECT_MISSING: &str = "heal_object_missing";
 const EVENT_HEAL_OBJECT_RESULT: &str = "heal_object_result";
-const EVENT_HEAL_OBJECT_CLEANUP: &str = "heal_object_cleanup";
 const EVENT_HEAL_BUCKET_STAGE: &str = "heal_bucket_stage";
 const EVENT_HEAL_BUCKET_RESULT: &str = "heal_bucket_result";
 const EVENT_HEAL_METADATA_STAGE: &str = "heal_metadata_stage";
@@ -446,6 +445,31 @@ impl HealTask {
         }
     }
 
+    fn is_object_not_found_heal_error(err: &Error) -> bool {
+        match err {
+            Error::Disk(DiskError::FileNotFound | DiskError::FileVersionNotFound) => true,
+            Error::Storage(
+                EcstoreError::FileNotFound
+                | EcstoreError::FileVersionNotFound
+                | EcstoreError::ObjectNotFound(_, _)
+                | EcstoreError::VersionNotFound(_, _, _),
+            ) => true,
+            Error::Other(message) | Error::IO(message) => {
+                message.contains("File not found")
+                    || message.contains("file not found")
+                    || message.contains("File version not found")
+                    || message.contains("file version not found")
+                    || message.contains("Object not found")
+                    || message.contains("object not found")
+            }
+            _ => false,
+        }
+    }
+
+    fn should_return_typed_heal_error(err: &Error) -> bool {
+        matches!(err, Error::Storage(_) | Error::Disk(_))
+    }
+
     async fn skip_data_usage_cache_heal_error(&self, bucket: &str, object: &str, err: &Error) -> bool {
         if !Self::should_skip_data_usage_cache_heal_error(bucket, object, err) {
             return false;
@@ -748,6 +772,18 @@ impl HealTask {
                     "Heal object recreate requested"
                 );
                 return self.recreate_missing_object(bucket, object, version_id).await;
+            } else if self.source == HealRequestSource::Scanner {
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_OBJECT_STAGE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_OBJECT,
+                    task_id = %self.id,
+                    bucket,
+                    object,
+                    stage = "scanner_missing_probe",
+                    "Heal scanner missing object will be checked by storage layer"
+                );
             } else {
                 return Err(Error::TaskExecutionFailed {
                     message: format!("Object not found: {bucket}/{object}"),
@@ -798,9 +834,7 @@ impl HealTask {
                         return Ok(());
                     }
 
-                    // Check if this is a "File not found" error during delete operations
-                    let error_msg = format!("{e}");
-                    if error_msg.contains("File not found") || error_msg.contains("not found") {
+                    if Self::is_object_not_found_heal_error(&e) {
                         debug!(
                             target: "rustfs::heal::task",
                             event = EVENT_HEAL_OBJECT_RESULT,
@@ -832,40 +866,13 @@ impl HealTask {
                         "Heal object operation failed"
                     );
 
-                    // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                    if self.options.remove_corrupted {
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_CLEANUP,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            action = "delete_corrupted_object",
-                            dry_run = self.options.dry_run,
-                            "Heal object cleanup requested"
-                        );
-                        if !self.options.dry_run {
-                            self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                            debug!(
-                                target: "rustfs::heal::task",
-                                event = EVENT_HEAL_OBJECT_CLEANUP,
-                                component = LOG_COMPONENT_HEAL,
-                                subsystem = LOG_SUBSYSTEM_OBJECT,
-                                task_id = %self.id,
-                                bucket,
-                                object,
-                                action = "delete_corrupted_object",
-                                result = "deleted",
-                                "Heal corrupted object deleted"
-                            );
-                        }
-                    }
-
                     {
                         let mut progress = self.progress.write().await;
                         progress.update_progress(3, 3, 0, 0);
+                    }
+
+                    if Self::should_return_typed_heal_error(&e) {
+                        return Err(e);
                     }
 
                     return Err(Error::TaskExecutionFailed {
@@ -914,9 +921,7 @@ impl HealTask {
                     return Ok(());
                 }
 
-                // Check if this is a "File not found" error during delete operations
-                let error_msg = format!("{e}");
-                if error_msg.contains("File not found") || error_msg.contains("not found") {
+                if Self::is_object_not_found_heal_error(&e) {
                     debug!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_OBJECT_RESULT,
@@ -948,45 +953,18 @@ impl HealTask {
                     "Heal object operation failed"
                 );
 
-                // If heal failed and remove_corrupted is enabled, delete the corrupted object
-                if self.options.remove_corrupted {
-                    debug!(
-                        target: "rustfs::heal::task",
-                        event = EVENT_HEAL_OBJECT_CLEANUP,
-                        component = LOG_COMPONENT_HEAL,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        task_id = %self.id,
-                        bucket,
-                        object,
-                        action = "delete_corrupted_object",
-                        dry_run = self.options.dry_run,
-                        "Heal object cleanup requested"
-                    );
-                    if !self.options.dry_run {
-                        self.await_with_control(self.storage.delete_object(bucket, object)).await?;
-                        debug!(
-                            target: "rustfs::heal::task",
-                            event = EVENT_HEAL_OBJECT_CLEANUP,
-                            component = LOG_COMPONENT_HEAL,
-                            subsystem = LOG_SUBSYSTEM_OBJECT,
-                            task_id = %self.id,
-                            bucket,
-                            object,
-                            action = "delete_corrupted_object",
-                            result = "deleted",
-                            "Heal corrupted object deleted"
-                        );
-                    }
-                }
-
                 {
                     let mut progress = self.progress.write().await;
                     progress.update_progress(3, 3, 0, 0);
                 }
 
-                Err(Error::TaskExecutionFailed {
-                    message: format!("Failed to heal object {bucket}/{object}: {e}"),
-                })
+                if Self::should_return_typed_heal_error(&e) {
+                    Err(e)
+                } else {
+                    Err(Error::TaskExecutionFailed {
+                        message: format!("Failed to heal object {bucket}/{object}: {e}"),
+                    })
+                }
             }
         }
     }
@@ -2242,6 +2220,7 @@ mod tests {
         object_exists: Mutex<Option<bool>>,
         object_exists_by_name: Mutex<HashMap<String, MockObjectExists>>,
         heal_object_outcome: Mutex<Option<MockHealObjectOutcome>>,
+        deleted_objects: Mutex<Vec<String>>,
         format_no_heal_required: Mutex<bool>,
         listed_prefixes: Mutex<Vec<String>>,
         truncate_without_token: Mutex<bool>,
@@ -2287,7 +2266,8 @@ mod tests {
             Ok(())
         }
 
-        async fn delete_object(&self, _bucket: &str, _object: &str) -> Result<()> {
+        async fn delete_object(&self, _bucket: &str, object: &str) -> Result<()> {
+            self.deleted_objects.lock().unwrap().push(object.to_string());
             Ok(())
         }
 
@@ -2356,6 +2336,7 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(version_id.map(ToString::to_string));
+            self.object_heal_opts.lock().unwrap().push(*opts);
             if let Some(outcome) = self.heal_object_outcome.lock().unwrap().take() {
                 return match outcome {
                     MockHealObjectOutcome::OkWithOtherError(message) => {
@@ -2376,7 +2357,6 @@ mod tests {
                 return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
             }
             self.healed_objects.lock().unwrap().push(object.to_string());
-            self.object_heal_opts.lock().unwrap().push(*opts);
             Ok((
                 HealResultItem {
                     object_size: 1,
@@ -3011,6 +2991,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_heal_scanner_missing_object_without_recreate_probes_storage() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: false,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner missing object should be checked by storage");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+        assert!(!storage.object_heal_opts.lock().unwrap()[0].recreate);
+    }
+
+    #[tokio::test]
+    async fn test_heal_scanner_missing_object_without_recreate_treats_not_found_as_stale() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(false)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::ErrOther("File not found"))),
+            ..Default::default()
+        });
+        let mut request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                recreate_missing: false,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        request.source = HealRequestSource::Scanner;
+        let task = HealTask::from_request(request, storage.clone());
+
+        task.execute()
+            .await
+            .expect("scanner confirmed-not-found object should be treated as stale");
+
+        assert!(matches!(task.get_status().await, HealTaskStatus::Completed));
+        assert_eq!(storage.heal_object_calls.lock().unwrap().as_slice(), ["x.rnd".to_string()]);
+    }
+
+    #[tokio::test]
     async fn test_heal_recreate_scanner_synthetic_object_dir_disk_not_found_fails() {
         let storage = Arc::new(MockStorage {
             object_exists: Mutex::new(Some(false)),
@@ -3104,6 +3146,37 @@ mod tests {
         let result_items = task.get_result_items().await;
         assert_eq!(result_items.len(), 1);
         assert_eq!(result_items[0].object_size, 1);
+    }
+
+    #[tokio::test]
+    async fn test_heal_failure_with_remove_corrupted_does_not_delete_object() {
+        let storage = Arc::new(MockStorage {
+            object_exists: Mutex::new(Some(true)),
+            heal_object_outcome: Mutex::new(Some(MockHealObjectOutcome::OkWithOtherError(
+                "can not reconstruct data: not enough available shards (need 12, have 11)",
+            ))),
+            ..Default::default()
+        });
+        let request = HealRequest::new(
+            HealType::Object {
+                bucket: "bucket-a".to_string(),
+                object: "x.rnd".to_string(),
+                version_id: None,
+            },
+            HealOptions {
+                remove_corrupted: true,
+                timeout: None,
+                ..Default::default()
+            },
+            HealPriority::Normal,
+        );
+        let task = HealTask::from_request(request, storage.clone());
+
+        let err = task.execute().await.expect_err("heal failure should still be reported");
+
+        assert!(matches!(err, Error::TaskExecutionFailed { .. }));
+        assert!(storage.deleted_objects.lock().unwrap().is_empty());
+        assert!(storage.object_heal_opts.lock().unwrap()[0].remove);
     }
 
     #[tokio::test]

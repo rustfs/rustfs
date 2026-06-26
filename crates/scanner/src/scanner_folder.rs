@@ -437,6 +437,7 @@ fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> H
     HealChannelRequest {
         bucket,
         priority,
+        recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
         ..Default::default()
     }
@@ -456,6 +457,7 @@ fn build_object_heal_request(
         priority,
         scan_mode: Some(scan_mode),
         remove_corrupted: Some(HEAL_DELETE_DANGLING),
+        recreate_missing: Some(false),
         source: HealRequestSource::Scanner,
         ..Default::default()
     }
@@ -3115,6 +3117,17 @@ mod tests {
         assert_eq!(request.priority, HealChannelPriority::Low);
         assert_eq!(request.source, HealRequestSource::Scanner);
         assert_eq!(request.remove_corrupted, Some(HEAL_DELETE_DANGLING));
+        assert_eq!(request.recreate_missing, Some(false));
+    }
+
+    #[test]
+    fn test_build_bucket_heal_request_disables_recreate_for_scanner() {
+        let request = build_bucket_heal_request("bucket".to_string(), HealChannelPriority::Low);
+
+        assert_eq!(request.bucket, "bucket");
+        assert_eq!(request.priority, HealChannelPriority::Low);
+        assert_eq!(request.source, HealRequestSource::Scanner);
+        assert_eq!(request.recreate_missing, Some(false));
     }
 
     fn metadata_for_object(bucket: &str, object: &str) -> Vec<u8> {

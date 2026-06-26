@@ -33,7 +33,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{DiskError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
+use super::{DiskError, EcstoreError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -557,15 +557,29 @@ fn is_recoverable_heal_error(err: &Error, error: &str) -> bool {
     match err {
         Error::TaskCancelled => false,
         Error::TaskTimeout | Error::TransientSkip { .. } => true,
-        Error::TaskExecutionFailed { .. }
-        | Error::Storage(_)
-        | Error::Disk(_)
-        | Error::Io(_)
-        | Error::IO(_)
-        | Error::Anyhow(_)
-        | Error::Other(_) => is_recoverable_heal_error_message(error),
+        Error::Storage(err) => is_recoverable_storage_heal_error(err) || is_recoverable_heal_error_message(error),
+        Error::Disk(err) => is_recoverable_disk_heal_error(err) || is_recoverable_heal_error_message(error),
+        Error::TaskExecutionFailed { .. } | Error::Io(_) | Error::IO(_) | Error::Anyhow(_) | Error::Other(_) => {
+            is_recoverable_heal_error_message(error)
+        }
         _ => false,
     }
+}
+
+fn is_recoverable_storage_heal_error(err: &EcstoreError) -> bool {
+    err.is_quorum_error() || matches!(err, EcstoreError::SlowDown | EcstoreError::OperationCanceled | EcstoreError::Lock(_))
+}
+
+fn is_recoverable_disk_heal_error(err: &DiskError) -> bool {
+    matches!(
+        err,
+        DiskError::ErasureReadQuorum
+            | DiskError::ErasureWriteQuorum
+            | DiskError::Timeout
+            | DiskError::SourceStalled
+            | DiskError::FaultyRemoteDisk
+            | DiskError::FaultyDisk
+    )
 }
 
 fn is_recoverable_heal_error_message(error: &str) -> bool {
@@ -3029,6 +3043,33 @@ mod tests {
         assert_eq!(retry_request.priority, task.priority);
         assert!(retry_delay > Duration::ZERO);
         assert!(retry_error.contains("Lock acquisition timeout"));
+    }
+
+    #[test]
+    fn test_retry_request_for_typed_read_quorum_error() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);
+        let result = Err(Error::Storage(EcstoreError::InsufficientReadQuorum(
+            "bucket".to_string(),
+            "object".to_string(),
+        )));
+
+        let (retry_request, retry_delay, retry_error) =
+            retry_request_for_result(&task, &result).expect("typed read quorum should be retryable");
+
+        assert_eq!(retry_request.id, task.id);
+        assert_eq!(retry_request.retry_attempts, 1);
+        assert!(retry_delay > Duration::ZERO);
+        assert!(retry_error.contains("Storage resources are insufficient"));
+    }
+
+    #[test]
+    fn test_retry_request_for_typed_not_found_error_is_not_retryable() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let task = HealTask::from_request(HealRequest::object("bucket".to_string(), "object".to_string(), None), storage);
+        let result = Err(Error::Storage(EcstoreError::ObjectNotFound("bucket".to_string(), "object".to_string())));
+
+        assert!(retry_request_for_result(&task, &result).is_none());
     }
 
     #[test]

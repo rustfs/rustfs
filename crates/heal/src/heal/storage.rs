@@ -937,7 +937,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self.ecstore.heal_object(bucket, object, version_id_str, opts).await {
             Ok((result, ecstore_error)) => {
-                let error = ecstore_error.map(Error::other);
+                let error = ecstore_error.map(Error::Storage);
                 debug!(
                     target: "rustfs::heal::storage",
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
@@ -968,7 +968,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }
@@ -1014,7 +1014,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }
@@ -1033,7 +1033,7 @@ impl HealStorageAPI for ECStoreHealStorage {
 
         match self.ecstore.heal_format(dry_run).await {
             Ok((result, ecstore_error)) => {
-                let error = ecstore_error.map(Error::other);
+                let error = ecstore_error.map(Error::Storage);
                 debug!(
                     target: "rustfs::heal::storage",
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
@@ -1058,7 +1058,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                     error = %e,
                     "Heal storage repair failed"
                 );
-                Err(Error::other(e))
+                Err(Error::Storage(e))
             }
         }
     }
