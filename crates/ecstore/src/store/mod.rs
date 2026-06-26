@@ -32,6 +32,7 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
 use crate::core::pools::PoolMeta;
 use crate::disk::endpoint::{Endpoint, EndpointType};
@@ -42,7 +43,6 @@ use crate::error::{
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
 use crate::rebalance::RebalanceMeta;
-use crate::rpc::RemoteClient;
 use crate::runtime::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
 use crate::runtime::sources as runtime_sources;
 use crate::services::event_notification::EventNotifier;
@@ -61,7 +61,6 @@ use crate::{
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET},
     layout::endpoints::EndpointServerPools,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    rpc::S3PeerSys,
 };
 use futures::future::join_all;
 use http::HeaderMap;

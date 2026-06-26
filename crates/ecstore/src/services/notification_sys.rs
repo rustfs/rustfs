@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cluster::rpc::PeerRestClient;
 use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::error::{Error, Result};
 use crate::layout::endpoints::EndpointServerPools;
 use crate::rebalance::RebalSaveOpt;
-use crate::rpc::PeerRestClient;
 use crate::runtime::sources as runtime_sources;
 use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::storage_api_contracts::admin::StorageAdminApi;
@@ -232,7 +232,12 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     match client
-                        .signal_service(crate::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC, &sub_sys, false, SystemTime::UNIX_EPOCH)
+                        .signal_service(
+                            crate::cluster::rpc::SERVICE_SIGNAL_RELOAD_DYNAMIC,
+                            &sub_sys,
+                            false,
+                            SystemTime::UNIX_EPOCH,
+                        )
                         .await
                     {
                         Ok(_) => NotificationPeerErr {
@@ -261,7 +266,7 @@ impl NotificationSys {
             futures.push(async move {
                 if let Some(client) = client {
                     match client
-                        .signal_service(crate::rpc::SERVICE_SIGNAL_REFRESH_CONFIG, "", false, SystemTime::UNIX_EPOCH)
+                        .signal_service(crate::cluster::rpc::SERVICE_SIGNAL_REFRESH_CONFIG, "", false, SystemTime::UNIX_EPOCH)
                         .await
                     {
                         Ok(_) => NotificationPeerErr {

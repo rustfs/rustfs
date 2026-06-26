@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cluster::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
-use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use crate::{disk::endpoint::Endpoint, runtime::sources as runtime_sources};
 
 use crate::data_usage::load_data_usage_cache;

@@ -156,7 +156,7 @@ pub mod rio {
 }
 
 pub mod rpc {
-    pub use crate::rpc::{
+    pub use crate::cluster::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, TonicInterceptor, gen_tonic_signature_interceptor,
         node_service_time_out_client, node_service_time_out_client_no_auth, verify_rpc_signature,

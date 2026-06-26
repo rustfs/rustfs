@@ -398,7 +398,6 @@ for ecstore_private_module in \
   error \
   io_support \
   rebalance \
-  rpc \
   runtime \
   services \
   set_disk \
@@ -2979,20 +2978,22 @@ fi
     [[ -e crates/ecstore/src/rpc/remote_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_disk.rs'
     [[ -e crates/ecstore/src/rpc/remote_locker.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_locker.rs'
     [[ -e crates/ecstore/src/rpc/runtime_sources.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/runtime_sources.rs'
+    [[ -e crates/ecstore/src/rpc/mod.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/mod.rs'
+    rg -n --with-filename '^\s*mod\s+rpc;' crates/ecstore/src/lib.rs || true
     true
   }
 ) >"$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE"
 
 if [[ -s "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE" ]]; then
-  report_failure "ECStore RPC support modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
+  report_failure "ECStore RPC modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
 fi
 
-rg -n --with-filename '^(pub(?:\(crate\))? )?(struct|enum|fn|trait) |^mod ' \
-  "${ROOT_DIR}/crates/ecstore/src/rpc/mod.rs" \
+rg -n --with-filename 'crate::rpc\b' \
+  "${ROOT_DIR}/crates/ecstore/src" \
   >"$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" || true
 
 if [[ -s "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" ]]; then
-  report_failure "ECStore root rpc module must only re-export cluster/rpc owner symbols: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
+  report_failure "ECStore internal RPC consumers must use the cluster/rpc owner path: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
 fi
 
 (

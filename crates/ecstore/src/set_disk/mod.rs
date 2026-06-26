@@ -22,6 +22,7 @@ use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
+use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::diagnostics::get::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
     GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
@@ -43,7 +44,6 @@ use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
-use crate::rpc::heal_bucket_local_on_disks;
 use crate::runtime::sources as runtime_sources;
 use crate::services::batch_processor::AsyncBatchProcessor;
 use crate::storage_api_contracts::{

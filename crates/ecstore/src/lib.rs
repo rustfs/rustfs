@@ -29,7 +29,6 @@ mod io_support;
 pub(crate) mod layout;
 mod object_api;
 mod rebalance;
-mod rpc;
 mod runtime;
 mod services;
 mod set_disk;
