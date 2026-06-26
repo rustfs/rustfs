@@ -18,22 +18,22 @@ use std::sync::Arc;
 use rustfs_storage_api as storage_contracts;
 
 mod ecstore_bucket {
-    pub(crate) use crate::storage::ecstore_bucket::{
+    pub(crate) use crate::storage::storage_api::ecstore_bucket::{
         bandwidth, bucket_target_sys, lifecycle, metadata, metadata_sys, quota, replication, target, utils, versioning,
         versioning_sys,
     };
 }
 
 mod ecstore_capacity {
-    pub(crate) use crate::storage::ecstore_capacity::is_reserved_or_invalid_bucket;
+    pub(crate) use crate::storage::storage_api::ecstore_capacity::is_reserved_or_invalid_bucket;
 }
 
 mod ecstore_client {
-    pub(crate) use crate::storage::ecstore_client::admin_handler_utils;
+    pub(crate) use crate::storage::storage_api::ecstore_client::admin_handler_utils;
 }
 
 pub(crate) mod ecstore_cluster {
-    pub(crate) use crate::storage::ecstore_cluster::{
+    pub(crate) use crate::storage::storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
         ClusterPoolStateSnapshot,
@@ -41,34 +41,34 @@ pub(crate) mod ecstore_cluster {
 }
 
 mod ecstore_config {
-    pub(crate) use crate::storage::ecstore_config::{com, init, storageclass};
+    pub(crate) use crate::storage::storage_api::ecstore_config::{com, init, storageclass};
 }
 
 #[allow(unused_imports)]
 mod ecstore_disk {
-    pub(crate) use crate::storage::ecstore_disk::{RUSTFS_META_BUCKET, endpoint};
+    pub(crate) use crate::storage::storage_api::ecstore_disk::{RUSTFS_META_BUCKET, endpoint};
 }
 
 mod ecstore_error {
-    pub(crate) use crate::storage::ecstore_error::StorageError;
+    pub(crate) use crate::storage::storage_api::ecstore_error::StorageError;
 }
 
 #[allow(unused_imports)]
 mod ecstore_layout {
-    pub(crate) use crate::storage::ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+    pub(crate) use crate::storage::storage_api::ecstore_layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 }
 
 mod ecstore_metrics {
-    pub(crate) use crate::storage::ecstore_metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
+    pub(crate) use crate::storage::storage_api::ecstore_metrics::{CollectMetricsOpts, MetricType, collect_local_metrics};
 }
 
 mod ecstore_notification {
-    pub(crate) use crate::storage::ecstore_notification::NotificationSys;
+    pub(crate) use crate::storage::storage_api::ecstore_notification::NotificationSys;
 }
 
 #[allow(unused_imports)]
 mod ecstore_rebalance {
-    pub(crate) use crate::storage::ecstore_rebalance::{
+    pub(crate) use crate::storage::storage_api::ecstore_rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
@@ -76,15 +76,15 @@ mod ecstore_rebalance {
 }
 
 mod ecstore_rpc {
-    pub(crate) use crate::storage::ecstore_rpc::PeerRestClient;
+    pub(crate) use crate::storage::storage_api::ecstore_rpc::PeerRestClient;
 }
 
 mod ecstore_storage {
-    pub(crate) use crate::storage::ecstore_storage::ECStore;
+    pub(crate) use crate::storage::storage_api::ecstore_storage::ECStore;
 }
 
 mod ecstore_tier {
-    pub(crate) use crate::storage::ecstore_tier::{tier, tier_admin, tier_config, tier_handlers};
+    pub(crate) use crate::storage::storage_api::ecstore_tier::{tier, tier_admin, tier_config, tier_handlers};
 }
 
 pub(crate) const RUSTFS_META_BUCKET: &str = ecstore_disk::RUSTFS_META_BUCKET;
@@ -414,15 +414,15 @@ pub(crate) mod data_usage {
     use std::sync::Arc;
 
     pub(crate) async fn load_data_usage_from_backend(
-        store: Arc<crate::storage::ECStore>,
-    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::StorageError> {
-        crate::storage::ecstore_data_usage::load_data_usage_from_backend(store).await
+        store: Arc<crate::storage::storage_api::ECStore>,
+    ) -> Result<rustfs_data_usage::DataUsageInfo, crate::storage::storage_api::StorageError> {
+        crate::storage::storage_api::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
 }
 
 pub(crate) mod access {
-    pub(crate) use crate::storage::access::{ReqInfo, authorize_request};
-    pub(crate) use crate::storage::request_context::{RequestContext, spawn_traced};
+    pub(crate) use crate::storage::storage_api::access_consumer::{ReqInfo, authorize_request};
+    pub(crate) use crate::storage::storage_api::request_context_consumer::{RequestContext, spawn_traced};
 }
 
 pub(crate) mod bucket {
@@ -501,7 +501,7 @@ pub(crate) mod metrics {
 }
 
 pub(crate) mod object {
-    pub(crate) use crate::storage::StorageObjectOptions;
+    pub(crate) use crate::storage::storage_api::StorageObjectOptions;
 }
 
 pub(crate) mod rebalance {
