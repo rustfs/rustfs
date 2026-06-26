@@ -40,6 +40,7 @@ mod erasure_coding;
 mod error;
 #[path = "diagnostics/get.rs"]
 mod get_diagnostics;
+#[path = "runtime/global.rs"]
 mod global;
 pub(crate) mod layout;
 #[path = "services/metrics_realtime.rs"]
@@ -51,6 +52,7 @@ mod pools;
 mod rebalance;
 mod rio;
 mod rpc;
+#[path = "runtime/sources.rs"]
 mod runtime_sources;
 mod set_disk;
 mod sets;
