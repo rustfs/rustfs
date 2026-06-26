@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::erasure_coding::BitrotReader;
 use crate::get_diagnostics::{
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
     GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
@@ -25,6 +26,7 @@ use crate::get_diagnostics::{
     record_get_object_pipeline_failure_for_path,
 };
 use crate::set_disk::shard_source::ShardReadCost;
+use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{

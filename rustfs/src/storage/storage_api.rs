@@ -1160,6 +1160,10 @@ pub(crate) fn get_lock_acquire_timeout() -> std::time::Duration {
     ecstore_set_disk::get_lock_acquire_timeout()
 }
 
+pub(crate) fn get_object_disk_read_timeout() -> std::time::Duration {
+    rustfs_ecstore::api::disk::get_object_disk_read_timeout()
+}
+
 #[cfg(test)]
 pub(crate) fn boxed_reader<R>(reader: R) -> DynReader
 where
