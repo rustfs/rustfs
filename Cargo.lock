@@ -9341,6 +9341,7 @@ dependencies = [
  "rmp-serde",
  "rustfs-checksums",
  "rustfs-common",
+ "rustfs-concurrency",
  "rustfs-config",
  "rustfs-credentials",
  "rustfs-data-usage",

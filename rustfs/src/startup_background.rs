@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::ECStore;
+use crate::storage_api::startup::{ECStore, set_workload_admission_snapshot_provider};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_workload_provider,
 };
@@ -45,9 +46,12 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         "Background services configured"
     );
 
+    let workload_provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync> =
+        Arc::new(RustFsWorkloadAdmissionSnapshotProvider);
+    let _ = set_workload_admission_snapshot_provider(workload_provider.clone());
+
     if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store));
-        let workload_provider = Arc::new(RustFsWorkloadAdmissionSnapshotProvider);
         init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider)).await?;
     }
 
