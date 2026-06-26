@@ -26,9 +26,11 @@ const LOG_SUBSYSTEM_DATA_MOVEMENT: &str = "data_movement";
 const EVENT_DATA_MOVEMENT_BACKPRESSURE: &str = "data_movement_backpressure";
 const DATA_MOVEMENT_BACKPRESSURE_ENABLE_ENV: &str = "RUSTFS_DATA_MOVEMENT_BACKPRESSURE_ENABLE";
 const DATA_MOVEMENT_FOREGROUND_READ_HIGH_PERCENT_ENV: &str = "RUSTFS_DATA_MOVEMENT_FOREGROUND_READ_HIGH_PERCENT";
+const DATA_MOVEMENT_FOREGROUND_WRITE_HIGH_PERCENT_ENV: &str = "RUSTFS_DATA_MOVEMENT_FOREGROUND_WRITE_HIGH_PERCENT";
 const DATA_MOVEMENT_RECHECK_MS_ENV: &str = "RUSTFS_DATA_MOVEMENT_RECHECK_MS";
 const DEFAULT_DATA_MOVEMENT_BACKPRESSURE_ENABLE: bool = true;
 const DEFAULT_DATA_MOVEMENT_FOREGROUND_READ_HIGH_PERCENT: usize = 80;
+const DEFAULT_DATA_MOVEMENT_FOREGROUND_WRITE_HIGH_PERCENT: usize = 80;
 const DEFAULT_DATA_MOVEMENT_RECHECK_MS: u64 = 250;
 const MIN_DATA_MOVEMENT_RECHECK_MS: u64 = 1;
 
@@ -51,6 +53,7 @@ impl DataMovementOperation {
 struct DataMovementBackpressureConfig {
     enabled: bool,
     foreground_read_high_percent: usize,
+    foreground_write_high_percent: usize,
     recheck_delay: Duration,
 }
 
@@ -61,6 +64,10 @@ impl DataMovementBackpressureConfig {
             foreground_read_high_percent: rustfs_utils::get_env_usize(
                 DATA_MOVEMENT_FOREGROUND_READ_HIGH_PERCENT_ENV,
                 DEFAULT_DATA_MOVEMENT_FOREGROUND_READ_HIGH_PERCENT,
+            ),
+            foreground_write_high_percent: rustfs_utils::get_env_usize(
+                DATA_MOVEMENT_FOREGROUND_WRITE_HIGH_PERCENT_ENV,
+                DEFAULT_DATA_MOVEMENT_FOREGROUND_WRITE_HIGH_PERCENT,
             ),
             recheck_delay: Duration::from_millis(
                 rustfs_utils::get_env_u64(DATA_MOVEMENT_RECHECK_MS_ENV, DEFAULT_DATA_MOVEMENT_RECHECK_MS)
@@ -95,24 +102,24 @@ async fn wait_for_data_movement_admission_with_provider(
     if cancel_token.is_cancelled() {
         return Err(Error::OperationCanceled);
     }
-    if !config.enabled || config.foreground_read_high_percent == 0 {
+    if !config.enabled || (config.foreground_read_high_percent == 0 && config.foreground_write_high_percent == 0) {
         return Ok(());
     }
     let Some(provider) = provider else {
         return Ok(());
     };
 
-    let mut delayed_since: Option<Instant> = None;
+    let mut delayed_since: Option<(Instant, ForegroundPressure)> = None;
     loop {
         if cancel_token.is_cancelled() {
             record_delay_completion(operation, pool_index, delayed_since, "cancelled");
             return Err(Error::OperationCanceled);
         }
 
-        if let Some(usage_pct) = foreground_read_pressure_pct(&config, Some(provider.as_ref())) {
+        if let Some(pressure) = foreground_pressure(&config, Some(provider.as_ref())) {
             if delayed_since.is_none() {
-                delayed_since = Some(Instant::now());
-                record_delay_start(operation, pool_index, usage_pct, &config);
+                delayed_since = Some((Instant::now(), pressure));
+                record_delay_start(operation, pool_index, pressure, &config);
             }
 
             tokio::select! {
@@ -130,44 +137,77 @@ async fn wait_for_data_movement_admission_with_provider(
     }
 }
 
-fn foreground_read_pressure_pct(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundPressure {
+    class: WorkloadClass,
+    usage_pct: usize,
+    threshold_pct: usize,
+}
+
+impl ForegroundPressure {
+    const fn reason(self) -> &'static str {
+        match self.class {
+            WorkloadClass::ForegroundRead => "foreground_read_pressure",
+            WorkloadClass::ForegroundWrite => "foreground_write_pressure",
+            _ => "foreground_pressure",
+        }
+    }
+}
+
+fn foreground_pressure(
     config: &DataMovementBackpressureConfig,
     provider: Option<&(dyn WorkloadAdmissionSnapshotProvider + Send + Sync)>,
-) -> Option<usize> {
-    if !config.enabled || config.foreground_read_high_percent == 0 {
+) -> Option<ForegroundPressure> {
+    if !config.enabled {
         return None;
     }
 
     let snapshot = provider?.workload_admission_snapshot();
-    let foreground_read = snapshot.get(WorkloadClass::ForegroundRead)?;
-    if matches!(foreground_read.state, AdmissionState::Saturated) {
-        return Some(100);
-    }
+    [
+        (WorkloadClass::ForegroundRead, config.foreground_read_high_percent),
+        (WorkloadClass::ForegroundWrite, config.foreground_write_high_percent),
+    ]
+    .into_iter()
+    .filter_map(|(class, threshold_pct)| {
+        if threshold_pct == 0 {
+            return None;
+        }
 
-    let limit = foreground_read.limit?;
-    if limit == 0 {
-        return None;
-    }
+        let entry = snapshot.get(class)?;
+        let usage_pct = if matches!(entry.state, AdmissionState::Saturated) {
+            100
+        } else {
+            let limit = entry.limit?;
+            if limit == 0 {
+                return None;
+            }
+            entry
+                .active
+                .unwrap_or(0)
+                .saturating_mul(100)
+                .checked_div(limit)
+                .unwrap_or(100)
+        };
 
-    let usage_pct = foreground_read
-        .active
-        .unwrap_or(0)
-        .saturating_mul(100)
-        .checked_div(limit)
-        .unwrap_or(100);
-    (usage_pct >= config.foreground_read_high_percent).then_some(usage_pct)
+        (usage_pct >= threshold_pct).then_some(ForegroundPressure {
+            class,
+            usage_pct,
+            threshold_pct,
+        })
+    })
+    .max_by_key(|pressure| pressure.usage_pct)
 }
 
 fn record_delay_start(
     operation: DataMovementOperation,
     pool_index: usize,
-    foreground_read_usage_pct: usize,
+    pressure: ForegroundPressure,
     config: &DataMovementBackpressureConfig,
 ) {
     counter!(
         "rustfs_data_movement_backpressure_total",
         "operation" => operation.as_str().to_string(),
-        "reason" => "foreground_read_pressure".to_string(),
+        "reason" => pressure.reason().to_string(),
         "result" => "delayed".to_string(),
         "pool_index" => pool_index.to_string()
     )
@@ -181,21 +221,22 @@ fn record_delay_start(
         operation = operation.as_str(),
         pool_index,
         state = "delayed",
-        reason = "foreground_read_pressure",
-        foreground_read_usage_pct,
-        threshold_pct = config.foreground_read_high_percent,
+        reason = pressure.reason(),
+        workload_class = pressure.class.as_str(),
+        foreground_usage_pct = pressure.usage_pct,
+        threshold_pct = pressure.threshold_pct,
         recheck_delay_ms = config.recheck_delay.as_millis(),
-        "Data movement delayed under foreground read pressure"
+        "Data movement delayed under foreground pressure"
     );
 }
 
 fn record_delay_completion(
     operation: DataMovementOperation,
     pool_index: usize,
-    delayed_since: Option<Instant>,
+    delayed_since: Option<(Instant, ForegroundPressure)>,
     result: &'static str,
 ) {
-    let Some(delayed_since) = delayed_since else {
+    let Some((delayed_since, pressure)) = delayed_since else {
         return;
     };
 
@@ -203,7 +244,7 @@ fn record_delay_completion(
     counter!(
         "rustfs_data_movement_backpressure_total",
         "operation" => operation.as_str().to_string(),
-        "reason" => "foreground_read_pressure".to_string(),
+        "reason" => pressure.reason().to_string(),
         "result" => result.to_string(),
         "pool_index" => pool_index.to_string()
     )
@@ -211,7 +252,7 @@ fn record_delay_completion(
     histogram!(
         "rustfs_data_movement_backpressure_delay_seconds",
         "operation" => operation.as_str().to_string(),
-        "reason" => "foreground_read_pressure".to_string(),
+        "reason" => pressure.reason().to_string(),
         "result" => result.to_string(),
         "pool_index" => pool_index.to_string()
     )
@@ -225,6 +266,8 @@ fn record_delay_completion(
         operation = operation.as_str(),
         pool_index,
         state = result,
+        reason = pressure.reason(),
+        workload_class = pressure.class.as_str(),
         delay_secs = delay.as_secs_f64(),
         "Data movement backpressure wait completed"
     );
@@ -259,6 +302,7 @@ mod tests {
         DataMovementBackpressureConfig {
             enabled: true,
             foreground_read_high_percent: 80,
+            foreground_write_high_percent: 80,
             recheck_delay: Duration::from_millis(1),
         }
     }
@@ -268,7 +312,14 @@ mod tests {
         let provider =
             StaticWorkloadProvider::new(WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, AdmissionState::Saturated));
 
-        assert_eq!(foreground_read_pressure_pct(&test_config(), Some(&provider)), Some(100));
+        assert_eq!(
+            foreground_pressure(&test_config(), Some(&provider)),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 100,
+                threshold_pct: 80,
+            })
+        );
     }
 
     #[test]
@@ -281,11 +332,38 @@ mod tests {
             ),
         );
 
-        assert_eq!(foreground_read_pressure_pct(&test_config(), Some(&provider)), Some(80));
+        assert_eq!(
+            foreground_pressure(&test_config(), Some(&provider)),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundRead,
+                usage_pct: 80,
+                threshold_pct: 80,
+            })
+        );
     }
 
     #[test]
-    fn foreground_read_pressure_ignores_open_low_usage() {
+    fn foreground_write_pressure_uses_active_limit_threshold() {
+        let provider = StaticWorkloadProvider::new(
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Open).with_counts(
+                Some(9),
+                None,
+                Some(10),
+            ),
+        );
+
+        assert_eq!(
+            foreground_pressure(&test_config(), Some(&provider)),
+            Some(ForegroundPressure {
+                class: WorkloadClass::ForegroundWrite,
+                usage_pct: 90,
+                threshold_pct: 80,
+            })
+        );
+    }
+
+    #[test]
+    fn foreground_pressure_ignores_open_low_usage() {
         let provider = StaticWorkloadProvider::new(
             WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, AdmissionState::Open).with_counts(
                 Some(7),
@@ -294,7 +372,7 @@ mod tests {
             ),
         );
 
-        assert_eq!(foreground_read_pressure_pct(&test_config(), Some(&provider)), None);
+        assert_eq!(foreground_pressure(&test_config(), Some(&provider)), None);
     }
 
     #[tokio::test]

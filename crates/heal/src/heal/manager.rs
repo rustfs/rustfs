@@ -106,6 +106,23 @@ enum QueuePushOutcome {
     Merged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ForegroundPressure {
+    class: WorkloadClass,
+    usage_pct: usize,
+    threshold_pct: usize,
+}
+
+impl ForegroundPressure {
+    const fn reason(self) -> &'static str {
+        match self.class {
+            WorkloadClass::ForegroundRead => "foreground_read_pressure",
+            WorkloadClass::ForegroundWrite => "foreground_write_pressure",
+            _ => "foreground_pressure",
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct CompletedHealStatus {
     heal_type: HealType,
@@ -636,7 +653,9 @@ pub struct HealConfig {
     pub mainline_throttle_enable: bool,
     /// Foreground read permit utilization percentage that delays best-effort heal starts.
     pub mainline_read_utilization_high_percent: usize,
-    /// Delay before rechecking foreground read pressure after delaying heal starts.
+    /// Foreground write utilization percentage that delays best-effort heal starts.
+    pub mainline_write_utilization_high_percent: usize,
+    /// Delay before rechecking foreground pressure after delaying heal starts.
     pub mainline_max_sleep: Duration,
 }
 
@@ -691,6 +710,11 @@ impl Default for HealConfig {
             rustfs_config::DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT,
         )
         .min(100);
+        let mainline_write_utilization_high_percent = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT,
+            rustfs_config::DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT,
+        )
+        .min(100);
         let mainline_max_sleep = Duration::from_millis(rustfs_utils::get_env_u64(
             rustfs_config::ENV_HEAL_MAINLINE_MAX_SLEEP_MS,
             rustfs_config::DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS,
@@ -709,6 +733,7 @@ impl Default for HealConfig {
             page_parallel_enable,
             mainline_throttle_enable,
             mainline_read_utilization_high_percent,
+            mainline_write_utilization_high_percent,
             mainline_max_sleep,
         }
     }
@@ -833,29 +858,51 @@ impl HealManager {
             || matches!(request.priority, HealPriority::High | HealPriority::Urgent)
     }
 
-    fn mainline_throttle_active(config: &HealConfig, provider: &Option<WorkloadSnapshotProviderRef>) -> Option<usize> {
-        if !config.mainline_throttle_enable || config.mainline_read_utilization_high_percent == 0 {
+    fn mainline_throttle_active(
+        config: &HealConfig,
+        provider: &Option<WorkloadSnapshotProviderRef>,
+    ) -> Option<ForegroundPressure> {
+        if !config.mainline_throttle_enable
+            || (config.mainline_read_utilization_high_percent == 0 && config.mainline_write_utilization_high_percent == 0)
+        {
             return None;
         }
 
         let provider = provider.as_ref()?;
         let snapshot = provider.workload_admission_snapshot();
-        let foreground_read = snapshot.get(WorkloadClass::ForegroundRead)?;
-        if matches!(foreground_read.state, AdmissionState::Saturated) {
-            return Some(100);
-        }
+        [
+            (WorkloadClass::ForegroundRead, config.mainline_read_utilization_high_percent),
+            (WorkloadClass::ForegroundWrite, config.mainline_write_utilization_high_percent),
+        ]
+        .into_iter()
+        .filter_map(|(class, threshold_pct)| {
+            if threshold_pct == 0 {
+                return None;
+            }
 
-        let limit = foreground_read.limit?;
-        if limit == 0 {
-            return None;
-        }
-        let usage_pct = foreground_read
-            .active
-            .unwrap_or(0)
-            .saturating_mul(100)
-            .checked_div(limit)
-            .unwrap_or(100);
-        (usage_pct >= config.mainline_read_utilization_high_percent).then_some(usage_pct)
+            let entry = snapshot.get(class)?;
+            let usage_pct = if matches!(entry.state, AdmissionState::Saturated) {
+                100
+            } else {
+                let limit = entry.limit?;
+                if limit == 0 {
+                    return None;
+                }
+                entry
+                    .active
+                    .unwrap_or(0)
+                    .saturating_mul(100)
+                    .checked_div(limit)
+                    .unwrap_or(100)
+            };
+
+            (usage_pct >= threshold_pct).then_some(ForegroundPressure {
+                class,
+                usage_pct,
+                threshold_pct,
+            })
+        })
+        .max_by_key(|pressure| pressure.usage_pct)
     }
 
     fn schedule_mainline_throttle_recheck(notify: Arc<Notify>, delay: Duration) {
@@ -870,12 +917,12 @@ impl HealManager {
         });
     }
 
-    fn record_mainline_throttle_delay(usage_pct: usize, config: &HealConfig) {
+    fn record_mainline_throttle_delay(pressure: ForegroundPressure, config: &HealConfig) {
         counter!(
             "rustfs_heal_mainline_throttle_total",
             "source" => "background",
             "result" => "delayed",
-            "reason" => "foreground_read_pressure"
+            "reason" => pressure.reason()
         )
         .increment(1);
         debug!(
@@ -884,10 +931,12 @@ impl HealManager {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_MANAGER,
             state = "delayed",
-            foreground_read_usage_pct = usage_pct,
-            threshold_pct = config.mainline_read_utilization_high_percent,
+            reason = pressure.reason(),
+            workload_class = pressure.class.as_str(),
+            foreground_usage_pct = pressure.usage_pct,
+            threshold_pct = pressure.threshold_pct,
             recheck_delay_ms = config.mainline_max_sleep.as_millis(),
-            "Heal scheduler delayed background work under foreground read pressure"
+            "Heal scheduler delayed background work under foreground pressure"
         );
     }
 
@@ -2294,7 +2343,7 @@ impl HealManager {
         } = context;
 
         let config = config.read().await;
-        let mainline_usage_pct = Self::mainline_throttle_active(&config, workload_provider);
+        let mainline_pressure = Self::mainline_throttle_active(&config, workload_provider);
         let mut active_heals_guard = active_heals.lock().await;
         publish_active_heal_count(&active_heals_guard);
 
@@ -2320,13 +2369,13 @@ impl HealManager {
         let mut delayed_by_mainline_throttle = false;
 
         for _ in 0..available_slots {
-            let selected_request = if config.set_bulkhead_enable || mainline_usage_pct.is_some() {
+            let selected_request = if config.set_bulkhead_enable || mainline_pressure.is_some() {
                 let max_concurrent_per_set = config.max_concurrent_per_set;
                 let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
                     |request| {
                         let set_allowed = !config.set_bulkhead_enable
                             || can_schedule_request(request, &running_per_set, max_concurrent_per_set);
-                        let mainline_allowed = mainline_usage_pct.is_none() || Self::request_bypasses_mainline_throttle(request);
+                        let mainline_allowed = mainline_pressure.is_none() || Self::request_bypasses_mainline_throttle(request);
                         set_allowed && mainline_allowed
                     },
                     |request| heal_request_set_key(request).map(|_| heal_request_set_metric_label(request)),
@@ -2614,7 +2663,7 @@ impl HealManager {
                 });
                 tasks_started += 1;
             } else {
-                delayed_by_mainline_throttle = mainline_usage_pct.is_some();
+                delayed_by_mainline_throttle = mainline_pressure.is_some();
                 break;
             }
         }
@@ -2626,8 +2675,8 @@ impl HealManager {
         publish_active_heal_count(&active_heals_guard);
         publish_heal_queue_length(&queue);
 
-        if delayed_by_mainline_throttle && let Some(usage_pct) = mainline_usage_pct {
-            Self::record_mainline_throttle_delay(usage_pct, &config);
+        if delayed_by_mainline_throttle && let Some(pressure) = mainline_pressure {
+            Self::record_mainline_throttle_delay(pressure, &config);
             Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep);
         }
 
@@ -2757,6 +2806,7 @@ mod tests {
 
     #[derive(Debug)]
     struct FixedWorkloadProvider {
+        class: WorkloadClass,
         active: usize,
         limit: usize,
         state: AdmissionState,
@@ -2764,13 +2814,11 @@ mod tests {
 
     impl WorkloadAdmissionSnapshotProvider for FixedWorkloadProvider {
         fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
-            WorkloadAdmissionRegistrySnapshot::new(vec![
-                WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, self.state).with_counts(
-                    Some(self.active),
-                    None,
-                    Some(self.limit),
-                ),
-            ])
+            WorkloadAdmissionRegistrySnapshot::new(vec![WorkloadAdmissionSnapshot::new(self.class, self.state).with_counts(
+                Some(self.active),
+                None,
+                Some(self.limit),
+            )])
         }
     }
 
@@ -4346,6 +4394,7 @@ mod tests {
     async fn test_mainline_throttle_delays_background_heal_start() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let provider: WorkloadSnapshotProviderRef = Arc::new(FixedWorkloadProvider {
+            class: WorkloadClass::ForegroundRead,
             active: 8,
             limit: 10,
             state: AdmissionState::Open,
@@ -4356,6 +4405,40 @@ mod tests {
                 max_concurrent_heals: 1,
                 mainline_throttle_enable: true,
                 mainline_read_utilization_high_percent: 80,
+                mainline_write_utilization_high_percent: 80,
+                mainline_max_sleep: Duration::from_millis(1),
+                ..HealConfig::default()
+            }),
+            Some(provider),
+        );
+
+        manager
+            .submit_heal_request(bucket_request("read-repair", HealPriority::Normal, HealRequestSource::ReadRepair))
+            .await
+            .expect("read repair request should be queued");
+
+        process_manager_queue_once(&manager).await;
+
+        assert_eq!(manager.get_queue_length().await, 1);
+        assert_eq!(manager.get_active_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mainline_throttle_delays_background_heal_start_under_write_pressure() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let provider: WorkloadSnapshotProviderRef = Arc::new(FixedWorkloadProvider {
+            class: WorkloadClass::ForegroundWrite,
+            active: 9,
+            limit: 10,
+            state: AdmissionState::Open,
+        });
+        let manager = HealManager::new_with_workload_provider(
+            storage,
+            Some(HealConfig {
+                max_concurrent_heals: 1,
+                mainline_throttle_enable: true,
+                mainline_read_utilization_high_percent: 80,
+                mainline_write_utilization_high_percent: 80,
                 mainline_max_sleep: Duration::from_millis(1),
                 ..HealConfig::default()
             }),
@@ -4377,6 +4460,7 @@ mod tests {
     async fn test_mainline_throttle_allows_admin_high_start() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let provider: WorkloadSnapshotProviderRef = Arc::new(FixedWorkloadProvider {
+            class: WorkloadClass::ForegroundRead,
             active: 10,
             limit: 10,
             state: AdmissionState::Saturated,
@@ -4387,6 +4471,7 @@ mod tests {
                 max_concurrent_heals: 1,
                 mainline_throttle_enable: true,
                 mainline_read_utilization_high_percent: 80,
+                mainline_write_utilization_high_percent: 80,
                 mainline_max_sleep: Duration::from_millis(1),
                 ..HealConfig::default()
             }),

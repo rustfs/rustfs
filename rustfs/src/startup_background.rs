@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::{ECStore, set_workload_admission_snapshot_provider};
+use crate::storage_api::startup::background::{ECStore, set_workload_admission_snapshot_provider};
 use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{

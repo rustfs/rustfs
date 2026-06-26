@@ -15,9 +15,10 @@
 use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage_api::server::{Endpoint, EndpointServerPools, StorageAdminApi, is_dist_erasure};
+use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
+use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
-use crate::storage_api::server::{Endpoints, PoolEndpoints};
+use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
@@ -58,6 +59,7 @@ pub enum ReadinessDegradedReason {
     IamNotReady,
     LockQuorumUnavailable,
     KmsNotReady,
+    ClusterHealthTimeout,
     StorageAndIamUnavailable,
     StorageAndLockUnavailable,
     IamAndLockUnavailable,
@@ -71,6 +73,7 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::IamNotReady => "iam_not_ready",
             ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
             ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
+            ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
             ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
             ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
@@ -137,6 +140,7 @@ fn is_probe_path(path: &str) -> bool {
             | crate::server::MINIO_HEALTH_LIVE_PATH
             | crate::server::MINIO_HEALTH_READY_PATH
             | crate::server::MINIO_HEALTH_CLUSTER_PATH
+            | crate::server::MINIO_HEALTH_CLUSTER_READ_PATH
             | crate::server::FAVICON_PATH
     );
 
@@ -208,7 +212,7 @@ pub async fn publish_ready_when_runtime_ready(
     wait_for_runtime_readiness_with(
         STARTUP_RUNTIME_READINESS_MAX_WAIT,
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
-        collect_dependency_readiness_uncached,
+        collect_node_readiness,
         |dependency_readiness| {
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             if let Some(state_manager) = state_manager {
@@ -218,7 +222,7 @@ pub async fn publish_ready_when_runtime_ready(
                 target: "rustfs::server::readiness",
                 storage_ready = dependency_readiness.storage_ready,
                 iam_ready = dependency_readiness.iam_ready,
-                "Runtime readiness reached write quorum; publishing ready state"
+                "Runtime node readiness reached; publishing ready state"
             );
         },
     )
@@ -235,6 +239,18 @@ struct StorageReadinessCacheEntry {
 struct LockQuorumCacheEntry {
     captured_at: Instant,
     status: LockQuorumStatus,
+}
+
+#[derive(Debug, Clone)]
+struct ClusterHealthReportCacheEntry {
+    captured_at: Instant,
+    report: DependencyReadinessReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterHealthProbeKind {
+    Write,
+    Read,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -256,6 +272,16 @@ fn health_readiness_cache_ttl() -> Duration {
     ))
 }
 
+fn health_cluster_timeout() -> Duration {
+    Duration::from_millis(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS,
+            rustfs_config::DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS,
+        )
+        .max(1),
+    )
+}
+
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
@@ -264,6 +290,46 @@ fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry
 fn lock_quorum_status_cache() -> &'static Mutex<Option<LockQuorumCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<LockQuorumCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_write_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_read_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_write_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_read_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_health_report_cache(kind: ClusterHealthProbeKind) -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_report_cache(),
+        ClusterHealthProbeKind::Read => cluster_read_health_report_cache(),
+    }
+}
+
+fn cluster_health_singleflight(kind: ClusterHealthProbeKind) -> &'static Mutex<()> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_singleflight(),
+        ClusterHealthProbeKind::Read => cluster_read_health_singleflight(),
+    }
+}
+
+#[cfg(test)]
+async fn reset_cluster_health_report_caches() {
+    *cluster_write_health_report_cache().lock().await = None;
+    *cluster_read_health_report_cache().lock().await = None;
 }
 
 async fn load_cached_storage_readiness() -> Option<bool> {
@@ -279,6 +345,33 @@ async fn load_cached_storage_readiness() -> Option<bool> {
     }
 
     None
+}
+
+async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+    let ttl = health_readiness_cache_ttl();
+    if ttl.is_zero() {
+        return None;
+    }
+
+    let cache = cluster_health_report_cache(kind).lock().await;
+    let entry = cache.as_ref()?;
+    if entry.captured_at.elapsed() <= ttl {
+        return Some(entry.report.clone());
+    }
+
+    None
+}
+
+async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
+    if health_readiness_cache_ttl().is_zero() {
+        return;
+    }
+
+    let mut cache = cluster_health_report_cache(kind).lock().await;
+    *cache = Some(ClusterHealthReportCacheEntry {
+        captured_at: Instant::now(),
+        report,
+    });
 }
 
 async fn update_storage_readiness_cache(storage_ready: bool) {
@@ -364,7 +457,24 @@ fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize
     write_quorum.max(1)
 }
 
-fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+    if set_drive_count == 0 {
+        return 1;
+    }
+
+    info.backend
+        .standard_sc_data
+        .get(pool_idx)
+        .copied()
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| (set_drive_count / 2).max(1))
+        .max(1)
+}
+
+fn storage_ready_from_runtime_state_with_quorum<F>(info: &StorageInfo, quorum_for_set: F) -> bool
+where
+    F: Fn(&StorageInfo, usize, usize) -> usize,
+{
     if info.disks.is_empty() {
         return false;
     }
@@ -407,9 +517,17 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
 
     set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
         let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
-        let write_quorum = pool_write_quorum(info, pool_idx, set_drive_count);
-        online >= write_quorum
+        let quorum = quorum_for_set(info, pool_idx, set_drive_count);
+        online >= quorum
     })
+}
+
+fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
+}
+
+fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_quorum(info, pool_read_quorum)
 }
 
 fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
@@ -465,6 +583,80 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
     report
 }
 
+pub async fn collect_cluster_write_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, collect_dependency_readiness_report).await
+}
+
+pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, collect_cluster_read_dependency_readiness_report).await
+}
+
+pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
+    let readiness = DependencyReadiness {
+        storage_ready: runtime_sources::object_store_handle().is_some(),
+        iam_ready: runtime_sources::iam_ready(),
+        lock_quorum_ready: true,
+    };
+    let report = dependency_readiness_report_from_readiness(readiness);
+    record_readiness_report(&report);
+    report
+}
+
+async fn collect_cluster_health_report_with<LoadFn, Fut>(
+    kind: ClusterHealthProbeKind,
+    mut load_report: LoadFn,
+) -> DependencyReadinessReport
+where
+    LoadFn: FnMut() -> Fut,
+    Fut: Future<Output = DependencyReadinessReport>,
+{
+    if let Some(cached) = load_cached_cluster_health_report(kind).await {
+        return cached;
+    }
+
+    let _singleflight = cluster_health_singleflight(kind).lock().await;
+    if let Some(cached) = load_cached_cluster_health_report(kind).await {
+        return cached;
+    }
+
+    let report = match tokio::time::timeout(health_cluster_timeout(), load_report()).await {
+        Ok(report) => report,
+        Err(_) => cluster_health_timeout_report(),
+    };
+    update_cluster_health_report_cache(kind, report.clone()).await;
+    report
+}
+
+fn cluster_health_timeout_report() -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        readiness: DependencyReadiness {
+            storage_ready: false,
+            iam_ready: false,
+            lock_quorum_ready: false,
+        },
+        degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
+    }
+}
+
+async fn collect_node_readiness() -> DependencyReadiness {
+    collect_node_readiness_report().await.readiness
+}
+
+pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
+    let iam_ready_raw = runtime_sources::iam_ready();
+    let storage_ready = collect_storage_read_readiness_uncached().await;
+    let lock_quorum_status = collect_lock_quorum_status().await;
+
+    let readiness = DependencyReadiness {
+        storage_ready,
+        iam_ready: iam_ready_raw,
+        lock_quorum_ready: lock_quorum_status.ready,
+    };
+    let report = dependency_readiness_report_from_readiness(readiness);
+    record_readiness_report(&report);
+    report
+}
+
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
         storage_ready: collect_storage_readiness_uncached().await,
@@ -485,25 +677,19 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
     }
 }
 
-async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready_raw = runtime_sources::iam_ready();
-    let storage_ready = collect_storage_readiness_uncached().await;
-    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
-
-    let readiness = DependencyReadiness {
-        storage_ready,
-        iam_ready: iam_ready_raw,
-        lock_quorum_ready: lock_quorum_status.ready,
-    };
-    let report = dependency_readiness_report_from_readiness(readiness);
-    record_readiness_report(&report);
-    report.readiness
-}
-
 async fn collect_storage_readiness_uncached() -> bool {
     if let Some(store) = runtime_sources::object_store_handle() {
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
+    } else {
+        false
+    }
+}
+
+async fn collect_storage_read_readiness_uncached() -> bool {
+    if let Some(store) = runtime_sources::object_store_handle() {
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+        storage_read_ready_from_runtime_state(&storage_info)
     } else {
         false
     }
@@ -627,7 +813,7 @@ where
 
     loop {
         let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
+        if readiness.storage_ready && readiness.iam_ready {
             on_ready(readiness);
             return Ok(());
         }
@@ -648,7 +834,7 @@ where
             storage_ready = readiness.storage_ready,
             iam_ready = readiness.iam_ready,
             lock_quorum_ready = readiness.lock_quorum_ready,
-            "Runtime readiness has not reached write quorum yet; delaying ready state publication"
+            "Runtime node readiness has not been reached yet; delaying ready state publication"
         );
         tokio::time::sleep(poll_interval).await;
     }
@@ -658,13 +844,101 @@ where
 mod tests {
     use super::*;
     use rustfs_madmin::{BackendInfo, Disk};
+    use serial_test::serial;
     use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::async_with_vars;
 
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
         assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
         assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_singleflight_reuses_inflight_result() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1000")),
+            ],
+            async {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let ready_report = DependencyReadinessReport {
+                    readiness: DependencyReadiness {
+                        storage_ready: true,
+                        iam_ready: true,
+                        lock_quorum_ready: true,
+                    },
+                    degraded_reasons: Vec::new(),
+                };
+
+                let first_calls = calls.clone();
+                let first_report = ready_report.clone();
+                let first = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let first_calls = first_calls.clone();
+                    let first_report = first_report.clone();
+                    async move {
+                        first_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        first_report
+                    }
+                });
+
+                let second_calls = calls.clone();
+                let second_report = ready_report.clone();
+                let second = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let second_calls = second_calls.clone();
+                    let second_report = second_report.clone();
+                    async move {
+                        second_calls.fetch_add(1, Ordering::SeqCst);
+                        second_report
+                    }
+                });
+
+                let (first, second) = tokio::join!(first, second);
+
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(first, ready_report);
+                assert_eq!(second, ready_report);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_timeout_is_sanitized() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    DependencyReadinessReport {
+                        readiness: DependencyReadiness {
+                            storage_ready: true,
+                            iam_ready: true,
+                            lock_quorum_ready: true,
+                        },
+                        degraded_reasons: Vec::new(),
+                    }
+                })
+                .await;
+
+                assert_eq!(report, cluster_health_timeout_report());
+                assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::ClusterHealthTimeout]);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
     }
 
     #[tokio::test]
@@ -696,11 +970,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_runtime_readiness_with_does_not_publish_ready_when_lock_quorum_is_not_reached() {
+    async fn wait_for_runtime_readiness_with_publishes_ready_without_lock_quorum() {
         let readiness = GlobalReadiness::new();
         let state_manager = ServiceStateManager::new();
 
-        let err = wait_for_runtime_readiness_with(
+        let result = wait_for_runtime_readiness_with(
             Duration::ZERO,
             Duration::from_millis(1),
             || {
@@ -715,12 +989,11 @@ mod tests {
                 state_manager.update(ServiceState::Ready);
             },
         )
-        .await
-        .expect_err("lock quorum should block readiness publication");
+        .await;
 
-        assert!(err.to_string().contains("lock_quorum_ready=false"));
-        assert!(!readiness.is_ready());
-        assert_eq!(state_manager.current_state(), ServiceState::Starting);
+        assert!(result.is_ok(), "lock quorum must not block node readiness publication");
+        assert!(readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Ready);
     }
 
     #[test]
@@ -773,6 +1046,33 @@ mod tests {
         };
 
         assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_read_ready_from_runtime_state_allows_read_quorum_below_write_quorum() {
+        let disks = (0..4)
+            .map(|disk_index| Disk {
+                endpoint: format!("127.0.0.1:900{disk_index}"),
+                drive_path: format!("/data{disk_index}"),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                state: if disk_index < 2 { "ok" } else { "offline" }.to_string(),
+                runtime_state: Some(if disk_index < 2 { "online" } else { "offline" }.to_string()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks,
+        };
+
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
     }
 
     #[test]

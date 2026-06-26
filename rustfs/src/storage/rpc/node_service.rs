@@ -12,34 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::{
-    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
-    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
-    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
-    load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
-};
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::contract::{
-    admin::StorageAdminApi,
-    bucket::{BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
+use crate::storage::storage_api::rpc_consumer::node_service::{
+    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
+    reload_transition_tier_config, resolve_object_store_handle,
 };
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::HealOpts;
-use rustfs_filemeta::{FileInfo, MetacacheReader};
+use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
-use rustfs_lock::{LockClient, LockRequest};
-use rustfs_madmin::health::{
-    get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
-};
-use rustfs_madmin::net::get_net_info;
+use rustfs_lock::LockClient;
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
@@ -127,11 +120,11 @@ fn unimplemented_rpc(method: &str) -> Status {
     Status::unimplemented(format!("{method} is not implemented"))
 }
 
-fn background_rebalance_start_error_message(result: super::super::Result<()>) -> Option<String> {
+fn background_rebalance_start_error_message(result: StorageResult<()>) -> Option<String> {
     result.err().map(|err| format!("start_rebalance failed: {err}"))
 }
 
-fn stop_rebalance_response(result: super::super::Result<()>) -> StopRebalanceResponse {
+fn stop_rebalance_response(result: StorageResult<()>) -> StopRebalanceResponse {
     match result {
         Ok(_) => StopRebalanceResponse {
             success: true,
@@ -144,7 +137,7 @@ fn stop_rebalance_response(result: super::super::Result<()>) -> StopRebalanceRes
     }
 }
 
-fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> super::super::Result<()> {
+fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> StorageResult<()> {
     let endpoints = store.endpoints();
     let endpoint = endpoints
         .as_ref()
@@ -1219,26 +1212,33 @@ impl Node for NodeService {
 #[cfg(test)]
 #[allow(unused_imports)]
 mod tests {
-    use super::*;
-    use Request;
+    use super::{
+        CollectMetricsOpts, Error, MetricType, Node as _, NodeService, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
+        SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, STORAGE_CLASS_SUB_SYS,
+        background_rebalance_start_error_message, make_server, stop_rebalance_response,
+    };
+    use bytes::Bytes;
+    use rustfs_protos::models::PingBodyBuilder;
     use rustfs_protos::proto_gen::node_service::{
         BackgroundHealStatusRequest, CheckPartsRequest, DeleteBucketMetadataRequest, DeleteBucketRequest, DeletePathsRequest,
         DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest, DeleteUserRequest, DeleteVersionRequest,
         DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, DownloadProfileDataRequest, GenerallyLockRequest,
         GetAllBucketStatsRequest, GetBucketInfoRequest, GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest,
-        GetMetacacheListingRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest,
-        GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, HealBucketRequest,
-        ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+        GetMetacacheListingRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest,
+        GetProcInfoRequest, GetSeLinuxInfoRequest, GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest,
+        HealBucketRequest, ListBucketRequest, ListDirRequest, ListVolumesRequest, LoadBucketMetadataRequest, LoadGroupRequest,
         LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
         LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest, MakeVolumeRequest,
-        MakeVolumesRequest, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest,
-        ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest, RenamePartRequest,
-        ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest,
-        UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-        WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
+        MakeVolumesRequest, Mss, PingRequest, ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest,
+        ReadXlRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest, RenameFileRequest,
+        RenamePartRequest, ServerInfoRequest, SignalServiceRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest, node_service_client::NodeServiceClient, node_service_server::NodeServiceServer,
     };
+    use std::collections::HashMap;
     use tokio::net::TcpListener;
     use tokio_stream::wrappers::TcpListenerStream;
+    use tonic::{Request, Response, Status};
 
     fn create_test_node_service() -> NodeService {
         make_server()
@@ -2527,7 +2527,7 @@ mod tests {
 
     #[test]
     fn test_background_rebalance_start_error_message_formats_error() {
-        let message = background_rebalance_start_error_message(Err(super::super::super::Error::other("boom")))
+        let message = background_rebalance_start_error_message(Err(Error::other("boom")))
             .expect("background rebalance start failure should be formatted");
 
         assert!(message.contains("start_rebalance failed"));
@@ -2536,7 +2536,7 @@ mod tests {
 
     #[test]
     fn test_stop_rebalance_response_reports_local_stop_error() {
-        let response = stop_rebalance_response(Err(super::super::super::Error::other("boom")));
+        let response = stop_rebalance_response(Err(Error::other("boom")));
 
         assert!(!response.success);
         assert!(response.error_info.as_deref().is_some_and(|message| message.contains("boom")));
@@ -2872,7 +2872,7 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert(PEER_RESTSIGNAL.to_string(), SERVICE_SIGNAL_RELOAD_DYNAMIC.to_string());
-        vars.insert(PEER_RESTSUB_SYS.to_string(), super::super::super::STORAGE_CLASS_SUB_SYS.to_string());
+        vars.insert(PEER_RESTSUB_SYS.to_string(), STORAGE_CLASS_SUB_SYS.to_string());
 
         let request = Request::new(SignalServiceRequest {
             vars: Some(Mss { value: vars }),

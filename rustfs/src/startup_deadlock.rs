@@ -19,7 +19,7 @@ const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_DEADLOCK_DETECTOR_STATE: &str = "deadlock_detector_state";
 
 pub(crate) fn init_deadlock_detector_runtime() {
-    let detector = crate::storage_api::startup::deadlock_detector::get_deadlock_detector();
+    let detector = crate::storage_api::startup::deadlock::get_deadlock_detector();
     if detector.is_enabled() {
         detector.start();
         info!(

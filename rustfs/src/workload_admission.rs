@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::runtime_sources::resolve_replication_pool_handle;
-use crate::storage_api::workload::{bucket_metadata_runtime_initialized, replication_queue_current_count};
+use crate::storage_api::workload::admission::{bucket_metadata_runtime_initialized, replication_queue_current_count};
 use rustfs_concurrency::{
     AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot, WorkloadAdmissionSnapshotProvider,
     WorkloadClass,
@@ -22,7 +22,6 @@ use rustfs_concurrency::{
 use crate::storage_api::workload::concurrency::get_concurrency_manager;
 
 const BUCKET_METADATA_RUNTIME_NOT_INITIALIZED: &str = "bucket metadata runtime not initialized";
-const FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER: &str = "foreground write admission not yet exposed by RustFS runtime";
 const HEAL_MANAGER_NOT_INITIALIZED: &str = "heal manager not initialized";
 const REPAIR_QUEUE_BACKLOG_PRESENT: &str = "repair queue has pending work";
 const REPLICATION_RUNTIME_NOT_INITIALIZED: &str = "replication runtime not initialized";
@@ -33,6 +32,8 @@ const SCANNER_ADMISSION_SATURATED: &str = "scanner active work reached configure
 const SCANNER_ACTIVITY_IDLE_OR_NOT_INITIALIZED: &str = "scanner activity idle or not initialized";
 const STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_READ: &str =
     "storage concurrency provider did not expose foreground read admission";
+const STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_WRITE: &str =
+    "storage concurrency provider did not expose foreground write admission";
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RustFsWorkloadAdmissionSnapshotProvider;
@@ -75,9 +76,13 @@ pub fn foreground_read_workload_admission_snapshot() -> WorkloadAdmissionSnapsho
 }
 
 pub fn foreground_write_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
-    WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Disabled)
-        .with_counts(Some(0), None, Some(0))
-        .with_reason(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER)
+    storage_concurrency_workload_admission_snapshot()
+        .get(WorkloadClass::ForegroundWrite)
+        .cloned()
+        .unwrap_or_else(|| {
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Unknown)
+                .with_reason(STORAGE_CONCURRENCY_PROVIDER_MISSING_FOREGROUND_WRITE)
+        })
 }
 
 pub fn metadata_workload_admission_snapshot() -> WorkloadAdmissionSnapshot {
@@ -260,14 +265,17 @@ mod tests {
     }
 
     #[test]
-    fn foreground_write_snapshot_reports_explicit_gap_reason() {
+    fn foreground_write_snapshot_uses_storage_concurrency_provider_contract() {
         let snapshot = foreground_write_workload_admission_snapshot();
+        let storage_snapshot = storage_concurrency_workload_admission_snapshot()
+            .get(WorkloadClass::ForegroundWrite)
+            .cloned();
 
+        assert_eq!(Some(snapshot.clone()), storage_snapshot);
         assert_eq!(snapshot.class, WorkloadClass::ForegroundWrite);
-        assert_eq!(snapshot.state, AdmissionState::Disabled);
-        assert_eq!(snapshot.active, Some(0));
-        assert_eq!(snapshot.limit, Some(0));
-        assert_eq!(snapshot.reason.as_deref(), Some(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER));
+        assert_ne!(snapshot.state, AdmissionState::Unknown);
+        assert!(snapshot.active.is_some());
+        assert!(snapshot.limit.is_some());
     }
 
     #[test]
@@ -386,6 +394,10 @@ mod tests {
             registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
             Some(AdmissionState::Unknown)
         );
+        assert_ne!(
+            registry.get(WorkloadClass::ForegroundWrite).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Unknown)
+        );
         assert_eq!(registry.get(WorkloadClass::Scanner).and_then(|snapshot| snapshot.active), Some(0));
     }
 
@@ -401,10 +413,12 @@ mod tests {
         assert_eq!(registry.get(WorkloadClass::Metadata), Some(&metadata_workload_admission_snapshot()));
         assert_eq!(registry.get(WorkloadClass::Scanner), Some(&scanner_workload_admission_snapshot()));
         assert_eq!(
-            registry
-                .get(WorkloadClass::ForegroundWrite)
-                .map(|snapshot| (snapshot.state, snapshot.reason.as_deref())),
-            Some((AdmissionState::Disabled, Some(FOREGROUND_WRITE_NOT_EXPOSED_BY_PROVIDER)))
+            registry.get(WorkloadClass::ForegroundWrite).map(|snapshot| snapshot.class),
+            Some(WorkloadClass::ForegroundWrite)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundWrite),
+            storage_registry.get(WorkloadClass::ForegroundWrite)
         );
     }
 }

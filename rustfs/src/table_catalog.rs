@@ -27,13 +27,18 @@ use std::{
     time::{Duration as StdDuration, Instant},
 };
 
+use crate::storage_api::table::contract::http::HTTPPreconditions;
+use crate::storage_api::table::contract::list::{
+    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+    ListOperations as StorageListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
+};
+use crate::storage_api::table::contract::namespace::NamespaceLocking as StorageNamespaceLocking;
+use crate::storage_api::table::contract::object::{ObjectIO as StorageObjectIO, ObjectOperations as StorageObjectOperations};
+use crate::storage_api::table::contract::range::HTTPRangeSpec;
 use crate::storage_api::table::{
     BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
-    BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, HTTPPreconditions, HTTPRangeSpec,
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-    ListOperations as StorageListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO,
-    ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations as StorageObjectOperations, RUSTFS_META_BUCKET, StorageError,
-    WalkOptions as StorageWalkOptions, get_bucket_metadata, get_lock_acquire_timeout, table_catalog_path_hash,
+    BUCKET_TABLE_RESERVED_PREFIX, Error as EcstoreError, RUSTFS_META_BUCKET, StorageError, get_bucket_metadata,
+    get_lock_acquire_timeout, table_catalog_path_hash,
 };
 use bytes::Bytes;
 use datafusion::{
