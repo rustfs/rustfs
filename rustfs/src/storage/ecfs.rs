@@ -23,14 +23,14 @@ use super::{
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
-use crate::storage::contract::{
-    bucket::{BucketOperations, BucketOptions},
-    object::{ObjectLockRetentionOptions, ObjectOperations as _},
-};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::runtime_sources;
 use crate::storage::s3_api::{self, acl};
+use crate::storage::storage_api::ecfs_consumer::contract::{
+    bucket::{BucketOperations, BucketOptions},
+    object::{ObjectLockRetentionOptions, ObjectOperations as _},
+};
 use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
 use crate::table_catalog;
 use http::StatusCode;
@@ -52,7 +52,7 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 const LOG_SUBSYSTEM_TAGGING: &str = "tagging";
 
-use crate::storage::StorageObjectOptions as ObjectOptions;
+use crate::storage::storage_api::ecfs_consumer::StorageObjectOptions as ObjectOptions;
 
 #[derive(Debug, Clone)]
 pub struct FS {
