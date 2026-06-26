@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::NodeService;
+use rustfs_lock::LockRequest;
+use rustfs_protos::proto_gen::node_service::*;
+use tonic::{Request, Response, Status};
 
 fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLockResult {
     GenerallyLockResult {
@@ -269,7 +272,7 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{lock_result_from_release, lock_result_from_response};
 
     fn test_lock_id() -> rustfs_lock::LockId {
         rustfs_lock::LockRequest::new(rustfs_lock::ObjectKey::new("bucket", "object"), rustfs_lock::LockType::Exclusive, "owner")

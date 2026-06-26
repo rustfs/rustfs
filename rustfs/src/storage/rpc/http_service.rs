@@ -714,7 +714,17 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_ROUTING, PUT_FILE_STREAM_PATH, PutFileQuery,
+        READ_FILE_STREAM_PATH, WALK_DIR_PATH, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
+        put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature, write_body_chunks_to_writer,
+    };
+    use bytes::Bytes;
+    use http::{HeaderMap, Method, StatusCode, Uri};
+    use rustfs_io_metrics::internode_metrics::{
+        INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    };
+    use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;

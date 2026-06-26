@@ -12,9 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::*;
+use super::NodeService;
 use crate::storage::rpc::encode_msgpack_map;
+use crate::storage::storage_api::rpc_consumer::node_service::contract::admin::StorageAdminApi;
+use crate::storage::storage_api::rpc_consumer::node_service::get_local_server_property;
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
+use bytes::Bytes;
+use rustfs_madmin::health::{
+    get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
+};
+use rustfs_madmin::net::get_net_info;
+use rustfs_protos::proto_gen::node_service::*;
+use tonic::{Request, Response, Status};
 
 impl NodeService {
     pub(super) async fn handle_get_proc_info(
@@ -240,7 +249,10 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use crate::storage::rpc::encode_msgpack_map;
+    use rmp_serde::Deserializer;
+    use serde::Deserialize;
+    use std::io::Cursor;
 
     #[test]
     fn local_storage_info_rpc_payload_uses_msgpack_map_encoding() {

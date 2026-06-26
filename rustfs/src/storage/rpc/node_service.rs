@@ -18,31 +18,21 @@ use crate::admin::service::{
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
-use crate::storage::storage_api::rpc_consumer::node_service::contract::{
-    admin::StorageAdminApi,
-    bucket::{BucketOptions, DeleteBucketOptions, MakeBucketOptions},
-};
+#[cfg(test)]
+use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
-    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
-    StorageResult, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref,
-    get_local_server_property, load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle,
-    set_bucket_metadata,
+    DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
+    reload_transition_tier_config, resolve_object_store_handle,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;
 use rmp_serde::Deserializer;
-use rustfs_common::heal_channel::HealOpts;
-use rustfs_filemeta::{FileInfo, MetacacheReader};
+use rustfs_filemeta::MetacacheReader;
 use rustfs_iam::store::UserType;
-use rustfs_lock::{LockClient, LockRequest};
-use rustfs_madmin::health::{
-    get_cpus, get_mem_info, get_os_info, get_partitions, get_proc_info, get_sys_config, get_sys_errors, get_sys_services,
-};
-use rustfs_madmin::net::get_net_info;
+use rustfs_lock::LockClient;
 use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{node_service_server::NodeService as Node, *},
