@@ -69,7 +69,8 @@ pub mod config {
 pub mod data_usage {
     pub use crate::data_usage::{
         DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, load_data_usage_from_backend,
-        record_bucket_object_delete_memory, record_bucket_object_write_memory, remove_bucket_usage_from_backend,
+        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
+        record_bucket_object_write_memory, refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
         replace_bucket_usage_memory_from_info,
     };
 }

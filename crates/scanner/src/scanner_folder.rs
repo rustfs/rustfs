@@ -697,10 +697,10 @@ impl ScannerItem {
                     component = LOG_COMPONENT_SCANNER,
                     subsystem = LOG_SUBSYSTEM_LIFECYCLE,
                     bucket = %self.bucket,
-                    state = "versioning_lookup_failed",
-                    "Scanner lifecycle action skipped"
+                    state = "versioning_lookup_failed_defaulting",
+                    "Scanner lifecycle action falling back to default bucket versioning"
                 );
-                return;
+                Default::default()
             }
         };
 

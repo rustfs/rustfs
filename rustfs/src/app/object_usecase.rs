@@ -50,7 +50,10 @@ use super::storage_api::object_usecase::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
 };
-use super::storage_api::object_usecase::data_usage::{record_bucket_object_delete_memory, record_bucket_object_write_memory};
+use super::storage_api::object_usecase::data_usage::{
+    record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
+    record_bucket_object_write_memory,
+};
 use super::storage_api::object_usecase::deadlock_detector;
 use super::storage_api::object_usecase::ecfs::FS;
 use super::storage_api::object_usecase::error::{
@@ -2641,8 +2644,13 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
+        let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Fast in-memory update for immediate quota and admin usage consistency
-        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        if put_versioned {
+            record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        } else {
+            record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+        }
 
         let raw_version = obj_info.version_id.map(|v| v.to_string());
 
@@ -2651,11 +2659,7 @@ impl DefaultObjectUsecase {
             helper = helper.version_id(version_id.clone());
         }
 
-        let put_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            raw_version
-        } else {
-            None
-        };
+        let put_version = if put_versioned { raw_version } else { None };
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
@@ -3625,17 +3629,18 @@ impl DefaultObjectUsecase {
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
 
+        let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Update quota tracking after successful copy
         if has_bucket_metadata {
-            record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            if dest_versioned {
+                record_bucket_object_version_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            } else {
+                record_bucket_object_write_memory(&bucket, previous_current_size, oi.size.max(0) as u64).await;
+            }
         }
 
         let raw_dest_version = oi.version_id.map(|v| v.to_string());
-        let dest_version = if BucketVersioningSys::prefix_enabled(&bucket, &key).await {
-            raw_dest_version
-        } else {
-            None
-        };
+        let dest_version = if dest_versioned { raw_dest_version } else { None };
 
         // warn!("copy_object oi {:?}", &oi);
         let object_info = oi.clone();
@@ -3850,6 +3855,7 @@ impl DefaultObjectUsecase {
                 &bucket,
                 object_to_delete.clone(),
                 ObjectOptions {
+                    versioned: version_cfg.enabled(),
                     version_suspended: version_cfg.suspended(),
                     ..Default::default()
                 },
@@ -3903,13 +3909,20 @@ impl DefaultObjectUsecase {
                         "failed to persist transitioned object cleanup journal"
                     );
                 }
-                let size = object_sizes[i].max(0) as u64;
-                record_bucket_object_delete_memory(
-                    &bucket,
-                    size,
-                    existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
-                )
-                .await;
+                let creates_delete_marker = object_to_delete[i].version_id.is_none()
+                    && version_cfg.prefix_enabled(object_to_delete[i].object_name.as_str())
+                    && !version_cfg.suspended();
+                if creates_delete_marker {
+                    record_bucket_delete_marker_memory(&bucket).await;
+                } else {
+                    let size = object_sizes[i].max(0) as u64;
+                    record_bucket_object_delete_memory(
+                        &bucket,
+                        size,
+                        existing_object_infos[i].is_some() && object_to_delete[i].version_id.is_none(),
+                    )
+                    .await;
+                }
                 continue;
             }
 
@@ -4141,7 +4154,11 @@ impl DefaultObjectUsecase {
         }
 
         // Fast in-memory update for immediate quota and admin usage consistency
-        record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
+        if delete_creates_delete_marker(&opts) {
+            record_bucket_delete_marker_memory(&bucket).await;
+        } else {
+            record_bucket_object_delete_memory(&bucket, obj_info.size.max(0) as u64, opts.version_id.is_none()).await;
+        }
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
