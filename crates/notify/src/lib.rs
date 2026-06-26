@@ -53,6 +53,6 @@ pub use runtime_facade::NotifyRuntimeFacade;
 pub use runtime_view::NotifyRuntimeView;
 pub use services::NotifyServices;
 pub use status_view::NotifyStatusView;
-pub(crate) use storage_api::{
+pub(crate) use storage_api::crate_boundary::{
     read_notify_server_config_without_migrate, resolve_notify_object_store_handle, save_notify_server_config,
 };

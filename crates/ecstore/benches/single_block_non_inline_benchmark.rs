@@ -18,7 +18,7 @@ mod storage_api;
 use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
-use storage_api::{BitrotWriterWrapper, CustomWriter, Erasure};
+use storage_api::single_block_non_inline::{BitrotWriterWrapper, CustomWriter, Erasure};
 
 #[derive(Clone, Debug)]
 struct BenchConfig {

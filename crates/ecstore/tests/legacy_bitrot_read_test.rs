@@ -32,7 +32,7 @@ mod storage_api;
 use rustfs_filemeta::{FileInfoOpts, get_file_info};
 use rustfs_utils::HashAlgorithm;
 use std::path::PathBuf;
-use storage_api::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, create_bitrot_reader, new_disk};
+use storage_api::legacy_bitrot_read::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, create_bitrot_reader, new_disk};
 use tokio::fs;
 
 fn workspace_root() -> PathBuf {

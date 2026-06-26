@@ -13,3 +13,23 @@ pub(crate) use rustfs_storage_api::{
     ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations as StorageObjectOperations, ObjectToDelete, PartInfo,
     StorageAdminApi, WalkOptions as StorageWalkOptions,
 };
+
+pub(crate) mod contract_compat {
+    pub(crate) use super::{
+        CompletePart, DeletedObject, DiskStore, ECStore, Error, GetObjectReader, HTTPRangeSpec, ListMultipartsInfo,
+        ListPartsInfo, MultipartInfo, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader,
+        StorageAdminApi, StorageHealOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageListOperations,
+        StorageMultipartOperations, StorageNamespaceLocking, StorageObjectIO, StorageObjectInfoOrErr, StorageObjectOperations,
+        StorageWalkOptions,
+    };
+}
+
+pub(crate) mod legacy_bitrot_read {
+    pub(crate) use super::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, create_bitrot_reader, new_disk};
+}
+
+pub(crate) mod minio_generated_read {
+    pub(crate) use super::{
+        DiskAPI, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
+    };
+}
