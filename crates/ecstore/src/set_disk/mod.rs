@@ -35,10 +35,10 @@ use crate::disk::{
     conv_part_err_to_int, has_part_err,
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
-use crate::erasure_codec::bridge::{
+use crate::erasure::codec::bridge::{
     CodecStreamingDecodeEngine, GET_CODEC_STREAMING_ENGINE_LEGACY, GET_CODEC_STREAMING_ENGINE_RUSTFS,
 };
-use crate::erasure_coding;
+use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
@@ -403,7 +403,7 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
     }
 }
 
-fn build_get_codec_streaming_decode_engine(erasure: erasure_coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
+fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
     match get_codec_streaming_engine() {
         GetCodecStreamingEngine::Legacy => Ok(CodecStreamingDecodeEngine::legacy(erasure)),
         GetCodecStreamingEngine::Rustfs => CodecStreamingDecodeEngine::rustfs(&erasure),
@@ -1417,7 +1417,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<ObjectInfo> = async {
-            let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure =
+                crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
@@ -3749,7 +3750,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
-        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure =
+            crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
         let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -7828,7 +7830,7 @@ mod tests {
         fi.size = payload.len() as i64;
         fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
 
-        let erasure = erasure_coding::Erasure::new_with_options(
+        let erasure = crate::erasure::coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,

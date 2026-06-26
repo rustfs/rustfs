@@ -13,10 +13,10 @@
 // limitations under the License.
 
 use crate::disk::error::{Error, Result};
-use crate::erasure_coding::BitrotReader;
-use crate::erasure_coding::BitrotWriterWrapper;
-use crate::erasure_coding::decode::ParallelReader;
-use crate::erasure_coding::encode::MultiWriter;
+use crate::erasure::coding::BitrotReader;
+use crate::erasure::coding::BitrotWriterWrapper;
+use crate::erasure::coding::decode::ParallelReader;
+use crate::erasure::coding::encode::MultiWriter;
 use bytes::Bytes;
 use tokio::io::AsyncRead;
 use tracing::{info, warn};
@@ -90,7 +90,7 @@ impl super::Erasure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::erasure_coding::{CustomWriter, Erasure};
+    use crate::erasure::coding::{CustomWriter, Erasure};
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;
 

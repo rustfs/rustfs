@@ -1688,7 +1688,7 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = erasure_coding::Erasure::new_with_options(
+        let erasure = crate::erasure::coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -1978,7 +1978,7 @@ impl SetDisks {
             return Err(Error::other("codec streaming reader only supports single-part plain objects"));
         }
 
-        let erasure = erasure_coding::Erasure::new_with_options(
+        let erasure = crate::erasure::coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -2075,7 +2075,7 @@ impl SetDisks {
             .await;
         }
 
-        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path_and_read_costs(
+        let source = crate::erasure::coding::decode::ParallelReader::new_with_metrics_path_and_read_costs(
             readers,
             erasure.clone(),
             0,
@@ -2084,8 +2084,8 @@ impl SetDisks {
             read_costs,
         );
         let engine = build_get_codec_streaming_decode_engine(erasure)?;
-        let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
-        Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))
+        let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
+        Ok(Box::new(crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new(reader)))
     }
 }
 
@@ -3017,7 +3017,7 @@ mod tests {
     #[test]
     fn codec_streaming_decode_engine_builder_selects_rustfs() {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
-            let erasure = erasure_coding::Erasure::new(4, 2, 32);
+            let erasure = crate::erasure::coding::Erasure::new(4, 2, 32);
             let engine = build_get_codec_streaming_decode_engine(erasure).expect("engine should be built");
 
             assert!(matches!(engine, CodecStreamingDecodeEngine::Rustfs(_)));

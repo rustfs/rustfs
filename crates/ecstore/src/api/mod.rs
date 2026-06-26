@@ -97,7 +97,7 @@ pub mod error {
 }
 
 pub mod erasure {
-    pub use crate::erasure_coding::{
+    pub use crate::erasure::coding::{
         BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
         calc_shard_size_legacy,
     };

@@ -20,8 +20,8 @@ use crate::diagnostics::get::{
 };
 use crate::disk::error::Error;
 use crate::disk::error_reduce::reduce_errs;
-use crate::erasure_codec::workspace::ShardBufferPool;
-use crate::erasure_coding::{BitrotReader, Erasure};
+use crate::erasure::codec::workspace::ShardBufferPool;
+use crate::erasure::coding::{BitrotReader, Erasure};
 use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeReadState};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
@@ -870,7 +870,7 @@ mod tests {
     use super::*;
     use crate::{
         disk::error::DiskError,
-        erasure_coding::{BitrotReader, BitrotWriter},
+        erasure::coding::{BitrotReader, BitrotWriter},
     };
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;

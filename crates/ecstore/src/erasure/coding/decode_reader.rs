@@ -20,7 +20,7 @@ use crate::diagnostics::get::{
     GET_STAGE_STRIPE_READ,
 };
 use crate::disk::error::Error as DiskError;
-use crate::erasure_codec::bridge::ErasureDecodeEngine;
+use crate::erasure::codec::bridge::ErasureDecodeEngine;
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::io;
 use std::io::ErrorKind;
@@ -476,10 +476,10 @@ fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::erasure_codec::bridge::{
+    use crate::erasure::codec::bridge::{
         CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
     };
-    use crate::erasure_coding::Erasure;
+    use crate::erasure::coding::Erasure;
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use std::collections::VecDeque;
     use std::sync::Arc;

@@ -138,6 +138,7 @@ ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_data_moveme
 ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_usage_diagnostics_module_hits.txt"
 ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_runtime_global_module_hits.txt"
 ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_module_hits.txt"
+ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_erasure_module_hits.txt"
 ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
 ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
 ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
@@ -370,6 +371,10 @@ require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod data_movement;" \
   "ECStore data movement owner module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod erasure;" \
+  "ECStore erasure owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod cluster;" \
@@ -2910,6 +2915,20 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore I/O support modules must stay under the io_support owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/erasure_codec ]] && printf '%s\n' 'crates/ecstore/src/erasure_codec'
+    [[ -e crates/ecstore/src/erasure_coding ]] && printf '%s\n' 'crates/ecstore/src/erasure_coding'
+    rg -n --with-filename '^mod erasure_(codec|coding);|#\[path = "erasure_(codec|coding)/' crates/ecstore/src/lib.rs || true
+    true
+  }
+) >"$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore erasure modules must stay under the erasure owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE")"
 fi
 
 (
