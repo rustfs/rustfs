@@ -25,7 +25,9 @@ use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{
-    DeletedObject, HTTPRangeSpec, ListOperations as _, ObjectIO, ObjectOperations, ObjectToDelete,
+    list::ListOperations as _,
+    object::{DeletedObject, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;

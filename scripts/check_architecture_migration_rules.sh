@@ -64,6 +64,8 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_ext
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
+ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/ecstore_storage_api_root_reexport_hits.txt"
+ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/ecstore_storage_api_root_consumer_hits.txt"
 ECSTORE_TEST_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_test_direct_api_hits.txt"
 ECSTORE_BENCH_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_bench_direct_api_hits.txt"
 LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
@@ -648,11 +650,11 @@ fi
 
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/core.rs" \
-  "pub use crate::storage_api_contracts::ExpirationOptions;" \
+  "pub use crate::storage_api_contracts::lifecycle::ExpirationOptions;" \
   "ECStore ExpirationOptions compatibility re-export"
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
-  "pub use crate::storage_api_contracts::TransitionedObject;" \
+  "pub use crate::storage_api_contracts::lifecycle::TransitionedObject;" \
   "ECStore TransitionedObject compatibility re-export"
 
 (
@@ -685,6 +687,34 @@ fi
 
 if [[ -s "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE" ]]; then
   report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts.rs: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^pub(?:\(crate\))? use rustfs_storage_api' \
+    crates/ecstore/src/storage_api_contracts.rs || true
+) >"$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE"
+
+if [[ -s "$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "ECStore storage_api_contracts must expose rustfs-storage-api contracts from domain modules, not root re-exports: $(paste -sd '; ' "$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n -U --with-filename 'storage_api_contracts::\{\s*[A-Z]' \
+      crates/ecstore/src \
+      --glob '*.rs' \
+      --glob '!storage_api_contracts.rs' || true
+    rg -n --with-filename 'storage_api_contracts::[A-Z]' \
+      crates/ecstore/src \
+      --glob '*.rs' \
+      --glob '!storage_api_contracts.rs' || true
+  }
+) >"$ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "ECStore modules must import storage_api_contracts from domain modules, not the root facade: $(paste -sd '; ' "$ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (

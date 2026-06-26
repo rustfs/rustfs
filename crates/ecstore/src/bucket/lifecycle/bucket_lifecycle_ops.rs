@@ -37,8 +37,11 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::runtime_sources;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
-    DeletedObject, ExpirationOptions, HTTPRangeSpec, ListOperations as _, MultipartOperations as _, ObjectOperations as _,
-    ObjectToDelete,
+    lifecycle::ExpirationOptions,
+    list::ListOperations as _,
+    multipart::MultipartOperations as _,
+    object::{DeletedObject, ObjectOperations as _, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
 use crate::tier::warm_backend::WarmBackendGetOpts;
@@ -387,7 +390,7 @@ pub trait ExpiryOp: 'static {
     fn as_any(&self) -> &dyn Any;
 }
 
-pub use crate::storage_api_contracts::TransitionedObject;
+pub use crate::storage_api_contracts::lifecycle::TransitionedObject;
 
 struct FreeVersionTask(ObjectInfo);
 
@@ -2891,8 +2894,11 @@ mod tests {
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
-    use crate::storage_api_contracts::ExpirationOptions;
-    use crate::storage_api_contracts::{BucketOperations, BucketOptions, MakeBucketOptions, MultipartOperations as _};
+    use crate::storage_api_contracts::{
+        bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
+        lifecycle::ExpirationOptions,
+        multipart::MultipartOperations as _,
+    };
     use crate::store::ECStore;
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
@@ -4167,7 +4173,7 @@ mod tests {
                 &bucket,
                 object,
                 &upload.upload_id,
-                vec![crate::storage_api_contracts::CompletePart {
+                vec![crate::storage_api_contracts::multipart::CompletePart {
                     part_num: 1,
                     etag: second_part.etag.clone(),
                     checksum_crc32: None,

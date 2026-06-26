@@ -18,7 +18,7 @@ use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service
 use crate::{disk::endpoint::Endpoint, runtime_sources};
 
 use crate::data_usage::load_data_usage_cache;
-use crate::storage_api_contracts::StorageAdminApi;
+use crate::storage_api_contracts::admin::StorageAdminApi;
 use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,

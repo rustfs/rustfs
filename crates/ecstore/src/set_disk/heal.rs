@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::storage_api_contracts::NamespaceLocking as _;
+use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";

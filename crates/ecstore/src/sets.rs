@@ -16,14 +16,13 @@
 use crate::disk::error_reduce::count_errs;
 use crate::error::{Error, Result};
 use crate::layout::set_heal::{formats_to_drives_info, new_heal_format_sets};
-use crate::storage_api_contracts::CompletePart;
-use crate::storage_api_contracts::HTTPRangeSpec;
 use crate::storage_api_contracts::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, ListMultipartsInfo, ListPartsInfo,
-    MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo, StorageListObjectVersionsInfo,
-    StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+    bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
+    object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
-use crate::storage_api_contracts::{ObjectIO as _, ObjectOperations as _};
 use crate::{
     disk::{
         DiskAPI, DiskOption, DiskStore,
@@ -400,7 +399,7 @@ fn apply_delete_objects_results(
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectIO for Sets {
+impl crate::storage_api_contracts::object::ObjectIO for Sets {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -493,7 +492,7 @@ impl BucketOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectOperations for Sets {
+impl crate::storage_api_contracts::object::ObjectOperations for Sets {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -701,7 +700,7 @@ impl crate::storage_api_contracts::ObjectOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ListOperations for Sets {
+impl crate::storage_api_contracts::list::ListOperations for Sets {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -762,7 +761,7 @@ impl crate::storage_api_contracts::ListOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::MultipartOperations for Sets {
+impl crate::storage_api_contracts::multipart::MultipartOperations for Sets {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -876,7 +875,7 @@ impl crate::storage_api_contracts::MultipartOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::HealOperations for Sets {
+impl crate::storage_api_contracts::heal::HealOperations for Sets {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -1016,7 +1015,7 @@ impl crate::storage_api_contracts::HealOperations for Sets {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::NamespaceLocking for Sets {
+impl crate::storage_api_contracts::namespace::NamespaceLocking for Sets {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -1092,8 +1091,8 @@ async fn init_storage_disks_with_errors(
 mod tests {
     use super::*;
     use crate::layout::endpoint::Endpoint;
-    use crate::storage_api_contracts::HealOperations as _;
-    use crate::storage_api_contracts::ListOperations as _;
+    use crate::storage_api_contracts::heal::HealOperations as _;
+    use crate::storage_api_contracts::list::ListOperations as _;
 
     #[test]
     fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {

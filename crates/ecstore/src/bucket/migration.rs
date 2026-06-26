@@ -20,10 +20,11 @@ use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET}
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::storage_api_contracts::{
-    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, ObjectToDelete,
-    StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+    bucket::{BucketOperations, BucketOptions},
+    list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
-use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;

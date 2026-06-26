@@ -19,8 +19,9 @@ use super::{
 use crate::error::{Error, Result};
 use crate::object_api::ObjectOptions;
 use crate::set_disk::get_lock_acquire_timeout;
-use crate::storage_api_contracts::EcstoreObjectIO;
-use crate::storage_api_contracts::{NamespaceLocking as StorageNamespaceLocking, StorageAdminApi};
+use crate::storage_api_contracts::{
+    admin::StorageAdminApi, namespace::NamespaceLocking as StorageNamespaceLocking, object::EcstoreObjectIO,
+};
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
 use std::sync::Arc;

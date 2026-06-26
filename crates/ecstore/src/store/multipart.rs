@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::storage_api_contracts::MultipartOperations as _;
+use crate::storage_api_contracts::multipart::MultipartOperations as _;
 
 impl ECStore {
     #[instrument(skip(self))]

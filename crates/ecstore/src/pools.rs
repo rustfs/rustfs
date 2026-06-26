@@ -40,8 +40,11 @@ use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_
 use crate::runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
-    BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, NamespaceLocking as _, ObjectIO as _,
-    ObjectOperations as _, StorageAdminApi,
+    admin::StorageAdminApi,
+    bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
+    heal::HealOperations as _,
+    namespace::NamespaceLocking as _,
+    object::{ObjectIO as _, ObjectOperations as _},
 };
 use crate::{sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};

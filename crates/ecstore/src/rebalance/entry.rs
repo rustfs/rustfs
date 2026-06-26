@@ -34,7 +34,7 @@ use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
-use crate::storage_api_contracts::ObjectOperations as _;
+use crate::storage_api_contracts::object::ObjectOperations as _;
 use crate::store::ECStore;
 use rustfs_filemeta::MetaCacheEntry;
 use rustfs_utils::path::encode_dir_object;

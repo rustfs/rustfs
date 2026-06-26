@@ -47,11 +47,11 @@ use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
 use crate::runtime_sources;
 use crate::storage_api_contracts::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
-    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
-};
-use crate::storage_api_contracts::{
-    HTTPRangeSpec, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+    bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo},
+    object::{DeletedObject, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
 use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::tier::tier::TierConfigMgr;
@@ -346,7 +346,7 @@ impl ECStore {
 // }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectIO for ECStore {
+impl crate::storage_api_contracts::object::ObjectIO for ECStore {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -407,7 +407,7 @@ impl BucketOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectOperations for ECStore {
+impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -498,7 +498,7 @@ impl crate::storage_api_contracts::ObjectOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ListOperations for ECStore {
+impl crate::storage_api_contracts::list::ListOperations for ECStore {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -563,7 +563,7 @@ impl crate::storage_api_contracts::ListOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::MultipartOperations for ECStore {
+impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -687,7 +687,7 @@ impl crate::storage_api_contracts::MultipartOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::HealOperations for ECStore {
+impl crate::storage_api_contracts::heal::HealOperations for ECStore {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -724,7 +724,7 @@ impl crate::storage_api_contracts::HealOperations for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::NamespaceLocking for ECStore {
+impl crate::storage_api_contracts::namespace::NamespaceLocking for ECStore {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -734,7 +734,7 @@ impl crate::storage_api_contracts::NamespaceLocking for ECStore {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::StorageAdminApi for ECStore {
+impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
     type BackendInfo = rustfs_madmin::BackendInfo;
     type StorageInfo = rustfs_madmin::StorageInfo;
     type Disk = DiskStore;
@@ -758,7 +758,7 @@ impl crate::storage_api_contracts::StorageAdminApi for ECStore {
     #[instrument(skip(self))]
     async fn disk_set_inventory(
         &self,
-        selector: crate::storage_api_contracts::DiskSetSelector,
+        selector: crate::storage_api_contracts::admin::DiskSetSelector,
     ) -> Result<Vec<Option<Self::Disk>>> {
         self.handle_get_disks(selector.pool_idx, selector.set_idx).await
     }

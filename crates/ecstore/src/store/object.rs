@@ -17,7 +17,7 @@ use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
     is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
-use crate::storage_api_contracts::{ObjectIO as _, ObjectOperations as _};
+use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_hold_duration, record_object_lock_diag_slow_acquire,
     record_object_lock_diag_slow_hold,
@@ -1281,7 +1281,7 @@ impl ECStore {
     }
 
     pub(super) async fn handle_verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as crate::storage_api_contracts::ObjectIO>::get_object_reader(
+        let get_object_reader = <Self as crate::storage_api_contracts::object::ObjectIO>::get_object_reader(
             self,
             bucket,
             object,

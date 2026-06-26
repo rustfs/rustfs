@@ -21,7 +21,8 @@ use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::Result;
 use crate::object_api::ObjectInfo;
 use crate::storage_api_contracts::{
-    BucketOperations, BucketOptions, ListOperations as _, StorageObjectInfoOrErr, StorageWalkOptions,
+    bucket::{BucketOperations, BucketOptions},
+    list::{ListOperations as _, StorageObjectInfoOrErr, StorageWalkOptions},
 };
 use crate::store::ECStore;
 use rustfs_filemeta::FileInfo;
