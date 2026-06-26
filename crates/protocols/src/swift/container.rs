@@ -17,7 +17,7 @@
 //! This module implements Swift container CRUD operations and container-bucket translation.
 
 use super::account::validate_account_access;
-use super::storage_api::{
+use super::storage_api::container::{
     BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations as _, MakeBucketOptions,
 };
 use super::types::Container;

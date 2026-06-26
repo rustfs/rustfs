@@ -2408,7 +2408,7 @@ mod tests {
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
     use rustfs_madmin::heal_commands::HealResultItem;
 
-    use super::super::{DiskStore, Endpoint, storage_api::BucketInfo};
+    use super::super::{DiskStore, Endpoint, storage_api::status::BucketInfo};
 
     struct MockStorage;
 

@@ -31,3 +31,12 @@ pub(crate) use rustfs_ecstore::api::global::{
 };
 pub(crate) use rustfs_ecstore::api::storage::ECStore as ObsStore;
 pub(crate) use rustfs_storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
+
+pub(crate) mod metrics {
+    pub(crate) use super::{
+        BucketOperations, BucketOptions, OBS_GLOBAL_EXPIRY_STATE, OBS_GLOBAL_REPLICATION_STATS, OBS_GLOBAL_TRANSITION_STATE,
+        ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsReplicationStats, ObsStore, StorageAdminApi,
+        obs_get_global_bucket_monitor, obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free,
+        obs_load_data_usage_from_backend, obs_resolve_object_store_handle,
+    };
+}

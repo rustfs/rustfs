@@ -41,7 +41,7 @@ use uuid::Uuid;
 
 mod storage_api;
 
-use storage_api::{
+use storage_api::lifecycle::{
     BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskAPI as _, DiskOption,
     ECStore, Endpoint, EndpointServerPools, Endpoints, ListOperations as _, MakeBucketOptions, MultipartOperations as _,
     ObjectIO as _, ObjectOperations as _, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerWarmBackend,

@@ -35,3 +35,14 @@ pub(crate) use rustfs_storage_api::{
     BucketOperations, BucketOptions, CompletePart, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO,
     ObjectOperations,
 };
+
+pub(crate) mod lifecycle {
+    pub(crate) use super::{
+        BUCKET_LIFECYCLE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart, DiskAPI, DiskOption,
+        ECStore, Endpoint, EndpointServerPools, Endpoints, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO,
+        ObjectOperations, PoolEndpoints, ReadCloser, ReaderImpl, STORAGE_FORMAT_FILE, ScannerWarmBackend, TierConfig, TierMinIO,
+        TierType, TransitionOptions, WarmBackendGetOpts, build_transition_put_options, enqueue_transition_for_existing_objects,
+        get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks,
+        new_disk, path2_bucket_object_with_base_path, update_bucket_metadata,
+    };
+}

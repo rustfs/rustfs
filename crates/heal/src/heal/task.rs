@@ -2208,7 +2208,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    use super::super::storage_api::BucketInfo;
+    use super::super::storage_api::status::BucketInfo;
     #[derive(Default)]
     struct MockStorage {
         listed: Mutex<bool>,

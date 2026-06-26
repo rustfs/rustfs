@@ -18,7 +18,7 @@
 //! Segments are discovered at download time using lexicographic ordering
 //! based on a container metadata manifest pointer.
 
-use super::storage_api::HTTPRangeSpec;
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, container, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;

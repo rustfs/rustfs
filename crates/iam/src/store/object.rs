@@ -37,7 +37,9 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
-use crate::storage_api::{HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations};
+use crate::storage_api::object_store::{
+    HTTPPreconditions, ListOperations as _, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations,
+};
 
 pub static IAM_CONFIG_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam"));
 pub static IAM_CONFIG_USERS_PREFIX: LazyLock<String> = LazyLock::new(|| format!("{IAM_CONFIG_ROOT_PREFIX}/iam/users/"));

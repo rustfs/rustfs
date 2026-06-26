@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::{IamNotificationSys, notification_sys as ecstore_notification_sys};
+use crate::storage_api::runtime::{IamNotificationSys, notification_sys as ecstore_notification_sys};
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
 

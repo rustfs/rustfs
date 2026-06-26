@@ -61,7 +61,9 @@ pub mod versioning;
 pub use errors::{SwiftError, SwiftResult};
 pub use router::{SwiftRoute, SwiftRouter};
 // Note: Container, Object, and SwiftMetadata types used by Swift implementation
-pub use storage_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
-pub(crate) use storage_api::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+pub use storage_api::public_api::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+pub(crate) use storage_api::public_api::{
+    get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata,
+};
 #[allow(unused_imports)]
 pub use types::{Container, Object, SwiftMetadata};

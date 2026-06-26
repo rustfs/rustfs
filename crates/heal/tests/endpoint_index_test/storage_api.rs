@@ -15,3 +15,7 @@
 pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+
+pub(crate) mod endpoint_index {
+    pub(crate) use super::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_local_disks};
+}

@@ -33,7 +33,7 @@ use walkdir::WalkDir;
 #[path = "heal_integration_test/storage_api.rs"]
 mod storage_api;
 
-use storage_api::{
+use storage_api::integration::{
     BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, ObjectIO as _, ObjectOperations as _,
     PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
 };

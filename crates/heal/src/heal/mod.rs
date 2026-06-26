@@ -23,13 +23,13 @@ pub(crate) mod storage_api;
 pub mod task;
 pub mod utils;
 
-use storage_api::{
+use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_GLOBAL_LOCAL_DISK_MAP, ECSTORE_RUSTFS_META_BUCKET,
     EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
     EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
 };
 #[cfg(test)]
-use storage_api::{EcstoreDiskOption, ecstore_new_disk};
+use storage_api::owner::{EcstoreDiskOption, ecstore_new_disk};
 
 pub use erasure_healer::ErasureSetHealer;
 pub use manager::{HealManager, HealOperationsSnapshot, HealPriorityCounts, HealSourceCounts};
