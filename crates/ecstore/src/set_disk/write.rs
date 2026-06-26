@@ -625,19 +625,24 @@ impl SetDisks {
         }
 
         let results = join_all(futures).await;
+        let mut delete_errs = Vec::with_capacity(results.len());
         for (index, result) in results.into_iter().enumerate() {
             let key = format!("ddisk-{index}");
             match result {
                 Ok(_) => {
                     tags.insert(key, "<nil>".to_string());
+                    delete_errs.push(None);
                 }
                 Err(e) => {
                     tags.insert(key, e.to_string());
+                    delete_errs.push(Some(e));
                 }
             }
         }
 
-        // TODO: audit
+        if let Some(err) = reduce_write_quorum_errs(&delete_errs, OBJECT_OP_IGNORED_ERRS, self.default_write_quorum()) {
+            return Err(err);
+        }
 
         Ok(m)
     }
