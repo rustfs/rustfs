@@ -17,6 +17,7 @@ use crate::get_diagnostics::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
     classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
 };
+use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
     collections::HashMap,
@@ -108,6 +109,10 @@ async fn release_read_repair_heal_reservation(key: &ReadRepairHealCacheKey) {
     }
 }
 
+fn record_read_repair_dedup(reason: &'static str) {
+    counter!("rustfs_heal_read_repair_dedup_total", "reason" => reason.to_string()).increment(1);
+}
+
 async fn submit_read_repair_heal(
     bucket: &str,
     object: &str,
@@ -118,6 +123,7 @@ async fn submit_read_repair_heal(
     reason: &'static str,
 ) {
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
+        record_read_repair_dedup("duplicate");
         debug!(
             bucket,
             object, part_number, pool_index, set_index, reason, "Skipped duplicate read-repair heal request"

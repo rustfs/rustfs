@@ -798,6 +798,17 @@ impl HealManager {
         matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
     }
 
+    fn record_admission_metric(source: HealRequestSource, admission: HealAdmissionResult, context: &'static str) {
+        counter!(
+            "rustfs_heal_admission_total",
+            "source" => source.as_str().to_string(),
+            "result" => admission.result_label().to_string(),
+            "reason" => admission.reason_label().to_string(),
+            "context" => context.to_string()
+        )
+        .increment(1);
+    }
+
     fn admit_request_to_queue(
         queue: &mut PriorityHealQueue,
         request: HealRequest,
@@ -815,6 +826,7 @@ impl HealManager {
                 let source = request.source;
                 if let Some(displaced) = queue.push_displacing_lower_priority(request) {
                     publish_heal_queue_length(queue);
+                    Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
                     warn!(
                         target: "rustfs::heal::manager",
                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -848,10 +860,12 @@ impl HealManager {
                     result = "full_no_displacement_candidate",
                     "Heal queue request rejected without displacement"
                 );
+                Self::record_admission_metric(source, HealAdmissionResult::Full, context);
                 return HealAdmissionResult::Full;
             }
 
             let admission = Self::classify_full_admission(&request, config);
+            Self::record_admission_metric(request.source, admission, context);
             match admission {
                 HealAdmissionResult::Dropped(reason) => {
                     warn!(
@@ -892,6 +906,7 @@ impl HealManager {
         }
 
         if let Some(admission) = Self::classify_pressure_admission(&request, queue_len, queue_capacity) {
+            Self::record_admission_metric(request.source, admission, context);
             if let HealAdmissionResult::Dropped(reason) = admission {
                 debug!(
                     target: "rustfs::heal::manager",
@@ -938,6 +953,7 @@ impl HealManager {
         match queue.push(request) {
             QueuePushOutcome::Accepted => {
                 publish_heal_queue_length(queue);
+                Self::record_admission_metric(source, HealAdmissionResult::Accepted, context);
                 if matches!(priority, HealPriority::High | HealPriority::Urgent) {
                     let stats = queue.get_priority_stats();
                     debug!(
@@ -974,6 +990,7 @@ impl HealManager {
                 HealAdmissionResult::Accepted
             }
             QueuePushOutcome::Merged => {
+                Self::record_admission_metric(source, HealAdmissionResult::Merged, context);
                 debug!(
                     target: "rustfs::heal::manager",
                     event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -1893,6 +1910,9 @@ impl HealManager {
                 let mut skipped_duplicate_count = 0usize;
                 let mut skipped_invalid_count = 0usize;
                 let mut enqueued_count = 0usize;
+                let mut not_enqueued_count = 0usize;
+                let mut dropped_count = 0usize;
+                let mut full_count = 0usize;
                 tokio::select! {
                     _ = cancel_token.cancelled() => {
                         info!(
@@ -2088,6 +2108,14 @@ impl HealManager {
                             } else {
                                 if matches!(admission, HealAdmissionResult::Merged) {
                                     skipped_duplicate_count += 1;
+                                } else {
+                                    not_enqueued_count += 1;
+                                }
+                                if matches!(admission, HealAdmissionResult::Full) {
+                                    full_count += 1;
+                                }
+                                if matches!(admission, HealAdmissionResult::Dropped(_)) {
+                                    dropped_count += 1;
                                 }
                                 debug!(
                                     target: "rustfs::heal::manager",
@@ -2112,6 +2140,9 @@ impl HealManager {
                             state = "cycle_completed",
                             candidate_count,
                             enqueued_count,
+                            not_enqueued_count,
+                            dropped_count,
+                            full_count,
                             skipped_duplicate_count,
                             skipped_invalid_count,
                             "Heal auto-scan cycle completed"
