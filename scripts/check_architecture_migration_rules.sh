@@ -200,6 +200,7 @@ RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_
 RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_helper_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_wildcard_import_hits.txt"
+RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_export_glob_hits.txt"
 RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
@@ -1935,6 +1936,17 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE" ]]; then
   report_failure "RustFS storage-owner modules must use explicit imports instead of parent wildcard imports: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^pub\(crate\) use storage_api::\*;' \
+    rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner root must explicitly list storage_api re-exports instead of using a wildcard: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE")"
 fi
 
 (
