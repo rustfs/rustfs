@@ -241,6 +241,10 @@ impl From<StorageError> for ApiError {
             StorageError::BucketExists(_) => S3ErrorCode::BucketAlreadyOwnedByYou,
             StorageError::StorageFull => S3ErrorCode::ServiceUnavailable,
             StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::ErasureReadQuorum
+            | StorageError::InsufficientReadQuorum(_, _)
+            | StorageError::ErasureWriteQuorum
+            | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::SlowDown,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::Lock(_) => S3ErrorCode::ServiceUnavailable,
             StorageError::DecommissionNotStarted => S3ErrorCode::InvalidRequest,
@@ -450,6 +454,10 @@ mod tests {
             (StorageError::BucketExists("test".into()), S3ErrorCode::BucketAlreadyOwnedByYou),
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (StorageError::ErasureReadQuorum, S3ErrorCode::SlowDown),
+            (StorageError::InsufficientReadQuorum("test".into(), "test".into()), S3ErrorCode::SlowDown),
+            (StorageError::ErasureWriteQuorum, S3ErrorCode::SlowDown),
+            (StorageError::InsufficientWriteQuorum("test".into(), "test".into()), S3ErrorCode::SlowDown),
             (
                 StorageError::NamespaceLockQuorumUnavailable {
                     mode: "write",

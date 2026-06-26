@@ -152,6 +152,9 @@ type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
 const EVENT_SET_DISK_MULTIPART: &str = "set_disk_multipart";
+const COMPLETE_MULTIPART_PART_MISSING: &str = "part_missing";
+const COMPLETE_MULTIPART_PART_READ_QUORUM_UNAVAILABLE: &str = "read_quorum_unavailable";
+const COMPLETE_MULTIPART_PART_ERROR: &str = "part_error";
 const EVENT_SET_DISK_WRITE: &str = "set_disk_write";
 const EVENT_SET_DISK_HEAL: &str = "set_disk_heal";
 const EVENT_SET_DISK_COMMIT_TAIL_SLOW: &str = "set_disk_commit_tail_slow";
@@ -440,6 +443,28 @@ fn get_codec_streaming_reader_decision(
     }
 
     GetCodecStreamingDecision::Use
+}
+
+fn is_confirmed_complete_part_missing(err: &str) -> bool {
+    err.contains("file not found")
+        || err.contains("Specified part could not be found")
+        || (err.starts_with("part.") && err.ends_with(" not found"))
+}
+
+fn complete_multipart_part_error(part_number: usize, err: &str, bucket: &str, object: &str) -> Error {
+    if is_confirmed_complete_part_missing(err) {
+        return Error::InvalidPart(part_number, bucket.to_owned(), object.to_owned());
+    }
+
+    to_object_err(Error::ErasureReadQuorum, vec![bucket, object])
+}
+
+fn complete_multipart_part_error_result(err: &Error) -> &'static str {
+    match err {
+        Error::InvalidPart(_, _, _) => COMPLETE_MULTIPART_PART_MISSING,
+        Error::ErasureReadQuorum | Error::InsufficientReadQuorum(_, _) => COMPLETE_MULTIPART_PART_READ_QUORUM_UNAVAILABLE,
+        _ => COMPLETE_MULTIPART_PART_ERROR,
+    }
 }
 
 /// Record a lock acquisition for deadlock detection.
@@ -4286,8 +4311,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
 
-        let object_parts =
-            Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum).await?;
+        let object_parts = Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
+            .await
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
 
         if object_parts.len() != uploaded_parts.len() {
             return Err(Error::other("part result number err"));
@@ -4310,11 +4336,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         for (i, part) in object_parts.iter().enumerate() {
             if let Some(err) = &part.error {
-                error!("complete_multipart_upload part error: {:?}", &err);
-                if issue3031_diag_enabled() {
-                    warn!(
+                let mapped_err = complete_multipart_part_error(uploaded_parts[i].part_num, err, bucket, object);
+                let result = complete_multipart_part_error_result(&mapped_err);
+                if matches!(mapped_err, Error::InvalidPart(_, _, _)) {
+                    debug!(
                         target: "rustfs_ecstore::set_disk",
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
                         op = "complete_multipart_upload",
+                        result = result,
                         bucket = %bucket,
                         object = %object,
                         upload_id = %upload_id,
@@ -4323,9 +4354,28 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                         read_quorum = read_quorum,
                         write_quorum = write_quorum,
                         error = %err,
-                        "issue3031_complete_part_error"
+                        "Set disk multipart part missing"
+                    );
+                } else {
+                    warn!(
+                        target: "rustfs_ecstore::set_disk",
+                        event = EVENT_SET_DISK_MULTIPART,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
+                        op = "complete_multipart_upload",
+                        result = result,
+                        bucket = %bucket,
+                        object = %object,
+                        upload_id = %upload_id,
+                        uploaded_part_num = uploaded_parts[i].part_num,
+                        observed_part_num = part.number,
+                        read_quorum = read_quorum,
+                        write_quorum = write_quorum,
+                        error = %err,
+                        "Set disk multipart part resolution failed"
                     );
                 }
+                return Err(mapped_err);
             }
 
             if uploaded_parts[i].part_num != part.number {
@@ -5647,6 +5697,41 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use time::OffsetDateTime;
+
+    #[test]
+    fn complete_part_error_maps_confirmed_missing_to_invalid_part() {
+        for err in ["file not found", "Specified part could not be found", "part.7 not found"] {
+            let mapped = complete_multipart_part_error(7, err, "bucket", "object");
+
+            assert!(matches!(
+                mapped,
+                Error::InvalidPart(7, ref bucket, ref object) if bucket == "bucket" && object == "object"
+            ));
+            assert_eq!(complete_multipart_part_error_result(&mapped), COMPLETE_MULTIPART_PART_MISSING);
+        }
+    }
+
+    #[test]
+    fn complete_part_error_maps_read_quorum_to_retryable_server_error() {
+        let mapped = complete_multipart_part_error(1, "erasure read quorum", "bucket", "object");
+
+        assert!(matches!(
+            mapped,
+            Error::InsufficientReadQuorum(ref bucket, ref object) if bucket == "bucket" && object == "object"
+        ));
+        assert_eq!(
+            complete_multipart_part_error_result(&mapped),
+            COMPLETE_MULTIPART_PART_READ_QUORUM_UNAVAILABLE
+        );
+    }
+
+    #[test]
+    fn complete_part_error_maps_unknown_part_error_to_retryable_server_error() {
+        let mapped = complete_multipart_part_error(1, "metadata decode failed", "bucket", "object");
+
+        assert!(matches!(mapped, Error::InsufficientReadQuorum(_, _)));
+        assert_ne!(complete_multipart_part_error_result(&mapped), COMPLETE_MULTIPART_PART_MISSING);
+    }
 
     #[derive(Debug, Default)]
     struct FailingClient;
