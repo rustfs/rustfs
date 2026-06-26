@@ -206,6 +206,28 @@ struct BackgroundHealStatus<'a> {
     heal_queue_length: u64,
     heal_active_tasks: u64,
     heal_operations: rustfs_heal::HealOperationsSnapshot,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    progress: Option<BackgroundHealProgress>,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct BackgroundHealProgress {
+    objects_scanned: u64,
+    objects_healed: u64,
+    objects_failed: u64,
+    bytes_processed: u64,
+}
+
+impl From<rustfs_heal::HealProgress> for BackgroundHealProgress {
+    fn from(progress: rustfs_heal::HealProgress) -> Self {
+        Self {
+            objects_scanned: progress.objects_scanned,
+            objects_healed: progress.objects_healed,
+            objects_failed: progress.objects_failed,
+            bytes_processed: progress.bytes_processed,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -345,12 +367,14 @@ fn heal_channel_response_progress(response: &rustfs_common::heal_channel::HealCh
 fn encode_background_heal_status(
     info: &BackgroundHealInfo,
     heal_operations: rustfs_heal::HealOperationsSnapshot,
+    progress: Option<BackgroundHealProgress>,
 ) -> S3Result<Vec<u8>> {
     let status = BackgroundHealStatus {
         info,
         heal_queue_length: heal_operations.queue_length,
         heal_active_tasks: heal_operations.active_tasks,
         heal_operations,
+        progress,
     };
     serde_json::to_vec(&status).map_err(|e| {
         warn!(
@@ -727,7 +751,10 @@ impl Operation for BackgroundHealStatusHandler {
 
         let info = read_background_heal_info(store).await;
         let heal_operations = rustfs_heal::current_heal_operations_snapshot().await;
-        let body = encode_background_heal_status(&info, heal_operations)?;
+        let progress = rustfs_heal::current_heal_progress_snapshot()
+            .await
+            .map(BackgroundHealProgress::from);
+        let body = encode_background_heal_status(&info, heal_operations, progress)?;
         info!(
             event = EVENT_ADMIN_RESPONSE_EMITTED,
             component = LOG_COMPONENT_ADMIN_API,
@@ -745,10 +772,10 @@ impl Operation for BackgroundHealStatusHandler {
 mod tests {
     use super::extract_heal_init_params;
     use super::{
-        HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status, encode_heal_start_success,
-        encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress, heal_channel_response_summary,
-        json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly, validate_heal_request_mode,
-        validate_heal_target,
+        BackgroundHealProgress, HealInitParams, HealResp, build_heal_channel_request, encode_background_heal_status,
+        encode_heal_start_success, encode_heal_task_status, heal_channel_response_items, heal_channel_response_progress,
+        heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly,
+        validate_heal_request_mode, validate_heal_target,
     };
     use crate::admin::storage_api::error::StorageError;
     use bytes::Bytes;
@@ -1190,7 +1217,7 @@ mod tests {
             ..Default::default()
         };
 
-        let encoded = encode_background_heal_status(&info, operations).expect("background heal info should serialize");
+        let encoded = encode_background_heal_status(&info, operations, None).expect("background heal info should serialize");
         let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
 
         assert_eq!(json["bitrotStartCycle"], 42);
@@ -1204,6 +1231,32 @@ mod tests {
         assert!(json["healOperations"]["queuedBySource"]["admin"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["low"].is_u64());
         assert!(json["healOperations"]["queuedByPriority"]["high"].is_u64());
+        assert!(json["progress"].is_null());
+    }
+
+    #[test]
+    fn test_encode_background_heal_status_includes_progress() {
+        let info = BackgroundHealInfo {
+            bitrot_start_time: None,
+            bitrot_start_cycle: 42,
+            current_scan_mode: HealScanMode::Deep,
+        };
+
+        let progress = BackgroundHealProgress {
+            objects_scanned: 7,
+            objects_healed: 3,
+            objects_failed: 1,
+            bytes_processed: 4096,
+        };
+
+        let encoded = encode_background_heal_status(&info, rustfs_heal::HealOperationsSnapshot::default(), Some(progress))
+            .expect("background heal info should serialize");
+        let json: serde_json::Value = serde_json::from_slice(&encoded).expect("json should deserialize");
+
+        assert_eq!(json["progress"]["objectsScanned"], 7);
+        assert_eq!(json["progress"]["objectsHealed"], 3);
+        assert_eq!(json["progress"]["objectsFailed"], 1);
+        assert_eq!(json["progress"]["bytesProcessed"], 4096);
     }
 
     #[test]
