@@ -69,6 +69,14 @@ pub(crate) const GET_METADATA_RESPONSE_NOT_FOUND: &str = "not_found";
 pub(crate) const GET_METADATA_RESPONSE_TIMEOUT: &str = "timeout";
 pub(crate) const GET_METADATA_RESPONSE_VALID: &str = "valid";
 pub(crate) const GET_METADATA_RESPONSE_VERSION_NOT_FOUND: &str = "version_not_found";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA: &str = "conflicting_metadata";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER: &str = "delete_marker";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_ERROR: &str = "error";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM: &str = "insufficient_quorum";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_NOT_FOUND: &str = "not_found";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST: &str = "unsafe_request";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM: &str = "valid_quorum";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND: &str = "version_not_found";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GetObjectFailureReason {
@@ -246,5 +254,13 @@ mod tests {
         assert_eq!(GET_METADATA_RESPONSE_TIMEOUT, "timeout");
         assert_eq!(GET_METADATA_RESPONSE_VALID, "valid");
         assert_eq!(GET_METADATA_RESPONSE_VERSION_NOT_FOUND, "version_not_found");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, "conflicting_metadata");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER, "delete_marker");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_ERROR, "error");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM, "insufficient_quorum");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, "not_found");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, "unsafe_request");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, "valid_quorum");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, "version_not_found");
     }
 }

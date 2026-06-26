@@ -299,6 +299,8 @@ const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -366,6 +368,10 @@ pub fn is_deadlock_detection_enabled() -> bool {
 
 fn is_get_codec_streaming_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+}
+
+fn is_get_metadata_early_stop_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE)
 }
 
 fn get_codec_streaming_min_size() -> usize {

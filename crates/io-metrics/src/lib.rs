@@ -430,6 +430,36 @@ pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize,
         .record(metadata_fanout_count_to_f64(errors));
 }
 
+/// Record a guarded metadata early-stop hit for GetObject.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_hit(path: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_early_stop_total", "path" => path, "decision" => "hit", "reason" => reason)
+        .increment(1);
+}
+
+/// Record a guarded metadata early-stop miss for GetObject.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_miss(path: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_early_stop_total", "path" => path, "decision" => "miss", "reason" => reason)
+        .increment(1);
+}
+
+/// Record how many trailing metadata responses were skipped by early-stop.
+#[inline(always)]
+pub fn record_get_object_metadata_early_stop_saved_responses(path: &'static str, saved: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_metadata_early_stop_saved_responses", "path" => path)
+        .record(metadata_fanout_count_to_f64(saved));
+}
+
 /// Record GetObject reader setup duration.
 #[inline(always)]
 pub fn record_get_object_reader_setup_duration(path: &'static str, duration_secs: f64) {
@@ -1293,6 +1323,9 @@ mod tests {
         record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
         record_get_object_metadata_response("legacy_duplex", "valid");
         record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
         record_get_object_reader_setup_duration("legacy_duplex", 0.003);
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
@@ -1368,6 +1401,9 @@ mod tests {
         record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
         record_get_object_metadata_response("legacy_duplex", "valid");
         record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
         record_get_object_reader_setup_duration("legacy_duplex", 0.003);
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
@@ -1406,6 +1442,9 @@ mod tests {
         record_get_object_quorum_reached_latency("legacy_duplex", 0.002);
         record_get_object_metadata_response("legacy_duplex", "valid");
         record_get_object_metadata_fanout_shape("legacy_duplex", 4, 3, 1, 1);
+        record_get_object_metadata_early_stop_hit("legacy_duplex", "valid_quorum");
+        record_get_object_metadata_early_stop_miss("legacy_duplex", "insufficient_quorum");
+        record_get_object_metadata_early_stop_saved_responses("legacy_duplex", 1);
         record_get_object_reader_setup_duration("legacy_duplex", 0.003);
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);

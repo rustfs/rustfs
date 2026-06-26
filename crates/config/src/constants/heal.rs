@@ -140,6 +140,10 @@ pub const ENV_HEAL_MAINLINE_THROTTLE_ENABLE: &str = "RUSTFS_HEAL_MAINLINE_THROTT
 /// at which background heal work pauses starting new tasks.
 pub const ENV_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: &str = "RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT";
 
+/// Environment variable that controls the foreground write utilization percentage
+/// at which background heal work pauses starting new tasks.
+pub const ENV_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: &str = "RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT";
+
 /// Environment variable that controls how soon the heal scheduler rechecks foreground
 /// pressure after delaying background work.
 pub const ENV_HEAL_MAINLINE_MAX_SLEEP_MS: &str = "RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS";
@@ -167,6 +171,9 @@ pub const DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE: bool = true;
 
 /// Default foreground read permit utilization threshold for pausing best-effort heal task starts.
 pub const DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT: usize = 80;
+
+/// Default foreground write utilization threshold for pausing best-effort heal task starts.
+pub const DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT: usize = 80;
 
 /// Default foreground pressure recheck delay for heal scheduler, in milliseconds.
 pub const DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS: u64 = 250;
