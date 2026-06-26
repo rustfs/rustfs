@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-runtime-global-boundary`
+- Branch: `overtrue/arch-app-usecase-context-boundary`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/CTX-002`.
-- Based on: stacked on API-230 PR #3894 while CI is pending; branch routes
-  remaining admin object-usecase and AppContext global entry points through the
-  admin runtime-source boundary.
+- Based on: stacked on API-231 local branch while API-230 PR #3894 is pending;
+  branch routes app usecase AppContext global lookups through the app
+  runtime-source boundary.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-231; admin misc extension and
-  service reload paths still use the same AppContext-backed handles.
+- Runtime behavior changes: none expected for API-232; app usecase constructors
+  still use the same AppContext-backed handles.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
@@ -5376,15 +5376,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     and layer guards, diff hygiene, residual admin global-entry scan, Rust risk
     scan, and full PR gate before PR.
 
+- [x] `API-232` Route app usecase AppContext lookup through runtime boundary.
+  - Do: expose current AppContext lookup from `rustfs/src/app/runtime_sources.rs`,
+    then route bucket, multipart, admin, and object usecase constructors and
+    object buffer config fallback through that boundary.
+  - Acceptance: app usecase files no longer import `get_global_app_context`
+    directly; direct global AppContext lookup remains confined to context
+    internals and `rustfs/src/app/runtime_sources.rs`.
+  - Must preserve: bucket, multipart, admin, and object usecase construction,
+    object buffer config fallback, and explicit test constructors without
+    context.
+  - Verification: focused app/admin tests, formatting, migration and layer
+    guards, diff hygiene, residual app global-entry scan, Rust risk scan, and
+    full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger admin/app/runtime global-source
-   batches after API-231.
+1. `consumer-migration`: continue larger app/runtime global-source batches
+   after API-232.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-232 moves app usecase AppContext lookup behind the app runtime-source boundary instead of importing the global context getter in each usecase file. |
+| Migration preservation | pass | Bucket, multipart, admin, and object usecase constructors plus object buffer config fallback keep the same AppContext-first behavior. |
+| Testing/verification | pass | Focused app/admin tests, formatting, migration/layer guards, residual app global-entry scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-231 moves admin misc object-usecase construction and AppContext lookup behind the admin runtime-source boundary instead of keeping direct global entry points in router/service files. |
 | Migration preservation | pass | Object-lambda get execution, listen-notification bucket validation, dynamic config reload, runtime config snapshot reload, and site-replication normalization still use the same runtime handles. |
 | Testing/verification | pass | Focused admin router/service checks, formatting, migration/layer guards, residual admin global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
@@ -5618,6 +5635,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-232 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-231
+    merged.
+  - `cargo test -p rustfs app::bucket_usecase --lib`: passed.
+  - `cargo test -p rustfs app::multipart_usecase --lib`: passed.
+  - `cargo test -p rustfs app::admin_usecase --lib`: passed.
+  - `cargo test -p rustfs app::object_usecase --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - App usecase global-entry residual scan: passed; remaining
+    `get_global_app_context` references are confined to
+    `rustfs/src/app/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
+  - Full PR gate: passed before PR.
 
 - Issue #660 API-231 current slice:
   - Branch freshness check: stacked on API-230 PR #3894 while CI is pending.

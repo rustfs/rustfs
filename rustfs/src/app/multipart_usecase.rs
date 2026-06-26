@@ -54,7 +54,7 @@ use super::storage_api::{
 };
 use super::storage_api::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::app::runtime_sources::{AppContext, get_global_app_context, resolve_object_store_handle_for_context};
+use crate::app::runtime_sources::{AppContext, current_app_context, resolve_object_store_handle_for_context};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
@@ -284,7 +284,7 @@ impl DefaultMultipartUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
