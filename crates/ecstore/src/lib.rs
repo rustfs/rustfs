@@ -49,7 +49,9 @@ mod sets;
 mod storage_api_contracts;
 mod store;
 mod store_init;
+#[path = "store/list_objects.rs"]
 mod store_list_objects;
+#[path = "store/utils.rs"]
 mod store_utils;
 
 // pub mod checksum;

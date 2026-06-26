@@ -5,19 +5,21 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-store-set-disk-layout`
+- Branch: `overtrue/arch-ecstore-store-support-layout`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, and CFG-009 from PR #3927.
-- Current phase PR: E-017/E-STORE-001 ECStore store and set-disk directory
-  owner layout.
-- Based on: current `origin/main` after PR #3927 merged.
+- Current phase PR: E-018/E-STORE-002 ECStore store support module owner layout.
+- Based on: E-017 branch while PR #3929 is pending; rebase onto `origin/main`
+  after E-017 merges before opening this PR.
 - PR type for this branch: `pure-move`
-- Runtime behavior changes: none expected for E-017; this is a pure module file
-  move that keeps the existing `store` and `set_disk` module paths.
-- Rust code changes: move ECStore `store.rs` and `set_disk.rs` into their
-  directory module owners without function-body changes.
-- CI/script changes: reject restoring ECStore root `store.rs` or `set_disk.rs`;
+- Runtime behavior changes: none expected for E-018; this is a pure module file
+  move that keeps the existing `store_list_objects` and `store_utils` module
+  paths.
+- Rust code changes: move ECStore store support modules into the `store/`
+  owner directory without function-body changes.
+- CI/script changes: reject restoring ECStore root `store.rs`, `set_disk.rs`,
+  `store_list_objects.rs`, or `store_utils.rs`;
   lock completed config model ownership against restoring
   old `rustfs_ecstore::config` model/accessor compatibility paths, and lock
   ECStore public facades against re-exporting the moved server-config symbols;
@@ -51,8 +53,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   root SSE re-exports after API-255, reject direct external
   `rustfs_ecstore::api` facade imports outside local `storage_api` boundary
   files after API-256, and reject restoring old ECStore server-config model or
-  global accessor compatibility paths after CFG-009, and reject restoring
-  ECStore root `store.rs` or `set_disk.rs` after E-017.
+  global accessor compatibility paths after CFG-009, reject restoring ECStore
+  root `store.rs` or `set_disk.rs` after E-017, and reject restoring ECStore
+  root store support modules after E-018.
 
 ## Phase 0 Tasks
 
@@ -3900,6 +3903,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     formatting, diff hygiene, Rust risk scan, branch freshness check,
     pre-commit quality gate, and three-expert review.
 
+- [x] `E-018/E-STORE-002` Move ECStore store support modules under the store owner.
+  - Do: move `crates/ecstore/src/store_list_objects.rs` to
+    `crates/ecstore/src/store/list_objects.rs`,
+    `crates/ecstore/src/store_utils.rs` to
+    `crates/ecstore/src/store/utils.rs` while preserving the existing crate
+    module names through path declarations.
+  - Acceptance: `crate::store_list_objects` and `crate::store_utils` continue
+    to resolve through the same module names, and migration rules reject
+    restoring the old root files.
+  - Must preserve: list object traversal, version marker handling, listing
+    quorum behavior, bucket-name utility behavior, public API re-exports,
+    set-disk list path call sites, and all runtime side effects.
+  - Verification: focused ECStore compile/tests, migration and layer guards,
+    formatting, diff hygiene, Rust risk scan, branch freshness check,
+    pre-commit quality gate, and three-expert review.
+
 - [x] `API-129` Route RustFS internal ECStore consumers through owner boundary.
   - Do: expose crate-local ECStore facade module aliases from
     `rustfs/src/storage/mod.rs` and migrate RustFS startup, server, capacity,
@@ -5754,6 +5773,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | E-018 moves ECStore store list/object utility support modules under the store owner directory and guards against restoring the old root files. |
+| Migration preservation | pass | `crate::store_list_objects` and `crate::store_utils` module names stay stable through path declarations, while both moved files are 100% renames. |
+| Testing/verification | pass | ECStore compile/tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
 | Quality/architecture | pass | E-017 moves ECStore store and set-disk root owners into directory modules and adds a guard against restoring the old root files. |
 | Migration preservation | pass | `crate::store` and `crate::set_disk` module names stay stable, and the staged Rust diff is two 100% renames with no added Rust lines. |
 | Testing/verification | pass | ECStore compile/tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, branch freshness, and pre-commit passed. |
