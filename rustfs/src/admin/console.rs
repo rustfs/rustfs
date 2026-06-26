@@ -13,9 +13,8 @@
 // limitations under the License.
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
-use crate::admin::runtime_sources::resolve_oidc_handle;
+use crate::admin::runtime_sources::{default_admin_usecase, resolve_oidc_handle};
 use crate::admin::storage_api::RequestContext;
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{
@@ -224,7 +223,7 @@ struct ApiDiscovery {
 }
 
 fn console_api_discovery() -> ApiDiscovery {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     ApiDiscovery {
         runtime_capabilities: usecase.runtime_capabilities_route().to_string(),
         cluster_snapshot: usecase.cluster_snapshot_route().to_string(),

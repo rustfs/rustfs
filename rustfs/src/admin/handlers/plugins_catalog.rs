@@ -19,8 +19,8 @@ use crate::admin::{
         PluginContractEntrypointKind, PluginContractPackaging, PluginDistributionContract, PluginRuntimeContract,
     },
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::default_admin_usecase,
 };
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue, StatusCode};
@@ -58,7 +58,7 @@ fn target_domain_name_from_subsystem(subsystem: &str) -> PluginContractDomain {
 }
 
 fn build_catalog_response() -> PluginCatalogResponse {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     let mut plugins: HashMap<&'static str, PluginCatalogEntry> = HashMap::new();
 
     for descriptor in builtin_notify_target_admin_descriptors()

@@ -16,6 +16,7 @@ use crate::admin::storage_api::{CapabilityState, CapabilityStatus, Observability
 use crate::admin::{
     auth::validate_admin_request,
     router::{AdminOperation, Operation, S3Router},
+    runtime_sources::default_admin_usecase,
     storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
@@ -23,7 +24,6 @@ use crate::admin::{
     },
     system,
 };
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::cluster_snapshot::{
     ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot, cluster_has_actionable_pressure,
@@ -103,7 +103,7 @@ pub struct GetClusterSnapshotHandler {}
 impl Operation for GetClusterSnapshotHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_cluster_snapshot_request(&req).await?;
-        let snapshot = DefaultAdminUsecase::from_global()
+        let snapshot = default_admin_usecase()
             .execute_collect_cluster_read_only_snapshot()
             .await
             .map(ClusterSnapshotView::from);
@@ -112,7 +112,7 @@ impl Operation for GetClusterSnapshotHandler {
 }
 
 pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapshotDiscoveryResponse {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     let path = usecase.cluster_snapshot_route().to_string();
     let snapshot = usecase.execute_collect_cluster_read_only_snapshot().await;
 

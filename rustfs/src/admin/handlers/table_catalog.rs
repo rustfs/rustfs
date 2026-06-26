@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_token_signing_key};
 use crate::admin::storage_api::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
 };
-use crate::app::admin_usecase::DefaultAdminUsecase;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
@@ -988,7 +988,7 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
 }
 
 fn catalog_config_response() -> CatalogConfigResponse {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     CatalogConfigResponse {
         defaults: BTreeMap::from([
             (WAREHOUSE_PROPERTY, DEFAULT_WAREHOUSE_ID),
