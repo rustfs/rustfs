@@ -199,6 +199,7 @@ RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_o
 RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_runtime_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_helper_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_RPC_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_wildcard_import_hits.txt"
 RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
@@ -1922,6 +1923,17 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS storage-owner RPC consumers must use storage_api consumer-domain modules instead of relative root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^[[:space:]]*use super::\*;' \
+    rustfs/src/storage/rpc/{bucket,disk,event,health,http_service,lock,metrics,mod}.rs || true
+) >"$RUSTFS_STORAGE_OWNER_RPC_WILDCARD_IMPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RPC_WILDCARD_IMPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner RPC modules must use explicit imports instead of parent wildcard imports: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RPC_WILDCARD_IMPORT_HITS_FILE")"
 fi
 
 (
