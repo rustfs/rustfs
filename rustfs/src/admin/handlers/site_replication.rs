@@ -34,7 +34,7 @@ use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
 use crate::admin::storage_api::bucket::{AdminReplicationConfigExt as _, AdminVersioningConfigExt as _};
 use crate::admin::storage_api::config::{delete_admin_config, read_admin_config, save_admin_config};
-use crate::admin::storage_api::contract::{
+use crate::admin::storage_api::contract::bucket::{
     BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
 };
 use crate::admin::storage_api::error::Error as StorageError;

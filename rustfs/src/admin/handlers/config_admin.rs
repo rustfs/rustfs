@@ -24,7 +24,7 @@ use crate::admin::storage_api::config::{
     RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, read_admin_config, read_admin_config_without_migrate,
     save_admin_config, save_admin_server_config,
 };
-use crate::admin::storage_api::contract::ListOperations as _;
+use crate::admin::storage_api::contract::list::ListOperations as _;
 use crate::admin::utils::{encode_compatible_admin_payload, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;

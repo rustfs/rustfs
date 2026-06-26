@@ -469,10 +469,27 @@ pub(crate) mod config {
 }
 
 pub(crate) mod contract {
-    pub(crate) use super::storage_contracts::{
-        BucketOperations, BucketOptions, DeleteBucketOptions, HealOperations, ListOperations, MakeBucketOptions, ObjectIO,
-        ObjectOperations, SRBucketDeleteOp, StorageAdminApi,
-    };
+    pub(crate) mod admin {
+        pub(crate) use super::super::storage_contracts::StorageAdminApi;
+    }
+
+    pub(crate) mod bucket {
+        pub(crate) use super::super::storage_contracts::{
+            BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp,
+        };
+    }
+
+    pub(crate) mod heal {
+        pub(crate) use super::super::storage_contracts::HealOperations;
+    }
+
+    pub(crate) mod list {
+        pub(crate) use super::super::storage_contracts::ListOperations;
+    }
+
+    pub(crate) mod object {
+        pub(crate) use super::super::storage_contracts::{ObjectIO, ObjectOperations};
+    }
 }
 
 pub(crate) mod error {
