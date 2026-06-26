@@ -54,28 +54,58 @@ impl ReadRepairHealCacheKey {
     }
 }
 
-async fn should_submit_read_repair_heal(
+fn resolved_read_repair_version_id(fi: &FileInfo, requested_version_id: Option<&str>) -> Option<String> {
+    fi.version_id
+        .as_ref()
+        .map(ToString::to_string)
+        .or_else(|| requested_version_id.filter(|value| !value.is_empty()).map(str::to_string))
+}
+
+async fn reserve_read_repair_heal(
     bucket: &str,
     object: &str,
     version_id: Option<&str>,
     pool_index: usize,
     set_index: usize,
-) -> bool {
+) -> Option<ReadRepairHealCacheKey> {
     let key = ReadRepairHealCacheKey::new(bucket, object, version_id, pool_index, set_index);
     let now = Instant::now();
     let cache = READ_REPAIR_HEAL_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+
+    {
+        let cache = cache.read().await;
+        if cache
+            .get(&key)
+            .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL)
+        {
+            return None;
+        }
+    }
+
     let mut cache = cache.write().await;
-    cache.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL);
-    if cache.contains_key(&key) {
-        return false;
+    if cache
+        .get(&key)
+        .is_some_and(|seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL)
+    {
+        return None;
+    }
+
+    if cache.len() >= READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES {
+        cache.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL);
     }
     if cache.len() >= READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES
         && let Some(oldest_key) = cache.iter().min_by_key(|(_, seen_at)| **seen_at).map(|(key, _)| key.clone())
     {
         cache.remove(&oldest_key);
     }
-    cache.insert(key, now);
-    true
+    cache.insert(key.clone(), now);
+    Some(key)
+}
+
+async fn release_read_repair_heal_reservation(key: &ReadRepairHealCacheKey) {
+    if let Some(cache) = READ_REPAIR_HEAL_CACHE.get() {
+        cache.write().await.remove(key);
+    }
 }
 
 async fn submit_read_repair_heal(
@@ -87,13 +117,13 @@ async fn submit_read_repair_heal(
     part_number: Option<usize>,
     reason: &'static str,
 ) {
-    if !should_submit_read_repair_heal(bucket, object, version_id, pool_index, set_index).await {
+    let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         debug!(
             bucket,
             object, part_number, pool_index, set_index, reason, "Skipped duplicate read-repair heal request"
         );
         return;
-    }
+    };
 
     let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
         bucket.to_string(),
@@ -123,6 +153,7 @@ async fn submit_read_repair_heal(
             );
         }
         Ok(result) => {
+            release_read_repair_heal_reservation(&dedup_key).await;
             debug!(
                 bucket,
                 object,
@@ -137,6 +168,7 @@ async fn submit_read_repair_heal(
             );
         }
         Err(err) => {
+            release_read_repair_heal_reservation(&dedup_key).await;
             debug!(
                 bucket,
                 object,
@@ -839,10 +871,11 @@ impl SetDisks {
 
         let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
         if errs.iter().any(|err| err.is_some()) {
+            let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
                 &fi.volume,
                 &fi.name,
-                opts.version_id.as_deref(),
+                version_id.as_deref(),
                 self.pool_index,
                 self.set_index,
                 None,
@@ -1140,7 +1173,7 @@ impl SetDisks {
             let available_shards = nil_count;
             let missing_shards = total_shards - available_shards;
 
-            info!(
+            debug!(
                 bucket,
                 object,
                 part_number,
@@ -1199,7 +1232,13 @@ impl SetDisks {
                 if written == part_length {
                     match de_err {
                         DiskError::FileNotFound | DiskError::FileCorrupt => {
-                            error!("erasure.decode err 111 {:?}", &de_err);
+                            debug!(
+                                bucket,
+                                object,
+                                part_number,
+                                error = ?de_err,
+                                "Recoverable decode error triggered read repair"
+                            );
                             let version_id = fi.version_id.as_ref().map(ToString::to_string);
                             submit_read_repair_heal(
                                 bucket,
@@ -1481,10 +1520,43 @@ mod metadata_cache_tests {
     async fn read_repair_heal_dedupes_same_object_version() {
         let bucket = format!("bucket-{}", Uuid::new_v4());
 
-        assert!(should_submit_read_repair_heal(&bucket, "object", None, 0, 0).await);
-        assert!(!should_submit_read_repair_heal(&bucket, "object", None, 0, 0).await);
-        assert!(should_submit_read_repair_heal(&bucket, "object", Some("version-2"), 0, 0).await);
-        assert!(should_submit_read_repair_heal(&bucket, "object", None, 0, 1).await);
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_some());
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_none());
+        assert!(
+            reserve_read_repair_heal(&bucket, "object", Some("version-2"), 0, 0)
+                .await
+                .is_some()
+        );
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 1).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn read_repair_heal_reservation_can_be_released_after_rejection() {
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        let key = reserve_read_repair_heal(&bucket, "object", None, 0, 0)
+            .await
+            .expect("first reservation should be accepted");
+
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_none());
+        release_read_repair_heal_reservation(&key).await;
+        assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_some());
+    }
+
+    #[test]
+    fn resolved_read_repair_version_prefers_selected_fileinfo_version() {
+        let mut fi = valid_test_fileinfo("object");
+        fi.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").unwrap());
+
+        assert_eq!(
+            resolved_read_repair_version_id(&fi, Some("00000000-0000-0000-0000-000000000002")).as_deref(),
+            Some("00000000-0000-0000-0000-000000000001")
+        );
+
+        fi.version_id = None;
+        assert_eq!(
+            resolved_read_repair_version_id(&fi, Some("00000000-0000-0000-0000-000000000002")).as_deref(),
+            Some("00000000-0000-0000-0000-000000000002")
+        );
     }
 
     #[tokio::test]
