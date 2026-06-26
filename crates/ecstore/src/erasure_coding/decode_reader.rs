@@ -476,7 +476,9 @@ fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usi
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::erasure_codec::bridge::LegacyEcDecodeEngine;
+    use crate::erasure_codec::bridge::{
+        CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
+    };
     use crate::erasure_coding::Erasure;
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use std::collections::VecDeque;
@@ -533,13 +535,25 @@ mod tests {
         }
     }
 
-    async fn decode_all(erasure: Erasure, data: &[u8], missing_indexes: &[usize]) -> io::Result<Vec<u8>> {
-        let source = source_from_data(&erasure, data, missing_indexes);
-        let engine = LegacyEcDecodeEngine::new(erasure);
+    async fn decode_all_with_engine<E>(
+        erasure: &Erasure,
+        engine: E,
+        data: &[u8],
+        missing_indexes: &[usize],
+    ) -> io::Result<Vec<u8>>
+    where
+        E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
+    {
+        let source = source_from_data(erasure, data, missing_indexes);
         let mut reader = ErasureDecodeReader::new(source, engine, data.len())?;
         let mut decoded = Vec::new();
         reader.read_to_end(&mut decoded).await?;
         Ok(decoded)
+    }
+
+    async fn decode_all(erasure: Erasure, data: &[u8], missing_indexes: &[usize]) -> io::Result<Vec<u8>> {
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        decode_all_with_engine(&erasure, engine, data, missing_indexes).await
     }
 
     #[tokio::test]
@@ -595,6 +609,54 @@ mod tests {
             .expect("reader should reconstruct one missing data shard");
 
         assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_rustfs_engine_matches_legacy_with_missing_data() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = b"rustfs codec reader output must match legacy reader output exactly";
+        let legacy = LegacyEcDecodeEngine::new(erasure.clone());
+        let rustfs = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+
+        let legacy_decoded = decode_all_with_engine(&erasure, legacy, data, &[1])
+            .await
+            .expect("legacy reader should decode");
+        let rustfs_decoded = decode_all_with_engine(&erasure, rustfs, data, &[1])
+            .await
+            .expect("rustfs codec reader should decode");
+
+        assert_eq!(rustfs_decoded, legacy_decoded);
+        assert_eq!(rustfs_decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_rustfs_engine_handles_empty_object() {
+        let erasure = Erasure::new(4, 2, 32);
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+
+        let decoded = decode_all_with_engine(&erasure, engine, b"", &[])
+            .await
+            .expect("empty object should decode");
+
+        assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_codec_streaming_engine_enum_matches_legacy() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = b"selected codec streaming engine preserves reader output";
+        let legacy = CodecStreamingDecodeEngine::legacy(erasure.clone());
+        let rustfs = CodecStreamingDecodeEngine::rustfs(&erasure).expect("engine should be created");
+
+        let legacy_decoded = decode_all_with_engine(&erasure, legacy, data, &[2])
+            .await
+            .expect("legacy enum reader should decode");
+        let rustfs_decoded = decode_all_with_engine(&erasure, rustfs, data, &[2])
+            .await
+            .expect("rustfs enum reader should decode");
+
+        assert_eq!(rustfs_decoded, legacy_decoded);
+        assert_eq!(rustfs_decoded, data);
     }
 
     #[tokio::test]

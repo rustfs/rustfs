@@ -2037,7 +2037,7 @@ impl SetDisks {
             part_size,
             Some(GET_OBJECT_PATH_CODEC_STREAMING),
         );
-        let engine = crate::erasure_codec::bridge::LegacyEcDecodeEngine::new(erasure);
+        let engine = build_get_codec_streaming_decode_engine(erasure)?;
         let reader = erasure_coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
         Ok(Box::new(erasure_coding::decode_reader::SyncErasureDecodeReader::new(reader)))
     }
@@ -2819,6 +2819,51 @@ mod tests {
                 );
             },
         );
+    }
+
+    #[test]
+    fn codec_streaming_engine_defaults_to_legacy_and_parses_rustfs() {
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, None::<&str>, || {
+            assert_eq!(get_codec_streaming_engine(), GetCodecStreamingEngine::Legacy);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
+            assert_eq!(get_codec_streaming_engine(), GetCodecStreamingEngine::Rustfs);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some("unknown"), || {
+            assert_eq!(get_codec_streaming_engine(), GetCodecStreamingEngine::Legacy);
+        });
+    }
+
+    #[test]
+    fn codec_streaming_engine_env_is_ignored_when_streaming_is_disabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_decode_engine_builder_selects_rustfs() {
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
+            let erasure = erasure_coding::Erasure::new(4, 2, 32);
+            let engine = build_get_codec_streaming_decode_engine(erasure).expect("engine should be built");
+
+            assert!(matches!(engine, CodecStreamingDecodeEngine::Rustfs(_)));
+        });
     }
 
     #[test]
