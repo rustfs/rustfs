@@ -143,6 +143,7 @@ use s3s::dto::{
     ServerSideEncryption, StorageClass, StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
+use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
@@ -168,6 +169,8 @@ use super::storage_api::object_usecase::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
+
+type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
@@ -398,12 +401,32 @@ pin_project! {
     }
 }
 
+pin_project! {
+    struct GetObjectReaderStream<R> {
+        #[pin]
+        inner: ReaderStream<R>,
+        remaining: usize,
+    }
+}
+
 impl MemoryTrackedBytesStream {
     fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
         Self {
             bytes,
             emitted: false,
             _guard: guard,
+        }
+    }
+}
+
+impl<R> GetObjectReaderStream<R>
+where
+    R: AsyncRead,
+{
+    fn new(reader: R, capacity: usize, remaining: usize) -> Self {
+        Self {
+            inner: ReaderStream::with_capacity(reader, capacity),
+            remaining,
         }
     }
 }
@@ -419,6 +442,50 @@ impl futures::Stream for MemoryTrackedBytesStream {
 
         *this.emitted = true;
         Poll::Ready(Some(Ok(this.bytes.clone())))
+    }
+}
+
+impl<R> futures::Stream for GetObjectReaderStream<R>
+where
+    R: AsyncRead,
+{
+    type Item = Result<Bytes, S3StdError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let mut this = self.project();
+        if *this.remaining == 0 {
+            return Poll::Ready(None);
+        }
+
+        match this.inner.as_mut().poll_next(cx) {
+            Poll::Ready(Some(Ok(mut bytes))) => {
+                if bytes.len() > *this.remaining {
+                    bytes.truncate(*this.remaining);
+                }
+                *this.remaining -= bytes.len();
+                if bytes.is_empty() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Ready(Some(Ok(bytes)))
+                }
+            }
+            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Box::new(err)))),
+            Poll::Ready(None) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.inner.size_hint()
+    }
+}
+
+impl<R> ByteStream for GetObjectReaderStream<R>
+where
+    R: AsyncRead,
+{
+    fn remaining_length(&self) -> RemainingLength {
+        RemainingLength::new_exact(self.remaining)
     }
 }
 
@@ -1667,7 +1734,7 @@ impl DefaultObjectUsecase {
         #[cfg(feature = "tracing-chunk-debug")]
         let stream = {
             let mut emitted = 0usize;
-            ReaderStream::with_capacity(reader, stream_buffer_size).inspect(move |item| match item {
+            GetObjectReaderStream::new(reader, stream_buffer_size, expected).inspect(move |item| match item {
                 Ok(bytes) => {
                     emitted += bytes.len();
                     tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
@@ -1683,8 +1750,8 @@ impl DefaultObjectUsecase {
             })
         };
         #[cfg(not(feature = "tracing-chunk-debug"))]
-        let stream = ReaderStream::with_capacity(reader, stream_buffer_size);
-        let blob = StreamingBlob::wrap(bytes_stream(stream, expected));
+        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected);
+        let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
                 stream_strategy.as_str(),
@@ -5976,6 +6043,40 @@ mod tests {
         };
 
         assert_eq!(err.code(), &S3ErrorCode::UnexpectedContent);
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_tracks_remaining_length() {
+        let mut stream = GetObjectReaderStream::new(std::io::Cursor::new(b"hello".to_vec()), 2, 5);
+
+        assert_eq!(stream.remaining_length().exact(), Some(5));
+
+        let first = stream
+            .next()
+            .await
+            .expect("reader stream should emit first chunk")
+            .expect("first chunk should read");
+
+        assert_eq!(first.as_ref(), b"he");
+        assert_eq!(stream.remaining_length().exact(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn get_object_reader_stream_truncates_to_expected_length() {
+        let stream = GetObjectReaderStream::new(std::io::Cursor::new(b"hello!".to_vec()), 64, 5);
+
+        let chunks = stream
+            .collect::<Vec<_>>()
+            .await
+            .into_iter()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("reader stream should read");
+        let body = chunks.into_iter().fold(Vec::new(), |mut acc, chunk| {
+            acc.extend_from_slice(&chunk);
+            acc
+        });
+
+        assert_eq!(body, b"hello");
     }
 
     #[tokio::test]
