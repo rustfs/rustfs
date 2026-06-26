@@ -58,14 +58,15 @@ pub(crate) mod data_usage {
     }
 
     pub(crate) async fn refresh_versioned_bucket_usage_from_object_layer(
-        store: Arc<crate::storage::ECStore>,
+        store: Arc<crate::storage::storage_api::ECStore>,
         data_usage_info: &mut rustfs_data_usage::DataUsageInfo,
     ) {
-        crate::storage::ecstore_data_usage::refresh_versioned_bucket_usage_from_object_layer(store, data_usage_info).await;
+        crate::storage::storage_api::ecstore_data_usage::refresh_versioned_bucket_usage_from_object_layer(store, data_usage_info)
+            .await;
     }
 
     pub(crate) async fn replace_bucket_usage_memory_from_info(data_usage_info: &rustfs_data_usage::DataUsageInfo) {
-        crate::storage::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
+        crate::storage::storage_api::ecstore_data_usage::replace_bucket_usage_memory_from_info(data_usage_info).await;
     }
 
     pub(crate) async fn record_bucket_object_delete_memory(bucket: &str, deleted_size: u64, removed_current_object: bool) {
@@ -78,7 +79,7 @@ pub(crate) mod data_usage {
     }
 
     pub(crate) async fn record_bucket_delete_marker_memory(bucket: &str) {
-        crate::storage::ecstore_data_usage::record_bucket_delete_marker_memory(bucket).await;
+        crate::storage::storage_api::ecstore_data_usage::record_bucket_delete_marker_memory(bucket).await;
     }
 
     pub(crate) async fn record_bucket_object_version_write_memory(
@@ -86,8 +87,12 @@ pub(crate) mod data_usage {
         previous_current_size: Option<u64>,
         new_size: u64,
     ) {
-        crate::storage::ecstore_data_usage::record_bucket_object_version_write_memory(bucket, previous_current_size, new_size)
-            .await;
+        crate::storage::storage_api::ecstore_data_usage::record_bucket_object_version_write_memory(
+            bucket,
+            previous_current_size,
+            new_size,
+        )
+        .await;
     }
 
     pub(crate) async fn record_bucket_object_write_memory(bucket: &str, previous_current_size: Option<u64>, new_size: u64) {
@@ -256,7 +261,9 @@ pub(crate) mod bucket {
 
     impl VersioningConfigExt for s3s::dto::VersioningConfiguration {
         fn enabled(&self) -> bool {
-            <s3s::dto::VersioningConfiguration as crate::storage::ecstore_bucket::versioning::VersioningApi>::enabled(self)
+            <s3s::dto::VersioningConfiguration as crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi>::enabled(
+                self,
+            )
         }
 
         fn prefix_enabled(&self, prefix: &str) -> bool {

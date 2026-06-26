@@ -263,11 +263,6 @@ pub(crate) mod s3_api_consumer {
             super::super::to_s3s_etag(etag)
         }
     }
-
-    #[cfg(test)]
-    pub(crate) mod test {
-        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
-    }
 }
 
 pub(crate) mod sse_consumer {
