@@ -667,7 +667,7 @@ impl Default for ConcurrencyManager {
 #[allow(unused_imports)]
 mod integration_tests {
     use super::super::io_schedule::{IoLoadLevel, IoPriority};
-    use super::super::request_guard::GetObjectGuard;
+    use super::super::request_guard::{GetObjectGuard, PutObjectGuard};
     use super::ConcurrencyManager;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
     use rustfs_config::MI_B;
