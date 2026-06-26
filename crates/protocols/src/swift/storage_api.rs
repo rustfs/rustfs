@@ -21,25 +21,24 @@ use rustfs_ecstore::api::bucket::metadata_sys::{
 pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
 pub(crate) use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_swift_object_store_handle;
 use rustfs_ecstore::api::storage::ECStore as SwiftStore;
-pub(crate) use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, HTTPRangeSpec, ListOperations, MakeBucketOptions, ObjectIO,
-    ObjectOperations,
-};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod account {
-    pub(crate) use super::{BucketOperations, MakeBucketOptions};
+    pub(crate) use super::storage_contracts::{BucketOperations, MakeBucketOptions};
 }
 
 pub(crate) mod container {
-    pub(crate) use super::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
+    pub(crate) use super::storage_contracts::{
+        BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions,
+    };
 }
 
 pub(crate) mod large_object {
-    pub(crate) use super::HTTPRangeSpec;
+    pub(crate) use super::storage_contracts::HTTPRangeSpec;
 }
 
 pub(crate) mod object {
-    pub(crate) use super::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO, ObjectOperations};
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO, ObjectOperations};
 }
 
 pub(crate) mod public_api {
@@ -48,13 +47,13 @@ pub(crate) mod public_api {
 }
 
 pub(crate) mod versioning {
-    pub(crate) use super::{ListOperations, ObjectOperations};
+    pub(crate) use super::storage_contracts::{ListOperations, ObjectOperations};
 }
 
-pub type SwiftGetObjectReader = <SwiftStore as ObjectIO>::GetObjectReader;
-pub type SwiftObjectInfo = <SwiftStore as ObjectOperations>::ObjectInfo;
-pub type SwiftObjectOptions = <SwiftStore as ObjectOperations>::ObjectOptions;
-pub type SwiftPutObjReader = <SwiftStore as ObjectIO>::PutObjectReader;
+pub type SwiftGetObjectReader = <SwiftStore as storage_contracts::ObjectIO>::GetObjectReader;
+pub type SwiftObjectInfo = <SwiftStore as storage_contracts::ObjectOperations>::ObjectInfo;
+pub type SwiftObjectOptions = <SwiftStore as storage_contracts::ObjectOperations>::ObjectOptions;
+pub type SwiftPutObjReader = <SwiftStore as storage_contracts::ObjectIO>::PutObjectReader;
 
 pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
     get_swift_bucket_metadata_from_backend(bucket).await

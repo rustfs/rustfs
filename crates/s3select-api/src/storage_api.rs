@@ -23,10 +23,10 @@ use rustfs_ecstore::api::error::{
 use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_select_object_store_handle_from_backend;
 pub(crate) use rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE as SELECT_DEFAULT_READ_BUFFER_SIZE;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as SelectStore;
-pub(crate) use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectOperations};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod object_store {
-    pub(crate) use super::{HTTPRangeSpec, ObjectIO, ObjectOperations};
+    pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO, ObjectOperations};
 }
 
 pub(crate) mod crate_boundary {
@@ -37,9 +37,9 @@ pub(crate) mod crate_boundary {
     };
 }
 
-pub(crate) type SelectGetObjectReader = <SelectStore as ObjectIO>::GetObjectReader;
-pub(crate) type SelectObjectInfo = <SelectStore as ObjectOperations>::ObjectInfo;
-pub(crate) type SelectObjectOptions = <SelectStore as ObjectOperations>::ObjectOptions;
+pub(crate) type SelectGetObjectReader = <SelectStore as storage_contracts::ObjectIO>::GetObjectReader;
+pub(crate) type SelectObjectInfo = <SelectStore as storage_contracts::ObjectOperations>::ObjectInfo;
+pub(crate) type SelectObjectOptions = <SelectStore as storage_contracts::ObjectOperations>::ObjectOptions;
 
 pub(crate) fn resolve_select_object_store_handle() -> Option<Arc<SelectStore>> {
     resolve_select_object_store_handle_from_backend()
