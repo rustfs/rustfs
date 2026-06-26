@@ -22,7 +22,7 @@ use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::BucketStats;
 use crate::admin::storage_api::bucket::target::BucketTarget;
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
-use crate::admin::storage_api::contract::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};

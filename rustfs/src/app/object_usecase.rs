@@ -409,6 +409,8 @@ pin_project! {
         #[pin]
         inner: ReaderStream<R>,
         remaining: usize,
+        emitted: usize,
+        expected: usize,
     }
 }
 
@@ -430,6 +432,8 @@ where
         Self {
             inner: ReaderStream::with_capacity(reader, capacity),
             remaining,
+            emitted: 0,
+            expected: remaining,
         }
     }
 }
@@ -466,13 +470,32 @@ where
                     bytes.truncate(*this.remaining);
                 }
                 *this.remaining -= bytes.len();
+                #[cfg(feature = "tracing-chunk-debug")]
+                {
+                    *this.emitted += bytes.len();
+                    tracing::debug!(
+                        emitted = *this.emitted,
+                        expected = *this.expected,
+                        chunk_len = bytes.len(),
+                        "GetObject ReaderStream emitted bytes"
+                    );
+                }
                 if bytes.is_empty() {
                     Poll::Ready(None)
                 } else {
                     Poll::Ready(Some(Ok(bytes)))
                 }
             }
-            Poll::Ready(Some(Err(err))) => Poll::Ready(Some(Err(Box::new(err)))),
+            Poll::Ready(Some(Err(err))) => {
+                #[cfg(feature = "tracing-chunk-debug")]
+                tracing::error!(
+                    emitted = *this.emitted,
+                    expected = *this.expected,
+                    error = %err,
+                    "GetObject ReaderStream returned error"
+                );
+                Poll::Ready(Some(Err(Box::new(err))))
+            }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
@@ -1734,25 +1757,6 @@ impl DefaultObjectUsecase {
             );
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
-        #[cfg(feature = "tracing-chunk-debug")]
-        let stream = {
-            let mut emitted = 0usize;
-            GetObjectReaderStream::new(reader, stream_buffer_size, expected).inspect(move |item| match item {
-                Ok(bytes) => {
-                    emitted += bytes.len();
-                    tracing::debug!(emitted, expected, chunk_len = bytes.len(), "GetObject ReaderStream emitted bytes");
-                }
-                Err(err) => {
-                    tracing::error!(
-                        emitted,
-                        expected,
-                        error = %err,
-                        "GetObject ReaderStream returned error"
-                    );
-                }
-            })
-        };
-        #[cfg(not(feature = "tracing-chunk-debug"))]
         let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
