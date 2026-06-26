@@ -38,15 +38,15 @@ use tracing::{debug, error, info, warn};
 
 use crate::client::admin_handler_utils::AdminError;
 use crate::error::{Error, Result, StorageError};
-use crate::storage_api_contracts::{
-    object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
-    range::HTTPRangeSpec,
-};
-use crate::tier::{
+use crate::services::tier::{
     tier_admin::TierCreds,
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_ALREADY_EXISTS, ERR_TIER_NAME_NOT_UPPERCASE, ERR_TIER_NOT_FOUND},
     warm_backend::{check_warm_backend, new_warm_backend},
+};
+use crate::storage_api_contracts::{
+    object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
 use crate::{
     config::com::{CONFIG_PREFIX, read_config},
@@ -266,7 +266,7 @@ fn tier_type_from_hint(hint: Option<&str>) -> Option<TierType> {
     }
 }
 
-fn external_tier_s3_from_internal(s3: &crate::tier::tier_config::TierS3) -> ExternalTierS3 {
+fn external_tier_s3_from_internal(s3: &crate::services::tier::tier_config::TierS3) -> ExternalTierS3 {
     ExternalTierS3 {
         endpoint: s3.endpoint.clone(),
         access_key: s3.access_key.clone(),
@@ -536,7 +536,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 .s3
                 .as_ref()
                 .ok_or_else(|| io::Error::other(format!("tier config '{}' missing s3 backend payload", cfg.name)))?;
-            cfg.s3 = Some(crate::tier::tier_config::TierS3 {
+            cfg.s3 = Some(crate::services::tier::tier_config::TierS3 {
                 name: cfg.name.clone(),
                 endpoint: s3.endpoint.clone(),
                 access_key: s3.access_key.clone(),
@@ -557,7 +557,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 .azure
                 .as_ref()
                 .ok_or_else(|| io::Error::other(format!("tier config '{}' missing azure backend payload", cfg.name)))?;
-            cfg.azure = Some(crate::tier::tier_config::TierAzure {
+            cfg.azure = Some(crate::services::tier::tier_config::TierAzure {
                 name: cfg.name.clone(),
                 endpoint: az.endpoint.clone(),
                 access_key: az.account_name.clone(),
@@ -566,7 +566,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 prefix: az.prefix.clone(),
                 region: az.region.clone(),
                 storage_class: az.storage_class.clone(),
-                sp_auth: crate::tier::tier_config::ServicePrincipalAuth {
+                sp_auth: crate::services::tier::tier_config::ServicePrincipalAuth {
                     tenant_id: az.sp_auth.tenant_id.clone(),
                     client_id: az.sp_auth.client_id.clone(),
                     client_secret: az.sp_auth.client_secret.clone(),
@@ -578,7 +578,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 .gcs
                 .as_ref()
                 .ok_or_else(|| io::Error::other(format!("tier config '{}' missing gcs backend payload", cfg.name)))?;
-            cfg.gcs = Some(crate::tier::tier_config::TierGCS {
+            cfg.gcs = Some(crate::services::tier::tier_config::TierGCS {
                 name: cfg.name.clone(),
                 endpoint: gcs.endpoint.clone(),
                 creds: gcs.creds.clone(),
@@ -593,7 +593,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 .compatible_backend
                 .as_ref()
                 .ok_or_else(|| io::Error::other(format!("tier config '{}' missing compatible backend payload", cfg.name)))?;
-            cfg.minio = Some(crate::tier::tier_config::TierMinIO {
+            cfg.minio = Some(crate::services::tier::tier_config::TierMinIO {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint.clone(),
                 access_key: m.access_key.clone(),
@@ -605,7 +605,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         }
         TierType::RustFS => {
             let m = decode_legacy_s3_like(&cfg.name, &ext)?;
-            cfg.rustfs = Some(crate::tier::tier_config::TierRustFS {
+            cfg.rustfs = Some(crate::services::tier::tier_config::TierRustFS {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint,
                 access_key: m.access_key,
@@ -618,7 +618,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         }
         TierType::Aliyun => {
             let m = decode_legacy_s3_like(&cfg.name, &ext)?;
-            cfg.aliyun = Some(crate::tier::tier_config::TierAliyun {
+            cfg.aliyun = Some(crate::services::tier::tier_config::TierAliyun {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint,
                 access_key: m.access_key,
@@ -630,7 +630,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         }
         TierType::Tencent => {
             let m = decode_legacy_s3_like(&cfg.name, &ext)?;
-            cfg.tencent = Some(crate::tier::tier_config::TierTencent {
+            cfg.tencent = Some(crate::services::tier::tier_config::TierTencent {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint,
                 access_key: m.access_key,
@@ -642,7 +642,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         }
         TierType::Huaweicloud => {
             let m = decode_legacy_s3_like(&cfg.name, &ext)?;
-            cfg.huaweicloud = Some(crate::tier::tier_config::TierHuaweicloud {
+            cfg.huaweicloud = Some(crate::services::tier::tier_config::TierHuaweicloud {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint,
                 access_key: m.access_key,
@@ -654,7 +654,7 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         }
         TierType::R2 => {
             let m = decode_legacy_s3_like(&cfg.name, &ext)?;
-            cfg.r2 = Some(crate::tier::tier_config::TierR2 {
+            cfg.r2 = Some(crate::services::tier::tier_config::TierR2 {
                 name: cfg.name.clone(),
                 endpoint: m.endpoint,
                 access_key: m.access_key,
@@ -1342,7 +1342,7 @@ mod tests {
             version: "v1".to_string(),
             tier_type: TierType::S3,
             name: name.to_string(),
-            s3: Some(crate::tier::tier_config::TierS3 {
+            s3: Some(crate::services::tier::tier_config::TierS3 {
                 name: name.to_string(),
                 endpoint: "https://example-s3.invalid".to_string(),
                 access_key: "ak".to_string(),
@@ -1393,7 +1393,7 @@ mod tests {
                 version: "v1".to_string(),
                 tier_type: TierType::RustFS,
                 name: "COLD-B".to_string(),
-                rustfs: Some(crate::tier::tier_config::TierRustFS {
+                rustfs: Some(crate::services::tier::tier_config::TierRustFS {
                     name: "COLD-B".to_string(),
                     endpoint: "https://example-compat.invalid".to_string(),
                     access_key: "ak".to_string(),

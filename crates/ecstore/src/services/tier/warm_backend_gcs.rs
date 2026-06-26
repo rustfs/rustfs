@@ -33,7 +33,7 @@ use crate::client::{
     api_put_object::PutObjectOptions,
     transition_api::{Options, ReadCloser, ReaderImpl},
 };
-use crate::tier::{
+use crate::services::tier::{
     tier_config::TierGCS,
     warm_backend::{WarmBackend, WarmBackendGetOpts},
 };

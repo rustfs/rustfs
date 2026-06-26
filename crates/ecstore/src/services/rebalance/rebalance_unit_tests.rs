@@ -2422,7 +2422,7 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         local_disk_map: crate::runtime::global::GLOBAL_LOCAL_DISK_MAP.clone(),
         local_disk_id_map: crate::runtime::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
         local_disk_set_drives: crate::runtime::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
-        tier_config_mgr: crate::tier::tier::TierConfigMgr::new(),
+        tier_config_mgr: crate::services::tier::tier::TierConfigMgr::new(),
         event_notifier: crate::services::event_notification::EventNotifier::new(),
         bucket_monitor: std::sync::OnceLock::new(),
     });

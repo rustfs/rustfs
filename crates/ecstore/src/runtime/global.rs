@@ -18,8 +18,8 @@ use crate::{
     disk::DiskStore,
     layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
     services::event_notification::EventNotifier,
+    services::tier::tier::TierConfigMgr,
     store::ECStore,
-    tier::tier::TierConfigMgr,
 };
 use lazy_static::lazy_static;
 use rustfs_lock::client::LockClient;

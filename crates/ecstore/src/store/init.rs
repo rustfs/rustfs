@@ -446,7 +446,7 @@ impl ECStore {
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
 
         TransitionState::init(self.clone()).await;
-        crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
+        crate::services::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
         if let Err(err) = runtime_sources::init_tier_config_mgr(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
@@ -474,7 +474,7 @@ mod tests {
         disk::endpoint::Endpoint,
         error::StorageError,
         layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
-        rebalance::RebalanceMeta,
+        services::rebalance::RebalanceMeta,
     };
     use std::time::Duration;
     use time::OffsetDateTime;

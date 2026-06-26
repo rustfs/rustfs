@@ -140,6 +140,8 @@ ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_runtime_gl
 ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_module_hits.txt"
 ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_erasure_module_hits.txt"
 ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
+ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_service_domain_module_hits.txt"
+ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_service_domain_impl_hits.txt"
 ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
 ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
 ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_support_module_hits.txt"
@@ -397,12 +399,10 @@ for ecstore_private_module in \
   disk \
   error \
   io_support \
-  rebalance \
   runtime \
   services \
   set_disk \
-  store \
-  tier; do
+  store; do
   require_source_line \
     "crates/ecstore/src/lib.rs" \
     "mod ${ecstore_private_module};" \
@@ -2941,6 +2941,28 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore error and rebalance modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/rebalance ]] && printf '%s\n' 'crates/ecstore/src/rebalance'
+    [[ -e crates/ecstore/src/tier ]] && printf '%s\n' 'crates/ecstore/src/tier'
+    rg -n --with-filename '^\s*mod\s+(rebalance|tier);|#\[path = "(rebalance|tier)/' crates/ecstore/src/lib.rs || true
+    true
+  }
+) >"$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore rebalance and tier modules must stay under the services owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename 'crate::(rebalance|tier)\b' \
+  "${ROOT_DIR}/crates/ecstore/src" \
+  >"$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore internal rebalance and tier consumers must use the services owner path: $(paste -sd '; ' "$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE")"
 fi
 
 (

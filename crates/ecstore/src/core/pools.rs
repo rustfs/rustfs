@@ -37,8 +37,8 @@ use crate::error::{
 };
 use crate::layout::endpoints::EndpointServerPools;
 use crate::object_api::{GetObjectReader, ObjectOptions};
-use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::runtime::sources as runtime_sources;
+use crate::services::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,
@@ -4925,7 +4925,7 @@ mod pools_tests {
     use crate::disk::endpoint::Endpoint;
     use crate::error::Error;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
-    use crate::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
+    use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_rio::Index;
     use std::sync::{

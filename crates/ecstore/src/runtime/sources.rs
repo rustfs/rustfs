@@ -39,8 +39,8 @@ use crate::{
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
     services::notification_sys::{NotificationSys, get_global_notification_sys},
+    services::tier::tier::TierConfigMgr,
     store::ECStore,
-    tier::tier::TierConfigMgr,
 };
 use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;

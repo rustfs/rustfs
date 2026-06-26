@@ -35,6 +35,7 @@ use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_ver
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::runtime::sources as runtime_sources;
 use crate::services::event_notification::{EventArgs, send_event};
+use crate::services::tier::warm_backend::WarmBackendGetOpts;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -44,7 +45,6 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
-use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;

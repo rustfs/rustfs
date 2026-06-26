@@ -27,21 +27,22 @@ use crate::client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
-use crate::tier::{
-    tier_config::TierRustFS,
+use crate::services::tier::{
+    tier_config::TierR2,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
+use tracing::warn;
 
 const MAX_MULTIPART_PUT_OBJECT_SIZE: i64 = 1024 * 1024 * 1024 * 1024 * 5;
 const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendRustFS(WarmBackendS3);
+pub struct WarmBackendR2(WarmBackendS3);
 
-impl WarmBackendRustFS {
-    pub async fn new(conf: &TierRustFS, tier: &str) -> Result<Self, std::io::Error> {
+impl WarmBackendR2 {
+    pub async fn new(conf: &TierR2, tier: &str) -> Result<Self, std::io::Error> {
         if conf.access_key == "" || conf.secret_key == "" {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
@@ -52,7 +53,9 @@ impl WarmBackendRustFS {
 
         let u = match url::Url::parse(&conf.endpoint) {
             Ok(u) => u,
-            Err(e) => return Err(std::io::Error::other(e)),
+            Err(e) => {
+                return Err(std::io::Error::other(e.to_string()));
+            }
         };
 
         let creds = Credentials::new(Static(Value {
@@ -74,8 +77,8 @@ impl WarmBackendRustFS {
         let default_port = if scheme == "https" { 443 } else { 80 };
         let host = u
             .host_str()
-            .ok_or_else(|| std::io::Error::other("endpoint URL must include a host"))?;
-        let client = TransitionClient::new(&format!("{host}:{}", u.port().unwrap_or(default_port)), opts, "rustfs").await?;
+            .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
+        let client = TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, "r2").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -90,7 +93,7 @@ impl WarmBackendRustFS {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for WarmBackendRustFS {
+impl WarmBackend for WarmBackendR2 {
     async fn put_with_meta(
         &self,
         object: &str,
@@ -148,36 +151,4 @@ fn optimal_part_size(object_size: i64) -> Result<i64, std::io::Error> {
         return Ok(MIN_PART_SIZE);
     }
     Ok(part_size)
-}
-
-#[cfg(test)]
-mod tests {
-    use futures::FutureExt;
-    use std::panic::AssertUnwindSafe;
-
-    use super::*;
-
-    fn rustfs_tier(endpoint: &str) -> TierRustFS {
-        TierRustFS {
-            endpoint: endpoint.to_string(),
-            access_key: "access".to_string(),
-            secret_key: "secret".to_string(),
-            bucket: "bucket".to_string(),
-            ..Default::default()
-        }
-    }
-
-    #[tokio::test]
-    async fn new_returns_error_when_endpoint_has_no_host() {
-        let conf = rustfs_tier("rustfs://");
-
-        let outcome = AssertUnwindSafe(WarmBackendRustFS::new(&conf, "tier")).catch_unwind().await;
-
-        let result = outcome.expect("initialization should return an error instead of panicking");
-        let err = match result {
-            Ok(_) => panic!("endpoint without host must be rejected"),
-            Err(err) => err,
-        };
-        assert!(err.to_string().contains("host"), "expected host validation error, got: {err}");
-    }
 }

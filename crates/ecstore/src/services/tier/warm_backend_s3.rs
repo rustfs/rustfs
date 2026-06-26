@@ -32,7 +32,7 @@ use crate::client::{
 };
 use crate::error::ErrorResponse;
 use crate::error::error_resp_to_object_err;
-use crate::tier::{
+use crate::services::tier::{
     tier_config::TierS3,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
 };

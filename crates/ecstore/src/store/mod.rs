@@ -42,10 +42,11 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
-use crate::rebalance::RebalanceMeta;
 use crate::runtime::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
 use crate::runtime::sources as runtime_sources;
 use crate::services::event_notification::EventNotifier;
+use crate::services::rebalance::RebalanceMeta;
+use crate::services::tier::tier::TierConfigMgr;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -54,7 +55,6 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::init_format::{check_disk_fatal_errs, ec_drives_no_config};
-use crate::tier::tier::TierConfigMgr;
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
     core::sets::Sets,
@@ -267,7 +267,7 @@ impl ECStore {
     }
 
     /// Get the tier config manager
-    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::services::tier::tier::TierConfigMgr>> {
         runtime_sources::global_tier_config_mgr()
     }
 

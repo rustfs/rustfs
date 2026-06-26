@@ -141,7 +141,7 @@ pub mod object {
 }
 
 pub mod rebalance {
-    pub use crate::rebalance::{
+    pub use crate::services::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
@@ -179,5 +179,5 @@ pub mod storage {
 }
 
 pub mod tier {
-    pub use crate::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
+    pub use crate::services::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
 }

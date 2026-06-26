@@ -27,7 +27,7 @@ use crate::client::{
     credentials::{Credentials, SignatureType, Static, Value},
     transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
-use crate::tier::{
+use crate::services::tier::{
     tier_config::TierAliyun,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,

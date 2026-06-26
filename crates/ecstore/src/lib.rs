@@ -28,7 +28,6 @@ mod error;
 mod io_support;
 pub(crate) mod layout;
 mod object_api;
-mod rebalance;
 mod runtime;
 mod services;
 mod set_disk;
@@ -38,7 +37,6 @@ mod store;
 // pub mod checksum;
 mod client;
 mod event;
-mod tier;
 
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use std::sync::Arc;
