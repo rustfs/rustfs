@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{BucketVersioningSys, Result, StorageError};
-use crate::storage::contract::{HTTPPreconditions, HTTPRangeSpec};
+use crate::storage::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{

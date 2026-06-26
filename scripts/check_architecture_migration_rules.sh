@@ -94,6 +94,7 @@ RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_con
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
 RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_direct_storage_source_hits.txt"
+RUSTFS_STORAGE_OWNER_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_contract_root_consumer_hits.txt"
 RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
@@ -1061,6 +1062,24 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
   report_failure "RustFS storage owner modules must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n -U --with-filename 'crate::storage::contract::\{\s*[A-Z]' \
+      rustfs/src/storage \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n --with-filename 'crate::storage::contract::[A-Z]' \
+      rustfs/src/storage \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+  }
+) >"$RUSTFS_STORAGE_OWNER_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner modules must import storage contracts from domain modules, not the root contract facade: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (
