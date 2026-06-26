@@ -5325,14 +5325,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     layer guards, diff hygiene, residual ECStore test API scan, Rust risk scan,
     and full PR gate before PR.
 
+- [x] `API-229` Route ECStore bench API imports through a bench boundary.
+  - Do: add `crates/ecstore/benches/storage_api/mod.rs` as the benchmark boundary
+    for ECStore erasure symbols, then route all ECStore benchmark facade
+    imports through it.
+  - Acceptance: ECStore benchmark crates no longer import
+    `rustfs_ecstore::api` directly outside the reviewed bench boundary, and
+    migration rules reject new bypasses.
+  - Must preserve: erasure SIMD, comparison, streaming decode, and single-block
+    non-inline benchmark behavior and direct erasure symbol usage.
+  - Verification: focused ECStore bench compile coverage, formatting,
+    migration and layer guards, diff hygiene, residual ECStore bench API scan,
+    Rust risk scan, and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-228.
+1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-229.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-229 routes ECStore benchmark erasure facade imports through a bench-local storage_api boundary. |
+| Migration preservation | pass | Erasure SIMD, comparison, streaming decode, and single-block non-inline benchmarks keep the same erasure implementations and behavior. |
+| Testing/verification | pass | Focused ECStore bench compile coverage, migration guard, residual bench API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-228 routes ECStore integration-test ECStore/storage-api symbols through a test-local storage_api boundary. |
 | Migration preservation | pass | Contract proofs, MinIO rio-v2 fixture reads, legacy bitrot reads, disk setup, object reader aliases, and trait bounds keep the same ECStore/storage-api implementations. |
 | Testing/verification | pass | Focused ECStore integration tests, migration guard, residual ECStore test API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |

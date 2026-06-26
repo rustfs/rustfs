@@ -65,6 +65,7 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_exter
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
 ECSTORE_TEST_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_test_direct_api_hits.txt"
+ECSTORE_BENCH_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_bench_direct_api_hits.txt"
 LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
@@ -684,6 +685,18 @@ fi
 
 if [[ -s "$ECSTORE_TEST_DIRECT_API_HITS_FILE" ]]; then
   report_failure "ECStore integration tests must route ECStore and storage-api symbols through crates/ecstore/tests/storage_api.rs: $(paste -sd '; ' "$ECSTORE_TEST_DIRECT_API_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::|rustfs_storage_api' \
+    crates/ecstore/benches \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/benches/storage_api/mod\.rs:' || true
+) >"$ECSTORE_BENCH_DIRECT_API_HITS_FILE"
+
+if [[ -s "$ECSTORE_BENCH_DIRECT_API_HITS_FILE" ]]; then
+  report_failure "ECStore benches must route ECStore and storage-api symbols through crates/ecstore/benches/storage_api/mod.rs: $(paste -sd '; ' "$ECSTORE_BENCH_DIRECT_API_HITS_FILE")"
 fi
 
 (
