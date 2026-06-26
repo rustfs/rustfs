@@ -15,6 +15,7 @@
 
 extern crate core;
 
+#[path = "diagnostics/admin_server_info.rs"]
 mod admin_server_info;
 pub mod api;
 #[path = "services/batch_processor.rs"]
@@ -37,6 +38,7 @@ mod endpoints;
 mod erasure_codec;
 mod erasure_coding;
 mod error;
+#[path = "diagnostics/get.rs"]
 mod get_diagnostics;
 mod global;
 pub(crate) mod layout;

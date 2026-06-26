@@ -135,6 +135,7 @@ ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_suppo
 ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_layout_contract_support_module_hits.txt"
 ECSTORE_ROOT_SERVICE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_service_runtime_module_hits.txt"
 ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_data_movement_module_hits.txt"
+ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_usage_diagnostics_module_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -2860,6 +2861,20 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore data movement modules must stay under the data_movement owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/admin_server_info.rs ]] && printf '%s\n' 'crates/ecstore/src/admin_server_info.rs'
+    [[ -e crates/ecstore/src/data_usage.rs ]] && printf '%s\n' 'crates/ecstore/src/data_usage.rs'
+    [[ -e crates/ecstore/src/get_diagnostics.rs ]] && printf '%s\n' 'crates/ecstore/src/get_diagnostics.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore usage and diagnostics modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
