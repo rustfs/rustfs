@@ -3018,6 +3018,19 @@ if [[ -s "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" ]]; then
   report_failure "ECStore internal RPC consumers must use the cluster/rpc owner path: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
 fi
 
+require_source_contains \
+  "crates/ecstore/src/cluster/control_plane.rs" \
+  "pub struct ClusterRpcBoundarySnapshot" \
+  "ECStore cluster RPC boundary snapshot"
+require_source_contains \
+  "crates/ecstore/src/cluster/control_plane.rs" \
+  "ClusterRpcTransport::Grpc" \
+  "ECStore cluster control RPC transport model"
+require_source_contains \
+  "crates/ecstore/src/cluster/rpc/internode_data_transport.rs" \
+  "Internode metadata, lock, health, and administrative calls remain on the" \
+  "ECStore internode data transport control-plane separation note"
+
 (
   cd "$ROOT_DIR"
   {

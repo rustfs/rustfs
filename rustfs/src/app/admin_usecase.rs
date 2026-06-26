@@ -28,9 +28,12 @@ use crate::app::runtime_sources::{
     AppContext, current_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
 };
 use crate::capacity::resolve_admin_used_capacity;
-use crate::cluster_snapshot::{ClusterReadOnlySnapshot, collect_cluster_read_only_snapshot};
+use crate::cluster_snapshot::{
+    ClusterReadOnlySnapshot, ClusterRuntimeStatusSnapshot, cluster_read_only_snapshot_from_endpoint_pools,
+    collect_cluster_read_only_snapshot,
+};
 use crate::error::ApiError;
-use crate::server::{DependencyReadiness, collect_dependency_readiness as collect_runtime_dependency_readiness};
+use crate::server::{DependencyReadiness, collect_dependency_readiness_report as collect_runtime_dependency_readiness_report};
 use rustfs_data_usage::DataUsageInfo;
 use rustfs_madmin::{InfoMessage, StorageInfo};
 use s3s::S3ErrorCode;
@@ -579,7 +582,14 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
-        collect_runtime_dependency_readiness().await
+        let report = collect_runtime_dependency_readiness_report().await;
+        if let Some(endpoint_pools) = resolve_endpoints_handle() {
+            let runtime_status = ClusterRuntimeStatusSnapshot::from_readiness_report(report);
+            return cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status)
+                .runtime_status
+                .readiness;
+        }
+        report.readiness
     }
 
     pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
