@@ -70,6 +70,9 @@ pub(crate) const TABLE_CATALOG_ENTRY_VERSION: u16 = 1;
 pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
+pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
+pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub const TABLE_RESERVED_PREFIX: &str = BUCKET_TABLE_RESERVED_PREFIX;
 const WAREHOUSE_ROOT: &str = "warehouses";
@@ -1187,6 +1190,41 @@ impl std::error::Error for TableCatalogStoreError {}
 
 pub(crate) type TableCatalogStoreResult<T> = Result<T, TableCatalogStoreError>;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TableCatalogBackingMode {
+    ObjectBacked,
+    DurableStrong,
+}
+
+impl TableCatalogBackingMode {
+    pub(crate) fn from_env() -> TableCatalogStoreResult<Self> {
+        match std::env::var(ENV_TABLE_CATALOG_BACKING) {
+            Ok(value) => Self::parse(&value),
+            Err(std::env::VarError::NotPresent) => Ok(Self::ObjectBacked),
+            Err(std::env::VarError::NotUnicode(_)) => Err(TableCatalogStoreError::Invalid(format!(
+                "{ENV_TABLE_CATALOG_BACKING} must be valid UTF-8"
+            ))),
+        }
+    }
+
+    fn parse(value: &str) -> TableCatalogStoreResult<Self> {
+        match value.trim() {
+            "" | TABLE_CATALOG_BACKING_OBJECT => Ok(Self::ObjectBacked),
+            TABLE_CATALOG_BACKING_DURABLE_STRONG => Ok(Self::DurableStrong),
+            value => Err(TableCatalogStoreError::Invalid(format!(
+                "unsupported table catalog backing {value}; expected {TABLE_CATALOG_BACKING_OBJECT} or {TABLE_CATALOG_BACKING_DURABLE_STRONG}"
+            ))),
+        }
+    }
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::ObjectBacked => TABLE_CATALOG_BACKING_OBJECT,
+            Self::DurableStrong => TABLE_CATALOG_BACKING_DURABLE_STRONG,
+        }
+    }
+}
+
 fn normalize_warehouse_object_prefix(object_prefix: &str, max_prefix_depth: Option<usize>) -> TableCatalogStoreResult<String> {
     let object_prefix = object_prefix.strip_suffix('/').unwrap_or(object_prefix);
     if object_prefix.is_empty() {
@@ -2261,6 +2299,44 @@ where
             )));
         };
         Ok(Self::table_commit_recovery_report_for_entry_locked(&state, entry))
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum ConfiguredTableCatalogStore<B>
+where
+    B: TableCatalogObjectBackend,
+{
+    ObjectBacked(ObjectTableCatalogStore<B>),
+    DurableStrong(StrongTableCatalogStore<B>),
+}
+
+impl<B> ConfiguredTableCatalogStore<B>
+where
+    B: TableCatalogObjectBackend,
+{
+    pub(crate) fn from_env(backend: B) -> TableCatalogStoreResult<Self> {
+        Ok(Self::new(backend, TableCatalogBackingMode::from_env()?))
+    }
+
+    pub(crate) fn new(backend: B, mode: TableCatalogBackingMode) -> Self {
+        match mode {
+            TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
+            TableCatalogBackingMode::DurableStrong => Self::DurableStrong(StrongTableCatalogStore::new(backend)),
+        }
+    }
+
+    pub(crate) fn backing_mode(&self) -> TableCatalogBackingMode {
+        match self {
+            Self::ObjectBacked(_) => TableCatalogBackingMode::ObjectBacked,
+            Self::DurableStrong(_) => TableCatalogBackingMode::DurableStrong,
+        }
+    }
+
+    fn unsupported_for_durable_strong(operation: &str) -> TableCatalogStoreError {
+        TableCatalogStoreError::Invalid(format!(
+            "{operation} is not supported with {TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing"
+        ))
     }
 }
 
@@ -5454,6 +5530,324 @@ where
     }
 }
 
+#[async_trait::async_trait]
+impl<B> TableCatalogStore for ConfiguredTableCatalogStore<B>
+where
+    B: TableCatalogObjectBackend,
+{
+    async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.get_table_bucket(table_bucket).await,
+            Self::DurableStrong(store) => store.get_table_bucket(table_bucket).await,
+        }
+    }
+
+    async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.put_table_bucket(entry).await,
+            Self::DurableStrong(store) => store.put_table_bucket(entry).await,
+        }
+    }
+
+    async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.create_namespace(entry).await,
+            Self::DurableStrong(store) => store.create_namespace(entry).await,
+        }
+    }
+
+    async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_namespaces(table_bucket).await,
+            Self::DurableStrong(store) => store.list_namespaces(table_bucket).await,
+        }
+    }
+
+    async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.get_namespace(table_bucket, namespace).await,
+            Self::DurableStrong(store) => store.get_namespace(table_bucket, namespace).await,
+        }
+    }
+
+    async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.drop_namespace(table_bucket, namespace).await,
+            Self::DurableStrong(store) => store.drop_namespace(table_bucket, namespace).await,
+        }
+    }
+
+    async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.create_table(entry).await,
+            Self::DurableStrong(store) => store.create_table(entry).await,
+        }
+    }
+
+    async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.register_table(entry).await,
+            Self::DurableStrong(store) => store.register_table(entry).await,
+        }
+    }
+
+    async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
+            Self::DurableStrong(store) => store.list_tables(table_bucket, namespace).await,
+        }
+    }
+
+    async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.load_table(table_bucket, namespace, table).await,
+            Self::DurableStrong(store) => store.load_table(table_bucket, namespace, table).await,
+        }
+    }
+
+    async fn resolve_table_data_plane_resource(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self {
+            Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
+            Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
+        }
+    }
+
+    async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => store.commit_table(request).await,
+            Self::DurableStrong(store) => store.commit_table(request).await,
+        }
+    }
+
+    async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.drop_table(table_bucket, namespace, table).await,
+            Self::DurableStrong(store) => store.drop_table(table_bucket, namespace, table).await,
+        }
+    }
+
+    async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.create_view(entry).await,
+            Self::DurableStrong(store) => store.create_view(entry).await,
+        }
+    }
+
+    async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.list_views(table_bucket, namespace).await,
+            Self::DurableStrong(store) => store.list_views(table_bucket, namespace).await,
+        }
+    }
+
+    async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.load_view(table_bucket, namespace, view).await,
+            Self::DurableStrong(store) => store.load_view(table_bucket, namespace, view).await,
+        }
+    }
+
+    async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
+        match self {
+            Self::ObjectBacked(store) => store.replace_view(request).await,
+            Self::DurableStrong(store) => store.replace_view(request).await,
+        }
+    }
+
+    async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()> {
+        match self {
+            Self::ObjectBacked(store) => store.drop_view(table_bucket, namespace, view).await,
+            Self::DurableStrong(store) => store.drop_view(table_bucket, namespace, view).await,
+        }
+    }
+
+    async fn get_commit_by_id(
+        &self,
+        table_bucket: &str,
+        table_id: &str,
+        commit_id: &str,
+    ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
+            Self::DurableStrong(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
+        }
+    }
+
+    async fn get_commit_by_idempotency_key(
+        &self,
+        table_bucket: &str,
+        table_id: &str,
+        idempotency_key: &str,
+    ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
+                    .await
+            }
+            Self::DurableStrong(store) => {
+                store
+                    .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
+                    .await
+            }
+        }
+    }
+}
+
+impl<B> ConfiguredTableCatalogStore<B>
+where
+    B: TableCatalogObjectBackend,
+{
+    pub(crate) async fn get_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        match self {
+            Self::ObjectBacked(store) => store.get_table_maintenance_config(table_bucket, namespace, table).await,
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance config")),
+        }
+    }
+
+    pub(crate) async fn put_table_maintenance_config(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        config: TableMaintenanceConfig,
+    ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .put_table_maintenance_config(table_bucket, namespace, table, config)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance config")),
+        }
+    }
+
+    pub(crate) async fn get_table_metadata_maintenance_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+    ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .get_table_metadata_maintenance_report(table_bucket, namespace, table, job_id)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance report")),
+        }
+    }
+
+    pub(crate) async fn run_table_metadata_maintenance_worker_once(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        worker_id: String,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance worker")),
+        }
+    }
+
+    pub(crate) async fn heartbeat_table_metadata_maintenance_job(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        lease_id: &str,
+        worker_id: &str,
+    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .heartbeat_table_metadata_maintenance_job(table_bucket, namespace, table, job_id, lease_id, worker_id)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance heartbeat")),
+        }
+    }
+
+    pub(crate) async fn export_table_catalog_entry(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCatalogExport> {
+        match self {
+            Self::ObjectBacked(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog export")),
+        }
+    }
+
+    pub(crate) async fn diagnose_table_catalog(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        retain_recent_metadata_files: usize,
+    ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("catalog diagnostics")),
+        }
+    }
+
+    pub(crate) async fn recover_table_commits(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
+        match self {
+            Self::ObjectBacked(store) => store.recover_table_commits(table_bucket, namespace, table).await,
+            Self::DurableStrong(store) => store.plan_table_commit_recovery(table_bucket, namespace, table).await,
+        }
+    }
+
+    pub(crate) async fn get_external_catalog_bridge(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
+        match self {
+            Self::ObjectBacked(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
+        }
+    }
+
+    pub(crate) async fn put_external_catalog_bridge(
+        &self,
+        entry: ExternalCatalogBridgeEntry,
+    ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
+        match self {
+            Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
+        }
+    }
+}
+
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
 }
@@ -5475,7 +5869,7 @@ where
     }
 }
 
-pub(crate) type EcStoreTableCatalogStore<S> = ObjectTableCatalogStore<EcStoreTableCatalogObjectBackend<S>>;
+pub(crate) type EcStoreTableCatalogStore<S> = ConfiguredTableCatalogStore<EcStoreTableCatalogObjectBackend<S>>;
 
 #[async_trait::async_trait]
 impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
@@ -8947,6 +9341,33 @@ mod tests {
         assert!(serde_json::from_value::<TableEntry>(value).is_err());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn table_catalog_backing_mode_defaults_to_object() {
+        temp_env::with_var_unset(ENV_TABLE_CATALOG_BACKING, || {
+            assert_eq!(TableCatalogBackingMode::from_env().unwrap(), TableCatalogBackingMode::ObjectBacked);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn table_catalog_backing_mode_accepts_durable_strong_value() {
+        temp_env::with_var(ENV_TABLE_CATALOG_BACKING, Some(TABLE_CATALOG_BACKING_DURABLE_STRONG), || {
+            assert_eq!(TableCatalogBackingMode::from_env().unwrap(), TableCatalogBackingMode::DurableStrong);
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn table_catalog_backing_mode_rejects_unknown_value() {
+        temp_env::with_var(ENV_TABLE_CATALOG_BACKING, Some("memory"), || {
+            assert!(matches!(
+                TableCatalogBackingMode::from_env().unwrap_err(),
+                TableCatalogStoreError::Invalid(_)
+            ));
+        });
+    }
+
     struct NoopTableCatalogStore;
 
     #[async_trait::async_trait]
@@ -9765,6 +10186,22 @@ mod tests {
             .collect::<BTreeSet<_>>();
 
         assert_eq!(object_buckets, BTreeSet::from([RUSTFS_META_BUCKET]));
+    }
+
+    #[tokio::test]
+    async fn configured_table_catalog_store_uses_durable_strong_snapshot() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ConfiguredTableCatalogStore::new(backend.clone(), TableCatalogBackingMode::DurableStrong);
+        let bucket = "analytics";
+
+        assert_eq!(store.backing_mode(), TableCatalogBackingMode::DurableStrong);
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+
+        let snapshot_path = StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path();
+        assert!(backend.object_exists(RUSTFS_META_BUCKET, &snapshot_path).await.unwrap());
+
+        let reloaded = ConfiguredTableCatalogStore::new(backend.clone(), TableCatalogBackingMode::DurableStrong);
+        assert!(reloaded.get_table_bucket(bucket).await.unwrap().is_some());
     }
 
     #[tokio::test]
