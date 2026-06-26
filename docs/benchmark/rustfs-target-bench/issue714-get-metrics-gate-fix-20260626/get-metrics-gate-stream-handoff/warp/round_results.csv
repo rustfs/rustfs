@@ -1,4 +1,0 @@
-size,tool,round,attempt,concurrency,status,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file
-10MiB,warp,1,1,32,ok,8301.26 MiB/s,8704502005.760000,830.13,37.5 ms,37.500000,target/bench/get-metrics-gate-stream-handoff/warp/logs/warp_10MiB_r1_a1.log
-10MiB,warp,2,1,32,ok,6114.77 MiB/s,6411801067.520000,611.48,50.0 ms,50.000000,target/bench/get-metrics-gate-stream-handoff/warp/logs/warp_10MiB_r2_a1.log
-10MiB,warp,3,1,32,ok,5949.81 MiB/s,6238827970.560000,594.98,46.7 ms,46.700000,target/bench/get-metrics-gate-stream-handoff/warp/logs/warp_10MiB_r3_a1.log

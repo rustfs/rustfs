@@ -1,2 +1,0 @@
-size,tool,concurrency,new_median_reqps,baseline_median_reqps,delta_reqps_pct,new_median_latency_ms,baseline_median_latency_ms,delta_latency_pct,new_median_throughput_bps,baseline_median_throughput_bps,delta_throughput_pct
-10MiB,warp,32,531.210000,546.920000,-2.87,50.600000,48.700000,3.90,5570151055.360000,5734882344.960000,-2.87
