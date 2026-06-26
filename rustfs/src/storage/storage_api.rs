@@ -359,7 +359,7 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter,
         RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo,
-        WalkDirOptions,
+        WalkDirOptions, get_object_disk_read_timeout,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
@@ -1161,7 +1161,7 @@ pub(crate) fn get_lock_acquire_timeout() -> std::time::Duration {
 }
 
 pub(crate) fn get_object_disk_read_timeout() -> std::time::Duration {
-    rustfs_ecstore::api::disk::get_object_disk_read_timeout()
+    ecstore_disk::get_object_disk_read_timeout()
 }
 
 #[cfg(test)]

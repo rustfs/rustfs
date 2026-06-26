@@ -12,39 +12,172 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::{self, DiskAPI as _, DiskStore, disk_store::get_object_disk_read_timeout, error::DiskError};
+use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
 use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
 use std::future::Future;
-use std::io::Cursor;
-use std::time::{Duration, Instant};
-use tokio::io::AsyncRead;
-use tokio::time;
+use std::io::{self, Cursor};
+use std::pin::Pin;
+use std::sync::Mutex;
+use std::task::{Context, Poll};
+use std::time::Instant;
+use tokio::io::{AsyncRead, ReadBuf};
 use tracing::debug;
 
-async fn read_zero_copy_with_timeout<F>(timeout: Duration, read: F) -> disk::error::Result<Bytes>
-where
-    F: Future<Output = disk::error::Result<Bytes>>,
-{
-    if timeout.is_zero() {
-        return read.await;
-    }
+type BoxedObjectReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
+type OpenObjectReaderFuture = Pin<Box<dyn Future<Output = disk::error::Result<Option<BoxedObjectReader>>> + Send>>;
 
-    match time::timeout(timeout, read).await {
-        Ok(result) => result,
-        Err(_) => Err(DiskError::Timeout),
+#[derive(Clone)]
+struct BitrotReaderSource {
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: String,
+    path: String,
+    offset: usize,
+    length: usize,
+    use_zero_copy: bool,
+}
+
+impl BitrotReaderSource {
+    async fn open(self) -> disk::error::Result<Option<BoxedObjectReader>> {
+        if let Some(data) = self.inline_data {
+            let mut rd = Cursor::new(data);
+            let offset = u64::try_from(self.offset).map_err(|_| DiskError::FileCorrupt)?;
+            rd.set_position(offset);
+            Ok(Some(Box::new(rd)))
+        } else if let Some(disk) = self.disk {
+            open_disk_reader(&disk, &self.bucket, &self.path, self.offset, self.length, self.use_zero_copy)
+                .await
+                .map(Some)
+        } else {
+            Ok(None)
+        }
     }
 }
 
-async fn read_file_zero_copy_with_object_timeout(
+struct DeferredObjectReader {
+    state: Mutex<DeferredObjectReaderState>,
+}
+
+enum DeferredObjectReaderState {
+    Pending(Option<BitrotReaderSource>),
+    Opening(OpenObjectReaderFuture),
+    Ready(BoxedObjectReader),
+    Failed,
+}
+
+impl DeferredObjectReader {
+    fn new(source: BitrotReaderSource) -> Self {
+        Self {
+            state: Mutex::new(DeferredObjectReaderState::Pending(Some(source))),
+        }
+    }
+}
+
+impl AsyncRead for DeferredObjectReader {
+    fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        loop {
+            let mut state = match self.state.lock() {
+                Ok(state) => state,
+                Err(_) => return Poll::Ready(Err(io::Error::other("deferred bitrot reader state poisoned"))),
+            };
+
+            match &mut *state {
+                DeferredObjectReaderState::Pending(source) => {
+                    let Some(source) = source.take() else {
+                        *state = DeferredObjectReaderState::Failed;
+                        return Poll::Ready(Err(io::Error::other("deferred bitrot reader source missing")));
+                    };
+                    *state = DeferredObjectReaderState::Opening(Box::pin(source.open()));
+                }
+                DeferredObjectReaderState::Opening(open) => match open.as_mut().poll(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Ok(Some(reader))) => {
+                        *state = DeferredObjectReaderState::Ready(reader);
+                    }
+                    Poll::Ready(Ok(None)) => {
+                        *state = DeferredObjectReaderState::Failed;
+                        return Poll::Ready(Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "deferred bitrot reader source missing",
+                        )));
+                    }
+                    Poll::Ready(Err(err)) => {
+                        *state = DeferredObjectReaderState::Failed;
+                        return Poll::Ready(Err(disk_error_to_io_error(err)));
+                    }
+                },
+                DeferredObjectReaderState::Ready(reader) => return Pin::new(reader).poll_read(cx, buf),
+                DeferredObjectReaderState::Failed => {
+                    return Poll::Ready(Err(io::Error::other("deferred bitrot reader already failed")));
+                }
+            }
+        }
+    }
+}
+
+fn disk_error_to_io_error(err: DiskError) -> io::Error {
+    let kind = match err {
+        DiskError::Timeout | DiskError::SourceStalled => io::ErrorKind::TimedOut,
+        DiskError::DiskNotFound | DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::PathNotFound => {
+            io::ErrorKind::NotFound
+        }
+        DiskError::FileCorrupt | DiskError::PartMissingOrCorrupt | DiskError::BitrotHashAlgoInvalid => io::ErrorKind::InvalidData,
+        DiskError::Io(io_err) => return io_err,
+        _ => io::ErrorKind::Other,
+    };
+    io::Error::new(kind, err.to_string())
+}
+
+async fn open_disk_reader(
     disk: &DiskStore,
     bucket: &str,
     path: &str,
     offset: usize,
     length: usize,
-) -> disk::error::Result<Bytes> {
-    read_zero_copy_with_timeout(get_object_disk_read_timeout(), disk.read_file_zero_copy(bucket, path, offset, length)).await
+    use_zero_copy: bool,
+) -> disk::error::Result<FileReader> {
+    if use_zero_copy && disk.is_local() {
+        let start = Instant::now();
+        match disk.read_file_zero_copy(bucket, path, offset, length).await {
+            Ok(bytes) => {
+                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+
+                rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
+                debug!(
+                    size = bytes.len(),
+                    path = %path,
+                    "zero_copy_read_success"
+                );
+
+                return Ok(Box::new(Cursor::new(bytes)));
+            }
+            Err(err) => {
+                let reason = format!("{err:?}");
+                rustfs_io_metrics::record_zero_copy_fallback(&reason);
+                debug!(
+                    reason = %reason,
+                    path = %path,
+                    "zero_copy_fallback"
+                );
+
+                return match disk.read_file_stream(bucket, path, offset, length).await {
+                    Ok(reader) => Ok(reader),
+                    Err(_) => Err(err),
+                };
+            }
+        }
+    }
+
+    disk.read_file_stream(bucket, path, offset, length).await
+}
+
+fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
+    (
+        offset.div_ceil(shard_size) * checksum_algo.size() + offset,
+        length.div_ceil(shard_size) * checksum_algo.size() + length,
+    )
 }
 
 /// Create a BitrotReader from either inline data or disk file stream
@@ -73,99 +206,48 @@ pub async fn create_bitrot_reader(
     skip_verify: bool,
     use_zero_copy: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
-    // Calculate the total length to read, including the checksum overhead
-    let length = length.div_ceil(shard_size) * checksum_algo.size() + length;
-    let offset = offset.div_ceil(shard_size) * checksum_algo.size() + offset;
-    if let Some(data) = inline_data {
-        // Use inline data
-        let mut rd = Cursor::new(Bytes::copy_from_slice(data));
-        // Apply the computed offset so inline data matches disk read behavior
-        rd.set_position(offset as u64);
-        let reader = BitrotReader::new(
-            Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
-            shard_size,
-            checksum_algo,
-            skip_verify,
-        );
-        Ok(Some(reader))
-    } else if let Some(disk) = disk {
-        // Read from disk
-        if use_zero_copy && disk.is_local() {
-            // Try zero-copy read first (uses mmap on Unix)
-            let start = Instant::now();
-            match read_file_zero_copy_with_object_timeout(disk, bucket, path, offset, length).await {
-                Ok(bytes) => {
-                    let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    let source = BitrotReaderSource {
+        inline_data: inline_data.map(Bytes::copy_from_slice),
+        disk: disk.cloned(),
+        bucket: bucket.to_string(),
+        path: path.to_string(),
+        offset,
+        length,
+        use_zero_copy,
+    };
 
-                    // Record zero-copy metrics
-                    rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
+    source
+        .open()
+        .await
+        .map(|reader| reader.map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify)))
+}
 
-                    // Log successful zero-copy read
-                    debug!(
-                        size = bytes.len(),
-                        path = %path,
-                        "zero_copy_read_success"
-                    );
+#[allow(clippy::too_many_arguments)]
+pub fn create_deferred_bitrot_reader(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_zero_copy: bool,
+) -> BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>> {
+    let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
+    let source = BitrotReaderSource {
+        inline_data,
+        disk,
+        bucket: bucket.to_string(),
+        path: path.to_string(),
+        offset,
+        length,
+        use_zero_copy,
+    };
 
-                    // Wrap Bytes in Cursor for AsyncRead
-                    // The Bytes is reference-counted, so this is zero-copy
-                    let rd = Cursor::new(bytes);
-                    let reader = BitrotReader::new(
-                        Box::new(rd) as Box<dyn AsyncRead + Send + Sync + Unpin>,
-                        shard_size,
-                        checksum_algo,
-                        skip_verify,
-                    );
-                    Ok(Some(reader))
-                }
-                Err(DiskError::Timeout) => {
-                    rustfs_io_metrics::record_zero_copy_fallback("Timeout");
-                    debug!(
-                        path = %path,
-                        timeout_ms = get_object_disk_read_timeout().as_millis(),
-                        "zero_copy_read_timeout"
-                    );
-
-                    Err(DiskError::Timeout)
-                }
-                Err(e) => {
-                    // Record zero-copy fallback
-                    rustfs_io_metrics::record_zero_copy_fallback(&format!("{:?}", e));
-
-                    // Log zero-copy fallback
-                    debug!(
-                        reason = %format!("{:?}", e),
-                        path = %path,
-                        "zero_copy_fallback"
-                    );
-
-                    // Fall back to regular stream read on error
-                    match disk.read_file_stream(bucket, path, offset, length).await {
-                        Ok(rd) => {
-                            let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
-                            Ok(Some(reader))
-                        }
-                        Err(_e2) => {
-                            // Return the original error from zero-copy attempt
-                            Err(e)
-                        }
-                    }
-                }
-            }
-        } else {
-            // Use regular stream read
-            match disk.read_file_stream(bucket, path, offset, length).await {
-                Ok(rd) => {
-                    let reader = BitrotReader::new(rd, shard_size, checksum_algo, skip_verify);
-                    Ok(Some(reader))
-                }
-                Err(e) => Err(e),
-            }
-        }
-    } else {
-        // Neither inline data nor disk available
-        Ok(None)
-    }
+    BitrotReader::new(Box::new(DeferredObjectReader::new(source)), shard_size, checksum_algo, skip_verify)
 }
 
 /// Create a new BitrotWriterWrapper based on the provided parameters
@@ -212,13 +294,6 @@ pub async fn create_bitrot_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[tokio::test(start_paused = true)]
-    async fn test_zero_copy_timeout_returns_disk_timeout() {
-        let result = read_zero_copy_with_timeout(Duration::from_secs(10), std::future::pending()).await;
-
-        assert_eq!(result.expect_err("pending read should time out"), DiskError::Timeout);
-    }
 
     #[tokio::test]
     async fn test_create_bitrot_reader_with_inline_data() {
@@ -310,6 +385,49 @@ mod tests {
 
         let mut out = [0u8; 4];
         let n = reader.read(&mut out).await.expect("read second shard");
+
+        assert_eq!(n, shard_size);
+        assert_eq!(&out[..n], b"efgh");
+    }
+
+    #[tokio::test]
+    async fn test_deferred_bitrot_reader_opens_inline_source_on_read() {
+        let shard_size = 4;
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let payload = b"abcdefghijkl";
+
+        let mut writer = create_bitrot_writer(
+            true,
+            None,
+            "test-volume",
+            "test-path",
+            payload.len() as i64,
+            shard_size,
+            checksum_algo.clone(),
+        )
+        .await
+        .expect("inline bitrot writer");
+
+        for chunk in payload.chunks(shard_size) {
+            writer.write(chunk).await.expect("write chunk");
+        }
+
+        let inline_data = writer.into_inline_data().expect("inline buffer");
+        let mut reader = create_deferred_bitrot_reader(
+            Some(inline_data.into()),
+            None,
+            "test-bucket",
+            "test-path",
+            shard_size,
+            shard_size,
+            shard_size,
+            checksum_algo,
+            false,
+            false,
+        );
+
+        let mut out = [0u8; 4];
+        let n = reader.read(&mut out).await.expect("read deferred second shard");
 
         assert_eq!(n, shard_size);
         assert_eq!(&out[..n], b"efgh");

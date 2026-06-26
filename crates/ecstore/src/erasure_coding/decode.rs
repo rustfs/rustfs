@@ -646,11 +646,13 @@ where
                         } else {
                             None
                         };
+                        let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
                         scheduled += 1;
                         active_readers[next_i] = has_reader;
                         pending += 1;
                         sets.push(read_shard(
                             next_i,
+                            next_read_cost,
                             next_reader,
                             recycled_buf,
                             shard_size,

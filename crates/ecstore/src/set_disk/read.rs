@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::*;
+use crate::bitrot::create_deferred_bitrot_reader;
 use crate::erasure_coding::BitrotReader;
 use crate::get_diagnostics::{
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
@@ -596,6 +597,7 @@ struct BitrotReaderSetup {
     readers: Vec<Option<ObjectBitrotReader>>,
     errors: Vec<Option<DiskError>>,
     attempted: Vec<bool>,
+    ready: Vec<bool>,
 }
 
 #[derive(Clone, Copy)]
@@ -606,15 +608,11 @@ enum BitrotReaderSetupMode {
 
 impl BitrotReaderSetup {
     fn available_shards(&self) -> usize {
-        self.readers.iter().filter(|reader| reader.is_some()).count()
+        self.ready.iter().filter(|ready| **ready).count()
     }
 
     fn available_data_shards(&self, data_shards: usize) -> usize {
-        self.readers
-            .iter()
-            .take(data_shards)
-            .filter(|reader| reader.is_some())
-            .count()
+        self.ready.iter().take(data_shards).filter(|ready| **ready).count()
     }
 
     fn completed_failed_shards(&self) -> usize {
@@ -668,6 +666,7 @@ async fn create_bitrot_readers_until_quorum(
         readers: (0..disks.len()).map(|_| None).collect(),
         errors: vec![Some(DiskError::DiskNotFound); disks.len()],
         attempted: vec![false; disks.len()],
+        ready: vec![false; disks.len()],
     };
     let mut reader_tasks = FuturesUnordered::new();
 
@@ -702,19 +701,48 @@ async fn create_bitrot_readers_until_quorum(
             Ok(Some(reader)) => {
                 setup.readers[idx] = Some(reader);
                 setup.errors[idx] = None;
+                setup.ready[idx] = true;
             }
             Ok(None) => {
                 setup.readers[idx] = None;
                 setup.errors[idx] = Some(DiskError::DiskNotFound);
+                setup.ready[idx] = false;
             }
             Err(e) => {
                 setup.readers[idx] = None;
                 setup.errors[idx] = Some(e);
+                setup.ready[idx] = false;
             }
         }
 
         if setup.has_setup_quorum(data_shards, parity_shards, mode) {
             break;
+        }
+    }
+
+    if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+        for idx in 0..disks.len() {
+            if setup.attempted[idx] {
+                continue;
+            }
+
+            let inline_data = files[idx].data.clone();
+            let disk = disks[idx].clone();
+            let data_dir = files[idx].data_dir.unwrap_or_default();
+            let path = format!("{object}/{data_dir}/part.{part_number}");
+            setup.readers[idx] = Some(create_deferred_bitrot_reader(
+                inline_data,
+                disk,
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_zero_copy,
+            ));
+            setup.errors[idx] = None;
         }
     }
     drop(reader_tasks);
@@ -2992,6 +3020,39 @@ mod tests {
         assert_eq!(setup.available_shards(), 2);
         assert!(setup.data_shards_attempted(2));
         assert_eq!(setup.completed_failed_shards(), 0);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_retains_unattempted_fallback_readers() {
+        let mut setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+
+        let fallback_index = setup
+            .attempted
+            .iter()
+            .position(|attempted| !*attempted)
+            .expect("read quorum should leave at least one deferred fallback");
+        assert!(!setup.ready[fallback_index]);
+
+        let mut fallback = setup.readers[fallback_index]
+            .take()
+            .expect("deferred fallback reader should be retained");
+        let mut out = [0u8; 4];
+        let n = fallback
+            .read(&mut out)
+            .await
+            .expect("deferred fallback reader should open on read");
+
+        assert_eq!(n, 4);
+        assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
     }
 
     #[tokio::test]
