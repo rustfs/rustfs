@@ -2419,11 +2419,11 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),
         pool_meta_save_gate: tokio::sync::Mutex::new(()),
-        local_disk_map: crate::global::GLOBAL_LOCAL_DISK_MAP.clone(),
-        local_disk_id_map: crate::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
-        local_disk_set_drives: crate::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
+        local_disk_map: crate::runtime::global::GLOBAL_LOCAL_DISK_MAP.clone(),
+        local_disk_id_map: crate::runtime::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+        local_disk_set_drives: crate::runtime::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
         tier_config_mgr: crate::tier::tier::TierConfigMgr::new(),
-        event_notifier: crate::event_notification::EventNotifier::new(),
+        event_notifier: crate::services::event_notification::EventNotifier::new(),
         bucket_monitor: std::sync::OnceLock::new(),
     });
 

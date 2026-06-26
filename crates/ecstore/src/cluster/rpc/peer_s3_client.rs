@@ -20,7 +20,7 @@ use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
 use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
@@ -1103,7 +1103,7 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::local::LocalDisk;
     use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::reset_local_disk_test_state;
+    use crate::runtime::global::reset_local_disk_test_state;
     use crate::store::init_local_disks;
     use rustfs_filemeta::FileInfo;
     use serial_test::serial;

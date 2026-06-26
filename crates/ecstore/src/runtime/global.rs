@@ -17,7 +17,7 @@ use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
     endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    event_notification::EventNotifier,
+    services::event_notification::EventNotifier,
     store::ECStore,
     tier::tier::TierConfigMgr,
 };

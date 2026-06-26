@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin_server_info::get_commit_id;
+use crate::diagnostics::admin_server_info::get_commit_id;
 use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
-use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
+use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use futures::future::join_all;
 use lazy_static::lazy_static;

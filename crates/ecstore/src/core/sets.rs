@@ -33,7 +33,7 @@ use crate::{
     endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    runtime_sources,
+    runtime::sources as runtime_sources,
     set_disk::SetDisks,
     store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };

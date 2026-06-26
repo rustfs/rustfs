@@ -2229,7 +2229,7 @@ impl DiskAPI for RemoteDisk {
 mod tests {
     use super::*;
     use crate::rpc::internode_data_transport::{InternodeDataTransportCapabilities, TcpHttpInternodeDataTransport};
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use serde_json::Value;
     use std::io::{self as std_io, Write};
     use std::pin::Pin;

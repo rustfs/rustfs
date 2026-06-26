@@ -14,7 +14,7 @@
 
 use crate::disk::error::{DiskError, Error as DiskErrorType};
 use crate::rpc::{TONIC_RPC_PREFIX, gen_signature_headers};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use http::Method;
 use rustfs_protos::{create_new_channel, proto_gen::node_service::node_service_client::NodeServiceClient};
 use std::{error::Error, io::ErrorKind};

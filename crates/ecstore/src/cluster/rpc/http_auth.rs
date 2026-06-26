@@ -164,7 +164,7 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
 mod tests {
     use super::*;
     use crate::rpc::context_propagation::REQUEST_ID_HEADER;
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use http::{HeaderMap, Method};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};

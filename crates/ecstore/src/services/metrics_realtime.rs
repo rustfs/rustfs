@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin_server_info::get_local_server_property;
-use crate::runtime_sources;
+use crate::diagnostics::admin_server_info::get_local_server_property;
+use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::admin::StorageAdminApi;
 use chrono::Utc;
 use rustfs_common::{heal_channel::DriveState, metrics::global_metrics};

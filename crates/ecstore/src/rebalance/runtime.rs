@@ -14,7 +14,7 @@ use super::{
     RebalanceBucketOutcome,
 };
 use crate::error::{Error, Result};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::store::ECStore;
 use std::collections::HashSet;
 use std::sync::Arc;

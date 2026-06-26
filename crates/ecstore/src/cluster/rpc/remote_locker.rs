@@ -536,7 +536,7 @@ impl LockClient for RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;

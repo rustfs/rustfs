@@ -17,8 +17,8 @@ use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node
 use crate::{
     disk::disk_store::{get_drive_active_check_interval, get_drive_active_check_timeout},
     endpoints::EndpointServerPools,
-    metrics_realtime::{CollectMetricsOpts, MetricType},
-    runtime_sources,
+    runtime::sources as runtime_sources,
+    services::metrics_realtime::{CollectMetricsOpts, MetricType},
 };
 use rmp_serde::{Deserializer, Serializer};
 use rustfs_madmin::{

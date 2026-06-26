@@ -15,7 +15,7 @@
 use super::*;
 use crate::error::is_err_decommission_running;
 use crate::pools::local_decommission_queue_prefix;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";

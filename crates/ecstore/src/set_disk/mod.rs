@@ -15,8 +15,6 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::batch_processor::AsyncBatchProcessor;
-use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
@@ -24,6 +22,10 @@ use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
+    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+};
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
     reduce_write_quorum_errs,
@@ -39,13 +41,11 @@ use crate::erasure_codec::bridge::{
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::get_diagnostics::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
-    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
-};
+use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
+use crate::services::batch_processor::AsyncBatchProcessor;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -69,9 +69,9 @@ use crate::{
         UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
-    // event::name::EventName,
-    event_notification::{EventArgs, send_event},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
+    // event::name::EventName,
+    services::event_notification::{EventArgs, send_event},
     store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
 use bytes::Bytes;
@@ -174,7 +174,7 @@ const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIP
 const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
 static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
+use crate::io_support::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -1573,7 +1573,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
+            let index_op = data
+                .stream
+                .try_get_index()
+                .map(crate::io_support::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -3869,7 +3872,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
+        let index_op = data
+            .stream
+            .try_get_index()
+            .map(crate::io_support::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 

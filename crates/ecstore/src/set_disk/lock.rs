@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::disk::health_state::DriveMembershipSnapshot;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 
 impl SetDisks {
     pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {

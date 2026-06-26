@@ -21,7 +21,6 @@ use std::{
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
 use crate::{
-    batch_processor::{GlobalBatchProcessors, get_global_processors},
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_ExpiryState, GLOBAL_TransitionState, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
     bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
@@ -30,8 +29,7 @@ use crate::{
     endpoints::EndpointServerPools,
     endpoints::SetupType,
     error::Result,
-    event_notification::EventNotifier,
-    global::{
+    runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
         TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
@@ -39,7 +37,9 @@ use crate::{
         init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle,
         set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
     },
-    notification_sys::{NotificationSys, get_global_notification_sys},
+    services::batch_processor::{GlobalBatchProcessors, get_global_processors},
+    services::event_notification::EventNotifier,
+    services::notification_sys::{NotificationSys, get_global_notification_sys},
     store::ECStore,
     tier::tier::TierConfigMgr,
 };

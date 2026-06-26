@@ -40,12 +40,12 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
-use crate::event_notification::EventNotifier;
-use crate::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
 use crate::pools::PoolMeta;
 use crate::rebalance::RebalanceMeta;
 use crate::rpc::RemoteClient;
-use crate::runtime_sources;
+use crate::runtime::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
+use crate::runtime::sources as runtime_sources;
+use crate::services::event_notification::EventNotifier;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -246,7 +246,7 @@ impl ECStore {
 /// service singletons. The globals remain the source of truth.
 impl ECStore {
     /// Get the notification system
-    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+    pub fn notification_system(&self) -> Option<&'static crate::services::notification_sys::NotificationSys> {
         runtime_sources::notification_sys()
     }
 
@@ -773,7 +773,7 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 mod tests {
     use super::*;
     use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
+    use crate::runtime::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
     use crate::store_init::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;

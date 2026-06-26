@@ -29,7 +29,7 @@ use crate::disk::{
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
 use crate::erasure_coding::bitrot_verify;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use parking_lot::RwLock as ParkingLotRwLock;

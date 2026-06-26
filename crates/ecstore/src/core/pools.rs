@@ -38,7 +38,7 @@ use crate::error::{
 };
 use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,

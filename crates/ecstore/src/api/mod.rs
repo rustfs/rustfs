@@ -15,11 +15,11 @@
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
 pub mod admin {
-    pub use crate::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
 }
 
 pub mod bitrot {
-    pub use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
+    pub use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
 }
 
 pub mod bucket {
@@ -56,7 +56,7 @@ pub mod cluster {
 }
 
 pub mod compression {
-    pub use crate::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 }
 
 pub mod config {
@@ -105,11 +105,11 @@ pub mod erasure {
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
 }
 
 pub mod global {
-    pub use crate::global::{
+    pub use crate::runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id,
         get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
         global_rustfs_port, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local, new_object_layer_fn,
@@ -124,11 +124,11 @@ pub mod layout {
 }
 
 pub mod metrics {
-    pub use crate::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
+    pub use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 }
 
 pub mod notification {
-    pub use crate::notification_sys::{
+    pub use crate::services::notification_sys::{
         NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
     };
 }
@@ -149,7 +149,7 @@ pub mod rebalance {
 }
 
 pub mod rio {
-    pub use crate::rio::{
+    pub use crate::io_support::rio::{
         DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
         boxed_reader, compression_metadata_value, wrap_reader,
     };

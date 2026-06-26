@@ -52,7 +52,7 @@ use crate::{
     config::com::{CONFIG_PREFIX, read_config},
     disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    runtime_sources,
+    runtime::sources as runtime_sources,
     store::ECStore,
 };
 use rustfs_filemeta::FileInfo;

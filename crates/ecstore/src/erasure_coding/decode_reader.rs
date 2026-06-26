@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::error::Error as DiskError;
-use crate::erasure_codec::bridge::ErasureDecodeEngine;
-use crate::get_diagnostics::{
+use crate::diagnostics::get::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_BUFFER_OUTPUT, GET_READER_BUFFER_PREFETCH, GET_READER_POLL_PENDING,
     GET_READER_POLL_READY_DATA, GET_READER_POLL_READY_EMPTY, GET_READER_POLL_READY_ERROR, GET_READER_PREFETCH_DIRECT,
     GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
     GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_FILL, GET_STAGE_OUTPUT_LOCK_WAIT, GET_STAGE_OUTPUT_POLL, GET_STAGE_RECONSTRUCT,
     GET_STAGE_STRIPE_READ,
 };
+use crate::disk::error::Error as DiskError;
+use crate::erasure_codec::bridge::ErasureDecodeEngine;
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::io;
 use std::io::ErrorKind;

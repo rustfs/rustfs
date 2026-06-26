@@ -16,7 +16,7 @@ use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
-use crate::rio::{HashReader, LimitReader};
+use crate::io_support::rio::{HashReader, LimitReader};
 use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
     range::HTTPRangeSpec,

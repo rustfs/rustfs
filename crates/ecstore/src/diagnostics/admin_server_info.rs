@@ -15,7 +15,7 @@
 use crate::data_usage::{DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, load_data_usage_from_backend};
 use crate::error::{Error, Result};
 use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
-use crate::{disk::endpoint::Endpoint, runtime_sources};
+use crate::{disk::endpoint::Endpoint, runtime::sources as runtime_sources};
 
 use crate::data_usage::load_data_usage_cache;
 use crate::storage_api_contracts::admin::StorageAdminApi;
@@ -389,7 +389,7 @@ pub fn get_commit_id() -> String {
 mod tests {
     use serial_test::serial;
 
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
 
     use super::get_server_info;
 

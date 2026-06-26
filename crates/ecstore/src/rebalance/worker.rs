@@ -10,7 +10,7 @@ use crate::error::{
     Error, is_err_object_not_found, is_err_operation_canceled, is_err_version_not_found, is_network_or_host_down,
 };
 use crate::pools::ListCallback;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use rand::RngExt as _;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};

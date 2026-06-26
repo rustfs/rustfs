@@ -144,6 +144,7 @@ ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.t
 ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_support_module_hits.txt"
 ECSTORE_ROOT_RPC_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_impl_hits.txt"
 ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE="${TMP_DIR}/ecstore_old_metadata_owner_path_hits.txt"
+ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE="${TMP_DIR}/ecstore_root_owner_path_shim_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -378,23 +379,20 @@ require_source_line \
   "pub mod cluster {" \
   "ECStore cluster control-plane public facade"
 for ecstore_private_module in \
-  admin_server_info \
   bucket \
   cache_value \
   client \
-  compress \
   config \
   data_usage \
+  diagnostics \
   disk \
   error \
-  event_notification \
-  global \
-  metrics_realtime \
-  notification_sys \
+  io_support \
   pools \
   rebalance \
-  rio \
   rpc \
+  runtime \
+  services \
   set_disk \
   store \
   store_utils \
@@ -2989,6 +2987,14 @@ fi
 
 if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
   report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
+fi
+
+rg -n --with-filename '#\[path = "(diagnostics|services|io_support|runtime)/' \
+  "${ROOT_DIR}/crates/ecstore/src/lib.rs" \
+  >"$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" ]]; then
+  report_failure "ECStore root lib must not restore owner path shims for diagnostics/services/io_support/runtime modules: $(paste -sd '; ' "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'

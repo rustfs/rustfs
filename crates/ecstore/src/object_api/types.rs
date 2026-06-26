@@ -222,14 +222,14 @@ impl ObjectInfo {
         Ok((algorithm, compressed))
     }
 
-    pub fn compression_read_plan(&self) -> Result<(CompressionAlgorithm, crate::rio::ReadCompressionBackend, bool)> {
+    pub fn compression_read_plan(&self) -> Result<(CompressionAlgorithm, crate::io_support::rio::ReadCompressionBackend, bool)> {
         let scheme = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_COMPRESSION);
 
         if let Some(scheme) = scheme {
-            let (algorithm, backend) = crate::rio::compression_scheme_to_read_plan(&scheme)?;
+            let (algorithm, backend) = crate::io_support::rio::compression_scheme_to_read_plan(&scheme)?;
             Ok((algorithm, backend, true))
         } else {
-            Ok((CompressionAlgorithm::None, crate::rio::ReadCompressionBackend::Legacy, false))
+            Ok((CompressionAlgorithm::None, crate::io_support::rio::ReadCompressionBackend::Legacy, false))
         }
     }
 

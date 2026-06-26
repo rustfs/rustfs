@@ -12,16 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::error::Error;
-use crate::disk::error_reduce::reduce_errs;
-use crate::erasure_codec::workspace::ShardBufferPool;
-use crate::erasure_coding::{BitrotReader, Erasure};
-use crate::get_diagnostics::{
+use crate::diagnostics::get::{
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_ERROR_MISSING, GET_SHARD_READ_ERROR_NONE, GET_SHARD_READ_OUTCOME_ERROR,
     GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS, GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT,
     GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GET_STAGE_STRIPE_READ_FIRST_SHARD,
     GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error, record_get_object_pipeline_failure,
 };
+use crate::disk::error::Error;
+use crate::disk::error_reduce::reduce_errs;
+use crate::erasure_codec::workspace::ShardBufferPool;
+use crate::erasure_coding::{BitrotReader, Erasure};
 use crate::set_disk::shard_source::{ShardReadCost, ShardStripeSource, StripeReadState};
 use futures::stream::{FuturesUnordered, StreamExt};
 use pin_project_lite::pin_project;
@@ -1051,7 +1051,7 @@ mod tests {
         const PARITY_SHARDS: usize = 2;
         const BLOCK_SIZE: usize = 1024 * 1024;
 
-        use crate::rio::CompressReader;
+        use crate::io_support::rio::CompressReader;
         use rustfs_utils::CompressionAlgorithm;
         use tokio::io::AsyncReadExt;
 

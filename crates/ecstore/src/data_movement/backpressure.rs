@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::{Error, Result};
-use crate::runtime_sources::{self, WorkloadSnapshotProviderRef};
+use crate::runtime::sources::{self as runtime_sources, WorkloadSnapshotProviderRef};
 use metrics::{counter, histogram};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
 use std::time::{Duration, Instant};

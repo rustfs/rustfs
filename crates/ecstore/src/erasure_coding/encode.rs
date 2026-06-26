@@ -18,7 +18,7 @@ use crate::disk::error_reduce::{
 };
 use crate::erasure_coding::BitrotWriterWrapper;
 use crate::erasure_coding::Erasure;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
