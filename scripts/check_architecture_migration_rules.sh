@@ -195,6 +195,7 @@ RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storag
 RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_domain_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_storage_contract_root_consumer_hits.txt"
 RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_facade_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_facade_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
@@ -1866,6 +1867,19 @@ fi
 
 if [[ -s "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS root runtime facade consumers must use consumer-domain modules from rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:contract::|StorageObjectInfo\b|StorageObjectOptions\b|to_s3s_etag\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner consumers must use storage_api consumer-domain modules instead of root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE")"
 fi
 
 (

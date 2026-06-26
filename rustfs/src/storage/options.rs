@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{BucketVersioningSys, Result, StorageError};
-use crate::storage::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
+use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
@@ -44,7 +44,7 @@ use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
-use crate::storage::StorageObjectOptions as ObjectOptions;
+use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
 
 #[cfg(test)]
 use rustfs_utils::http::insert_header;

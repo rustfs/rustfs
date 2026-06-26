@@ -23,11 +23,11 @@ use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
-use crate::storage::contract::{
+use crate::storage::runtime_sources;
+use crate::storage::storage_api::rpc_consumer::node_service::contract::{
     admin::StorageAdminApi,
     bucket::{BucketOptions, DeleteBucketOptions, MakeBucketOptions},
 };
-use crate::storage::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
 use futures_util::future::join_all;

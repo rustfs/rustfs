@@ -37,7 +37,7 @@ use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span, warn};
 
-use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::helper_consumer::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.

@@ -61,6 +61,129 @@ pub(crate) type StorageObjectOptions = super::ObjectOptions;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 
+pub(crate) mod access_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::BucketOperations;
+        }
+    }
+}
+
+pub(crate) mod ecfs_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::{ObjectLockRetentionOptions, ObjectOperations};
+        }
+    }
+
+    pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
+}
+
+pub(crate) mod ecfs_extend_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::ObjectToDelete;
+        }
+    }
+
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
+
+pub(crate) mod head_prefix_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod list {
+            pub(crate) use super::super::super::contract::list::ListOperations;
+        }
+    }
+}
+
+pub(crate) mod helper_consumer {
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
+
+pub(crate) mod options_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::HTTPPreconditions;
+        }
+
+        pub(crate) mod range {
+            pub(crate) use super::super::super::contract::range::HTTPRangeSpec;
+        }
+    }
+
+    pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
+}
+
+pub(crate) mod rpc_consumer {
+    pub(crate) mod node_service {
+        pub(crate) mod contract {
+            pub(crate) mod admin {
+                pub(crate) use super::super::super::super::contract::admin::StorageAdminApi;
+            }
+
+            pub(crate) mod bucket {
+                pub(crate) use super::super::super::super::contract::bucket::{
+                    BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+                };
+            }
+        }
+    }
+}
+
+pub(crate) mod s3_api_consumer {
+    pub(crate) mod bucket {
+        pub(crate) mod contract {
+            pub(crate) mod bucket {
+                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
+            }
+
+            pub(crate) mod list {
+                pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
+            }
+        }
+
+        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
+
+        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+            super::super::to_s3s_etag(etag)
+        }
+    }
+
+    pub(crate) mod multipart {
+        pub(crate) mod contract {
+            pub(crate) mod multipart {
+                pub(crate) use super::super::super::super::contract::multipart::{ListMultipartsInfo, ListPartsInfo};
+
+                #[cfg(test)]
+                pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};
+            }
+        }
+
+        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+            super::super::to_s3s_etag(etag)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) mod test {
+        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_consumer {
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
+
 pub(crate) mod ecstore_admin {
     pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info};
 }

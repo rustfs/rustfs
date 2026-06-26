@@ -22,9 +22,9 @@ use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_in
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
-use crate::storage::contract::bucket::BucketOperations;
 use crate::storage::request_context::RequestContext;
 use crate::storage::runtime_sources;
+use crate::storage::storage_api::access_consumer::contract::bucket::BucketOperations;
 use metrics::counter;
 use rustfs_iam::error::Error as IamError;
 use rustfs_policy::policy::action::{Action, AdminAction, S3Action};
