@@ -19,7 +19,7 @@ use super::io_schedule::{
     get_advanced_buffer_size,
 };
 use super::request_guard::{GetObjectGuard, PutObjectGuard};
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use rustfs_concurrency::{
     AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
     WorkloadAdmissionSnapshotProvider, WorkloadClass,

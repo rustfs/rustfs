@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::storage::rpc::encode_msgpack_map;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 
 impl NodeService {
     pub(super) async fn handle_get_proc_info(

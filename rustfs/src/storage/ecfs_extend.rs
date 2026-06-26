@@ -49,8 +49,8 @@ use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
 
-use crate::storage::runtime_sources;
 use crate::storage::storage_api::ecfs_extend_consumer::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";

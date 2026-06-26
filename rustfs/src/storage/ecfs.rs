@@ -25,13 +25,15 @@ use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
-use crate::storage::runtime_sources;
 use crate::storage::s3_api::{self, acl};
 use crate::storage::storage_api::ecfs_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
     object::{ObjectLockRetentionOptions, ObjectOperations as _},
 };
-use crate::storage::{parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled};
+use crate::storage::storage_api::ecfs_consumer::object_lock::{
+    parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
+};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};

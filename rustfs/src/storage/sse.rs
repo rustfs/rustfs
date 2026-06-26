@@ -70,7 +70,7 @@
 //! ```
 
 use super::StorageError;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
 use aes_gcm::{

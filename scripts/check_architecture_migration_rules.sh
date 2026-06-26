@@ -196,6 +196,10 @@ RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_
 RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_storage_contract_root_consumer_hits.txt"
 RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_facade_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_facade_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_runtime_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_helper_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
@@ -1880,6 +1884,55 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE" ]]; then
   report_failure "RustFS storage-owner consumers must use storage_api consumer-domain modules instead of root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:runtime_sources\b|ECStore\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner runtime consumers must use storage_api consumer-domain modules instead of root storage runtime facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:parse_object_lock_legal_hold\b|parse_object_lock_retention\b|validate_bucket_object_lock_enabled\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner helper consumers must use storage_api consumer-domain modules instead of root storage helpers: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    '(?:use\s+super::super::(?:StorageDiskRpcExt|WalkDirOptions|find_local_disk_by_ref|verify_rpc_signature)|super::super::Result<|super::super::super::(?:Error|STORAGE_CLASS_SUB_SYS))' \
+    rustfs/src/storage/rpc/http_service.rs \
+    rustfs/src/storage/rpc/node_service.rs || true
+) >"$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner RPC consumers must use storage_api consumer-domain modules instead of relative root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'use\s+(?:super::super|crate::storage)::\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
+    rustfs/src/storage/ecfs_test.rs || true
+) >"$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner tests must use storage_api test consumer modules instead of root storage helper facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (
