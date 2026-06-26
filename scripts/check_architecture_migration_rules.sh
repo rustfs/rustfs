@@ -1417,16 +1417,21 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'use (crate::|super::)?storage_api::\{|use storage_api::\{|\b(crate::|super::)?storage_api::(BucketInfo|BucketOperations|BucketOptions|DeleteBucketOptions|DiskSetSelector|HTTPRangeSpec|ListOperations|MakeBucketOptions|NamespaceLocking|ObjectIO|ObjectOperations|StorageAdminApi|TonicInterceptor|BucketTargetSys)\b' \
+  rg -n --with-filename 'use (crate::|super::)?storage_api::\{|use storage_api::\{|\b(crate::|super::)?storage_api::(BucketInfo|BucketOperations|BucketOptions|DeleteBucketOptions|DiskSetSelector|ECStore|Erasure|HTTPRangeSpec|ListOperations|MakeBucketOptions|NamespaceLocking|ObjectIO|ObjectOperations|StorageAdminApi|TonicInterceptor|BucketTargetSys)\b' \
+    crates/ecstore/benches \
+    crates/ecstore/tests \
     crates/heal/src/heal \
     crates/heal/tests \
     crates/iam/src \
+    crates/notify/src \
     crates/obs/src/metrics \
     crates/protocols/src/swift \
     crates/s3select-api/src \
     crates/scanner/src \
     crates/scanner/tests \
     crates/e2e_test/src \
+    rustfs/src/admin/service/config.rs \
+    rustfs/src/storage/rpc/node_service.rs \
     --glob '*.rs' \
     --glob '!**/storage_api.rs' \
     --glob '!**/storage_api/mod.rs' || true

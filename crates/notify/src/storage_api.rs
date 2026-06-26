@@ -41,3 +41,9 @@ pub(crate) async fn save_notify_server_config(
         .await
         .map_err(|err| err.to_string())
 }
+
+pub(crate) mod crate_boundary {
+    pub(crate) use super::{
+        read_notify_server_config_without_migrate, resolve_notify_object_store_handle, save_notify_server_config,
+    };
+}

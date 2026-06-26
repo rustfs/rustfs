@@ -18,6 +18,7 @@ use crate::admin::runtime_sources::{
 };
 use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
 use crate::admin::storage_api::contract::StorageAdminApi;
+use crate::admin::storage_api::runtime::ECStore;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
@@ -66,9 +67,7 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidRequest, message.into())
 }
 
-fn resolve_runtime_config_store_for_context(
-    context: Option<&AppContext>,
-) -> S3Result<std::sync::Arc<crate::app::storage_api::ECStore>> {
+fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<ECStore>> {
     resolve_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 

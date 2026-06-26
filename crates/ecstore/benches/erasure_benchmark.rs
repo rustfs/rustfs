@@ -49,7 +49,7 @@ mod storage_api;
 use std::hint::black_box;
 use std::io::Cursor;
 use std::time::Duration;
-use storage_api::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
+use storage_api::erasure::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
 use tokio::runtime::Runtime;
 
 /// Benchmark configuration structure

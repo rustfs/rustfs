@@ -9,7 +9,7 @@ mod storage_api;
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
-use storage_api::{
+use storage_api::minio_generated_read::{
     DiskAPI as _, DiskOption, Endpoint, Erasure, GetObjectReader, ObjectInfo, ObjectOptions, create_bitrot_reader, new_disk,
 };
 use temp_env::async_with_vars;

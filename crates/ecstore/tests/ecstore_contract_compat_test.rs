@@ -18,7 +18,7 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
-use storage_api::{
+use storage_api::contract_compat::{
     CompletePart, DeletedObject, DiskStore, ECStore, Error, GetObjectReader, HTTPRangeSpec, ListMultipartsInfo, ListPartsInfo,
     MultipartInfo, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAdminApi,
     StorageHealOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageListOperations,
