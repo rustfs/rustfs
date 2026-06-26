@@ -15,8 +15,9 @@
 use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::{
-    HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH,
-    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report,
+    HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_READY_PATH,
+    PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, collect_cluster_read_dependency_readiness_report,
+    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report, collect_node_readiness_report,
 };
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -55,6 +56,14 @@ pub(crate) struct HealthCheckState {
 pub(crate) enum HealthProbe {
     Liveness,
     Readiness,
+    ClusterWrite,
+    ClusterRead,
+}
+
+impl HealthProbe {
+    const fn requires_lock_quorum(self) -> bool {
+        matches!(self, Self::ClusterWrite | Self::ClusterRead)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -76,8 +85,13 @@ pub(crate) struct HealthPayloadContext<'a> {
     pub(crate) include_dependency_details: bool,
 }
 
-pub(crate) async fn collect_dependency_readiness() -> crate::server::DependencyReadinessReport {
-    collect_runtime_dependency_readiness_report().await
+pub(crate) async fn collect_probe_readiness(probe: HealthProbe) -> Option<crate::server::DependencyReadinessReport> {
+    match probe {
+        HealthProbe::Liveness => None,
+        HealthProbe::Readiness => Some(collect_node_readiness_report().await),
+        HealthProbe::ClusterWrite => Some(collect_runtime_dependency_readiness_report().await),
+        HealthProbe::ClusterRead => Some(collect_cluster_read_dependency_readiness_report().await),
+    }
 }
 
 pub(crate) fn health_check_state(
@@ -94,7 +108,7 @@ pub(crate) fn health_check_state(
         };
     }
 
-    let ready = storage_ready && iam_ready && lock_quorum_ready;
+    let ready = storage_ready && iam_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
     let status = if ready { "ok" } else { "degraded" };
 
     let status_code = if ready {
@@ -158,10 +172,11 @@ pub(crate) fn build_degraded_reasons(reasons: &[crate::server::ReadinessDegraded
 }
 
 pub(crate) fn probe_from_path(path: &str) -> HealthProbe {
-    if path == HEALTH_READY_PATH {
-        HealthProbe::Readiness
-    } else {
-        HealthProbe::Liveness
+    match path {
+        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH => HealthProbe::Readiness,
+        MINIO_HEALTH_CLUSTER_PATH => HealthProbe::ClusterWrite,
+        MINIO_HEALTH_CLUSTER_READ_PATH => HealthProbe::ClusterRead,
+        _ => HealthProbe::Liveness,
     }
 }
 
@@ -175,7 +190,7 @@ pub(crate) fn build_health_response_parts(
 ) -> HealthResponseParts {
     let (storage_ready, iam_ready, lock_quorum_ready, mut health, mut degraded_reasons, include_dependency_details) =
         match (probe, readiness_report) {
-            (HealthProbe::Readiness, Some(readiness_report)) => {
+            (probe @ (HealthProbe::Readiness | HealthProbe::ClusterWrite | HealthProbe::ClusterRead), Some(readiness_report)) => {
                 let storage_ready = readiness_report.readiness.storage_ready;
                 let iam_ready = readiness_report.readiness.iam_ready;
                 let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
@@ -188,7 +203,7 @@ pub(crate) fn build_health_response_parts(
                     true,
                 )
             }
-            (HealthProbe::Readiness, None) => (
+            (HealthProbe::Readiness | HealthProbe::ClusterWrite | HealthProbe::ClusterRead, None) => (
                 false,
                 false,
                 false,
@@ -284,11 +299,7 @@ impl Operation for HealthCheckHandler {
         }
 
         let probe = probe_from_path(req.uri.path());
-        let readiness_report = if probe == HealthProbe::Readiness {
-            Some(collect_dependency_readiness().await)
-        } else {
-            None
-        };
+        let readiness_report = collect_probe_readiness(probe).await;
 
         let response_parts =
             build_health_response_parts(method.clone(), probe, readiness_report.as_ref(), "rustfs-endpoint", None, None);
@@ -347,6 +358,14 @@ mod tests {
     #[test]
     fn test_readiness_state_lock_not_ready() {
         let state = health_check_state(true, true, false, HealthProbe::Readiness);
+        assert_eq!(state.status_code, StatusCode::OK);
+        assert_eq!(state.status, "ok");
+        assert!(state.ready);
+    }
+
+    #[test]
+    fn test_cluster_write_state_lock_not_ready() {
+        let state = health_check_state(true, true, false, HealthProbe::ClusterWrite);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -375,6 +394,9 @@ mod tests {
     #[test]
     fn test_probe_from_path_readiness() {
         assert_eq!(probe_from_path(HEALTH_READY_PATH), HealthProbe::Readiness);
+        assert_eq!(probe_from_path(MINIO_HEALTH_READY_PATH), HealthProbe::Readiness);
+        assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_PATH), HealthProbe::ClusterWrite);
+        assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_READ_PATH), HealthProbe::ClusterRead);
     }
 
     #[test]

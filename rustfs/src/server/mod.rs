@@ -52,16 +52,18 @@ pub(crate) use module_switch::{
 };
 pub(crate) use prefix::{
     ADMIN_PREFIX, CONSOLE_PREFIX, FAVICON_PATH, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, LICENSE,
-    MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH,
-    PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX,
-    TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
+    MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
+    MINIO_HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, TABLE_CATALOG_COMPAT_PREFIX,
+    TABLE_CATALOG_PREFIX, TONIC_PREFIX, VERSION, has_path_prefix, is_admin_path, is_table_catalog_path,
 };
 pub(crate) use readiness::DependencyReadiness;
 pub(crate) use readiness::DependencyReadinessReport;
 pub(crate) use readiness::ReadinessDegradedReason;
 pub(crate) use readiness::ReadinessGateLayer;
+pub(crate) use readiness::collect_cluster_read_dependency_readiness_report;
 pub(crate) use readiness::collect_dependency_readiness;
 pub(crate) use readiness::collect_dependency_readiness_report;
+pub(crate) use readiness::collect_node_readiness_report;
 pub use readiness::publish_ready_when_runtime_ready;
 pub(crate) use readiness::snapshot_dependency_readiness_report;
 

@@ -137,6 +137,7 @@ fn is_probe_path(path: &str) -> bool {
             | crate::server::MINIO_HEALTH_LIVE_PATH
             | crate::server::MINIO_HEALTH_READY_PATH
             | crate::server::MINIO_HEALTH_CLUSTER_PATH
+            | crate::server::MINIO_HEALTH_CLUSTER_READ_PATH
             | crate::server::FAVICON_PATH
     );
 
@@ -364,7 +365,24 @@ fn pool_write_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize
     write_quorum.max(1)
 }
 
-fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+fn pool_read_quorum(info: &StorageInfo, pool_idx: usize, set_drive_count: usize) -> usize {
+    if set_drive_count == 0 {
+        return 1;
+    }
+
+    info.backend
+        .standard_sc_data
+        .get(pool_idx)
+        .copied()
+        .filter(|count| *count > 0)
+        .unwrap_or_else(|| (set_drive_count / 2).max(1))
+        .max(1)
+}
+
+fn storage_ready_from_runtime_state_with_quorum<F>(info: &StorageInfo, quorum_for_set: F) -> bool
+where
+    F: Fn(&StorageInfo, usize, usize) -> usize,
+{
     if info.disks.is_empty() {
         return false;
     }
@@ -407,9 +425,17 @@ fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
 
     set_drive_counts.into_iter().all(|((pool_idx, set_idx), set_drive_count)| {
         let online = set_online_counts.get(&(pool_idx, set_idx)).copied().unwrap_or_default();
-        let write_quorum = pool_write_quorum(info, pool_idx, set_drive_count);
-        online >= write_quorum
+        let quorum = quorum_for_set(info, pool_idx, set_drive_count);
+        online >= quorum
     })
+}
+
+fn storage_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_quorum(info, pool_write_quorum)
+}
+
+fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
+    storage_ready_from_runtime_state_with_quorum(info, pool_read_quorum)
 }
 
 fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
@@ -465,6 +491,32 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
     report
 }
 
+pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
+    let readiness = DependencyReadiness {
+        storage_ready: runtime_sources::object_store_handle().is_some(),
+        iam_ready: runtime_sources::iam_ready(),
+        lock_quorum_ready: true,
+    };
+    let report = dependency_readiness_report_from_readiness(readiness);
+    record_readiness_report(&report);
+    report
+}
+
+pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
+    let iam_ready_raw = runtime_sources::iam_ready();
+    let storage_ready = collect_storage_read_readiness_uncached().await;
+    let lock_quorum_status = collect_lock_quorum_status().await;
+
+    let readiness = DependencyReadiness {
+        storage_ready,
+        iam_ready: iam_ready_raw,
+        lock_quorum_ready: lock_quorum_status.ready,
+    };
+    let report = dependency_readiness_report_from_readiness(readiness);
+    record_readiness_report(&report);
+    report
+}
+
 pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
         storage_ready: collect_storage_readiness_uncached().await,
@@ -504,6 +556,15 @@ async fn collect_storage_readiness_uncached() -> bool {
     if let Some(store) = runtime_sources::object_store_handle() {
         let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
         storage_ready_from_runtime_state(&storage_info)
+    } else {
+        false
+    }
+}
+
+async fn collect_storage_read_readiness_uncached() -> bool {
+    if let Some(store) = runtime_sources::object_store_handle() {
+        let storage_info = StorageAdminApi::storage_info(store.as_ref()).await;
+        storage_read_ready_from_runtime_state(&storage_info)
     } else {
         false
     }
@@ -773,6 +834,33 @@ mod tests {
         };
 
         assert!(storage_ready_from_runtime_state(&info));
+    }
+
+    #[test]
+    fn storage_read_ready_from_runtime_state_allows_read_quorum_below_write_quorum() {
+        let disks = (0..4)
+            .map(|disk_index| Disk {
+                endpoint: format!("127.0.0.1:900{disk_index}"),
+                drive_path: format!("/data{disk_index}"),
+                pool_index: 0,
+                set_index: 0,
+                disk_index,
+                state: if disk_index < 2 { "ok" } else { "offline" }.to_string(),
+                runtime_state: Some(if disk_index < 2 { "online" } else { "offline" }.to_string()),
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let info = StorageInfo {
+            backend: BackendInfo {
+                standard_sc_data: vec![2],
+                drives_per_set: vec![4],
+                ..Default::default()
+            },
+            disks,
+        };
+
+        assert!(storage_read_ready_from_runtime_state(&info));
+        assert!(!storage_ready_from_runtime_state(&info));
     }
 
     #[test]
