@@ -24,15 +24,15 @@ pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
 pub(crate) use rustfs_ecstore::api::global::GLOBAL_LOCAL_DISK_MAP as ECSTORE_GLOBAL_LOCAL_DISK_MAP;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
-pub(crate) use rustfs_storage_api::{
-    BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations, StorageAdminApi,
-};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
+
     pub(crate) use super::{
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_GLOBAL_LOCAL_DISK_MAP, ECSTORE_RUSTFS_META_BUCKET,
         EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
-        EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
+        EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore,
     };
 
     #[cfg(test)]
@@ -40,7 +40,7 @@ pub(crate) mod owner {
 }
 
 pub(crate) mod storage {
-    pub(crate) use super::{
+    pub(crate) use super::storage_contracts::{
         BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
         StorageAdminApi,
     };
@@ -48,5 +48,5 @@ pub(crate) mod storage {
 
 #[cfg(test)]
 pub(crate) mod status {
-    pub(crate) use super::BucketInfo;
+    pub(crate) use super::storage_contracts::BucketInfo;
 }

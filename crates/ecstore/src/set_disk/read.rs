@@ -122,6 +122,16 @@ enum ReadRepairAdmissionOutcome {
 type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
 type ReadRepairAdmissionSubmitter = fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
 
+struct ReadRepairHealSubmission<'a> {
+    bucket: &'a str,
+    object: &'a str,
+    version_id: Option<&'a str>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: Option<usize>,
+    reason: &'static str,
+}
+
 fn send_read_repair_heal_request(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
     Box::pin(async {
         match send_heal_request_with_admission(request).await {
@@ -141,6 +151,25 @@ async fn submit_read_repair_heal(
     reason: &'static str,
 ) {
     submit_read_repair_heal_with_submitter(
+        ReadRepairHealSubmission {
+            bucket,
+            object,
+            version_id,
+            pool_index,
+            set_index,
+            part_number,
+            reason,
+        },
+        send_read_repair_heal_request,
+    )
+    .await;
+}
+
+async fn submit_read_repair_heal_with_submitter(
+    submission: ReadRepairHealSubmission<'_>,
+    submitter: ReadRepairAdmissionSubmitter,
+) {
+    let ReadRepairHealSubmission {
         bucket,
         object,
         version_id,
@@ -148,21 +177,8 @@ async fn submit_read_repair_heal(
         set_index,
         part_number,
         reason,
-        send_read_repair_heal_request,
-    )
-    .await;
-}
+    } = submission;
 
-async fn submit_read_repair_heal_with_submitter(
-    bucket: &str,
-    object: &str,
-    version_id: Option<&str>,
-    pool_index: usize,
-    set_index: usize,
-    part_number: Option<usize>,
-    reason: &'static str,
-    submitter: ReadRepairAdmissionSubmitter,
-) {
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
         debug!(
@@ -1622,13 +1638,15 @@ mod metadata_cache_tests {
         let started = Instant::now();
 
         submit_read_repair_heal_with_submitter(
-            &bucket,
-            "object",
-            None,
-            0,
-            0,
-            Some(1),
-            "missing_shards",
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
             slow_read_repair_submitter,
         )
         .await;
@@ -1654,13 +1672,15 @@ mod metadata_cache_tests {
         let bucket = format!("bucket-{}", Uuid::new_v4());
 
         submit_read_repair_heal_with_submitter(
-            &bucket,
-            "object",
-            None,
-            0,
-            0,
-            Some(1),
-            "missing_shards",
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
             dropped_read_repair_submitter,
         )
         .await;

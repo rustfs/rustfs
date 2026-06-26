@@ -72,12 +72,11 @@ pub(crate) use rustfs_ecstore::api::global::{
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 pub(crate) use rustfs_ecstore::api::tier::tier_config::TierConfig as EcstoreTierConfig;
-pub(crate) use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, HTTPRangeSpec, NamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectToDelete, StorageAdminApi,
-};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete};
+
     pub(crate) use super::{
         ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
         ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys,
@@ -86,12 +85,12 @@ pub(crate) mod owner {
         EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfig,
         EcstoreReplicationConfigurationExt, EcstoreReplicationHealQueueResult, EcstoreReplicationQueueAdmission,
         EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig,
-        EcstoreVersioningApi, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, ecstore_apply_expiry_rule,
-        ecstore_apply_transition_rule, ecstore_get_global_expiry_state, ecstore_get_global_tier_config_mgr,
-        ecstore_get_lifecycle_config, ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_is_erasure,
-        ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_path2_bucket_object,
-        ecstore_path2_bucket_object_with_base_path, ecstore_queue_replication_heal_internal, ecstore_read_config,
-        ecstore_replace_bucket_usage_memory_from_info, ecstore_resolve_object_store_handle, ecstore_save_config,
+        EcstoreVersioningApi, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_get_global_expiry_state,
+        ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
+        ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket,
+        ecstore_list_path_raw, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,
+        ecstore_queue_replication_heal_internal, ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info,
+        ecstore_resolve_object_store_handle, ecstore_save_config,
     };
 
     #[cfg(test)]
@@ -99,11 +98,11 @@ pub(crate) mod owner {
 }
 
 pub(crate) mod scan {
-    pub(crate) use super::{BucketOperations, BucketOptions, NamespaceLocking};
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, NamespaceLocking};
 }
 
 pub(crate) mod scanner_io {
-    pub(crate) use super::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
+    pub(crate) use super::storage_contracts::{BucketInfo, BucketOperations, BucketOptions, DiskSetSelector, StorageAdminApi};
     #[cfg(test)]
-    pub(crate) use super::{HTTPRangeSpec, ObjectIO};
+    pub(crate) use super::storage_contracts::{HTTPRangeSpec, ObjectIO};
 }
