@@ -23,7 +23,7 @@ use crate::admin::storage_api::bucket::{
     quota::BucketQuota,
     target::BucketTargets,
 };
-use crate::admin::storage_api::contract::{BucketOperations, BucketOptions, MakeBucketOptions};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::{
     admin::runtime_sources::resolve_object_store_handle,

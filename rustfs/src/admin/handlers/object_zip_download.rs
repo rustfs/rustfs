@@ -15,9 +15,9 @@
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
 use crate::admin::storage_api::access::{ReqInfo, authorize_request};
-use crate::admin::storage_api::contract::{
-    BucketOperations, BucketOptions, ListOperations as _, ObjectIO as _, ObjectOperations as _,
-};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::list::ListOperations as _;
+use crate::admin::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
 use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
