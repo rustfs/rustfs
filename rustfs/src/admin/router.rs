@@ -33,7 +33,7 @@ use crate::admin::runtime_sources::{
     resolve_server_config,
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
-use crate::admin::storage_api::contract::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;

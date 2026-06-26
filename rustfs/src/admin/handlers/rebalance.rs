@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_api::contract::{BucketOperations, BucketOptions, StorageAdminApi};
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
+use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::rebalance::{
     DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,

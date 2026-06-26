@@ -18,7 +18,7 @@ use crate::admin::runtime_sources::resolve_object_store_handle;
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
-use crate::admin::storage_api::contract::HealOperations as _;
+use crate::admin::storage_api::contract::heal::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use bytes::Bytes;
