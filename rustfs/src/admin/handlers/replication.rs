@@ -16,14 +16,14 @@ use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
-use crate::admin::storage_api::StorageError;
-use crate::admin::storage_api::bucket_target_sys::{BucketTargetError, BucketTargetSys};
-use crate::admin::storage_api::metadata::BUCKET_TARGETS_FILE;
-use crate::admin::storage_api::metadata_sys;
-use crate::admin::storage_api::metadata_sys::get_replication_config;
-use crate::admin::storage_api::replication::BucketStats;
-use crate::admin::storage_api::target::BucketTarget;
-use crate::admin::storage_api::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
+use crate::admin::storage_api::bucket::metadata_sys;
+use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
+use crate::admin::storage_api::bucket::replication::BucketStats;
+use crate::admin::storage_api::bucket::target::BucketTarget;
+use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
+use crate::admin::storage_api::contract::{BucketOperations, BucketOptions};
+use crate::admin::storage_api::error::StorageError;
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
@@ -448,7 +448,7 @@ impl Operation for RemoveRemoteTargetHandler {
 #[cfg(test)]
 mod tests {
     use super::{extract_query_params, validate_remote_target_tls_settings};
-    use crate::admin::storage_api::target::BucketTarget;
+    use crate::admin::storage_api::bucket::target::BucketTarget;
     use http::Uri;
 
     #[test]

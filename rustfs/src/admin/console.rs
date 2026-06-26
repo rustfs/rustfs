@@ -14,7 +14,7 @@
 
 use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_dependency_readiness};
 use crate::admin::runtime_sources::{default_admin_usecase, resolve_oidc_handle};
-use crate::admin::storage_api::RequestContext;
+use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
 use crate::server::{

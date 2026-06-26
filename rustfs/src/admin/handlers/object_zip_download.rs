@@ -14,8 +14,11 @@
 
 use crate::admin::router::{ADMIN_OBJECT_ZIP_DOWNLOADS_PATH, AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle, resolve_region};
-use crate::admin::storage_api::{BucketOperations, BucketOptions, ListOperations as _, ObjectIO as _, ObjectOperations as _};
-use crate::admin::storage_api::{ReqInfo, StorageObjectOptions as ObjectOptions, authorize_request};
+use crate::admin::storage_api::access::{ReqInfo, authorize_request};
+use crate::admin::storage_api::contract::{
+    BucketOperations, BucketOptions, ListOperations as _, ObjectIO as _, ObjectOperations as _,
+};
+use crate::admin::storage_api::object::StorageObjectOptions as ObjectOptions;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::license::license_check;
@@ -645,7 +648,7 @@ async fn preflight_zip_items(request: &CreateObjectZipDownloadRequest, items: &[
     Ok(())
 }
 
-fn storage_error_to_s3(err: crate::admin::storage_api::Error) -> s3s::S3Error {
+fn storage_error_to_s3(err: crate::admin::storage_api::error::Error) -> s3s::S3Error {
     ApiError::from(err).into()
 }
 
