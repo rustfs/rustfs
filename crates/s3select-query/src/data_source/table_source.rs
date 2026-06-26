@@ -18,12 +18,11 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
-use datafusion::common::Result as DFResult;
+use datafusion::common::{Result as DFResult, TableReference};
 use datafusion::datasource::{TableProvider, provider_as_source};
 use datafusion::error::DataFusionError;
 use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder, TableProviderFilterPushDown, TableSource};
 use datafusion::prelude::Expr;
-use datafusion::sql::TableReference;
 use tracing::debug;
 
 pub const TEMP_LOCATION_TABLE_NAME: &str = "external_location_table";
