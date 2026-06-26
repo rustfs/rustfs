@@ -16,5 +16,5 @@ use crate::app::context;
 
 pub(crate) use context::{
     AppContext, publish_oidc_handle, resolve_action_credentials, resolve_buffer_config, resolve_notify_interface,
-    resolve_ready_iam_handle, resolve_region, resolve_replication_pool_handle,
+    resolve_outbound_tls_generation, resolve_ready_iam_handle, resolve_region, resolve_replication_pool_handle,
 };

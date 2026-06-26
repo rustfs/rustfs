@@ -22,7 +22,11 @@ use rustfs_kms::ObjectEncryptionService;
 use rustfs_lock::LockClient;
 use std::sync::Arc;
 
-pub(crate) use context::{AppContext, get_global_app_context};
+pub(crate) use context::AppContext;
+
+pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
+    context::get_global_app_context()
+}
 
 pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
     context::resolve_object_store_handle()

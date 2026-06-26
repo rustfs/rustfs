@@ -5407,15 +5407,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, diff hygiene, residual ECFS usecase-construction scan, Rust risk
     scan, and full PR gate before PR.
 
+- [x] `API-234` Wrap runtime AppContext entrypoints behind owner sources.
+  - Do: replace storage RPC use of the re-exported global AppContext getter
+    with an owner-local `current_app_context()` helper, and route startup
+    replication-pool/TLS-generation reads through the root runtime-source
+    entrypoints.
+  - Acceptance: storage consumers no longer call or re-export
+    `get_global_app_context`, startup runtime sources no longer directly
+    reference `crate::app::context`, and migration rules reject both bypasses.
+  - Must preserve: node RPC server context fallback, object-store resolution,
+    startup bucket replication resync, TLS generation increments, outbound TLS
+    publication, and runtime-source visibility.
+  - Verification: focused storage RPC/startup TLS checks, formatting,
+    migration and layer guards, diff hygiene, residual AppContext entrypoint
+    scans, Rust risk scan, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue larger app/runtime global-source batches
-   after API-233.
+   after API-234.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-234 removes the storage runtime-source re-export of the global AppContext getter and keeps startup AppContext reads behind root runtime-source entrypoints. |
+| Migration preservation | pass | Node RPC context fallback, object-store lookup, startup replication resync, and TLS generation math keep the same runtime handles and fallback behavior. |
+| Testing/verification | pass | Focused storage RPC/startup TLS checks, formatting, migration/layer guards, residual entrypoint scans, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-233 moves ECFS S3 route bucket, multipart, and object usecase construction behind the storage S3 API boundary without introducing storage infra reverse dependencies. |
 | Migration preservation | pass | ECFS request forwarding, metrics recording, boxed recursive async handlers, and AppContext-backed usecase construction keep the same behavior. |
 | Testing/verification | pass | Focused storage ECFS tests, formatting, migration/layer guards, residual ECFS construction scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
@@ -5655,6 +5673,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-234 current slice:
+  - Branch freshness check: stacked on API-233 local branch while API-231 PR
+    #3895 is pending.
+  - `cargo test -p rustfs storage::rpc --lib`: passed, 115 passed and 9
+    ignored.
+  - `cargo test -p rustfs startup_tls_material --lib`: passed, 3 passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - AppContext entrypoint residual scans: passed; storage consumers no longer
+    call or re-export `get_global_app_context`, and startup runtime sources no
+    longer reference `crate::app::context` directly.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - Full PR gate: planned before PR.
 
 - Issue #660 API-233 current slice:
   - Branch freshness check: stacked on API-232 local branch while API-231 PR
