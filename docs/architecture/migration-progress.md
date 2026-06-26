@@ -5,14 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-admin-usecase-runtime-boundary`
+- Branch: `overtrue/arch-admin-runtime-global-boundary`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/CTX-002`.
-- Based on: latest `origin/main` after CTX-002 PR #3893 merged; branch routes
-  admin `DefaultAdminUsecase` construction through the admin runtime-source
-  boundary.
+- Based on: stacked on API-230 PR #3894 while CI is pending; branch routes
+  remaining admin object-usecase and AppContext global entry points through the
+  admin runtime-source boundary.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-230; admin handlers still use
-  the same `DefaultAdminUsecase` implementation and AppContext-backed handles.
+- Runtime behavior changes: none expected for API-231; admin misc extension and
+  service reload paths still use the same AppContext-backed handles.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
@@ -5362,15 +5362,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     diff hygiene, residual admin usecase import scan, Rust risk scan, and full
     PR gate passed before PR.
 
+- [x] `API-231` Route admin object-usecase and AppContext globals through runtime boundary.
+  - Do: expose admin object-usecase construction and current AppContext lookup
+    from `rustfs/src/admin/runtime_sources.rs`, then route misc extension object
+    lambda and admin service reload paths through those boundary helpers.
+  - Acceptance: admin production sources no longer import
+    `crate::app::object_usecase` or `get_global_app_context` directly outside
+    `rustfs/src/admin/runtime_sources.rs`.
+  - Must preserve: object-lambda request execution, listen-notification bucket
+    validation, dynamic config reloads, runtime config snapshot publication, and
+    site-replication state reload/normalization behavior.
+  - Verification: focused admin router/service checks, formatting, migration
+    and layer guards, diff hygiene, residual admin global-entry scan, Rust risk
+    scan, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue larger admin/app/runtime global-source
-   batches after API-230.
+   batches after API-231.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-231 moves admin misc object-usecase construction and AppContext lookup behind the admin runtime-source boundary instead of keeping direct global entry points in router/service files. |
+| Migration preservation | pass | Object-lambda get execution, listen-notification bucket validation, dynamic config reload, runtime config snapshot reload, and site-replication normalization still use the same runtime handles. |
+| Testing/verification | pass | Focused admin router/service checks, formatting, migration/layer guards, residual admin global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-230 moves admin handler `DefaultAdminUsecase` construction behind the admin runtime-source boundary instead of letting each handler import the app usecase directly. |
 | Migration preservation | pass | Admin auth checks, discovery URLs, system info, pool/decommission, cluster snapshot, plugin catalog, table catalog, module-switch, and console responses keep the same usecase implementation. |
 | Testing/verification | pass | Focused admin tests, formatting, migration/layer guards, direct app-usecase import scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
@@ -5601,6 +5618,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-231 current slice:
+  - Branch freshness check: stacked on API-230 PR #3894 while CI is pending.
+  - `cargo test -p rustfs admin::router --lib`: passed.
+  - `cargo test -p rustfs admin::service::config --lib`: passed.
+  - `cargo test -p rustfs admin::service::site_replication --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin global-entry residual scan: passed; remaining
+    `get_global_app_context`, `crate::app::object_usecase`, and
+    `DefaultObjectUsecase::from_global()` references are confined to
+    `rustfs/src/admin/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
 
 - Issue #660 API-230 current slice:
   - Branch freshness check: based on CTX-002 PR #3893 head while #3893 was
