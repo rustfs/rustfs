@@ -37,6 +37,16 @@ use tracing::error;
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>)> + Send + 'a>>;
 
+const ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: &str = "RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE";
+const DEFAULT_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: bool = false;
+
+fn get_shard_locality_preference_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE,
+        DEFAULT_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE,
+    )
+}
+
 #[derive(Default)]
 struct ShardReadCostCounts {
     local: usize,
@@ -57,6 +67,60 @@ impl ShardReadCostCounts {
 
     fn low_cost(&self) -> usize {
         self.local + self.same_node
+    }
+}
+
+fn shard_read_launch_rank(cost: ShardReadCost) -> u8 {
+    match cost {
+        ShardReadCost::Local | ShardReadCost::SameNode => 0,
+        ShardReadCost::Unknown => 1,
+        ShardReadCost::Remote => 2,
+    }
+}
+
+fn shard_read_launch_order(read_costs: &[ShardReadCost], num_readers: usize, locality_preference_enabled: bool) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..num_readers).collect();
+    if locality_preference_enabled {
+        order.sort_by_key(|index| {
+            (
+                shard_read_launch_rank(read_costs.get(*index).copied().unwrap_or(ShardReadCost::Unknown)),
+                *index,
+            )
+        });
+    }
+    order
+}
+
+enum ReaderLaunchIter<'a, R> {
+    Original(std::iter::Enumerate<std::slice::IterMut<'a, Option<BitrotReader<R>>>>),
+    Locality(std::vec::IntoIter<(usize, &'a mut Option<BitrotReader<R>>)>),
+}
+
+impl<'a, R> ReaderLaunchIter<'a, R> {
+    fn new(readers: &'a mut [Option<BitrotReader<R>>], read_costs: &[ShardReadCost], locality_preference_enabled: bool) -> Self {
+        if !locality_preference_enabled {
+            return Self::Original(readers.iter_mut().enumerate());
+        }
+
+        let mut ordered_readers: Vec<_> = readers.iter_mut().enumerate().collect();
+        ordered_readers.sort_by_key(|(index, _)| {
+            (
+                shard_read_launch_rank(read_costs.get(*index).copied().unwrap_or(ShardReadCost::Unknown)),
+                *index,
+            )
+        });
+        Self::Locality(ordered_readers.into_iter())
+    }
+}
+
+impl<'a, R> Iterator for ReaderLaunchIter<'a, R> {
+    type Item = (usize, &'a mut Option<BitrotReader<R>>);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            Self::Original(iter) => iter.next(),
+            Self::Locality(iter) => iter.next(),
+        }
     }
 }
 
@@ -155,6 +219,7 @@ pub(crate) struct ParallelReader<R> {
     total_shards: usize,
     metrics_path: Option<&'static str>,
     read_costs: Vec<ShardReadCost>,
+    locality_preference_enabled: bool,
     // Request-scoped shard buffers keyed by shard index. Keeping ownership in
     // `ParallelReader` avoids dropping unused parity/backup slot buffers between stripes.
     buffers: ShardBufferPool,
@@ -207,6 +272,7 @@ where
             total_shards: e.data_shards + e.parity_shards,
             metrics_path,
             read_costs,
+            locality_preference_enabled: get_shard_locality_preference_enabled(),
             buffers: ShardBufferPool::new(e.data_shards + e.parity_shards),
         }
     }
@@ -234,27 +300,38 @@ where
 
         let mut shards: Vec<Option<Vec<u8>>> = vec![None; num_readers];
         let mut errs = vec![None; num_readers];
+        let read_costs = self.read_costs.as_slice();
+        let locality_preference_enabled = self.locality_preference_enabled;
         let low_cost_available = self
             .readers
             .iter()
             .enumerate()
             .filter(|(index, reader)| {
                 reader.is_some()
-                    && self
-                        .read_costs
+                    && read_costs
                         .get(*index)
                         .copied()
                         .unwrap_or(ShardReadCost::Unknown)
                         .is_low_cost()
             })
             .count();
+        let remote_available = self
+            .readers
+            .iter()
+            .enumerate()
+            .filter(|(index, reader)| {
+                reader.is_some() && read_costs.get(*index).copied().unwrap_or(ShardReadCost::Unknown).is_remote()
+            })
+            .count();
         let mut successful_costs = ShardReadCostCounts::default();
+        let mut local_preferred = 0usize;
+        let mut fallback_to_remote = 0usize;
+        let mut remote_scheduled = 0usize;
 
         self.buffers.ensure_slots(num_readers);
 
-        let reader_iter: std::slice::IterMut<'_, Option<BitrotReader<R>>> = self.readers.iter_mut();
         if num_readers >= self.data_shards {
-            let mut reader_iter = reader_iter.enumerate();
+            let mut reader_iter = ReaderLaunchIter::new(&mut self.readers, read_costs, locality_preference_enabled);
             let mut sets = FuturesUnordered::new();
             let stripe_read_start = Instant::now();
             let mut scheduled = 0usize;
@@ -266,7 +343,17 @@ where
                     } else {
                         None
                     };
-                    let read_cost = self.read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+                    let read_cost = read_costs.get(i).copied().unwrap_or(ShardReadCost::Unknown);
+                    if locality_preference_enabled {
+                        if read_cost.is_low_cost() {
+                            local_preferred += 1;
+                        } else if read_cost.is_remote() {
+                            remote_scheduled += 1;
+                            if low_cost_available < self.data_shards {
+                                fallback_to_remote += 1;
+                            }
+                        }
+                    }
                     scheduled += 1;
                     sets.push(read_shard(
                         i,
@@ -314,7 +401,15 @@ where
                             } else {
                                 None
                             };
-                            let next_read_cost = self.read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
+                            let next_read_cost = read_costs.get(next_i).copied().unwrap_or(ShardReadCost::Unknown);
+                            if locality_preference_enabled {
+                                if next_read_cost.is_low_cost() {
+                                    local_preferred += 1;
+                                } else if next_read_cost.is_remote() {
+                                    remote_scheduled += 1;
+                                    fallback_to_remote += 1;
+                                }
+                            }
                             scheduled += 1;
                             sets.push(read_shard(
                                 next_i,
@@ -337,6 +432,17 @@ where
                             stripe_read_start.elapsed().as_secs_f64(),
                         );
                         rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
+                        if locality_preference_enabled {
+                            let remote_avoided = remote_available.saturating_sub(remote_scheduled);
+                            rustfs_io_metrics::record_get_object_shard_locality_policy(
+                                path,
+                                local_preferred,
+                                remote_avoided,
+                                fallback_to_remote,
+                            );
+                        } else {
+                            rustfs_io_metrics::record_get_object_shard_locality_policy_disabled(path);
+                        }
                     }
                     quorum_recorded = true;
                     break;
@@ -350,6 +456,17 @@ where
                     stripe_read_start.elapsed().as_secs_f64(),
                 );
                 rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
+                if locality_preference_enabled {
+                    let remote_avoided = remote_available.saturating_sub(remote_scheduled);
+                    rustfs_io_metrics::record_get_object_shard_locality_policy(
+                        path,
+                        local_preferred,
+                        remote_avoided,
+                        fallback_to_remote,
+                    );
+                } else {
+                    rustfs_io_metrics::record_get_object_shard_locality_policy_disabled(path);
+                }
             }
         }
 
@@ -984,6 +1101,190 @@ mod tests {
         assert_eq!(decoded, compressed);
     }
 
+    #[test]
+    fn test_shard_locality_preference_gate_defaults_disabled() {
+        temp_env::with_var(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>, || {
+            assert!(!get_shard_locality_preference_enabled());
+        });
+    }
+
+    #[test]
+    fn test_shard_read_launch_order_is_gated() {
+        let read_costs = [
+            ShardReadCost::Remote,
+            ShardReadCost::Local,
+            ShardReadCost::Unknown,
+            ShardReadCost::SameNode,
+            ShardReadCost::Remote,
+        ];
+
+        assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2, 3, 4]);
+        assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), true), vec![1, 3, 2, 0, 4]);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_parallel_reader_local_first_avoids_remote_when_local_quorum_exists() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
+            const NUM_SHARDS: usize = 1;
+            const BLOCK_SIZE: usize = 64;
+            const DATA_SHARDS: usize = 4;
+            const PARITY_SHARDS: usize = 2;
+            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+            let hash_algo = HashAlgorithm::HighwayHash256;
+            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[]).await;
+            let read_costs = vec![
+                ShardReadCost::Remote,
+                ShardReadCost::Remote,
+                ShardReadCost::Local,
+                ShardReadCost::SameNode,
+                ShardReadCost::Local,
+                ShardReadCost::SameNode,
+            ];
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                readers,
+                erasure,
+                0,
+                NUM_SHARDS * BLOCK_SIZE,
+                None,
+                read_costs,
+            );
+
+            let (bufs, errs) = parallel_reader.read().await;
+
+            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+            assert!(bufs[0].is_none());
+            assert!(bufs[1].is_none());
+            for (index, buf) in bufs.iter().enumerate().take(DATA_SHARDS + PARITY_SHARDS).skip(2) {
+                assert_eq!(buf.as_deref(), Some(&[(index % 256) as u8; SHARD_SIZE][..]));
+            }
+            assert!(errs.iter().all(Option::is_none));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_parallel_reader_local_missing_falls_back_to_remote() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
+            const NUM_SHARDS: usize = 1;
+            const BLOCK_SIZE: usize = 64;
+            const DATA_SHARDS: usize = 4;
+            const PARITY_SHARDS: usize = 2;
+            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+            let hash_algo = HashAlgorithm::HighwayHash256;
+            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[1], &[]).await;
+            let read_costs = vec![
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Remote,
+                ShardReadCost::Remote,
+            ];
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                readers,
+                erasure,
+                0,
+                NUM_SHARDS * BLOCK_SIZE,
+                None,
+                read_costs,
+            );
+
+            let (bufs, errs) = parallel_reader.read().await;
+
+            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+            assert!(matches!(errs[1], Some(Error::FileNotFound)));
+            assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
+            assert!(bufs[5].is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_parallel_reader_local_corrupt_falls_back_to_remote() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
+            const NUM_SHARDS: usize = 1;
+            const BLOCK_SIZE: usize = 64;
+            const DATA_SHARDS: usize = 4;
+            const PARITY_SHARDS: usize = 2;
+            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+
+            let hash_algo = HashAlgorithm::HighwayHash256;
+            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[1]).await;
+            let read_costs = vec![
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::Remote,
+                ShardReadCost::Remote,
+            ];
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                readers,
+                erasure,
+                0,
+                NUM_SHARDS * BLOCK_SIZE,
+                None,
+                read_costs,
+            );
+
+            let (bufs, errs) = parallel_reader.read().await;
+
+            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+            assert!(
+                matches!(&errs[1], Some(DiskError::Io(err)) if err.kind() == ErrorKind::InvalidData && err.to_string().contains("bitrot"))
+            );
+            assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
+            assert!(bufs[5].is_none());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_erasure_decode_local_first_preserves_output_order() {
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
+            const DATA_SHARDS: usize = 4;
+            const PARITY_SHARDS: usize = 2;
+            const BLOCK_SIZE: usize = 64;
+
+            let total_data: Vec<u8> = (0..BLOCK_SIZE as u32).map(|i| i as u8).collect();
+            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+            let shard_size = erasure.shard_size();
+            let hash_algo = HashAlgorithm::HighwayHash256;
+            let shard_bufs = encode_test_object(&erasure, &total_data, shard_size, &hash_algo).await;
+            let readers = shard_bufs
+                .iter()
+                .map(|buf| Some(BitrotReader::new(Cursor::new(buf.clone()), shard_size, hash_algo.clone(), false)))
+                .collect();
+            let read_costs = vec![
+                ShardReadCost::Remote,
+                ShardReadCost::Remote,
+                ShardReadCost::Local,
+                ShardReadCost::Local,
+                ShardReadCost::SameNode,
+                ShardReadCost::SameNode,
+            ];
+
+            let mut output = Vec::new();
+            let (written, err) = erasure
+                .decode_with_read_costs(&mut output, readers, 0, total_data.len(), total_data.len(), read_costs)
+                .await;
+
+            assert!(err.is_none(), "unexpected decode error: {err:?}");
+            assert_eq!(written, total_data.len());
+            assert_eq!(output, total_data);
+        })
+        .await;
+    }
+
     #[tokio::test]
     async fn test_parallel_reader_normal() {
         const BLOCK_SIZE: usize = 64;
@@ -1120,5 +1421,43 @@ mod tests {
 
         let reader_cursor = Cursor::new(buf);
         BitrotReader::new(reader_cursor, shard_size, hash_algo.clone(), false)
+    }
+
+    async fn make_test_readers(
+        total_shards: usize,
+        shard_size: usize,
+        num_shards: usize,
+        hash_algo: &HashAlgorithm,
+        missing: &[usize],
+        corrupt: &[usize],
+    ) -> Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> {
+        let mut readers = Vec::with_capacity(total_shards);
+        for index in 0..total_shards {
+            if missing.contains(&index) {
+                readers.push(None);
+            } else {
+                readers.push(Some(
+                    create_reader(shard_size, num_shards, (index % 256) as u8, hash_algo, corrupt.contains(&index)).await,
+                ));
+            }
+        }
+        readers
+    }
+
+    async fn encode_test_object(erasure: &Erasure, data: &[u8], shard_size: usize, hash_algo: &HashAlgorithm) -> Vec<Vec<u8>> {
+        let total_shards = erasure.data_shards + erasure.parity_shards;
+        let mut shard_writers: Vec<BitrotWriter<Cursor<Vec<u8>>>> = (0..total_shards)
+            .map(|_| BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone()))
+            .collect();
+
+        let shards = erasure.encode_data(data).unwrap();
+        for (index, shard) in shards.iter().enumerate() {
+            shard_writers[index].write(shard).await.unwrap();
+        }
+
+        shard_writers
+            .into_iter()
+            .map(|writer| writer.into_inner().into_inner())
+            .collect()
     }
 }
