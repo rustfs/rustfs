@@ -23,7 +23,7 @@ use super::handles::{
     default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
     default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
     default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface,
+    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface, oidc_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
@@ -33,7 +33,7 @@ use super::interfaces::{
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
     ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
 };
-use rustfs_iam::{store::object::ObjectStore, sys::IamSys};
+use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
 
@@ -116,7 +116,9 @@ impl AppContext {
         iam: Arc<IamSys<ObjectStore>>,
         kms: Arc<KmsServiceManager>,
     ) -> Self {
-        Self::new(object_store, Arc::new(IamHandle::new(iam)), Arc::new(KmsHandle::new(kms)))
+        let mut context = Self::new(object_store, Arc::new(IamHandle::new(iam)), Arc::new(KmsHandle::new(kms)));
+        context.oidc = oidc_interface(super::runtime_sources::oidc_handle());
+        context
     }
 
     pub fn object_store(&self) -> Arc<ECStore> {
@@ -129,6 +131,10 @@ impl AppContext {
 
     pub fn oidc(&self) -> Arc<dyn OidcInterface> {
         self.oidc.clone()
+    }
+
+    pub fn publish_oidc_handle(&self, oidc: Arc<OidcSys>) -> bool {
+        self.oidc.publish_handle(oidc)
     }
 
     #[allow(dead_code)]

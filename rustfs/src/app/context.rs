@@ -87,7 +87,12 @@ pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
 
 /// Resolve OIDC system handle using AppContext-first precedence.
 pub fn resolve_oidc_handle() -> Option<Arc<OidcSys>> {
-    resolve_oidc_handle_with(get_global_app_context(), runtime_sources::oidc_handle)
+    resolve_oidc_handle_with(get_global_app_context())
+}
+
+/// Publish the initialized OIDC system handle into the global AppContext.
+pub fn publish_oidc_handle(oidc: Arc<OidcSys>) -> bool {
+    publish_oidc_handle_with(get_global_app_context(), oidc)
 }
 
 /// Resolve a ready IAM system handle using AppContext-first precedence.
@@ -319,11 +324,12 @@ fn resolve_iam_handle_with(
     context.map(|context| context.iam().handle()).or_else(fallback)
 }
 
-fn resolve_oidc_handle_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<OidcSys>>,
-) -> Option<Arc<OidcSys>> {
-    context.and_then(|context| context.oidc().handle()).or_else(fallback)
+fn resolve_oidc_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<OidcSys>> {
+    context.and_then(|context| context.oidc().handle())
+}
+
+fn publish_oidc_handle_with(context: Option<Arc<AppContext>>, oidc: Arc<OidcSys>) -> bool {
+    context.is_some_and(|context| context.publish_oidc_handle(oidc))
 }
 
 fn resolve_ready_iam_handle_with(
@@ -586,14 +592,16 @@ mod tests {
         server::dbms::{DatabaseManagerSystem, QueryHandle},
     };
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{
+        RwLock as StdRwLock,
+        atomic::{AtomicUsize, Ordering},
+    };
     use std::time::{Duration, SystemTime};
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     struct TestIamInterface {
         ready: bool,
-        oidc: Option<Arc<OidcSys>>,
         token_signing_key: Option<String>,
     }
 
@@ -606,22 +614,34 @@ mod tests {
             self.ready
         }
 
-        fn oidc(&self) -> Option<Arc<OidcSys>> {
-            self.oidc.clone()
-        }
-
         fn token_signing_key(&self) -> Option<String> {
             self.token_signing_key.clone()
         }
     }
 
     struct TestOidcInterface {
-        oidc: Option<Arc<OidcSys>>,
+        oidc: StdRwLock<Option<Arc<OidcSys>>>,
+    }
+
+    impl TestOidcInterface {
+        fn new(oidc: Option<Arc<OidcSys>>) -> Self {
+            Self {
+                oidc: StdRwLock::new(oidc),
+            }
+        }
     }
 
     impl OidcInterface for TestOidcInterface {
         fn handle(&self) -> Option<Arc<rustfs_iam::oidc::OidcSys>> {
-            self.oidc.clone()
+            self.oidc.read().ok().and_then(|oidc| oidc.as_ref().cloned())
+        }
+
+        fn publish_handle(&self, oidc: Arc<rustfs_iam::oidc::OidcSys>) -> bool {
+            let Ok(mut published_oidc) = self.oidc.write() else {
+                return false;
+            };
+            *published_oidc = Some(oidc);
+            true
         }
     }
 
@@ -1058,12 +1078,9 @@ mod tests {
             AppContextTestInterfaces {
                 iam: Arc::new(TestIamInterface {
                     ready: true,
-                    oidc: None,
                     token_signing_key: Some(context_token_signing_key.clone()),
                 }),
-                oidc: Arc::new(TestOidcInterface {
-                    oidc: Some(context_oidc.clone()),
-                }),
+                oidc: Arc::new(TestOidcInterface::new(Some(context_oidc.clone()))),
                 kms: Arc::new(TestKmsInterface {
                     kms: context_kms.clone(),
                 }),
@@ -1160,8 +1177,11 @@ mod tests {
             context_outbound_tls_state.generation
         );
         assert!(resolve_iam_ready_with(Some(context.clone()), || false));
-        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()), || Some(fallback_oidc.clone()));
+        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
         assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &context_oidc)));
+        assert!(publish_oidc_handle_with(Some(context.clone()), fallback_oidc.clone()));
+        let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
+        assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &fallback_oidc)));
         assert_eq!(
             resolve_token_signing_key_with(Some(context.clone()), || Some(fallback_token_signing_key.clone())).as_deref(),
             Some(context_token_signing_key.as_str())
@@ -1288,8 +1308,8 @@ mod tests {
         assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
-        // OIDC fallback path: both context absent and fallback return None.
-        assert!(resolve_oidc_handle_with(None, || None).is_none());
+        assert!(resolve_oidc_handle_with(None).is_none());
+        assert!(!publish_oidc_handle_with(None, context_oidc));
         assert!(Arc::ptr_eq(
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata

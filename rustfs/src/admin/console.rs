@@ -136,7 +136,6 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
         let oidc = resolve_oidc_handle()
             .map(|sys| {
                 sys.list_visible_providers()

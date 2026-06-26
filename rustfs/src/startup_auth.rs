@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use rustfs_iam::init_oidc_sys;
+use rustfs_iam::{get_oidc, init_oidc_sys};
 use std::io::{Error, Result};
 use tracing::{error, info, warn};
 
@@ -44,14 +44,21 @@ pub(crate) async fn init_auth_integrations() -> Result<()> {
         }
     }
 
-    if let Err(e) = init_oidc_sys().await {
-        warn!(
-            event = EVENT_OIDC_INITIALIZATION_FAILED,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_AUTH,
-            error = %e,
-            "OIDC initialization failed; continuing without OIDC providers"
-        );
+    match init_oidc_sys().await {
+        Ok(()) => {
+            if let Some(oidc) = get_oidc() {
+                crate::runtime_sources::publish_oidc_handle(oidc);
+            }
+        }
+        Err(e) => {
+            warn!(
+                event = EVENT_OIDC_INITIALIZATION_FAILED,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_AUTH,
+                error = %e,
+                "OIDC initialization failed; continuing without OIDC providers"
+            );
+        }
     }
 
     Ok(())

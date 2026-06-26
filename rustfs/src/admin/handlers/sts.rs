@@ -59,7 +59,6 @@ fn has_identity_authorization_context(policies: &[String], groups: &[String]) ->
 }
 
 fn configured_roles_claim_key(provider_id: &str) -> Option<String> {
-    // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
     resolve_oidc_handle()
         .as_ref()
         .and_then(|oidc_sys| oidc_sys.get_provider_config(provider_id))
@@ -317,7 +316,6 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     }
 
     // Verify the JWT and extract claims
-    // RUSTFS_COMPAT_TODO(CTX-002): admin OIDC consumers still depend on the resolver's global fallback while AppContext OIDC wiring is incomplete. Remove after OIDC ownership moves fully into AppContext and the global fallback is retired.
     let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
     let (claims, provider_id) = oidc_sys

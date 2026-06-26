@@ -5,11 +5,11 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-storage-api-import-boundaries`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225`.
-- Based on: API-225 branch; branch routes ECStore internal storage contract imports through the owner-local `storage_api_contracts` boundary.
+- Branch: `overtrue/arch-oidc-app-context-ownership`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229`.
+- Based on: API-229 branch; branch retires the CTX-002 OIDC resolver fallback by publishing the initialized OIDC handle into AppContext.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none.
+- Runtime behavior changes: admin OIDC resolution is now AppContext-owned after startup publishes the initialized OIDC handle; endpoint behavior and non-fatal OIDC initialization semantics remain unchanged.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
@@ -1465,6 +1465,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     metadata, object store, endpoints, tier config, server config, and buffer
     config.
   - Acceptance: context wins when present and global fallback works when absent.
+  - Cleanup update: retire the admin OIDC resolver's legacy global fallback by
+    publishing the initialized OIDC handle into AppContext and removing the
+    CTX-002 compatibility source/register entries.
   - Verification: focused resolver compatibility test, formatting, compile
     checks, migration guards, diff hygiene, Rust risk scan, and full
     `make pre-commit`.
@@ -5346,6 +5349,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | CTX-002 cleanup makes OIDC resolution AppContext-owned and removes the unused IAM-to-OIDC shortcut instead of keeping a hidden global bypass. |
+| Migration preservation | pass | Startup still treats OIDC initialization as non-fatal and publishes the initialized handle when available; admin OIDC, STS, and console consumers keep the same response behavior. |
+| Testing/verification | pass | Focused app::context tests, formatting, compatibility marker scan, and Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-229 routes ECStore benchmark erasure facade imports through a bench-local storage_api boundary. |
 | Migration preservation | pass | Erasure SIMD, comparison, streaming decode, and single-block non-inline benchmarks keep the same erasure implementations and behavior. |
 | Testing/verification | pass | Focused ECStore bench compile coverage, migration guard, residual bench API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |
