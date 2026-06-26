@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::storage_api_contracts::HealOperations as _;
+use crate::storage_api_contracts::heal::HealOperations as _;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";

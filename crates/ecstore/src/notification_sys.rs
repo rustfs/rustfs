@@ -19,7 +19,7 @@ use crate::metrics_realtime::{CollectMetricsOpts, MetricType};
 use crate::rebalance::RebalSaveOpt;
 use crate::rpc::PeerRestClient;
 use crate::runtime_sources;
-use crate::storage_api_contracts::StorageAdminApi;
+use crate::storage_api_contracts::admin::StorageAdminApi;
 use futures::future::join_all;
 use lazy_static::lazy_static;
 use rustfs_madmin::health::{Cpus, MemInfo, OsInfo, Partitions, ProcInfo, SysConfig, SysErrors, SysServices};

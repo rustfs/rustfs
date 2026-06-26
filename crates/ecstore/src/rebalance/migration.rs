@@ -3,7 +3,10 @@ use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
-use crate::storage_api_contracts::{HTTPRangeSpec, ObjectIO, ObjectOperations as _};
+use crate::storage_api_contracts::{
+    object::{ObjectIO, ObjectOperations as _},
+    range::HTTPRangeSpec,
+};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_utils::path::encode_dir_object;

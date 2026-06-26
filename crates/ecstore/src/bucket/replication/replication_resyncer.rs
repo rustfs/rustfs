@@ -32,10 +32,11 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader
 use crate::runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{
-    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectToDelete, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+    list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    namespace::NamespaceLocking as StorageNamespaceLocking,
+    object::{DeletedObject, EcstoreObjectIO, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
-use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;

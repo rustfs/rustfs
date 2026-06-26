@@ -25,8 +25,11 @@ use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::sets::Sets;
 use crate::storage_api_contracts::{
-    ListObjectsInfo as StorageListObjectsInfo, ObjectOperations as _, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
-    StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
+    list::{
+        ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
+        StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
+    },
+    object::ObjectOperations as _,
 };
 use crate::store::ECStore;
 use crate::store_utils::is_reserved_or_invalid_bucket;

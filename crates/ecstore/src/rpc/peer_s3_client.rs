@@ -21,7 +21,7 @@ use crate::rpc::client::{
     TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
 };
 use crate::runtime_sources;
-use crate::storage_api_contracts::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
+use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::store::all_local_disk;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{

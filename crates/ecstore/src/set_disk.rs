@@ -43,13 +43,15 @@ use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
 use crate::runtime_sources;
 use crate::storage_api_contracts::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
-    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
+    bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
+    list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
+    multipart::{
+        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations as _, MultipartUploadResult, PartInfo,
+    },
+    namespace::NamespaceLocking as _,
+    object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
+    range::HTTPRangeSpec,
 };
-use crate::storage_api_contracts::{
-    HTTPRangeSpec, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
-};
-use crate::storage_api_contracts::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
@@ -1025,7 +1027,7 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectIO for SetDisks {
+impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -2013,7 +2015,7 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::NamespaceLocking for SetDisks {
+impl crate::storage_api_contracts::namespace::NamespaceLocking for SetDisks {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -2269,7 +2271,7 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ObjectOperations for SetDisks {
+impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -3375,7 +3377,7 @@ impl crate::storage_api_contracts::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader = <Self as crate::storage_api_contracts::ObjectIO>::get_object_reader(
+        let get_object_reader = <Self as crate::storage_api_contracts::object::ObjectIO>::get_object_reader(
             self,
             bucket,
             object,
@@ -3506,7 +3508,7 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::ListOperations for SetDisks {
+impl crate::storage_api_contracts::list::ListOperations for SetDisks {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -3567,7 +3569,7 @@ impl crate::storage_api_contracts::ListOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::MultipartOperations for SetDisks {
+impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -4675,7 +4677,7 @@ impl crate::storage_api_contracts::MultipartOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl crate::storage_api_contracts::HealOperations for SetDisks {
+impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -5630,10 +5632,10 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::object_api::ObjectInfo;
-    use crate::storage_api_contracts::HealOperations as _;
-    use crate::storage_api_contracts::ListOperations as _;
-    use crate::storage_api_contracts::TransitionedObject;
-    use crate::storage_api_contracts::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
+    use crate::storage_api_contracts::{
+        heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
+        namespace::NamespaceLocking as _, object::ObjectOperations as _,
+    };
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
@@ -7451,7 +7453,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::storage_api_contracts::ObjectLockRetentionOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
@@ -7486,7 +7488,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(crate::storage_api_contracts::ObjectLockRetentionOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::object::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,

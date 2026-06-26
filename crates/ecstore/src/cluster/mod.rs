@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::storage_api_contracts::{
+use crate::storage_api_contracts::topology::{
     CapabilityStatus, DiskCapabilities, TopologyCapabilities, TopologyDisk, TopologyLabels, TopologyPool, TopologySet,
     TopologySnapshot,
 };

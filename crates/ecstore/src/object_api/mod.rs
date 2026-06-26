@@ -17,7 +17,10 @@ use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
 use crate::rio::{HashReader, LimitReader};
-use crate::storage_api_contracts::{ExpirationOptions, HTTPRangeSpec, TransitionedObject};
+use crate::storage_api_contracts::{
+    lifecycle::{ExpirationOptions, TransitionedObject},
+    range::HTTPRangeSpec,
+};
 use crate::store_utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;

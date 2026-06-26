@@ -54,7 +54,7 @@ use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::disk::error::DiskError;
 use crate::error::{Error, Result};
-use crate::storage_api_contracts::HTTPRangeSpec;
+use crate::storage_api_contracts::range::HTTPRangeSpec;
 use rustfs_filemeta::FileInfo;
 use rustfs_filemeta::TRANSITION_COMPLETE;
 use rustfs_rio::Index;

@@ -26,7 +26,7 @@ use crate::client::{
     credentials,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
-use crate::storage_api_contracts::BucketInfo;
+use crate::storage_api_contracts::bucket::BucketInfo;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Body;
