@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::app::context;
+use crate::runtime_sources::{
+    NotifyInterface, resolve_endpoints_handle, resolve_iam_ready, resolve_kms_runtime_service_manager,
+    resolve_lock_clients_handle, resolve_notify_interface, resolve_object_store_handle, resolve_server_config,
+};
 use crate::storage_api::{ECStore, EndpointServerPools};
 use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
@@ -20,29 +23,29 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) fn kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
-    context::resolve_kms_runtime_service_manager()
+    resolve_kms_runtime_service_manager()
 }
 
 pub(crate) fn server_config() -> Option<rustfs_config::server_config::Config> {
-    context::resolve_server_config()
+    resolve_server_config()
 }
 
-pub(crate) fn notify_interface() -> Arc<dyn context::NotifyInterface> {
-    context::resolve_notify_interface()
+pub(crate) fn notify_interface() -> Arc<dyn NotifyInterface> {
+    resolve_notify_interface()
 }
 
 pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
-    context::resolve_object_store_handle()
+    resolve_object_store_handle()
 }
 
 pub(crate) fn iam_ready() -> bool {
-    context::resolve_iam_ready()
+    resolve_iam_ready()
 }
 
 pub(crate) fn endpoints_handle() -> Option<EndpointServerPools> {
-    context::resolve_endpoints_handle()
+    resolve_endpoints_handle()
 }
 
 pub(crate) fn lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    context::resolve_lock_clients_handle()
+    resolve_lock_clients_handle()
 }
