@@ -1093,6 +1093,7 @@ mod tests {
     use crate::layout::endpoint::Endpoint;
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::list::ListOperations as _;
+    use rustfs_lock::client::local::LocalClient;
 
     #[test]
     fn test_apply_delete_objects_results_preserves_original_order_for_out_of_order_batches() {
@@ -1247,7 +1248,7 @@ mod tests {
             0,
             endpoints.clone(),
             format.clone(),
-            Vec::new(),
+            vec![Arc::new(LocalClient::new()), Arc::new(LocalClient::new())],
         )
         .await;
 
@@ -1272,23 +1273,26 @@ mod tests {
             exit_signal: None,
         });
 
-        sets.make_bucket("bucket", &MakeBucketOptions::default())
+        let bucket = format!("bucket-{}", Uuid::new_v4().simple());
+        let object = format!("object-{}", Uuid::new_v4().simple());
+
+        sets.make_bucket(&bucket, &MakeBucketOptions::default())
             .await
             .expect("bucket should be created");
 
         let mut reader = PutObjReader::from_vec(b"hello".to_vec());
-        sets.put_object("bucket", "object", &mut reader, &ObjectOptions::default())
+        sets.put_object(&bucket, &object, &mut reader, &ObjectOptions::default())
             .await
             .expect("object should be written");
 
         let result = sets
             .clone()
-            .list_objects_v2("bucket", "", None, None, 1000, false, None, false)
+            .list_objects_v2(&bucket, "", None, None, 1000, false, None, false)
             .await
             .expect("pool-level listing should succeed");
 
         assert_eq!(result.objects.len(), 1);
-        assert_eq!(result.objects[0].name, "object");
+        assert_eq!(result.objects[0].name, object);
     }
 
     #[tokio::test]

@@ -28,7 +28,9 @@ mod data_movement;
 mod data_movement_backpressure;
 mod data_usage;
 mod disk;
+#[path = "layout/disks_layout_facade.rs"]
 mod disks_layout;
+#[path = "layout/endpoints_facade.rs"]
 mod endpoints;
 mod erasure_codec;
 mod erasure_coding;

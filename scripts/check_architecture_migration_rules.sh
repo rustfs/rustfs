@@ -132,6 +132,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
 ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
 ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_support_module_hits.txt"
+ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_layout_contract_support_module_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -700,17 +701,21 @@ fi
   rg -n --with-filename '^use rustfs_storage_api|^pub use rustfs_storage_api|rustfs_storage_api::' \
     crates/ecstore/src \
     --glob '*.rs' \
-    --glob '!storage_api_contracts.rs' || true
+    --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+    --glob '!crates/ecstore/src/storage_api_contracts/**' \
+    --glob '!storage_api_contracts.rs' \
+    --glob '!storage_api_contracts/mod.rs' \
+    --glob '!storage_api_contracts/**' || true
 ) >"$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE"
 
 if [[ -s "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE" ]]; then
-  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts.rs: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
+  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
   rg -n --with-filename '^pub(?:\(crate\))? use rustfs_storage_api' \
-    crates/ecstore/src/storage_api_contracts.rs || true
+    crates/ecstore/src/storage_api_contracts/mod.rs || true
 ) >"$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE"
 
 if [[ -s "$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE" ]]; then
@@ -723,11 +728,19 @@ fi
     rg -n -U --with-filename 'storage_api_contracts::\{\s*[A-Z]' \
       crates/ecstore/src \
       --glob '*.rs' \
-      --glob '!storage_api_contracts.rs' || true
+      --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+      --glob '!crates/ecstore/src/storage_api_contracts/**' \
+      --glob '!storage_api_contracts.rs' \
+      --glob '!storage_api_contracts/mod.rs' \
+      --glob '!storage_api_contracts/**' || true
     rg -n --with-filename 'storage_api_contracts::[A-Z]' \
       crates/ecstore/src \
       --glob '*.rs' \
-      --glob '!storage_api_contracts.rs' || true
+      --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+      --glob '!crates/ecstore/src/storage_api_contracts/**' \
+      --glob '!storage_api_contracts.rs' \
+      --glob '!storage_api_contracts/mod.rs' \
+      --glob '!storage_api_contracts/**' || true
   }
 ) >"$ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE"
 
@@ -2803,6 +2816,20 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore store support modules must stay under the store owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/disks_layout.rs ]] && printf '%s\n' 'crates/ecstore/src/disks_layout.rs'
+    [[ -e crates/ecstore/src/endpoints.rs ]] && printf '%s\n' 'crates/ecstore/src/endpoints.rs'
+    [[ -e crates/ecstore/src/storage_api_contracts.rs ]] && printf '%s\n' 'crates/ecstore/src/storage_api_contracts.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore layout facade and storage API contract modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
