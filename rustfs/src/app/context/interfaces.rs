@@ -39,9 +39,6 @@ pub trait IamInterface: Send + Sync {
     #[allow(dead_code)]
     fn handle(&self) -> Arc<IamSys<ObjectStore>>;
     fn is_ready(&self) -> bool;
-    fn oidc(&self) -> Option<Arc<OidcSys>> {
-        None
-    }
     fn token_signing_key(&self) -> Option<String> {
         None
     }
@@ -50,6 +47,9 @@ pub trait IamInterface: Send + Sync {
 /// OIDC interface for admin and runtime consumers.
 pub trait OidcInterface: Send + Sync {
     fn handle(&self) -> Option<Arc<OidcSys>>;
+    fn publish_handle(&self, _oidc: Arc<OidcSys>) -> bool {
+        false
+    }
 }
 
 /// KMS interface for application-layer use-cases.
