@@ -2051,10 +2051,23 @@ impl S3Access for FS {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{
+        AMZ_WRITE_OFFSET_BYTES_HEADER, BucketPolicyArgs, BucketPolicyExistingObjectTagHint, BucketPolicyRawLoadErrorKind, FS,
+        ObjectTagConditions, PostObjectRequestMarker, ReqInfo, S3Access, StorageError,
+        bucket_policy_needs_existing_object_tag_from_hint, classify_bucket_policy_raw_load_error,
+        complete_multipart_upload_authorize_action, get_bucket_policy_authorize_action, has_write_offset_bytes_header,
+        legal_hold_write_requested, list_parts_authorize_action, load_bucket_policy_existing_object_tag_hint,
+        merge_list_bucket_query_conditions, owner_can_bypass_policy_deny, post_object_authorize_action,
+        put_bucket_policy_authorize_action, request_context_from_req, retention_write_requested, secondary_tag_hint_action,
+        table_data_plane_admin_action, validate_post_object_success_controls,
+    };
+    use crate::error::ApiError;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use rustfs_policy::policy::action::{Action, S3Action};
     use rustfs_policy::policy::{BucketPolicy, bucket_policy_uses_existing_object_tag_conditions};
+    use s3s::{S3ErrorCode, S3Request, dto::*};
     use std::collections::HashMap;
     use time::OffsetDateTime;
 
