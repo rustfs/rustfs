@@ -580,9 +580,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                 {
                     finished_fn(&errs).await;
                 }
-                if errs.iter().flatten().any(|err| *err == DiskError::Timeout) {
-                    return Err(DiskError::Timeout);
-                }
+                // Tolerated reader failures, including timeouts, must not turn a
+                // quorum EOF into a failed listing. The quorum failure branch above
+                // is the single place that escalates too many reader errors.
                 // error!("list_path_raw: at_eof + has_err == readers.len() break {:?}", &errs);
                 break;
             }
@@ -772,8 +772,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_path_raw_returns_timeout_for_stalled_reader_after_quorum_eof() {
-        let err = list_path_raw(
+    async fn list_path_raw_tolerates_stalled_reader_after_quorum_eof() {
+        list_path_raw(
             CancellationToken::new(),
             ListPathRawOptions {
                 disks: vec![None, None, None],
@@ -784,13 +784,11 @@ mod tests {
             },
         )
         .await
-        .expect_err("stalled reader should fail instead of returning a partial listing");
-
-        assert_eq!(err, DiskError::Timeout);
+        .expect("stalled reader within the tolerated failure budget should not fail quorum EOF");
     }
 
     #[tokio::test]
-    async fn list_path_raw_returns_timeout_after_partial_results_when_reader_stalls() {
+    async fn list_path_raw_completes_after_partial_quorum_when_reader_stalls() {
         let entry = MetaCacheEntry {
             name: "bucket/object".to_string(),
             metadata: vec![1, 2, 3],
@@ -800,7 +798,7 @@ mod tests {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = seen.clone();
 
-        let err = list_path_raw(
+        list_path_raw(
             CancellationToken::new(),
             ListPathRawOptions {
                 disks: vec![None, None, None],
@@ -826,9 +824,8 @@ mod tests {
             },
         )
         .await
-        .expect_err("stalled reader must fail even after some entries were emitted");
+        .expect("stalled reader within failure budget should not fail a quorum listing");
 
-        assert_eq!(err, DiskError::Timeout);
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
     }
 
@@ -854,7 +851,7 @@ mod tests {
         .await;
 
         let listing = result.expect("list_path_raw should abort unresponsive producer instead of hanging");
-        assert_eq!(listing.expect_err("unresponsive producer should fail the listing"), DiskError::Timeout);
+        listing.expect("unresponsive producer within failure budget should not fail quorum EOF");
     }
 
     #[tokio::test]

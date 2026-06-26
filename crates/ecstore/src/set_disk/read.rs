@@ -596,9 +596,23 @@ struct BitrotReaderSetup {
     attempted: Vec<bool>,
 }
 
+#[derive(Clone, Copy)]
+enum BitrotReaderSetupMode {
+    ReadQuorum,
+    VerifyReconstruction,
+}
+
 impl BitrotReaderSetup {
     fn available_shards(&self) -> usize {
         self.readers.iter().filter(|reader| reader.is_some()).count()
+    }
+
+    fn available_data_shards(&self, data_shards: usize) -> usize {
+        self.readers
+            .iter()
+            .take(data_shards)
+            .filter(|reader| reader.is_some())
+            .count()
     }
 
     fn completed_failed_shards(&self) -> usize {
@@ -613,16 +627,21 @@ impl BitrotReaderSetup {
         self.attempted.iter().take(data_shards).all(|attempted| *attempted)
     }
 
-    fn setup_target(data_shards: usize, parity_shards: usize) -> usize {
-        if parity_shards > 0 {
-            (data_shards + 1).min(data_shards + parity_shards)
+    fn reconstruction_verification_target(&self, data_shards: usize, parity_shards: usize) -> usize {
+        let missing_data_sources = data_shards.saturating_sub(self.available_data_shards(data_shards));
+        if missing_data_sources > 0 && missing_data_sources < parity_shards {
+            data_shards.saturating_add(1).min(data_shards.saturating_add(parity_shards))
         } else {
             data_shards
         }
     }
 
-    fn has_setup_quorum(&self, data_shards: usize, parity_shards: usize) -> bool {
-        self.available_shards() >= Self::setup_target(data_shards, parity_shards) && self.data_shards_attempted(data_shards)
+    fn has_setup_quorum(&self, data_shards: usize, parity_shards: usize, mode: BitrotReaderSetupMode) -> bool {
+        let target = match mode {
+            BitrotReaderSetupMode::ReadQuorum => data_shards,
+            BitrotReaderSetupMode::VerifyReconstruction => self.reconstruction_verification_target(data_shards, parity_shards),
+        };
+        self.available_shards() >= target
     }
 }
 
@@ -641,6 +660,7 @@ async fn create_bitrot_readers_until_quorum(
     use_zero_copy: bool,
     data_shards: usize,
     parity_shards: usize,
+    mode: BitrotReaderSetupMode,
 ) -> BitrotReaderSetup {
     let mut setup = BitrotReaderSetup {
         readers: (0..disks.len()).map(|_| None).collect(),
@@ -691,7 +711,7 @@ async fn create_bitrot_readers_until_quorum(
             }
         }
 
-        if setup.has_setup_quorum(data_shards, parity_shards) {
+        if setup.has_setup_quorum(data_shards, parity_shards, mode) {
             break;
         }
     }
@@ -1855,6 +1875,7 @@ impl SetDisks {
                 use_zero_copy,
                 erasure.data_shards,
                 erasure.parity_shards,
+                BitrotReaderSetupMode::ReadQuorum,
             )
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
@@ -2160,6 +2181,7 @@ impl SetDisks {
             use_zero_copy,
             erasure.data_shards,
             erasure.parity_shards,
+            BitrotReaderSetupMode::VerifyReconstruction,
         )
         .await;
         rustfs_io_metrics::record_get_object_stage_duration(
@@ -2927,7 +2949,12 @@ mod tests {
         fi
     }
 
-    async fn setup_inline_bitrot_readers(data: Vec<Option<&'static [u8]>>) -> BitrotReaderSetup {
+    async fn setup_inline_bitrot_readers(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+    ) -> BitrotReaderSetup {
         let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
         let disks = vec![None; files.len()];
 
@@ -2943,27 +2970,71 @@ mod tests {
             HashAlgorithm::None,
             false,
             false,
-            2,
-            2,
+            data_shards,
+            parity_shards,
+            mode,
         )
         .await
     }
 
     #[tokio::test]
-    async fn bitrot_reader_setup_does_not_count_quorum_early_stop_as_missing() {
-        let setup = setup_inline_bitrot_readers(vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")]).await;
+    async fn bitrot_reader_setup_stops_at_read_quorum() {
+        let setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+        )
+        .await;
 
-        assert!(setup.available_shards() >= BitrotReaderSetup::setup_target(2, 2));
+        assert_eq!(setup.available_shards(), 2);
         assert!(setup.data_shards_attempted(2));
         assert_eq!(setup.completed_failed_shards(), 0);
     }
 
     #[tokio::test]
-    async fn bitrot_reader_setup_counts_only_completed_failures_as_missing() {
-        let setup = setup_inline_bitrot_readers(vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")]).await;
+    async fn bitrot_reader_setup_verify_mode_stops_when_data_quorum_is_available() {
+        let setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.available_data_shards(2), 2);
+        assert_eq!(setup.completed_failed_shards(), 0);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_verify_mode_collects_extra_source_for_reconstruction() {
+        let setup = setup_inline_bitrot_readers(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
 
         assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.available_data_shards(2), 1);
         assert!(setup.data_shards_attempted(2));
+        assert_eq!(setup.completed_failed_shards(), 1);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_verify_mode_does_not_wait_for_impossible_extra_source() {
+        let setup = setup_inline_bitrot_readers(
+            vec![None, Some(b"bbbb"), Some(b"cccc")],
+            2,
+            1,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.available_data_shards(2), 1);
         assert_eq!(setup.completed_failed_shards(), 1);
     }
 
