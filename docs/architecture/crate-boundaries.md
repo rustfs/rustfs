@@ -215,6 +215,11 @@ Test and fuzz `storage_compat.rs` harnesses must also stay narrow. Heal and
 scanner test harnesses must expose ECStore contracts through direct aliases or
 local wrappers, and fuzz harnesses must wrap bucket utility entrypoints instead
 of restoring grouped ECStore passthrough exports.
+External ECStore API facade imports must stay inside local `storage_api`
+boundary files after the external runtime, test, and fuzz consumers have been
+narrowed. IAM, heal, scanner, notify, observability, Swift, S3 Select, e2e, and
+fuzz code must not reintroduce direct `rustfs_ecstore::api::...` references
+outside those boundary files.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so
