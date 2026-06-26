@@ -14,8 +14,11 @@
 
 use super::*;
 use crate::get_diagnostics::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR,
+    GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
+    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE,
+    GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path,
 };
 use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
@@ -34,6 +37,152 @@ const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
 
 static READ_REPAIR_HEAL_CACHE: OnceLock<RwLock<HashMap<ReadRepairHealCacheKey, Instant>>> = OnceLock::new();
+
+#[derive(Clone, Copy, Debug)]
+struct MetadataFanoutObservation {
+    outcome: &'static str,
+    elapsed: Duration,
+    valid: bool,
+    ignored: bool,
+}
+
+impl MetadataFanoutObservation {
+    fn from_file_info(file_info: &FileInfo, elapsed: Duration) -> Self {
+        if file_info.is_valid() {
+            Self {
+                outcome: GET_METADATA_RESPONSE_VALID,
+                elapsed,
+                valid: true,
+                ignored: false,
+            }
+        } else {
+            Self {
+                outcome: GET_METADATA_RESPONSE_ERROR,
+                elapsed,
+                valid: false,
+                ignored: false,
+            }
+        }
+    }
+
+    fn from_error(err: &DiskError, elapsed: Duration) -> Self {
+        Self {
+            outcome: classify_metadata_response_error(err),
+            elapsed,
+            valid: false,
+            ignored: is_metadata_fanout_ignored_error(err),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct MetadataFanoutDiagnostics {
+    fanout_duration: Duration,
+    observations: Vec<MetadataFanoutObservation>,
+}
+
+impl MetadataFanoutDiagnostics {
+    fn new(fanout_duration: Duration, observations: Vec<MetadataFanoutObservation>) -> Self {
+        Self {
+            fanout_duration,
+            observations,
+        }
+    }
+
+    fn total_responses(&self) -> usize {
+        self.observations.len()
+    }
+
+    fn valid_responses(&self) -> usize {
+        self.observations.iter().filter(|observation| observation.valid).count()
+    }
+
+    fn ignored_responses(&self) -> usize {
+        self.observations.iter().filter(|observation| observation.ignored).count()
+    }
+
+    fn error_responses(&self) -> usize {
+        self.total_responses().saturating_sub(self.valid_responses())
+    }
+
+    fn first_response_latency(&self) -> Option<Duration> {
+        self.observations.iter().map(|observation| observation.elapsed).min()
+    }
+
+    fn first_valid_response_latency(&self) -> Option<Duration> {
+        self.observations
+            .iter()
+            .filter(|observation| observation.valid)
+            .map(|observation| observation.elapsed)
+            .min()
+    }
+
+    fn slowest_response_latency(&self) -> Option<Duration> {
+        self.observations.iter().map(|observation| observation.elapsed).max()
+    }
+
+    fn quorum_candidate_latency(&self, read_quorum: usize) -> Option<Duration> {
+        if read_quorum == 0 {
+            return Some(Duration::ZERO);
+        }
+
+        let mut valid_latencies = self
+            .observations
+            .iter()
+            .filter(|observation| observation.valid)
+            .map(|observation| observation.elapsed)
+            .collect::<Vec<_>>();
+        valid_latencies.sort_unstable();
+        valid_latencies.get(read_quorum.saturating_sub(1)).copied()
+    }
+
+    fn record(&self, path: &'static str) {
+        rustfs_io_metrics::record_get_object_metadata_fanout_duration(path, self.fanout_duration.as_secs_f64());
+        if let Some(latency) = self.first_response_latency() {
+            rustfs_io_metrics::record_get_object_first_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        if let Some(latency) = self.first_valid_response_latency() {
+            rustfs_io_metrics::record_get_object_first_valid_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        if let Some(latency) = self.slowest_response_latency() {
+            rustfs_io_metrics::record_get_object_slowest_metadata_response_latency(path, latency.as_secs_f64());
+        }
+        rustfs_io_metrics::record_get_object_metadata_fanout_shape(
+            path,
+            self.total_responses(),
+            self.valid_responses(),
+            self.ignored_responses(),
+            self.error_responses(),
+        );
+        for observation in &self.observations {
+            rustfs_io_metrics::record_get_object_metadata_response(path, observation.outcome);
+        }
+    }
+
+    fn record_quorum_candidate_latency(&self, path: &'static str, read_quorum: usize) {
+        if let Some(latency) = self.quorum_candidate_latency(read_quorum) {
+            rustfs_io_metrics::record_get_object_quorum_reached_latency(path, latency.as_secs_f64());
+        }
+    }
+}
+
+fn classify_metadata_response_error(err: &DiskError) -> &'static str {
+    match err {
+        DiskError::FileNotFound | DiskError::VolumeNotFound => GET_METADATA_RESPONSE_NOT_FOUND,
+        DiskError::FileVersionNotFound => GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+        DiskError::DiskNotFound => GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+        DiskError::FileCorrupt | DiskError::CorruptedFormat | DiskError::CorruptedBackend | DiskError::OutdatedXLMeta => {
+            GET_METADATA_RESPONSE_CORRUPT
+        }
+        DiskError::Timeout => GET_METADATA_RESPONSE_TIMEOUT,
+        DiskError::FaultyDisk | DiskError::FaultyRemoteDisk => GET_METADATA_RESPONSE_IGNORED,
+        _ => GET_METADATA_RESPONSE_ERROR,
+    }
+}
+
+fn is_metadata_fanout_ignored_error(err: &DiskError) -> bool {
+    OBJECT_OP_IGNORED_ERRS.iter().any(|ignored| ignored == err)
+}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ReadRepairHealCacheKey {
@@ -522,8 +671,62 @@ impl SetDisks {
         healing: bool,
         incl_free_versions: bool,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>)> {
+        let (ress, errors, _) = Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            false,
+        )
+        .await?;
+        Ok((ress, errors))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_observed(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        Self::read_all_fileinfo_inner(
+            disks,
+            org_bucket,
+            bucket,
+            object,
+            version_id,
+            read_data,
+            healing,
+            incl_free_versions,
+            true,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn read_all_fileinfo_inner(
+        disks: &[Option<DiskStore>],
+        org_bucket: &str,
+        bucket: &str,
+        object: &str,
+        version_id: &str,
+        read_data: bool,
+        healing: bool,
+        incl_free_versions: bool,
+        observe: bool,
+    ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
+        let fanout_start = observe.then(Instant::now);
         let mut ress = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
+        let mut observations = observe.then(|| Vec::with_capacity(disks.len()));
         let opts = Arc::new(ReadOptions {
             incl_free_versions,
             read_data,
@@ -541,11 +744,14 @@ impl SetDisks {
             let object = object.clone();
             let version_id = version_id.clone();
             tokio::spawn(async move {
-                if let Some(disk) = disk {
+                let response_start = observe.then(Instant::now);
+                let result = if let Some(disk) = disk {
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
                 } else {
                     Err(DiskError::DiskNotFound)
-                }
+                };
+                let elapsed = response_start.map(|start| start.elapsed());
+                (result, elapsed)
             })
         });
 
@@ -554,23 +760,37 @@ impl SetDisks {
 
         for result in results {
             match result {
-                Ok(res) => match res {
+                Ok((res, elapsed)) => match res {
                     Ok(file_info) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
+                        }
                         ress.push(file_info);
                         errors.push(None);
                     }
                     Err(e) => {
+                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                            observations.push(MetadataFanoutObservation::from_error(&e, elapsed));
+                        }
                         ress.push(FileInfo::default());
                         errors.push(Some(e));
                     }
                 },
                 Err(_) => {
+                    let err = DiskError::Unexpected;
+                    if let (Some(observations), Some(fanout_start)) = (&mut observations, fanout_start) {
+                        observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    }
                     ress.push(FileInfo::default());
-                    errors.push(Some(DiskError::Unexpected));
+                    errors.push(Some(err));
                 }
             }
         }
-        Ok((ress, errors))
+        let diagnostics = match (fanout_start, observations) {
+            (Some(fanout_start), Some(observations)) => MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations),
+            _ => MetadataFanoutDiagnostics::default(),
+        };
+        Ok((ress, errors, diagnostics))
     }
 
     pub async fn read_version_optimized(
@@ -912,8 +1132,10 @@ impl SetDisks {
         let vid = opts.version_id.clone().unwrap_or_default();
 
         // TODO: optimize concurrency and break once enough slots are available
-        let (parts_metadata, errs) =
-            Self::read_all_fileinfo(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions).await?;
+        let (parts_metadata, errs, metadata_fanout_diagnostics) =
+            Self::read_all_fileinfo_observed(&disks, "", bucket, object, vid.as_str(), read_data, false, opts.incl_free_versions)
+                .await?;
+        metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -928,15 +1150,18 @@ impl SetDisks {
                 return Err(e);
             }
         };
+        let read_quorum =
+            usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, read_quorum);
 
-        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize) {
+        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum as usize);
+        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum);
 
-        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
+        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum)?;
         if errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(
@@ -950,7 +1175,7 @@ impl SetDisks {
             )
             .await;
         } else if use_metadata_cache {
-            self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum as usize)
+            self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
                 .await;
         }
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
@@ -1861,6 +2086,16 @@ mod metadata_cache_tests {
 mod tests {
     use super::*;
 
+    fn metadata_fanout_test_fileinfo(object: &str) -> FileInfo {
+        let mut fi = FileInfo::new(object, 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = object.to_string();
+        fi.size = 1;
+        fi.erasure.index = 1;
+        fi.metadata.insert("etag".to_string(), "etag-1".to_string());
+        fi
+    }
+
     fn codec_streaming_test_fileinfo(size: i64, part_count: usize) -> FileInfo {
         let mut fi = FileInfo::new("object", 4, 2);
         fi.volume = "bucket".to_string();
@@ -1886,6 +2121,134 @@ mod tests {
         }
 
         fi
+    }
+
+    #[test]
+    fn metadata_fanout_diagnostics_classifies_response_outcomes() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let invalid = FileInfo::default();
+
+        let observations = vec![
+            MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(3)),
+            MetadataFanoutObservation::from_file_info(&invalid, Duration::from_millis(4)),
+            MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(5)),
+            MetadataFanoutObservation::from_error(&DiskError::FileVersionNotFound, Duration::from_millis(6)),
+            MetadataFanoutObservation::from_error(&DiskError::DiskNotFound, Duration::from_millis(7)),
+            MetadataFanoutObservation::from_error(&DiskError::FileCorrupt, Duration::from_millis(8)),
+            MetadataFanoutObservation::from_error(&DiskError::Timeout, Duration::from_millis(9)),
+            MetadataFanoutObservation::from_error(&DiskError::FaultyDisk, Duration::from_millis(10)),
+            MetadataFanoutObservation::from_error(&DiskError::Unexpected, Duration::from_millis(11)),
+        ];
+        let diagnostics = MetadataFanoutDiagnostics::new(Duration::from_millis(12), observations);
+        let outcomes = diagnostics
+            .observations
+            .iter()
+            .map(|observation| observation.outcome)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            outcomes,
+            vec![
+                GET_METADATA_RESPONSE_VALID,
+                GET_METADATA_RESPONSE_ERROR,
+                GET_METADATA_RESPONSE_NOT_FOUND,
+                GET_METADATA_RESPONSE_VERSION_NOT_FOUND,
+                GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+                GET_METADATA_RESPONSE_CORRUPT,
+                GET_METADATA_RESPONSE_TIMEOUT,
+                GET_METADATA_RESPONSE_IGNORED,
+                GET_METADATA_RESPONSE_ERROR,
+            ]
+        );
+        assert_eq!(diagnostics.total_responses(), 9);
+        assert_eq!(diagnostics.valid_responses(), 1);
+        assert_eq!(diagnostics.error_responses(), 8);
+    }
+
+    #[test]
+    fn metadata_fanout_diagnostics_tracks_ignored_errors_without_hiding_outcomes() {
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(15),
+            vec![
+                MetadataFanoutObservation::from_error(&DiskError::DiskNotFound, Duration::from_millis(1)),
+                MetadataFanoutObservation::from_error(&DiskError::FaultyRemoteDisk, Duration::from_millis(2)),
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(3)),
+            ],
+        );
+
+        assert_eq!(diagnostics.ignored_responses(), 2);
+        assert_eq!(diagnostics.error_responses(), 3);
+        assert_eq!(diagnostics.observations[0].outcome, GET_METADATA_RESPONSE_DISK_NOT_FOUND);
+        assert_eq!(diagnostics.observations[1].outcome, GET_METADATA_RESPONSE_IGNORED);
+        assert_eq!(diagnostics.observations[2].outcome, GET_METADATA_RESPONSE_NOT_FOUND);
+    }
+
+    #[test]
+    fn metadata_fanout_quorum_candidate_latency_ignores_slow_trailing_valid_response() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(250),
+            vec![
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(2)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(5)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(7)),
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(250)),
+            ],
+        );
+
+        assert_eq!(diagnostics.first_response_latency(), Some(Duration::from_millis(2)));
+        assert_eq!(diagnostics.first_valid_response_latency(), Some(Duration::from_millis(5)));
+        assert_eq!(diagnostics.slowest_response_latency(), Some(Duration::from_millis(250)));
+        assert_eq!(diagnostics.quorum_candidate_latency(2), Some(Duration::from_millis(7)));
+    }
+
+    #[test]
+    fn metadata_fanout_quorum_candidate_latency_requires_enough_valid_responses() {
+        let valid = metadata_fanout_test_fileinfo("object");
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(8),
+            vec![
+                MetadataFanoutObservation::from_file_info(&valid, Duration::from_millis(5)),
+                MetadataFanoutObservation::from_error(&DiskError::FileNotFound, Duration::from_millis(6)),
+            ],
+        );
+
+        assert_eq!(diagnostics.quorum_candidate_latency(0), Some(Duration::ZERO));
+        assert_eq!(diagnostics.quorum_candidate_latency(1), Some(Duration::from_millis(5)));
+        assert_eq!(diagnostics.quorum_candidate_latency(2), None);
+    }
+
+    #[test]
+    fn metadata_fanout_counts_delete_marker_and_conflicting_versions_as_valid_observations_only() {
+        let mut latest = metadata_fanout_test_fileinfo("object");
+        latest.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+
+        let mut historical = metadata_fanout_test_fileinfo("object");
+        historical.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        let mut delete_marker = metadata_fanout_test_fileinfo("object");
+        delete_marker.deleted = true;
+        delete_marker.version_id =
+            Some(Uuid::parse_str("00000000-0000-0000-0000-000000000003").expect("static uuid should parse"));
+
+        let diagnostics = MetadataFanoutDiagnostics::new(
+            Duration::from_millis(9),
+            vec![
+                MetadataFanoutObservation::from_file_info(&latest, Duration::from_millis(3)),
+                MetadataFanoutObservation::from_file_info(&historical, Duration::from_millis(4)),
+                MetadataFanoutObservation::from_file_info(&delete_marker, Duration::from_millis(5)),
+            ],
+        );
+
+        assert_eq!(diagnostics.total_responses(), 3);
+        assert_eq!(diagnostics.valid_responses(), 3);
+        assert_eq!(diagnostics.error_responses(), 0);
+        assert!(
+            diagnostics
+                .observations
+                .iter()
+                .all(|observation| observation.outcome == GET_METADATA_RESPONSE_VALID)
+        );
     }
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {
