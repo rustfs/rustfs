@@ -209,7 +209,7 @@ pub async fn publish_ready_when_runtime_ready(
     wait_for_runtime_readiness_with(
         STARTUP_RUNTIME_READINESS_MAX_WAIT,
         STARTUP_RUNTIME_READINESS_POLL_INTERVAL,
-        collect_dependency_readiness_uncached,
+        collect_node_readiness,
         |dependency_readiness| {
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             if let Some(state_manager) = state_manager {
@@ -219,7 +219,7 @@ pub async fn publish_ready_when_runtime_ready(
                 target: "rustfs::server::readiness",
                 storage_ready = dependency_readiness.storage_ready,
                 iam_ready = dependency_readiness.iam_ready,
-                "Runtime readiness reached write quorum; publishing ready state"
+                "Runtime node readiness reached; publishing ready state"
             );
         },
     )
@@ -502,6 +502,10 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     report
 }
 
+async fn collect_node_readiness() -> DependencyReadiness {
+    collect_node_readiness_report().await.readiness
+}
+
 pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::iam_ready();
     let storage_ready = collect_storage_read_readiness_uncached().await;
@@ -535,21 +539,6 @@ async fn collect_lock_quorum_status() -> LockQuorumStatus {
         update_lock_quorum_status_cache(computed).await;
         computed
     }
-}
-
-async fn collect_dependency_readiness_uncached() -> DependencyReadiness {
-    let iam_ready_raw = runtime_sources::iam_ready();
-    let storage_ready = collect_storage_readiness_uncached().await;
-    let lock_quorum_status = collect_lock_quorum_status_uncached().await;
-
-    let readiness = DependencyReadiness {
-        storage_ready,
-        iam_ready: iam_ready_raw,
-        lock_quorum_ready: lock_quorum_status.ready,
-    };
-    let report = dependency_readiness_report_from_readiness(readiness);
-    record_readiness_report(&report);
-    report.readiness
 }
 
 async fn collect_storage_readiness_uncached() -> bool {
@@ -688,7 +677,7 @@ where
 
     loop {
         let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
+        if readiness.storage_ready && readiness.iam_ready {
             on_ready(readiness);
             return Ok(());
         }
@@ -709,7 +698,7 @@ where
             storage_ready = readiness.storage_ready,
             iam_ready = readiness.iam_ready,
             lock_quorum_ready = readiness.lock_quorum_ready,
-            "Runtime readiness has not reached write quorum yet; delaying ready state publication"
+            "Runtime node readiness has not been reached yet; delaying ready state publication"
         );
         tokio::time::sleep(poll_interval).await;
     }
@@ -757,11 +746,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_runtime_readiness_with_does_not_publish_ready_when_lock_quorum_is_not_reached() {
+    async fn wait_for_runtime_readiness_with_publishes_ready_without_lock_quorum() {
         let readiness = GlobalReadiness::new();
         let state_manager = ServiceStateManager::new();
 
-        let err = wait_for_runtime_readiness_with(
+        let result = wait_for_runtime_readiness_with(
             Duration::ZERO,
             Duration::from_millis(1),
             || {
@@ -776,12 +765,11 @@ mod tests {
                 state_manager.update(ServiceState::Ready);
             },
         )
-        .await
-        .expect_err("lock quorum should block readiness publication");
+        .await;
 
-        assert!(err.to_string().contains("lock_quorum_ready=false"));
-        assert!(!readiness.is_ready());
-        assert_eq!(state_manager.current_state(), ServiceState::Starting);
+        assert!(result.is_ok(), "lock quorum must not block node readiness publication");
+        assert!(readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Ready);
     }
 
     #[test]
