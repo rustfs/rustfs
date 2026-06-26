@@ -13,8 +13,9 @@
 // limitations under the License.
 
 pub(crate) use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
-pub(crate) use rustfs_storage_api::BucketInfo;
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod bug_fixes {
-    pub(crate) use super::{BucketInfo, DiskStore, Endpoint};
+    pub(crate) use super::storage_contracts::BucketInfo;
+    pub(crate) use super::{DiskStore, Endpoint};
 }

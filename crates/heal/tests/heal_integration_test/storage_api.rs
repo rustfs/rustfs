@@ -16,11 +16,12 @@ pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::init_bucket_metadata_s
 pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
-pub(crate) use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod integration {
+    pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, ObjectIO, ObjectOperations};
+
     pub(crate) use super::{
-        BucketOperations, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, ObjectIO, ObjectOperations,
-        PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
+        ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints, init_bucket_metadata_sys, init_local_disks,
     };
 }

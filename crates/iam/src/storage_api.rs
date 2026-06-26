@@ -29,14 +29,14 @@ use rustfs_ecstore::api::notification::{
     NotificationPeerErr as EcstoreNotificationPeerErr, NotificationSys as EcstoreNotificationSys, get_global_notification_sys,
 };
 use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
-pub(crate) use rustfs_storage_api::{HTTPPreconditions, ListOperations, ObjectInfoOrErr, ObjectOperations};
+use rustfs_storage_api as storage_contracts;
 
 pub(crate) type IamEcstoreError = EcstoreErrorType;
 pub(crate) type IamStorageError = EcstoreStorageError;
 pub(crate) type IamStorageResult<T> = EcstoreResultType<T>;
 pub(crate) type IamStore = EcstoreStore;
-pub(crate) type IamConfigObjectInfo = <IamStore as ObjectOperations>::ObjectInfo;
-pub(crate) type IamConfigObjectOptions = <IamStore as ObjectOperations>::ObjectOptions;
+pub(crate) type IamConfigObjectInfo = <IamStore as storage_contracts::ObjectOperations>::ObjectInfo;
+pub(crate) type IamConfigObjectOptions = <IamStore as storage_contracts::ObjectOperations>::ObjectOptions;
 pub(crate) type IamNotificationSys = EcstoreNotificationSys;
 pub(crate) type IamEcstoreNotificationPeerErr = EcstoreNotificationPeerErr;
 
@@ -90,7 +90,7 @@ pub(crate) mod crate_boundary {
 }
 
 pub(crate) mod object_store {
-    pub(crate) use super::{HTTPPreconditions, ListOperations, ObjectInfoOrErr, ObjectOperations};
+    pub(crate) use super::storage_contracts::{HTTPPreconditions, ListOperations, ObjectInfoOrErr, ObjectOperations};
 }
 
 pub(crate) mod runtime {
