@@ -184,6 +184,7 @@ RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_so
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
 RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_WILDCARD_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_wildcard_hits.txt"
+RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_contract_root_consumer_hits.txt"
 RUSTFS_APP_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_app_wildcard_import_hits.txt"
 RUSTFS_APP_USECASE_S3_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_s3_api_bypass_hits.txt"
 RUSTFS_APP_USECASE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_storage_api_bypass_hits.txt"
@@ -192,6 +193,17 @@ RUSTFS_ADMIN_STORAGE_API_ROOT_FACADE_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_
 RUSTFS_ROOT_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_contract_bypass_hits.txt"
 RUSTFS_ROOT_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_root_storage_api_domain_bypass_hits.txt"
+RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_storage_contract_root_consumer_hits.txt"
+RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_runtime_facade_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_facade_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_runtime_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_helper_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
+RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_wildcard_import_hits.txt"
+RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_export_glob_hits.txt"
+RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_facade_direct_owner_bypass_hits.txt"
+RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_sse_root_export_hits.txt"
+RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_contract_bypass_hits.txt"
@@ -1854,6 +1866,162 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage_api::(?:capacity::(?:\{|all_local_disk|disk_drive_path|disk_endpoint)|protocols::(?:access|ecfs|request_context)\b|server::(?:\{|contract\b|ecfs\b|request_context\b|rpc\b|tonic_service\b|apply_cors_headers|ECStore|Endpoint(?:s|ServerPools)?|Error|EventArgs|StorageObjectInfo|TONIC_RPC_PREFIX|is_dist_erasure|read_config|register_event_dispatch_hook|save_config|verify_rpc_signature)|startup::(?:\{|contract\b|concurrency\b|deadlock_detector\b|ecfs\b|DynReplicationPool|ECStore|EndpointServerPools|Error\b|Result\b|get_bucket_notification_config|init_background_replication|init_bucket_metadata_sys|init_ecstore_config|init_global_config_sys|init_local_disks|init_lock_clients|new_global_notification_sys|prewarm_local_disk_id_map|process_lambda_configurations|process_queue_configurations|process_topic_configurations|set_global_endpoints|set_global_region|set_global_rustfs_port|set_workload_admission_snapshot_provider|shutdown_background_services|try_migrate_bucket_metadata|try_migrate_iam_config|try_migrate_server_config|update_erasure_type)|workload::(?:\{|bucket_metadata_runtime_initialized|replication_queue_current_count))' \
+    rustfs/src \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage_api.rs' || true
+) >"$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS root runtime facade consumers must use consumer-domain modules from rustfs/src/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ROOT_RUNTIME_FACADE_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:contract::|StorageObjectInfo\b|StorageObjectOptions\b|to_s3s_etag\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner consumers must use storage_api consumer-domain modules instead of root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_FACADE_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:runtime_sources\b|ECStore\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner runtime consumers must use storage_api consumer-domain modules instead of root storage runtime facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'crate::storage::(?:parse_object_lock_legal_hold\b|parse_object_lock_retention\b|validate_bucket_object_lock_enabled\b)' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner helper consumers must use storage_api consumer-domain modules instead of root storage helpers: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    '(?:use\s+super::super::(?:StorageDiskRpcExt|WalkDirOptions|find_local_disk_by_ref|verify_rpc_signature)|super::super::Result<|super::super::super::(?:Error|STORAGE_CLASS_SUB_SYS))' \
+    rustfs/src/storage/rpc/http_service.rs \
+    rustfs/src/storage/rpc/node_service.rs || true
+) >"$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner RPC consumers must use storage_api consumer-domain modules instead of relative root storage facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^[[:space:]]*use super::\*;' \
+    rustfs/src/storage \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner modules must use explicit imports instead of parent wildcard imports: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^pub\(crate\) use storage_api::\*;' \
+    rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner root must explicitly list storage_api re-exports instead of using a wildcard: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg --pcre2 -n --with-filename \
+    '(use crate::storage::\{|crate::storage::(?!storage_api\b))' \
+    rustfs/src/storage_api.rs \
+    rustfs/src/app/storage_api.rs \
+    rustfs/src/admin/storage_api.rs || true
+) >"$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS root/app/admin storage facades must consume owner APIs through crate::storage::storage_api: $(paste -sd '; ' "$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^pub\(crate\) use sse::' \
+    rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner root must expose SSE helpers through storage_api instead of root sse re-exports: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    'use\s+(?:super::super|crate::storage)::\{[^}]*?(?:BucketMetadata|DEFAULT_READ_BUFFER_SIZE|bucket_metadata_sys_initialized|get_global_bucket_metadata_sys|set_bucket_metadata|apply_cors_headers|apply_default_lock_retention_metadata|check_preconditions|decode_tags_to_map|get_adaptive_buffer_size_with_profile|get_buffer_size_opt_in|is_etag_equal|matches_origin_pattern|parse_etag|parse_object_lock_legal_hold|parse_object_lock_retention|process_lambda_configurations|process_queue_configurations|process_topic_configurations|remove_object_lock_metadata_for_copy|remove_object_lock_retention_metadata|validate_bucket_object_lock_enabled|validate_list_object_unordered_with_delimiter)' \
+    rustfs/src/storage/ecfs_test.rs || true
+) >"$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS storage-owner tests must use storage_api test consumer modules instead of root storage helper facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n -U --with-filename \
+      'storage_api::cluster::\{[^}]*?(CapabilitySnapshotError|CapabilityState|CapabilityStatus|DiskCapabilities|MemorySamplingState|ObservabilitySnapshot|ObservabilitySnapshotProvider|PlatformSupport|TopologyCapabilities|TopologySnapshot|TopologySnapshotProvider|UserspaceProfilingCapability)' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+    rg -n --with-filename \
+      'storage_api::cluster::(?:CapabilitySnapshotError|CapabilityState|CapabilityStatus|DiskCapabilities|MemorySamplingState|ObservabilitySnapshot|ObservabilitySnapshotProvider|PlatformSupport|TopologyCapabilities|TopologySnapshot|TopologySnapshotProvider|UserspaceProfilingCapability)\b|storage_api::server::(?:StorageAdminApi|TransitionedObject)\b|storage_api::startup::(?:BucketOperations|BucketOptions)\b|storage_api::table::(?:HTTPPreconditions|HTTPRangeSpec|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|NamespaceLocking|ObjectIO|ObjectInfoOrErr|ObjectOperations|WalkOptions)\b|storage_api::error::HTTPRangeError\b' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+    rg -n -U --with-filename \
+      'storage_api::(?:server::\{[^}]*?(StorageAdminApi|TransitionedObject)|startup::\{[^}]*?(BucketOperations|BucketOptions)|table::\{[^}]*?(HTTPPreconditions|HTTPRangeSpec|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|NamespaceLocking|ObjectIO|ObjectInfoOrErr|ObjectOperations|WalkOptions)|error::\{[^}]*?HTTPRangeError)' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage_api.rs' \
+      --glob '!rustfs/src/admin/**' \
+      --glob '!rustfs/src/app/**' \
+      --glob '!rustfs/src/storage/**' || true
+  }
+) >"$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS root storage consumers must import storage contracts from domain modules, not root storage_api facades: $(paste -sd '; ' "$RUSTFS_ROOT_STORAGE_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename \
     '(?:crate::admin|super)::storage_api::(?:ecstore_cluster|ecstore_utils|Error|StorageError|ECStore|Endpoint|EndpointServerPools|Endpoints|PoolEndpoints|PeerRestClient|RequestContext|ReqInfo|authorize_request|spawn_traced|CollectMetricsOpts|MetricType|collect_local_metrics|BucketOperations|BucketOptions|DeleteBucketOptions|HealOperations|ListOperations|MakeBucketOptions|ObjectIO|ObjectOperations|StorageAdminApi|CapabilitySnapshotError|CapabilityState|CapabilityStatus|ObservabilitySnapshot|ObservabilitySnapshotProvider|TopologySnapshot|TopologySnapshotProvider|read_admin_config|read_admin_config_without_migrate|save_admin_config|save_admin_server_config|delete_admin_config|init_admin_config_defaults|STORAGE_CLASS_SUB_SYS|RebalanceStats|RebalanceMeta|RebalanceStopPropagationRecord|StorageObjectOptions|is_reserved_or_invalid_bucket)\b|use (?:crate::admin|super)::storage_api::\{' \
     rustfs/src/admin \
@@ -1875,6 +2043,31 @@ fi
 
 if [[ -s "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS app storage contracts must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$RUSTFS_APP_STORAGE_API_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename \
+      'storage_api::(?:admin_usecase|bucket_usecase|object_usecase|multipart_usecase|select_object)::(?:StorageAdminApi|BucketOperations|BucketOptions|DeleteBucketOptions|MakeBucketOptions|ListObjectVersionsInfo|ListObjectsV2Info|ListOperations|HTTPPreconditions|HTTPRangeSpec|NamespaceLocking|ObjectIO|ObjectOperations|CompletePart|MultipartOperations|MultipartUploadResult)\b' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n -U --with-filename \
+      'storage_api::test::\{[^}]*?(BucketOperations|BucketOptions|HealOperations|ListOperations|MakeBucketOptions|MultipartOperations|ObjectIO|ObjectOperations)' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n --with-filename \
+      'storage_api::test::(?:BucketOperations|BucketOptions|HealOperations|ListOperations|MakeBucketOptions|MultipartOperations|ObjectIO|ObjectOperations)\b' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+  }
+) >"$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS app usecase modules must import storage contracts from domain modules, not usecase root facades: $(paste -sd '; ' "$RUSTFS_APP_USECASE_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (

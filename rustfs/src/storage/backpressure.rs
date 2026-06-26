@@ -483,8 +483,9 @@ impl Default for BackpressureMonitor {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{BackpressureMonitor, BackpressurePipe, BackpressureState, ObjectPipeBackpressurePolicy};
 
     #[test]
     fn test_backpressure_config_default() {

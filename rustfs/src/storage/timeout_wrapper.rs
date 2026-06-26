@@ -462,8 +462,11 @@ pub fn get_io_buffer_size() -> usize {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{
+        GetObjectTimeoutPolicy, RequestTimeoutWrapper, TimedGetObjectResult, get_duplex_buffer_size, get_io_buffer_size,
+    };
     use std::time::Duration;
 
     #[test]
