@@ -171,6 +171,9 @@ use super::storage_api::object_usecase::{
 
 const ACCEPT_RANGES_BYTES: &str = "bytes";
 const MAX_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 64 * 1024 * 1024;
+const MEDIUM_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 8 * 1024 * 1024;
+const HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 4 * 1024 * 1024;
+const VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES: i64 = 1024 * 1024;
 const LOG_COMPONENT_APP: &str = "app";
 const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
@@ -744,14 +747,56 @@ fn object_seek_support_threshold() -> usize {
     })
 }
 
+fn object_seek_support_concurrency_thresholds() -> (usize, usize) {
+    static OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS: OnceLock<(usize, usize)> = OnceLock::new();
+    *OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS.get_or_init(|| {
+        let medium = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD,
+        )
+        .max(1);
+        let high = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+        )
+        .max(medium + 1);
+        (medium, high)
+    })
+}
+
+fn concurrency_aware_seek_support_threshold(configured_threshold: i64, concurrent_requests: usize) -> i64 {
+    let (medium_threshold, high_threshold) = object_seek_support_concurrency_thresholds();
+    let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
+
+    if concurrent_requests >= high_threshold.saturating_mul(2) {
+        return effective_threshold.min(VERY_HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    }
+    if concurrent_requests >= high_threshold {
+        return effective_threshold.min(HIGH_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    }
+    if concurrent_requests >= medium_threshold {
+        return effective_threshold.min(MEDIUM_CONCURRENCY_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    }
+
+    effective_threshold
+}
+
 fn should_buffer_get_object_in_memory(
     info: &ObjectInfo,
     response_content_length: i64,
     part_number: Option<usize>,
     has_range: bool,
+    concurrent_requests: usize,
 ) -> bool {
     let configured_threshold = object_seek_support_threshold() as i64;
-    should_buffer_get_object_in_memory_with_threshold(info, response_content_length, part_number, has_range, configured_threshold)
+    should_buffer_get_object_in_memory_with_threshold(
+        info,
+        response_content_length,
+        part_number,
+        has_range,
+        configured_threshold,
+        concurrent_requests,
+    )
 }
 
 fn should_buffer_get_object_in_memory_with_threshold(
@@ -760,12 +805,13 @@ fn should_buffer_get_object_in_memory_with_threshold(
     part_number: Option<usize>,
     has_range: bool,
     configured_threshold: i64,
+    concurrent_requests: usize,
 ) -> bool {
     if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
         return false;
     }
 
-    let effective_threshold = configured_threshold.min(MAX_GET_OBJECT_MEMORY_BUFFER_BYTES);
+    let effective_threshold = concurrency_aware_seek_support_threshold(configured_threshold, concurrent_requests);
     if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES
         && GET_OBJECT_BUFFER_THRESHOLD_WARNED
             .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
@@ -2121,6 +2167,7 @@ impl DefaultObjectUsecase {
         response_content_length: i64,
         optimal_buffer_size: usize,
         enable_readahead: bool,
+        concurrent_requests: usize,
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
@@ -2130,7 +2177,7 @@ impl DefaultObjectUsecase {
     {
         if encryption_applied {
             let should_buffer_encrypted_object =
-                should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
+                should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -2162,7 +2209,7 @@ impl DefaultObjectUsecase {
         }
 
         let should_provide_seek_support =
-            should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range);
+            should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
@@ -2905,6 +2952,7 @@ impl DefaultObjectUsecase {
             response_content_length,
             optimal_buffer_size,
             enable_readahead,
+            concurrent_requests,
             part_number,
             rs.is_some(),
             encryption_applied,
@@ -5549,7 +5597,7 @@ mod tests {
         let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
         let response_len = 80_i64 * 1024 * 1024;
         let should_buffer =
-            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold);
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold, 1);
 
         assert!(
             !should_buffer,
@@ -5567,21 +5615,24 @@ mod tests {
             1024 * 1024,
             None,
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
             1024 * 1024,
             Some(1),
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
             1024 * 1024,
             None,
             true,
-            configured_threshold
+            configured_threshold,
+            1
         ));
     }
 
@@ -5595,14 +5646,16 @@ mod tests {
             configured_threshold,
             None,
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
             configured_threshold + 1,
             None,
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
     }
 
@@ -5616,16 +5669,49 @@ mod tests {
             0,
             None,
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
             -1,
             None,
             false,
-            configured_threshold
+            configured_threshold,
+            1
         ));
-        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0, 1));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_reduces_threshold_under_concurrency() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold,
+            1
+        ));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            configured_threshold,
+            None,
+            false,
+            configured_threshold,
+            32
+        ));
+        assert!(should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            4_i64 * 1024 * 1024,
+            None,
+            false,
+            configured_threshold,
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD
+        ));
     }
 
     struct ReadProbeReader {
@@ -5656,6 +5742,7 @@ mod tests {
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
             true,
+            1,
             None,
             false,
             false,
@@ -5688,6 +5775,7 @@ mod tests {
             18_i64 * 1024 * 1024 * 1024,
             128 * 1024,
             true,
+            1,
             None,
             false,
             true,
