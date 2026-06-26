@@ -1930,9 +1930,17 @@ pub fn get_buffer_size_opt_in(file_size: i64) -> usize {
 // ============================================
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{
+        IoLoadLevel, IoPriority, IoPriorityMetrics, IoPriorityQueue, IoPriorityQueueConfig, IoSchedulerConfig,
+        IoSchedulingContext, IoStrategy, get_advanced_buffer_size, get_buffer_size_opt_in, get_concurrency_aware_buffer_size,
+    };
+    use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
+    use rustfs_io_metrics::bandwidth::{BandwidthSnapshot, BandwidthTier};
     use serial_test::serial;
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial]

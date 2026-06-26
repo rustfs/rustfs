@@ -391,12 +391,18 @@ impl Drop for OperationHelper {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+    use crate::storage::access::ReqInfo;
+    use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_credentials::Credentials;
+    use rustfs_s3_ops::S3Operation;
+    use rustfs_s3_types::EventName;
+    use s3s::S3Request;
     use s3s::dto::DeleteObjectTaggingInput;
     use std::sync::{Arc, Mutex};
     use temp_env::with_vars;
