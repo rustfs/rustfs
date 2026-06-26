@@ -104,8 +104,8 @@ pub(crate) mod startup {
         init_bucket_metadata_sys, init_ecstore_config, init_global_config_sys, init_local_disks, init_lock_clients,
         new_global_notification_sys, prewarm_local_disk_id_map, process_lambda_configurations, process_queue_configurations,
         process_topic_configurations, set_global_endpoints, set_global_region, set_global_rustfs_port,
-        shutdown_background_services, try_migrate_bucket_metadata, try_migrate_iam_config, try_migrate_server_config,
-        update_erasure_type,
+        set_workload_admission_snapshot_provider, shutdown_background_services, try_migrate_bucket_metadata,
+        try_migrate_iam_config, try_migrate_server_config, update_erasure_type,
     };
 
     #[cfg(test)]

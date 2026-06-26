@@ -228,6 +228,7 @@ pub(crate) type ObjectLockBlockReason = ecstore_bucket::object_lock::objectlock_
 pub(crate) type ObjectStoreResolver = dyn Fn() -> Option<Arc<ECStore>> + Send + Sync + 'static;
 pub(crate) type PolicySys = ecstore_bucket::policy_sys::PolicySys;
 pub(crate) type PoolEndpoints = ecstore_layout::PoolEndpoints;
+pub(crate) type WorkloadAdmissionSnapshotProviderRef = rustfs_ecstore::WorkloadAdmissionSnapshotProviderRef;
 pub(crate) type QuotaError = ecstore_bucket::quota::QuotaError;
 pub(crate) type RawFileInfo = rustfs_filemeta::RawFileInfo;
 pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
@@ -837,6 +838,12 @@ pub(crate) fn new_object_layer_fn() -> Option<Arc<ECStore>> {
 
 pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
     ecstore_global::set_object_store_resolver(resolver)
+}
+
+pub(crate) fn set_workload_admission_snapshot_provider(
+    provider: WorkloadAdmissionSnapshotProviderRef,
+) -> std::result::Result<(), WorkloadAdmissionSnapshotProviderRef> {
+    rustfs_ecstore::set_workload_admission_snapshot_provider(provider)
 }
 
 pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> {
