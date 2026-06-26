@@ -9449,6 +9449,7 @@ dependencies = [
  "http 1.4.2",
  "metrics",
  "rustfs-common",
+ "rustfs-concurrency",
  "rustfs-config",
  "rustfs-ecstore",
  "rustfs-madmin",

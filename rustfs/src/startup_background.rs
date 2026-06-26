@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use crate::storage_api::startup::ECStore;
-use rustfs_heal::{create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager};
+use crate::workload_admission::RustFsWorkloadAdmissionSnapshotProvider;
+use rustfs_heal::{
+    create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_workload_provider,
+};
 use rustfs_utils::get_env_bool_with_aliases;
 use std::{io::Result, sync::Arc};
 use tracing::{debug, info};
@@ -44,7 +47,8 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
 
     if enable_heal || enable_scanner {
         let heal_storage = Arc::new(ECStoreHealStorage::new(store));
-        init_heal_manager(heal_storage, None).await?;
+        let workload_provider = Arc::new(RustFsWorkloadAdmissionSnapshotProvider);
+        init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider)).await?;
     }
 
     if !enable_heal && !enable_scanner {

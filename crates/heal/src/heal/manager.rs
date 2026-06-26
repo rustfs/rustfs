@@ -20,6 +20,7 @@ use crate::heal::{
 use crate::{Error, Result};
 use metrics::{counter, gauge};
 use rustfs_common::heal_channel::{HealAdmissionDropReason, HealAdmissionResult, HealRequestSource};
+use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
 use rustfs_madmin::heal_commands::HealResultItem;
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
@@ -44,10 +45,13 @@ const EVENT_HEAL_AUTO_SCAN_DISK: &str = "heal_auto_scan_disk";
 const EVENT_HEAL_AUTO_SCAN_ENQUEUE: &str = "heal_auto_scan_enqueue";
 const EVENT_HEAL_MANAGER_STATE: &str = "heal_manager_state";
 const EVENT_HEAL_QUEUE_ADMISSION: &str = "heal_queue_admission";
+const EVENT_HEAL_MAINLINE_THROTTLE: &str = "heal_mainline_throttle";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
+
+type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
 
 /// Priority queue wrapper for heal requests
 /// Uses BinaryHeap for priority-based ordering while maintaining FIFO for same-priority items
@@ -628,6 +632,12 @@ pub struct HealConfig {
     pub set_bulkhead_enable: bool,
     /// Whether erasure-set page parallelism is enabled.
     pub page_parallel_enable: bool,
+    /// Whether foreground read pressure can delay best-effort heal task starts.
+    pub mainline_throttle_enable: bool,
+    /// Foreground read permit utilization percentage that delays best-effort heal starts.
+    pub mainline_read_utilization_high_percent: usize,
+    /// Delay before rechecking foreground read pressure after delaying heal starts.
+    pub mainline_max_sleep: Duration,
 }
 
 impl Default for HealConfig {
@@ -672,6 +682,19 @@ impl Default for HealConfig {
             rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE,
             rustfs_config::DEFAULT_HEAL_PAGE_PARALLEL_ENABLE,
         );
+        let mainline_throttle_enable = rustfs_utils::get_env_bool(
+            rustfs_config::ENV_HEAL_MAINLINE_THROTTLE_ENABLE,
+            rustfs_config::DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE,
+        );
+        let mainline_read_utilization_high_percent = rustfs_utils::get_env_usize(
+            rustfs_config::ENV_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT,
+            rustfs_config::DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT,
+        )
+        .min(100);
+        let mainline_max_sleep = Duration::from_millis(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEAL_MAINLINE_MAX_SLEEP_MS,
+            rustfs_config::DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS,
+        ));
         Self {
             enable_auto_heal,
             heal_interval,        // 10 seconds
@@ -684,6 +707,9 @@ impl Default for HealConfig {
             event_driven_scheduler_enable,
             set_bulkhead_enable,
             page_parallel_enable,
+            mainline_throttle_enable,
+            mainline_read_utilization_high_percent,
+            mainline_max_sleep,
         }
     }
 }
@@ -729,6 +755,8 @@ pub struct HealManager {
     statistics: Arc<RwLock<HealStatistics>>,
     /// Scheduler wake-up notifier for event-driven dispatch
     notify: Arc<Notify>,
+    /// Optional runtime workload snapshot provider used to protect foreground data-plane work.
+    workload_provider: Option<WorkloadSnapshotProviderRef>,
 }
 
 struct HealQueueContext<'a> {
@@ -741,6 +769,7 @@ struct HealQueueContext<'a> {
     storage: &'a Arc<dyn HealStorageAPI>,
     notify: &'a Arc<Notify>,
     cancel_token: &'a CancellationToken,
+    workload_provider: &'a Option<WorkloadSnapshotProviderRef>,
 }
 
 impl HealManager {
@@ -796,6 +825,70 @@ impl HealManager {
 
     fn can_displace_queued_work(request: &HealRequest) -> bool {
         matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
+    }
+
+    fn request_bypasses_mainline_throttle(request: &HealRequest) -> bool {
+        request.force_start
+            || matches!(request.source, HealRequestSource::Admin | HealRequestSource::Internal)
+            || matches!(request.priority, HealPriority::High | HealPriority::Urgent)
+    }
+
+    fn mainline_throttle_active(config: &HealConfig, provider: &Option<WorkloadSnapshotProviderRef>) -> Option<usize> {
+        if !config.mainline_throttle_enable || config.mainline_read_utilization_high_percent == 0 {
+            return None;
+        }
+
+        let provider = provider.as_ref()?;
+        let snapshot = provider.workload_admission_snapshot();
+        let foreground_read = snapshot.get(WorkloadClass::ForegroundRead)?;
+        if matches!(foreground_read.state, AdmissionState::Saturated) {
+            return Some(100);
+        }
+
+        let limit = foreground_read.limit?;
+        if limit == 0 {
+            return None;
+        }
+        let usage_pct = foreground_read
+            .active
+            .unwrap_or(0)
+            .saturating_mul(100)
+            .checked_div(limit)
+            .unwrap_or(100);
+        (usage_pct >= config.mainline_read_utilization_high_percent).then_some(usage_pct)
+    }
+
+    fn schedule_mainline_throttle_recheck(notify: Arc<Notify>, delay: Duration) {
+        if delay.is_zero() {
+            notify.notify_one();
+            return;
+        }
+
+        tokio::spawn(async move {
+            sleep(delay).await;
+            notify.notify_one();
+        });
+    }
+
+    fn record_mainline_throttle_delay(usage_pct: usize, config: &HealConfig) {
+        counter!(
+            "rustfs_heal_mainline_throttle_total",
+            "source" => "background",
+            "result" => "delayed",
+            "reason" => "foreground_read_pressure"
+        )
+        .increment(1);
+        debug!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_MAINLINE_THROTTLE,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            state = "delayed",
+            foreground_read_usage_pct = usage_pct,
+            threshold_pct = config.mainline_read_utilization_high_percent,
+            recheck_delay_ms = config.mainline_max_sleep.as_millis(),
+            "Heal scheduler delayed background work under foreground read pressure"
+        );
     }
 
     fn record_admission_metric(source: HealRequestSource, admission: HealAdmissionResult, context: &'static str) {
@@ -1040,6 +1133,15 @@ impl HealManager {
 
     /// Create new HealManager
     pub fn new(storage: Arc<dyn HealStorageAPI>, config: Option<HealConfig>) -> Self {
+        Self::new_with_workload_provider(storage, config, None)
+    }
+
+    /// Create new HealManager with an optional workload admission snapshot provider.
+    pub fn new_with_workload_provider(
+        storage: Arc<dyn HealStorageAPI>,
+        config: Option<HealConfig>,
+        workload_provider: Option<WorkloadSnapshotProviderRef>,
+    ) -> Self {
         let config = config.unwrap_or_default();
         Self {
             config: Arc::new(RwLock::new(config)),
@@ -1053,6 +1155,7 @@ impl HealManager {
             cancel_token: CancellationToken::new(),
             statistics: Arc::new(RwLock::new(HealStatistics::new())),
             notify: Arc::new(Notify::new()),
+            workload_provider,
         }
     }
 
@@ -1824,6 +1927,7 @@ impl HealManager {
         let statistics = self.statistics.clone();
         let storage = self.storage.clone();
         let notify = self.notify.clone();
+        let workload_provider = self.workload_provider.clone();
 
         tokio::spawn(async move {
             let mut interval = interval(config.read().await.heal_interval);
@@ -1853,6 +1957,7 @@ impl HealManager {
                             storage: &storage,
                             notify: &notify,
                             cancel_token: &cancel_token,
+                            workload_provider: &workload_provider,
                         })
                         .await;
                     }
@@ -1867,6 +1972,7 @@ impl HealManager {
                             storage: &storage,
                             notify: &notify,
                             cancel_token: &cancel_token,
+                            workload_provider: &workload_provider,
                         })
                         .await;
                     }
@@ -2167,9 +2273,11 @@ impl HealManager {
             storage,
             notify,
             cancel_token,
+            workload_provider,
         } = context;
 
         let config = config.read().await;
+        let mainline_usage_pct = Self::mainline_throttle_active(&config, workload_provider);
         let mut active_heals_guard = active_heals.lock().await;
         publish_active_heal_count(&active_heals_guard);
 
@@ -2192,12 +2300,18 @@ impl HealManager {
 
         let mut running_per_set = running_erasure_set_counts(&active_heals_guard);
         let mut tasks_started = 0usize;
+        let mut delayed_by_mainline_throttle = false;
 
         for _ in 0..available_slots {
-            let selected_request = if config.set_bulkhead_enable {
+            let selected_request = if config.set_bulkhead_enable || mainline_usage_pct.is_some() {
                 let max_concurrent_per_set = config.max_concurrent_per_set;
                 let (selected_request, skipped_sets) = queue.pop_runnable_with_skips(
-                    |request| can_schedule_request(request, &running_per_set, max_concurrent_per_set),
+                    |request| {
+                        let set_allowed = !config.set_bulkhead_enable
+                            || can_schedule_request(request, &running_per_set, max_concurrent_per_set);
+                        let mainline_allowed = mainline_usage_pct.is_none() || Self::request_bypasses_mainline_throttle(request);
+                        set_allowed && mainline_allowed
+                    },
                     |request| heal_request_set_key(request).map(|_| heal_request_set_metric_label(request)),
                 );
                 for skipped_set in skipped_sets {
@@ -2483,6 +2597,7 @@ impl HealManager {
                 });
                 tasks_started += 1;
             } else {
+                delayed_by_mainline_throttle = mainline_usage_pct.is_some();
                 break;
             }
         }
@@ -2493,6 +2608,11 @@ impl HealManager {
         stats.update_running_tasks(active_heals_guard.len() as u64);
         publish_active_heal_count(&active_heals_guard);
         publish_heal_queue_length(&queue);
+
+        if delayed_by_mainline_throttle && let Some(usage_pct) = mainline_usage_pct {
+            Self::record_mainline_throttle_delay(usage_pct, &config);
+            Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep);
+        }
 
         // Log queue status if items remain
         if !queue.is_empty() {
@@ -2613,9 +2733,45 @@ mod tests {
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use crate::heal::task::{HealOptions, HealPriority, HealRequest, HealTask, HealType};
     use rustfs_common::heal_channel::{HealOpts, HealRequestSource};
+    use rustfs_concurrency::{WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot};
     use rustfs_madmin::heal_commands::HealResultItem;
 
     use super::super::{DiskStore, Endpoint, storage_api::BucketInfo};
+
+    #[derive(Debug)]
+    struct FixedWorkloadProvider {
+        active: usize,
+        limit: usize,
+        state: AdmissionState,
+    }
+
+    impl WorkloadAdmissionSnapshotProvider for FixedWorkloadProvider {
+        fn workload_admission_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
+            WorkloadAdmissionRegistrySnapshot::new(vec![
+                WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundRead, self.state).with_counts(
+                    Some(self.active),
+                    None,
+                    Some(self.limit),
+                ),
+            ])
+        }
+    }
+
+    async fn process_manager_queue_once(manager: &HealManager) {
+        HealManager::process_heal_queue(HealQueueContext {
+            heal_queue: &manager.heal_queue,
+            active_heals: &manager.active_heals,
+            completed_heals: &manager.completed_heals,
+            retrying_heals: &manager.retrying_heals,
+            config: &manager.config,
+            statistics: &manager.statistics,
+            storage: &manager.storage,
+            notify: &manager.notify,
+            cancel_token: &manager.cancel_token,
+            workload_provider: &manager.workload_provider,
+        })
+        .await;
+    }
 
     struct MockStorage;
 
@@ -4130,6 +4286,67 @@ mod tests {
 
         assert_eq!(admission, HealAdmissionResult::Accepted);
         assert_eq!(manager.get_queue_length().await, 9);
+    }
+
+    #[tokio::test]
+    async fn test_mainline_throttle_delays_background_heal_start() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let provider: WorkloadSnapshotProviderRef = Arc::new(FixedWorkloadProvider {
+            active: 8,
+            limit: 10,
+            state: AdmissionState::Open,
+        });
+        let manager = HealManager::new_with_workload_provider(
+            storage,
+            Some(HealConfig {
+                max_concurrent_heals: 1,
+                mainline_throttle_enable: true,
+                mainline_read_utilization_high_percent: 80,
+                mainline_max_sleep: Duration::from_millis(1),
+                ..HealConfig::default()
+            }),
+            Some(provider),
+        );
+
+        manager
+            .submit_heal_request(bucket_request("read-repair", HealPriority::Normal, HealRequestSource::ReadRepair))
+            .await
+            .expect("read repair request should be queued");
+
+        process_manager_queue_once(&manager).await;
+
+        assert_eq!(manager.get_queue_length().await, 1);
+        assert_eq!(manager.get_active_task_count().await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_mainline_throttle_allows_admin_high_start() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let provider: WorkloadSnapshotProviderRef = Arc::new(FixedWorkloadProvider {
+            active: 10,
+            limit: 10,
+            state: AdmissionState::Saturated,
+        });
+        let manager = HealManager::new_with_workload_provider(
+            storage,
+            Some(HealConfig {
+                max_concurrent_heals: 1,
+                mainline_throttle_enable: true,
+                mainline_read_utilization_high_percent: 80,
+                mainline_max_sleep: Duration::from_millis(1),
+                ..HealConfig::default()
+            }),
+            Some(provider),
+        );
+
+        manager
+            .submit_heal_request(bucket_request("admin", HealPriority::High, HealRequestSource::Admin))
+            .await
+            .expect("admin request should be queued");
+
+        process_manager_queue_once(&manager).await;
+
+        assert_eq!(manager.get_queue_length().await, 0);
     }
 
     #[tokio::test]

@@ -20,6 +20,7 @@ pub use heal::{
     HealManager, HealOperationsSnapshot, HealOptions, HealPriority, HealPriorityCounts, HealRequest, HealSourceCounts, HealType,
     channel::HealChannelProcessor,
 };
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio_util::sync::CancellationToken;
@@ -71,8 +72,17 @@ pub async fn init_heal_manager(
     storage: Arc<dyn heal::storage::HealStorageAPI>,
     config: Option<heal::manager::HealConfig>,
 ) -> Result<Arc<HealManager>> {
+    init_heal_manager_with_workload_provider(storage, config, None).await
+}
+
+/// Initialize and start heal manager with channel processor and workload snapshots.
+pub async fn init_heal_manager_with_workload_provider(
+    storage: Arc<dyn heal::storage::HealStorageAPI>,
+    config: Option<heal::manager::HealConfig>,
+    workload_provider: Option<Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>>,
+) -> Result<Arc<HealManager>> {
     // Create heal manager
-    let heal_manager = Arc::new(HealManager::new(storage, config));
+    let heal_manager = Arc::new(HealManager::new_with_workload_provider(storage, config, workload_provider));
 
     // Start heal manager
     heal_manager.start().await?;
