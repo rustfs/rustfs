@@ -14,15 +14,15 @@
 
 use super::runtime_sources;
 use crate::admin::console::is_console_path;
-use crate::admin::handlers::health::{HealthProbe, build_health_response_parts};
+use crate::admin::handlers::health::{HealthProbe, build_health_response_parts, collect_probe_readiness};
 use crate::error::ApiError;
 use crate::server::RemoteAddr;
 use crate::server::cors;
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, CONSOLE_PREFIX, HEALTH_COMPAT_LIVE_PATH, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX,
-    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_LIVE_PATH, MINIO_HEALTH_READY_PATH, RPC_PREFIX,
-    RUSTFS_ADMIN_PREFIX, active_http_requests, collect_dependency_readiness_report, has_path_prefix, is_admin_path,
+    MINIO_ADMIN_V3_PREFIX, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_LIVE_PATH,
+    MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, has_path_prefix, is_admin_path,
     is_table_catalog_path,
 };
 use crate::storage_api::server::apply_cors_headers;
@@ -886,7 +886,9 @@ fn resolve_public_health_probe(method: &Method, path: &str) -> Option<HealthProb
 
     match path {
         HEALTH_PREFIX | HEALTH_COMPAT_LIVE_PATH | MINIO_HEALTH_LIVE_PATH => Some(HealthProbe::Liveness),
-        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH | MINIO_HEALTH_CLUSTER_PATH => Some(HealthProbe::Readiness),
+        HEALTH_READY_PATH | MINIO_HEALTH_READY_PATH => Some(HealthProbe::Readiness),
+        MINIO_HEALTH_CLUSTER_PATH => Some(HealthProbe::ClusterWrite),
+        MINIO_HEALTH_CLUSTER_READ_PATH => Some(HealthProbe::ClusterRead),
         _ => None,
     }
 }
@@ -939,11 +941,7 @@ where
             .expect("failed to build health busy response");
     }
 
-    let readiness_report = if probe == HealthProbe::Readiness {
-        Some(collect_dependency_readiness_report().await)
-    } else {
-        None
-    };
+    let readiness_report = collect_probe_readiness(probe).await;
     let kms_ready = if probe == HealthProbe::Readiness && health_compat_kms_ready_check_enabled() {
         Some(health_kms_ready().await)
     } else {
@@ -1293,6 +1291,7 @@ impl ConditionalCorsLayer {
         "/minio/health/live",
         "/minio/health/ready",
         "/minio/health/cluster",
+        "/minio/health/cluster/read",
         "/profile/cpu",
         "/profile/memory",
     ];
@@ -1940,6 +1939,31 @@ mod tests {
                     Request::builder()
                         .method(Method::GET)
                         .uri(MINIO_HEALTH_CLUSTER_PATH)
+                        .body(Full::<Bytes>::from(Bytes::new()))
+                        .expect("request"),
+                )
+                .await
+                .expect("health response");
+
+            assert!(response.status() == StatusCode::OK || response.status() == StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn public_health_endpoint_layer_handles_minio_health_cluster_read_before_inner_service() {
+        async_with_vars([(rustfs_config::ENV_HEALTH_ENDPOINT_ENABLE, Some("true"))], async {
+            let inner = CountingHybridService::default();
+            let calls = inner.calls();
+            let mut service = PublicHealthEndpointLayer.layer(inner);
+
+            let response = service
+                .call(
+                    Request::builder()
+                        .method(Method::GET)
+                        .uri(MINIO_HEALTH_CLUSTER_READ_PATH)
                         .body(Full::<Bytes>::from(Bytes::new()))
                         .expect("request"),
                 )

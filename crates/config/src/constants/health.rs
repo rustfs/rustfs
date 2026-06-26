@@ -22,6 +22,11 @@ pub const DEFAULT_HEALTH_ENDPOINT_ENABLE: bool = true;
 pub const ENV_HEALTH_READINESS_CACHE_TTL_MS: &str = "RUSTFS_HEALTH_READINESS_CACHE_TTL_MS";
 pub const DEFAULT_HEALTH_READINESS_CACHE_TTL_MS: u64 = 1000;
 
+/// Timeout for cluster health readiness collectors (milliseconds).
+/// This bounds expensive storage and lock quorum checks used by cluster probes.
+pub const ENV_HEALTH_CLUSTER_TIMEOUT_MS: &str = "RUSTFS_HEALTH_CLUSTER_TIMEOUT_MS";
+pub const DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS: u64 = 2000;
+
 /// Enable minimal health payload mode for GET `/health*` responses.
 /// When enabled, only `status` and `ready` fields are returned.
 pub const ENV_HEALTH_MINIMAL_RESPONSE_ENABLE: &str = "RUSTFS_HEALTH_MINIMAL_RESPONSE_ENABLE";

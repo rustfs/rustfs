@@ -575,6 +575,28 @@ impl ConcurrencyManager {
         }
     }
 
+    /// Get a read-only workload admission snapshot for foreground writes.
+    pub fn put_object_admission_snapshot(&self) -> WorkloadAdmissionSnapshot {
+        let active = PutObjectGuard::concurrent_count();
+        let limit = self.scheduler_config.max_concurrent_reads;
+        let state = if limit == 0 {
+            AdmissionState::Disabled
+        } else if active >= limit {
+            AdmissionState::Saturated
+        } else {
+            AdmissionState::Open
+        };
+
+        let admission =
+            WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, state).with_counts(Some(active), None, Some(limit));
+
+        match state {
+            AdmissionState::Disabled => admission.with_reason("foreground write pressure tracking disabled"),
+            AdmissionState::Saturated => admission.with_reason("foreground write concurrency reached local pressure limit"),
+            _ => admission,
+        }
+    }
+
     /// Get a read-only workload admission registry snapshot for local storage concurrency.
     pub fn workload_admission_registry_snapshot(&self) -> WorkloadAdmissionRegistrySnapshot {
         let entries = WorkloadClass::REQUIRED
@@ -582,6 +604,7 @@ impl ConcurrencyManager {
             .copied()
             .map(|class| match class {
                 WorkloadClass::ForegroundRead => self.get_object_admission_snapshot(),
+                WorkloadClass::ForegroundWrite => self.put_object_admission_snapshot(),
                 class => WorkloadAdmissionSnapshot::new(class, AdmissionState::Unknown)
                     .with_reason("not exposed by storage concurrency manager"),
             })
@@ -697,6 +720,28 @@ mod integration_tests {
 
     #[tokio::test]
     #[serial]
+    async fn test_concurrency_manager_workload_admission_snapshot_tracks_put_requests() {
+        crate::storage::concurrency::reset_active_put_requests();
+        let manager = ConcurrencyManager::new();
+        let initial = manager.put_object_admission_snapshot();
+
+        assert_eq!(initial.class, WorkloadClass::ForegroundWrite);
+        assert_eq!(initial.state, AdmissionState::Open);
+        assert_eq!(initial.active, Some(0));
+        assert_eq!(initial.queued, None);
+        assert_eq!(initial.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        let guard = PutObjectGuard::new();
+        let snapshot = manager.put_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+        drop(guard);
+        crate::storage::concurrency::reset_active_put_requests();
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_concurrency_manager_workload_admission_registry_covers_required_classes() {
         let manager = ConcurrencyManager::new();
         let registry = manager.workload_admission_registry_snapshot();
@@ -711,6 +756,10 @@ mod integration_tests {
 
         assert_eq!(
             registry.get(WorkloadClass::ForegroundRead).map(|snapshot| snapshot.state),
+            Some(AdmissionState::Open)
+        );
+        assert_eq!(
+            registry.get(WorkloadClass::ForegroundWrite).map(|snapshot| snapshot.state),
             Some(AdmissionState::Open)
         );
         assert_eq!(
