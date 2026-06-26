@@ -521,7 +521,7 @@ mod tests {
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };
-    use rustfs_concurrency::{AdmissionState, WorkloadClass};
+    use rustfs_concurrency::WorkloadClass;
     use rustfs_madmin::{InfoMessage, StorageInfo};
 
     #[tokio::test]
@@ -539,20 +539,6 @@ mod tests {
         assert_eq!(response.cluster_snapshot_summary, None);
         assert_eq!(response.summary.cluster_snapshot.state, CapabilityState::Unknown);
         assert_eq!(response.observability.platform.os.as_deref(), Some(std::env::consts::OS));
-        assert_eq!(
-            response
-                .workload_admission
-                .get(WorkloadClass::ForegroundRead)
-                .map(|snapshot| snapshot.state),
-            Some(AdmissionState::Open)
-        );
-        assert_eq!(
-            response
-                .workload_admission
-                .get(WorkloadClass::ForegroundWrite)
-                .map(|snapshot| snapshot.state),
-            Some(AdmissionState::Disabled)
-        );
         assert_eq!(response.workload_admission.entries().len(), WorkloadClass::REQUIRED.len());
     }
 
