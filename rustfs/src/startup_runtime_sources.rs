@@ -80,6 +80,10 @@ pub(crate) fn set_put_stage_metrics_enabled(enabled: bool) {
     rustfs_io_metrics::set_put_stage_metrics_enabled(enabled);
 }
 
+pub(crate) fn set_get_stage_metrics_enabled(enabled: bool) {
+    rustfs_io_metrics::set_get_stage_metrics_enabled(enabled);
+}
+
 pub(crate) fn init_tls_metrics() {
     rustfs_tls_runtime::init_tls_metrics();
 }

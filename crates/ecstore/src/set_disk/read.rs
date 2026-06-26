@@ -1154,7 +1154,7 @@ impl SetDisks {
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
-            let reader_setup_stage_start = Instant::now();
+            let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
             let mut readers = Vec::with_capacity(disks.len());
             let mut errors = Vec::with_capacity(disks.len());
             for (idx, disk_op) in disks.iter().enumerate() {
@@ -1186,7 +1186,11 @@ impl SetDisks {
                     }
                 }
             }
-            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_stage_start.elapsed().as_secs_f64());
+            if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(
+                    reader_setup_stage_start.elapsed().as_secs_f64(),
+                );
+            }
 
             let nil_count = errors.iter().filter(|&e| e.is_none()).count();
             if nil_count < erasure.data_shards {
@@ -1281,9 +1285,11 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
-            let decode_stage_start = Instant::now();
+            let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
             let (written, err) = erasure.decode(writer, readers, part_offset, part_length, part_size).await;
-            rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
+            if let Some(decode_stage_start) = decode_stage_start {
+                rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
+            }
             debug!(
                 bucket,
                 object,
@@ -1396,7 +1402,7 @@ impl SetDisks {
         let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
         let till_offset = erasure.shard_file_offset(0, part_length, part_size);
 
-        let reader_setup_stage_start = Instant::now();
+        let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
         let mut readers = Vec::with_capacity(disks.len());
         let mut errors = Vec::with_capacity(disks.len());
         for (idx, disk_op) in disks.iter().enumerate() {
@@ -1428,11 +1434,13 @@ impl SetDisks {
                 }
             }
         }
-        rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
-            GET_STAGE_READER_SETUP,
-            reader_setup_stage_start.elapsed().as_secs_f64(),
-        );
+        if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                GET_STAGE_READER_SETUP,
+                reader_setup_stage_start.elapsed().as_secs_f64(),
+            );
+        }
 
         let available_shards = errors.iter().filter(|err| err.is_none()).count();
         if available_shards < erasure.data_shards {
