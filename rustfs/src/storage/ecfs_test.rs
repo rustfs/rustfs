@@ -14,18 +14,18 @@
 
 #[cfg(test)]
 mod tests {
-    use super::super::{BucketMetadata, DEFAULT_READ_BUFFER_SIZE, get_global_bucket_metadata_sys, set_bucket_metadata};
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::ecfs::{FS, validate_object_lock_configuration_input};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
-    use crate::storage::{
-        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, get_adaptive_buffer_size_with_profile,
-        get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag, parse_object_lock_legal_hold,
-        parse_object_lock_retention, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
-        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
-        storage_api::test_consumer::StorageObjectInfo as ObjectInfo, validate_bucket_object_lock_enabled,
-        validate_list_object_unordered_with_delimiter,
+    use crate::storage::storage_api::test_consumer::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, StorageObjectInfo as ObjectInfo, apply_cors_headers,
+        apply_default_lock_retention_metadata, bucket_metadata_sys_initialized, check_preconditions, decode_tags_to_map,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, get_global_bucket_metadata_sys, is_etag_equal,
+        matches_origin_pattern, parse_etag, parse_object_lock_legal_hold, parse_object_lock_retention,
+        process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+        remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata, set_bucket_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
     };
     use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
     use rustfs_config::MI_B;
@@ -954,8 +954,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_validate_bucket_object_lock_enabled() {
-        use super::super::bucket_metadata_sys_initialized;
-        use super::super::set_bucket_metadata;
         use s3s::dto::{ObjectLockConfiguration, ObjectLockEnabled};
         use time::OffsetDateTime;
 
@@ -1794,7 +1792,6 @@ mod tests {
     /// with a single-element vec value, matching the format expected by policy evaluation.
     #[test]
     fn test_object_tag_condition_key_format() {
-        use super::super::decode_tags_to_map;
         use std::collections::HashMap;
 
         let tags_str = "security=public&project=webapp&env=prod";

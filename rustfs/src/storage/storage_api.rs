@@ -80,6 +80,12 @@ pub(crate) mod ecfs_consumer {
         }
     }
 
+    pub(crate) mod object_lock {
+        pub(crate) use super::super::super::{
+            parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
+        };
+    }
+
     pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
 }
 
@@ -124,7 +130,24 @@ pub(crate) mod options_consumer {
 }
 
 pub(crate) mod rpc_consumer {
+    pub(crate) mod http_service {
+        pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
+        pub(crate) use super::super::{StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature};
+    }
+
     pub(crate) mod node_service {
+        pub(crate) use super::super::{
+            CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
+            LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+            SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
+            UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
+            load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+        };
+        pub(crate) type StorageResult<T> = super::super::Result<T>;
+
+        #[cfg(test)]
+        pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;
+
         pub(crate) mod contract {
             pub(crate) mod admin {
                 pub(crate) use super::super::super::super::contract::admin::StorageAdminApi;
@@ -137,6 +160,11 @@ pub(crate) mod rpc_consumer {
             }
         }
     }
+}
+
+pub(crate) mod runtime_sources_consumer {
+    pub(crate) type ECStore = super::ECStore;
+    pub(crate) use crate::storage::runtime_sources;
 }
 
 pub(crate) mod s3_api_consumer {
@@ -181,6 +209,17 @@ pub(crate) mod s3_api_consumer {
 
 #[cfg(test)]
 pub(crate) mod test_consumer {
+    pub(crate) use super::super::{
+        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
+        parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
+        process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    };
+    pub(crate) use super::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, bucket_metadata_sys_initialized, get_global_bucket_metadata_sys,
+        set_bucket_metadata,
+    };
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
 

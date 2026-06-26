@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::DEFAULT_READ_BUFFER_SIZE;
-use super::super::StorageDiskRpcExt as _;
-use super::super::WalkDirOptions;
-use super::super::find_local_disk_by_ref;
-use super::super::verify_rpc_signature;
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::rpc_consumer::http_service::{
+    DEFAULT_READ_BUFFER_SIZE, StorageDiskRpcExt as _, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature,
+};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
