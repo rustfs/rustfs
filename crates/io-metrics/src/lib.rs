@@ -792,7 +792,6 @@ pub fn record_get_object_shard_locality_policy_disabled(path: &'static str) {
     }
     counter!("rustfs_io_get_object_shard_locality_policy_disabled_total", "path" => path).increment(1);
 }
-
 /// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
 #[inline(always)]
 pub fn record_get_object_shard_read_fanout(
