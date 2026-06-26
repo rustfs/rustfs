@@ -115,6 +115,9 @@ const SITE_REPLICATION_PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
 const SITE_REPLICATION_PEER_ERROR_DETAIL_LIMIT: usize = 256;
 const SITE_REPLICATION_RETRY_QUEUE_LIMIT: usize = 256;
 const SITE_REPLICATION_RETRY_FAILED_AFTER: u32 = 3;
+const SITE_REPLICATION_PEER_BUCKET_OPS_PATH: &str = "/rustfs/admin/v3/site-replication/peer/bucket-ops";
+const SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING: &str = "make-with-versioning";
+const SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION: &str = "configure-replication";
 const IDENTITY_LDAP_SUB_SYS: &str = "identity_ldap";
 const LEGACY_LDAP_SUB_SYS: &str = "ldapserverconfig";
 const SITE_REPLICATION_PEER_JOIN_PATH: &str = "/rustfs/admin/v3/site-replication/peer/join";
@@ -1944,7 +1947,7 @@ async fn send_peer_admin_request_with_retry_event<T: Serialize>(
 ) -> S3Result<Vec<u8>> {
     match send_peer_admin_request(&peer.endpoint, path, access_key, secret_key, body).await {
         Ok(body) => {
-            dequeue_site_replication_retry_event(&peer.deployment_id, path).await;
+            dequeue_site_replication_retry_event(peer, path).await;
             Ok(body)
         }
         Err(err) => {
@@ -3129,6 +3132,20 @@ fn remove_sites(mut state: SiteReplicationState, req: SRRemoveReq) -> SiteReplic
     state
 }
 
+fn removed_deployment_ids_for_remove_req(state: &SiteReplicationState, req: &SRRemoveReq) -> HashSet<String> {
+    if req.remove_all || req.site_names.contains(&state.name) {
+        return state.peers.keys().cloned().collect();
+    }
+
+    let names: HashSet<&str> = req.site_names.iter().map(String::as_str).collect();
+    state
+        .peers
+        .values()
+        .filter(|peer| names.contains(peer.name.as_str()))
+        .map(|peer| peer.deployment_id.clone())
+        .collect()
+}
+
 fn validate_remove_sites_req(state: &SiteReplicationState, req: &SRRemoveReq) -> S3Result<()> {
     if req.remove_all {
         if !req.site_names.is_empty() {
@@ -3182,6 +3199,12 @@ fn summarize_peer_error_detail(detail: &str) -> String {
 
 fn retry_event_matches(event: &SiteReplicationRetryEvent, peer: &PeerInfo, path: &str) -> bool {
     (event.peer_deployment_id == peer.deployment_id || event.peer_endpoint == peer.endpoint) && event.path == path
+}
+
+fn dequeue_site_replication_retry_events(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str) -> usize {
+    let before = queue.len();
+    queue.retain(|event| !retry_event_matches(event, peer, path));
+    before.saturating_sub(queue.len())
 }
 
 fn upsert_site_replication_retry_event(queue: &mut Vec<SiteReplicationRetryEvent>, peer: &PeerInfo, path: &str, error: &str) {
@@ -3250,17 +3273,29 @@ async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error
     }
 }
 
-/// Remove a retry event for (peer_deployment_id, path) from the queue on
-/// successful delivery.  This is a no-op (load + no-op persist skipped) when
-/// no matching entry exists, avoiding unnecessary I/O on the common path.
-async fn dequeue_site_replication_retry_event(peer_deployment_id: &str, path: &str) {
+fn retry_bucket_operation(path: &str) -> Option<String> {
+    let (base_path, query) = path.split_once('?')?;
+    if base_path != SITE_REPLICATION_PEER_BUCKET_OPS_PATH {
+        return None;
+    }
+
+    form_urlencoded::parse(query.as_bytes()).find_map(|(key, value)| (key == "operation").then(|| value.into_owned()))
+}
+
+fn retry_event_replayed_by_bootstrap(event: &SiteReplicationRetryEvent) -> bool {
+    matches!(
+        retry_bucket_operation(&event.path).as_deref(),
+        Some(SITE_REPLICATION_BUCKET_OP_MAKE_WITH_VERSIONING | SITE_REPLICATION_BUCKET_OP_CONFIGURE_REPLICATION)
+    )
+}
+
+/// Remove a retry event for (peer, path) from the queue on successful delivery.
+/// This is a no-op (load + no-op persist skipped) when no matching entry exists,
+/// avoiding unnecessary I/O on the common path.
+async fn dequeue_site_replication_retry_event(peer: &PeerInfo, path: &str) {
     let result = async {
         let mut state = load_site_replication_state().await?;
-        let before = state.retry_queue.len();
-        state
-            .retry_queue
-            .retain(|event| !(event.peer_deployment_id == peer_deployment_id && event.path == path));
-        if state.retry_queue.len() < before {
+        if dequeue_site_replication_retry_events(&mut state.retry_queue, peer, path) > 0 {
             persist_site_replication_state(&state).await?;
         }
         Ok::<_, S3Error>(())
@@ -3272,7 +3307,8 @@ async fn dequeue_site_replication_retry_event(peer_deployment_id: &str, path: &s
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
             event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-            peer = peer_deployment_id,
+            peer = %peer.endpoint,
+            deployment_id = %peer.deployment_id,
             path,
             error = ?err,
             "failed to dequeue site replication retry event"
@@ -5381,36 +5417,23 @@ impl Operation for SRPeerRemoveHandler {
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
         let current_state = load_site_replication_state().await?;
 
-        // Compute the set of deployment IDs that are about to be removed so we
-        // can prune bucket targets and replication rules pointing at those peers.
-        let removed_deployment_ids: HashSet<String> =
-            if remove_req.remove_all || remove_req.site_names.contains(&current_state.name) {
-                current_state.peers.keys().cloned().collect()
-            } else {
-                let names: HashSet<&str> = remove_req.site_names.iter().map(|s| s.as_str()).collect();
-                current_state
-                    .peers
-                    .values()
-                    .filter(|peer| names.contains(peer.name.as_str()))
-                    .map(|peer| peer.deployment_id.clone())
-                    .collect()
-            };
+        let removed_deployment_ids = removed_deployment_ids_for_remove_req(&current_state, &remove_req);
 
         let state = remove_sites(current_state, remove_req);
         persist_site_replication_state(&state).await?;
 
         // Clean up bucket targets and replication rules that referenced removed peers.
-        if !removed_deployment_ids.is_empty() {
-            if let Err(err) = cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
-                warn!(
-                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
-                    component = LOG_COMPONENT_ADMIN,
-                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
-                    result = "peer_remove_bucket_cleanup_failed",
-                    error = ?err,
-                    "admin site replication state"
-                );
-            }
+        if !removed_deployment_ids.is_empty()
+            && let Err(err) = cleanup_removed_site_replication_buckets(&removed_deployment_ids).await
+        {
+            warn!(
+                event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                component = LOG_COMPONENT_ADMIN,
+                subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                result = "peer_remove_bucket_cleanup_failed",
+                error = ?err,
+                "admin site replication state"
+            );
         }
 
         Ok(empty_response(StatusCode::OK))
@@ -5544,11 +5567,8 @@ impl Operation for SiteReplicationRepairHandler {
             let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
             let mut latest = load_site_replication_state().await?;
             // Only clear retry events whose operations are replayed by bootstrap.
-            // Retain destructive operations (e.g. delete-bucket) that bootstrap
-            // does not replay, so they are not silently lost.
-            latest
-                .retry_queue
-                .retain(|e| e.path.contains("operation=delete-bucket") || e.path.contains("operation=force-delete-bucket"));
+            // Retain body-sensitive or destructive operations so they are not silently lost.
+            latest.retry_queue.retain(|event| !retry_event_replayed_by_bootstrap(event));
             persist_site_replication_state(&latest).await?;
         }
 
@@ -6270,6 +6290,79 @@ mod tests {
     }
 
     #[test]
+    fn test_retry_event_dequeue_matches_deployment_id_or_endpoint() {
+        let peer = PeerInfo {
+            deployment_id: "current-dep".to_string(),
+            ..peer("remote", "https://remote.example.com")
+        };
+        let path = "/rustfs/admin/v3/site-replication/peer/iam-item";
+        let mut queue = vec![
+            SiteReplicationRetryEvent {
+                id: "same-endpoint".to_string(),
+                peer_deployment_id: "old-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                path: path.to_string(),
+                ..Default::default()
+            },
+            SiteReplicationRetryEvent {
+                id: "different-path".to_string(),
+                peer_deployment_id: "old-dep".to_string(),
+                peer_endpoint: "https://remote.example.com".to_string(),
+                path: "/rustfs/admin/v3/site-replication/peer/bucket-meta".to_string(),
+                ..Default::default()
+            },
+        ];
+
+        let removed = dequeue_site_replication_retry_events(&mut queue, &peer, path);
+
+        assert_eq!(removed, 1);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue[0].id, "different-path");
+    }
+
+    #[test]
+    fn test_retry_event_replayed_by_bootstrap_only_clears_replayable_bucket_ops() {
+        let retry_event = |id: &str, path: &str| SiteReplicationRetryEvent {
+            id: id.to_string(),
+            path: path.to_string(),
+            ..Default::default()
+        };
+        let mut queue = vec![
+            retry_event(
+                "make",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=make-with-versioning",
+            ),
+            retry_event(
+                "configure",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?operation=configure-replication&bucket=photos",
+            ),
+            retry_event(
+                "delete",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=delete-bucket",
+            ),
+            retry_event(
+                "force-delete",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=force-delete-bucket",
+            ),
+            retry_event(
+                "purge",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=purge-deleted-bucket",
+            ),
+            retry_event(
+                "unknown",
+                "/rustfs/admin/v3/site-replication/peer/bucket-ops?bucket=photos&operation=custom",
+            ),
+            retry_event("iam", "/rustfs/admin/v3/site-replication/peer/iam-item"),
+            retry_event("bucket-meta", "/rustfs/admin/v3/site-replication/peer/bucket-meta"),
+        ];
+
+        queue.retain(|event| !retry_event_replayed_by_bootstrap(event));
+
+        let retained_ids = queue.iter().map(|event| event.id.as_str()).collect::<Vec<_>>();
+        assert_eq!(retained_ids, vec!["delete", "force-delete", "purge", "unknown", "iam", "bucket-meta"]);
+    }
+
+    #[test]
     fn test_remove_sites_prunes_retry_queue_for_removed_peer() {
         let state = SiteReplicationState {
             name: "local".to_string(),
@@ -6300,6 +6393,61 @@ mod tests {
         );
 
         assert!(state.retry_queue.is_empty());
+    }
+
+    #[test]
+    fn test_removed_deployment_ids_for_remove_req_uses_pre_remove_state() {
+        let state = SiteReplicationState {
+            name: "site-c".to_string(),
+            peers: BTreeMap::from([
+                (
+                    "site-a-dep".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-a-dep".to_string(),
+                        name: "site-a".to_string(),
+                        ..peer("site-a", "https://site-a.example.com")
+                    },
+                ),
+                (
+                    "site-b-dep".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-b-dep".to_string(),
+                        name: "site-b".to_string(),
+                        ..peer("site-b", "https://site-b.example.com")
+                    },
+                ),
+                (
+                    "site-c-dep".to_string(),
+                    PeerInfo {
+                        deployment_id: "site-c-dep".to_string(),
+                        name: "site-c".to_string(),
+                        ..peer("site-c", "https://site-c.example.com")
+                    },
+                ),
+            ]),
+            ..Default::default()
+        };
+
+        let removed = removed_deployment_ids_for_remove_req(
+            &state,
+            &SRRemoveReq {
+                site_names: vec!["site-b".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(removed, HashSet::from(["site-b-dep".to_string()]));
+
+        let removed_local = removed_deployment_ids_for_remove_req(
+            &state,
+            &SRRemoveReq {
+                site_names: vec!["site-c".to_string()],
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            removed_local,
+            HashSet::from(["site-a-dep".to_string(), "site-b-dep".to_string(), "site-c-dep".to_string()])
+        );
     }
 
     #[test]
