@@ -697,6 +697,46 @@ impl Erasure {
         Ok(())
     }
 
+    pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
+        let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        let source_parity = if missing_data_source && available_shards > self.data_shards {
+            shards
+                .iter()
+                .enumerate()
+                .skip(self.data_shards)
+                .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if source_parity.is_empty() {
+            return self.decode_data(shards);
+        }
+
+        self.decode_data_and_parity(shards)?;
+        for (index, source) in source_parity {
+            let Some(rebuilt) = shards[index].as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing rebuilt parity shard after read verification",
+                ));
+            };
+            if rebuilt != &source {
+                warn!(
+                    shard_index = index,
+                    data_shards = self.data_shards,
+                    parity_shards = self.parity_shards,
+                    "erasure decode rejected inconsistent read source shards"
+                );
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "inconsistent read source shards"));
+            }
+        }
+
+        Ok(())
+    }
+
     pub(crate) fn verify_data_and_parity(&self, shards: &[Option<Vec<u8>>]) -> io::Result<bool> {
         let expected_shards = self.total_shard_count();
         if shards.len() != expected_shards {

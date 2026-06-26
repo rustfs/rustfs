@@ -2199,7 +2199,7 @@ impl SetDisks {
         }
 
         let readers = reader_setup.readers;
-        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path_and_read_costs(
+        let source = erasure_coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
             readers,
             erasure.clone(),
             0,

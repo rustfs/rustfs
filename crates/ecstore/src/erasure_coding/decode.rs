@@ -265,6 +265,44 @@ where
         )
     }
 
+    pub(crate) fn new_with_metrics_path_and_reconstruction_verification(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+    ) -> Self {
+        Self::new_with_metrics_path_read_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            get_object_disk_read_timeout(),
+            true,
+        )
+    }
+
+    pub(crate) fn new_with_metrics_path_read_costs_and_reconstruction_verification(
+        readers: Vec<Option<BitrotReader<R>>>,
+        e: Erasure,
+        offset: usize,
+        total_length: usize,
+        metrics_path: Option<&'static str>,
+        read_costs: Vec<ShardReadCost>,
+    ) -> Self {
+        Self::new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
+            readers,
+            e,
+            offset,
+            total_length,
+            metrics_path,
+            read_costs,
+            get_object_disk_read_timeout(),
+            true,
+        )
+    }
+
     fn new_with_read_timeout(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
@@ -718,46 +756,6 @@ where
     }
 }
 
-fn decode_and_verify_reconstructed_shards(erasure: &Erasure, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
-    let missing_data_source = shards.iter().take(erasure.data_shards).any(|shard| shard.is_none());
-    let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
-    let source_parity = if missing_data_source && available_shards > erasure.data_shards {
-        shards
-            .iter()
-            .enumerate()
-            .skip(erasure.data_shards)
-            .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
-            .collect::<Vec<_>>()
-    } else {
-        Vec::new()
-    };
-
-    if source_parity.is_empty() {
-        return erasure.decode_data(shards);
-    }
-
-    erasure.decode_data_and_parity(shards)?;
-    for (index, source) in source_parity {
-        let Some(rebuilt) = shards[index].as_ref() else {
-            return Err(io::Error::new(
-                ErrorKind::InvalidData,
-                "missing rebuilt parity shard after read verification",
-            ));
-        };
-        if rebuilt != &source {
-            warn!(
-                shard_index = index,
-                data_shards = erasure.data_shards,
-                parity_shards = erasure.parity_shards,
-                "erasure decode rejected inconsistent read source shards"
-            );
-            return Err(io::Error::new(ErrorKind::InvalidData, "inconsistent read source shards"));
-        }
-    }
-
-    Ok(())
-}
-
 /// Get the total length of data blocks
 fn get_data_block_len(shards: &[Option<Vec<u8>>], data_blocks: usize) -> usize {
     let mut size = 0;
@@ -1031,7 +1029,7 @@ impl Erasure {
             // missing data shard and an extra source shard was available, verify
             // the reconstructed data against that source before streaming bytes.
             let reconstruct_stage_start = Instant::now();
-            if let Err(e) = decode_and_verify_reconstructed_shards(self, &mut shards) {
+            if let Err(e) = self.decode_data_with_reconstruction_verification(&mut shards) {
                 rustfs_io_metrics::record_get_object_stage_duration(
                     "legacy_duplex",
                     "reconstruct",

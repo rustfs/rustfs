@@ -98,7 +98,7 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
             return Ok(());
         }
 
-        self.erasure.decode_data(shards)
+        self.erasure.decode_data_with_reconstruction_verification(shards)
     }
 }
 
