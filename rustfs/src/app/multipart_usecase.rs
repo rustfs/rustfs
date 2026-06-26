@@ -27,7 +27,9 @@ use super::storage_api::multipart_usecase::bucket::{
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::multipart_usecase::compression::is_disk_compressible;
-use super::storage_api::multipart_usecase::data_usage::record_bucket_object_write_memory;
+use super::storage_api::multipart_usecase::data_usage::{
+    record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+};
 use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::multipart_usecase::helper::OperationHelper;
 #[cfg(test)]
@@ -489,7 +491,13 @@ impl DefaultMultipartUsecase {
                         ));
                     }
                     // Update quota tracking after successful multipart upload
-                    record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    let mpu_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                    if mpu_versioned {
+                        record_bucket_object_version_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64)
+                            .await;
+                    } else {
+                        record_bucket_object_write_memory(&bucket, previous_current_size, obj_info.size.max(0) as u64).await;
+                    }
                 }
                 Err(e) => {
                     warn!("Quota check failed for bucket {}: {}, allowing operation", bucket, e);

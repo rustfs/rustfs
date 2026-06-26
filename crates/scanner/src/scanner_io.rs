@@ -1543,8 +1543,10 @@ mod tests {
     use super::*;
     use crate::scanner_folder::ScannerItem;
     use crate::{DiskOption, Endpoint, new_disk, path2_bucket_object_with_base_path};
+    use rustfs_filemeta::FileInfo;
     use serial_test::serial;
     use temp_env::with_var;
+    use time::OffsetDateTime;
     use uuid::Uuid;
 
     fn bucket_info(name: &str) -> BucketInfo {
@@ -1766,6 +1768,76 @@ mod tests {
             .await
             .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
         assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn get_size_counts_delete_markers_separately_from_versions() {
+        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-versioned-usage-{}", Uuid::new_v4()));
+        let bucket = "bucket";
+        let object = "object";
+        let object_dir = temp_dir.join(bucket).join(object);
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("failed to create object directory");
+
+        let mut meta = FileMeta::new();
+        for (size, timestamp) in [(10, 10), (20, 20)] {
+            let mut fi = FileInfo::new(object, 1, 1);
+            fi.version_id = Some(Uuid::new_v4());
+            fi.mod_time = Some(OffsetDateTime::from_unix_timestamp(timestamp).expect("timestamp should be valid"));
+            fi.size = size;
+            meta.add_version(fi).expect("object version should be added");
+        }
+
+        let mut delete_marker = FileInfo::new(object, 1, 1);
+        delete_marker.version_id = Some(Uuid::new_v4());
+        delete_marker.mod_time = Some(OffsetDateTime::from_unix_timestamp(30).expect("timestamp should be valid"));
+        delete_marker.deleted = true;
+        meta.add_version(delete_marker).expect("delete marker should be added");
+
+        tokio::fs::write(&metadata_path, meta.marshal_msg().expect("metadata should marshal"))
+            .await
+            .expect("failed to write metadata");
+
+        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("failed to open local disk");
+
+        let relative_path = metadata_path.to_string_lossy().to_string();
+        let (_, scanner_path) = path2_bucket_object_with_base_path(temp_dir.to_string_lossy().as_ref(), relative_path.as_str());
+        let file_type = tokio::fs::metadata(&metadata_path)
+            .await
+            .expect("failed to stat metadata")
+            .file_type();
+        let item = ScannerItem {
+            path: scanner_path,
+            bucket: bucket.to_string(),
+            prefix: object.to_string(),
+            object_name: STORAGE_FORMAT_FILE.to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+
+        let summary = disk.get_size(item).await.expect("scanner should read versioned metadata");
+
+        assert_eq!(summary.versions, 2);
+        assert_eq!(summary.delete_markers, 1);
+        assert_eq!(summary.total_size, 30);
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

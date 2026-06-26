@@ -81,8 +81,10 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_object_delete_memory,
-        record_bucket_object_write_memory, remove_bucket_usage_from_backend,
+        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
+        replace_bucket_usage_memory_from_info,
     };
 }
 
