@@ -16,6 +16,7 @@ use bytes::Bytes;
 use pin_project_lite::pin_project;
 use rustfs_utils::HashAlgorithm;
 use std::io::IoSlice;
+use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tracing::error;
 use uuid::Uuid;
@@ -30,6 +31,7 @@ pin_project! {
         buf: Vec<u8>,
         hash_buf: Vec<u8>,
         skip_verify: bool,
+        last_verify_duration: Duration,
         id: Uuid,
     }
 }
@@ -48,13 +50,19 @@ where
             buf: Vec::new(),
             hash_buf: vec![0u8; hash_size],
             skip_verify,
+            last_verify_duration: Duration::ZERO,
             id: Uuid::new_v4(),
         }
+    }
+
+    pub(crate) fn last_verify_duration(&self) -> Duration {
+        self.last_verify_duration
     }
 
     /// Read a single (hash+data) block, verify hash, and return the number of bytes read into `out`.
     /// Returns an error if hash verification fails or data exceeds shard_size.
     pub async fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        self.last_verify_duration = Duration::ZERO;
         if out.len() > self.shard_size {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -86,7 +94,9 @@ where
         }
 
         if hash_size > 0 && !self.skip_verify {
+            let verify_start = std::time::Instant::now();
             let actual_hash = self.hash_algo.hash_encode(&out[..data_len]);
+            self.last_verify_duration = verify_start.elapsed();
             if actual_hash.as_ref() != self.hash_buf.as_slice() {
                 error!("bitrot reader hash mismatch, id={} data_len={}, out_len={}", self.id, data_len, out.len());
                 return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "bitrot hash mismatch"));
