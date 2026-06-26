@@ -25,8 +25,8 @@ use crate::server::{
     MINIO_HEALTH_READY_PATH, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, active_http_requests, has_path_prefix, is_admin_path,
     is_table_catalog_path,
 };
-use crate::storage_api::server::apply_cors_headers;
-use crate::storage_api::server::request_context::{
+use crate::storage_api::server::layer::apply_cors_headers;
+use crate::storage_api::server::layer::request_context::{
     RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
 };
 use bytes::Bytes;

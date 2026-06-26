@@ -611,8 +611,10 @@ pub fn is_deadlock_detection_enabled() -> bool {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{DeadlockDetector, LockInfo, LockType, RequestHangDetectionPolicy, RequestResourceTracker, WaitGraphEdge};
+    use std::time::{Duration, Instant};
 
     #[test]
     fn test_deadlock_detector_config_default() {

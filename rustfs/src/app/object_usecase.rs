@@ -16,8 +16,6 @@
 
 // Performance metrics recording (with zero-copy-metrics integration)
 use super::storage_api::object_usecase::ECStore;
-#[cfg(test)]
-use super::storage_api::object_usecase::HTTPPreconditions;
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
 };
@@ -50,6 +48,11 @@ use super::storage_api::object_usecase::concurrency::{
     self, ConcurrencyManager, GetObjectGuard, PutObjectGuard, get_concurrency_aware_buffer_size, get_concurrency_manager,
     get_put_concurrency_aware_buffer_size,
 };
+#[cfg(test)]
+use super::storage_api::object_usecase::contract::http::HTTPPreconditions;
+use super::storage_api::object_usecase::contract::namespace::NamespaceLocking;
+use super::storage_api::object_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
+use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
     record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
     record_bucket_object_write_memory,
@@ -78,7 +81,6 @@ use super::storage_api::object_usecase::sse::{
 };
 use super::storage_api::object_usecase::storage_class as storageclass;
 use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
-use super::storage_api::object_usecase::{HTTPRangeSpec, NamespaceLocking, ObjectIO as _, ObjectOperations as _};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, get_validated_store, has_replication_rules, parse_object_lock_legal_hold,
     parse_object_lock_retention, parse_part_number_i32_to_usize, remove_object_lock_metadata_for_copy,

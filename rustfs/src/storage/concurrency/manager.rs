@@ -19,7 +19,7 @@ use super::io_schedule::{
     get_advanced_buffer_size,
 };
 use super::request_guard::{GetObjectGuard, PutObjectGuard};
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use rustfs_concurrency::{
     AdmissionState, GetObjectQueueSnapshot, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshot,
     WorkloadAdmissionSnapshotProvider, WorkloadClass,
@@ -664,9 +664,16 @@ impl Default for ConcurrencyManager {
 // ============================================
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod integration_tests {
-    use super::*;
+    use super::super::io_schedule::{IoLoadLevel, IoPriority};
+    use super::super::request_guard::GetObjectGuard;
+    use super::ConcurrencyManager;
+    use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
+    use rustfs_config::MI_B;
+    use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
+    use std::time::Duration;
 
     #[tokio::test]
     #[serial]

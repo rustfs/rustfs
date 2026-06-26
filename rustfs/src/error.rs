@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::error::{HTTPRangeError, QuotaError, StorageError};
+use crate::storage_api::error::contract::range::HTTPRangeError;
+use crate::storage_api::error::{QuotaError, StorageError};
 use s3s::{S3Error, S3ErrorCode};
 
 #[derive(Debug)]

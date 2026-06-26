@@ -14,7 +14,7 @@
 
 use crate::config::RustFSBufferConfig;
 use crate::runtime_sources as root_runtime_sources;
-use crate::storage::ECStore;
+use crate::storage::storage_api::runtime_sources_consumer::ECStore;
 use rustfs_credentials::Credentials;
 use rustfs_iam::{error::Result as IamResult, store::object::ObjectStore, sys::IamSys};
 use rustfs_io_metrics::{PerformanceMetrics, internode_metrics::InternodeMetrics};

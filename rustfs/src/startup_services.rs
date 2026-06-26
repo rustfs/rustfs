@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::startup::{ECStore, EndpointServerPools};
+use crate::storage_api::startup::services::{ECStore, EndpointServerPools};
 use crate::{
     config::Config,
     init::{init_buffer_profile_system, init_kms_system},

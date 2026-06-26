@@ -60,6 +60,246 @@ pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
 pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
+pub(crate) use super::ecfs_extend::{
+    RFC1123, apply_bucket_default_lock_retention, apply_cors_headers, check_preconditions, get_buffer_size_opt_in,
+    get_validated_store, has_replication_rules, parse_object_lock_legal_hold, parse_object_lock_retention,
+    parse_part_number_i32_to_usize, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
+    remove_object_lock_metadata_for_copy, validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    validate_object_key, wrap_response_with_cors,
+};
+pub(crate) use super::sse::{
+    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers, sse_decryption,
+    sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read,
+};
+
+pub(crate) mod access_consumer {
+    pub(crate) use super::super::access::{
+        PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
+    };
+
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::BucketOperations;
+        }
+    }
+}
+
+pub(crate) mod concurrency_consumer {
+    pub(crate) use super::super::concurrency::{
+        ConcurrencyManager, GetObjectGuard, IoQueueStatus, IoStrategy, PutObjectGuard, get_concurrency_aware_buffer_size,
+        get_concurrency_manager, get_put_concurrency_aware_buffer_size,
+    };
+}
+
+pub(crate) mod deadlock_detector_consumer {
+    #[cfg(test)]
+    pub(crate) use super::super::deadlock_detector::RequestHangDetectionPolicy;
+    pub(crate) use super::super::deadlock_detector::{DeadlockDetector, get_deadlock_detector};
+}
+
+pub(crate) mod ecfs_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::{ObjectLockRetentionOptions, ObjectOperations};
+        }
+    }
+
+    pub(crate) mod object_lock {
+        pub(crate) use super::super::super::{
+            parse_object_lock_legal_hold, parse_object_lock_retention, validate_bucket_object_lock_enabled,
+        };
+    }
+
+    pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
+}
+
+pub(crate) mod ecfs_extend_consumer {
+    pub(crate) mod contract {
+        pub(crate) mod bucket {
+            pub(crate) use super::super::super::contract::bucket::{BucketOperations, BucketOptions};
+        }
+
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::ObjectToDelete;
+        }
+    }
+
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
+
+pub(crate) mod head_prefix_consumer {
+    pub(crate) use super::super::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
+
+    pub(crate) mod contract {
+        pub(crate) mod list {
+            pub(crate) use super::super::super::contract::list::ListOperations;
+        }
+    }
+}
+
+pub(crate) mod helper_consumer {
+    pub(crate) use super::super::helper::{OperationHelper, spawn_background_with_context};
+
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
+
+pub(crate) mod options_consumer {
+    pub(crate) use super::super::options::{
+        copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime,
+        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
+        get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, parse_copy_source_range, put_opts,
+        validate_archive_content_encoding,
+    };
+
+    pub(crate) mod contract {
+        pub(crate) mod object {
+            pub(crate) use super::super::super::contract::object::HTTPPreconditions;
+        }
+
+        pub(crate) mod range {
+            pub(crate) use super::super::super::contract::range::HTTPRangeSpec;
+        }
+    }
+
+    pub(crate) type StorageObjectOptions = super::StorageObjectOptions;
+}
+
+pub(crate) mod request_context_consumer {
+    pub(crate) use super::super::request_context::{
+        RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
+    };
+}
+
+pub(crate) mod rpc_consumer {
+    pub(crate) use super::super::rpc::InternodeRpcService;
+
+    pub(crate) mod http_service {
+        pub(crate) const DEFAULT_READ_BUFFER_SIZE: usize = super::super::DEFAULT_READ_BUFFER_SIZE;
+        pub(crate) use super::super::{StorageDiskRpcExt, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature};
+    }
+
+    pub(crate) mod node_service {
+        pub(crate) use super::super::{
+            CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
+            LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+            SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
+            UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
+            load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+        };
+        pub(crate) type StorageResult<T> = super::super::Result<T>;
+
+        #[cfg(test)]
+        pub(crate) const STORAGE_CLASS_SUB_SYS: &str = super::super::STORAGE_CLASS_SUB_SYS;
+
+        pub(crate) mod contract {
+            pub(crate) mod admin {
+                pub(crate) use super::super::super::super::contract::admin::StorageAdminApi;
+            }
+
+            pub(crate) mod bucket {
+                pub(crate) use super::super::super::super::contract::bucket::{
+                    BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+                };
+            }
+        }
+    }
+}
+
+pub(crate) mod runtime_sources_consumer {
+    pub(crate) type ECStore = super::ECStore;
+    pub(crate) use crate::storage::runtime_sources;
+}
+
+pub(crate) mod s3_api_consumer {
+    pub(crate) mod bucket {
+        pub(crate) use super::super::super::s3_api::bucket::{
+            ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
+            build_list_objects_output, build_list_objects_v2_output, parse_list_object_versions_params,
+            parse_list_objects_v2_params,
+        };
+
+        pub(crate) mod contract {
+            pub(crate) mod bucket {
+                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
+            }
+
+            pub(crate) mod list {
+                pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
+            }
+        }
+
+        pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
+
+        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+            super::super::to_s3s_etag(etag)
+        }
+    }
+
+    pub(crate) mod common {
+        pub(crate) use super::super::super::s3_api::common::rustfs_owner;
+    }
+
+    pub(crate) mod multipart {
+        pub(crate) use super::super::super::s3_api::multipart::{
+            ListMultipartUploadsParams, build_list_multipart_uploads_output, build_list_parts_output,
+            parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
+        };
+
+        pub(crate) mod contract {
+            pub(crate) mod multipart {
+                pub(crate) use super::super::super::super::contract::multipart::{ListMultipartsInfo, ListPartsInfo};
+
+                #[cfg(test)]
+                pub(crate) use super::super::super::super::contract::multipart::{MultipartInfo, PartInfo};
+            }
+        }
+
+        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
+            super::super::to_s3s_etag(etag)
+        }
+    }
+}
+
+pub(crate) mod sse_consumer {
+    pub(crate) use super::super::sse::{
+        EncryptionKeyKind, SSEType, build_ssec_read_headers, encryption_material_to_metadata, extract_ssec_params_from_headers,
+        extract_ssekms_context_from_headers, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+    };
+    pub(crate) use super::{
+        DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, apply_bucket_default_lock_retention,
+        extract_server_side_encryption_from_headers, get_buffer_size_opt_in, sse_decryption, sse_encryption,
+        sse_prepare_encryption,
+    };
+}
+
+pub(crate) mod timeout_wrapper_consumer {
+    pub(crate) use super::super::timeout_wrapper::{GetObjectTimeoutPolicy, RequestTimeoutWrapper};
+}
+
+pub(crate) mod tonic_service_consumer {
+    pub(crate) use super::super::tonic_service::make_server;
+}
+
+#[cfg(test)]
+pub(crate) mod test_consumer {
+    pub(crate) use super::super::{
+        apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
+        get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, is_etag_equal, matches_origin_pattern, parse_etag,
+        parse_object_lock_legal_hold, parse_object_lock_retention, process_lambda_configurations, process_queue_configurations,
+        process_topic_configurations, remove_object_lock_metadata_for_copy, remove_object_lock_retention_metadata,
+        validate_bucket_object_lock_enabled, validate_list_object_unordered_with_delimiter,
+    };
+    pub(crate) use super::{
+        BucketMetadata, DEFAULT_READ_BUFFER_SIZE, bucket_metadata_sys_initialized, get_global_bucket_metadata_sys,
+        set_bucket_metadata,
+    };
+    pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
+}
 
 pub(crate) mod ecstore_admin {
     pub(crate) use rustfs_ecstore::api::admin::{get_local_server_property, get_server_info};
