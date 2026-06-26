@@ -22,6 +22,7 @@ use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE
 use std::{
     collections::HashMap,
     future::Future,
+    pin::Pin,
     sync::OnceLock,
     time::{Duration, Instant},
 };
@@ -113,6 +114,23 @@ fn record_read_repair_dedup(reason: &'static str) {
     counter!("rustfs_heal_read_repair_dedup_total", "reason" => reason.to_string()).increment(1);
 }
 
+enum ReadRepairAdmissionOutcome {
+    Response(HealAdmissionResult),
+    Failed(String),
+}
+
+type ReadRepairAdmissionFuture = Pin<Box<dyn Future<Output = ReadRepairAdmissionOutcome> + Send>>;
+type ReadRepairAdmissionSubmitter = fn(rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture;
+
+fn send_read_repair_heal_request(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+    Box::pin(async {
+        match send_heal_request_with_admission(request).await {
+            Ok(result) => ReadRepairAdmissionOutcome::Response(result),
+            Err(err) => ReadRepairAdmissionOutcome::Failed(err),
+        }
+    })
+}
+
 async fn submit_read_repair_heal(
     bucket: &str,
     object: &str,
@@ -121,6 +139,29 @@ async fn submit_read_repair_heal(
     set_index: usize,
     part_number: Option<usize>,
     reason: &'static str,
+) {
+    submit_read_repair_heal_with_submitter(
+        bucket,
+        object,
+        version_id,
+        pool_index,
+        set_index,
+        part_number,
+        reason,
+        send_read_repair_heal_request,
+    )
+    .await;
+}
+
+async fn submit_read_repair_heal_with_submitter(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: Option<usize>,
+    reason: &'static str,
+    submitter: ReadRepairAdmissionSubmitter,
 ) {
     let Some(dedup_key) = reserve_read_repair_heal(bucket, object, version_id, pool_index, set_index).await else {
         record_read_repair_dedup("duplicate");
@@ -144,50 +185,54 @@ async fn submit_read_repair_heal(
     request.recreate_missing = Some(true);
 
     let request_id = request.id.clone();
-    match send_heal_request_with_admission(request).await {
-        Ok(result) if result.is_admitted() => {
-            debug!(
-                bucket,
-                object,
-                part_number,
-                pool_index,
-                set_index,
-                request_id,
-                reason,
-                admission = result.result_label(),
-                "Read-repair heal request admitted"
-            );
+    let bucket = bucket.to_string();
+    let object = object.to_string();
+    tokio::spawn(async move {
+        match submitter(request).await {
+            ReadRepairAdmissionOutcome::Response(result) if result.is_admitted() => {
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    admission = result.result_label(),
+                    "Read-repair heal request admitted"
+                );
+            }
+            ReadRepairAdmissionOutcome::Response(result) => {
+                release_read_repair_heal_reservation(&dedup_key).await;
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    admission = result.result_label(),
+                    drop_reason = result.reason_label(),
+                    "Read-repair heal request not admitted"
+                );
+            }
+            ReadRepairAdmissionOutcome::Failed(err) => {
+                release_read_repair_heal_reservation(&dedup_key).await;
+                debug!(
+                    bucket,
+                    object,
+                    part_number,
+                    pool_index,
+                    set_index,
+                    request_id,
+                    reason,
+                    error = %err,
+                    "Read-repair heal request could not be submitted"
+                );
+            }
         }
-        Ok(result) => {
-            release_read_repair_heal_reservation(&dedup_key).await;
-            debug!(
-                bucket,
-                object,
-                part_number,
-                pool_index,
-                set_index,
-                request_id,
-                reason,
-                admission = result.result_label(),
-                drop_reason = result.reason_label(),
-                "Read-repair heal request not admitted"
-            );
-        }
-        Err(err) => {
-            release_read_repair_heal_reservation(&dedup_key).await;
-            debug!(
-                bucket,
-                object,
-                part_number,
-                pool_index,
-                set_index,
-                request_id,
-                reason,
-                error = %err,
-                "Read-repair heal request could not be submitted"
-            );
-        }
-    }
+    });
 }
 
 async fn collect_read_multiple_results<F>(
@@ -1434,6 +1479,27 @@ fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOpti
 #[cfg(test)]
 mod metadata_cache_tests {
     use super::*;
+    use rustfs_common::heal_channel::HealAdmissionDropReason;
+    use serial_test::serial;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(250)).await;
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted)
+        })
+    }
+
+    fn dropped_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
+        Box::pin(async {
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+        })
+    }
 
     async fn new_metadata_cache_test_set() -> Arc<SetDisks> {
         SetDisks::new(
@@ -1546,6 +1612,72 @@ mod metadata_cache_tests {
         assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_none());
         release_read_repair_heal_reservation(&key).await;
         assert!(reserve_read_repair_heal(&bucket, "object", None, 0, 0).await.is_some());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_does_not_wait_for_slow_admission() {
+        SLOW_READ_REPAIR_SUBMITTER_CALLS.store(0, Ordering::Relaxed);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+        let started = Instant::now();
+
+        submit_read_repair_heal_with_submitter(
+            &bucket,
+            "object",
+            None,
+            0,
+            0,
+            Some(1),
+            "missing_shards",
+            slow_read_repair_submitter,
+        )
+        .await;
+
+        assert!(
+            started.elapsed() < Duration::from_millis(50),
+            "read-repair submission should not wait for admission response"
+        );
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while SLOW_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background read-repair submitter should be called");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_releases_reservation_after_policy_drop() {
+        DROPPED_READ_REPAIR_SUBMITTER_CALLS.store(0, Ordering::Relaxed);
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        submit_read_repair_heal_with_submitter(
+            &bucket,
+            "object",
+            None,
+            0,
+            0,
+            Some(1),
+            "missing_shards",
+            dropped_read_repair_submitter,
+        )
+        .await;
+
+        let released_key = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Some(key) = reserve_read_repair_heal(&bucket, "object", None, 0, 0).await {
+                    break key;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("read-repair reservation should be released after policy drop");
+
+        assert_eq!(DROPPED_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed), 1);
+        release_read_repair_heal_reservation(&released_key).await;
     }
 
     #[test]
