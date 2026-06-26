@@ -66,6 +66,13 @@ impl HealthProbe {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HealthReadinessSource {
+    Node,
+    ClusterWrite,
+    ClusterRead,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HealthResponseParts {
     pub(crate) status_code: StatusCode,
@@ -86,11 +93,19 @@ pub(crate) struct HealthPayloadContext<'a> {
 }
 
 pub(crate) async fn collect_probe_readiness(probe: HealthProbe) -> Option<crate::server::DependencyReadinessReport> {
+    match readiness_source_for_probe(probe)? {
+        HealthReadinessSource::Node => Some(collect_node_readiness_report().await),
+        HealthReadinessSource::ClusterWrite => Some(collect_cluster_write_health_report().await),
+        HealthReadinessSource::ClusterRead => Some(collect_cluster_read_health_report().await),
+    }
+}
+
+fn readiness_source_for_probe(probe: HealthProbe) -> Option<HealthReadinessSource> {
     match probe {
         HealthProbe::Liveness => None,
-        HealthProbe::Readiness => Some(collect_node_readiness_report().await),
-        HealthProbe::ClusterWrite => Some(collect_cluster_write_health_report().await),
-        HealthProbe::ClusterRead => Some(collect_cluster_read_health_report().await),
+        HealthProbe::Readiness => Some(HealthReadinessSource::Node),
+        HealthProbe::ClusterWrite => Some(HealthReadinessSource::ClusterWrite),
+        HealthProbe::ClusterRead => Some(HealthReadinessSource::ClusterRead),
     }
 }
 
@@ -397,6 +412,24 @@ mod tests {
         assert_eq!(probe_from_path(MINIO_HEALTH_READY_PATH), HealthProbe::Readiness);
         assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_PATH), HealthProbe::ClusterWrite);
         assert_eq!(probe_from_path(MINIO_HEALTH_CLUSTER_READ_PATH), HealthProbe::ClusterRead);
+    }
+
+    #[test]
+    fn test_readiness_probe_uses_node_collector_only() {
+        assert_eq!(readiness_source_for_probe(HealthProbe::Readiness), Some(HealthReadinessSource::Node));
+        assert_eq!(readiness_source_for_probe(HealthProbe::Liveness), None);
+    }
+
+    #[test]
+    fn test_cluster_probes_use_cluster_collectors() {
+        assert_eq!(
+            readiness_source_for_probe(HealthProbe::ClusterWrite),
+            Some(HealthReadinessSource::ClusterWrite)
+        );
+        assert_eq!(
+            readiness_source_for_probe(HealthProbe::ClusterRead),
+            Some(HealthReadinessSource::ClusterRead)
+        );
     }
 
     #[test]
