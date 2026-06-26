@@ -17,6 +17,7 @@ extern crate core;
 
 mod admin_server_info;
 pub mod api;
+#[path = "services/batch_processor.rs"]
 mod batch_processor;
 mod bitrot;
 mod bucket;
@@ -38,7 +39,9 @@ mod error;
 mod get_diagnostics;
 mod global;
 pub(crate) mod layout;
+#[path = "services/metrics_realtime.rs"]
 mod metrics_realtime;
+#[path = "services/notification_sys.rs"]
 mod notification_sys;
 mod object_api;
 mod pools;
@@ -60,6 +63,7 @@ mod store_utils;
 // pub mod checksum;
 mod client;
 mod event;
+#[path = "services/event_notification.rs"]
 mod event_notification;
 #[cfg(test)]
 mod pools_test;
