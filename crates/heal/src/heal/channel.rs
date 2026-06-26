@@ -462,7 +462,10 @@ impl HealChannelProcessor {
 
         let recreate_missing = request.recreate_missing.unwrap_or(match request.source {
             HealRequestSource::Scanner => false,
-            HealRequestSource::Admin | HealRequestSource::AutoHeal | HealRequestSource::Internal => true,
+            HealRequestSource::Admin
+            | HealRequestSource::AutoHeal
+            | HealRequestSource::Internal
+            | HealRequestSource::ReadRepair => true,
         });
 
         // Build HealOptions with all available fields
@@ -769,6 +772,7 @@ mod tests {
             HealRequestSource::Admin,
             HealRequestSource::AutoHeal,
             HealRequestSource::Internal,
+            HealRequestSource::ReadRepair,
         ] {
             let channel_request = HealChannelRequest {
                 id: format!("test-id-{source:?}"),
@@ -806,6 +810,7 @@ mod tests {
             (HealRequestSource::Admin, false),
             (HealRequestSource::AutoHeal, false),
             (HealRequestSource::Internal, false),
+            (HealRequestSource::ReadRepair, false),
         ] {
             let channel_request = HealChannelRequest {
                 id: format!("test-id-{source:?}-{recreate_missing}"),

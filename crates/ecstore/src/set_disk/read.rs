@@ -18,9 +18,139 @@ use crate::get_diagnostics::{
     classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
 };
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
-use std::future::Future;
+use std::{
+    collections::HashMap,
+    future::Future,
+    sync::OnceLock,
+    time::{Duration, Instant},
+};
 use tokio::io::AsyncRead;
+use tokio::sync::RwLock;
 use tokio::task::JoinSet;
+
+const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
+const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
+
+static READ_REPAIR_HEAL_CACHE: OnceLock<RwLock<HashMap<ReadRepairHealCacheKey, Instant>>> = OnceLock::new();
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ReadRepairHealCacheKey {
+    bucket: String,
+    object: String,
+    version_id: Option<String>,
+    pool_index: usize,
+    set_index: usize,
+}
+
+impl ReadRepairHealCacheKey {
+    fn new(bucket: &str, object: &str, version_id: Option<&str>, pool_index: usize, set_index: usize) -> Self {
+        Self {
+            bucket: bucket.to_string(),
+            object: object.to_string(),
+            version_id: version_id.filter(|value| !value.is_empty()).map(str::to_string),
+            pool_index,
+            set_index,
+        }
+    }
+}
+
+async fn should_submit_read_repair_heal(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    pool_index: usize,
+    set_index: usize,
+) -> bool {
+    let key = ReadRepairHealCacheKey::new(bucket, object, version_id, pool_index, set_index);
+    let now = Instant::now();
+    let cache = READ_REPAIR_HEAL_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    let mut cache = cache.write().await;
+    cache.retain(|_, seen_at| now.saturating_duration_since(*seen_at) <= READ_REPAIR_HEAL_DEDUP_TTL);
+    if cache.contains_key(&key) {
+        return false;
+    }
+    if cache.len() >= READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES
+        && let Some(oldest_key) = cache.iter().min_by_key(|(_, seen_at)| **seen_at).map(|(key, _)| key.clone())
+    {
+        cache.remove(&oldest_key);
+    }
+    cache.insert(key, now);
+    true
+}
+
+async fn submit_read_repair_heal(
+    bucket: &str,
+    object: &str,
+    version_id: Option<&str>,
+    pool_index: usize,
+    set_index: usize,
+    part_number: Option<usize>,
+    reason: &'static str,
+) {
+    if !should_submit_read_repair_heal(bucket, object, version_id, pool_index, set_index).await {
+        debug!(
+            bucket,
+            object, part_number, pool_index, set_index, reason, "Skipped duplicate read-repair heal request"
+        );
+        return;
+    }
+
+    let mut request = rustfs_common::heal_channel::create_heal_request_with_options(
+        bucket.to_string(),
+        Some(object.to_string()),
+        false,
+        Some(HealChannelPriority::Normal),
+        Some(pool_index),
+        Some(set_index),
+    );
+    request.source = HealRequestSource::ReadRepair;
+    request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
+    request.recreate_missing = Some(true);
+
+    let request_id = request.id.clone();
+    match send_heal_request_with_admission(request).await {
+        Ok(result) if result.is_admitted() => {
+            debug!(
+                bucket,
+                object,
+                part_number,
+                pool_index,
+                set_index,
+                request_id,
+                reason,
+                admission = result.result_label(),
+                "Read-repair heal request admitted"
+            );
+        }
+        Ok(result) => {
+            debug!(
+                bucket,
+                object,
+                part_number,
+                pool_index,
+                set_index,
+                request_id,
+                reason,
+                admission = result.result_label(),
+                drop_reason = result.reason_label(),
+                "Read-repair heal request not admitted"
+            );
+        }
+        Err(err) => {
+            debug!(
+                bucket,
+                object,
+                part_number,
+                pool_index,
+                set_index,
+                request_id,
+                reason,
+                error = %err,
+                "Read-repair heal request could not be submitted"
+            );
+        }
+    }
+}
 
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
@@ -709,16 +839,16 @@ impl SetDisks {
 
         let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum as usize)?;
         if errs.iter().any(|err| err.is_some()) {
-            let _ =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    fi.volume.to_string(),             // bucket
-                    Some(fi.name.to_string()),         // object_prefix
-                    false,                             // force_start
-                    Some(HealChannelPriority::Normal), // priority
-                    Some(self.pool_index),             // pool_index
-                    Some(self.set_index),              // set_index
-                ))
-                .await;
+            submit_read_repair_heal(
+                &fi.volume,
+                &fi.name,
+                opts.version_id.as_deref(),
+                self.pool_index,
+                self.set_index,
+                None,
+                "metadata_read_error",
+            )
+            .await;
         } else if use_metadata_cache {
             self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum as usize)
                 .await;
@@ -1024,7 +1154,7 @@ impl SetDisks {
 
             if missing_shards > 0 && available_shards >= erasure.data_shards {
                 // We have missing shards but enough to read - trigger background heal
-                info!(
+                debug!(
                     bucket,
                     object,
                     part_number,
@@ -1034,27 +1164,17 @@ impl SetDisks {
                     set_index,
                     "Detected missing shards during read, triggering background heal"
                 );
-                if let Err(e) =
-                    rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                        bucket.to_string(),
-                        Some(object.to_string()),
-                        false,
-                        Some(HealChannelPriority::Normal),
-                        Some(pool_index),
-                        Some(set_index),
-                    ))
-                    .await
-                {
-                    warn!(
-                        bucket,
-                        object,
-                        part_number,
-                        error = %e,
-                        "Failed to enqueue heal request for missing shards"
-                    );
-                } else {
-                    warn!(bucket, object, part_number, "Successfully enqueued heal request for missing shards");
-                }
+                let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                submit_read_repair_heal(
+                    bucket,
+                    object,
+                    version_id.as_deref(),
+                    pool_index,
+                    set_index,
+                    Some(part_number),
+                    "missing_shards",
+                )
+                .await;
             }
 
             // debug!(
@@ -1080,26 +1200,17 @@ impl SetDisks {
                     match de_err {
                         DiskError::FileNotFound | DiskError::FileCorrupt => {
                             error!("erasure.decode err 111 {:?}", &de_err);
-                            if let Err(e) = rustfs_common::heal_channel::send_heal_request(
-                                rustfs_common::heal_channel::create_heal_request_with_options(
-                                    bucket.to_string(),
-                                    Some(object.to_string()),
-                                    false,
-                                    Some(HealChannelPriority::Normal),
-                                    Some(pool_index),
-                                    Some(set_index),
-                                ),
+                            let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                            submit_read_repair_heal(
+                                bucket,
+                                object,
+                                version_id.as_deref(),
+                                pool_index,
+                                set_index,
+                                Some(part_number),
+                                "decode_error",
                             )
-                            .await
-                            {
-                                warn!(
-                                    bucket,
-                                    object,
-                                    part_number,
-                                    error = %e,
-                                    "Failed to enqueue heal request after decode error"
-                                );
-                            }
+                            .await;
                             has_err = false;
                         }
                         _ => {}
@@ -1234,25 +1345,18 @@ impl SetDisks {
 
         let total_shards = erasure.data_shards + erasure.parity_shards;
         let missing_shards = total_shards.saturating_sub(available_shards);
-        if missing_shards > 0
-            && let Err(e) =
-                rustfs_common::heal_channel::send_heal_request(rustfs_common::heal_channel::create_heal_request_with_options(
-                    bucket.to_string(),
-                    Some(object.to_string()),
-                    false,
-                    Some(HealChannelPriority::Normal),
-                    Some(pool_index),
-                    Some(set_index),
-                ))
-                .await
-        {
-            warn!(
+        if missing_shards > 0 {
+            let version_id = fi.version_id.as_ref().map(ToString::to_string);
+            submit_read_repair_heal(
                 bucket,
                 object,
-                part_number,
-                error = %e,
-                "Failed to enqueue heal request for missing shards"
-            );
+                version_id.as_deref(),
+                pool_index,
+                set_index,
+                Some(part_number),
+                "missing_shards_streaming",
+            )
+            .await;
         }
 
         let source = erasure_coding::decode::ParallelReader::new_with_metrics_path(
@@ -1371,6 +1475,16 @@ mod metadata_cache_tests {
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+    }
+
+    #[tokio::test]
+    async fn read_repair_heal_dedupes_same_object_version() {
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        assert!(should_submit_read_repair_heal(&bucket, "object", None, 0, 0).await);
+        assert!(!should_submit_read_repair_heal(&bucket, "object", None, 0, 0).await);
+        assert!(should_submit_read_repair_heal(&bucket, "object", Some("version-2"), 0, 0).await);
+        assert!(should_submit_read_repair_heal(&bucket, "object", None, 0, 1).await);
     }
 
     #[tokio::test]
