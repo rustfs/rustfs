@@ -22,7 +22,7 @@ use super::storage_api::capacity::{
 use super::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_data_usage_from_backend};
 use super::storage_api::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
-    AppContext, get_global_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
+    AppContext, current_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
 };
 use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{ClusterReadOnlySnapshot, collect_cluster_read_only_snapshot};
@@ -181,7 +181,7 @@ impl DefaultAdminUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
