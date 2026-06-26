@@ -15,7 +15,6 @@
 use super::*;
 use crate::storage::rpc::encode_msgpack_map;
 use crate::storage::runtime_sources;
-use rustfs_storage_api::StorageAdminApi;
 
 impl NodeService {
     pub(super) async fn handle_get_proc_info(

@@ -12,9 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BucketVersioningSys;
-use super::Result;
-use super::StorageError;
+use super::{BucketVersioningSys, HTTPPreconditions, HTTPRangeSpec, Result, StorageError};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
@@ -32,7 +30,6 @@ use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
 use crate::auth::UNSIGNED_PAYLOAD;
 use crate::auth::UNSIGNED_PAYLOAD_TRAILER;
 use rustfs_policy::service_type::ServiceType;
-use rustfs_storage_api::{HTTPPreconditions, HTTPRangeSpec};
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use rustfs_utils::http::AMZ_CONTENT_SHA256;
 use rustfs_utils::path::is_dir_object;

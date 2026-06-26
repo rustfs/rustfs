@@ -87,7 +87,7 @@ RUSTFS_LOCAL_COMPAT_GLOB_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_local_compat_glob_e
 RUSTFS_ADMIN_CONFIG_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_config_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage_bucket_storage_compat_module_hits.txt"
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
-RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_storage_mod_direct_storage_source_hits.txt"
+RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_direct_storage_source_hits.txt"
 RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
@@ -973,11 +973,12 @@ fi
 (
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::|^use rustfs_storage_api|rustfs_storage_api::' \
-    rustfs/src/storage/mod.rs || true
-) >"$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE"
+    rustfs/src/storage \
+    -g '!storage_api.rs' || true
+) >"$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE"
 
-if [[ -s "$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
-  report_failure "RustFS storage module root must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_MOD_DIRECT_STORAGE_SOURCE_HITS_FILE")"
+if [[ -s "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner modules must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE")"
 fi
 
 (

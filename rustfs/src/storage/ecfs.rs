@@ -14,8 +14,9 @@
 
 use super::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_VERSIONING_CONFIG,
-    BUCKET_WEBSITE_CONFIG, BucketVersioningSys, OBJECT_LOCK_CONFIG, StorageError, check_retention_for_modification, decode_tags,
-    decode_tags_to_map, delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
+    BUCKET_WEBSITE_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, OBJECT_LOCK_CONFIG, ObjectLockRetentionOptions,
+    ObjectOperations as _, StorageError, check_retention_for_modification, decode_tags, decode_tags_to_map,
+    delete_bucket_metadata_config, encode_tags, get_bucket_accelerate_config, get_bucket_logging_config,
     get_bucket_object_lock_config, get_bucket_replication_config, get_bucket_request_payment_config, get_bucket_website_config,
     is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, record_replication_proxy, serialize,
     update_bucket_metadata_config,
@@ -36,7 +37,6 @@ use http::StatusCode;
 use metrics::{counter, histogram};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_s3_ops::S3Operation;
-use rustfs_storage_api::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};
 use rustfs_targets::EventName;
 use rustfs_utils::http::headers::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
