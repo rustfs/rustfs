@@ -17,3 +17,15 @@
 pub(crate) use rustfs_ecstore::api::erasure::{
     BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, calc_shard_size,
 };
+
+pub(crate) mod comparison {
+    pub(crate) use super::Erasure;
+}
+
+pub(crate) mod erasure {
+    pub(crate) use super::{BitrotReader, BitrotWriter, Erasure, calc_shard_size};
+}
+
+pub(crate) mod single_block_non_inline {
+    pub(crate) use super::{BitrotWriterWrapper, CustomWriter, Erasure};
+}

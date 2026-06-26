@@ -36,7 +36,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group, criterion_m
 mod storage_api;
 use std::hint::black_box;
 use std::time::Duration;
-use storage_api::Erasure;
+use storage_api::comparison::Erasure;
 
 /// Performance test data configuration
 struct TestData {
