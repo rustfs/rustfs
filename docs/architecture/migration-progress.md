@@ -5422,15 +5422,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration and layer guards, diff hygiene, residual AppContext entrypoint
     scans, Rust risk scan, and full PR gate before PR.
 
+- [x] `API-235` Route server runtime-source reads through root entrypoints.
+  - Do: expose the server-needed AppContext resolver entrypoints from
+    `rustfs/src/runtime_sources.rs`, then route server runtime-source helpers
+    through those entrypoints instead of directly importing app context.
+  - Acceptance: `rustfs/src/server/runtime_sources.rs` no longer imports
+    `crate::app::context`, server consumers continue using the server-local
+    runtime-source helpers, and migration rules reject direct server
+    runtime-source AppContext imports.
+  - Must preserve: audit/event server config reads, module-switch object-store
+    lookup, readiness IAM/object-store/endpoints/lock-client checks, KMS
+    runtime lookup, and notify interface dispatch.
+  - Verification: focused server checks, formatting, migration and layer
+    guards, diff hygiene, residual server AppContext entrypoint scan, Rust risk
+    scan, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue larger app/runtime global-source batches
-   after API-234.
+   after API-235.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-235 makes server runtime sources consume root runtime-source entrypoints instead of importing app context directly. |
+| Migration preservation | pass | Server audit/event config reads, readiness checks, object-store lookups, KMS lookup, lock-client checks, and notify dispatch keep the same resolver semantics. |
+| Testing/verification | pass | Focused server checks, formatting, migration/layer guards, residual server AppContext scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-234 removes the storage runtime-source re-export of the global AppContext getter and keeps startup AppContext reads behind root runtime-source entrypoints. |
 | Migration preservation | pass | Node RPC context fallback, object-store lookup, startup replication resync, and TLS generation math keep the same runtime handles and fallback behavior. |
 | Testing/verification | pass | Focused storage RPC/startup TLS checks, formatting, migration/layer guards, residual entrypoint scans, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
@@ -5673,6 +5691,23 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-235 current slice:
+  - Branch freshness check: stacked on API-234 local branch while API-231 PR
+    #3895 is pending.
+  - `cargo test -p rustfs server:: --lib`: passed, 151 passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after deleting the stale
+    server runtime-source AppContext baseline.
+  - Server AppContext entrypoint residual scan: passed; server runtime sources
+    no longer import `crate::app::context`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - Full PR gate: planned before PR.
 
 - Issue #660 API-234 current slice:
   - Branch freshness check: stacked on API-233 local branch while API-231 PR

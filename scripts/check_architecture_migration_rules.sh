@@ -167,6 +167,7 @@ RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_runtime_s
 RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
 RUSTFS_STARTUP_APP_CONTEXT_ENTRYPOINT_HITS_FILE="${TMP_DIR}/rustfs_startup_app_context_entrypoint_hits.txt"
 RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
+RUSTFS_SERVER_APP_CONTEXT_ENTRYPOINT_HITS_FILE="${TMP_DIR}/rustfs_server_app_context_entrypoint_hits.txt"
 RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
 RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_ecfs_usecase_bypass_hits.txt"
 RUSTFS_STORAGE_GLOBAL_APP_CONTEXT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_global_app_context_reexport_hits.txt"
@@ -1473,6 +1474,17 @@ fi
 
 if [[ -s "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS server runtime source reads must stay behind rustfs/src/server/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::context::|use crate::app::context|app::context::' \
+    rustfs/src/server/runtime_sources.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_SERVER_APP_CONTEXT_ENTRYPOINT_HITS_FILE"
+
+if [[ -s "$RUSTFS_SERVER_APP_CONTEXT_ENTRYPOINT_HITS_FILE" ]]; then
+  report_failure "RustFS server AppContext reads must use rustfs/src/runtime_sources.rs entrypoints: $(paste -sd '; ' "$RUSTFS_SERVER_APP_CONTEXT_ENTRYPOINT_HITS_FILE")"
 fi
 
 (
