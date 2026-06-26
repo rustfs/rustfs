@@ -5,95 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-app-usecase-contract-domain-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/CTX-002`.
-- Based on: stacked on `overtrue/arch-admin-contract-domain-batch` while PR
-  #3911 is pending; rebase onto current `origin/main` after prerequisite PRs
-  merge before opening this PR.
+- Branch: `overtrue/arch-root-storage-contract-domain-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/CTX-002`.
+- Based on: stacked on `overtrue/arch-app-usecase-contract-domain-batch`
+  while prerequisite PRs are pending; rebase onto current `origin/main` after
+  prerequisite PRs merge before opening this PR.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-247; app usecase code still
-  uses the same storage contracts, now exposed from usecase `contract` domain
-  modules instead of usecase root facades.
-- Rust code changes: segment app usecase contract exports into domain modules,
-  migrate app consumers to domain contract imports, reject flat app usecase
-  contract consumers in migration guardrails, route
-  replication pool, outbound TLS generation, runtime region, KMS encryption
-  service, runtime support handles, S3 Select DB,
-  internode RPC metrics, IAM authorization/handler reads, notification
-  rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
-  consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
-  runtime source reads, RIO HTTP reader TLS/metrics runtime source reads, and
-  gRPC/transition network client TLS/metrics runtime source reads, plus ECStore
-  data-plane KMS/storage-class/deployment-id/lock-manager/erasure metric reads,
-  plus ECStore observability/status object-store, endpoint, node-name,
-  boot-time, init-time, root-disk threshold, and cached RPC channel reads,
-  plus ECStore replication pool, replication stats, and event-host reads,
-  plus ECStore lifecycle queue state, tier config, lifecycle config, deployment
-  id, event-host reads, bucket monitor reads, replication worker pool reads,
-  config/tier first-node checks, rebalance endpoint-locality checks, bucket
-  metadata object-store reads, metadata endpoint/setup reads, lifecycle
-  object-store reads, replication object-store readiness checks, and ECStore
-  pools/tier/notification owner-root runtime source reads, plus ECStore setup
-  state, boot-time, endpoint snapshot, local node, local disk map, and lock
-  client reads in store initialization, sets, set-disk, pool-space, and peer
-  client paths, plus ECStore facade server-config, storage-class,
-  notification, bucket-metadata, endpoint, region, tier-config, server-address,
-  object-store publication, lock-client publication, and local-node publication
-  paths, plus ECStore batch processor, dynamic storage-class publication,
-  RustFS cluster snapshot facade alias paths, ECStore RPC test runtime global
-  helpers, ECStore lifecycle queue and transition state handle facades, RustFS
-  AppContext lifecycle expiry-state resolver paths, RustFS app/admin test
-  runtime-source helpers, scanner lifecycle/tier runtime source reads, and the
-  stale RustFS tier-config and expiry-state test compat shims, plus scanner
-  runtime config, erasure-mode, lifecycle queue, and tier runtime source helper
-  names, plus IAM root-credential, server-config, and notification runtime
-  source helpers, plus AppContext fallback KMS/IAM/ECStore/config/metrics/TLS
-  runtime source helpers, plus startup/root KMS, credentials, region,
-  readiness-time, observability, metrics, buffer, and TLS runtime source
-  helpers, plus server readiness/audit/event/module-switch runtime source
-  helpers, storage request/RPC/SSE runtime source helpers, and admin
-  handler/service/router runtime source helpers, plus root auth/init/config/protocol/workload, app usecase, storage node-service, remaining admin grouped context import runtime source helpers, app bucket/object/multipart usecase explicit storage imports, app select/bucket/object/multipart explicit S3 DTO plus ECFS owner imports, app-local S3 API response helper imports for bucket/object/multipart usecases, app-local storage helper boundary imports for select/bucket/object/multipart usecases, admin/app test storage helper boundary imports for request context, authorization, object options, and ECFS test harness consumers, app storage IO/compression/set-disk helper boundary imports for object and multipart usecases, app storage error, ETag, and storage-class helper boundary imports for bucket/object/multipart usecases and lifecycle transition tests, app bucket owner facade imports for lifecycle, metadata, object-lock, quota, replication, tagging, target, versioning, and transition test helpers, and app/admin runtime, capacity, data-usage, endpoint, and global facade imports,
-  admin root storage facade consumers for config, bucket metadata, replication,
-  rebalancing, tier, quota, metrics, object zip, site replication, and admin
-  service config paths, through AppContext-first or owner-crate resolver
-  boundaries, plus root/server/startup storage facade consumers for startup
-  storage, bucket metadata, notification, services, readiness, HTTP/layer
-  request context, module switches, event dispatch, cluster/runtime snapshots,
-  capacity, workload admission, table catalog, init, protocol clients, and
-  config tests through a root-local storage_api boundary, plus root/server/startup
-  `rustfs_storage_api` contract imports through the same boundary, app/admin
-  `rustfs_storage_api` contract imports through their local boundaries, app
-  S3 helper forwarding through `app::storage_api`, scanner/heal source and
-  test ECStore plus storage contract imports through crate-local `storage_api`
-  boundaries, and remaining IAM, notify, OBS metrics, Swift, S3 Select, e2e,
-  and fuzz ECStore/storage contract imports through local `storage_api`
-  boundaries, plus storage owner root ECStore facade and storage contract
-  aggregation through `rustfs/src/storage/storage_api.rs`, storage owner
-  submodule storage contract imports through the same owner-local boundary,
-  ECStore internal storage contract imports through the owner-local
-  `storage_api_contracts` boundary, admin system, pool, cluster snapshot,
-  plugin catalog, table catalog, module-switch, and console admin discovery
-  `DefaultAdminUsecase` construction through `admin::runtime_sources`, storage
-  ECFS S3 route app usecase construction through `storage::s3_api`, root
-  storage API consumers through domain modules for startup, server, cluster,
-  table, protocols, capacity, workload, config tests, and error mapping, and
-  admin storage API consumers through admin domain modules for access, bucket,
-  cluster, config, contract, error, metrics, object, rebalance, runtime, and
-  tier boundaries, plus app storage API consumers through app domain modules
-  for admin, bucket, object, multipart, select, context, and test boundaries,
-  plus scanner, heal, IAM, OBS metrics, S3 Select, Swift, e2e, and related test
-  storage API consumers through external crate-local domain modules, plus
-  residual notify crate-boundary consumers, ECStore test/bench storage API
-  domain modules, and local ECStore type aliases for admin config and storage
-  RPC paths, plus external/test local storage API contract imports through
-  local `storage_contracts` aliases and consumer-domain modules instead of
-  root re-exports, plus RustFS storage owner, admin, and app local storage API
-  contract imports through local `storage_contracts` aliases and domain-module
-  exports instead of root re-exports, plus RustFS app/admin storage helper
-  imports through domain-module exports instead of root re-exports, plus
-  ECStore owner-local `storage_api_contracts` consumers import bucket, list,
-  multipart, object, admin, topology, range, namespace, heal, lifecycle, and
-  error contracts through domain modules instead of the flat root facade.
+- Runtime behavior changes: none expected for API-248; root runtime/server/table
+  code still uses the same storage contracts, now exposed from root
+  `storage_api` contract domain modules instead of root facades.
+- Rust code changes: segment root `storage_api` contract exports for cluster,
+  error, server, startup, and table consumers into domain modules, migrate root
+  consumers, and reject flat root contract consumers in migration guardrails.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -5648,14 +5571,29 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     app usecase contract root consumer scan, diff hygiene, and Rust risk scan
     passed; full PR gate is planned before PR.
 
+- [x] `API-248` Segment root storage contract facades by domain module.
+  - Do: split root cluster, error, server, startup, and table storage contract
+    exports into domain modules, then migrate root consumers to those modules.
+  - Acceptance: root consumers no longer import storage contract symbols from
+    root storage_api facades, and migration rules reject regressions.
+  - Must preserve: runtime capabilities, cluster snapshots, server readiness,
+    server event tests, startup bucket metadata migration, API error mapping,
+    and table catalog contract call paths.
+  - Verification: focused RustFS compile, formatting, migration/layer guards,
+    root storage contract root consumer scan, diff hygiene, and Rust risk scan
+    passed; full PR gate is planned before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner boundary batches after API-247.
+1. `consumer-migration`: continue larger owner boundary batches after API-248.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-248 segments root storage contract exports into domain modules instead of root facade exposure. |
+| Migration preservation | pass | Runtime capabilities, cluster snapshots, server readiness, server event tests, startup bucket metadata migration, API error mapping, and table catalog paths keep the same underlying contracts. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, root storage contract root consumer scan, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-247 segments app usecase contract exports into domain modules instead of root usecase facade exposure. |
 | Migration preservation | pass | Admin info, bucket metadata/listing, object, multipart, select-object, and app capacity dirty-scope test paths keep the same underlying contracts. |
 | Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, app usecase contract root consumer scan, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
@@ -5937,6 +5875,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-248 current slice:
+  - Branch freshness check: stacked on `overtrue/arch-app-usecase-contract-domain-batch`
+    while prerequisite PRs are pending.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Root storage contract root consumer scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Full PR gate: pending before PR after prerequisite PRs merge and this
+    branch is rebased onto `origin/main`.
 
 - Issue #660 API-247 current slice:
   - Branch freshness check: stacked on `overtrue/arch-admin-contract-domain-batch`

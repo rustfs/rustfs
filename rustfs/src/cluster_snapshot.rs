@@ -16,11 +16,13 @@ use crate::runtime_capabilities::runtime_observability_snapshot;
 use crate::server::{
     DependencyReadiness, DependencyReadinessReport, ReadinessDegradedReason, snapshot_dependency_readiness_report,
 };
+use crate::storage_api::cluster::EndpointServerPools;
+use crate::storage_api::cluster::contract::observability::ObservabilitySnapshot;
+use crate::storage_api::cluster::contract::topology::TopologySnapshot;
 use crate::storage_api::cluster::control_plane::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
     ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
 };
-use crate::storage_api::cluster::{EndpointServerPools, ObservabilitySnapshot, TopologySnapshot};
 use crate::workload_admission::workload_admission_registry_snapshot;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
 
@@ -115,9 +117,9 @@ pub fn cluster_has_actionable_pressure(snapshot: &ClusterReadOnlySnapshot) -> bo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_api::cluster::{
-        CapabilityState, CapabilityStatus, DiskCapabilities, Endpoint, Endpoints, PoolEndpoints, TopologyCapabilities,
-    };
+    use crate::storage_api::cluster::contract::capability::{CapabilityState, CapabilityStatus};
+    use crate::storage_api::cluster::contract::topology::{DiskCapabilities, TopologyCapabilities};
+    use crate::storage_api::cluster::{Endpoint, Endpoints, PoolEndpoints};
     use rustfs_concurrency::{WorkloadAdmissionSnapshot, WorkloadClass};
 
     #[test]
