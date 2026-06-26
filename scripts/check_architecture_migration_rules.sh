@@ -95,6 +95,7 @@ RUSTFS_STORAGE_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_storage
 RUSTFS_STORAGE_OWNER_COMPAT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_compat_reexport_hits.txt"
 RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_direct_storage_source_hits.txt"
 RUSTFS_STORAGE_OWNER_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_contract_root_consumer_hits.txt"
+RUSTFS_ADMIN_CONTRACT_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_admin_contract_root_consumer_hits.txt"
 RUSTFS_ADMIN_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_admin_bucket_storage_compat_module_hits.txt"
 RUSTFS_APP_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/rustfs_app_bucket_storage_compat_module_hits.txt"
 RUSTFS_OUTER_COMPAT_FACADE_ALIAS_HITS_FILE="${TMP_DIR}/rustfs_outer_compat_facade_alias_hits.txt"
@@ -1899,6 +1900,32 @@ fi
 
 if [[ -s "$RUSTFS_ADMIN_STORAGE_API_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS admin storage contracts must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$RUSTFS_ADMIN_STORAGE_API_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n -U --with-filename 'crate::admin::storage_api::contract::\{\s*[A-Z]' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n --with-filename 'crate::admin::storage_api::contract::[A-Z]' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n -U --with-filename 'super::storage_api::contract::\{\s*[A-Z]' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+    rg -n --with-filename 'super::storage_api::contract::[A-Z]' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!storage_api.rs' || true
+  }
+) >"$RUSTFS_ADMIN_CONTRACT_ROOT_CONSUMER_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_CONTRACT_ROOT_CONSUMER_HITS_FILE" ]]; then
+  report_failure "RustFS admin modules must import storage contracts from domain modules, not the root contract facade: $(paste -sd '; ' "$RUSTFS_ADMIN_CONTRACT_ROOT_CONSUMER_HITS_FILE")"
 fi
 
 (

@@ -410,6 +410,7 @@ pin_project! {
         inner: ReaderStream<R>,
         remaining: usize,
         emitted: usize,
+        expected: usize,
     }
 }
 
@@ -432,6 +433,7 @@ where
             inner: ReaderStream::with_capacity(reader, capacity),
             remaining,
             emitted: 0,
+            expected: remaining,
         }
     }
 }
@@ -464,23 +466,23 @@ where
 
         match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(mut bytes))) => {
-                #[cfg(feature = "tracing-chunk-debug")]
-                let expected = *this.emitted + *this.remaining;
                 if bytes.len() > *this.remaining {
                     bytes.truncate(*this.remaining);
                 }
                 *this.remaining -= bytes.len();
-                if bytes.is_empty() {
-                    Poll::Ready(None)
-                } else {
+                #[cfg(feature = "tracing-chunk-debug")]
+                {
                     *this.emitted += bytes.len();
-                    #[cfg(feature = "tracing-chunk-debug")]
                     tracing::debug!(
                         emitted = *this.emitted,
-                        expected,
+                        expected = *this.expected,
                         chunk_len = bytes.len(),
                         "GetObject ReaderStream emitted bytes"
                     );
+                }
+                if bytes.is_empty() {
+                    Poll::Ready(None)
+                } else {
                     Poll::Ready(Some(Ok(bytes)))
                 }
             }
@@ -488,7 +490,7 @@ where
                 #[cfg(feature = "tracing-chunk-debug")]
                 tracing::error!(
                     emitted = *this.emitted,
-                    expected = *this.emitted + *this.remaining,
+                    expected = *this.expected,
                     error = %err,
                     "GetObject ReaderStream returned error"
                 );

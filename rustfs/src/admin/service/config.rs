@@ -17,7 +17,7 @@ use crate::admin::runtime_sources::{
     resolve_object_store_handle, resolve_object_store_handle_for_context,
 };
 use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
-use crate::admin::storage_api::contract::StorageAdminApi;
+use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::runtime::ECStore;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
