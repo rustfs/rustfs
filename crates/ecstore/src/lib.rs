@@ -26,6 +26,7 @@ mod cluster;
 mod compress;
 mod config;
 mod data_movement;
+#[path = "data_movement/backpressure.rs"]
 mod data_movement_backpressure;
 mod data_usage;
 mod disk;
