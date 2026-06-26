@@ -2309,6 +2309,7 @@ impl HealManager {
                         let retry_active_heals = active_heals_clone.clone();
                         let retry_heal_queue = heal_queue_clone.clone();
                         let retrying_heals_for_spawn = retrying_heals_clone.clone();
+                        let retry_completed_heals = completed_heals_clone.clone();
                         let retry_notify = notify_clone.clone();
                         let retry_cancel_token = CancellationToken::new();
                         let retry_manager_cancel_token = manager_cancel_token.clone();
@@ -2322,38 +2323,42 @@ impl HealManager {
                             },
                         );
                         tokio::spawn(async move {
-                            tokio::select! {
-                                _ = retry_cancel_token.cancelled() => {
-                                    info!(
-                                        target: "rustfs::heal::manager",
-                                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                                        component = LOG_COMPONENT_HEAL,
-                                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                                        request_id = %retry_request_id,
-                                        priority = ?retry_priority,
-                                        retry_attempt,
-                                        result = "retry_cancelled",
-                                        "Heal retry admission decided"
-                                    );
-                                    return;
+                            loop {
+                                tokio::select! {
+                                    _ = retry_cancel_token.cancelled() => {
+                                        info!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            result = "retry_cancelled",
+                                            "Heal retry admission decided"
+                                        );
+                                        return;
+                                    }
+                                    _ = retry_manager_cancel_token.cancelled() => {
+                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        return;
+                                    }
+                                    _ = sleep(retry_delay) => {}
                                 }
-                                _ = retry_manager_cancel_token.cancelled() => {
+
+                                {
+                                    let retrying_heals_guard = retrying_heals_for_spawn.lock().await;
+                                    if !retrying_heals_guard.contains_key(&retry_request_id) {
+                                        return;
+                                    }
+                                }
+
+                                let active_duplicate = {
+                                    let active_heals_guard = retry_active_heals.lock().await;
+                                    active_heals_contains_dedup_key(&active_heals_guard, &retry_key)
+                                };
+                                if active_duplicate {
                                     retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
-                                    return;
-                                }
-                                _ = sleep(retry_delay) => {}
-                            }
-
-                            {
-                                let mut retrying_heals_guard = retrying_heals_for_spawn.lock().await;
-                                if retrying_heals_guard.remove(&retry_request_id).is_none() {
-                                    return;
-                                }
-                            }
-
-                            {
-                                let active_heals_guard = retry_active_heals.lock().await;
-                                if active_heals_contains_dedup_key(&active_heals_guard, &retry_key) {
                                     info!(
                                         target: "rustfs::heal::manager",
                                         event = EVENT_HEAL_QUEUE_ADMISSION,
@@ -2367,71 +2372,78 @@ impl HealManager {
                                     );
                                     return;
                                 }
-                            }
 
-                            let mut queue = retry_heal_queue.lock().await;
-                            let admission = Self::admit_request_to_queue(&mut queue, retry_request, &retry_config, "retry");
-                            let should_notify =
-                                matches!(admission, HealAdmissionResult::Accepted) && retry_config.event_driven_scheduler_enable;
-                            match admission {
-                                HealAdmissionResult::Accepted => {
-                                    info!(
-                                        target: "rustfs::heal::manager",
-                                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                                        component = LOG_COMPONENT_HEAL,
-                                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                                        request_id = %retry_request_id,
-                                        priority = ?retry_priority,
-                                        retry_attempt,
-                                        retry_delay_ms = retry_delay.as_millis(),
-                                        error = %retry_error,
-                                        result = "retry_enqueued",
-                                        "Heal retry admission decided"
-                                    );
-                                    drop(queue);
-                                    if should_notify {
-                                        retry_notify.notify_one();
+                                let mut queue = retry_heal_queue.lock().await;
+                                let admission =
+                                    Self::admit_request_to_queue(&mut queue, retry_request.clone(), &retry_config, "retry");
+                                let should_notify = matches!(admission, HealAdmissionResult::Accepted)
+                                    && retry_config.event_driven_scheduler_enable;
+                                match admission {
+                                    HealAdmissionResult::Accepted => {
+                                        drop(queue);
+                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        retry_completed_heals.lock().await.remove(&retry_request_id);
+                                        info!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            retry_delay_ms = retry_delay.as_millis(),
+                                            error = %retry_error,
+                                            result = "retry_enqueued",
+                                            "Heal retry admission decided"
+                                        );
+                                        if should_notify {
+                                            retry_notify.notify_one();
+                                        }
+                                        return;
                                     }
-                                }
-                                HealAdmissionResult::Merged => {
-                                    info!(
-                                        target: "rustfs::heal::manager",
-                                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                                        component = LOG_COMPONENT_HEAL,
-                                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                                        request_id = %retry_request_id,
-                                        priority = ?retry_priority,
-                                        retry_attempt,
-                                        result = "retry_merged_duplicate",
-                                        "Heal retry admission decided"
-                                    );
-                                }
-                                HealAdmissionResult::Full => {
-                                    warn!(
-                                        target: "rustfs::heal::manager",
-                                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                                        component = LOG_COMPONENT_HEAL,
-                                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                                        request_id = %retry_request_id,
-                                        priority = ?retry_priority,
-                                        retry_attempt,
-                                        result = "retry_rejected_full",
-                                        "Heal retry admission decided"
-                                    );
-                                }
-                                HealAdmissionResult::Dropped(reason) => {
-                                    debug!(
-                                        target: "rustfs::heal::manager",
-                                        event = EVENT_HEAL_QUEUE_ADMISSION,
-                                        component = LOG_COMPONENT_HEAL,
-                                        subsystem = LOG_SUBSYSTEM_MANAGER,
-                                        request_id = %retry_request_id,
-                                        priority = ?retry_priority,
-                                        retry_attempt,
-                                        reason = reason.as_str(),
-                                        result = "retry_dropped",
-                                        "Heal retry admission decided"
-                                    );
+                                    HealAdmissionResult::Merged => {
+                                        drop(queue);
+                                        retrying_heals_for_spawn.lock().await.remove(&retry_request_id);
+                                        info!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            result = "retry_merged_duplicate",
+                                            "Heal retry admission decided"
+                                        );
+                                        return;
+                                    }
+                                    HealAdmissionResult::Full => {
+                                        warn!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            result = "retry_rejected_full",
+                                            "Heal retry admission decided"
+                                        );
+                                    }
+                                    HealAdmissionResult::Dropped(reason) => {
+                                        debug!(
+                                            target: "rustfs::heal::manager",
+                                            event = EVENT_HEAL_QUEUE_ADMISSION,
+                                            component = LOG_COMPONENT_HEAL,
+                                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                                            request_id = %retry_request_id,
+                                            priority = ?retry_priority,
+                                            retry_attempt,
+                                            reason = reason.as_str(),
+                                            result = "retry_dropped",
+                                            "Heal retry admission decided"
+                                        );
+                                    }
                                 }
                             }
                         });
