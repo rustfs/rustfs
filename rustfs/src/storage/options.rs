@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{BucketVersioningSys, HTTPPreconditions, HTTPRangeSpec, Result, StorageError};
+use super::{BucketVersioningSys, Result, StorageError};
+use crate::storage::contract::{HTTPPreconditions, HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{

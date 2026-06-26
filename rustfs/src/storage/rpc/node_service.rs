@@ -13,17 +13,17 @@
 // limitations under the License.
 
 use super::super::{
-    BucketOptions, CollectMetricsOpts, DeleteBucketOptions, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error,
-    FileInfoVersions, LocalPeerS3Client, MakeBucketOptions, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
-    ReadMultipleResp, ReadOptions, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageAdminApi,
-    StorageDiskRpcExt as _, StoragePeerS3ClientExt as _, UpdateMetadataOpts, all_local_disk_path, collect_local_metrics,
-    find_local_disk_by_ref, get_local_server_property, load_bucket_metadata, reload_transition_tier_config,
-    resolve_object_store_handle, set_bucket_metadata,
+    CollectMetricsOpts, DeleteOptions, DiskError, DiskInfoOptions, DiskStore, ECStore, Error, FileInfoVersions,
+    LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StoragePeerS3ClientExt as _,
+    UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
+    load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
 };
 use crate::admin::service::{
     config::{reload_dynamic_config_runtime_state, reload_runtime_config_snapshot},
     site_replication::reload_site_replication_runtime_state,
 };
+use crate::storage::contract::{BucketOptions, DeleteBucketOptions, MakeBucketOptions, StorageAdminApi};
 use crate::storage::runtime_sources;
 use bytes::Bytes;
 use futures::Stream;
