@@ -19,7 +19,7 @@ use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod capacity {
     pub(crate) mod service {
-        pub(crate) use crate::storage::{all_local_disk, disk_drive_path, disk_endpoint};
+        pub(crate) use crate::storage::storage_api::{all_local_disk, disk_drive_path, disk_endpoint};
     }
 }
 
@@ -44,13 +44,13 @@ pub(crate) mod cluster {
         }
     }
 
-    pub(crate) use crate::storage::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
+    pub(crate) use crate::storage::storage_api::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 
     #[cfg(test)]
-    pub(crate) use crate::storage::{Endpoint, Endpoints, PoolEndpoints};
+    pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};
 
     pub(crate) mod control_plane {
-        pub(crate) use crate::storage::ecstore_cluster::{
+        pub(crate) use crate::storage::storage_api::ecstore_cluster::{
             ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
             ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
         };
@@ -59,7 +59,7 @@ pub(crate) mod cluster {
 
 #[cfg(test)]
 pub(crate) mod config_test {
-    pub(crate) use crate::storage::DisksLayout;
+    pub(crate) use crate::storage::storage_api::DisksLayout;
 }
 
 pub(crate) mod error {
@@ -69,14 +69,14 @@ pub(crate) mod error {
         }
     }
 
-    pub(crate) use crate::storage::{QuotaError, StorageError};
+    pub(crate) use crate::storage::storage_api::{QuotaError, StorageError};
 }
 
 pub(crate) mod protocols {
     pub(crate) mod client {
-        pub(crate) use crate::storage::access::ReqInfo;
-        pub(crate) type FS = crate::storage::FS;
-        pub(crate) use crate::storage::request_context::RequestContext;
+        pub(crate) use crate::storage::storage_api::access_consumer::ReqInfo;
+        pub(crate) type FS = crate::storage::storage_api::FS;
+        pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
     }
 }
 
@@ -89,41 +89,43 @@ pub(crate) mod server {
             }
         }
 
-        pub(crate) use crate::storage::{EventArgs, StorageObjectInfo, register_event_dispatch_hook};
+        pub(crate) use crate::storage::storage_api::{EventArgs, StorageObjectInfo, register_event_dispatch_hook};
     }
 
     pub(crate) mod http {
-        pub(crate) use crate::storage::{TONIC_RPC_PREFIX, verify_rpc_signature};
+        pub(crate) use crate::storage::storage_api::{TONIC_RPC_PREFIX, verify_rpc_signature};
 
         pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::FS;
+            pub(crate) type FS = crate::storage::storage_api::FS;
         }
 
         pub(crate) mod request_context {
-            pub(crate) use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
+            pub(crate) use crate::storage::storage_api::request_context_consumer::{
+                RequestContext, extract_request_id_from_headers,
+            };
         }
 
         pub(crate) mod rpc {
-            pub(crate) use crate::storage::rpc::InternodeRpcService;
+            pub(crate) use crate::storage::storage_api::rpc_consumer::InternodeRpcService;
         }
 
         pub(crate) mod tonic_service {
-            pub(crate) use crate::storage::tonic_service::make_server;
+            pub(crate) use crate::storage::storage_api::tonic_service_consumer::make_server;
         }
     }
 
     pub(crate) mod layer {
-        pub(crate) use crate::storage::apply_cors_headers;
+        pub(crate) use crate::storage::storage_api::apply_cors_headers;
 
         pub(crate) mod request_context {
-            pub(crate) use crate::storage::request_context::{
+            pub(crate) use crate::storage::storage_api::request_context_consumer::{
                 RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers, spawn_traced,
             };
         }
     }
 
     pub(crate) mod module_switch {
-        pub(crate) use crate::storage::{Error, read_config, save_config};
+        pub(crate) use crate::storage::storage_api::{Error, read_config, save_config};
     }
 
     pub(crate) mod readiness {
@@ -133,20 +135,20 @@ pub(crate) mod server {
             }
         }
 
-        pub(crate) use crate::storage::{Endpoint, EndpointServerPools, is_dist_erasure};
+        pub(crate) use crate::storage::storage_api::{Endpoint, EndpointServerPools, is_dist_erasure};
 
         #[cfg(test)]
-        pub(crate) use crate::storage::{Endpoints, PoolEndpoints};
+        pub(crate) use crate::storage::storage_api::{Endpoints, PoolEndpoints};
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::{ECStore, EndpointServerPools};
+        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
     }
 }
 
 pub(crate) mod startup {
     pub(crate) mod background {
-        pub(crate) use crate::storage::{ECStore, set_workload_admission_snapshot_provider};
+        pub(crate) use crate::storage::storage_api::{ECStore, set_workload_admission_snapshot_provider};
     }
 
     pub(crate) mod bucket_metadata {
@@ -156,61 +158,63 @@ pub(crate) mod startup {
             }
         }
 
-        pub(crate) use crate::storage::{ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config};
+        pub(crate) use crate::storage::storage_api::{
+            ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
+        };
     }
 
     pub(crate) mod deadlock {
-        pub(crate) use crate::storage::deadlock_detector::get_deadlock_detector;
+        pub(crate) use crate::storage::storage_api::deadlock_detector_consumer::get_deadlock_detector;
     }
 
     pub(crate) mod fs_guard {
-        pub(crate) use crate::storage::EndpointServerPools;
+        pub(crate) use crate::storage::storage_api::EndpointServerPools;
     }
 
     pub(crate) mod iam {
-        pub(crate) use crate::storage::ECStore;
+        pub(crate) use crate::storage::storage_api::ECStore;
     }
 
     pub(crate) mod init {
-        pub(crate) use crate::storage::{
+        pub(crate) use crate::storage::storage_api::{
             get_bucket_notification_config, process_lambda_configurations, process_queue_configurations,
             process_topic_configurations,
         };
 
         pub(crate) mod concurrency {
-            pub(crate) use crate::storage::concurrency::get_concurrency_manager;
+            pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
         }
 
         pub(crate) mod ecfs {
-            pub(crate) type FS = crate::storage::FS;
+            pub(crate) type FS = crate::storage::storage_api::FS;
         }
     }
 
     pub(crate) mod lifecycle {
-        pub(crate) use crate::storage::ECStore;
+        pub(crate) use crate::storage::storage_api::ECStore;
     }
 
     pub(crate) mod notification {
-        pub(crate) use crate::storage::{EndpointServerPools, Result, new_global_notification_sys};
+        pub(crate) use crate::storage::storage_api::{EndpointServerPools, Result, new_global_notification_sys};
 
         #[cfg(test)]
-        pub(crate) use crate::storage::Error;
+        pub(crate) use crate::storage::storage_api::Error;
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::{DynReplicationPool, set_global_region, set_global_rustfs_port};
+        pub(crate) use crate::storage::storage_api::{DynReplicationPool, set_global_region, set_global_rustfs_port};
     }
 
     pub(crate) mod services {
-        pub(crate) use crate::storage::{ECStore, EndpointServerPools};
+        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
     }
 
     pub(crate) mod shutdown {
-        pub(crate) use crate::storage::shutdown_background_services;
+        pub(crate) use crate::storage::storage_api::shutdown_background_services;
     }
 
     pub(crate) mod storage {
-        pub(crate) use crate::storage::{
+        pub(crate) use crate::storage::storage_api::{
             ECStore, EndpointServerPools, init_background_replication, init_ecstore_config, init_global_config_sys,
             init_local_disks, init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config,
             update_erasure_type,
@@ -220,11 +224,11 @@ pub(crate) mod startup {
 
 pub(crate) mod workload {
     pub(crate) mod admission {
-        pub(crate) use crate::storage::{bucket_metadata_runtime_initialized, replication_queue_current_count};
+        pub(crate) use crate::storage::storage_api::{bucket_metadata_runtime_initialized, replication_queue_current_count};
     }
 
     pub(crate) mod concurrency {
-        pub(crate) use crate::storage::concurrency::get_concurrency_manager;
+        pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
     }
 }
 
@@ -253,7 +257,7 @@ pub(crate) mod table {
         }
     }
 
-    pub(crate) use crate::storage::{
+    pub(crate) use crate::storage::storage_api::{
         BUCKET_TABLE_CATALOG_META_PREFIX, BUCKET_TABLE_CATALOG_TABLE_BUCKETS_PREFIX, BUCKET_TABLE_CONFIG,
         BUCKET_TABLE_RESERVED_PREFIX, Error, RUSTFS_META_BUCKET, StorageDeletedObject, StorageError, StorageGetObjectReader,
         StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, get_bucket_metadata,

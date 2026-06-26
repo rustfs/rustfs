@@ -43,11 +43,6 @@ mod sse_test;
 pub(crate) mod storage_api;
 
 pub(crate) use ecfs_extend::*;
-pub(crate) use sse::{
-    DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, extract_server_side_encryption_from_headers, sse_decryption,
-    sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
-    validate_sse_headers_for_write, validate_ssec_for_read,
-};
 #[allow(unused_imports)]
 pub(crate) use storage_api::{
     BUCKET_ACCELERATE_CONFIG, BUCKET_LOGGING_CONFIG, BUCKET_REQUEST_PAYMENT_CONFIG, BUCKET_TABLE_CATALOG_META_PREFIX,

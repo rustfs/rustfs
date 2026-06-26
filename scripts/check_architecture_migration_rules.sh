@@ -201,6 +201,8 @@ RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_o
 RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_wildcard_import_hits.txt"
 RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_export_glob_hits.txt"
+RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_facade_direct_owner_bypass_hits.txt"
+RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_sse_root_export_hits.txt"
 RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
 RUSTFS_ADMIN_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_storage_api_domain_bypass_hits.txt"
 RUSTFS_APP_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_storage_api_domain_bypass_hits.txt"
@@ -1947,6 +1949,30 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE" ]]; then
   report_failure "RustFS storage owner root must explicitly list storage_api re-exports instead of using a wildcard: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg --pcre2 -n --with-filename \
+    '(use crate::storage::\{|crate::storage::(?!storage_api\b))' \
+    rustfs/src/storage_api.rs \
+    rustfs/src/app/storage_api.rs \
+    rustfs/src/admin/storage_api.rs || true
+) >"$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS root/app/admin storage facades must consume owner APIs through crate::storage::storage_api: $(paste -sd '; ' "$RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^pub\(crate\) use sse::' \
+    rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner root must expose SSE helpers through storage_api instead of root sse re-exports: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE")"
 fi
 
 (
