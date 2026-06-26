@@ -14,7 +14,7 @@
 
 use crate::admin::router::Operation;
 use crate::admin::runtime_sources::resolve_endpoints_handle;
-use crate::admin::storage_api::PeerRestClient;
+use crate::admin::storage_api::runtime::PeerRestClient;
 use http::StatusCode;
 use hyper::Uri;
 use matchit::Params;

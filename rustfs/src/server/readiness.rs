@@ -15,9 +15,9 @@
 use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
-use crate::storage_api::{Endpoint, EndpointServerPools, StorageAdminApi, is_dist_erasure};
+use crate::storage_api::server::{Endpoint, EndpointServerPools, StorageAdminApi, is_dist_erasure};
 #[cfg(test)]
-use crate::storage_api::{Endpoints, PoolEndpoints};
+use crate::storage_api::server::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;

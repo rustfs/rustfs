@@ -16,9 +16,8 @@ use crate::admin::runtime_sources::{
     AppContext, current_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
     resolve_object_store_handle, resolve_object_store_handle_for_context,
 };
-use crate::admin::storage_api::StorageAdminApi;
-use crate::admin::storage_api::storageclass;
-use crate::admin::storage_api::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate};
+use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
+use crate::admin::storage_api::contract::StorageAdminApi;
 use rustfs_audit::reload_audit_config;
 use rustfs_config::audit::{AUDIT_MQTT_SUB_SYS, AUDIT_REDIS_DEFAULT_CHANNEL, AUDIT_WEBHOOK_SUB_SYS};
 use rustfs_config::notify::{NOTIFY_MQTT_SUB_SYS, NOTIFY_REDIS_DEFAULT_CHANNEL, NOTIFY_WEBHOOK_SUB_SYS};
@@ -384,7 +383,7 @@ pub async fn signal_config_snapshot_reload() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::storage_api::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
+    use crate::admin::storage_api::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, BUCKET_REPLICATION_CONFIG};
     use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
     use rustfs_config::oidc::{OIDC_CLIENT_ID, OIDC_CONFIG_URL, OIDC_SCOPES};
     use rustfs_config::{HEAL_SUB_SYS, SCANNER_SUB_SYS};
@@ -440,7 +439,7 @@ mod tests {
 
     #[test]
     fn validate_notify_subsystem_config_rejects_invalid_webhook_endpoint() {
-        crate::admin::storage_api::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(NOTIFY_WEBHOOK_SUB_SYS).expect("notify webhook defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -454,7 +453,7 @@ mod tests {
 
     #[test]
     fn validate_audit_subsystem_config_rejects_relative_queue_dir() {
-        crate::admin::storage_api::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(AUDIT_MQTT_SUB_SYS).expect("audit mqtt defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -469,7 +468,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_missing_openid_scope() {
-        crate::admin::storage_api::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let kvs = targets.get_mut(DEFAULT_DELIMITER).expect("default target");
@@ -486,7 +485,7 @@ mod tests {
 
     #[test]
     fn validate_identity_openid_config_rejects_invalid_named_provider_id() {
-        crate::admin::storage_api::init_admin_config_defaults();
+        crate::admin::storage_api::config::init_admin_config_defaults();
         let mut config = ServerConfig::new();
         let targets = config.0.get_mut(IDENTITY_OPENID_SUB_SYS).expect("openid defaults");
         let default_kvs = targets.get(DEFAULT_DELIMITER).cloned().expect("default target");

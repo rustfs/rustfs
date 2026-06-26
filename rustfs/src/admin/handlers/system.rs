@@ -18,7 +18,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
     DefaultAdminUsecase, QueryServerInfoRequest, default_admin_usecase, resolve_endpoints_handle,
 };
-use crate::admin::storage_api::{
+use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
 use crate::auth::{check_key_valid, get_session_token};
@@ -298,7 +298,7 @@ pub struct RuntimeCapabilitiesResponse {
     pub summary: RuntimeCapabilitiesSummary,
     pub cluster_snapshot_path: String,
     pub cluster_snapshot_summary: Option<CapabilityStatus>,
-    pub observability: crate::admin::storage_api::ObservabilitySnapshot,
+    pub observability: crate::admin::storage_api::cluster::ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub topology: Option<TopologySnapshot>,
     pub topology_status: CapabilityStatus,
@@ -307,7 +307,7 @@ pub struct RuntimeCapabilitiesResponse {
 pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
--> Result<RuntimeCapabilitiesResponse, crate::admin::storage_api::CapabilitySnapshotError> {
+-> Result<RuntimeCapabilitiesResponse, crate::admin::storage_api::cluster::CapabilitySnapshotError> {
     let usecase = default_admin_usecase();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
@@ -340,7 +340,7 @@ pub(crate) async fn build_runtime_capabilities_response()
 }
 
 fn build_runtime_capabilities_summary(
-    observability: &crate::admin::storage_api::ObservabilitySnapshot,
+    observability: &crate::admin::storage_api::cluster::ObservabilitySnapshot,
     topology: Option<&TopologySnapshot>,
     topology_status: &CapabilityStatus,
     cluster_snapshot_summary: Option<&CapabilityStatus>,
@@ -517,7 +517,7 @@ mod tests {
         build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
     use crate::admin::runtime_sources::DefaultAdminUsecase;
-    use crate::admin::storage_api::{
+    use crate::admin::storage_api::cluster::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };

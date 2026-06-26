@@ -428,3 +428,93 @@ pub(crate) mod data_usage {
         crate::storage::ecstore_data_usage::load_data_usage_from_backend(store).await
     }
 }
+
+pub(crate) mod access {
+    pub(crate) use super::{ReqInfo, RequestContext, authorize_request, spawn_traced};
+}
+
+pub(crate) mod bucket {
+    pub(crate) use super::bandwidth;
+    pub(crate) use super::bucket_target_sys as target_sys;
+    #[cfg(test)]
+    pub(crate) use super::lifecycle;
+    pub(crate) use super::metadata;
+    pub(crate) use super::metadata_sys;
+    pub(crate) use super::quota;
+    pub(crate) use super::replication;
+    pub(crate) use super::target;
+    pub(crate) use super::versioning_sys;
+    pub(crate) use super::{AdminReplicationConfigExt, AdminVersioningConfigExt, is_reserved_or_invalid_bucket};
+
+    pub(crate) mod utils {
+        pub(crate) use super::super::ecstore_utils::{deserialize, is_valid_object_prefix, serialize};
+    }
+}
+
+pub(crate) mod cluster {
+    pub(crate) use super::ecstore_cluster::{
+        ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
+        ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
+        ClusterPoolStateSnapshot,
+    };
+    pub(crate) use super::{
+        CapabilitySnapshotError, CapabilityState, CapabilityStatus, ObservabilitySnapshot, ObservabilitySnapshotProvider,
+        TopologySnapshot, TopologySnapshotProvider,
+    };
+
+    #[cfg(test)]
+    pub(crate) use super::{MemorySamplingState, PlatformSupport, TopologyCapabilities, UserspaceProfilingCapability};
+}
+
+pub(crate) mod config {
+    pub(crate) use super::storageclass;
+    pub(crate) use super::{
+        RUSTFS_META_BUCKET, STORAGE_CLASS_SUB_SYS, delete_admin_config, init_admin_config_defaults, read_admin_config,
+        read_admin_config_without_migrate, save_admin_config, save_admin_server_config,
+    };
+}
+
+pub(crate) mod contract {
+    pub(crate) use super::{
+        BucketOperations, BucketOptions, DeleteBucketOptions, HealOperations, ListOperations, MakeBucketOptions, ObjectIO,
+        ObjectOperations, SRBucketDeleteOp, StorageAdminApi,
+    };
+}
+
+pub(crate) mod error {
+    pub(crate) use super::{Error, StorageError};
+}
+
+pub(crate) mod metrics {
+    pub(crate) use super::{CollectMetricsOpts, MetricType, collect_local_metrics};
+}
+
+pub(crate) mod object {
+    pub(crate) use super::StorageObjectOptions;
+}
+
+pub(crate) mod rebalance {
+    pub(crate) use super::{
+        DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord,
+        decode_rebalance_stop_propagation_record,
+    };
+
+    #[cfg(test)]
+    pub(crate) use super::{RebalStatus, RebalanceCleanupWarningEntry, RebalanceInfo, encode_rebalance_stop_propagation_record};
+}
+
+pub(crate) mod runtime {
+    pub(crate) use super::{ECStore, EndpointServerPools, NotificationSys, PeerRestClient};
+
+    #[cfg(test)]
+    pub(crate) use super::{Endpoint, Endpoints, PoolEndpoints};
+}
+
+pub(crate) mod tier {
+    pub(crate) use super::storageclass;
+    pub(crate) use super::{
+        AdminError, DailyAllTierStats, ERR_TIER_ALREADY_EXISTS, ERR_TIER_BACKEND_IN_USE, ERR_TIER_BACKEND_NOT_EMPTY,
+        ERR_TIER_CONNECT_ERR, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_MISSING_CREDENTIALS, ERR_TIER_NAME_NOT_UPPERCASE,
+        ERR_TIER_NOT_FOUND, TierConfig, TierCreds, TierType,
+    };
+}
