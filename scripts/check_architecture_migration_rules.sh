@@ -120,6 +120,8 @@ EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_ec
 EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_storage_api_bypass_hits.txt"
 EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/external_storage_api_domain_bypass_hits.txt"
 EXTERNAL_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/external_storage_api_root_reexport_hits.txt"
+RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_api_root_reexport_hits.txt"
+RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_app_admin_storage_helper_root_reexport_hits.txt"
 EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_compat_bypass_hits.txt"
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
@@ -1462,6 +1464,30 @@ fi
 
 if [[ -s "$EXTERNAL_STORAGE_API_ROOT_REEXPORT_HITS_FILE" ]]; then
   report_failure "external local storage_api boundaries must expose storage-api contracts from consumer-domain modules, not root re-exports: $(paste -sd '; ' "$EXTERNAL_STORAGE_API_ROOT_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^pub(?:\(crate\))? use rustfs_storage_api' \
+    rustfs/src/storage_api.rs \
+    rustfs/src/storage/storage_api.rs \
+    rustfs/src/admin/storage_api.rs \
+    rustfs/src/app/storage_api.rs || true
+) >"$RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS local storage_api boundaries must expose storage-api contracts from domain modules, not root re-exports: $(paste -sd '; ' "$RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^pub(?:\(crate\))? use crate::storage::' \
+    rustfs/src/admin/storage_api.rs \
+    rustfs/src/app/storage_api.rs || true
+) >"$RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS app/admin storage_api boundaries must expose storage helpers from domain modules, not root re-exports: $(paste -sd '; ' "$RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE")"
 fi
 
 (

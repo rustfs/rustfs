@@ -12,11 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::s3_api::common::rustfs_owner;
-use crate::storage::to_s3s_etag;
-use crate::storage::{
+use crate::storage::contract::{
     BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
 };
+use crate::storage::s3_api::common::rustfs_owner;
+use crate::storage::to_s3s_etag;
 use percent_encoding::percent_decode_str;
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
@@ -394,8 +394,8 @@ mod tests {
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
-    use crate::storage::BucketInfo;
     use crate::storage::StorageObjectInfo as ObjectInfo;
+    use crate::storage::contract::BucketInfo;
     use crate::storage::s3_api::common::rustfs_owner;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};

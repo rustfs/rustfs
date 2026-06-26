@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BucketOperations;
 use super::ECStore;
 use super::ecfs::FS;
 use super::resolve_object_store_handle;
@@ -23,6 +22,7 @@ use crate::auth::{check_key_valid, get_condition_values_with_query_and_client_in
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::RemoteAddr;
+use crate::storage::contract::BucketOperations;
 use crate::storage::request_context::RequestContext;
 use crate::storage::runtime_sources;
 use metrics::counter;
