@@ -16,8 +16,8 @@ use super::profile::{TriggerProfileCPU, TriggerProfileMemory};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::{
     HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_HEALTH_CLUSTER_PATH, MINIO_HEALTH_CLUSTER_READ_PATH, MINIO_HEALTH_READY_PATH,
-    PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, collect_cluster_read_dependency_readiness_report,
-    collect_dependency_readiness_report as collect_runtime_dependency_readiness_report, collect_node_readiness_report,
+    PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, collect_cluster_read_health_report, collect_cluster_write_health_report,
+    collect_node_readiness_report,
 };
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
@@ -89,8 +89,8 @@ pub(crate) async fn collect_probe_readiness(probe: HealthProbe) -> Option<crate:
     match probe {
         HealthProbe::Liveness => None,
         HealthProbe::Readiness => Some(collect_node_readiness_report().await),
-        HealthProbe::ClusterWrite => Some(collect_runtime_dependency_readiness_report().await),
-        HealthProbe::ClusterRead => Some(collect_cluster_read_dependency_readiness_report().await),
+        HealthProbe::ClusterWrite => Some(collect_cluster_write_health_report().await),
+        HealthProbe::ClusterRead => Some(collect_cluster_read_health_report().await),
     }
 }
 

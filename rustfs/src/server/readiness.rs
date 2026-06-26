@@ -58,6 +58,7 @@ pub enum ReadinessDegradedReason {
     IamNotReady,
     LockQuorumUnavailable,
     KmsNotReady,
+    ClusterHealthTimeout,
     StorageAndIamUnavailable,
     StorageAndLockUnavailable,
     IamAndLockUnavailable,
@@ -71,6 +72,7 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::IamNotReady => "iam_not_ready",
             ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
             ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
+            ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
             ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
             ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
@@ -238,6 +240,18 @@ struct LockQuorumCacheEntry {
     status: LockQuorumStatus,
 }
 
+#[derive(Debug, Clone)]
+struct ClusterHealthReportCacheEntry {
+    captured_at: Instant,
+    report: DependencyReadinessReport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClusterHealthProbeKind {
+    Write,
+    Read,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LockQuorumStatus {
     pub ready: bool,
@@ -257,6 +271,16 @@ fn health_readiness_cache_ttl() -> Duration {
     ))
 }
 
+fn health_cluster_timeout() -> Duration {
+    Duration::from_millis(
+        rustfs_utils::get_env_u64(
+            rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS,
+            rustfs_config::DEFAULT_HEALTH_CLUSTER_TIMEOUT_MS,
+        )
+        .max(1),
+    )
+}
+
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<StorageReadinessCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
@@ -265,6 +289,46 @@ fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry
 fn lock_quorum_status_cache() -> &'static Mutex<Option<LockQuorumCacheEntry>> {
     static CACHE: OnceLock<Mutex<Option<LockQuorumCacheEntry>>> = OnceLock::new();
     CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_write_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_read_health_report_cache() -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    static CACHE: OnceLock<Mutex<Option<ClusterHealthReportCacheEntry>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(None))
+}
+
+fn cluster_write_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_read_health_singleflight() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn cluster_health_report_cache(kind: ClusterHealthProbeKind) -> &'static Mutex<Option<ClusterHealthReportCacheEntry>> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_report_cache(),
+        ClusterHealthProbeKind::Read => cluster_read_health_report_cache(),
+    }
+}
+
+fn cluster_health_singleflight(kind: ClusterHealthProbeKind) -> &'static Mutex<()> {
+    match kind {
+        ClusterHealthProbeKind::Write => cluster_write_health_singleflight(),
+        ClusterHealthProbeKind::Read => cluster_read_health_singleflight(),
+    }
+}
+
+#[cfg(test)]
+async fn reset_cluster_health_report_caches() {
+    *cluster_write_health_report_cache().lock().await = None;
+    *cluster_read_health_report_cache().lock().await = None;
 }
 
 async fn load_cached_storage_readiness() -> Option<bool> {
@@ -280,6 +344,33 @@ async fn load_cached_storage_readiness() -> Option<bool> {
     }
 
     None
+}
+
+async fn load_cached_cluster_health_report(kind: ClusterHealthProbeKind) -> Option<DependencyReadinessReport> {
+    let ttl = health_readiness_cache_ttl();
+    if ttl.is_zero() {
+        return None;
+    }
+
+    let cache = cluster_health_report_cache(kind).lock().await;
+    let entry = cache.as_ref()?;
+    if entry.captured_at.elapsed() <= ttl {
+        return Some(entry.report.clone());
+    }
+
+    None
+}
+
+async fn update_cluster_health_report_cache(kind: ClusterHealthProbeKind, report: DependencyReadinessReport) {
+    if health_readiness_cache_ttl().is_zero() {
+        return;
+    }
+
+    let mut cache = cluster_health_report_cache(kind).lock().await;
+    *cache = Some(ClusterHealthReportCacheEntry {
+        captured_at: Instant::now(),
+        report,
+    });
 }
 
 async fn update_storage_readiness_cache(storage_ready: bool) {
@@ -491,6 +582,14 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
     report
 }
 
+pub async fn collect_cluster_write_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Write, collect_dependency_readiness_report).await
+}
+
+pub async fn collect_cluster_read_health_report() -> DependencyReadinessReport {
+    collect_cluster_health_report_with(ClusterHealthProbeKind::Read, collect_cluster_read_dependency_readiness_report).await
+}
+
 pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
         storage_ready: runtime_sources::object_store_handle().is_some(),
@@ -500,6 +599,42 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
     report
+}
+
+async fn collect_cluster_health_report_with<LoadFn, Fut>(
+    kind: ClusterHealthProbeKind,
+    mut load_report: LoadFn,
+) -> DependencyReadinessReport
+where
+    LoadFn: FnMut() -> Fut,
+    Fut: Future<Output = DependencyReadinessReport>,
+{
+    if let Some(cached) = load_cached_cluster_health_report(kind).await {
+        return cached;
+    }
+
+    let _singleflight = cluster_health_singleflight(kind).lock().await;
+    if let Some(cached) = load_cached_cluster_health_report(kind).await {
+        return cached;
+    }
+
+    let report = match tokio::time::timeout(health_cluster_timeout(), load_report()).await {
+        Ok(report) => report,
+        Err(_) => cluster_health_timeout_report(),
+    };
+    update_cluster_health_report_cache(kind, report.clone()).await;
+    report
+}
+
+fn cluster_health_timeout_report() -> DependencyReadinessReport {
+    DependencyReadinessReport {
+        readiness: DependencyReadiness {
+            storage_ready: false,
+            iam_ready: false,
+            lock_quorum_ready: false,
+        },
+        degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
+    }
 }
 
 async fn collect_node_readiness() -> DependencyReadiness {
@@ -708,13 +843,101 @@ where
 mod tests {
     use super::*;
     use rustfs_madmin::{BackendInfo, Disk};
+    use serial_test::serial;
     use std::future;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::async_with_vars;
 
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
         assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
         assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_singleflight_reuses_inflight_result() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1000")),
+            ],
+            async {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let ready_report = DependencyReadinessReport {
+                    readiness: DependencyReadiness {
+                        storage_ready: true,
+                        iam_ready: true,
+                        lock_quorum_ready: true,
+                    },
+                    degraded_reasons: Vec::new(),
+                };
+
+                let first_calls = calls.clone();
+                let first_report = ready_report.clone();
+                let first = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let first_calls = first_calls.clone();
+                    let first_report = first_report.clone();
+                    async move {
+                        first_calls.fetch_add(1, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        first_report
+                    }
+                });
+
+                let second_calls = calls.clone();
+                let second_report = ready_report.clone();
+                let second = collect_cluster_health_report_with(ClusterHealthProbeKind::Write, move || {
+                    let second_calls = second_calls.clone();
+                    let second_report = second_report.clone();
+                    async move {
+                        second_calls.fetch_add(1, Ordering::SeqCst);
+                        second_report
+                    }
+                });
+
+                let (first, second) = tokio::join!(first, second);
+
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert_eq!(first, ready_report);
+                assert_eq!(second, ready_report);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn cluster_health_report_timeout_is_sanitized() {
+        reset_cluster_health_report_caches().await;
+        async_with_vars(
+            [
+                (rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0")),
+                (rustfs_config::ENV_HEALTH_CLUSTER_TIMEOUT_MS, Some("1")),
+            ],
+            async {
+                let report = collect_cluster_health_report_with(ClusterHealthProbeKind::Read, || async {
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                    DependencyReadinessReport {
+                        readiness: DependencyReadiness {
+                            storage_ready: true,
+                            iam_ready: true,
+                            lock_quorum_ready: true,
+                        },
+                        degraded_reasons: Vec::new(),
+                    }
+                })
+                .await;
+
+                assert_eq!(report, cluster_health_timeout_report());
+                assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::ClusterHealthTimeout]);
+            },
+        )
+        .await;
+        reset_cluster_health_report_caches().await;
     }
 
     #[tokio::test]
