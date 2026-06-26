@@ -14,8 +14,8 @@
 
 use crate::admin::runtime_sources::{AppContext, current_app_context, resolve_object_store_handle_for_context};
 use crate::admin::site_replication_identity::{deployment_id_for_endpoint, normalize_peer_map_by_identity_with};
-use crate::admin::storage_api::Error as StorageError;
-use crate::admin::storage_api::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
+use crate::admin::storage_api::error::Error as StorageError;
 use rustfs_madmin::PeerInfo;
 use s3s::{S3Error, S3ErrorCode, S3Result};
 use serde_json::{Map, Value};

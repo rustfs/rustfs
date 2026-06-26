@@ -17,9 +17,9 @@
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{resolve_bucket_metadata_handle, resolve_object_store_handle};
-use crate::admin::storage_api::metadata_sys::BucketMetadataSys;
-use crate::admin::storage_api::quota::checker::QuotaChecker;
-use crate::admin::storage_api::quota::{BucketQuota, QuotaError, QuotaOperation};
+use crate::admin::storage_api::bucket::metadata_sys::BucketMetadataSys;
+use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
+use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};

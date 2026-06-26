@@ -14,7 +14,8 @@
 
 use crate::admin::runtime_sources::default_admin_usecase;
 use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_token_signing_key};
-use crate::admin::storage_api::{ECStore, metadata::table_catalog_path_hash, metadata_sys};
+use crate::admin::storage_api::bucket::{metadata::table_catalog_path_hash, metadata_sys};
+use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::{
     auth::{AdminResourceScope, validate_admin_request, validate_admin_request_with_bucket_object},
     router::{AdminOperation, Operation, S3Router},
