@@ -5437,27 +5437,47 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, diff hygiene, residual server AppContext entrypoint scan, Rust risk
     scan, and full PR gate before PR.
 
+- [x] `API-236` Route owner runtime-source AppContext reads through root entrypoints.
+  - Do: expose the remaining admin/app/storage AppContext resolver entrypoints
+    from `rustfs/src/runtime_sources.rs`, then route owner runtime-source
+    helpers through that root boundary instead of direct app-context imports.
+  - Acceptance: `rustfs/src/admin/runtime_sources.rs`,
+    `rustfs/src/app/runtime_sources.rs`, and
+    `rustfs/src/storage/runtime_sources.rs` no longer import
+    `crate::app::context`, and migration rules reject new owner runtime-source
+    AppContext bypasses.
+  - Must preserve: admin/object usecase construction, app usecase explicit
+    context fallback, storage RPC/storage helper runtime reads, IAM/KMS/TLS
+    resolver semantics, notification dispatch, and test-only TLS generation
+    hooks.
+  - Verification: focused admin/app/storage checks, formatting, migration and
+    layer guards, diff hygiene, residual owner runtime-source AppContext scan,
+    Rust risk scan, and full PR gate before PR.
+
 ## Next PRs
 
 1. `consumer-migration`: continue larger app/runtime global-source batches
-   after API-235.
+   after API-236.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-236 makes admin, app, and storage runtime sources consume root runtime-source entrypoints instead of importing app context directly. |
+| Migration preservation | pass | Admin/object usecase construction, app explicit-context fallback, storage runtime reads, IAM/KMS/TLS resolver behavior, notification dispatch, and test TLS hooks keep the same semantics. |
+| Testing/verification | pass | Focused admin/app/storage checks, formatting, migration/layer guards, residual owner runtime-source AppContext scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-235 makes server runtime sources consume root runtime-source entrypoints instead of importing app context directly. |
 | Migration preservation | pass | Server audit/event config reads, readiness checks, object-store lookups, KMS lookup, lock-client checks, and notify dispatch keep the same resolver semantics. |
-| Testing/verification | pass | Focused server checks, formatting, migration/layer guards, residual server AppContext scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
+| Testing/verification | pass | Focused server checks, formatting, migration/layer guards, residual server AppContext scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-234 removes the storage runtime-source re-export of the global AppContext getter and keeps startup AppContext reads behind root runtime-source entrypoints. |
 | Migration preservation | pass | Node RPC context fallback, object-store lookup, startup replication resync, and TLS generation math keep the same runtime handles and fallback behavior. |
-| Testing/verification | pass | Focused storage RPC/startup TLS checks, formatting, migration/layer guards, residual entrypoint scans, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
+| Testing/verification | pass | Focused storage RPC/startup TLS checks, formatting, migration/layer guards, residual entrypoint scans, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-233 moves ECFS S3 route bucket, multipart, and object usecase construction behind the storage S3 API boundary without introducing storage infra reverse dependencies. |
 | Migration preservation | pass | ECFS request forwarding, metrics recording, boxed recursive async handlers, and AppContext-backed usecase construction keep the same behavior. |
-| Testing/verification | pass | Focused storage ECFS tests, formatting, migration/layer guards, residual ECFS construction scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
+| Testing/verification | pass | Focused storage ECFS tests, formatting, migration/layer guards, residual ECFS construction scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-232 moves app usecase AppContext lookup behind the app runtime-source boundary instead of importing the global context getter in each usecase file. |
 | Migration preservation | pass | Bucket, multipart, admin, and object usecase constructors plus object buffer config fallback keep the same AppContext-first behavior. |
-| Testing/verification | pass | Focused app/admin tests, formatting, migration/layer guards, residual app global-entry scan, diff hygiene, and Rust risk scan passed; full PR gate is planned before PR. |
+| Testing/verification | pass | Focused app/admin tests, formatting, migration/layer guards, residual app global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | API-231 moves admin misc object-usecase construction and AppContext lookup behind the admin runtime-source boundary instead of keeping direct global entry points in router/service files. |
 | Migration preservation | pass | Object-lambda get execution, listen-notification bucket validation, dynamic config reload, runtime config snapshot reload, and site-replication normalization still use the same runtime handles. |
 | Testing/verification | pass | Focused admin router/service checks, formatting, migration/layer guards, residual admin global-entry scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
@@ -5692,9 +5712,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 Passed before push:
 
+- Issue #660 API-236 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
+  - `cargo test -p rustfs admin::router --lib`: passed, 61 passed.
+  - `cargo test -p rustfs app::bucket_usecase --lib`: passed, 64 passed.
+  - `cargo test -p rustfs app::object_usecase --lib`: passed, 102 passed
+    and 2 ignored.
+  - `cargo test -p rustfs storage::rpc --lib`: passed, 115 passed and 9
+    ignored.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed after deleting the stale
+    storage runtime-source AppContext baseline.
+  - Owner runtime-source AppContext residual scan: passed; admin, app, and
+    storage runtime sources no longer import `crate::app::context`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
+
 - Issue #660 API-235 current slice:
-  - Branch freshness check: stacked on API-234 local branch while API-231 PR
-    #3895 is pending.
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
   - `cargo test -p rustfs server:: --lib`: passed, 151 passed.
   - `cargo fmt --all`: passed.
   - `cargo fmt --all --check`: passed.
@@ -5707,11 +5750,12 @@ Passed before push:
   - Diff-added Rust risk scan: passed; no new production unwrap/expect,
     numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
     ordering lines.
-  - Full PR gate: planned before PR.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
 
 - Issue #660 API-234 current slice:
-  - Branch freshness check: stacked on API-233 local branch while API-231 PR
-    #3895 is pending.
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
   - `cargo test -p rustfs storage::rpc --lib`: passed, 115 passed and 9
     ignored.
   - `cargo test -p rustfs startup_tls_material --lib`: passed, 3 passed.
@@ -5726,11 +5770,12 @@ Passed before push:
   - Diff-added Rust risk scan: passed; no new production unwrap/expect,
     numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
     ordering lines.
-  - Full PR gate: planned before PR.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
 
 - Issue #660 API-233 current slice:
-  - Branch freshness check: stacked on API-232 local branch while API-231 PR
-    #3895 is pending.
+  - Branch freshness check: rebased onto current `origin/main` after API-232
+    merged.
   - `cargo test -p rustfs storage::ecfs --lib`: passed.
   - `cargo fmt --all`: passed.
   - `cargo fmt --all --check`: passed.
@@ -5742,7 +5787,8 @@ Passed before push:
     `rustfs/src/storage/s3_api/mod.rs`.
   - Diff-added Rust risk scan: passed; no new production unwrap/expect,
     numeric cast, Box dyn Error, print macro, or relaxed atomic ordering lines.
-  - Full PR gate: planned before PR.
+  - `make pre-pr`: passed on the combined API-233 through API-236 branch.
+  - Full PR gate: passed before PR.
 
 - Issue #660 API-232 current slice:
   - Branch freshness check: rebased onto current `origin/main` after API-231

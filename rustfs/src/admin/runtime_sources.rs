@@ -15,8 +15,8 @@
 pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
-use crate::app::context::get_global_app_context;
-pub(crate) use crate::app::context::{
+use crate::app::object_usecase::DefaultObjectUsecase;
+pub(crate) use crate::runtime_sources::{
     AppContext, publish_server_config, publish_storage_class_config, resolve_action_credentials, resolve_boot_time,
     resolve_bucket_metadata_handle, resolve_bucket_monitor_handle, resolve_daily_tier_stats, resolve_deployment_id,
     resolve_endpoints_handle, resolve_iam_handle, resolve_kms_runtime_service_manager, resolve_notification_system,
@@ -26,11 +26,10 @@ pub(crate) use crate::app::context::{
     resolve_runtime_port, resolve_scanner_metrics_report, resolve_server_config, resolve_tier_config_handle,
     resolve_token_signing_key,
 };
-use crate::app::object_usecase::DefaultObjectUsecase;
 use std::sync::Arc;
 
 #[cfg(test)]
-pub(crate) use crate::app::context::set_test_outbound_tls_generation;
+pub(crate) use crate::runtime_sources::set_test_outbound_tls_generation;
 
 pub(crate) fn default_admin_usecase() -> DefaultAdminUsecase {
     DefaultAdminUsecase::from_global()
@@ -41,5 +40,5 @@ pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
 }
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
-    get_global_app_context()
+    crate::runtime_sources::current_app_context()
 }
