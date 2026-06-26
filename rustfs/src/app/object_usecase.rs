@@ -1609,12 +1609,15 @@ impl DefaultObjectUsecase {
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let (stream_buffer_size, buffer_source) =
             resolve_reader_stream_buffer_size(stream_buffer_size, get_reader_stream_buffer_size_override());
-        rustfs_io_metrics::record_get_object_stream_strategy(
-            stream_strategy.as_str(),
-            stream_buffer_size,
-            response_content_length,
-        );
-        let handoff_start = std::time::Instant::now();
+        let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        if get_stage_metrics_enabled {
+            rustfs_io_metrics::record_get_object_stream_strategy(
+                stream_strategy.as_str(),
+                stream_buffer_size,
+                response_content_length,
+            );
+        }
+        let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         #[cfg(feature = "tracing-chunk-debug")]
         let stream = {
             let mut emitted = 0usize;
@@ -1636,13 +1639,15 @@ impl DefaultObjectUsecase {
         #[cfg(not(feature = "tracing-chunk-debug"))]
         let stream = ReaderStream::with_capacity(reader, stream_buffer_size);
         let blob = StreamingBlob::wrap(bytes_stream(stream, expected));
-        rustfs_io_metrics::record_get_object_response_handoff(
-            stream_strategy.as_str(),
-            buffer_source,
-            stream_buffer_size,
-            response_content_length,
-            handoff_start.elapsed().as_secs_f64(),
-        );
+        if let Some(handoff_start) = handoff_start {
+            rustfs_io_metrics::record_get_object_response_handoff(
+                stream_strategy.as_str(),
+                buffer_source,
+                stream_buffer_size,
+                response_content_length,
+                handoff_start.elapsed().as_secs_f64(),
+            );
+        }
         Some(blob)
     }
 
@@ -1793,17 +1798,32 @@ impl DefaultObjectUsecase {
     ) -> S3Result<GetObjectPreparedRead<'a>> {
         let h = req.headers.clone();
         let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
-        let store_lookup_start = std::time::Instant::now();
+        let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let store = get_validated_store(bucket).await?;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            "s3_handler",
-            "store_lookup",
-            store_lookup_start.elapsed().as_secs_f64(),
-        );
+        if let Some(store_lookup_start) = store_lookup_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "store_lookup",
+                store_lookup_start.elapsed().as_secs_f64(),
+            );
+        }
 
         let read_start = std::time::Instant::now();
-        let read_setup =
-            Self::prepare_get_object_read(req, &store, manager, bucket, key, rs, h, opts, part_number, read_start).await?;
+        let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
+        let read_setup = Self::prepare_get_object_read(
+            req,
+            &store,
+            manager,
+            bucket,
+            key,
+            rs,
+            h,
+            opts,
+            part_number,
+            read_start,
+            read_stage_start,
+        )
+        .await?;
 
         Ok(GetObjectPreparedRead { io_planning, read_setup })
     }
@@ -1820,16 +1840,19 @@ impl DefaultObjectUsecase {
         opts: &ObjectOptions,
         part_number: Option<usize>,
         read_start: std::time::Instant,
+        read_stage_start: Option<std::time::Instant>,
     ) -> S3Result<GetObjectReadSetup> {
         let reader = store
             .get_object_reader(bucket, key, rs.clone(), h, opts)
             .await
             .map_err(map_get_object_reader_error)?;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            "s3_handler",
-            "store_reader_setup",
-            read_start.elapsed().as_secs_f64(),
-        );
+        if let Some(read_stage_start) = read_stage_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "store_reader_setup",
+                read_stage_start.elapsed().as_secs_f64(),
+            );
+        }
 
         let info = reader.object_info;
 
@@ -2974,13 +2997,15 @@ impl DefaultObjectUsecase {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
         // mc get 3
 
-        let request_context_start = std::time::Instant::now();
+        let request_context_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let request_context = Self::prepare_get_object_request_context(&req).await?;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            "s3_handler",
-            "request_context",
-            request_context_start.elapsed().as_secs_f64(),
-        );
+        if let Some(request_context_start) = request_context_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "request_context",
+                request_context_start.elapsed().as_secs_f64(),
+            );
+        }
         let GetObjectRequestContext {
             bucket,
             key,
@@ -3025,14 +3050,16 @@ impl DefaultObjectUsecase {
             encryption_applied,
         } = read_setup;
 
-        let versioning_start = std::time::Instant::now();
+        let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            "s3_handler",
-            "versioning_lookup",
-            versioning_start.elapsed().as_secs_f64(),
-        );
-        let output_build_start = std::time::Instant::now();
+        if let Some(versioning_start) = versioning_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "versioning_lookup",
+                versioning_start.elapsed().as_secs_f64(),
+            );
+        }
+        let output_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output_context = self
             .build_get_object_output_context(
                 &req,
@@ -3060,11 +3087,13 @@ impl DefaultObjectUsecase {
                 versioned,
             )
             .await?;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            "s3_handler",
-            "output_build",
-            output_build_start.elapsed().as_secs_f64(),
-        );
+        if let Some(output_build_start) = output_build_start {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                "s3_handler",
+                "output_build",
+                output_build_start.elapsed().as_secs_f64(),
+            );
+        }
         let GetObjectOutputContext {
             output,
             event_info,
