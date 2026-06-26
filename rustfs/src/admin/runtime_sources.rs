@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub(crate) use crate::app::admin_usecase::{
+    AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
+};
 pub(crate) use crate::app::context::{
     AppContext, get_global_app_context, publish_server_config, publish_storage_class_config, resolve_action_credentials,
     resolve_boot_time, resolve_bucket_metadata_handle, resolve_bucket_monitor_handle, resolve_daily_tier_stats,
@@ -25,3 +28,7 @@ pub(crate) use crate::app::context::{
 
 #[cfg(test)]
 pub(crate) use crate::app::context::set_test_outbound_tls_generation;
+
+pub(crate) fn default_admin_usecase() -> DefaultAdminUsecase {
+    DefaultAdminUsecase::from_global()
+}

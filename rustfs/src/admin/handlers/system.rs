@@ -15,11 +15,12 @@
 use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::resolve_endpoints_handle;
+use crate::admin::runtime_sources::{
+    DefaultAdminUsecase, QueryServerInfoRequest, default_admin_usecase, resolve_endpoints_handle,
+};
 use crate::admin::storage_api::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
 };
-use crate::app::admin_usecase::{DefaultAdminUsecase, QueryServerInfoRequest};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::runtime_capabilities::{EndpointTopologySnapshotProvider, RustFsObservabilitySnapshotProvider};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -202,7 +203,7 @@ impl Operation for ServerInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase
             .execute_query_server_info(QueryServerInfoRequest { include_pools: true })
             .await
@@ -260,7 +261,7 @@ impl Operation for StorageInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase.execute_query_storage_info().await.map_err(S3Error::from)?;
         let response = StorageInfoResponse {
             info,
@@ -307,7 +308,7 @@ pub struct RuntimeCapabilitiesHandler {}
 
 pub(crate) async fn build_runtime_capabilities_response()
 -> Result<RuntimeCapabilitiesResponse, crate::admin::storage_api::CapabilitySnapshotError> {
-    let usecase = DefaultAdminUsecase::from_global();
+    let usecase = default_admin_usecase();
     let observability_provider = RustFsObservabilitySnapshotProvider;
     let observability = observability_provider.observability_snapshot().await?;
     let workload_admission = workload_admission_registry_snapshot();
@@ -493,7 +494,7 @@ impl Operation for DataUsageInfoHandler {
         )
         .await?;
 
-        let usecase = DefaultAdminUsecase::from_global();
+        let usecase = default_admin_usecase();
         let info = usecase.execute_query_data_usage_info().await.map_err(S3Error::from)?;
 
         let data = serde_json::to_vec(&info).map_err(|e| {
@@ -515,11 +516,11 @@ mod tests {
         OBSERVABILITY_SUMMARY_RESOLVED, ServerInfoResponse, TOPOLOGY_SNAPSHOT_NOT_AVAILABLE, TOPOLOGY_SUMMARY_RESOLVED,
         build_runtime_capabilities_response, build_runtime_capabilities_summary, system_admin_discovery,
     };
+    use crate::admin::runtime_sources::DefaultAdminUsecase;
     use crate::admin::storage_api::{
         CapabilityState, CapabilityStatus, MemorySamplingState, ObservabilitySnapshot, PlatformSupport, TopologyCapabilities,
         TopologySnapshot, UserspaceProfilingCapability,
     };
-    use crate::app::admin_usecase::DefaultAdminUsecase;
     use rustfs_concurrency::{AdmissionState, WorkloadClass};
     use rustfs_madmin::{InfoMessage, StorageInfo};
 

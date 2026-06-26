@@ -5,11 +5,14 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-oidc-app-context-ownership`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229`.
-- Based on: API-229 branch; branch retires the CTX-002 OIDC resolver fallback by publishing the initialized OIDC handle into AppContext.
+- Branch: `overtrue/arch-admin-usecase-runtime-boundary`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/CTX-002`.
+- Based on: latest `origin/main` after CTX-002 PR #3893 merged; branch routes
+  admin `DefaultAdminUsecase` construction through the admin runtime-source
+  boundary.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: admin OIDC resolution is now AppContext-owned after startup publishes the initialized OIDC handle; endpoint behavior and non-fatal OIDC initialization semantics remain unchanged.
+- Runtime behavior changes: none expected for API-230; admin handlers still use
+  the same `DefaultAdminUsecase` implementation and AppContext-backed handles.
 - Rust code changes: route replication pool, outbound TLS generation, runtime
   region, KMS encryption service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
@@ -63,8 +66,10 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   boundaries, plus storage owner root ECStore facade and storage contract
   aggregation through `rustfs/src/storage/storage_api.rs`, storage owner
   submodule storage contract imports through the same owner-local boundary,
-  and ECStore internal storage contract imports through the owner-local
-  `storage_api_contracts` boundary.
+  ECStore internal storage contract imports through the owner-local
+  `storage_api_contracts` boundary, and admin system, pool, cluster snapshot,
+  plugin catalog, table catalog, module-switch, and console admin discovery
+  `DefaultAdminUsecase` construction through `admin::runtime_sources`.
 - CI/script changes: lock completed owner and test/fuzz boundaries against
   bare/glob imports, scattered raw ECStore facade subpaths, and startup
   runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
@@ -5341,14 +5346,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     migration and layer guards, diff hygiene, residual ECStore bench API scan,
     Rust risk scan, and full PR gate before PR.
 
+- [x] `API-230` Route admin usecase construction through runtime boundary.
+  - Do: expose admin usecase construction and required admin DTO types from
+    `rustfs/src/admin/runtime_sources.rs`, then route system, pool, cluster
+    snapshot, plugin catalog, table catalog, module-switch, and console admin
+    discovery paths through that boundary.
+  - Acceptance: migrated admin handler sources no longer import
+    `crate::app::admin_usecase` directly, and the server-info route guard
+    requires the admin runtime-source constructor.
+  - Must preserve: admin authentication and authorization checks, admin
+    discovery route values, storage/data-usage/pool/decommission responses,
+    cluster snapshot collection, plugin catalog payloads, table catalog config
+    payloads, module switch responses, and console config discovery.
+  - Verification: focused admin tests, formatting, migration and layer guards,
+    diff hygiene, residual admin usecase import scan, Rust risk scan, and full
+    PR gate passed before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-229.
+1. `consumer-migration`: continue larger admin/app/runtime global-source
+   batches after API-230.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-230 moves admin handler `DefaultAdminUsecase` construction behind the admin runtime-source boundary instead of letting each handler import the app usecase directly. |
+| Migration preservation | pass | Admin auth checks, discovery URLs, system info, pool/decommission, cluster snapshot, plugin catalog, table catalog, module-switch, and console responses keep the same usecase implementation. |
+| Testing/verification | pass | Focused admin tests, formatting, migration/layer guards, direct app-usecase import scan, diff hygiene, Rust risk scan, and full PR gate passed before PR. |
 | Quality/architecture | pass | CTX-002 cleanup makes OIDC resolution AppContext-owned and removes the unused IAM-to-OIDC shortcut instead of keeping a hidden global bypass. |
 | Migration preservation | pass | Startup still treats OIDC initialization as non-fatal and publishes the initialized handle when available; admin OIDC, STS, and console consumers keep the same response behavior. |
 | Testing/verification | pass | Focused app::context tests, formatting, compatibility marker scan, and Rust risk scan passed; full PR gate is planned before PR. |
@@ -5576,6 +5601,26 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-230 current slice:
+  - Branch freshness check: based on CTX-002 PR #3893 head while #3893 was
+    pending, then rebased onto latest `origin/main` after #3893 merged.
+  - `cargo test -p rustfs admin::handlers::system --lib`: passed.
+  - `cargo test -p rustfs admin::handlers::pools --lib`: passed.
+  - `cargo test -p rustfs admin::route_registration_test::test_phase5_admin_info_contract --lib`:
+    passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Admin usecase import residual scan: passed; remaining
+    `crate::app::admin_usecase` and `DefaultAdminUsecase::from_global()`
+    references are confined to `rustfs/src/admin/runtime_sources.rs`.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `make pre-pr`: passed.
 
 - Issue #660 API-187 current slice:
   - `cargo check -p rustfs-ecstore --tests`: passed.
