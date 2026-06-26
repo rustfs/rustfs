@@ -19,20 +19,46 @@ use std::sync::Arc;
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod contract {
-    pub(crate) use rustfs_storage_api::{
-        BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, HTTPPreconditions, HTTPRangeSpec, ListMultipartsInfo,
-        ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ListPartsInfo, MakeBucketOptions, ObjectLockRetentionOptions,
-        ObjectOperations, ObjectToDelete, StorageAdminApi,
-    };
-    #[cfg(test)]
-    pub(crate) use rustfs_storage_api::{MultipartInfo, PartInfo};
+    pub(crate) mod admin {
+        pub(crate) use super::super::storage_contracts::StorageAdminApi;
+    }
+
+    pub(crate) mod bucket {
+        pub(crate) use super::super::storage_contracts::{
+            BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions,
+        };
+    }
+
+    pub(crate) mod list {
+        pub(crate) use super::super::storage_contracts::{ListObjectVersionsInfo, ListObjectsV2Info, ListOperations};
+    }
+
+    pub(crate) mod multipart {
+        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
+        #[cfg(test)]
+        pub(crate) use super::super::storage_contracts::{MultipartInfo, PartInfo};
+    }
+
+    pub(crate) mod object {
+        pub(crate) use super::super::storage_contracts::{
+            DeletedObject, HTTPPreconditions, ObjectIO, ObjectLockRetentionOptions, ObjectOperations, ObjectToDelete,
+        };
+    }
+
+    pub(crate) mod range {
+        pub(crate) use super::super::storage_contracts::HTTPRangeSpec;
+    }
+
+    pub(crate) mod topology {
+        pub(crate) use super::super::storage_contracts::{DiskCapabilities, TopologyCapabilities, TopologySnapshot};
+    }
 }
 
-pub(crate) type StorageDeletedObject = storage_contracts::DeletedObject;
+pub(crate) type StorageDeletedObject = contract::object::DeletedObject;
 pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
-pub(crate) type StorageObjectToDelete = storage_contracts::ObjectToDelete;
+pub(crate) type StorageObjectToDelete = contract::object::ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 
 pub(crate) mod ecstore_admin {
@@ -628,14 +654,14 @@ pub(crate) trait StoragePeerS3ClientExt {
         bucket: &str,
         opts: &rustfs_common::heal_channel::HealOpts,
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
-    async fn make_bucket(&self, bucket: &str, opts: &storage_contracts::MakeBucketOptions) -> DiskResult<()>;
-    async fn list_bucket(&self, opts: &storage_contracts::BucketOptions) -> DiskResult<Vec<storage_contracts::BucketInfo>>;
-    async fn delete_bucket(&self, bucket: &str, opts: &storage_contracts::DeleteBucketOptions) -> DiskResult<()>;
+    async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()>;
+    async fn list_bucket(&self, opts: &contract::bucket::BucketOptions) -> DiskResult<Vec<contract::bucket::BucketInfo>>;
+    async fn delete_bucket(&self, bucket: &str, opts: &contract::bucket::DeleteBucketOptions) -> DiskResult<()>;
     async fn get_bucket_info(
         &self,
         bucket: &str,
-        opts: &storage_contracts::BucketOptions,
-    ) -> DiskResult<storage_contracts::BucketInfo>;
+        opts: &contract::bucket::BucketOptions,
+    ) -> DiskResult<contract::bucket::BucketInfo>;
 }
 
 impl StoragePeerS3ClientExt for LocalPeerS3Client {
@@ -647,23 +673,23 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
         ecstore_rpc::PeerS3Client::heal_bucket(self, bucket, opts).await
     }
 
-    async fn make_bucket(&self, bucket: &str, opts: &storage_contracts::MakeBucketOptions) -> DiskResult<()> {
+    async fn make_bucket(&self, bucket: &str, opts: &contract::bucket::MakeBucketOptions) -> DiskResult<()> {
         ecstore_rpc::PeerS3Client::make_bucket(self, bucket, opts).await
     }
 
-    async fn list_bucket(&self, opts: &storage_contracts::BucketOptions) -> DiskResult<Vec<storage_contracts::BucketInfo>> {
+    async fn list_bucket(&self, opts: &contract::bucket::BucketOptions) -> DiskResult<Vec<contract::bucket::BucketInfo>> {
         ecstore_rpc::PeerS3Client::list_bucket(self, opts).await
     }
 
-    async fn delete_bucket(&self, bucket: &str, opts: &storage_contracts::DeleteBucketOptions) -> DiskResult<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &contract::bucket::DeleteBucketOptions) -> DiskResult<()> {
         ecstore_rpc::PeerS3Client::delete_bucket(self, bucket, opts).await
     }
 
     async fn get_bucket_info(
         &self,
         bucket: &str,
-        opts: &storage_contracts::BucketOptions,
-    ) -> DiskResult<storage_contracts::BucketInfo> {
+        opts: &contract::bucket::BucketOptions,
+    ) -> DiskResult<contract::bucket::BucketInfo> {
         ecstore_rpc::PeerS3Client::get_bucket_info(self, bucket, opts).await
     }
 }
@@ -924,9 +950,9 @@ where
 
 pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
     endpoint_pools: &EndpointServerPools,
-    capabilities: storage_contracts::TopologyCapabilities,
-    disk_capabilities: storage_contracts::DiskCapabilities,
-) -> storage_contracts::TopologySnapshot {
+    capabilities: contract::topology::TopologyCapabilities,
+    disk_capabilities: contract::topology::DiskCapabilities,
+) -> contract::topology::TopologySnapshot {
     ecstore_cluster::topology_snapshot_from_endpoint_pools_with_capabilities(endpoint_pools, capabilities, disk_capabilities)
 }
 
@@ -964,7 +990,7 @@ impl StorageVersioningConfigExt for s3s::dto::VersioningConfiguration {
     }
 }
 
-pub(crate) type GetObjectReader = <ECStore as storage_contracts::ObjectIO>::GetObjectReader;
-pub(crate) type ObjectInfo = <ECStore as storage_contracts::ObjectOperations>::ObjectInfo;
-pub(crate) type ObjectOptions = <ECStore as storage_contracts::ObjectOperations>::ObjectOptions;
-pub(crate) type PutObjReader = <ECStore as storage_contracts::ObjectIO>::PutObjectReader;
+pub(crate) type GetObjectReader = <ECStore as contract::object::ObjectIO>::GetObjectReader;
+pub(crate) type ObjectInfo = <ECStore as contract::object::ObjectOperations>::ObjectInfo;
+pub(crate) type ObjectOptions = <ECStore as contract::object::ObjectOperations>::ObjectOptions;
+pub(crate) type PutObjReader = <ECStore as contract::object::ObjectIO>::PutObjectReader;

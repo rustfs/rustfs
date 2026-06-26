@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::contract::{ListMultipartsInfo, ListPartsInfo};
+use crate::storage::contract::multipart::{ListMultipartsInfo, ListPartsInfo};
 use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
 use crate::storage::to_s3s_etag;
 use s3s::dto::{CommonPrefix, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
@@ -195,7 +195,7 @@ mod tests {
         MAX_MULTIPART_UPLOADS_LIST, build_list_multipart_uploads_output, build_list_parts_output,
         parse_list_multipart_uploads_params, parse_list_parts_params, parse_upload_part_number,
     };
-    use crate::storage::contract::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
+    use crate::storage::contract::multipart::{ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo};
     use crate::storage::s3_api::common::{rustfs_initiator, rustfs_owner};
     use crate::storage::to_s3s_etag;
     use s3s::S3ErrorCode;

@@ -5,15 +5,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-storage-contract-boundary-batch`
-- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/CTX-002`.
-- Based on: rebased onto current `origin/main` after PR #3909 merged.
+- Branch: `overtrue/arch-storage-owner-contract-domain-batch`
+- Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/CTX-002`.
+- Based on: rebased onto current `origin/main` after PR #3910 merged.
 - PR type for this branch: `consumer-migration`
-- Runtime behavior changes: none expected for API-244; ECStore still uses the
-  same storage contracts, now exposed from `storage_api_contracts` domain
-  modules instead of its flat root facade.
-- Rust code changes: route replication pool, outbound TLS generation, runtime
-  region, KMS encryption service, runtime support handles, S3 Select DB,
+- Runtime behavior changes: none expected for API-245; storage owner code still
+  uses the same storage contracts, now exposed from `contract` domain modules
+  instead of its flat root facade.
+- Rust code changes: segment the storage-owner local `contract` facade into
+  domain modules, migrate storage-owner consumers to domain contract imports,
+  reject flat storage-owner contract consumers in migration guardrails, route
+  replication pool, outbound TLS generation, runtime region, KMS encryption
+  service, runtime support handles, S3 Select DB,
   internode RPC metrics, IAM authorization/handler reads, notification
   rules/event dispatch, admin OIDC/token-signing reads, IAM root credential
   consumers, IAM OIDC config reads, scanner runtime-config reads, OBS metrics
@@ -5603,14 +5606,32 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     guards, ECStore root contract re-export/root consumer scans, diff hygiene,
     Rust risk scan, and full PR gate passed before PR.
 
+- [x] `API-245` Segment storage-owner contract facade by domain module.
+  - Do: split the storage-owner local `contract` facade into admin, bucket,
+    list, multipart, object, range, and topology modules, then migrate storage
+    owner consumers to those modules.
+  - Acceptance: `rustfs/src/storage/storage_api.rs` no longer uses raw
+    storage contract paths internally, storage owner consumers no longer import
+    contract symbols from the flat `contract` root, and migration rules reject
+    both regressions.
+  - Must preserve: ECFS bucket/object calls, storage RPC bucket/admin calls,
+    S3 list/multipart DTO projections, request option parsing, access checks,
+    and topology snapshot construction.
+  - Verification: focused RustFS compile, formatting, migration/layer guards,
+    storage-owner raw contract/root consumer scans, diff hygiene, and Rust risk
+    scan passed; full PR gate is planned before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner boundary batches after API-244.
+1. `consumer-migration`: continue larger owner boundary batches after API-245.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-245 segments the storage-owner local contract facade into domain modules instead of flat root contract exposure. |
+| Migration preservation | pass | ECFS bucket/object calls, storage RPC bucket/admin calls, S3 list/multipart DTO projections, request option parsing, access checks, and topology snapshot construction keep the same underlying contracts. |
+| Testing/verification | pass | Focused RustFS compile, formatting, migration/layer guards, storage-owner raw contract/root consumer scans, diff hygiene, and diff-added Rust risk scan passed; full PR gate is planned before PR. |
 | Quality/architecture | pass | API-244 segments ECStore storage_api_contracts into domain modules instead of a flat root facade. |
 | Migration preservation | pass | ECStore object/list/multipart/heal/admin trait impls, lifecycle/tier/replication DTOs, config storage, peer S3 client, range helpers, topology snapshots, and error mappings keep the same contracts. |
 | Testing/verification | pass | Focused ECStore compile, formatting, migration/layer guards, ECStore root contract re-export/root consumer scans, diff hygiene, diff-added Rust risk scan, and full PR gate passed before PR. |
@@ -5883,6 +5904,25 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 API-245 current slice:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3910
+    merged.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_layer_dependencies.sh`: passed.
+  - Storage-owner raw contract path scan: passed; no raw
+    `rustfs_storage_api::Type` contract paths remain in the owner boundary.
+  - Storage-owner root contract consumer scan: passed; storage consumers now
+    import contract symbols through domain modules.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    numeric cast, String error, Box dyn Error, print macro, or relaxed atomic
+    ordering lines.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `make pre-pr`: passed; nextest ran 6776 tests with 6776 passed and
+    112 skipped, and doctests passed.
 
 - Issue #660 API-244 current slice:
   - Branch freshness check: rebased onto current `origin/main` after PR #3909

@@ -20,7 +20,10 @@ use super::{
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
-use crate::storage::contract::{BucketOperations, BucketOptions, ObjectToDelete};
+use crate::storage::contract::{
+    bucket::{BucketOperations, BucketOptions},
+    object::ObjectToDelete,
+};
 use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};

@@ -13,7 +13,8 @@
 // limitations under the License.
 
 use crate::storage::contract::{
-    BucketInfo, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
+    bucket::BucketInfo,
+    list::{ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info},
 };
 use crate::storage::s3_api::common::rustfs_owner;
 use crate::storage::to_s3s_etag;
@@ -395,7 +396,7 @@ mod tests {
         parse_list_object_versions_params, parse_list_objects_v2_params,
     };
     use crate::storage::StorageObjectInfo as ObjectInfo;
-    use crate::storage::contract::BucketInfo;
+    use crate::storage::contract::bucket::BucketInfo;
     use crate::storage::s3_api::common::rustfs_owner;
     use s3s::S3ErrorCode;
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};

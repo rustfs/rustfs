@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::ECStore;
-use crate::storage::contract::ListOperations as _;
+use crate::storage::contract::list::ListOperations as _;
 use std::sync::Arc;
 
 /// Determines if the key "looks like a prefix" (ends with `/`).

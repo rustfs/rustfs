@@ -23,7 +23,10 @@ use super::{
 use super::{StorageReplicationConfigExt as _, StorageVersioningConfigExt as _};
 use crate::error::ApiError;
 use crate::storage::access::has_bypass_governance_header;
-use crate::storage::contract::{BucketOperations, BucketOptions, ObjectLockRetentionOptions, ObjectOperations as _};
+use crate::storage::contract::{
+    bucket::{BucketOperations, BucketOptions},
+    object::{ObjectLockRetentionOptions, ObjectOperations as _},
+};
 use crate::storage::helper::OperationHelper;
 use crate::storage::options::get_opts;
 use crate::storage::runtime_sources;
