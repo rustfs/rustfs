@@ -48,6 +48,7 @@ mod set_disk;
 mod sets;
 mod storage_api_contracts;
 mod store;
+#[path = "store/init_format.rs"]
 mod store_init;
 #[path = "store/list_objects.rs"]
 mod store_list_objects;
