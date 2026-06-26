@@ -12,7 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::{collections::HashMap, sync::Arc, time::SystemTime};
+use std::{
+    collections::HashMap,
+    sync::{Arc, OnceLock},
+    time::SystemTime,
+};
 
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::disk::endpoint::Endpoint;
@@ -40,6 +44,7 @@ use crate::{
     tier::tier::TierConfigMgr,
 };
 use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
+use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
@@ -52,6 +57,20 @@ use uuid::Uuid;
 
 #[cfg(test)]
 const TEST_RPC_SECRET: &str = "test-rpc-secret";
+
+pub(crate) type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+
+static WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER: OnceLock<WorkloadSnapshotProviderRef> = OnceLock::new();
+
+pub(crate) fn set_workload_admission_snapshot_provider(
+    provider: WorkloadSnapshotProviderRef,
+) -> std::result::Result<(), WorkloadSnapshotProviderRef> {
+    WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER.set(provider)
+}
+
+pub(crate) fn workload_admission_snapshot_provider() -> Option<WorkloadSnapshotProviderRef> {
+    WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER.get().cloned()
+}
 
 pub(crate) fn record_erasure_write_quorum_failure(stage: &'static str, dominant_error: &'static str) {
     global_internode_metrics().record_erasure_write_quorum_failure(stage, dominant_error);

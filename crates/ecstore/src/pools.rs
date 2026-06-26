@@ -27,6 +27,7 @@ use crate::bucket::{
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
 use crate::data_movement;
+use crate::data_movement_backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -3112,7 +3113,40 @@ impl ECStore {
                     let callback_rx = callback_rx.clone();
 
                     Box::pin(async move {
-                        let worker_permit = match workers.clone().acquire_owned().await {
+                        if callback_rx.is_cancelled() {
+                            return;
+                        }
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
+
+                        if let Err(err) = data_movement_backpressure::wait_for_data_movement_admission(
+                            DataMovementOperation::Decommission,
+                            idx,
+                            &callback_rx,
+                        )
+                        .await
+                        {
+                            if matches!(err, Error::OperationCanceled) {
+                                return;
+                            }
+                            error!("decommission_pool: data movement admission failed: {err}");
+                            let mut first_err = entry_error.lock().await;
+                            if first_err.is_none() {
+                                *first_err = Some(err);
+                                callback_rx.cancel();
+                            }
+                            return;
+                        }
+
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
+
+                        let worker_permit = match tokio::select! {
+                            _ = callback_rx.cancelled() => return,
+                            permit = workers.clone().acquire_owned() => permit,
+                        } {
                             Ok(permit) => permit,
                             Err(err) => {
                                 let err = Error::other(format!("decommission entry worker permit acquire failed: {err}"));
@@ -3125,6 +3159,9 @@ impl ECStore {
                                 return;
                             }
                         };
+                        if entry_error.lock().await.is_some() {
+                            return;
+                        }
                         let entry_rx = callback_rx.clone();
                         if let Err(err) = this
                             .decommission_entry(

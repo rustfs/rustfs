@@ -30,6 +30,7 @@ use super::{
     REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome,
 };
 use crate::data_movement;
+use crate::data_movement_backpressure::{self, DataMovementOperation};
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectOptions};
 use crate::pools::ListCallback;
@@ -397,6 +398,25 @@ impl ECStore {
                             return;
                         }
                         if entry_error.lock().await.is_some() {
+                            return;
+                        }
+
+                        if let Err(err) = data_movement_backpressure::wait_for_data_movement_admission(
+                            DataMovementOperation::Rebalance,
+                            pool_index,
+                            &callback_rx,
+                        )
+                        .await
+                        {
+                            if matches!(err, Error::OperationCanceled) {
+                                return;
+                            }
+                            error!("rebalance_entry: data movement admission failed: {err}");
+                            let mut first_err = entry_error.lock().await;
+                            if first_err.is_none() {
+                                *first_err = Some(err);
+                                callback_rx.cancel();
+                            }
                             return;
                         }
 
