@@ -167,6 +167,7 @@ RUSTFS_APP_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_runtime_s
 RUSTFS_STARTUP_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_startup_runtime_source_bypass_hits.txt"
 RUSTFS_SERVER_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_server_runtime_source_bypass_hits.txt"
 RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_runtime_source_bypass_hits.txt"
+RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_ecfs_usecase_bypass_hits.txt"
 RUSTFS_ADMIN_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_admin_runtime_source_bypass_hits.txt"
 RUSTFS_APP_CONTEXT_DIRECT_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_context_direct_bypass_hits.txt"
 RUSTFS_APP_USECASE_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_app_usecase_runtime_source_bypass_hits.txt"
@@ -1478,6 +1479,17 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "RustFS storage runtime source reads must stay behind rustfs/src/storage/runtime_sources.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::app::(?:bucket_usecase|multipart_usecase|object_usecase)|Default(?:Bucket|Multipart|Object)Usecase::from_global\(\)' \
+    rustfs/src/storage/ecfs.rs \
+    --glob '*.rs' || true
+) >"$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage ECFS S3 routes must construct app usecases through rustfs/src/storage/s3_api/mod.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_ECFS_USECASE_BYPASS_HITS_FILE")"
 fi
 
 (
