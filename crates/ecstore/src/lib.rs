@@ -20,10 +20,12 @@ mod admin_server_info;
 pub mod api;
 #[path = "services/batch_processor.rs"]
 mod batch_processor;
+#[path = "io_support/bitrot.rs"]
 mod bitrot;
 mod bucket;
 mod cache_value;
 mod cluster;
+#[path = "io_support/compress.rs"]
 mod compress;
 mod config;
 mod data_movement;
@@ -50,6 +52,7 @@ mod notification_sys;
 mod object_api;
 mod pools;
 mod rebalance;
+#[path = "io_support/rio.rs"]
 mod rio;
 mod rpc;
 #[path = "runtime/sources.rs"]
