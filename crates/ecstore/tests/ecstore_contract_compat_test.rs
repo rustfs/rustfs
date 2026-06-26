@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod storage_api;
+
 use rustfs_common::heal_channel::HealOpts;
-use rustfs_ecstore::api::object::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use rustfs_ecstore::api::{disk::DiskStore, error::Error, storage::ECStore};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
-use rustfs_storage_api::{
-    CompletePart, DeletedObject, HTTPRangeSpec, HealOperations as StorageHealOperations, ListMultipartsInfo,
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info, ListPartsInfo,
-    MultipartInfo, MultipartOperations as StorageMultipartOperations, MultipartUploadResult,
-    NamespaceLocking as StorageNamespaceLocking, ObjectIO as StorageObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
-    ObjectOperations as StorageObjectOperations, ObjectToDelete, PartInfo, StorageAdminApi, WalkOptions as StorageWalkOptions,
+use storage_api::{
+    CompletePart, DeletedObject, DiskStore, ECStore, Error, GetObjectReader, HTTPRangeSpec, ListMultipartsInfo, ListPartsInfo,
+    MultipartInfo, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAdminApi,
+    StorageHealOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageListOperations,
+    StorageMultipartOperations, StorageNamespaceLocking, StorageObjectIO, StorageObjectInfoOrErr, StorageObjectOperations,
+    StorageWalkOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -82,7 +82,7 @@ where
 
 fn storage_list_operations_type_name<T>() -> &'static str
 where
-    T: rustfs_storage_api::ListOperations<
+    T: StorageListOperations<
             Error = Error,
             ListObjectsV2Info = ListObjectsV2Info,
             ListObjectVersionsInfo = ListObjectVersionsInfo,

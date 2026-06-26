@@ -5311,14 +5311,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     compile coverage, formatting, migration and layer guards, diff hygiene,
     residual raw-path scan, Rust risk scan, and full PR gate before PR.
 
+- [x] `API-228` Route ECStore integration test API imports through a test boundary.
+  - Do: add `crates/ecstore/tests/storage_api.rs` as the integration-test
+    boundary for ECStore and storage-api symbols, then route ECStore contract,
+    MinIO fixture, and legacy bitrot tests through it.
+  - Acceptance: ECStore integration tests no longer import
+    `rustfs_ecstore::api` or `rustfs_storage_api` directly outside the
+    reviewed test boundary, and migration rules reject new bypasses.
+  - Must preserve: ECStore storage-api compatibility proofs, MinIO-generated
+    rio-v2 fixture reads, legacy bitrot reads, endpoint/disk creation, object
+    reader aliases, and storage contract trait bounds.
+  - Verification: focused ECStore integration tests, formatting, migration and
+    layer guards, diff hygiene, residual ECStore test API scan, Rust risk scan,
+    and full PR gate before PR.
+
 ## Next PRs
 
-1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-227.
+1. `consumer-migration`: continue larger owner/external crate storage-boundary batches after API-228.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | API-228 routes ECStore integration-test ECStore/storage-api symbols through a test-local storage_api boundary. |
+| Migration preservation | pass | Contract proofs, MinIO rio-v2 fixture reads, legacy bitrot reads, disk setup, object reader aliases, and trait bounds keep the same ECStore/storage-api implementations. |
+| Testing/verification | pass | Focused ECStore integration tests, migration guard, residual ECStore test API scan, Rust risk scan, formatting, and diff hygiene passed; layer guard and full PR gate are planned before PR. |
 | Quality/architecture | pass | API-227 normalizes completed local storage-api boundary internals to use imported local aliases instead of raw fully qualified contract paths. |
 | Migration preservation | pass | Storage owner peer S3 operations, topology snapshots, app lifecycle/replication helpers, IAM config aliases, Swift aliases, and S3 Select aliases keep the same storage-api contracts. |
 | Testing/verification | pass | RustFS test compile coverage, explicit IAM/S3 Select/Swift compile coverage, migration/layer guards, residual raw-path scan, formatting, and diff hygiene passed; full PR gate is planned before PR. |
