@@ -26,10 +26,10 @@ pub(crate) use rustfs_storage_api::{
     ObjectOperations,
 };
 
-pub type SwiftGetObjectReader = <SwiftStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
-pub type SwiftObjectInfo = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
-pub type SwiftObjectOptions = <SwiftStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
-pub type SwiftPutObjReader = <SwiftStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
+pub type SwiftGetObjectReader = <SwiftStore as ObjectIO>::GetObjectReader;
+pub type SwiftObjectInfo = <SwiftStore as ObjectOperations>::ObjectInfo;
+pub type SwiftObjectOptions = <SwiftStore as ObjectOperations>::ObjectOptions;
+pub type SwiftPutObjReader = <SwiftStore as ObjectIO>::PutObjectReader;
 
 pub(crate) async fn get_swift_bucket_metadata(bucket: &str) -> SwiftStorageResult<Arc<SwiftBucketMetadata>> {
     get_swift_bucket_metadata_from_backend(bucket).await

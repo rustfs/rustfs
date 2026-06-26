@@ -18,6 +18,7 @@ use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::runtime_sources;
 use crate::storage_api_contracts::EcstoreObjectIO;
+use crate::storage_api_contracts::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, StorageAdminApi};
 use http::HeaderMap;
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
@@ -34,7 +35,6 @@ use rustfs_config::oidc::{IDENTITY_OPENID_KEYS, IDENTITY_OPENID_SUB_SYS, OIDC_RE
 use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{COMMENT_KEY, DEFAULT_DELIMITER, ENABLE_KEY, EnableState, RUSTFS_REGION};
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{DeletedObject, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, StorageAdminApi};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -1315,6 +1315,8 @@ mod tests {
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
     use crate::runtime_sources;
     use crate::set_disk::SetDisks;
+    use crate::storage_api_contracts::NamespaceLocking as _;
+    use crate::storage_api_contracts::{HTTPRangeSpec, StorageAdminApi};
     use http::HeaderMap;
     use rustfs_config::audit::{AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_WEBHOOK_SUB_SYS};
     use rustfs_config::notify::{
@@ -1328,8 +1330,6 @@ mod tests {
     use rustfs_lock::client::LockClient;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::NamespaceLocking as _;
-    use rustfs_storage_api::{HTTPRangeSpec, StorageAdminApi};
     use serde_json::Value;
     use serial_test::serial;
     use std::collections::HashMap;
@@ -1498,7 +1498,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::ObjectIO for LockingConfigStorage {
+    impl crate::storage_api_contracts::ObjectIO for LockingConfigStorage {
         type Error = Error;
         type RangeSpec = HTTPRangeSpec;
         type HeaderMap = HeaderMap;
@@ -1549,7 +1549,7 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl rustfs_storage_api::NamespaceLocking for LockingConfigStorage {
+    impl crate::storage_api_contracts::NamespaceLocking for LockingConfigStorage {
         type Error = crate::error::Error;
         type NamespaceLock = rustfs_lock::NamespaceLockWrapper;
 
@@ -1579,7 +1579,7 @@ mod tests {
 
         async fn disk_set_inventory(
             &self,
-            _selector: rustfs_storage_api::DiskSetSelector,
+            _selector: crate::storage_api_contracts::DiskSetSelector,
         ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
             panic!("unused in test")
         }

@@ -17,18 +17,19 @@
 use std::sync::Arc;
 
 pub(crate) use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, HTTPPreconditions, HTTPRangeSpec, ListMultipartsInfo,
-    ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ListPartsInfo, MakeBucketOptions, ObjectLockRetentionOptions,
-    ObjectOperations, StorageAdminApi,
+    BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, DeletedObject, DiskCapabilities, HTTPPreconditions,
+    HTTPRangeSpec, ListMultipartsInfo, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ListPartsInfo,
+    MakeBucketOptions, ObjectIO, ObjectLockRetentionOptions, ObjectOperations, ObjectToDelete, StorageAdminApi,
+    TopologyCapabilities, TopologySnapshot,
 };
 #[cfg(test)]
 pub(crate) use rustfs_storage_api::{MultipartInfo, PartInfo};
 
-pub(crate) type StorageDeletedObject = rustfs_storage_api::DeletedObject;
+pub(crate) type StorageDeletedObject = DeletedObject;
 pub(crate) type StorageGetObjectReader = super::GetObjectReader;
 pub(crate) type StorageObjectInfo = super::ObjectInfo;
 pub(crate) type StorageObjectOptions = super::ObjectOptions;
-pub(crate) type StorageObjectToDelete = rustfs_storage_api::ObjectToDelete;
+pub(crate) type StorageObjectToDelete = ObjectToDelete;
 pub(crate) type StoragePutObjReader = super::PutObjReader;
 
 pub(crate) mod ecstore_admin {
@@ -623,14 +624,10 @@ pub(crate) trait StoragePeerS3ClientExt {
         bucket: &str,
         opts: &rustfs_common::heal_channel::HealOpts,
     ) -> DiskResult<rustfs_madmin::heal_commands::HealResultItem>;
-    async fn make_bucket(&self, bucket: &str, opts: &rustfs_storage_api::MakeBucketOptions) -> DiskResult<()>;
-    async fn list_bucket(&self, opts: &rustfs_storage_api::BucketOptions) -> DiskResult<Vec<rustfs_storage_api::BucketInfo>>;
-    async fn delete_bucket(&self, bucket: &str, opts: &rustfs_storage_api::DeleteBucketOptions) -> DiskResult<()>;
-    async fn get_bucket_info(
-        &self,
-        bucket: &str,
-        opts: &rustfs_storage_api::BucketOptions,
-    ) -> DiskResult<rustfs_storage_api::BucketInfo>;
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> DiskResult<()>;
+    async fn list_bucket(&self, opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>>;
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> DiskResult<()>;
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> DiskResult<BucketInfo>;
 }
 
 impl StoragePeerS3ClientExt for LocalPeerS3Client {
@@ -642,23 +639,19 @@ impl StoragePeerS3ClientExt for LocalPeerS3Client {
         ecstore_rpc::PeerS3Client::heal_bucket(self, bucket, opts).await
     }
 
-    async fn make_bucket(&self, bucket: &str, opts: &rustfs_storage_api::MakeBucketOptions) -> DiskResult<()> {
+    async fn make_bucket(&self, bucket: &str, opts: &MakeBucketOptions) -> DiskResult<()> {
         ecstore_rpc::PeerS3Client::make_bucket(self, bucket, opts).await
     }
 
-    async fn list_bucket(&self, opts: &rustfs_storage_api::BucketOptions) -> DiskResult<Vec<rustfs_storage_api::BucketInfo>> {
+    async fn list_bucket(&self, opts: &BucketOptions) -> DiskResult<Vec<BucketInfo>> {
         ecstore_rpc::PeerS3Client::list_bucket(self, opts).await
     }
 
-    async fn delete_bucket(&self, bucket: &str, opts: &rustfs_storage_api::DeleteBucketOptions) -> DiskResult<()> {
+    async fn delete_bucket(&self, bucket: &str, opts: &DeleteBucketOptions) -> DiskResult<()> {
         ecstore_rpc::PeerS3Client::delete_bucket(self, bucket, opts).await
     }
 
-    async fn get_bucket_info(
-        &self,
-        bucket: &str,
-        opts: &rustfs_storage_api::BucketOptions,
-    ) -> DiskResult<rustfs_storage_api::BucketInfo> {
+    async fn get_bucket_info(&self, bucket: &str, opts: &BucketOptions) -> DiskResult<BucketInfo> {
         ecstore_rpc::PeerS3Client::get_bucket_info(self, bucket, opts).await
     }
 }
@@ -913,9 +906,9 @@ where
 
 pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
     endpoint_pools: &EndpointServerPools,
-    capabilities: rustfs_storage_api::TopologyCapabilities,
-    disk_capabilities: rustfs_storage_api::DiskCapabilities,
-) -> rustfs_storage_api::TopologySnapshot {
+    capabilities: TopologyCapabilities,
+    disk_capabilities: DiskCapabilities,
+) -> TopologySnapshot {
     ecstore_cluster::topology_snapshot_from_endpoint_pools_with_capabilities(endpoint_pools, capabilities, disk_capabilities)
 }
 
@@ -953,7 +946,7 @@ impl StorageVersioningConfigExt for s3s::dto::VersioningConfiguration {
     }
 }
 
-pub(crate) type GetObjectReader = <ECStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
-pub(crate) type ObjectInfo = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
-pub(crate) type ObjectOptions = <ECStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
-pub(crate) type PutObjReader = <ECStore as rustfs_storage_api::ObjectIO>::PutObjectReader;
+pub(crate) type GetObjectReader = <ECStore as ObjectIO>::GetObjectReader;
+pub(crate) type ObjectInfo = <ECStore as ObjectOperations>::ObjectInfo;
+pub(crate) type ObjectOptions = <ECStore as ObjectOperations>::ObjectOptions;
+pub(crate) type PutObjReader = <ECStore as ObjectIO>::PutObjectReader;

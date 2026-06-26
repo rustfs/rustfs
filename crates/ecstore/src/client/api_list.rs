@@ -26,12 +26,12 @@ use crate::client::{
     credentials,
     transition_api::{ReaderImpl, RequestMetadata, TransitionClient},
 };
+use crate::storage_api_contracts::BucketInfo;
 use http::{HeaderMap, StatusCode};
 use http_body_util::BodyExt;
 use hyper::body::Body;
 use hyper::body::Bytes;
 use rustfs_config::MAX_S3_CLIENT_RESPONSE_SIZE;
-use rustfs_storage_api::BucketInfo;
 use rustfs_utils::hash::EMPTY_STRING_SHA256_HASH;
 use std::collections::HashMap;
 use std::io::ErrorKind;

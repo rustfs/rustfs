@@ -64,6 +64,9 @@ ECSTORE_OBJECT_API_EXTERNAL_ALIAS_ACTUAL_FILE="${TMP_DIR}/ecstore_object_api_ext
 ECSTORE_OBJECT_API_EXTERNAL_ALIAS_DIFF_FILE="${TMP_DIR}/ecstore_object_api_external_alias_diff.txt"
 ECSTORE_OBJECT_API_UNAPPROVED_NAME_HITS_FILE="${TMP_DIR}/ecstore_object_api_unapproved_name_hits.txt"
 STARTUP_PUBLIC_SHIM_HITS_FILE="${TMP_DIR}/startup_public_shim_hits.txt"
+ECSTORE_TEST_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_test_direct_api_hits.txt"
+ECSTORE_BENCH_DIRECT_API_HITS_FILE="${TMP_DIR}/ecstore_bench_direct_api_hits.txt"
+LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE="${TMP_DIR}/local_storage_api_raw_contract_path_hits.txt"
 STORE_API_DELETE_DTO_REEXPORTS_FILE="${TMP_DIR}/store_api_delete_dto_reexports.txt"
 STORE_API_DELETE_DTO_INTERNAL_HITS_FILE="${TMP_DIR}/store_api_delete_dto_internal_hits.txt"
 STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_definition_hits.txt"
@@ -71,6 +74,7 @@ STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycl
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
+ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE="${TMP_DIR}/ecstore_direct_storage_api_source_hits.txt"
 DIRECT_ECSTORE_IMPORT_HITS_FILE="${TMP_DIR}/direct_ecstore_import_hits.txt"
 ECSTORE_API_FACADE_REQUIRED_HITS_FILE="${TMP_DIR}/ecstore_api_facade_required_hits.txt"
 ECSTORE_PUBLIC_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_public_facade_bypass_hits.txt"
@@ -632,11 +636,11 @@ fi
 
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/core.rs" \
-  "pub use rustfs_storage_api::ExpirationOptions;" \
+  "pub use crate::storage_api_contracts::ExpirationOptions;" \
   "ECStore ExpirationOptions compatibility re-export"
 require_source_line \
   "crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs" \
-  "pub use rustfs_storage_api::TransitionedObject;" \
+  "pub use crate::storage_api_contracts::TransitionedObject;" \
   "ECStore TransitionedObject compatibility re-export"
 
 (
@@ -657,6 +661,42 @@ fi
 
 if [[ -s "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE" ]]; then
   report_failure "external list response consumers must use rustfs-storage-api contracts: $(paste -sd '; ' "$STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^use rustfs_storage_api|^pub use rustfs_storage_api|rustfs_storage_api::' \
+    crates/ecstore/src \
+    --glob '*.rs' \
+    --glob '!storage_api_contracts.rs' || true
+) >"$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE"
+
+if [[ -s "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE" ]]; then
+  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts.rs: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::|rustfs_storage_api' \
+    crates/ecstore/tests \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/tests/storage_api\.rs:' || true
+) >"$ECSTORE_TEST_DIRECT_API_HITS_FILE"
+
+if [[ -s "$ECSTORE_TEST_DIRECT_API_HITS_FILE" ]]; then
+  report_failure "ECStore integration tests must route ECStore and storage-api symbols through crates/ecstore/tests/storage_api.rs: $(paste -sd '; ' "$ECSTORE_TEST_DIRECT_API_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::|rustfs_storage_api' \
+    crates/ecstore/benches \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/benches/storage_api/mod\.rs:' || true
+) >"$ECSTORE_BENCH_DIRECT_API_HITS_FILE"
+
+if [[ -s "$ECSTORE_BENCH_DIRECT_API_HITS_FILE" ]]; then
+  report_failure "ECStore benches must route ECStore and storage-api symbols through crates/ecstore/benches/storage_api/mod.rs: $(paste -sd '; ' "$ECSTORE_BENCH_DIRECT_API_HITS_FILE")"
 fi
 
 (
@@ -979,6 +1019,25 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE" ]]; then
   report_failure "RustFS storage owner modules must route ECStore and storage-api symbols through rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_DIRECT_STORAGE_SOURCE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_storage_api::[A-Za-z_]' \
+    rustfs/src/storage_api.rs \
+    rustfs/src/app/storage_api.rs \
+    rustfs/src/admin/storage_api.rs \
+    rustfs/src/storage/storage_api.rs \
+    crates/iam/src/storage_api.rs \
+    crates/protocols/src/swift/storage_api.rs \
+    crates/s3select-api/src/storage_api.rs \
+    crates/scanner/src/storage_api.rs \
+    crates/obs/src/metrics/storage_api.rs \
+    crates/heal/src/heal/storage_api.rs || true
+) >"$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE"
+
+if [[ -s "$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE" ]]; then
+  report_failure "local storage_api boundaries must import storage-api contracts once and use local aliases internally: $(paste -sd '; ' "$LOCAL_STORAGE_API_RAW_CONTRACT_PATH_HITS_FILE")"
 fi
 
 (

@@ -31,6 +31,10 @@ use crate::event_notification::{EventArgs, send_event};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
+use crate::storage_api_contracts::{
+    DeletedObject, HTTPRangeSpec, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO, ObjectOperations,
+    ObjectToDelete, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+};
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -56,11 +60,6 @@ use rustfs_filemeta::{
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use rustfs_s3_types::EventName;
-use rustfs_storage_api::{
-    DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, NamespaceLocking as StorageNamespaceLocking, ObjectIO,
-    ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations, ObjectToDelete, WalkOptions as StorageWalkOptions,
-};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,

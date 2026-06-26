@@ -24,6 +24,10 @@ use crate::error::{
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::sets::Sets;
+use crate::storage_api_contracts::{
+    ListObjectsInfo as StorageListObjectsInfo, ObjectOperations as _, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
+    StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
+};
 use crate::store::ECStore;
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use futures::future::join_all;
@@ -31,11 +35,6 @@ use rand::seq::SliceRandom;
 use rustfs_filemeta::{
     MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
     merge_file_meta_versions,
-};
-use rustfs_storage_api::{
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo as StorageListObjectsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ObjectInfoOrErr as StorageObjectInfoOrErr, ObjectOperations as _,
-    VersionMarker, WalkOptions as StorageWalkOptions, WalkVersionsSortOrder,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};

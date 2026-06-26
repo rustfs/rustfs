@@ -42,6 +42,14 @@ use crate::get_diagnostics::{
 use crate::object_api::ObjectOptions;
 use crate::rpc::heal_bucket_local_on_disks;
 use crate::runtime_sources;
+use crate::storage_api_contracts::{
+    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
+    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
+};
+use crate::storage_api_contracts::{
+    HTTPRangeSpec, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+};
+use crate::storage_api_contracts::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use crate::store_utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
@@ -88,15 +96,6 @@ use rustfs_object_capacity::capacity_scope::{
     CapacityScope, CapacityScopeDisk, record_capacity_scope, record_global_dirty_scope,
 };
 use rustfs_s3_types::EventName;
-use rustfs_storage_api::{
-    BucketInfo, BucketOperations, BucketOptions, CompletePart, DeleteBucketOptions, DeletedObject, ListMultipartsInfo,
-    ListPartsInfo, MakeBucketOptions, MultipartInfo, MultipartUploadResult, ObjectToDelete, PartInfo,
-};
-use rustfs_storage_api::{
-    HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
-};
-use rustfs_storage_api::{MultipartOperations as _, NamespaceLocking as _, ObjectIO as _, ObjectOperations as _};
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::headers::AMZ_STORAGE_CLASS;
 use rustfs_utils::http::headers::{
@@ -1023,7 +1022,7 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectIO for SetDisks {
+impl crate::storage_api_contracts::ObjectIO for SetDisks {
     type Error = Error;
     type RangeSpec = HTTPRangeSpec;
     type HeaderMap = HeaderMap;
@@ -2011,7 +2010,7 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::NamespaceLocking for SetDisks {
+impl crate::storage_api_contracts::NamespaceLocking for SetDisks {
     type Error = Error;
     type NamespaceLock = NamespaceLockWrapper;
 
@@ -2267,7 +2266,7 @@ fn check_object_lock_retention_update(bucket: &str, object: &str, obj_info: &Obj
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ObjectOperations for SetDisks {
+impl crate::storage_api_contracts::ObjectOperations for SetDisks {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -3373,8 +3372,15 @@ impl rustfs_storage_api::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self))]
     async fn verify_object_integrity(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
-        let get_object_reader =
-            <Self as rustfs_storage_api::ObjectIO>::get_object_reader(self, bucket, object, None, HeaderMap::new(), opts).await?;
+        let get_object_reader = <Self as crate::storage_api_contracts::ObjectIO>::get_object_reader(
+            self,
+            bucket,
+            object,
+            None,
+            HeaderMap::new(),
+            opts,
+        )
+        .await?;
         // Stream to sink to avoid loading entire object into memory during verification
         let mut reader = get_object_reader.stream;
         tokio::io::copy(&mut reader, &mut tokio::io::sink()).await?;
@@ -3497,7 +3503,7 @@ impl SetDisks {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::ListOperations for SetDisks {
+impl crate::storage_api_contracts::ListOperations for SetDisks {
     type Error = Error;
     type ListObjectsV2Info = ListObjectsV2Info;
     type ListObjectVersionsInfo = ListObjectVersionsInfo;
@@ -3558,7 +3564,7 @@ impl rustfs_storage_api::ListOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::MultipartOperations for SetDisks {
+impl crate::storage_api_contracts::MultipartOperations for SetDisks {
     type Error = Error;
     type ObjectInfo = ObjectInfo;
     type ObjectOptions = ObjectOptions;
@@ -4666,7 +4672,7 @@ impl rustfs_storage_api::MultipartOperations for SetDisks {
 }
 
 #[async_trait::async_trait]
-impl rustfs_storage_api::HealOperations for SetDisks {
+impl crate::storage_api_contracts::HealOperations for SetDisks {
     type Error = Error;
     type HealResultItem = HealResultItem;
     type HealOptions = HealOpts;
@@ -5621,6 +5627,10 @@ mod tests {
     use crate::disk::health_state::RuntimeDriveHealthState;
     use crate::endpoints::SetupType;
     use crate::object_api::ObjectInfo;
+    use crate::storage_api_contracts::HealOperations as _;
+    use crate::storage_api_contracts::ListOperations as _;
+    use crate::storage_api_contracts::TransitionedObject;
+    use crate::storage_api_contracts::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use crate::store_init::save_format_file;
     use crate::store_list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
@@ -5628,10 +5638,6 @@ mod tests {
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_storage_api::HealOperations as _;
-    use rustfs_storage_api::ListOperations as _;
-    use rustfs_storage_api::TransitionedObject;
-    use rustfs_storage_api::{CompletePart, NamespaceLocking as _, ObjectOperations as _};
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -7442,7 +7448,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::COMPLIANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,
@@ -7477,7 +7483,7 @@ mod tests {
             ..Default::default()
         };
         let opts = ObjectOptions {
-            object_lock_retention: Some(rustfs_storage_api::ObjectLockRetentionOptions {
+            object_lock_retention: Some(crate::storage_api_contracts::ObjectLockRetentionOptions {
                 mode: Some(s3s::dto::ObjectLockRetentionMode::GOVERNANCE.to_string()),
                 retain_until: Some(requested_until),
                 bypass_governance: true,

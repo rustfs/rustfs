@@ -7,9 +7,9 @@ use super::{
 };
 use crate::config::com::{read_config_with_metadata, save_config_with_opts};
 use crate::error::is_err_operation_canceled;
+use crate::storage_api_contracts::{HTTPRangeSpec, ObjectIO};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
-use rustfs_storage_api::{HTTPRangeSpec, ObjectIO};
 use std::{collections::HashSet, fmt, io::Cursor, sync::Arc};
 use time::OffsetDateTime;
 use tracing::{debug, info};

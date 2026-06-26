@@ -1,5 +1,5 @@
 use super::*;
-use rustfs_storage_api::{
+use crate::storage_api_contracts::{
     HTTPPreconditions, ObjectLockRetentionOptions, ObjectPreconditionError, ObjectPreconditionPart, ObjectPreconditionState,
     VersionMarker,
 };

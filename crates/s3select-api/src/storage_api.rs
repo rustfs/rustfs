@@ -25,9 +25,9 @@ pub(crate) use rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE as SELECT
 pub(crate) use rustfs_ecstore::api::storage::ECStore as SelectStore;
 pub(crate) use rustfs_storage_api::{HTTPRangeSpec, ObjectIO, ObjectOperations};
 
-pub(crate) type SelectGetObjectReader = <SelectStore as rustfs_storage_api::ObjectIO>::GetObjectReader;
-pub(crate) type SelectObjectInfo = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectInfo;
-pub(crate) type SelectObjectOptions = <SelectStore as rustfs_storage_api::ObjectOperations>::ObjectOptions;
+pub(crate) type SelectGetObjectReader = <SelectStore as ObjectIO>::GetObjectReader;
+pub(crate) type SelectObjectInfo = <SelectStore as ObjectOperations>::ObjectInfo;
+pub(crate) type SelectObjectOptions = <SelectStore as ObjectOperations>::ObjectOptions;
 
 pub(crate) fn resolve_select_object_store_handle() -> Option<Arc<SelectStore>> {
     resolve_select_object_store_handle_from_backend()

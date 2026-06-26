@@ -17,6 +17,7 @@ use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
 use crate::rio::{HashReader, LimitReader};
+use crate::storage_api_contracts::{ExpirationOptions, HTTPRangeSpec, TransitionedObject};
 use crate::store_utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
@@ -27,7 +28,6 @@ use rustfs_filemeta::{
     version_purge_statuses_map,
 };
 use rustfs_rio::Checksum;
-use rustfs_storage_api::{ExpirationOptions, HTTPRangeSpec, TransitionedObject};
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
 use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, AMZ_RESTORE, AMZ_STORAGE_CLASS};

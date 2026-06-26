@@ -18,6 +18,7 @@ use crate::rpc::{TonicInterceptor, gen_tonic_signature_interceptor, node_service
 use crate::{disk::endpoint::Endpoint, runtime_sources};
 
 use crate::data_usage::load_data_usage_cache;
+use crate::storage_api_contracts::StorageAdminApi;
 use rustfs_common::heal_channel::DriveState;
 use rustfs_madmin::{
     BackendDisks, Disk, ErasureSetInfo, ITEM_INITIALIZING, ITEM_OFFLINE, ITEM_ONLINE, InfoMessage, ServerProperties,
@@ -26,7 +27,6 @@ use rustfs_protos::{
     models::{PingBody, PingBodyBuilder},
     proto_gen::node_service::{PingRequest, PingResponse},
 };
-use rustfs_storage_api::StorageAdminApi;
 use std::{
     collections::{HashMap, HashSet},
     time::Duration,

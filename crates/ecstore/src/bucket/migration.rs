@@ -19,16 +19,15 @@ use crate::bucket::replication::{decode_resync_file, encode_resync_file};
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
+use crate::storage_api_contracts::{
+    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListOperations, ObjectIO, ObjectOperations, ObjectToDelete,
+    StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions,
+};
 use crate::storage_api_contracts::{EcstoreObjectIO, EcstoreObjectOperations};
 use http::HeaderMap;
 use rustfs_filemeta::FileInfo;
 use rustfs_policy::auth::UserIdentity;
 use rustfs_policy::policy::PolicyDoc;
-use rustfs_storage_api::{
-    BucketOperations, BucketOptions, DeletedObject, HTTPRangeSpec, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
-    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, ObjectIO, ObjectInfoOrErr as StorageObjectInfoOrErr,
-    ObjectOperations, ObjectToDelete, WalkOptions as StorageWalkOptions,
-};
 use rustfs_utils::path::SLASH_SEPARATOR;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
