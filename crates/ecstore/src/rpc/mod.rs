@@ -12,27 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod client;
-mod context_propagation;
-mod http_auth;
-mod internode_data_transport;
-mod peer_rest_client;
-mod peer_s3_client;
-mod remote_disk;
-mod remote_locker;
-mod runtime_sources;
-
-pub use client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client, node_service_time_out_client_no_auth,
-};
-pub use http_auth::{TONIC_RPC_PREFIX, build_auth_headers, gen_signature_headers, verify_rpc_signature};
 #[cfg(test)]
-pub(crate) use internode_data_transport::TcpHttpInternodeDataTransport;
-pub use internode_data_transport::build_internode_data_transport_from_env;
-pub use peer_rest_client::{
-    PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC,
+pub(crate) use crate::cluster::rpc::TcpHttpInternodeDataTransport;
+pub(crate) use crate::cluster::rpc::heal_bucket_local_on_disks;
+pub use crate::cluster::rpc::{
+    LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, RemoteClient, RemoteDisk, S3PeerSys,
+    SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, TonicInterceptor, build_auth_headers,
+    build_internode_data_transport_from_env, gen_signature_headers, gen_tonic_signature_interceptor,
+    node_service_time_out_client, node_service_time_out_client_no_auth, verify_rpc_signature,
 };
-pub(crate) use peer_s3_client::heal_bucket_local_on_disks;
-pub use peer_s3_client::{LocalPeerS3Client, PeerS3Client, S3PeerSys};
-pub use remote_disk::RemoteDisk;
-pub use remote_locker::RemoteClient;
+pub(crate) use crate::cluster::rpc::{client, context_propagation, internode_data_transport, runtime_sources};

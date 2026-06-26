@@ -130,6 +130,20 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
+ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
+ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_support_module_hits.txt"
+ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_layout_contract_support_module_hits.txt"
+ECSTORE_ROOT_SERVICE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_service_runtime_module_hits.txt"
+ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_data_movement_module_hits.txt"
+ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_usage_diagnostics_module_hits.txt"
+ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_runtime_global_module_hits.txt"
+ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_module_hits.txt"
+ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
+ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
+ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
+ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_support_module_hits.txt"
+ECSTORE_ROOT_RPC_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_impl_hits.txt"
+ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE="${TMP_DIR}/ecstore_old_metadata_owner_path_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -698,17 +712,21 @@ fi
   rg -n --with-filename '^use rustfs_storage_api|^pub use rustfs_storage_api|rustfs_storage_api::' \
     crates/ecstore/src \
     --glob '*.rs' \
-    --glob '!storage_api_contracts.rs' || true
+    --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+    --glob '!crates/ecstore/src/storage_api_contracts/**' \
+    --glob '!storage_api_contracts.rs' \
+    --glob '!storage_api_contracts/mod.rs' \
+    --glob '!storage_api_contracts/**' || true
 ) >"$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE"
 
 if [[ -s "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE" ]]; then
-  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts.rs: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
+  report_failure "ECStore modules must route storage-api symbols through crates/ecstore/src/storage_api_contracts: $(paste -sd '; ' "$ECSTORE_DIRECT_STORAGE_API_SOURCE_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
   rg -n --with-filename '^pub(?:\(crate\))? use rustfs_storage_api' \
-    crates/ecstore/src/storage_api_contracts.rs || true
+    crates/ecstore/src/storage_api_contracts/mod.rs || true
 ) >"$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE"
 
 if [[ -s "$ECSTORE_STORAGE_API_ROOT_REEXPORT_HITS_FILE" ]]; then
@@ -721,11 +739,19 @@ fi
     rg -n -U --with-filename 'storage_api_contracts::\{\s*[A-Z]' \
       crates/ecstore/src \
       --glob '*.rs' \
-      --glob '!storage_api_contracts.rs' || true
+      --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+      --glob '!crates/ecstore/src/storage_api_contracts/**' \
+      --glob '!storage_api_contracts.rs' \
+      --glob '!storage_api_contracts/mod.rs' \
+      --glob '!storage_api_contracts/**' || true
     rg -n --with-filename 'storage_api_contracts::[A-Z]' \
       crates/ecstore/src \
       --glob '*.rs' \
-      --glob '!storage_api_contracts.rs' || true
+      --glob '!crates/ecstore/src/storage_api_contracts/mod.rs' \
+      --glob '!crates/ecstore/src/storage_api_contracts/**' \
+      --glob '!storage_api_contracts.rs' \
+      --glob '!storage_api_contracts/mod.rs' \
+      --glob '!storage_api_contracts/**' || true
   }
 ) >"$ECSTORE_STORAGE_API_ROOT_CONSUMER_HITS_FILE"
 
@@ -2774,6 +2800,195 @@ fi
 
 if [[ -s "$STORE_API_MODULE_PATH_HITS_FILE" ]]; then
   report_failure "legacy ECStore store_api module files must not be restored: $(paste -sd '; ' "$STORE_API_MODULE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/store.rs ]] && printf '%s\n' 'crates/ecstore/src/store.rs'
+    [[ -e crates/ecstore/src/set_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/set_disk.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore store and set_disk owners must stay in directory modules: $(paste -sd '; ' "$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/store_list_objects.rs ]] && printf '%s\n' 'crates/ecstore/src/store_list_objects.rs'
+    [[ -e crates/ecstore/src/store_utils.rs ]] && printf '%s\n' 'crates/ecstore/src/store_utils.rs'
+    [[ -e crates/ecstore/src/store_init.rs ]] && printf '%s\n' 'crates/ecstore/src/store_init.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore store support modules must stay under the store owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/disks_layout.rs ]] && printf '%s\n' 'crates/ecstore/src/disks_layout.rs'
+    [[ -e crates/ecstore/src/endpoints.rs ]] && printf '%s\n' 'crates/ecstore/src/endpoints.rs'
+    [[ -e crates/ecstore/src/storage_api_contracts.rs ]] && printf '%s\n' 'crates/ecstore/src/storage_api_contracts.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore layout facade and storage API contract modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_LAYOUT_CONTRACT_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/batch_processor.rs ]] && printf '%s\n' 'crates/ecstore/src/batch_processor.rs'
+    [[ -e crates/ecstore/src/event_notification.rs ]] && printf '%s\n' 'crates/ecstore/src/event_notification.rs'
+    [[ -e crates/ecstore/src/metrics_realtime.rs ]] && printf '%s\n' 'crates/ecstore/src/metrics_realtime.rs'
+    [[ -e crates/ecstore/src/notification_sys.rs ]] && printf '%s\n' 'crates/ecstore/src/notification_sys.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_SERVICE_RUNTIME_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_SERVICE_RUNTIME_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore service runtime modules must stay under the services owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_SERVICE_RUNTIME_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/data_movement.rs ]] && printf '%s\n' 'crates/ecstore/src/data_movement.rs'
+    [[ -e crates/ecstore/src/data_movement_backpressure.rs ]] && printf '%s\n' 'crates/ecstore/src/data_movement_backpressure.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore data movement modules must stay under the data_movement owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/admin_server_info.rs ]] && printf '%s\n' 'crates/ecstore/src/admin_server_info.rs'
+    [[ -e crates/ecstore/src/data_usage.rs ]] && printf '%s\n' 'crates/ecstore/src/data_usage.rs'
+    [[ -e crates/ecstore/src/get_diagnostics.rs ]] && printf '%s\n' 'crates/ecstore/src/get_diagnostics.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore usage and diagnostics modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/global.rs ]] && printf '%s\n' 'crates/ecstore/src/global.rs'
+    [[ -e crates/ecstore/src/runtime_sources.rs ]] && printf '%s\n' 'crates/ecstore/src/runtime_sources.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore runtime global modules must stay under the runtime owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/bitrot.rs ]] && printf '%s\n' 'crates/ecstore/src/bitrot.rs'
+    [[ -e crates/ecstore/src/compress.rs ]] && printf '%s\n' 'crates/ecstore/src/compress.rs'
+    [[ -e crates/ecstore/src/rio.rs ]] && printf '%s\n' 'crates/ecstore/src/rio.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore I/O support modules must stay under the io_support owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/error.rs ]] && printf '%s\n' 'crates/ecstore/src/error.rs'
+    [[ -e crates/ecstore/src/rebalance.rs ]] && printf '%s\n' 'crates/ecstore/src/rebalance.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore error and rebalance modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/pools.rs ]] && printf '%s\n' 'crates/ecstore/src/pools.rs'
+    [[ -e crates/ecstore/src/sets.rs ]] && printf '%s\n' 'crates/ecstore/src/sets.rs'
+    [[ -e crates/ecstore/src/pools_test.rs ]] && printf '%s\n' 'crates/ecstore/src/pools_test.rs'
+    [[ -e crates/ecstore/src/store_test.rs ]] && printf '%s\n' 'crates/ecstore/src/store_test.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore core runtime modules must stay under the core owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename 'pub (struct|enum|fn) Cluster|pub fn (topology|membership|pool_state|local_node_storage|peer_health)_snapshot' \
+  "${ROOT_DIR}/crates/ecstore/src/cluster/mod.rs" \
+  >"$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore cluster root module must only re-export control-plane owner symbols: $(paste -sd '; ' "$ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/rpc/client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/client.rs'
+    [[ -e crates/ecstore/src/rpc/context_propagation.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/context_propagation.rs'
+    [[ -e crates/ecstore/src/rpc/http_auth.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/http_auth.rs'
+    [[ -e crates/ecstore/src/rpc/internode_data_transport.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/internode_data_transport.rs'
+    [[ -e crates/ecstore/src/rpc/peer_rest_client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/peer_rest_client.rs'
+    [[ -e crates/ecstore/src/rpc/peer_s3_client.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/peer_s3_client.rs'
+    [[ -e crates/ecstore/src/rpc/remote_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_disk.rs'
+    [[ -e crates/ecstore/src/rpc/remote_locker.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_locker.rs'
+    [[ -e crates/ecstore/src/rpc/runtime_sources.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/runtime_sources.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore RPC support modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename '^(pub(?:\(crate\))? )?(struct|enum|fn|trait) |^mod ' \
+  "${ROOT_DIR}/crates/ecstore/src/rpc/mod.rs" \
+  >"$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore root rpc module must only re-export cluster/rpc owner symbols: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/bucket/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata.rs'
+    [[ -e crates/ecstore/src/bucket/metadata_sys.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_sys.rs'
+    [[ -e crates/ecstore/src/bucket/metadata_test.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_test.rs'
+    [[ -e crates/ecstore/src/set_disk/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/set_disk/metadata.rs'
+    true
+  }
+) >"$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE"
+
+if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
+  report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
