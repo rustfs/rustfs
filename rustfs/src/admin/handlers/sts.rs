@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::is_admin::IsAdminHandler;
-use crate::admin::storage_api::ecstore_utils::serialize;
+use crate::admin::storage_api::bucket::utils::serialize;
 use crate::{
     admin::runtime_sources::{resolve_action_credentials, resolve_oidc_handle, resolve_token_signing_key},
     admin::{

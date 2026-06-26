@@ -12,11 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::storage_api::{BucketOperations, BucketOptions, StorageAdminApi};
-use crate::admin::storage_api::{
-    DiskStat, ECStore, NotificationSys, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
-    StorageError, decode_rebalance_stop_propagation_record,
+use crate::admin::storage_api::contract::{BucketOperations, BucketOptions, StorageAdminApi};
+use crate::admin::storage_api::error::StorageError;
+use crate::admin::storage_api::rebalance::{
+    DiskStat, RebalSaveOpt, RebalanceCleanupWarnings, RebalanceMeta, RebalanceStopPropagationRecord,
+    decode_rebalance_stop_propagation_record,
 };
+use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
     admin::runtime_sources::{resolve_notification_system, resolve_object_store_handle},
     admin::{
@@ -296,7 +298,7 @@ fn build_rebalance_pool_progress(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    ps: &crate::admin::storage_api::RebalanceStats,
+    ps: &crate::admin::storage_api::rebalance::RebalanceStats,
 ) -> Option<RebalPoolProgress> {
     let total_bytes_to_rebal = ps.init_capacity as f64 * percent_free_goal - ps.init_free_space as f64;
     let terminal_time = ps.info.end_time.or(stop_time);
@@ -339,7 +341,7 @@ fn build_rebalance_pool_statuses(
     now: OffsetDateTime,
     stop_time: Option<OffsetDateTime>,
     percent_free_goal: f64,
-    pool_stats: &[crate::admin::storage_api::RebalanceStats],
+    pool_stats: &[crate::admin::storage_api::rebalance::RebalanceStats],
     disk_stats: &[DiskStat],
 ) -> Vec<RebalancePoolStatus> {
     pool_stats
@@ -903,7 +905,7 @@ mod rebalance_handler_tests {
         rebalance_pool_used, rebalance_query_present, rebalance_remaining_buckets, rebalance_rollback_failure_message,
         rebalance_rollback_stop_failure_message, rebalance_start_rollback_error, rebalance_used_pct, rollback_result_label,
     };
-    use crate::admin::storage_api::{
+    use crate::admin::storage_api::rebalance::{
         DiskStat, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo, RebalanceMeta,
         RebalanceStats, RebalanceStopPropagationRecord, encode_rebalance_stop_propagation_record,
     };

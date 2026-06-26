@@ -81,7 +81,7 @@ use super::storage_api::{
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
-    AppContext, get_global_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
+    AppContext, current_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
     resolve_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
@@ -1527,7 +1527,7 @@ impl DefaultObjectUsecase {
 
     pub fn from_global() -> Self {
         Self {
-            context: get_global_app_context(),
+            context: current_app_context(),
         }
     }
 
@@ -1542,7 +1542,7 @@ impl DefaultObjectUsecase {
     fn base_buffer_size(&self) -> usize {
         self.context
             .clone()
-            .or_else(get_global_app_context)
+            .or_else(current_app_context)
             .map(|context| context.buffer_config().get().base_config.default_unknown)
             .unwrap_or_else(|| RustFSBufferConfig::default().base_config.default_unknown)
     }

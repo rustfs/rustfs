@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::{
+use crate::storage_api::cluster::{
     CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, EndpointServerPools, MemorySamplingState, ObservabilitySnapshot,
     ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
     UserspaceProfilingCapability, topology_snapshot_from_endpoint_pools_with_capabilities,
@@ -184,7 +184,7 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_api::{
+    use crate::storage_api::cluster::{
         CapabilityState, Endpoint, Endpoints, ObservabilitySnapshotProvider, PoolEndpoints, TopologySnapshotProvider,
     };
 

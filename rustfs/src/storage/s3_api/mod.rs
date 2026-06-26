@@ -19,8 +19,24 @@
 //! This file intentionally starts as skeleton-only. Behavior remains in place
 //! until each helper is moved with dedicated small refactor steps.
 
+use crate::app::{
+    bucket_usecase::DefaultBucketUsecase, multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase,
+};
+
 pub(crate) mod acl;
 pub(crate) mod bucket;
 pub(crate) mod common;
 pub(crate) mod multipart;
 pub(crate) mod tagging;
+
+pub(crate) fn default_bucket_usecase() -> DefaultBucketUsecase {
+    DefaultBucketUsecase::from_global()
+}
+
+pub(crate) fn default_multipart_usecase() -> DefaultMultipartUsecase {
+    DefaultMultipartUsecase::from_global()
+}
+
+pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
+    DefaultObjectUsecase::from_global()
+}

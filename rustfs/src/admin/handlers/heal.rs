@@ -15,10 +15,10 @@
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::resolve_object_store_handle;
-use crate::admin::storage_api::HealOperations as _;
-use crate::admin::storage_api::ecstore_utils::is_valid_object_prefix;
-use crate::admin::storage_api::is_reserved_or_invalid_bucket;
-use crate::admin::storage_api::spawn_traced;
+use crate::admin::storage_api::access::spawn_traced;
+use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
+use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
+use crate::admin::storage_api::contract::HealOperations as _;
 use crate::server::ADMIN_PREFIX;
 use crate::server::RemoteAddr;
 use bytes::Bytes;
@@ -410,10 +410,10 @@ fn should_handle_root_heal_directly(_hip: &HealInitParams) -> bool {
     false
 }
 
-fn map_root_heal_status(heal_err: Option<crate::admin::storage_api::Error>) -> S3Result<()> {
+fn map_root_heal_status(heal_err: Option<crate::admin::storage_api::error::Error>) -> S3Result<()> {
     match heal_err {
         None => Ok(()),
-        Some(crate::admin::storage_api::StorageError::NoHealRequired) => {
+        Some(crate::admin::storage_api::error::StorageError::NoHealRequired) => {
             info!(
                 event = EVENT_ADMIN_RESPONSE_EMITTED,
                 component = LOG_COMPONENT_ADMIN_API,
@@ -777,7 +777,7 @@ mod tests {
         heal_channel_response_summary, json_response, map_heal_response, map_root_heal_status, should_handle_root_heal_directly,
         validate_heal_request_mode, validate_heal_target,
     };
-    use crate::admin::storage_api::StorageError;
+    use crate::admin::storage_api::error::StorageError;
     use bytes::Bytes;
     use http::StatusCode;
     use http::Uri;

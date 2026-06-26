@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::startup_runtime_sources;
-use crate::storage_api::{
+use crate::storage_api::startup::{
     BucketOperations, BucketOptions, ECStore, init_bucket_metadata_sys, try_migrate_bucket_metadata, try_migrate_iam_config,
 };
 use std::{
