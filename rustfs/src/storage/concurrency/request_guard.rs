@@ -173,7 +173,7 @@ impl Drop for PutObjectGuard {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{GetObjectGuard, PutObjectGuard};
 
     #[test]
     fn test_guard_increments_counter() {

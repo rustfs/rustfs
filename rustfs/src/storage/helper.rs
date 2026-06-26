@@ -15,7 +15,7 @@
 use crate::server::{convert_ecstore_object_info, is_audit_module_enabled, is_notify_module_enabled};
 use crate::storage::access::{ReqInfo, request_context_from_req};
 use crate::storage::request_context::{RequestContext, extract_request_id_from_headers};
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use hashbrown::HashMap;
 use http::StatusCode;
 use metrics::counter;
@@ -37,7 +37,7 @@ use std::future::Future;
 use tokio::runtime::{Builder, Handle};
 use tracing::{Instrument, info_span, warn};
 
-use crate::storage::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::helper_consumer::StorageObjectInfo as ObjectInfo;
 
 /// Schedules an asynchronous task on the current runtime;
 /// if there is no runtime, creates a minimal runtime execution on a new thread.
@@ -391,12 +391,18 @@ impl Drop for OperationHelper {
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::OperationHelper;
     use crate::server::{refresh_audit_module_enabled, refresh_notify_module_enabled};
+    use crate::storage::access::ReqInfo;
+    use crate::storage::request_context::RequestContext;
     use http::{Extensions, HeaderMap, HeaderValue, Method, Uri};
     use metrics::{Counter, CounterFn, Gauge, GaugeFn, Histogram, HistogramFn, Key, KeyName, Metadata, SharedString, Unit};
     use rustfs_credentials::Credentials;
+    use rustfs_s3_ops::S3Operation;
+    use rustfs_s3_types::EventName;
+    use s3s::S3Request;
     use s3s::dto::DeleteObjectTaggingInput;
     use std::sync::{Arc, Mutex};
     use temp_env::with_vars;

@@ -20,11 +20,11 @@ use super::{
 use crate::config::{RustFSBufferConfig, WorkloadProfile, is_buffer_profile_enabled};
 use crate::error::ApiError;
 use crate::server::cors;
-use crate::storage::contract::{
+use crate::storage::ecfs::ListObjectUnorderedQuery;
+use crate::storage::storage_api::ecfs_extend_consumer::contract::{
     bucket::{BucketOperations, BucketOptions},
     object::ObjectToDelete,
 };
-use crate::storage::ecfs::ListObjectUnorderedQuery;
 use http::header::{IF_MATCH, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_UNMODIFIED_SINCE};
 use http::{HeaderMap, HeaderValue, StatusCode};
 use metrics::counter;
@@ -49,8 +49,8 @@ use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
 use tracing::{debug, warn};
 
-use crate::storage::StorageObjectInfo as ObjectInfo;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::ecfs_extend_consumer::StorageObjectInfo as ObjectInfo;
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 
 const LOG_COMPONENT_STORAGE: &str = "storage";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";

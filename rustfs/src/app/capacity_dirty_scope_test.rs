@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use super::storage_api::test::bucket::metadata_sys;
-use super::storage_api::test::{BucketOperations, BucketOptions, HealOperations as _, MakeBucketOptions, ObjectIO as _};
+use super::storage_api::test::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+use super::storage_api::test::contract::heal::HealOperations as _;
+use super::storage_api::test::contract::object::ObjectIO as _;
 use super::storage_api::test::{ECStore, Endpoint, EndpointServerPools, Endpoints, PoolEndpoints};
 use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_object_capacity::capacity_manager::{HybridStrategyConfig, create_isolated_manager};

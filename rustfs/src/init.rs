@@ -14,7 +14,7 @@
 
 use crate::runtime_sources::{resolve_notify_interface, resolve_region};
 use crate::server::ShutdownHandle;
-use crate::storage_api::startup::{
+use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };
 use crate::{admin, config, startup_runtime_sources, version};
@@ -717,7 +717,7 @@ where
 /// When enabled, it spawns a background task that tunes concurrency settings
 /// every 60 seconds.
 pub async fn init_auto_tuner(ctx: tokio_util::sync::CancellationToken) {
-    use crate::storage_api::startup::concurrency::get_concurrency_manager;
+    use crate::storage_api::startup::init::concurrency::get_concurrency_manager;
     use rustfs_io_metrics::AutoTuner;
     use rustfs_io_metrics::TunerConfig;
     use tracing::{debug, error, info};
@@ -850,7 +850,7 @@ pub async fn init_ftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::er
         config.validate().await?;
 
         // Create FTP server with protocol storage client
-        let fs = crate::storage_api::startup::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
@@ -970,7 +970,7 @@ pub async fn init_ftps_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         config.validate().await?;
 
         // Create FTPS server with protocol storage client
-        let fs = crate::storage_api::startup::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: FtpsServer<ProtocolStorageClient> = FtpsServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
@@ -1088,7 +1088,7 @@ pub async fn init_webdav_system() -> Result<Option<ShutdownHandle>, Box<dyn std:
         };
 
         // Create WebDAV server with protocol storage client
-        let fs = crate::storage_api::startup::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
         let server: WebDavServer<crate::protocols::ProtocolStorageClient> = WebDavServer::new(config, storage_client).await?;
         let bind_addr = server.config().bind_addr;
@@ -1222,7 +1222,7 @@ pub async fn init_sftp_system() -> Result<Option<ShutdownHandle>, Box<dyn std::e
         // file has insecure permissions.
         let host_keys = SftpConfig::load_host_keys(&config.host_key_dir).await?;
 
-        let fs = crate::storage_api::startup::ecfs::FS::new();
+        let fs = crate::storage_api::startup::init::ecfs::FS::new();
         let storage_client = ProtocolStorageClient::new(fs);
 
         let server = SftpServer::new(config.clone(), storage_client, host_keys)?;

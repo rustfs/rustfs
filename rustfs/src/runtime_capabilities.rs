@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage_api::cluster::{
-    CapabilitySnapshotError, CapabilityStatus, DiskCapabilities, EndpointServerPools, MemorySamplingState, ObservabilitySnapshot,
-    ObservabilitySnapshotProvider, PlatformSupport, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider,
-    UserspaceProfilingCapability, topology_snapshot_from_endpoint_pools_with_capabilities,
+use crate::storage_api::cluster::contract::{
+    capability::{CapabilitySnapshotError, CapabilityStatus, MemorySamplingState, PlatformSupport, UserspaceProfilingCapability},
+    observability::{ObservabilitySnapshot, ObservabilitySnapshotProvider},
+    topology::{DiskCapabilities, TopologyCapabilities, TopologySnapshot, TopologySnapshotProvider},
 };
+use crate::storage_api::cluster::{EndpointServerPools, topology_snapshot_from_endpoint_pools_with_capabilities};
 
 const NOT_WIRED_INTO_RUNTIME: &str = "not wired into runtime";
 const EBPF_LINUX_ONLY: &str = "eBPF support is only available on linux targets";
@@ -184,9 +185,10 @@ fn cgroup_memory_status() -> CapabilityStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage_api::cluster::{
-        CapabilityState, Endpoint, Endpoints, ObservabilitySnapshotProvider, PoolEndpoints, TopologySnapshotProvider,
-    };
+    use crate::storage_api::cluster::contract::capability::CapabilityState;
+    use crate::storage_api::cluster::contract::observability::ObservabilitySnapshotProvider;
+    use crate::storage_api::cluster::contract::topology::TopologySnapshotProvider;
+    use crate::storage_api::cluster::{Endpoint, Endpoints, PoolEndpoints};
 
     #[tokio::test]
     async fn observability_provider_returns_platform_snapshot() {

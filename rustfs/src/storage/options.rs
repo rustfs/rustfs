@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::{BucketVersioningSys, Result, StorageError};
-use crate::storage::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
+use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
@@ -44,10 +44,7 @@ use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
-use crate::storage::StorageObjectOptions as ObjectOptions;
-
-#[cfg(test)]
-use rustfs_utils::http::insert_header;
+use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -782,12 +779,24 @@ fn get_content_sha256_cksum(headers: &HeaderMap<HeaderValue>, service_type: Serv
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
     use proptest::prelude::*;
     use temp_env;
 
-    use super::*;
+    use super::super::StorageError;
+    use super::{
+        ENV_REJECT_ARCHIVE_CONTENT_ENCODING, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
+        detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
+        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_default_opts, get_opts, parse_copy_source_range,
+        put_opts, put_opts_from_headers, validate_archive_content_encoding,
+    };
     use http::{HeaderMap, HeaderValue};
+    use rustfs_utils::http::{
+        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+        SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, insert_header,
+    };
+    use s3s::S3ErrorCode;
     use std::collections::HashMap;
     use uuid::Uuid;
 

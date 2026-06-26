@@ -12,14 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::super::DEFAULT_READ_BUFFER_SIZE;
-use super::super::StorageDiskRpcExt as _;
-use super::super::WalkDirOptions;
-use super::super::find_local_disk_by_ref;
-use super::super::verify_rpc_signature;
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
-use crate::storage::runtime_sources;
+use crate::storage::storage_api::rpc_consumer::http_service::{
+    DEFAULT_READ_BUFFER_SIZE, StorageDiskRpcExt as _, WalkDirOptions, find_local_disk_by_ref, verify_rpc_signature,
+};
+use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures_util::TryStreamExt;
 use http::{HeaderMap, Method, Request, Response, StatusCode, Uri};
@@ -716,7 +714,17 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{
+        LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_ROUTING, PUT_FILE_STREAM_PATH, PutFileQuery,
+        READ_FILE_STREAM_PATH, WALK_DIR_PATH, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
+        put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature, write_body_chunks_to_writer,
+    };
+    use bytes::Bytes;
+    use http::{HeaderMap, Method, StatusCode, Uri};
+    use rustfs_io_metrics::internode_metrics::{
+        INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
+    };
+    use tokio::io;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio_stream::StreamExt;
     use tokio_stream::iter;

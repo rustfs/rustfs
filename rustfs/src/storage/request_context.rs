@@ -192,8 +192,11 @@ where
 }
 
 #[cfg(test)]
+#[allow(unused_imports)]
 mod tests {
-    use super::*;
+    use super::{RequestContext, extract_request_id_from_headers, extract_trace_context_ids_from_headers};
+    use http::HeaderMap;
+    use opentelemetry::global;
     use opentelemetry::trace::{SpanContext, TraceContextExt, TraceFlags, TraceId, TraceState, TracerProvider as _};
     use opentelemetry_sdk::propagation::TraceContextPropagator;
     use opentelemetry_sdk::trace::SdkTracerProvider;
