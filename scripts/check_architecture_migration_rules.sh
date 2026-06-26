@@ -2796,6 +2796,7 @@ fi
   {
     [[ -e crates/ecstore/src/store_list_objects.rs ]] && printf '%s\n' 'crates/ecstore/src/store_list_objects.rs'
     [[ -e crates/ecstore/src/store_utils.rs ]] && printf '%s\n' 'crates/ecstore/src/store_utils.rs'
+    [[ -e crates/ecstore/src/store_init.rs ]] && printf '%s\n' 'crates/ecstore/src/store_init.rs'
     true
   }
 ) >"$ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE"
