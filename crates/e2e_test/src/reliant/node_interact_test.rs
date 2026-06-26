@@ -14,7 +14,7 @@
 // limitations under the License.
 
 use crate::common::workspace_root;
-use crate::storage_api::{
+use crate::storage_api::node_interact::{
     TonicInterceptor, VolumeInfo, WalkDirOptions, gen_tonic_signature_interceptor, node_service_time_out_client,
 };
 use futures::future::join_all;

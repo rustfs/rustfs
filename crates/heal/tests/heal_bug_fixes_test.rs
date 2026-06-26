@@ -21,7 +21,7 @@ use rustfs_heal::heal::{
 #[path = "heal_bug_fixes_test/storage_api.rs"]
 mod storage_api;
 
-use storage_api::{BucketInfo, DiskStore, Endpoint};
+use storage_api::bug_fixes::{BucketInfo, DiskStore, Endpoint};
 
 #[test]
 fn test_heal_event_to_heal_request_no_panic() {

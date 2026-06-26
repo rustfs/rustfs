@@ -55,7 +55,7 @@ use super::account::validate_account_access;
 use super::container::ContainerMapper;
 use super::object::{ObjectKeyMapper, SwiftObjectOptions as ObjectOptions, head_object};
 use super::resolve_swift_object_store_handle;
-use super::storage_api::{ListOperations as _, ObjectOperations as _};
+use super::storage_api::versioning::{ListOperations as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult};
 use rustfs_credentials::Credentials;
 use std::time::{SystemTime, UNIX_EPOCH};

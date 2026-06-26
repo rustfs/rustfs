@@ -30,7 +30,7 @@ pub use scheduler::{
     MetricsRuntimeShutdownHandle, MetricsRuntimeStatusSnapshot, MetricsRuntimeWorkerMutation, init_metrics_collectors,
     init_metrics_runtime, metrics_runtime_controller_snapshot, metrics_runtime_status_snapshot,
 };
-pub(crate) use storage_api::{
+pub(crate) use storage_api::metrics::{
     BucketOperations, BucketOptions, OBS_GLOBAL_EXPIRY_STATE, OBS_GLOBAL_REPLICATION_STATS, OBS_GLOBAL_TRANSITION_STATE,
     ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsReplicationStats, ObsStore, StorageAdminApi, obs_get_global_bucket_monitor,
     obs_get_quota_config, obs_get_total_usable_capacity, obs_get_total_usable_capacity_free, obs_load_data_usage_from_backend,

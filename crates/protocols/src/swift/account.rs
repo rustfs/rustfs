@@ -14,7 +14,7 @@
 
 //! Swift account operations and validation
 
-use super::storage_api::{BucketOperations, MakeBucketOptions};
+use super::storage_api::account::{BucketOperations, MakeBucketOptions};
 use super::{SwiftError, SwiftResult};
 use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
 use rustfs_credentials::Credentials;

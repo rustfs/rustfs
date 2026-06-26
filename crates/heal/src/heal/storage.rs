@@ -19,7 +19,7 @@ use rustfs_madmin::heal_commands::HealResultItem;
 use std::sync::Arc;
 use tracing::{debug, error, warn};
 
-use super::storage_api::{
+use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations as _, ListOperations as _, ObjectIO as _,
     ObjectOperations as _, StorageAdminApi,
 };

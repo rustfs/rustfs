@@ -26,6 +26,31 @@ pub(crate) use rustfs_storage_api::{
     ObjectOperations,
 };
 
+pub(crate) mod account {
+    pub(crate) use super::{BucketOperations, MakeBucketOptions};
+}
+
+pub(crate) mod container {
+    pub(crate) use super::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, ListOperations, MakeBucketOptions};
+}
+
+pub(crate) mod large_object {
+    pub(crate) use super::HTTPRangeSpec;
+}
+
+pub(crate) mod object {
+    pub(crate) use super::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO, ObjectOperations};
+}
+
+pub(crate) mod public_api {
+    pub use super::{SwiftGetObjectReader, SwiftObjectInfo, SwiftObjectOptions, SwiftPutObjReader};
+    pub(crate) use super::{get_swift_bucket_metadata, resolve_swift_object_store_handle, set_swift_bucket_metadata};
+}
+
+pub(crate) mod versioning {
+    pub(crate) use super::{ListOperations, ObjectOperations};
+}
+
 pub type SwiftGetObjectReader = <SwiftStore as ObjectIO>::GetObjectReader;
 pub type SwiftObjectInfo = <SwiftStore as ObjectOperations>::ObjectInfo;
 pub type SwiftObjectOptions = <SwiftStore as ObjectOperations>::ObjectOptions;

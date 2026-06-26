@@ -118,6 +118,7 @@ RUSTFS_APP_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_app_ecstore_source_hits.t
 RUSTFS_ADMIN_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_admin_ecstore_source_hits.txt"
 EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_ecstore_compat_bypass_hits.txt"
 EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_storage_api_bypass_hits.txt"
+EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/external_storage_api_domain_bypass_hits.txt"
 EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_compat_bypass_hits.txt"
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
@@ -1412,6 +1413,27 @@ fi
 
 if [[ -s "$EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE" ]]; then
   report_failure "external runtime crates must source storage-api contracts through their local storage_api boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'use (crate::|super::)?storage_api::\{|use storage_api::\{|\b(crate::|super::)?storage_api::(BucketInfo|BucketOperations|BucketOptions|DeleteBucketOptions|DiskSetSelector|HTTPRangeSpec|ListOperations|MakeBucketOptions|NamespaceLocking|ObjectIO|ObjectOperations|StorageAdminApi|TonicInterceptor|BucketTargetSys)\b' \
+    crates/heal/src/heal \
+    crates/heal/tests \
+    crates/iam/src \
+    crates/obs/src/metrics \
+    crates/protocols/src/swift \
+    crates/s3select-api/src \
+    crates/scanner/src \
+    crates/scanner/tests \
+    crates/e2e_test/src \
+    --glob '*.rs' \
+    --glob '!**/storage_api.rs' \
+    --glob '!**/storage_api/mod.rs' || true
+) >"$EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE"
+
+if [[ -s "$EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE" ]]; then
+  report_failure "external local storage_api consumers must use domain modules instead of flat imports: $(paste -sd '; ' "$EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE")"
 fi
 
 (

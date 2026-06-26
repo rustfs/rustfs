@@ -44,7 +44,7 @@ use tokio::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, instrument, warn};
 
-use crate::storage_api::{BucketOperations, BucketOptions, NamespaceLocking as _};
+use crate::storage_api::scan::{BucketOperations, BucketOptions, NamespaceLocking as _};
 use crate::{
     ECStore, EcstoreError, RUSTFS_META_BUCKET, ScannerLifecycleConfigExt as _, ScannerReplicationConfigExt as _,
     get_lifecycle_config, get_replication_config, read_config, replace_bucket_usage_memory_from_info, save_config,
@@ -1148,9 +1148,9 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl crate::storage_api::ObjectIO for MemoryConfigStore {
+    impl crate::storage_api::scanner_io::ObjectIO for MemoryConfigStore {
         type Error = EcstoreError;
-        type RangeSpec = crate::storage_api::HTTPRangeSpec;
+        type RangeSpec = crate::storage_api::scanner_io::HTTPRangeSpec;
         type HeaderMap = http::HeaderMap;
         type ObjectOptions = ObjectOptions;
         type ObjectInfo = ObjectInfo;
@@ -1161,7 +1161,7 @@ mod tests {
             &self,
             bucket: &str,
             object: &str,
-            _range: Option<crate::storage_api::HTTPRangeSpec>,
+            _range: Option<crate::storage_api::scanner_io::HTTPRangeSpec>,
             _h: http::HeaderMap,
             _opts: &ObjectOptions,
         ) -> EcstoreResult<GetObjectReader> {

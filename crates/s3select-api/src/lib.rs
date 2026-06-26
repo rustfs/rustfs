@@ -25,7 +25,7 @@ mod storage_api;
 mod test;
 
 pub type QueryResult<T> = Result<T, QueryError>;
-pub(crate) use storage_api::{
+pub(crate) use storage_api::crate_boundary::{
     SELECT_DEFAULT_READ_BUFFER_SIZE, SelectGetObjectReader, SelectObjectInfo, SelectObjectOptions, SelectStorageError,
     SelectStore, resolve_select_object_store_handle, select_is_err_bucket_not_found, select_is_err_object_not_found,
     select_is_err_version_not_found,

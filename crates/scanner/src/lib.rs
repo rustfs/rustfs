@@ -24,7 +24,7 @@ use http::HeaderMap;
 use rustfs_config::server_config::{Config as ServerConfig, get_global_server_config as config_get_global_server_config};
 use std::path::PathBuf;
 use std::sync::Arc;
-use storage_api::{
+use storage_api::owner::{
     ECSTORE_BUCKET_META_PREFIX, ECSTORE_RUSTFS_META_BUCKET, ECSTORE_STORAGE_FORMAT_FILE, ECSTORE_STORAGECLASS_RRS,
     ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys, EcstoreDisk,
     EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo, EcstoreDiskInfoOptions, EcstoreDiskLocation,
@@ -40,7 +40,7 @@ use storage_api::{
     ecstore_resolve_object_store_handle, ecstore_save_config,
 };
 #[cfg(test)]
-use storage_api::{EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, ecstore_config_init, ecstore_new_disk};
+use storage_api::owner::{EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, ecstore_config_init, ecstore_new_disk};
 use tokio_util::sync::CancellationToken;
 
 pub mod data_usage_define;

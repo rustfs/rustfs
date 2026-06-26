@@ -39,7 +39,7 @@ mod storage_api;
 pub mod store;
 pub mod sys;
 pub mod utils;
-pub(crate) use storage_api::{
+pub(crate) use storage_api::crate_boundary::{
     IAM_CONFIG_ROOT_PREFIX, IamEcstoreError, IamStorageError, IamStore, classify_iam_system_path_failure_reason,
     delete_iam_config, is_iam_first_cluster_node_local, read_iam_config_no_lock, read_iam_config_with_metadata, save_iam_config,
     save_iam_config_with_opts,
@@ -53,8 +53,8 @@ pub(crate) struct IamNotificationPeerErr {
     pub(crate) err: Option<IamEcstoreError>,
 }
 
-impl From<storage_api::IamEcstoreNotificationPeerErr> for IamNotificationPeerErr {
-    fn from(value: storage_api::IamEcstoreNotificationPeerErr) -> Self {
+impl From<storage_api::crate_boundary::IamEcstoreNotificationPeerErr> for IamNotificationPeerErr {
+    fn from(value: storage_api::crate_boundary::IamEcstoreNotificationPeerErr) -> Self {
         Self { err: value.err }
     }
 }

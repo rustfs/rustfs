@@ -14,3 +14,7 @@
 
 pub(crate) use rustfs_ecstore::api::disk::{DiskStore, endpoint::Endpoint};
 pub(crate) use rustfs_storage_api::BucketInfo;
+
+pub(crate) mod bug_fixes {
+    pub(crate) use super::{BucketInfo, DiskStore, Endpoint};
+}

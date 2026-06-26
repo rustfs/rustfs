@@ -18,7 +18,7 @@
 //! Large files (>5GB) are split into segments, and a manifest defines
 //! how segments are assembled on download.
 
-use super::storage_api::HTTPRangeSpec;
+use super::storage_api::large_object::HTTPRangeSpec;
 use super::{SwiftError, object};
 use axum::http::{HeaderMap, Response, StatusCode};
 use rustfs_credentials::Credentials;

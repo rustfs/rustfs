@@ -51,7 +51,7 @@
 
 use super::account::validate_account_access;
 use super::container::ContainerMapper;
-use super::storage_api::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use super::storage_api::object::{BucketOperations, BucketOptions, HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 use super::{SwiftError, SwiftResult, resolve_swift_object_store_handle};
 use axum::http::HeaderMap;
 use rustfs_credentials::Credentials;

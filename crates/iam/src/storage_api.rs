@@ -80,3 +80,19 @@ pub(crate) async fn is_iam_first_cluster_node_local() -> bool {
 pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
     get_global_notification_sys()
 }
+
+pub(crate) mod crate_boundary {
+    pub(crate) use super::{
+        IAM_CONFIG_ROOT_PREFIX, IamEcstoreError, IamEcstoreNotificationPeerErr, IamStorageError, IamStore,
+        classify_iam_system_path_failure_reason, delete_iam_config, is_iam_first_cluster_node_local, read_iam_config_no_lock,
+        read_iam_config_with_metadata, save_iam_config, save_iam_config_with_opts,
+    };
+}
+
+pub(crate) mod object_store {
+    pub(crate) use super::{HTTPPreconditions, ListOperations, ObjectInfoOrErr, ObjectOperations};
+}
+
+pub(crate) mod runtime {
+    pub(crate) use super::{IamNotificationSys, notification_sys};
+}

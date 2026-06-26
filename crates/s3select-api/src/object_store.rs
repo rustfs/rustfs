@@ -48,7 +48,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio_util::io::ReaderStream;
 use transform_stream::AsyncTryStream;
 
-use crate::storage_api::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
+use crate::storage_api::object_store::{HTTPRangeSpec, ObjectIO as _, ObjectOperations as _};
 
 fn select_default_read_buffer_size_u64() -> u64 {
     u64::try_from(SELECT_DEFAULT_READ_BUFFER_SIZE).unwrap_or(u64::MAX)

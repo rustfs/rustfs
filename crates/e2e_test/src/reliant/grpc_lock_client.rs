@@ -24,7 +24,7 @@ use rustfs_protos::proto_gen::node_service::{BatchGenerallyLockRequest, Generall
 use tonic::Request;
 use tracing::{info, warn};
 
-use crate::storage_api::{TonicInterceptor, node_service_time_out_client_no_auth};
+use crate::storage_api::grpc_lock::{TonicInterceptor, node_service_time_out_client_no_auth};
 
 /// gRPC lock client without authentication for testing
 /// Similar to RemoteClient but uses no_auth client

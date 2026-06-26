@@ -27,3 +27,26 @@ pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 pub(crate) use rustfs_storage_api::{
     BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations, StorageAdminApi,
 };
+
+pub(crate) mod owner {
+    pub(crate) use super::{
+        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_GLOBAL_LOCAL_DISK_MAP, ECSTORE_RUSTFS_META_BUCKET,
+        EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
+        EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
+    };
+
+    #[cfg(test)]
+    pub(crate) use super::{EcstoreDiskOption, ecstore_new_disk};
+}
+
+pub(crate) mod storage {
+    pub(crate) use super::{
+        BucketInfo, BucketOperations, DiskSetSelector, HealOperations, ListOperations, ObjectIO, ObjectOperations,
+        StorageAdminApi,
+    };
+}
+
+#[cfg(test)]
+pub(crate) mod status {
+    pub(crate) use super::BucketInfo;
+}

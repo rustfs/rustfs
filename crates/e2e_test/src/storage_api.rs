@@ -19,3 +19,19 @@ pub(crate) use rustfs_ecstore::api::disk::{VolumeInfo, WalkDirOptions};
 pub(crate) use rustfs_ecstore::api::rpc::{TonicInterceptor, node_service_time_out_client_no_auth};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::rpc::{gen_tonic_signature_interceptor, node_service_time_out_client};
+
+#[cfg(test)]
+pub(crate) mod node_interact {
+    pub(crate) use super::{
+        TonicInterceptor, VolumeInfo, WalkDirOptions, gen_tonic_signature_interceptor, node_service_time_out_client,
+    };
+}
+
+pub(crate) mod grpc_lock {
+    pub(crate) use super::{TonicInterceptor, node_service_time_out_client_no_auth};
+}
+
+#[cfg(test)]
+pub(crate) mod replication_extension {
+    pub(crate) use super::BucketTargetSys;
+}
