@@ -1943,7 +1943,10 @@ async fn send_peer_admin_request_with_retry_event<T: Serialize>(
     body: &T,
 ) -> S3Result<Vec<u8>> {
     match send_peer_admin_request(&peer.endpoint, path, access_key, secret_key, body).await {
-        Ok(body) => Ok(body),
+        Ok(body) => {
+            dequeue_site_replication_retry_event(&peer.deployment_id, path).await;
+            Ok(body)
+        }
         Err(err) => {
             enqueue_site_replication_retry_event(peer, path, &err).await;
             Err(err)
@@ -3243,6 +3246,36 @@ async fn enqueue_site_replication_retry_event(peer: &PeerInfo, path: &str, error
             path,
             error = ?err,
             "failed to persist site replication retry event"
+        );
+    }
+}
+
+/// Remove a retry event for (peer_deployment_id, path) from the queue on
+/// successful delivery.  This is a no-op (load + no-op persist skipped) when
+/// no matching entry exists, avoiding unnecessary I/O on the common path.
+async fn dequeue_site_replication_retry_event(peer_deployment_id: &str, path: &str) {
+    let result = async {
+        let mut state = load_site_replication_state().await?;
+        let before = state.retry_queue.len();
+        state
+            .retry_queue
+            .retain(|event| !(event.peer_deployment_id == peer_deployment_id && event.path == path));
+        if state.retry_queue.len() < before {
+            persist_site_replication_state(&state).await?;
+        }
+        Ok::<_, S3Error>(())
+    }
+    .await;
+
+    if let Err(err) = result {
+        warn!(
+            component = LOG_COMPONENT_ADMIN,
+            subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+            event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+            peer = peer_deployment_id,
+            path,
+            error = ?err,
+            "failed to dequeue site replication retry event"
         );
     }
 }
@@ -5346,8 +5379,40 @@ impl Operation for SRPeerRemoveHandler {
         validate_site_replication_admin_request(&req, AdminAction::SiteReplicationRemoveAction).await?;
         let remove_req: SRRemoveReq = read_site_replication_json(req, "", false).await?;
         let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
-        let state = remove_sites(load_site_replication_state().await?, remove_req);
+        let current_state = load_site_replication_state().await?;
+
+        // Compute the set of deployment IDs that are about to be removed so we
+        // can prune bucket targets and replication rules pointing at those peers.
+        let removed_deployment_ids: HashSet<String> =
+            if remove_req.remove_all || remove_req.site_names.contains(&current_state.name) {
+                current_state.peers.keys().cloned().collect()
+            } else {
+                let names: HashSet<&str> = remove_req.site_names.iter().map(|s| s.as_str()).collect();
+                current_state
+                    .peers
+                    .values()
+                    .filter(|peer| names.contains(peer.name.as_str()))
+                    .map(|peer| peer.deployment_id.clone())
+                    .collect()
+            };
+
+        let state = remove_sites(current_state, remove_req);
         persist_site_replication_state(&state).await?;
+
+        // Clean up bucket targets and replication rules that referenced removed peers.
+        if !removed_deployment_ids.is_empty() {
+            if let Err(err) = cleanup_removed_site_replication_buckets(&removed_deployment_ids).await {
+                warn!(
+                    event = EVENT_ADMIN_SITE_REPLICATION_STATE,
+                    component = LOG_COMPONENT_ADMIN,
+                    subsystem = LOG_SUBSYSTEM_SITE_REPLICATION,
+                    result = "peer_remove_bucket_cleanup_failed",
+                    error = ?err,
+                    "admin site replication state"
+                );
+            }
+        }
+
         Ok(empty_response(StatusCode::OK))
     }
 }
@@ -5478,7 +5543,12 @@ impl Operation for SiteReplicationRepairHandler {
         if repair_errors.is_empty() {
             let _state_guard = SITE_REPLICATION_STATE_LOCK.lock().await;
             let mut latest = load_site_replication_state().await?;
-            latest.retry_queue.clear();
+            // Only clear retry events whose operations are replayed by bootstrap.
+            // Retain destructive operations (e.g. delete-bucket) that bootstrap
+            // does not replay, so they are not silently lost.
+            latest
+                .retry_queue
+                .retain(|e| e.path.contains("operation=delete-bucket") || e.path.contains("operation=force-delete-bucket"));
             persist_site_replication_state(&latest).await?;
         }
 
