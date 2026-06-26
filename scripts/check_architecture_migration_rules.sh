@@ -130,6 +130,7 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
+ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -2774,6 +2775,19 @@ fi
 
 if [[ -s "$STORE_API_MODULE_PATH_HITS_FILE" ]]; then
   report_failure "legacy ECStore store_api module files must not be restored: $(paste -sd '; ' "$STORE_API_MODULE_PATH_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/store.rs ]] && printf '%s\n' 'crates/ecstore/src/store.rs'
+    [[ -e crates/ecstore/src/set_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/set_disk.rs'
+    true
+  }
+) >"$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore store and set_disk owners must stay in directory modules: $(paste -sd '; ' "$ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'
