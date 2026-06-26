@@ -759,6 +759,40 @@ pub fn record_get_object_shard_read_cost_summary(
     .increment(1);
 }
 
+/// Record opt-in GetObject shard-locality policy effects.
+#[inline(always)]
+pub fn record_get_object_shard_locality_policy(
+    path: &'static str,
+    local_preferred: usize,
+    remote_avoided: usize,
+    fallback_to_remote: usize,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    if local_preferred > 0 {
+        counter!("rustfs_io_get_object_shard_local_preferred_total", "path" => path)
+            .increment(u64::try_from(local_preferred).unwrap_or(u64::MAX));
+    }
+    if remote_avoided > 0 {
+        counter!("rustfs_io_get_object_shard_remote_avoided_total", "path" => path)
+            .increment(u64::try_from(remote_avoided).unwrap_or(u64::MAX));
+    }
+    if fallback_to_remote > 0 {
+        counter!("rustfs_io_get_object_shard_fallback_to_remote_total", "path" => path)
+            .increment(u64::try_from(fallback_to_remote).unwrap_or(u64::MAX));
+    }
+}
+
+/// Record that the opt-in shard-locality policy stayed disabled for a stripe.
+#[inline(always)]
+pub fn record_get_object_shard_locality_policy_disabled(path: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_shard_locality_policy_disabled_total", "path" => path).increment(1);
+}
+
 /// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
 #[inline(always)]
 pub fn record_get_object_shard_read_fanout(
