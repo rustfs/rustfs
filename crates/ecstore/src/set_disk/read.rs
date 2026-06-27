@@ -22,7 +22,8 @@ use crate::diagnostics::get::{
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::create_deferred_bitrot_reader;
@@ -2281,7 +2282,8 @@ impl SetDisks {
         let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
         let till_offset = erasure.shard_file_offset(0, part_length, part_size);
 
-        let reader_setup_stage_start = Instant::now();
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = disks
             .iter()
             .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
@@ -2304,11 +2306,7 @@ impl SetDisks {
         )
         .await;
         let metrics_path = get_codec_streaming_metrics_path();
-        rustfs_io_metrics::record_get_object_stage_duration(
-            metrics_path,
-            GET_STAGE_READER_SETUP,
-            reader_setup_stage_start.elapsed().as_secs_f64(),
-        );
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
         if available_shards < erasure.data_shards {
