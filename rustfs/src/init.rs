@@ -12,8 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::{current_notify_interface, current_region};
+use crate::runtime_sources::current_region;
 use crate::server::ShutdownHandle;
+use crate::server::runtime_sources::current_notify_interface;
 use crate::storage_api::startup::init::{
     get_bucket_notification_config, process_lambda_configurations, process_queue_configurations, process_topic_configurations,
 };

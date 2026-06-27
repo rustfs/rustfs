@@ -110,6 +110,15 @@ pub(crate) type TierConfig = ecstore_tier::tier_config::TierConfig;
 pub(crate) type TierCreds = ecstore_tier::tier_admin::TierCreds;
 pub(crate) type TierType = ecstore_tier::tier_config::TierType;
 
+pub(crate) mod runtime_sources {
+    pub(crate) type DailyAllTierStats = super::DailyAllTierStats;
+    pub(crate) type ECStore = super::ECStore;
+    pub(crate) type NotificationSys = super::NotificationSys;
+    pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
+    pub(crate) type StorageClassConfig = crate::storage::storage_api::ecstore_config::storageclass::Config;
+    pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
+}
+
 #[cfg(test)]
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
 #[cfg(test)]

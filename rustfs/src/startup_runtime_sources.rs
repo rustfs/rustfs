@@ -91,7 +91,9 @@ pub(crate) fn init_tls_metrics() {
 }
 
 pub(crate) fn current_outbound_tls_generation() -> u64 {
-    runtime_current_outbound_tls_generation().0
+    runtime_current_outbound_tls_generation()
+        .map(|generation| generation.0)
+        .unwrap_or_default()
 }
 
 pub(crate) async fn publish_outbound_tls_state(generation: TlsGeneration, outbound: &OutboundTlsMaterial) {

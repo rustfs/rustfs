@@ -28,7 +28,7 @@ pub(crate) fn current_server_config() -> Option<rustfs_config::server_config::Co
 }
 
 pub(crate) fn current_notify_interface() -> Arc<dyn NotifyInterface> {
-    crate::runtime_sources::current_notify_interface()
+    crate::runtime_sources::current_notify_interface().unwrap_or_else(crate::runtime_sources::fallback_notify_interface)
 }
 
 pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
