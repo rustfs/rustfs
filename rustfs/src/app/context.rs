@@ -136,14 +136,12 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc
 
 /// Resolve notification system handle using AppContext-first precedence.
 pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
-    resolve_notification_system_with(get_global_app_context(), || default_notification_system_interface().handle())
+    resolve_notification_system_with(get_global_app_context(), || None)
 }
 
-/// Resolve notification system handle using an explicit AppContext, falling back to the legacy global notification system.
+/// Resolve notification system handle using an explicit AppContext.
 pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<&'static NotificationSys> {
-    context
-        .and_then(|context| context.notification_system().handle())
-        .or_else(|| default_notification_system_interface().handle())
+    context.and_then(|context| context.notification_system().handle())
 }
 
 /// Resolve endpoints using AppContext-first precedence.
@@ -250,12 +248,12 @@ pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
-    resolve_server_config_with(get_global_app_context(), || default_server_config_interface().get())
+    resolve_server_config_with(get_global_app_context(), || None)
 }
 
-/// Resolve server config using an explicit AppContext, falling back to the legacy global server config.
+/// Resolve server config using an explicit AppContext.
 pub fn resolve_server_config_for_context(context: Option<&AppContext>) -> Option<Config> {
-    context.map_or_else(|| default_server_config_interface().get(), |context| context.server_config().get())
+    context.and_then(|context| context.server_config().get())
 }
 
 /// Publish server config using AppContext-first precedence.
@@ -374,11 +372,9 @@ fn resolve_bucket_metadata_handle_with(
 
 fn resolve_notification_system_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<&'static NotificationSys>,
+    _fallback: impl FnOnce() -> Option<&'static NotificationSys>,
 ) -> Option<&'static NotificationSys> {
-    context
-        .and_then(|context| context.notification_system().handle())
-        .or_else(fallback)
+    context.and_then(|context| context.notification_system().handle())
 }
 
 fn resolve_bucket_monitor_handle_with(
@@ -543,8 +539,8 @@ fn resolve_expiry_state_handle_with(
         .unwrap_or_else(fallback)
 }
 
-fn resolve_server_config_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<Config>) -> Option<Config> {
-    context.map_or_else(fallback, |context| context.server_config().get())
+fn resolve_server_config_with(context: Option<Arc<AppContext>>, _fallback: impl FnOnce() -> Option<Config>) -> Option<Config> {
+    context.and_then(|context| context.server_config().get())
 }
 
 fn publish_server_config_with(context: Option<Arc<AppContext>>, config: Config, fallback: impl FnOnce(Config)) {
@@ -1390,10 +1386,7 @@ mod tests {
             &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
             &fallback_expiry_state
         ));
-        assert_eq!(
-            resolve_server_config_with(None, || Some(server_config.clone())).expect("fallback server config"),
-            server_config
-        );
+        assert!(resolve_server_config_with(None, || Some(server_config.clone())).is_none());
         publish_server_config_with(None, Config::new(), |config| {
             drop(config);
             fallback_server_config_published.fetch_add(1, Ordering::SeqCst);

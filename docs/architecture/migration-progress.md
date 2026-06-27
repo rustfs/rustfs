@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-object-store-fallback-removal`
+- Branch: `overtrue/arch-runtime-notification-config-fallback-removal`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -19,18 +19,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   GLOB-007 app runtime facade consumer batch from PR #3947, the pending
   GLOB-007 core runtime facade consumer batch from PR #3948, and the
   GLOB-007 runtime facade alias sweep merged into that base branch from
-  PR #3949.
-- Current phase PR: GLOB-007 object-store fallback removal.
-- Based on: `overtrue/arch-global-core-runtime-consumer-batch` while PR #3948
-  is pending.
+  PR #3949, and the GLOB-007 object-store fallback removal from PR #3950,
+  which is merged into that pending base branch.
+- Current phase PR: GLOB-007 notification-system/server-config fallback removal.
+- Based on: `overtrue/arch-global-core-runtime-consumer-batch` after PR #3950
+  was merged into that branch while PR #3948 is pending.
 - PR type for this branch: `ci-gate`.
-- Runtime behavior changes: object-store access now requires AppContext instead
-  of falling back to the legacy global object layer.
-- Rust code changes: remove the legacy global object-store fallback from the
-  AppContext object-store resolver family.
+- Runtime behavior changes: notification-system and server-config read paths
+  now require AppContext instead of falling back to legacy globals; server-config
+  publish keeps the no-context startup write path.
+- Rust code changes: remove the legacy global notification-system and
+  server-config read fallbacks from the AppContext resolver family.
 - CI/script changes: none intended.
-- Docs changes: update this progress ledger for the object-store fallback
-  removal.
+- Docs changes: update this progress ledger for the notification-system and
+  server-config fallback removal.
 
 ## Phase 0 Tasks
 
@@ -2811,6 +2813,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Current slice: remove the legacy global object-store fallback from the
     AppContext object-store resolver family after production consumers were
     routed through current runtime facade helpers.
+  - Current slice: remove the legacy global notification-system and
+    server-config read fallbacks from the AppContext resolver family while
+    preserving the server-config publish path used during startup.
   - Remaining work: remove the next fallback family per PR only after scans
     prove no production caller depends on it.
   - Verification: focused RustFS compile and admin test-target compile,
@@ -6079,6 +6084,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | GLOB-007 removes the notification-system and server-config resolver read fallbacks, keeping no-context reads from consulting legacy globals while preserving explicit AppContext interfaces. |
+| Migration preservation | pass | Server-config publishing keeps the no-context startup write path; notification-system and server-config consumers already route through current runtime facades, so initialized AppContext behavior remains unchanged. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, notification/server-config fallback residual scan, diff hygiene, diff-added Rust risk scan, and full `make pre-pr` passed before PR. |
 | Quality/architecture | pass | GLOB-007 removes the object-store resolver family's legacy global fallback and keeps object-store access behind AppContext-backed current runtime facades. |
 | Migration preservation | pass | All production object-store consumers resolve through admin, app, server, storage, or root current-runtime helpers; absent AppContext now returns `None` instead of consulting the legacy object layer. |
 | Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, object-store fallback residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
@@ -6459,6 +6467,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 GLOB-007 notification-system/server-config fallback removal:
+  - Branch freshness check: prepared from
+    `overtrue/arch-runtime-object-store-fallback-removal`, then based on
+    `origin/overtrue/arch-global-core-runtime-consumer-batch` after PR #3950
+    merged into that pending base branch.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Notification/server-config fallback residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests
+    passed).
 
 - Issue #660 GLOB-007 object-store fallback removal:
   - Branch freshness check: rebased onto
