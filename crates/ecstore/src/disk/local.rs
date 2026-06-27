@@ -5011,7 +5011,16 @@ mod test {
     #[test]
     fn should_reclaim_file_cache_after_read_respects_env_and_threshold() {
         temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, || {
-            assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+            temp_env::with_var_unset(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, || {
+                assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+                assert!(!should_reclaim_file_cache_after_read(1024));
+            });
+        });
+
+        temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("false"), || {
+            temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_THRESHOLD, Some("4194304"), || {
+                assert!(!should_reclaim_file_cache_after_read(8 * 1024 * 1024));
+            });
         });
 
         temp_env::with_var(rustfs_config::ENV_OBJECT_FILE_CACHE_RECLAIM_READ_ENABLE, Some("true"), || {
