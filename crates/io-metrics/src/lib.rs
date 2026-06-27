@@ -715,6 +715,15 @@ pub fn record_get_object_fill_queued(path: &'static str, policy: &'static str, q
     histogram!("rustfs_io_get_object_fill_queued", "path" => path, "policy" => policy).record(usize_to_f64(queued));
 }
 
+/// Record that a background fill task was started for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_fill_started(path: &'static str, policy: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_started_total", "path" => path, "policy" => policy).increment(1);
+}
+
 /// Record that a fill completed while the current output buffer still had unread bytes.
 #[inline(always)]
 pub fn record_get_object_fill_completed_before_output_drained(path: &'static str, policy: &'static str) {
@@ -1696,6 +1705,7 @@ mod tests {
     #[test]
     fn test_record_get_object_fill_metrics() {
         record_get_object_fill_queued("codec_streaming", "single_inflight", 1);
+        record_get_object_fill_started("codec_streaming", "single_inflight");
         record_get_object_fill_completed_before_output_drained("codec_streaming", "single_inflight");
         record_get_object_fill_waited_by_output("codec_streaming", "single_inflight", 0.0003);
         record_get_object_fill_cancelled_on_drop("codec_streaming", "single_inflight");

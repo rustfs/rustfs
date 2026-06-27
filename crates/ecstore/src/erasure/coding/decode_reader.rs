@@ -215,6 +215,7 @@ where
             let fill_policy = self.fill_policy;
             let remaining = self.remaining;
             let mut reusable_buffers = std::mem::take(&mut self.reusable_output_bufs);
+            rustfs_io_metrics::record_get_object_fill_started(metrics_path, fill_policy.as_str());
             self.fill = Some(tokio::spawn(async move {
                 let mut queued_buffers = VecDeque::new();
                 let mut deferred_error = None;
