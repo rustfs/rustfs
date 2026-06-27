@@ -339,6 +339,71 @@ pub fn record_get_object_response_handoff(
     record_get_object_response_handoff_duration("s3_handler", duration_secs);
 }
 
+/// Record ReaderStream capacity chosen for GetObject handoff.
+#[inline(always)]
+pub fn record_get_object_reader_stream_buffer_size(strategy: &str, buffer_source: &str, buffer_size_bytes: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_reader_stream_buffer_size_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string()
+    )
+    .record(usize_to_f64(buffer_size_bytes));
+}
+
+/// Record ReaderStream poll outcomes for GetObject handoff attribution.
+#[inline(always)]
+pub fn record_get_object_reader_stream_poll(
+    strategy: &str,
+    buffer_source: &str,
+    outcome: &'static str,
+    remaining_before: usize,
+    bytes: usize,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!(
+        "rustfs_io_get_object_reader_stream_poll_total",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string(),
+        "outcome" => outcome
+    )
+    .increment(1);
+    counter!(
+        "rustfs_io_get_object_reader_stream_poll_bytes_total",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string(),
+        "outcome" => outcome
+    )
+    .increment(bytes);
+    histogram!(
+        "rustfs_io_get_object_reader_stream_poll_remaining_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string(),
+        "outcome" => outcome
+    )
+    .record(usize_to_f64(remaining_before));
+    histogram!(
+        "rustfs_io_get_object_reader_stream_poll_bytes",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string(),
+        "outcome" => outcome
+    )
+    .record(usize_to_f64(bytes as usize));
+    histogram!(
+        "rustfs_io_get_object_reader_stream_poll_duration_seconds",
+        "strategy" => strategy.to_string(),
+        "buffer_source" => buffer_source.to_string(),
+        "outcome" => outcome
+    )
+    .record(duration_secs);
+}
+
 /// Record I/O queue congestion observation.
 #[inline(always)]
 pub fn record_io_queue_congestion() {
@@ -1548,6 +1613,8 @@ mod tests {
         record_get_object_fill_waited_by_output("codec_streaming", "single_inflight", 0.0003);
         record_get_object_fill_cancelled_on_drop("codec_streaming", "single_inflight");
         record_get_object_reader_prefetch_bytes("codec_streaming", "single_inflight", 4096);
+        record_get_object_reader_stream_buffer_size("standard", "selected", 131072);
+        record_get_object_reader_stream_poll("standard", "selected", "ready_data", 8192, 4096, 0.0002);
 
         assert!(0.0003_f64.is_sign_positive());
     }

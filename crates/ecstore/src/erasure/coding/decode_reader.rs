@@ -405,6 +405,8 @@ where
     E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
 {
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        let filled_before_poll = buf.filled().len();
+
         loop {
             if self.output_pos < self.output_buf.len() {
                 if self.prefetched_bufs.len() < self.fill_policy.max_inflight()
@@ -431,7 +433,10 @@ where
                         copy_start.elapsed().as_secs_f64(),
                     );
                 }
-                return Poll::Ready(Ok(()));
+                if buf.remaining() == 0 {
+                    return Poll::Ready(Ok(()));
+                }
+                continue;
             }
 
             if let Some(next_buf) = self.prefetched_bufs.pop_front() {
@@ -441,6 +446,9 @@ where
                 continue;
             }
 
+            if self.prefetch_error.is_some() && buf.filled().len() > filled_before_poll {
+                return Poll::Ready(Ok(()));
+            }
             if let Some(err) = self.prefetch_error.take() {
                 return Poll::Ready(Err(err));
             }
@@ -452,7 +460,11 @@ where
             if self.output_wait_started_at.is_none() {
                 self.output_wait_started_at = Some(Instant::now());
             }
-            let prefetch = ready!(self.poll_prefetch(cx));
+            let prefetch = match self.poll_prefetch(cx) {
+                Poll::Ready(result) => result,
+                Poll::Pending if buf.filled().len() > filled_before_poll => return Poll::Ready(Ok(())),
+                Poll::Pending => return Poll::Pending,
+            };
             if let Some(started_at) = self.output_wait_started_at.take() {
                 rustfs_io_metrics::record_get_object_fill_waited_by_output(
                     self.metrics_path,
