@@ -26,7 +26,7 @@ use crate::admin::storage_api::bucket::{
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
 use crate::admin::storage_api::error::StorageError;
 use crate::{
-    admin::runtime_sources::resolve_object_store_handle,
+    admin::runtime_sources::current_object_store_handle,
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
@@ -131,7 +131,7 @@ impl Operation for ExportBucketMetadata {
         )
         .await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -517,7 +517,7 @@ impl Operation for ImportBucketMetadata {
             };
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 

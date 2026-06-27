@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 pub(crate) use crate::app::admin_usecase::{
     AdminPoolStatus, DefaultAdminUsecase, QueryPoolStatusRequest, QueryServerInfoRequest,
 };
@@ -19,13 +20,13 @@ use crate::app::object_usecase::DefaultObjectUsecase;
 pub(crate) use crate::runtime_sources::{
     AppContext, publish_server_config, publish_storage_class_config, resolve_action_credentials, resolve_boot_time,
     resolve_bucket_metadata_handle, resolve_bucket_monitor_handle, resolve_daily_tier_stats, resolve_deployment_id,
-    resolve_endpoints_handle, resolve_iam_handle, resolve_kms_runtime_service_manager, resolve_notification_system,
-    resolve_notification_system_for_context, resolve_object_store_handle, resolve_object_store_handle_for_context,
-    resolve_oidc_handle, resolve_or_init_kms_runtime_service_manager, resolve_outbound_tls_generation,
-    resolve_outbound_tls_state, resolve_ready_iam_handle, resolve_region, resolve_replication_pool_handle,
-    resolve_replication_stats_handle, resolve_runtime_port, resolve_scanner_metrics_report, resolve_server_config,
+    resolve_endpoints_handle, resolve_iam_handle, resolve_kms_runtime_service_manager, resolve_notification_system_for_context,
+    resolve_object_store_handle_for_context, resolve_oidc_handle, resolve_or_init_kms_runtime_service_manager,
+    resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_ready_iam_handle, resolve_region,
+    resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_runtime_port, resolve_scanner_metrics_report,
     resolve_server_config_for_context, resolve_tier_config_handle, resolve_token_signing_key,
 };
+use rustfs_config::server_config::Config;
 use std::sync::Arc;
 
 #[cfg(test)]
@@ -41,4 +42,19 @@ pub(crate) fn default_object_usecase() -> DefaultObjectUsecase {
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     crate::runtime_sources::current_app_context()
+}
+
+pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
+    let context = current_app_context();
+    resolve_object_store_handle_for_context(context.as_deref())
+}
+
+pub(crate) fn current_notification_system() -> Option<&'static NotificationSys> {
+    let context = current_app_context();
+    resolve_notification_system_for_context(context.as_deref())
+}
+
+pub(crate) fn current_server_config() -> Option<Config> {
+    let context = current_app_context();
+    resolve_server_config_for_context(context.as_deref())
 }

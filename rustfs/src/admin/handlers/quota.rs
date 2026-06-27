@@ -16,7 +16,7 @@
 
 use crate::admin::auth::{validate_admin_request, validate_admin_request_with_bucket};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{resolve_bucket_metadata_handle, resolve_object_store_handle};
+use crate::admin::runtime_sources::{current_object_store_handle, resolve_bucket_metadata_handle};
 use crate::admin::storage_api::bucket::metadata_sys::BucketMetadataSys;
 use crate::admin::storage_api::bucket::quota::checker::QuotaChecker;
 use crate::admin::storage_api::bucket::quota::{BucketQuota, QuotaError, QuotaOperation};
@@ -171,7 +171,7 @@ fn bucket_metadata_from_context() -> Option<Arc<RwLock<BucketMetadataSys>>> {
 }
 
 async fn current_usage_from_context(bucket: &str) -> u64 {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = current_object_store_handle() else {
         return 0;
     };
 

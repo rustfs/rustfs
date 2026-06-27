@@ -14,7 +14,7 @@
 
 use crate::admin::auth::{authenticate_request, validate_admin_request};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::resolve_object_store_handle;
+use crate::admin::runtime_sources::current_object_store_handle;
 use crate::admin::storage_api::access::spawn_traced;
 use crate::admin::storage_api::bucket::is_reserved_or_invalid_bucket;
 use crate::admin::storage_api::bucket::utils::is_valid_object_prefix;
@@ -500,7 +500,7 @@ impl Operation for HealHandler {
         // The heal channel currently models bucket/object work. Root heal reuses the
         // existing format-heal path directly so `/v3/heal/` is accepted intentionally.
         if should_handle_root_heal_directly(&hip) {
-            let Some(store) = resolve_object_store_handle() else {
+            let Some(store) = current_object_store_handle() else {
                 warn!(
                     event = EVENT_ADMIN_REQUEST_FAILED,
                     component = LOG_COMPONENT_ADMIN_API,
@@ -736,7 +736,7 @@ impl Operation for BackgroundHealStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         validate_heal_admin_request(&req).await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             warn!(
                 event = EVENT_ADMIN_REQUEST_FAILED,
                 component = LOG_COMPONENT_ADMIN_API,

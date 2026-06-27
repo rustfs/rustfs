@@ -21,7 +21,7 @@ use crate::admin::storage_api::rebalance::{
 };
 use crate::admin::storage_api::runtime::{ECStore, NotificationSys};
 use crate::{
-    admin::runtime_sources::{resolve_notification_system, resolve_object_store_handle},
+    admin::runtime_sources::{current_notification_system, current_object_store_handle},
     admin::{
         auth::validate_admin_request,
         router::{AdminOperation, Operation, S3Router},
@@ -446,7 +446,7 @@ impl Operation for RebalanceStart {
             return Err(s3_error!(InvalidArgument, "rebalance start does not accept query parameters"));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -499,7 +499,7 @@ impl Operation for RebalanceStart {
             rebalance_id = %id,
             "admin rebalance state"
         );
-        if let Some(notification_sys) = resolve_notification_system() {
+        if let Some(notification_sys) = current_notification_system() {
             info!(
                 event = EVENT_ADMIN_REBALANCE_STATE,
                 component = LOG_COMPONENT_ADMIN,
@@ -630,7 +630,7 @@ impl Operation for RebalanceStatus {
         )
         .await?;
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -735,7 +735,7 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(InvalidArgument, "rebalance stop does not accept query parameters"));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object layer is not initialized"));
         };
 
@@ -750,7 +750,7 @@ impl Operation for RebalanceStop {
             return Err(s3_error!(NoSuchResource, "pool rebalance is not started"));
         }
 
-        let notification_sys = resolve_notification_system();
+        let notification_sys = current_notification_system();
         let stop_attempt_at = OffsetDateTime::now_utc();
         let mut stop_failures = Vec::new();
         if let Some(notification_sys) = notification_sys {
