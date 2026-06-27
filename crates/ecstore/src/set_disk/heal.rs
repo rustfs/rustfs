@@ -129,14 +129,14 @@ impl SetDisks {
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
                             // Initialize erasure coding; use legacy mode for old-version files
-                            erasure_coding::Erasure::new_with_options(
+                            crate::erasure::coding::Erasure::new_with_options(
                                 latest_meta.erasure.data_blocks,
                                 latest_meta.erasure.parity_blocks,
                                 latest_meta.erasure.block_size,
                                 latest_meta.uses_legacy_checksum,
                             )
                         } else {
-                            erasure_coding::Erasure::default()
+                            crate::erasure::coding::Erasure::default()
                         };
 
                         result.object_size =

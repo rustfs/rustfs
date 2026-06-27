@@ -27,18 +27,18 @@ use crate::bucket::{
 use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
 use crate::config::com::{CONFIG_PREFIX, read_config, read_config_no_lock, save_config, save_config_with_opts};
 use crate::data_movement;
-use crate::data_movement_backpressure::{self, DataMovementOperation};
+use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::error::DiskError;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::endpoints::EndpointServerPools;
 use crate::error::{Error, Result};
 use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
+use crate::layout::endpoints::EndpointServerPools;
 use crate::object_api::{GetObjectReader, ObjectOptions};
-use crate::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
+use crate::services::rebalance::{REBAL_META_NAME, RebalanceMeta, is_rebalance_conflicting_with_decommission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,
@@ -47,7 +47,7 @@ use crate::storage_api_contracts::{
     namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
-use crate::{sets::Sets, store::ECStore};
+use crate::{core::sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
 use futures::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use http::HeaderMap;
@@ -3123,12 +3123,9 @@ impl ECStore {
                             return;
                         }
 
-                        if let Err(err) = data_movement_backpressure::wait_for_data_movement_admission(
-                            DataMovementOperation::Decommission,
-                            idx,
-                            &callback_rx,
-                        )
-                        .await
+                        if let Err(err) =
+                            backpressure::wait_for_data_movement_admission(DataMovementOperation::Decommission, idx, &callback_rx)
+                                .await
                         {
                             if matches!(err, Error::OperationCanceled) {
                                 return;
@@ -4926,9 +4923,9 @@ mod pools_tests {
     };
     use crate::data_movement;
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::Error;
-    use crate::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+    use crate::services::rebalance::{RebalStatus, RebalanceInfo, RebalanceMeta, RebalanceStats};
     use rustfs_filemeta::{FileInfo, FileInfoVersions, MetaCacheEntry, ObjectPartInfo};
     use rustfs_rio::Index;
     use std::sync::{

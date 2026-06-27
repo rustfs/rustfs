@@ -14,7 +14,7 @@
 
 #[cfg(test)]
 mod capacity_dedup_tests {
-    use crate::pools::{
+    use crate::core::pools::{
         fallback_free_capacity_dedup, fallback_total_capacity_dedup, get_total_usable_capacity, get_total_usable_capacity_free,
     };
 

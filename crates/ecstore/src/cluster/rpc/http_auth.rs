@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
+use crate::cluster::rpc::context_propagation::{inject_request_id_into_http_headers, inject_trace_context_into_http_headers};
 use base64::Engine as _;
 use base64::engine::general_purpose;
 use hmac::{Hmac, KeyInit, Mac};
@@ -163,8 +163,8 @@ pub fn verify_rpc_signature(url: &str, method: &Method, headers: &HeaderMap) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::rpc::context_propagation::REQUEST_ID_HEADER;
-    use crate::runtime_sources;
+    use crate::cluster::rpc::context_propagation::REQUEST_ID_HEADER;
+    use crate::runtime::sources as runtime_sources;
     use http::{HeaderMap, Method};
     use std::io::{self, Write};
     use std::sync::{Arc, Mutex};

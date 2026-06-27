@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::erasure_codec::workspace::RustfsCodecDecodeWorkspace;
-use crate::erasure_coding::Erasure;
+use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
+use crate::erasure::coding::Erasure;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::io;
 

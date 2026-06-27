@@ -25,10 +25,10 @@ use crate::client::{
     admin_handler_utils::AdminError,
     api_put_object::PutObjectOptions,
     credentials::{Credentials, SignatureType, Static, Value},
-    transition_api::{BucketLookupType, Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
+    transition_api::{Options, ReadCloser, ReaderImpl, TransitionClient, TransitionCore},
 };
-use crate::tier::{
-    tier_config::TierHuaweicloud,
+use crate::services::tier::{
+    tier_config::TierMinIO,
     warm_backend::{WarmBackend, WarmBackendGetOpts, build_transition_put_options},
     warm_backend_s3::WarmBackendS3,
 };
@@ -39,10 +39,10 @@ const MAX_PARTS_COUNT: i64 = 10000;
 const _MAX_PART_SIZE: i64 = 1024 * 1024 * 1024 * 5;
 const MIN_PART_SIZE: i64 = 1024 * 1024 * 128;
 
-pub struct WarmBackendHuaweicloud(WarmBackendS3);
+pub struct WarmBackendMinIO(WarmBackendS3);
 
-impl WarmBackendHuaweicloud {
-    pub async fn new(conf: &TierHuaweicloud, tier: &str) -> Result<Self, std::io::Error> {
+impl WarmBackendMinIO {
+    pub async fn new(conf: &TierMinIO, tier: &str) -> Result<Self, std::io::Error> {
         if conf.access_key == "" || conf.secret_key == "" {
             return Err(std::io::Error::other("both access and secret keys are required"));
         }
@@ -71,7 +71,6 @@ impl WarmBackendHuaweicloud {
             //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
             region: conf.region.clone(),
-            bucket_lookup: BucketLookupType::BucketLookupDNS,
             ..Default::default()
         };
         let scheme = u.scheme();
@@ -79,8 +78,7 @@ impl WarmBackendHuaweicloud {
         let host = u
             .host_str()
             .ok_or_else(|| std::io::Error::other("Invalid endpoint URL: missing host"))?;
-        let client =
-            TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, "huaweicloud").await?;
+        let client = TransitionClient::new(&format!("{}:{}", host, u.port().unwrap_or(default_port)), opts, "minio").await?;
 
         let client = Arc::new(client);
         let core = TransitionCore(Arc::clone(&client));
@@ -95,7 +93,7 @@ impl WarmBackendHuaweicloud {
 }
 
 #[async_trait::async_trait]
-impl WarmBackend for WarmBackendHuaweicloud {
+impl WarmBackend for WarmBackendMinIO {
     async fn put_with_meta(
         &self,
         object: &str,

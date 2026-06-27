@@ -16,10 +16,10 @@ use crate::bucket::bandwidth::monitor::Monitor;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::LifecycleSys,
     disk::DiskStore,
-    endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
-    event_notification::EventNotifier,
+    layout::endpoints::{EndpointServerPools, PoolEndpoints, SetupType},
+    services::event_notification::EventNotifier,
+    services::tier::tier::TierConfigMgr,
     store::ECStore,
-    tier::tier::TierConfigMgr,
 };
 use lazy_static::lazy_static;
 use rustfs_lock::client::LockClient;

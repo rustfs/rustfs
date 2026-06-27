@@ -29,11 +29,11 @@ use super::{
     EVENT_REBALANCE_BUCKET, EVENT_REBALANCE_ENTRY, EVENT_REBALANCE_STATE, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REBALANCE,
     REBALANCE_DEFERRED_ENTRY_ERROR_PREFIX, RebalanceBucketConfigs, RebalanceBucketOutcome, RebalanceEntryOutcome,
 };
+use crate::core::pools::ListCallback;
 use crate::data_movement;
-use crate::data_movement_backpressure::{self, DataMovementOperation};
+use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectOptions};
-use crate::pools::ListCallback;
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::object::ObjectOperations as _;
 use crate::store::ECStore;
@@ -113,7 +113,7 @@ impl ECStore {
         let mut expired: usize = 0;
         let mut stats_updates = Vec::with_capacity(fivs.versions.len());
         for version in fivs.versions.iter() {
-            if crate::pools::should_skip_lifecycle_for_data_movement(
+            if crate::core::pools::should_skip_lifecycle_for_data_movement(
                 self.clone(),
                 &bucket,
                 version,
@@ -401,7 +401,7 @@ impl ECStore {
                             return;
                         }
 
-                        if let Err(err) = data_movement_backpressure::wait_for_data_movement_admission(
+                        if let Err(err) = backpressure::wait_for_data_movement_admission(
                             DataMovementOperation::Rebalance,
                             pool_index,
                             &callback_rx,

@@ -16,9 +16,9 @@ use crate::disk::error::Error;
 use crate::disk::error_reduce::{
     OBJECT_OP_IGNORED_ERRS, WriteQuorumFailureSummary, build_write_quorum_failure_summary, reduce_write_quorum_errs,
 };
-use crate::erasure_coding::BitrotWriterWrapper;
-use crate::erasure_coding::Erasure;
-use crate::runtime_sources;
+use crate::erasure::coding::BitrotWriterWrapper;
+use crate::erasure::coding::Erasure;
+use crate::runtime::sources as runtime_sources;
 use bytes::{Bytes, BytesMut};
 use futures::StreamExt;
 use futures::stream::FuturesUnordered;
@@ -666,7 +666,7 @@ impl Erasure {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::erasure_coding::{BitrotWriterWrapper, CustomWriter};
+    use crate::erasure::coding::{BitrotWriterWrapper, CustomWriter};
     use rustfs_rio::HardLimitReader;
     use rustfs_utils::HashAlgorithm;
     use std::io::Cursor;

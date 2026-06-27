@@ -17,7 +17,7 @@ use crate::bucket::{
     metadata::{BUCKET_TABLE_RESERVED_PREFIX, table_bucket_catalog_metadata_prefix},
     utils::is_meta_bucketname,
 };
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 

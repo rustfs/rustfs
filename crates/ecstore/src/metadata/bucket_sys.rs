@@ -19,7 +19,7 @@ use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{BUCKET_LIFECYCLE_CONFIG, load_bucket_metadata_parse};
 use crate::bucket::utils::{deserialize, is_meta_bucketname};
 use crate::error::{Error, Result, is_err_bucket_not_found};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::heal::HealOperations as _;
 use crate::store::ECStore;
 use futures::future::join_all;

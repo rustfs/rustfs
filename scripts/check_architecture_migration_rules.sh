@@ -138,12 +138,16 @@ ECSTORE_ROOT_DATA_MOVEMENT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_data_moveme
 ECSTORE_ROOT_USAGE_DIAGNOSTICS_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_usage_diagnostics_module_hits.txt"
 ECSTORE_ROOT_RUNTIME_GLOBAL_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_runtime_global_module_hits.txt"
 ECSTORE_ROOT_IO_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_io_support_module_hits.txt"
+ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_erasure_module_hits.txt"
 ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_error_rebalance_module_hits.txt"
+ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_service_domain_module_hits.txt"
+ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_service_domain_impl_hits.txt"
 ECSTORE_ROOT_CORE_RUNTIME_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_core_runtime_module_hits.txt"
 ECSTORE_CLUSTER_ROOT_IMPL_HITS_FILE="${TMP_DIR}/ecstore_cluster_root_impl_hits.txt"
 ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_support_module_hits.txt"
 ECSTORE_ROOT_RPC_IMPL_HITS_FILE="${TMP_DIR}/ecstore_root_rpc_impl_hits.txt"
 ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE="${TMP_DIR}/ecstore_old_metadata_owner_path_hits.txt"
+ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE="${TMP_DIR}/ecstore_root_owner_path_shim_hits.txt"
 ALL_STORAGE_COMPAT_SELF_FACADE_PATH_HITS_FILE="${TMP_DIR}/all_storage_compat_self_facade_path_hits.txt"
 RUSTFS_LOCAL_COMPAT_OWNER_SELF_PATH_HITS_FILE="${TMP_DIR}/rustfs_local_compat_owner_self_path_hits.txt"
 RUSTFS_ROOT_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_root_compat_relative_consumer_hits.txt"
@@ -363,42 +367,42 @@ require_source_line \
   "startup IAM shim crate-private module"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
-  "mod disks_layout;" \
-  "ECStore legacy disks-layout compatibility module crate-private visibility"
+  "mod core;" \
+  "ECStore core owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
-  "mod endpoints;" \
-  "ECStore legacy endpoint compatibility module crate-private visibility"
+  "mod data_movement;" \
+  "ECStore data movement owner module crate-private visibility"
+require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "mod erasure;" \
+  "ECStore erasure owner module crate-private visibility"
 require_source_line \
   "crates/ecstore/src/lib.rs" \
   "mod cluster;" \
   "ECStore cluster control-plane owner module crate-private visibility"
 require_source_line \
+  "crates/ecstore/src/lib.rs" \
+  "pub(crate) mod layout;" \
+  "ECStore layout owner module crate-private visibility"
+require_source_line \
   "crates/ecstore/src/api/mod.rs" \
   "pub mod cluster {" \
   "ECStore cluster control-plane public facade"
 for ecstore_private_module in \
-  admin_server_info \
   bucket \
   cache_value \
   client \
-  compress \
   config \
   data_usage \
+  diagnostics \
   disk \
   error \
-  event_notification \
-  global \
-  metrics_realtime \
-  notification_sys \
-  pools \
-  rebalance \
-  rio \
-  rpc \
+  io_support \
+  runtime \
+  services \
   set_disk \
-  store \
-  store_utils \
-  tier; do
+  store; do
   require_source_line \
     "crates/ecstore/src/lib.rs" \
     "mod ${ecstore_private_module};" \
@@ -2915,6 +2919,20 @@ fi
 (
   cd "$ROOT_DIR"
   {
+    [[ -e crates/ecstore/src/erasure_codec ]] && printf '%s\n' 'crates/ecstore/src/erasure_codec'
+    [[ -e crates/ecstore/src/erasure_coding ]] && printf '%s\n' 'crates/ecstore/src/erasure_coding'
+    rg -n --with-filename '^mod erasure_(codec|coding);|#\[path = "erasure_(codec|coding)/' crates/ecstore/src/lib.rs || true
+    true
+  }
+) >"$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore erasure modules must stay under the erasure owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_ERASURE_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
     [[ -e crates/ecstore/src/error.rs ]] && printf '%s\n' 'crates/ecstore/src/error.rs'
     [[ -e crates/ecstore/src/rebalance.rs ]] && printf '%s\n' 'crates/ecstore/src/rebalance.rs'
     true
@@ -2923,6 +2941,28 @@ fi
 
 if [[ -s "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE" ]]; then
   report_failure "ECStore error and rebalance modules must stay under owner directories: $(paste -sd '; ' "$ECSTORE_ROOT_ERROR_REBALANCE_MODULE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    [[ -e crates/ecstore/src/rebalance ]] && printf '%s\n' 'crates/ecstore/src/rebalance'
+    [[ -e crates/ecstore/src/tier ]] && printf '%s\n' 'crates/ecstore/src/tier'
+    rg -n --with-filename '^\s*mod\s+(rebalance|tier);|#\[path = "(rebalance|tier)/' crates/ecstore/src/lib.rs || true
+    true
+  }
+) >"$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE"
+
+if [[ -s "$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE" ]]; then
+  report_failure "ECStore rebalance and tier modules must stay under the services owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_SERVICE_DOMAIN_MODULE_HITS_FILE")"
+fi
+
+rg -n --with-filename 'crate::(rebalance|tier)\b' \
+  "${ROOT_DIR}/crates/ecstore/src" \
+  >"$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE" ]]; then
+  report_failure "ECStore internal rebalance and tier consumers must use the services owner path: $(paste -sd '; ' "$ECSTORE_ROOT_SERVICE_DOMAIN_IMPL_HITS_FILE")"
 fi
 
 (
@@ -2960,20 +3000,22 @@ fi
     [[ -e crates/ecstore/src/rpc/remote_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_disk.rs'
     [[ -e crates/ecstore/src/rpc/remote_locker.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/remote_locker.rs'
     [[ -e crates/ecstore/src/rpc/runtime_sources.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/runtime_sources.rs'
+    [[ -e crates/ecstore/src/rpc/mod.rs ]] && printf '%s\n' 'crates/ecstore/src/rpc/mod.rs'
+    rg -n --with-filename '^\s*mod\s+rpc;' crates/ecstore/src/lib.rs || true
     true
   }
 ) >"$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE"
 
 if [[ -s "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE" ]]; then
-  report_failure "ECStore RPC support modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
+  report_failure "ECStore RPC modules must stay under the cluster/rpc owner directory: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_SUPPORT_MODULE_HITS_FILE")"
 fi
 
-rg -n --with-filename '^(pub(?:\(crate\))? )?(struct|enum|fn|trait) |^mod ' \
-  "${ROOT_DIR}/crates/ecstore/src/rpc/mod.rs" \
+rg -n --with-filename 'crate::rpc\b' \
+  "${ROOT_DIR}/crates/ecstore/src" \
   >"$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" || true
 
 if [[ -s "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE" ]]; then
-  report_failure "ECStore root rpc module must only re-export cluster/rpc owner symbols: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
+  report_failure "ECStore internal RPC consumers must use the cluster/rpc owner path: $(paste -sd '; ' "$ECSTORE_ROOT_RPC_IMPL_HITS_FILE")"
 fi
 
 (
@@ -2989,6 +3031,14 @@ fi
 
 if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
   report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
+fi
+
+rg -n --with-filename '#\[path = "(data_movement|layout|core|store|diagnostics|services|io_support|runtime)/' \
+  "${ROOT_DIR}/crates/ecstore/src/lib.rs" \
+  >"$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" || true
+
+if [[ -s "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE" ]]; then
+  report_failure "ECStore root lib must not restore owner path shims for data_movement/layout/core/store/diagnostics/services/io_support/runtime modules: $(paste -sd '; ' "$ECSTORE_ROOT_OWNER_PATH_SHIM_HITS_FILE")"
 fi
 
 cat >"$ECSTORE_COMPAT_PASSTHROUGH_EXPECTED_FILE" <<'EOF'

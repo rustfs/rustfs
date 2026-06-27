@@ -15,8 +15,6 @@
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
-use crate::batch_processor::AsyncBatchProcessor;
-use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
@@ -24,6 +22,11 @@ use crate::bucket::replication::check_replicate_delete;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
+use crate::cluster::rpc::heal_bucket_local_on_disks;
+use crate::diagnostics::get::{
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
+    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+};
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
     reduce_write_quorum_errs,
@@ -33,19 +36,16 @@ use crate::disk::{
     conv_part_err_to_int, has_part_err,
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
-use crate::erasure_codec::bridge::{
+use crate::erasure::codec::bridge::{
     CodecStreamingDecodeEngine, GET_CODEC_STREAMING_ENGINE_LEGACY, GET_CODEC_STREAMING_ENGINE_RUSTFS,
 };
-use crate::erasure_coding;
+use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::get_diagnostics::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
-    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
-};
+use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
-use crate::rpc::heal_bucket_local_on_disks;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
+use crate::services::batch_processor::AsyncBatchProcessor;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -56,7 +56,7 @@ use crate::storage_api_contracts::{
     object::{DeletedObject, ObjectIO as _, ObjectOperations as _, ObjectToDelete},
     range::HTTPRangeSpec,
 };
-use crate::store_utils::is_reserved_or_invalid_bucket;
+use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{
         LifecycleOps, gen_transition_objname, get_transitioned_object_reader, put_restore_opts,
@@ -69,10 +69,10 @@ use crate::{
         UpdateMetadataOpts, endpoint::Endpoint, error::DiskError, format::FormatV3, new_disk,
     },
     error::{StorageError, to_object_err},
-    // event::name::EventName,
-    event_notification::{EventArgs, send_event},
     object_api::{GetObjectReader, ObjectInfo, PutObjReader},
-    store_init::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
+    // event::name::EventName,
+    services::event_notification::{EventArgs, send_event},
+    store::init_format::{get_format_erasure_in_quorum, load_format_erasure, load_format_erasure_all, save_format_file},
 };
 use bytes::Bytes;
 use bytesize::ByteSize;
@@ -174,7 +174,7 @@ const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIP
 const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
 static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 
-use crate::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
+use crate::io_support::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
@@ -403,7 +403,7 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
     }
 }
 
-fn build_get_codec_streaming_decode_engine(erasure: erasure_coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
+fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
     match get_codec_streaming_engine() {
         GetCodecStreamingEngine::Legacy => Ok(CodecStreamingDecodeEngine::legacy(erasure)),
         GetCodecStreamingEngine::Rustfs => CodecStreamingDecodeEngine::rustfs(&erasure),
@@ -1417,7 +1417,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<ObjectInfo> = async {
-            let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure =
+                crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
@@ -1573,7 +1574,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 insert_str(&mut user_defined, SUFFIX_COMPRESSION_SIZE, w_size.to_string());
             }
 
-            let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
+            let index_op = data
+                .stream
+                .try_get_index()
+                .map(crate::io_support::rio::compression_index_storage_bytes);
 
             //TODO: userDefined
 
@@ -3746,7 +3750,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
-        let erasure = erasure_coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure =
+            crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
         let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -3869,7 +3874,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             )));
         }
 
-        let index_op = data.stream.try_get_index().map(crate::rio::compression_index_storage_bytes);
+        let index_op = data
+            .stream
+            .try_get_index()
+            .map(crate::io_support::rio::compression_index_storage_bytes);
 
         let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
 
@@ -4850,7 +4858,7 @@ impl crate::storage_api_contracts::heal::HealOperations for SetDisks {
             }
         };
 
-        let endpoints = crate::endpoints::Endpoints::from(self.set_endpoints.clone());
+        let endpoints = crate::layout::endpoints::Endpoints::from(self.set_endpoints.clone());
         let before_drives = crate::layout::set_heal::formats_to_drives_info(&endpoints, &formats, &errs);
         let mut result = HealResultItem {
             heal_item_type: HealItemType::Metadata.to_string(),
@@ -5778,14 +5786,14 @@ mod tests {
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
-    use crate::endpoints::SetupType;
+    use crate::layout::endpoints::SetupType;
     use crate::object_api::ObjectInfo;
     use crate::storage_api_contracts::{
         heal::HealOperations as _, lifecycle::TransitionedObject, list::ListOperations as _, multipart::CompletePart,
         namespace::NamespaceLocking as _, object::ObjectOperations as _,
     };
-    use crate::store_init::save_format_file;
-    use crate::store_list_objects::ListPathOptions;
+    use crate::store::init_format::save_format_file;
+    use crate::store::list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_filemeta::ReplicationState;
@@ -7141,7 +7149,7 @@ mod tests {
         let err = set_disks
             .list_path(
                 CancellationToken::new(),
-                crate::store_list_objects::ListPathOptions {
+                crate::store::list_objects::ListPathOptions {
                     bucket: "bucket".to_string(),
                     recursive: true,
                     ..Default::default()
@@ -7822,7 +7830,7 @@ mod tests {
         fi.size = payload.len() as i64;
         fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
 
-        let erasure = erasure_coding::Erasure::new_with_options(
+        let erasure = crate::erasure::coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,

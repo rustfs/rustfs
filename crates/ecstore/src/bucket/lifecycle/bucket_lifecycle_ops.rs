@@ -32,9 +32,10 @@ use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_MULTIPART_BUCKET, ST
 use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
-use crate::event_notification::{EventArgs, send_event};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
+use crate::services::event_notification::{EventArgs, send_event};
+use crate::services::tier::warm_backend::WarmBackendGetOpts;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
     lifecycle::ExpirationOptions,
@@ -44,7 +45,6 @@ use crate::storage_api_contracts::{
     range::HTTPRangeSpec,
 };
 use crate::store::ECStore;
-use crate::tier::warm_backend::WarmBackendGetOpts;
 use async_channel::{Receiver as A_Receiver, Sender as A_Sender, bounded};
 use futures::Future;
 use http::HeaderMap;
@@ -622,7 +622,7 @@ impl ExpiryState {
     }
 
     async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>, stats: Arc<ExpiryStats>) {
-        let cancel_token = crate::global::get_background_services_cancel_token().unwrap_or_else(|| {
+        let cancel_token = crate::runtime::global::get_background_services_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new)
         });
@@ -1376,7 +1376,7 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::global::get_background_services_cancel_token()
+        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         let mut interval = tokio::time::interval(StdDuration::from_secs(60));
@@ -1451,7 +1451,7 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::global::get_background_services_cancel_token()
+        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;
@@ -2889,10 +2889,10 @@ mod tests {
     use crate::bucket::metadata_sys;
     use crate::disk::RUSTFS_META_MULTIPART_BUCKET;
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::error::is_err_invalid_upload_id;
+    use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, MakeBucketOptions},

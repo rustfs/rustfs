@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::cluster::rpc::build_auth_headers;
 use crate::disk::error::{Error, Result};
 use crate::disk::{FileReader, FileWriter};
-use crate::rpc::build_auth_headers;
 use async_trait::async_trait;
 use http::{HeaderMap, HeaderValue, Method, header::CONTENT_TYPE};
 use rustfs_config::{

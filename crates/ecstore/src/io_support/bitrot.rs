@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::disk::{self, DiskAPI as _, DiskStore, error::DiskError};
-use crate::erasure_coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
+use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_utils::HashAlgorithm;
 use std::io::Cursor;

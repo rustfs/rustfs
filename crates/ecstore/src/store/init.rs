@@ -13,9 +13,9 @@
 // limitations under the License.
 
 use super::*;
+use crate::core::pools::local_decommission_queue_prefix;
 use crate::error::is_err_decommission_running;
-use crate::pools::local_decommission_queue_prefix;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error, info, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -25,7 +25,7 @@ const EVENT_DECOMMISSION_RESUME_FAILED: &str = "decommission_resume_failed";
 const EVENT_STORE_FORMAT_RETRY: &str = "store_format_retry";
 const EVENT_ECSTORE_INIT_STATUS: &str = "ecstore_init_status";
 
-fn pool_first_endpoint_is_local(pool: &crate::endpoints::PoolEndpoints) -> bool {
+fn pool_first_endpoint_is_local(pool: &crate::layout::endpoints::PoolEndpoints) -> bool {
     pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local)
 }
 
@@ -202,7 +202,7 @@ impl ECStore {
             // periodic monitoring until format loading succeeds. Startup RPC
             // failures can still spawn recovery probes for peers that come up
             // after this node.
-            let (disks, errs) = store_init::init_disks(
+            let (disks, errs) = init_format::init_disks(
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -217,7 +217,7 @@ impl ECStore {
                 let mut times = 0;
                 let mut interval = 1;
                 loop {
-                    match store_init::connect_load_init_formats(
+                    match init_format::connect_load_init_formats(
                         pool_first_is_local,
                         &disks,
                         pool_eps.set_count,
@@ -446,7 +446,7 @@ impl ECStore {
         crate::bucket::lifecycle::bucket_lifecycle_ops::init_background_stale_multipart_upload_cleanup(self.clone());
 
         TransitionState::init(self.clone()).await;
-        crate::tier::tier::try_migrate_tiering_config(self.clone()).await;
+        crate::services::tier::tier::try_migrate_tiering_config(self.clone()).await;
 
         if let Err(err) = runtime_sources::init_tier_config_mgr(self.clone()).await {
             info!("TierConfigMgr init error: {}", err);
@@ -470,11 +470,11 @@ mod tests {
         should_resume_local_decommission, should_retry_local_decommission_resume, wait_for_local_decommission_resume_delay,
     };
     use crate::{
+        core::pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
         disk::endpoint::Endpoint,
-        endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
         error::StorageError,
-        pools::{POOL_META_VERSION, PoolDecommissionInfo, PoolMeta, PoolStatus},
-        rebalance::RebalanceMeta,
+        layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints},
+        services::rebalance::RebalanceMeta,
     };
     use std::time::Duration;
     use time::OffsetDateTime;

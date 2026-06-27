@@ -13,23 +13,23 @@
 // limitations under the License.
 
 use crate::bucket::metadata_sys;
+use crate::cluster::rpc::client::{
+    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
+};
 use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
 use crate::disk::{DiskAPI, DiskStore, disk_store::get_max_timeout_duration};
-use crate::rpc::client::{
-    TonicInterceptor, gen_tonic_signature_interceptor, is_network_like_disk_error, node_service_time_out_client,
-};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::bucket::{BucketInfo, BucketOptions, DeleteBucketOptions, MakeBucketOptions};
 use crate::store::all_local_disk;
-use crate::store_utils::is_reserved_or_invalid_bucket;
+use crate::store::utils::is_reserved_or_invalid_bucket;
 use crate::{
     disk::{
         self, VolumeInfo,
         disk_store::{DiskHealthTracker, get_drive_active_check_interval, get_drive_active_check_timeout},
     },
-    endpoints::{EndpointServerPools, Node},
+    layout::endpoints::{EndpointServerPools, Node},
 };
 use async_trait::async_trait;
 use futures::future::join_all;
@@ -1102,8 +1102,8 @@ mod tests {
     use crate::disk::disk_store::LocalDiskWrapper;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::local::LocalDisk;
-    use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::reset_local_disk_test_state;
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::runtime::global::reset_local_disk_test_state;
     use crate::store::init_local_disks;
     use rustfs_filemeta::FileInfo;
     use serial_test::serial;

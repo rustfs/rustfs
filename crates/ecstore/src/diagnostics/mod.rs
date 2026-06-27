@@ -12,11 +12,5 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::tier::tier::TierConfigMgr;
-
-#[allow(dead_code)]
-impl TierConfigMgr {
-    pub fn msg_size(&self) -> usize {
-        100
-    }
-}
+pub(crate) mod admin_server_info;
+pub(crate) mod get;

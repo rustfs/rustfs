@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
+use crate::cluster::rpc::client::{TonicInterceptor, gen_tonic_signature_interceptor, node_service_time_out_client};
 use async_trait::async_trait;
 use bytes::Bytes;
 use rustfs_lock::{
@@ -536,7 +536,7 @@ impl LockClient for RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
     use tokio::net::TcpListener;
     use tokio::task::JoinHandle;

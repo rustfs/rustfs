@@ -2408,22 +2408,22 @@ async fn test_init_and_start_rebalance_rejects_second_start_after_gate() {
         ..Default::default()
     };
 
-    let endpoint_pools: crate::endpoints::EndpointServerPools = Vec::new().into();
+    let endpoint_pools: crate::layout::endpoints::EndpointServerPools = Vec::new().into();
     let store = Arc::new(crate::store::ECStore {
         id: uuid::Uuid::new_v4(),
         disk_map: std::collections::HashMap::new(),
         pools: Vec::new(),
-        peer_sys: crate::rpc::S3PeerSys::new(&endpoint_pools),
-        pool_meta: tokio::sync::RwLock::new(crate::pools::PoolMeta::default()),
+        peer_sys: crate::cluster::rpc::S3PeerSys::new(&endpoint_pools),
+        pool_meta: tokio::sync::RwLock::new(crate::core::pools::PoolMeta::default()),
         rebalance_meta: tokio::sync::RwLock::new(Some(active_meta)),
         decommission_cancelers: tokio::sync::RwLock::new(Vec::new()),
         start_gate: tokio::sync::Mutex::new(()),
         pool_meta_save_gate: tokio::sync::Mutex::new(()),
-        local_disk_map: crate::global::GLOBAL_LOCAL_DISK_MAP.clone(),
-        local_disk_id_map: crate::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
-        local_disk_set_drives: crate::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
-        tier_config_mgr: crate::tier::tier::TierConfigMgr::new(),
-        event_notifier: crate::event_notification::EventNotifier::new(),
+        local_disk_map: crate::runtime::global::GLOBAL_LOCAL_DISK_MAP.clone(),
+        local_disk_id_map: crate::runtime::global::GLOBAL_LOCAL_DISK_ID_MAP.clone(),
+        local_disk_set_drives: crate::runtime::global::GLOBAL_LOCAL_DISK_SET_DRIVES.clone(),
+        tier_config_mgr: crate::services::tier::tier::TierConfigMgr::new(),
+        event_notifier: crate::services::event_notification::EventNotifier::new(),
         bucket_monitor: std::sync::OnceLock::new(),
     });
 

@@ -15,11 +15,11 @@
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
 pub mod admin {
-    pub use crate::admin_server_info::{get_local_server_property, get_server_info};
+    pub use crate::diagnostics::admin_server_info::{get_local_server_property, get_server_info};
 }
 
 pub mod bitrot {
-    pub use crate::bitrot::{create_bitrot_reader, create_bitrot_writer};
+    pub use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
 }
 
 pub mod bucket {
@@ -34,11 +34,11 @@ pub mod cache {
 }
 
 pub mod capacity {
-    pub use crate::pools::{
+    pub use crate::core::pools::{
         PoolDecommissionInfo, PoolStatus, get_total_usable_capacity, get_total_usable_capacity_free, path2_bucket_object,
         path2_bucket_object_with_base_path,
     };
-    pub use crate::store_utils::is_reserved_or_invalid_bucket;
+    pub use crate::store::utils::is_reserved_or_invalid_bucket;
 }
 
 pub mod client {
@@ -56,7 +56,7 @@ pub mod cluster {
 }
 
 pub mod compression {
-    pub use crate::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
 }
 
 pub mod config {
@@ -97,7 +97,7 @@ pub mod error {
 }
 
 pub mod erasure {
-    pub use crate::erasure_coding::{
+    pub use crate::erasure::coding::{
         BitrotReader, BitrotWriter, BitrotWriterWrapper, CustomWriter, Erasure, ReedSolomonEncoder, calc_shard_size,
         calc_shard_size_legacy,
     };
@@ -105,11 +105,11 @@ pub mod erasure {
 
 pub mod event {
     pub use crate::event::name::EventName;
-    pub use crate::event_notification::{EventArgs, register_event_dispatch_hook};
+    pub use crate::services::event_notification::{EventArgs, register_event_dispatch_hook};
 }
 
 pub mod global {
-    pub use crate::global::{
+    pub use crate::runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id,
         get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
         global_rustfs_port, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local, new_object_layer_fn,
@@ -119,16 +119,16 @@ pub mod global {
 }
 
 pub mod layout {
-    pub use crate::disks_layout::DisksLayout;
-    pub use crate::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
+    pub use crate::layout::disks_layout::DisksLayout;
+    pub use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};
 }
 
 pub mod metrics {
-    pub use crate::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
+    pub use crate::services::metrics_realtime::{CollectMetricsOpts, MetricType, collect_local_metrics};
 }
 
 pub mod notification {
-    pub use crate::notification_sys::{
+    pub use crate::services::notification_sys::{
         NotificationPeerErr, NotificationSys, get_global_notification_sys, new_global_notification_sys,
     };
 }
@@ -141,7 +141,7 @@ pub mod object {
 }
 
 pub mod rebalance {
-    pub use crate::rebalance::{
+    pub use crate::services::rebalance::{
         DiskStat, RebalSaveOpt, RebalStatus, RebalanceCleanupWarningEntry, RebalanceCleanupWarnings, RebalanceInfo,
         RebalanceMeta, RebalanceStats, RebalanceStopPropagationRecord, decode_rebalance_stop_propagation_record,
         encode_rebalance_stop_propagation_record,
@@ -149,14 +149,14 @@ pub mod rebalance {
 }
 
 pub mod rio {
-    pub use crate::rio::{
+    pub use crate::io_support::rio::{
         DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
         boxed_reader, compression_metadata_value, wrap_reader,
     };
 }
 
 pub mod rpc {
-    pub use crate::rpc::{
+    pub use crate::cluster::rpc::{
         LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client, SERVICE_SIGNAL_REFRESH_CONFIG,
         SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, TonicInterceptor, gen_tonic_signature_interceptor,
         node_service_time_out_client, node_service_time_out_client_no_auth, verify_rpc_signature,
@@ -168,7 +168,7 @@ pub mod set_disk {
 }
 
 pub mod store_list {
-    pub use crate::store_list_objects::{ListPathOptions, max_keys_plus_one};
+    pub use crate::store::list_objects::{ListPathOptions, max_keys_plus_one};
 }
 
 pub mod storage {
@@ -179,5 +179,5 @@ pub mod storage {
 }
 
 pub mod tier {
-    pub use crate::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
+    pub use crate::services::tier::{tier, tier_admin, tier_config, tier_handlers, warm_backend};
 }

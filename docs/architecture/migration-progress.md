@@ -5,20 +5,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-cluster-rpc-metadata-layout`
+- Branch: `overtrue/arch-ecstore-services-domain-batch`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, and CFG-009 from PR #3927.
-- Current phase PR: E-029/E-030 ECStore cluster RPC and metadata owner layout.
-- Based on: E-028 batch branch while PR #3931 is pending; rebase onto
-  `origin/main` after E-019 through E-028 merge before opening this PR.
+- Current phase PR: E-035/E-008 ECStore services domain batch.
+- Based on: E-034 branch while PR #3932 and follow-up ECStore owner PRs are
+  pending; rebase onto `origin/main` after E-019 through E-034 merge before
+  opening this PR.
 - PR type for this branch: `pure-move`.
-- Runtime behavior changes: none expected for E-029/E-030; production changes
-  are module file moves that keep the existing `rpc`, `bucket::metadata`,
-  `bucket::metadata_sys`, and `set_disk::metadata` facade paths.
-- Rust code changes: move ECStore RPC implementation files under the
-  `cluster/rpc` owner directory and move bucket/set-disk metadata support files
-  under the `metadata` owner directory without function-body changes.
+- Runtime behavior changes: none expected for E-035/E-008; production changes
+  only move the ECStore rebalance and tier owner modules under `services` while
+  retaining the public `api::rebalance` and `api::tier` facades.
+- Rust code changes: move the ECStore root `rebalance` and `tier` directories
+  into `services`, remove the root `lib.rs` declarations, and migrate
+  crate-internal imports to `services::{rebalance,tier}` without function-body
+  changes.
 - CI/script changes: reject restoring ECStore root `store.rs`, `set_disk.rs`,
   `store_list_objects.rs`, `store_utils.rs`, `store_init.rs`,
   `disks_layout.rs`, `endpoints.rs`, `storage_api_contracts.rs`,
@@ -26,11 +28,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   `notification_sys.rs`, `data_movement.rs`, or
   `data_movement_backpressure.rs`, `admin_server_info.rs`, `data_usage.rs`,
   `get_diagnostics.rs`, `global.rs`, `runtime_sources.rs`, `bitrot.rs`,
-  `compress.rs`, `rio.rs`, `error.rs`, `rebalance.rs`, `pools.rs`,
-  `sets.rs`, `pools_test.rs`, or `store_test.rs`, keep the ECStore cluster root
-  module as a re-export-only owner facade, reject restoring ECStore root RPC
-  support files, keep the ECStore root RPC module as a re-export-only facade,
-  and reject restoring old bucket/set-disk metadata owner paths;
+  `compress.rs`, `rio.rs`, `erasure_codec`, `erasure_coding`, `error.rs`,
+  `rebalance.rs`, `pools.rs`, `sets.rs`, `pools_test.rs`, or `store_test.rs`,
+  keep the ECStore cluster root module as a re-export-only owner facade, reject
+  restoring ECStore root RPC modules or root `lib.rs` declaration, reject
+  ECStore-internal `crate::rpc` consumers, reject restoring old bucket/set-disk
+  metadata owner paths, and reject
+  restoring ECStore root `lib.rs` owner path shims for core, store, layout, data
+  movement, diagnostics, services, I/O support, and runtime modules; reject
+  restoring ECStore root rebalance or tier service-domain modules or
+  ECStore-internal `crate::rebalance`/`crate::tier` consumers;
   lock completed config model ownership against restoring
   old `rustfs_ecstore::config` model/accessor compatibility paths, and lock
   ECStore public facades against re-exporting the moved server-config symbols;
@@ -77,8 +84,15 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   rebalance facade modules after E-026, and reject restoring ECStore root core
   runtime/test modules after E-027, keep the ECStore cluster root module as a
   re-export-only owner facade after E-028, reject restoring ECStore root RPC
-  support files after E-029, and reject restoring old bucket/set-disk metadata
-  owner paths after E-030.
+  support files after E-029, reject restoring old bucket/set-disk metadata owner
+  paths after E-030, reject restoring ECStore root owner path shims for
+  diagnostics, services, I/O support, and runtime modules after E-031, and
+  reject restoring ECStore root owner path shims for core, store, layout, and
+  data movement modules after E-032, reject restoring ECStore root erasure
+  codec or coding modules after E-033/E-004, and reject restoring ECStore root
+  RPC facade modules or ECStore-internal `crate::rpc` consumers after E-034,
+  and reject restoring ECStore root rebalance/tier service-domain modules or
+  ECStore-internal `crate::rebalance`/`crate::tier` consumers after E-035/E-008.
 
 ## Phase 0 Tasks
 
@@ -9265,6 +9279,72 @@ Notes:
 - The slice does not alter startup behavior, readiness behavior, table catalog
   object I/O, notification persistence, S3 Select reads, IAM error mapping,
   observability metrics, test/fuzz semantics, or ECStore definitions.
+
+- Issue #660 E-032 current slice:
+  - `cargo check -p rustfs-ecstore --lib`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib layout`: passed.
+  - `cargo test -p rustfs-ecstore --lib store`: passed.
+  - `cargo test -p rustfs-ecstore --lib data_movement`: passed.
+  - `cargo test -p rustfs-ecstore --lib core::`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check overtrue/arch-ecstore-root-owner-facade-shrink...HEAD`:
+    passed.
+  - ECStore root owner path shim scan: passed; no root `lib.rs` path shims remain
+    for core, store, layout, or data movement owner modules.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+
+- Issue #660 E-033/E-004 current slice:
+  - `cargo check -p rustfs-ecstore --lib`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib erasure`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check overtrue/arch-ecstore-core-store-layout-shims...HEAD`:
+    passed.
+  - ECStore root erasure module scan: passed; no root `erasure_codec` or
+    `erasure_coding` module directories or root `lib.rs` declarations remain.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+
+- Issue #660 E-034/E-006/E-009 current slice:
+  - `cargo check -p rustfs-ecstore --lib`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib cluster::rpc`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check overtrue/arch-ecstore-erasure-owner-layout...HEAD`:
+    passed.
+  - ECStore RPC root consumer scan: passed; no ECStore-internal `crate::rpc`
+    consumers remain.
+  - ECStore root RPC facade scan: passed; no root `rpc` module or root
+    `lib.rs` declaration remains.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+
+- Issue #660 E-035/E-008 current slice:
+  - `cargo check -p rustfs-ecstore --lib`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib services::rebalance`: passed.
+  - `cargo test -p rustfs-ecstore --lib services::tier`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check overtrue/arch-ecstore-cluster-rpc-facade-shrink...HEAD`:
+    passed.
+  - ECStore services domain scan: passed; no root `rebalance`/`tier` modules
+    or ECStore-internal `crate::rebalance`/`crate::tier` consumers remain.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
 
 ## Handoff Notes
 

@@ -20,7 +20,7 @@ use crate::{
     config::com::read_config,
     disk::DiskAPI,
     error::{Error, classify_system_path_failure_reason},
-    runtime_sources,
+    runtime::sources as runtime_sources,
     store::ECStore,
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};

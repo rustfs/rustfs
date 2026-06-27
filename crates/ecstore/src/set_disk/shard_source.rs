@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::disk::error::Error;
-use crate::get_diagnostics::{
+use crate::diagnostics::get::{
     GET_SHARD_READ_COST_LOCAL, GET_SHARD_READ_COST_REMOTE, GET_SHARD_READ_COST_SAME_NODE, GET_SHARD_READ_COST_UNKNOWN,
 };
+use crate::disk::error::Error;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ShardReadCost {

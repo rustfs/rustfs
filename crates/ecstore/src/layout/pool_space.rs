@@ -17,8 +17,8 @@ use std::slice::Iter;
 use crate::bucket::utils::is_meta_bucketname;
 use crate::disk::DiskInfo;
 use crate::error::{Error, Result};
-use crate::global::{DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES};
-use crate::runtime_sources;
+use crate::runtime::global::{DISK_ASSUME_UNKNOWN_SIZE, DISK_FILL_FRACTION, DISK_MIN_INODES};
+use crate::runtime::sources as runtime_sources;
 
 #[derive(Debug, Default, Clone)]
 pub struct PoolAvailableSpace {

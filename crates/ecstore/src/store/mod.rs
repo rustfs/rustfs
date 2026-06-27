@@ -32,7 +32,9 @@ use crate::bucket::utils::check_object_args;
 use crate::bucket::utils::check_put_object_args;
 use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
+use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
+use crate::core::pools::PoolMeta;
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -40,12 +42,11 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
-use crate::event_notification::EventNotifier;
-use crate::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
-use crate::pools::PoolMeta;
-use crate::rebalance::RebalanceMeta;
-use crate::rpc::RemoteClient;
-use crate::runtime_sources;
+use crate::runtime::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
+use crate::runtime::sources as runtime_sources;
+use crate::services::event_notification::EventNotifier;
+use crate::services::rebalance::RebalanceMeta;
+use crate::services::tier::tier::TierConfigMgr;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -53,16 +54,13 @@ use crate::storage_api_contracts::{
     object::{DeletedObject, ObjectToDelete},
     range::HTTPRangeSpec,
 };
-use crate::store_init::{check_disk_fatal_errs, ec_drives_no_config};
-use crate::tier::tier::TierConfigMgr;
+use crate::store::init_format::{check_disk_fatal_errs, ec_drives_no_config};
 use crate::{
     bucket::{lifecycle::bucket_lifecycle_ops::TransitionState, metadata::BucketMetadata},
+    core::sets::Sets,
     disk::{BUCKET_META_PREFIX, DiskOption, DiskStore, RUSTFS_META_BUCKET},
-    endpoints::EndpointServerPools,
+    layout::endpoints::EndpointServerPools,
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    rpc::S3PeerSys,
-    sets::Sets,
-    store_init,
 };
 use futures::future::join_all;
 use http::HeaderMap;
@@ -157,11 +155,14 @@ const MAX_UPLOADS_LIST: usize = 10000;
 mod bucket;
 mod heal;
 mod init;
+pub(crate) mod init_format;
 mod list;
+pub(crate) mod list_objects;
 mod multipart;
 mod object;
 mod peer;
 mod rebalance;
+pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
@@ -246,7 +247,7 @@ impl ECStore {
 /// service singletons. The globals remain the source of truth.
 impl ECStore {
     /// Get the notification system
-    pub fn notification_system(&self) -> Option<&'static crate::notification_sys::NotificationSys> {
+    pub fn notification_system(&self) -> Option<&'static crate::services::notification_sys::NotificationSys> {
         runtime_sources::notification_sys()
     }
 
@@ -266,7 +267,7 @@ impl ECStore {
     }
 
     /// Get the tier config manager
-    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::tier::tier::TierConfigMgr>> {
+    pub fn tier_config_mgr(&self) -> Arc<tokio::sync::RwLock<crate::services::tier::tier::TierConfigMgr>> {
         runtime_sources::global_tier_config_mgr()
     }
 
@@ -772,9 +773,9 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoints::{Endpoints, PoolEndpoints};
-    use crate::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
-    use crate::store_init::{connect_load_init_formats, init_disks};
+    use crate::layout::endpoints::{Endpoints, PoolEndpoints};
+    use crate::runtime::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
+    use crate::store::init_format::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;
 

@@ -23,7 +23,7 @@ use crate::{
         format::{FormatErasureVersion, FormatMetaVersion, FormatV3},
         new_disk,
     },
-    endpoints::Endpoints,
+    layout::endpoints::Endpoints,
 };
 use futures::future::join_all;
 use rustfs_config::server_config::KVS;

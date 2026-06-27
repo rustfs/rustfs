@@ -30,12 +30,12 @@ use crate::{
         format::{DistributionAlgoVersion, FormatV3},
         new_disk,
     },
-    endpoints::{Endpoints, PoolEndpoints},
     error::StorageError,
+    layout::endpoints::{Endpoints, PoolEndpoints},
     object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader},
-    runtime_sources,
+    runtime::sources as runtime_sources,
     set_disk::SetDisks,
-    store_init::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
+    store::init_format::{check_format_erasure_values, get_format_erasure_in_quorum, load_format_erasure_all, save_format_file},
 };
 use futures::{
     future::join_all,
@@ -1090,8 +1090,8 @@ async fn init_storage_disks_with_errors(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::endpoints::SetupType;
     use crate::layout::endpoint::Endpoint;
+    use crate::layout::endpoints::SetupType;
     use crate::storage_api_contracts::heal::HealOperations as _;
     use crate::storage_api_contracts::list::ListOperations as _;
     use rustfs_lock::client::local::LocalClient;

@@ -24,7 +24,7 @@ use crate::client::{
     transition_api::{ReadCloser, ReaderImpl},
 };
 use crate::error::is_err_bucket_not_found;
-use crate::tier::{
+use crate::services::tier::{
     tier::ERR_TIER_TYPE_UNSUPPORTED,
     tier_config::{TierConfig, TierType},
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
