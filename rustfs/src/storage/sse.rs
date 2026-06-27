@@ -2158,6 +2158,7 @@ pub fn reset_sse_dek_provider() {
 }
 
 #[cfg(test)]
+#[cfg(feature = "rio-v2")]
 pub fn set_sse_dek_provider_for_test(provider: Arc<dyn SseDekProvider>) {
     if let Ok(mut slot) = GLOBAL_SSE_DEK_PROVIDER.write() {
         *slot = Some(provider);
@@ -2455,7 +2456,6 @@ mod tests {
         TestSseDekProvider, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, generate_ssec_nonce, is_managed_sse,
         map_get_object_reader_error, mark_encrypted_multipart_metadata, normalize_managed_metadata, reset_sse_dek_provider,
-        set_sse_dek_provider_for_test,
         resolve_effective_kms_key_id, sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata,
         validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, validate_ssec_params,
         verify_ssec_key_match,
@@ -3005,7 +3005,7 @@ mod tests {
         let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
             .await
             .expect("kms provider should initialize from the configured test manager");
-        set_sse_dek_provider_for_test(Arc::new(provider));
+        super::set_sse_dek_provider_for_test(Arc::new(provider));
 
         let client_context = HashMap::from([("tenant".to_string(), "alpha".to_string())]);
         let request = EncryptionRequest {
