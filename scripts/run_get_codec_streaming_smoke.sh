@@ -1066,6 +1066,13 @@ else:
                 delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="range"'),
                 "proves runtime Range GET fallback reason delta",
             )
+            add(
+                profile,
+                "fallback_multipart",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="multipart"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="multipart"'),
+                "proves runtime multipart object fallback reason delta",
+            )
             below_delta = delta_for(
                 profile,
                 "rustfs_io_get_object_codec_streaming_fallback_total",
@@ -1214,6 +1221,7 @@ EOF
 profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
 ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
+${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,multipart,dry-run only
 EOF
     cat >"${compat_dir}/snapshot.json" <<EOF
 {
@@ -1240,6 +1248,7 @@ EOF
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
     "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" <<'PY'
+import csv
 import datetime as dt
 import hashlib
 import hmac
@@ -1249,6 +1258,8 @@ import pathlib
 import sys
 from typing import Dict, List, Optional, Tuple
 import urllib.parse
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 
 endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, codec_min_size_raw, out_dir_raw, profile = sys.argv[1:]
 object_size = int(object_size_raw)
@@ -1347,6 +1358,25 @@ def header_map(headers) -> Dict[str, List[str]]:
     return dict(sorted(result.items()))
 
 
+def first_header(snapshot, name: str) -> str:
+    name = name.lower()
+    for header_name, value in snapshot["headers"]:
+        if header_name.lower() == name:
+            return value
+    return ""
+
+
+def find_xml_text(body: bytes, name: str) -> Optional[str]:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == name:
+            return elem.text
+    return None
+
+
 bucket_path = "/" + urllib.parse.quote(bucket, safe="")
 object_path = bucket_path + "/" + urllib.parse.quote(object_key, safe="/-_.~")
 body = payload(object_size)
@@ -1425,6 +1455,104 @@ else:
         }
     )
 
+multipart_key = object_key + ".multipart"
+multipart_path = bucket_path + "/" + urllib.parse.quote(multipart_key, safe="/-_.~")
+multipart_part_one = payload(5 * 1024 * 1024)
+multipart_part_two = payload(1)
+initiate_multipart, initiate_multipart_body = request("POST", multipart_path + "?uploads")
+if initiate_multipart["status"] not in (200, 201):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "multipart",
+            "object_key": multipart_key,
+            "status": "initiate_failed",
+            "status_code": initiate_multipart["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": "multipart",
+            "note": "multipart initiate failed",
+        }
+    )
+else:
+    upload_id = find_xml_text(initiate_multipart_body, "UploadId")
+    if not upload_id:
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "multipart",
+                "object_key": multipart_key,
+                "status": "upload_id_missing",
+                "status_code": initiate_multipart["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "multipart",
+                "note": "multipart initiate response did not include UploadId",
+            }
+        )
+    else:
+        upload_id_query = urllib.parse.quote(upload_id, safe="")
+        part_one, _ = request("PUT", f"{multipart_path}?partNumber=1&uploadId={upload_id_query}", multipart_part_one)
+        part_two, _ = request("PUT", f"{multipart_path}?partNumber=2&uploadId={upload_id_query}", multipart_part_two)
+        etag_one = first_header(part_one, "etag")
+        etag_two = first_header(part_two, "etag")
+        if part_one["status"] not in (200, 201) or part_two["status"] not in (200, 201) or not etag_one or not etag_two:
+            fallback_rows.append(
+                {
+                    "profile": profile,
+                    "probe": "multipart",
+                    "object_key": multipart_key,
+                    "status": "upload_part_failed",
+                    "status_code": f"{part_one['status']};{part_two['status']}",
+                    "body_len": 0,
+                    "expected_runtime_fallback_reason": "multipart",
+                    "note": "multipart part upload failed or ETag was missing",
+                }
+            )
+            request("DELETE", f"{multipart_path}?uploadId={upload_id_query}")
+        else:
+            complete_body = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<CompleteMultipartUpload>"
+                f"<Part><PartNumber>1</PartNumber><ETag>{xml_escape(etag_one)}</ETag></Part>"
+                f"<Part><PartNumber>2</PartNumber><ETag>{xml_escape(etag_two)}</ETag></Part>"
+                "</CompleteMultipartUpload>"
+            ).encode()
+            complete_multipart, _ = request(
+                "POST",
+                f"{multipart_path}?uploadId={upload_id_query}",
+                complete_body,
+                [("content-type", "application/xml")],
+            )
+            if complete_multipart["status"] not in (200, 201):
+                fallback_rows.append(
+                    {
+                        "profile": profile,
+                        "probe": "multipart",
+                        "object_key": multipart_key,
+                        "status": "complete_failed",
+                        "status_code": complete_multipart["status"],
+                        "body_len": 0,
+                        "expected_runtime_fallback_reason": "multipart",
+                        "note": "multipart complete failed",
+                    }
+                )
+                request("DELETE", f"{multipart_path}?uploadId={upload_id_query}")
+            else:
+                multipart_get, multipart_get_body = request("GET", multipart_path)
+                expected_multipart_len = len(multipart_part_one) + len(multipart_part_two)
+                multipart_ok = multipart_get["status"] == 200 and len(multipart_get_body) == expected_multipart_len
+                fallback_rows.append(
+                    {
+                        "profile": profile,
+                        "probe": "multipart",
+                        "object_key": multipart_key,
+                        "status": "ok" if multipart_ok else "unexpected_status_or_length",
+                        "status_code": multipart_get["status"],
+                        "body_len": len(multipart_get_body),
+                        "expected_runtime_fallback_reason": "multipart",
+                        "note": "Multipart object GET should stay on the legacy fallback path for codec profiles",
+                    }
+                )
+
 body_sha = sha256_hex(get_body)
 expected_sha = sha256_hex(body)
 body_match = body_sha == expected_sha
@@ -1451,26 +1579,20 @@ snapshot = {
 (out_dir / "response_headers.json").write_text(json.dumps(headers_report, indent=2, sort_keys=True) + "\n")
 (out_dir / "snapshot.json").write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
 (out_dir / "body_sha256.txt").write_text(body_sha + "\n")
-(out_dir / "fallback_probe_summary.csv").write_text(
-    "profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note\n"
-    + "\n".join(
-        ",".join(
-            str(row[field]).replace(",", ";")
-            for field in [
-                "profile",
-                "probe",
-                "object_key",
-                "status",
-                "status_code",
-                "body_len",
-                "expected_runtime_fallback_reason",
-                "note",
-            ]
-        )
-        for row in fallback_rows
-    )
-    + "\n"
-)
+with (out_dir / "fallback_probe_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+    fieldnames = [
+        "profile",
+        "probe",
+        "object_key",
+        "status",
+        "status_code",
+        "body_len",
+        "expected_runtime_fallback_reason",
+        "note",
+    ]
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(fallback_rows)
 
 get_headers = snapshot["get_headers"]
 content_length = ",".join(get_headers.get("content-length", []))
