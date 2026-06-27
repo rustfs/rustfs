@@ -5,98 +5,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-cluster-lock-health-phase`
+- Branch: `overtrue/arch-docs-phase`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
-  #3925, CFG-009 from PR #3927, and C-007/C-009 from PR #3935.
-- Current phase PR: C-008/C-010 cluster lock-registry consumption and gated
-  peer-health readiness impact batch.
-- Based on: `origin/main` after PR #3935 merged.
-- PR type for this branch: `contract`.
-- Runtime behavior changes: lock client selection now consumes a runtime
-  `LockRegistry` snapshot instead of directly scanning global clients inside
-  each set; peer-health readiness impact is gated by
-  `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` and remains disabled by default.
-- Rust code changes: add the ECStore lock-registry runtime source, route
-  `Sets::new` through endpoint-ordered registry selection, add a disabled-by
-  default peer-health readiness gate, carry the peer-health readiness bit
-  through health and cluster runtime status views, and cover default-disabled
-  and enabled-degraded readiness behavior.
-- CI/script changes: guard that the ECStore RPC boundary snapshot and
-  internode data-transport control-plane separation note remain present; reject
-  restoring ECStore root `store.rs`, `set_disk.rs`,
-  `store_list_objects.rs`, `store_utils.rs`, `store_init.rs`,
-  `disks_layout.rs`, `endpoints.rs`, `storage_api_contracts.rs`,
-  `batch_processor.rs`, `event_notification.rs`, `metrics_realtime.rs`, or
-  `notification_sys.rs`, `data_movement.rs`, or
-  `data_movement_backpressure.rs`, `admin_server_info.rs`, `data_usage.rs`,
-  `get_diagnostics.rs`, `global.rs`, `runtime_sources.rs`, `bitrot.rs`,
-  `compress.rs`, `rio.rs`, `erasure_codec`, `erasure_coding`, `error.rs`,
-  `rebalance.rs`, `pools.rs`, `sets.rs`, `pools_test.rs`, or `store_test.rs`,
-  keep the ECStore cluster root module as a re-export-only owner facade, reject
-  restoring ECStore root RPC modules or root `lib.rs` declaration, reject
-  ECStore-internal `crate::rpc` consumers, reject restoring old bucket/set-disk
-  metadata owner paths, and reject
-  restoring ECStore root `lib.rs` owner path shims for core, store, layout, data
-  movement, diagnostics, services, I/O support, and runtime modules; reject
-  restoring ECStore root rebalance or tier service-domain modules or
-  ECStore-internal `crate::rebalance`/`crate::tier` consumers;
-  lock completed config model ownership against restoring
-  old `rustfs_ecstore::config` model/accessor compatibility paths, and lock
-  ECStore public facades against re-exporting the moved server-config symbols;
-  retain the existing completed owner and test/fuzz boundaries against
-  bare/glob imports, scattered raw ECStore facade subpaths, and startup
-  runtime/root-server/table/S3/app shared/app bucket/app ECStore/admin facade
-  regressions, plus external runtime, test, fuzz, and storage-owner module
-  ECStore compatibility bypasses, plus runtime crate, owner crate, test/fuzz,
-  and storage owner thin bridge regressions, plus app context and notify
-  event-bridge thin module regressions, plus IAM runtime-source bypasses;
-  accept the reviewed AppContext resolver reverse dependencies in the layer
-  baseline, and block direct admin AppContext resolver consumers outside the
-  admin runtime-source boundary, block root, app usecase, and storage direct AppContext resolver consumers outside their runtime-source boundaries, catch grouped AppContext imports, reject app usecase storage wildcard imports, reject app-layer S3 DTO and ECFS wildcard imports, narrow the object-usecase ECFS layer baseline entry to `FS`, reject direct storage S3 API helper imports from app usecase files, reject direct storage helper imports from app select/usecase files, reject completed app/admin storage helper bypasses, reject app usecase bypasses for migrated storage IO/compression/set-disk helpers, reject app usecase/test bypasses for migrated storage error, ETag, and storage-class helpers, reject app root bucket owner facade bypasses from migrated app consumers, reject app/admin runtime/data-usage root facade regressions, reject admin root storage facade regressions from migrated admin consumers, reject root/server/startup direct storage facade regressions from migrated outer consumers, reject root/server/startup direct storage contract imports from migrated outer consumers, reject app/admin direct storage contract imports from migrated owner consumers, keep app S3 helper imports routed through `app::storage_api`, reject scanner/heal direct ECStore or storage contract imports outside their local `storage_api` boundaries, reject external runtime/test/fuzz ECStore or storage contract imports outside their local `storage_api` boundaries, reject storage owner direct ECStore/storage-api imports outside the owner-local `storage_api` boundary, reject ECStore internal direct storage-api imports outside the owner-local `storage_api_contracts` boundary, reject direct storage ECFS app usecase construction outside the storage S3 API boundary, reject flat root `storage_api` imports outside the new root-local domain modules, reject flat admin `storage_api` imports outside the new admin domain modules, reject flat app `storage_api` imports outside the new app consumer-domain modules, reject flat external crate-local `storage_api` imports outside the new consumer-domain modules, reject residual flat local `storage_api` imports from notify, ECStore tests/benches, and remaining RustFS app storage API type references, reject external/test local storage API root contract re-exports, reject RustFS local storage API root contract re-exports, reject RustFS app/admin storage helper root re-exports, and reject ECStore storage_api_contracts root re-exports or root consumers.
-- Docs changes: record the API-136 through API-242 owner facade,
-  runtime-source, ECFS usecase, root storage API domain-boundary, and admin
-  storage API domain-boundary cleanup, and app storage API consumer-domain
-  cleanup, plus external crate-local and residual local storage API
-  consumer-domain cleanup, external/test storage contract root re-export
-  cleanup, RustFS local storage contract root re-export cleanup, RustFS
-  app/admin storage helper root re-export cleanup, ECStore
-  storage_api_contracts domain segmentation, root storage contract facade
-  domain segmentation, root runtime facade consumer-domain segmentation, and
-  storage-owner internal consumer-domain cleanup; reject storage-owner internal
-  root contract/object helper facade consumers after API-250, reject
-  storage-owner runtime source, object-lock helper, RPC relative root, and ECFS
-  test root consumers after API-251, reject restored RPC wildcard imports
-  after API-252, reject restored parent wildcard imports anywhere under
-  `rustfs/src/storage` after API-253, reject restoring storage owner root
-  wildcard re-exports after API-254, reject direct storage owner paths from the
-  root/app/admin storage facades after API-255, reject restoring storage
-  root SSE re-exports after API-255, reject direct external
-  `rustfs_ecstore::api` facade imports outside local `storage_api` boundary
-  files after API-256, and reject restoring old ECStore server-config model or
-  global accessor compatibility paths after CFG-009, reject restoring ECStore
-  root `store.rs` or `set_disk.rs` after E-017, reject restoring ECStore root
-  store support modules after E-018, reject restoring ECStore root
-  `store_init.rs` after E-019, reject restoring ECStore root layout facade
-  and storage API contract support modules after E-020, and reject restoring
-  ECStore root service runtime modules after E-021, and reject restoring
-  ECStore root data movement modules after E-022, and reject restoring ECStore
-  root usage and diagnostics modules after E-023, and reject restoring ECStore
-  root runtime global modules after E-024, and reject restoring ECStore root
-  I/O support modules after E-025, and reject restoring ECStore root error and
-  rebalance facade modules after E-026, and reject restoring ECStore root core
-  runtime/test modules after E-027, keep the ECStore cluster root module as a
-  re-export-only owner facade after E-028, reject restoring ECStore root RPC
-  support files after E-029, reject restoring old bucket/set-disk metadata owner
-  paths after E-030, reject restoring ECStore root owner path shims for
-  diagnostics, services, I/O support, and runtime modules after E-031, and
-  reject restoring ECStore root owner path shims for core, store, layout, and
-  data movement modules after E-032, reject restoring ECStore root erasure
-  codec or coding modules after E-033/E-004, and reject restoring ECStore root
-  RPC facade modules or ECStore-internal `crate::rpc` consumers after E-034,
-  and reject restoring ECStore root rebalance/tier service-domain modules or
-  ECStore-internal `crate::rebalance`/`crate::tier` consumers after E-035/E-008,
-  and reject losing the C-009 cluster RPC boundary model.
+  #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, and C-008/C-010
+  from PR #3936.
+- Current phase PR: DOC-001/DOC-002/DOC-003/DOC-004/DOC-005/TEST-DOC-001
+  architecture documentation guard batch.
+- Based on: `origin/main` after PR #3936 merged.
+- PR type for this branch: `ci-gate`.
+- Runtime behavior changes: none.
+- Rust code changes: none.
+- CI/script changes: require the core architecture docs and readiness matrix
+  sections in `scripts/check_architecture_migration_rules.sh`.
+- Docs changes: add the readiness matrix, link it from the architecture overview,
+  align runtime/startup/control-plane docs with the gated peer-health readiness
+  contract, and record required architecture docs in crate boundaries.
 
 ## Phase 0 Tasks
 
@@ -1652,6 +1576,48 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     transition tests, and existing "Not init" error paths.
   - Verification: formatting, compile checks, migration guards, diff hygiene,
     Rust risk scan, and full `make pre-commit`.
+
+## Phase 1c Architecture Documentation Tasks
+
+- [x] `DOC-001` Add architecture overview.
+  - Completed slice: keep the architecture document index current and link the
+    readiness matrix from [`overview.md`](overview.md).
+  - Acceptance: overview records baseline, core principle, phase order, and the
+    required architecture document set.
+  - Verification: architecture documentation guard and diff hygiene.
+- [x] `DOC-002` Add runtime lifecycle architecture document.
+  - Completed slice: align the runtime lifecycle contract with effective
+    `FullReady` and the disabled-by-default peer-health readiness gate.
+  - Acceptance: startup/readiness, shutdown, AppContext, and peer-health gate
+    contracts remain documented without changing runtime behavior.
+  - Verification: architecture documentation guard and diff hygiene.
+- [x] `DOC-003` Add storage control/data plane document.
+  - Completed slice: link storage, lock quorum, peer health, probes, admin,
+    RPC, and S3 data-plane readiness behavior from the control-plane baseline.
+  - Acceptance: StorageCore, ClusterControlPlane, data-plane, control-plane, and
+    background-controller boundaries remain explicit.
+  - Verification: architecture documentation guard and diff hygiene.
+- [x] `DOC-004` Add crate boundaries document.
+  - Completed slice: record the required architecture document set in
+    [`crate-boundaries.md`](crate-boundaries.md).
+  - Acceptance: storage-api, config, security-governance, extension-plane, and
+    ECStore boundary docs remain guarded by existing migration rules.
+  - Verification: architecture documentation guard and diff hygiene.
+- [x] `DOC-005` Add readiness matrix.
+  - Completed slice: add [`readiness-matrix.md`](readiness-matrix.md) for S3,
+    admin/console, internode RPC/gRPC, table catalog, probes, optional
+    sidecars, runtime dependencies, and probe semantics.
+  - Acceptance: S3 data requests remain gated until `FullReady`; probe/admin/RPC
+    bypass behavior, `StorageReady`, `IamReady`, lock quorum, peer-health gate,
+    and KMS compatibility readiness semantics are documented.
+  - Verification: architecture documentation guard and diff hygiene.
+- [x] `TEST-DOC-001` Guard architecture documentation coverage.
+  - Completed slice: extend `scripts/check_architecture_migration_rules.sh` to
+    require the core architecture docs and readiness matrix anchors.
+  - Acceptance: the migration guard fails if required architecture docs or
+    required readiness-matrix sections are removed.
+  - Verification: `bash -n scripts/check_architecture_migration_rules.sh`;
+    `./scripts/check_architecture_migration_rules.sh`; `git diff --check`.
 
 ## Phase 1 Security Governance Tasks
 
@@ -6035,6 +6001,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | DOC-001 through DOC-005 add one phase-level architecture documentation batch and keep the guard anchored to required sections instead of duplicating a parallel docs system. |
+| Migration preservation | pass | The readiness matrix and lifecycle docs only record existing S3/admin/RPC/probe behavior plus the disabled-by-default peer-health readiness gate; no runtime code or behavior changes are included. |
+| Testing/verification | pass | Shell syntax, architecture migration guard, diff hygiene, and full `make pre-pr` passed after rebasing onto current `origin/main`. |
 | Quality/architecture | pass | E-028 moves the ECStore cluster control-plane implementation into an owner submodule and leaves the root module as a facade. |
 | Migration preservation | pass | `crate::cluster::*` and `rustfs_ecstore::api::cluster::*` stay stable through root re-exports; the moved implementation is a 100% rename. |
 | Testing/verification | pass | ECStore cluster tests, ECStore full tests, architecture/layer guards, formatting, diff hygiene, diff-added Rust risk scan, and pre-commit passed. |
@@ -6382,6 +6351,16 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 DOC-001/DOC-002/DOC-003/DOC-004/DOC-005/TEST-DOC-001 current
+  slice:
+  - Branch freshness check: rebased onto `origin/main` after PR #3936 merged.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Rust source risk scan: passed; no Rust source changed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed.
 
 - Issue #660 API-256 current slice:
   - Branch freshness check: based on current `origin/main` after PR #3923

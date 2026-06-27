@@ -36,6 +36,21 @@ Existing migration checks live in:
 
 Extend these guardrails instead of adding a parallel system.
 
+## Required Architecture Documents
+
+The migration guard must keep these baseline documents present and anchored to
+their required sections:
+
+- `docs/architecture/overview.md`: Baseline, Core Principle, Phase Order.
+- `docs/architecture/runtime-lifecycle.md`: Startup And Readiness, Shutdown
+  Lifecycle Boundary, AppContext Foundation.
+- `docs/architecture/storage-control-data-plane.md`: Storage API Contracts,
+  Cluster Control Plane, Background Controllers.
+- `docs/architecture/crate-boundaries.md`: PR Types, Dependency Direction,
+  Required Architecture Documents.
+- `docs/architecture/readiness-matrix.md`: Request Behavior Matrix, Runtime
+  Dependency Matrix, Probe Semantics.
+
 ## Pre-Push Expert Review
 
 Before pushing any PR branch, record three expert reviews in the task notes:

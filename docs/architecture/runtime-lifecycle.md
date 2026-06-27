@@ -6,13 +6,17 @@ shutdown semantics.
 ## Startup And Readiness
 
 - HTTP can listen early, but normal requests must remain behind readiness gates.
-- `FullReady = storage_ready && iam_ready && lock_quorum_ready`.
+- Effective `FullReady = storage_ready && iam_ready && lock_quorum_ready &&
+  peer_health_ready`; `peer_health_ready` is true by default unless
+  `RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE` is enabled.
 - Boot phases must keep the old fatal and non-fatal boundaries.
 - AppContext migration keeps context-first lookup with global fallback until the
   global path is proven unused.
 - Notify and audit lifecycle behavior must not drift during lifecycle movement.
 - IAM and KMS startup, deferred recovery, and fatal boundary behavior must not be
   changed by pure movement PRs.
+- Request-surface and dependency details are tracked in
+  [`readiness-matrix.md`](readiness-matrix.md).
 
 ## Service Registry Scope
 
