@@ -17,7 +17,7 @@
 //! This module provides metrics for monitoring the health and performance
 //! of the dial9 telemetry system itself.
 
-#![allow(dead_code)]
+#![warn(dead_code)] // Gradually clean up; see https://github.com/rustfs/backlog/issues/742
 
 use crate::MetricType;
 use crate::metrics::report::PrometheusMetric;
