@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::io::AsyncRead;
 use tokio::spawn;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -57,6 +58,10 @@ async fn peek_with_timeout<R: AsyncRead + Unpin>(reader: &mut MetacacheReader<R>
 
 fn is_missing_path_error(err: &DiskError) -> bool {
     matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
+}
+
+async fn take_fallback_candidate<T>(fallback_items: &Arc<TokioMutex<VecDeque<T>>>) -> Option<T> {
+    fallback_items.lock().await.pop_front()
 }
 
 #[cfg(test)]
@@ -128,7 +133,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>();
+    let fds = Arc::new(TokioMutex::new(opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>()));
     let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
     let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
@@ -137,7 +142,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
-        let mut fds_clone = fds.clone();
+        let fds_clone = fds.clone();
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
         let (rd, wr) = tokio::io::duplex(64);
@@ -250,7 +255,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
             while need_fallback {
                 let mut disk_op = None;
-                while let Some(disk) = fds_clone.pop_front() {
+                while let Some(disk) = take_fallback_candidate(&fds_clone).await {
                     if disk.is_online().await {
                         disk_op = Some(disk);
                         break;
@@ -751,6 +756,19 @@ mod tests {
         assert!(!is_missing_path_error(&DiskError::Timeout));
         assert!(!is_missing_path_error(&DiskError::DiskNotFound));
         assert!(!is_missing_path_error(&DiskError::FileAccessDenied));
+    }
+
+    #[tokio::test]
+    async fn fallback_candidates_are_claimed_once_across_producers() {
+        let mut queue = VecDeque::new();
+        queue.push_back(1usize);
+        let candidates = Arc::new(TokioMutex::new(queue));
+
+        let first = take_fallback_candidate(&candidates).await;
+        let second = take_fallback_candidate(&candidates).await;
+
+        assert_eq!(first, Some(1));
+        assert_eq!(second, None);
     }
 
     #[tokio::test]

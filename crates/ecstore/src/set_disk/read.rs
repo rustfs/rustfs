@@ -433,6 +433,7 @@ fn metadata_early_stop_candidate_matches(left: &FileInfo, right: &FileInfo) -> b
         && left.parts == right.parts
         && left.checksum == right.checksum
         && left.versioned == right.versioned
+        && left.data_dir == right.data_dir
         && left.erasure.algorithm == right.erasure.algorithm
         && left.erasure.data_blocks == right.erasure.data_blocks
         && left.erasure.parity_blocks == right.erasure.parity_blocks
@@ -3160,6 +3161,21 @@ mod tests {
         let first = metadata_early_stop_candidate("object", 1);
         let mut second = metadata_early_stop_candidate("object", 2);
         second.version_id = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_split_data_dir() {
+        let mut accumulator = metadata_early_stop_accumulator();
+        let mut first = metadata_early_stop_candidate("object", 1);
+        let mut second = metadata_early_stop_candidate("object", 2);
+        first.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+        second.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
 
         accumulator.observe_file_info(&first);
         accumulator.observe_file_info(&second);
