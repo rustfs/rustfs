@@ -869,6 +869,10 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        // 清除 bucket 验证缓存
+        crate::storage::invalidate_bucket_validation_cache(&input.bucket);
+
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
         if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");

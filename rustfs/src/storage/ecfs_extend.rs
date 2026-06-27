@@ -42,7 +42,8 @@ use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
@@ -745,17 +746,60 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
     false
 }
 
+/// Bucket 验证缓存：避免每次 GET 都执行 stat_volume()
+///
+/// 缓存 bucket 验证结果，TTL 内跳过重复验证。
+/// 写操作（delete/make bucket）会清除对应缓存。
+static BUCKET_VALIDATED_CACHE: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
+
+/// 清除指定 bucket 的验证缓存
+pub fn invalidate_bucket_validation_cache(bucket: &str) {
+    if let Some(cache) = BUCKET_VALIDATED_CACHE.get() {
+        if let Ok(mut map) = cache.write() {
+            map.remove(bucket);
+        }
+    }
+}
+
+/// 清除所有 bucket 验证缓存
+pub fn invalidate_all_bucket_validation_cache() {
+    if let Some(cache) = BUCKET_VALIDATED_CACHE.get() {
+        if let Ok(mut map) = cache.write() {
+            map.clear();
+        }
+    }
+}
+
 /// Helper function to get store and validate bucket exists
+///
+/// 使用短期缓存（5s TTL）避免每次 GET 都执行 stat_volume()。
+/// 缓存命中时直接返回 store，不调用 get_bucket_info()。
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    // Validate bucket exists
+    // 检查缓存
+    let cache = BUCKET_VALIDATED_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
+    if let Ok(map) = cache.read() {
+        if let Some(entry_time) = map.get(bucket) {
+            if entry_time.elapsed() < BUCKET_VALIDATION_TTL {
+                return Ok(store); // 缓存命中，跳过验证
+            }
+        }
+    }
+
+    // 缓存未命中或过期，执行验证
     store
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
         .map_err(ApiError::from)?;
+
+    // 更新缓存
+    if let Ok(mut map) = cache.write() {
+        map.insert(bucket.to_string(), Instant::now());
+    }
 
     Ok(store)
 }
