@@ -33,7 +33,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tokio::task::JoinHandle;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 2;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 1;
 const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
 const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
 
@@ -738,9 +738,9 @@ mod tests {
     }
 
     #[test]
-    fn fill_policy_defaults_to_dual_inflight() {
+    fn fill_policy_defaults_to_single_inflight() {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, None::<&str>, || {
-            assert_eq!(FillPolicy::from_env(), FillPolicy::DualInFlight);
+            assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
         });
 
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("2"), || {
