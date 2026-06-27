@@ -102,12 +102,12 @@ pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<Object
 
 /// Resolve token signing key using AppContext-first precedence.
 pub fn resolve_token_signing_key() -> Option<String> {
-    resolve_token_signing_key_with(get_global_app_context(), || None)
+    resolve_token_signing_key_with(get_global_app_context())
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
 pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    resolve_bucket_metadata_handle_with(get_global_app_context(), || None)
+    resolve_bucket_metadata_handle_with(get_global_app_context())
 }
 
 /// Resolve object store handle using AppContext-first precedence.
@@ -136,7 +136,7 @@ pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc
 
 /// Resolve notification system handle using AppContext-first precedence.
 pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
-    resolve_notification_system_with(get_global_app_context(), || None)
+    resolve_notification_system_with(get_global_app_context())
 }
 
 /// Resolve notification system handle using an explicit AppContext.
@@ -146,27 +146,27 @@ pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> 
 
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
-    resolve_endpoints_handle_with(get_global_app_context(), || None)
+    resolve_endpoints_handle_with(get_global_app_context())
 }
 
 /// Resolve bucket bandwidth monitor using AppContext-first precedence.
 pub fn resolve_bucket_monitor_handle() -> Option<Arc<BucketBandwidthMonitor>> {
-    resolve_bucket_monitor_handle_with(get_global_app_context(), || None)
+    resolve_bucket_monitor_handle_with(get_global_app_context())
 }
 
 /// Resolve replication pool handle using AppContext-first precedence.
 pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
-    resolve_replication_pool_handle_with(get_global_app_context(), || None)
+    resolve_replication_pool_handle_with(get_global_app_context())
 }
 
 /// Resolve replication statistics handle using AppContext-first precedence.
 pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
-    resolve_replication_stats_handle_with(get_global_app_context(), || None)
+    resolve_replication_stats_handle_with(get_global_app_context())
 }
 
 /// Resolve boot time using AppContext-first precedence.
 pub fn resolve_boot_time() -> Option<SystemTime> {
-    resolve_boot_time_with(get_global_app_context(), || None)
+    resolve_boot_time_with(get_global_app_context())
 }
 
 /// Resolve daily tier transition statistics using AppContext-first precedence.
@@ -182,7 +182,7 @@ pub async fn resolve_scanner_metrics_report() -> ScannerMetricsReport {
 
 /// Resolve deployment identity using AppContext-first precedence.
 pub fn resolve_deployment_id() -> Option<String> {
-    resolve_deployment_id_with(get_global_app_context(), || None)
+    resolve_deployment_id_with(get_global_app_context())
 }
 
 /// Resolve runtime port using AppContext-first precedence.
@@ -192,12 +192,12 @@ pub fn resolve_runtime_port() -> u16 {
 
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
-    resolve_lock_client_with(get_global_app_context(), || None)
+    resolve_lock_client_with(get_global_app_context())
 }
 
 /// Resolve lock clients using AppContext-first precedence.
 pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    resolve_lock_clients_handle_with(get_global_app_context(), || None)
+    resolve_lock_clients_handle_with(get_global_app_context())
 }
 
 /// Resolve performance metrics using AppContext-first precedence.
@@ -233,7 +233,7 @@ pub fn resolve_action_credentials() -> Option<Credentials> {
 
 /// Resolve region using AppContext-first precedence.
 pub fn resolve_region() -> Option<s3s::region::Region> {
-    resolve_region_with(get_global_app_context(), || None)
+    resolve_region_with(get_global_app_context())
 }
 
 /// Resolve tier config handle using AppContext-first precedence.
@@ -248,7 +248,7 @@ pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
-    resolve_server_config_with(get_global_app_context(), || None)
+    resolve_server_config_with(get_global_app_context())
 }
 
 /// Resolve server config using an explicit AppContext.
@@ -355,52 +355,31 @@ fn resolve_ready_iam_handle_with(
     fallback()
 }
 
-fn resolve_token_signing_key_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<String>,
-) -> Option<String> {
+fn resolve_token_signing_key_with(context: Option<Arc<AppContext>>) -> Option<String> {
     context.and_then(|context| context.iam().token_signing_key())
 }
 
-fn resolve_bucket_metadata_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<RwLock<BucketMetadataSys>>>,
-) -> Option<Arc<RwLock<BucketMetadataSys>>> {
+fn resolve_bucket_metadata_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<RwLock<BucketMetadataSys>>> {
     context.and_then(|context| context.bucket_metadata().handle())
 }
 
-fn resolve_notification_system_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<&'static NotificationSys>,
-) -> Option<&'static NotificationSys> {
+fn resolve_notification_system_with(context: Option<Arc<AppContext>>) -> Option<&'static NotificationSys> {
     context.and_then(|context| context.notification_system().handle())
 }
 
-fn resolve_bucket_monitor_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<BucketBandwidthMonitor>>,
-) -> Option<Arc<BucketBandwidthMonitor>> {
+fn resolve_bucket_monitor_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<BucketBandwidthMonitor>> {
     context.and_then(|context| context.bucket_monitor().handle())
 }
 
-fn resolve_replication_pool_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<DynReplicationPool>>,
-) -> Option<Arc<DynReplicationPool>> {
+fn resolve_replication_pool_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<DynReplicationPool>> {
     context.and_then(|context| context.replication_pool().handle())
 }
 
-fn resolve_replication_stats_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<ReplicationStats>>,
-) -> Option<Arc<ReplicationStats>> {
+fn resolve_replication_stats_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<ReplicationStats>> {
     context.and_then(|context| context.replication_stats().handle())
 }
 
-fn resolve_boot_time_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<SystemTime>,
-) -> Option<SystemTime> {
+fn resolve_boot_time_with(context: Option<Arc<AppContext>>) -> Option<SystemTime> {
     context.and_then(|context| context.boot_time().get())
 }
 
@@ -424,21 +403,15 @@ where
 }
 
 #[cfg(test)]
-fn resolve_object_store_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<ECStore>>,
-) -> Option<Arc<ECStore>> {
+fn resolve_object_store_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<ECStore>> {
     context.map(|context| context.object_store())
 }
 
-fn resolve_endpoints_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<EndpointServerPools>,
-) -> Option<EndpointServerPools> {
+fn resolve_endpoints_handle_with(context: Option<Arc<AppContext>>) -> Option<EndpointServerPools> {
     context.and_then(|context| context.endpoints().handle())
 }
 
-fn resolve_deployment_id_with(context: Option<Arc<AppContext>>, _fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+fn resolve_deployment_id_with(context: Option<Arc<AppContext>>) -> Option<String> {
     context.and_then(|context| context.deployment_id().get())
 }
 
@@ -446,17 +419,11 @@ fn resolve_runtime_port_with(context: Option<Arc<AppContext>>, fallback: impl Fn
     context.map_or_else(fallback, |context| context.runtime_port().get())
 }
 
-fn resolve_lock_client_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<Arc<dyn LockClient>>,
-) -> Option<Arc<dyn LockClient>> {
+fn resolve_lock_client_with(context: Option<Arc<AppContext>>) -> Option<Arc<dyn LockClient>> {
     context.and_then(|context| context.lock_client().handle())
 }
 
-fn resolve_lock_clients_handle_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
-) -> Option<HashMap<String, Arc<dyn LockClient>>> {
+fn resolve_lock_clients_handle_with(context: Option<Arc<AppContext>>) -> Option<HashMap<String, Arc<dyn LockClient>>> {
     context.and_then(|context| context.lock_clients().handle())
 }
 
@@ -512,10 +479,7 @@ fn resolve_action_credentials_with(
         .unwrap_or_else(fallback)
 }
 
-fn resolve_region_with(
-    context: Option<Arc<AppContext>>,
-    _fallback: impl FnOnce() -> Option<s3s::region::Region>,
-) -> Option<s3s::region::Region> {
+fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<s3s::region::Region> {
     context.and_then(|context| context.region().get())
 }
 
@@ -535,7 +499,7 @@ fn resolve_expiry_state_handle_with(
         .unwrap_or_else(fallback)
 }
 
-fn resolve_server_config_with(context: Option<Arc<AppContext>>, _fallback: impl FnOnce() -> Option<Config>) -> Option<Config> {
+fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config> {
     context.and_then(|context| context.server_config().get())
 }
 
@@ -996,9 +960,7 @@ mod tests {
         let fallback_kms = Arc::new(KmsServiceManager::new());
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
-        let fallback_replication_stats = Arc::new(ReplicationStats::new());
         let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let fallback_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(20);
         let mut context_daily_tier_stats = DailyAllTierStats::new();
         context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let mut fallback_daily_tier_stats = DailyAllTierStats::new();
@@ -1021,17 +983,13 @@ mod tests {
         let fallback_storage_class_published = Arc::new(AtomicUsize::new(0));
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
         let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
-        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let context_node_name = "context-node".to_string();
         let fallback_node_name = "fallback-node".to_string();
         let context_deployment_id = "context-deployment".to_string();
-        let fallback_deployment_id = "fallback-deployment".to_string();
         let context_runtime_port = 19000;
         let fallback_runtime_port = 29000;
         let mut context_lock_clients = HashMap::new();
         context_lock_clients.insert("context-node:9000".to_string(), context_lock_client.clone());
-        let mut fallback_lock_clients = HashMap::new();
-        fallback_lock_clients.insert("fallback-node:9000".to_string(), fallback_lock_client.clone());
         let context_performance_metrics = Arc::new(PerformanceMetrics::new());
         let fallback_performance_metrics = Arc::new(PerformanceMetrics::new());
         let context_internode_metrics = Arc::new(InternodeMetrics::default());
@@ -1052,7 +1010,6 @@ mod tests {
             ..Default::default()
         };
         let context_region: s3s::region::Region = "context-region".parse().expect("test region");
-        let fallback_region: s3s::region::Region = "fallback-region".parse().expect("test region");
         let context_oidc_sys = match OidcSys::empty() {
             Ok(sys) => sys,
             Err(err) => unreachable!("test OIDC sys should initialize: {err}"),
@@ -1064,7 +1021,6 @@ mod tests {
         let context_oidc = Arc::new(context_oidc_sys);
         let fallback_oidc = Arc::new(fallback_oidc_sys);
         let context_token_signing_key = "context-token-signing-key".to_string();
-        let fallback_token_signing_key = "fallback-token-signing-key".to_string();
 
         let context = Arc::new(AppContext::with_test_interfaces(
             object_store.clone(),
@@ -1176,23 +1132,23 @@ mod tests {
         let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
         assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &fallback_oidc)));
         assert_eq!(
-            resolve_token_signing_key_with(Some(context.clone()), || Some(fallback_token_signing_key.clone())).as_deref(),
+            resolve_token_signing_key_with(Some(context.clone())).as_deref(),
             Some(context_token_signing_key.as_str())
         );
         assert!(Arc::ptr_eq(
-            &resolve_bucket_metadata_handle_with(Some(context.clone()), || None).expect("context bucket metadata"),
+            &resolve_bucket_metadata_handle_with(Some(context.clone())).expect("context bucket metadata"),
             &bucket_metadata
         ));
         assert!(Arc::ptr_eq(
-            &resolve_object_store_handle_with(Some(context.clone()), || None).expect("context object store"),
+            &resolve_object_store_handle_with(Some(context.clone())).expect("context object store"),
             &object_store
         ));
         assert!(Arc::ptr_eq(
-            &resolve_replication_stats_handle_with(Some(context.clone()), || None).expect("context replication stats"),
+            &resolve_replication_stats_handle_with(Some(context.clone())).expect("context replication stats"),
             &context_replication_stats
         ));
         assert_eq!(
-            resolve_boot_time_with(Some(context.clone()), || Some(fallback_boot_time)).expect("context boot time"),
+            resolve_boot_time_with(Some(context.clone())).expect("context boot time"),
             context_boot_time
         );
         assert!(
@@ -1205,15 +1161,14 @@ mod tests {
             context_scanner_metrics.current_cycle
         );
         assert_eq!(
-            resolve_endpoints_handle_with(Some(context.clone()), || None)
+            resolve_endpoints_handle_with(Some(context.clone()))
                 .expect("context endpoints")
                 .as_ref()[0]
                 .drives_per_set,
             endpoints.as_ref()[0].drives_per_set
         );
         assert_eq!(
-            resolve_deployment_id_with(Some(context.clone()), || Some(fallback_deployment_id.clone()))
-                .expect("context deployment id"),
+            resolve_deployment_id_with(Some(context.clone())).expect("context deployment id"),
             context_deployment_id
         );
         assert_eq!(
@@ -1221,11 +1176,11 @@ mod tests {
             context_runtime_port
         );
         assert!(Arc::ptr_eq(
-            &resolve_lock_client_with(Some(context.clone()), || None).expect("context lock client"),
+            &resolve_lock_client_with(Some(context.clone())).expect("context lock client"),
             &context_lock_client
         ));
         assert!(Arc::ptr_eq(
-            resolve_lock_clients_handle_with(Some(context.clone()), || None)
+            resolve_lock_clients_handle_with(Some(context.clone()))
                 .expect("context lock clients")
                 .get("context-node:9000")
                 .expect("context lock client entry"),
@@ -1257,10 +1212,7 @@ mod tests {
                 .access_key,
             context_credentials.access_key
         );
-        assert_eq!(
-            resolve_region_with(Some(context.clone()), || Some(fallback_region.clone())).expect("context region"),
-            context_region
-        );
+        assert_eq!(resolve_region_with(Some(context.clone())).expect("context region"), context_region);
         assert!(Arc::ptr_eq(
             &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
             &tier_config
@@ -1270,7 +1222,7 @@ mod tests {
             &context_expiry_state
         ));
         assert_eq!(
-            resolve_server_config_with(Some(context.clone()), || None).expect("context server config"),
+            resolve_server_config_with(Some(context.clone())).expect("context server config"),
             server_config
         );
         publish_server_config_with(Some(context.clone()), Config::new(), |config| {
@@ -1302,14 +1254,14 @@ mod tests {
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
         assert!(resolve_oidc_handle_with(None).is_none());
-        assert!(resolve_token_signing_key_with(None, || Some(fallback_token_signing_key.clone())).is_none());
+        assert!(resolve_token_signing_key_with(None).is_none());
         assert!(!publish_oidc_handle_with(None, context_oidc));
-        assert!(resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).is_none());
-        assert!(resolve_bucket_monitor_handle_with(None, || default_bucket_monitor_interface().handle()).is_none());
-        assert!(resolve_replication_pool_handle_with(None, || default_replication_pool_interface().handle()).is_none());
-        assert!(resolve_object_store_handle_with(None, || Some(object_store.clone())).is_none());
-        assert!(resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone())).is_none());
-        assert!(resolve_boot_time_with(None, || Some(fallback_boot_time)).is_none());
+        assert!(resolve_bucket_metadata_handle_with(None).is_none());
+        assert!(resolve_bucket_monitor_handle_with(None).is_none());
+        assert!(resolve_replication_pool_handle_with(None).is_none());
+        assert!(resolve_object_store_handle_with(None).is_none());
+        assert!(resolve_replication_stats_handle_with(None).is_none());
+        assert!(resolve_boot_time_with(None).is_none());
         assert!(resolve_daily_tier_stats_with(None, || fallback_daily_tier_stats.clone()).contains_key("FALLBACK"));
         assert_eq!(
             resolve_scanner_metrics_report_with(None, || async { fallback_scanner_metrics.clone() })
@@ -1317,11 +1269,11 @@ mod tests {
                 .current_cycle,
             fallback_scanner_metrics.current_cycle
         );
-        assert!(resolve_endpoints_handle_with(None, || Some(endpoints.clone())).is_none());
-        assert!(resolve_deployment_id_with(None, || Some(fallback_deployment_id.clone())).is_none());
+        assert!(resolve_endpoints_handle_with(None).is_none());
+        assert!(resolve_deployment_id_with(None).is_none());
         assert_eq!(resolve_runtime_port_with(None, || fallback_runtime_port), fallback_runtime_port);
-        assert!(resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).is_none());
-        assert!(resolve_lock_clients_handle_with(None, || Some(fallback_lock_clients.clone())).is_none());
+        assert!(resolve_lock_client_with(None).is_none());
+        assert!(resolve_lock_clients_handle_with(None).is_none());
         assert!(Arc::ptr_eq(
             &resolve_performance_metrics_with(None, || fallback_performance_metrics.clone()),
             &fallback_performance_metrics
@@ -1348,13 +1300,13 @@ mod tests {
                 .access_key,
             fallback_credentials.access_key
         );
-        assert!(resolve_region_with(None, || Some(fallback_region.clone())).is_none());
+        assert!(resolve_region_with(None).is_none());
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
         assert!(Arc::ptr_eq(
             &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
             &fallback_expiry_state
         ));
-        assert!(resolve_server_config_with(None, || Some(server_config.clone())).is_none());
+        assert!(resolve_server_config_with(None).is_none());
         publish_server_config_with(None, Config::new(), |config| {
             drop(config);
             fallback_server_config_published.fetch_add(1, Ordering::SeqCst);
