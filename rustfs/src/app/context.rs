@@ -51,9 +51,8 @@ pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
 }
 
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
-pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
+pub fn resolve_or_init_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_or_init_kms_runtime_service_manager_with(get_global_app_context())
-        .unwrap_or_else(runtime_sources::init_kms_service_manager)
 }
 
 /// Resolve KMS encryption service using AppContext-first precedence.
@@ -72,7 +71,7 @@ pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
 }
 
 /// Resolve outbound TLS state using AppContext-first precedence.
-pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
+pub async fn resolve_outbound_tls_state() -> Option<GlobalPublishedOutboundTlsState> {
     resolve_outbound_tls_state_with(get_global_app_context()).await
 }
 
@@ -127,16 +126,14 @@ pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> 
 }
 
 /// Resolve notify interface using AppContext-first precedence.
-pub fn resolve_notify_interface() -> Arc<dyn NotifyInterface> {
+pub fn resolve_notify_interface() -> Option<Arc<dyn NotifyInterface>> {
     let context = get_global_app_context();
     resolve_notify_interface_for_context(context.as_deref())
 }
 
-/// Resolve notify interface using an explicit AppContext, falling back to the legacy global notifier.
-pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Arc<dyn NotifyInterface> {
-    context
-        .map(|context| context.notify())
-        .unwrap_or_else(default_notify_interface)
+/// Resolve notify interface using an explicit AppContext.
+pub fn resolve_notify_interface_for_context(context: Option<&AppContext>) -> Option<Arc<dyn NotifyInterface>> {
+    context.map(|context| context.notify())
 }
 
 /// Resolve notification system handle using AppContext-first precedence.
@@ -180,12 +177,8 @@ pub fn resolve_daily_tier_stats() -> Option<DailyAllTierStats> {
 }
 
 /// Resolve scanner metrics report using AppContext-first precedence.
-pub async fn resolve_scanner_metrics_report() -> ScannerMetricsReport {
-    if let Some(report) = resolve_scanner_metrics_report_with(get_global_app_context()).await {
-        return report;
-    }
-
-    default_scanner_metrics_interface().report().await
+pub async fn resolve_scanner_metrics_report() -> Option<ScannerMetricsReport> {
+    resolve_scanner_metrics_report_with(get_global_app_context()).await
 }
 
 /// Resolve deployment identity using AppContext-first precedence.
@@ -222,12 +215,12 @@ pub fn resolve_internode_metrics() -> Option<Arc<InternodeMetrics>> {
 pub async fn resolve_s3select_db(
     input: SelectObjectContentInput,
     enable_debug: bool,
-) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+) -> Option<QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>> {
     if let Some(context) = get_global_app_context() {
-        return resolve_s3select_db_with(context, input, enable_debug).await;
+        return Some(resolve_s3select_db_with(context, input, enable_debug).await);
     }
 
-    default_s3select_db_interface().get(input, enable_debug).await
+    None
 }
 
 /// Resolve local node name using AppContext-first precedence.
@@ -266,15 +259,13 @@ pub fn resolve_server_config_for_context(context: Option<&AppContext>) -> Option
 }
 
 /// Publish server config using AppContext-first precedence.
-pub fn publish_server_config(config: Config) {
-    publish_server_config_with(get_global_app_context(), config, |config| default_server_config_interface().set(config));
+pub fn publish_server_config(config: Config) -> bool {
+    publish_server_config_with(get_global_app_context(), config)
 }
 
 /// Publish storage class config using AppContext-first precedence.
-pub fn publish_storage_class_config(config: StorageClassConfig) {
-    publish_storage_class_config_with(get_global_app_context(), config, |config| {
-        default_storage_class_interface().set(config);
-    });
+pub fn publish_storage_class_config(config: StorageClassConfig) -> bool {
+    publish_storage_class_config_with(get_global_app_context(), config)
 }
 
 /// Resolve buffer profile config using AppContext-first precedence.
@@ -299,12 +290,12 @@ fn resolve_outbound_tls_generation_with(context: Option<Arc<AppContext>>) -> Opt
     context.map(|context| context.outbound_tls_runtime().generation())
 }
 
-async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> GlobalPublishedOutboundTlsState {
+async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> Option<GlobalPublishedOutboundTlsState> {
     if let Some(context) = context {
-        return context.outbound_tls_runtime().state().await;
+        return Some(context.outbound_tls_runtime().state().await);
     }
 
-    default_outbound_tls_runtime_interface().state().await
+    None
 }
 
 fn resolve_iam_ready_with(context: Option<Arc<AppContext>>) -> Option<bool> {
@@ -440,24 +431,22 @@ fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config
     context.and_then(|context| context.server_config().get())
 }
 
-fn publish_server_config_with(context: Option<Arc<AppContext>>, config: Config, fallback: impl FnOnce(Config)) {
+fn publish_server_config_with(context: Option<Arc<AppContext>>, config: Config) -> bool {
     if let Some(context) = context {
         context.server_config().set(config);
-    } else {
-        fallback(config);
+        return true;
     }
+
+    false
 }
 
-fn publish_storage_class_config_with(
-    context: Option<Arc<AppContext>>,
-    config: StorageClassConfig,
-    fallback: impl FnOnce(StorageClassConfig),
-) {
+fn publish_storage_class_config_with(context: Option<Arc<AppContext>>, config: StorageClassConfig) -> bool {
     if let Some(context) = context {
         context.storage_class().set(config);
-    } else {
-        fallback(config);
+        return true;
     }
+
+    false
 }
 
 fn resolve_buffer_config_with(context: Option<Arc<AppContext>>) -> Option<RustFSBufferConfig> {
@@ -904,9 +893,7 @@ mod tests {
         let context_expiry_state = ExpiryState::new();
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
-        let fallback_server_config_published = Arc::new(AtomicUsize::new(0));
         let context_storage_class_published = Arc::new(AtomicUsize::new(0));
-        let fallback_storage_class_published = Arc::new(AtomicUsize::new(0));
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
         let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let context_node_name = "context-node".to_string();
@@ -1038,7 +1025,10 @@ mod tests {
             context_outbound_tls_state.generation
         );
         assert_eq!(
-            resolve_outbound_tls_state_with(Some(context.clone())).await.generation,
+            resolve_outbound_tls_state_with(Some(context.clone()))
+                .await
+                .expect("context outbound TLS state")
+                .generation,
             context_outbound_tls_state.generation
         );
         assert!(resolve_iam_ready_with(Some(context.clone())).expect("context IAM ready"));
@@ -1144,18 +1134,10 @@ mod tests {
             resolve_server_config_with(Some(context.clone())).expect("context server config"),
             server_config
         );
-        publish_server_config_with(Some(context.clone()), Config::new(), |config| {
-            drop(config);
-            fallback_server_config_published.fetch_add(1, Ordering::SeqCst);
-        });
+        assert!(publish_server_config_with(Some(context.clone()), Config::new()));
         assert_eq!(context_server_config_published.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_server_config_published.load(Ordering::SeqCst), 0);
-        publish_storage_class_config_with(Some(context.clone()), StorageClassConfig::default(), |config| {
-            drop(config);
-            fallback_storage_class_published.fetch_add(1, Ordering::SeqCst);
-        });
+        assert!(publish_storage_class_config_with(Some(context.clone()), StorageClassConfig::default()));
         assert_eq!(context_storage_class_published.load(Ordering::SeqCst), 1);
-        assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 0);
         assert_eq!(
             resolve_buffer_config_with(Some(context))
                 .expect("context buffer config")
@@ -1166,10 +1148,12 @@ mod tests {
         assert!(resolve_kms_runtime_service_manager_with(None).is_none());
         assert!(resolve_or_init_kms_runtime_service_manager_with(None).is_none());
         assert!(resolve_outbound_tls_generation_with(None).is_none());
+        assert!(resolve_outbound_tls_state_with(None).await.is_none());
         assert!(resolve_iam_ready_with(None).is_none());
         assert!(resolve_iam_handle_with(None).is_none());
         assert!(resolve_oidc_handle_with(None).is_none());
         assert!(resolve_token_signing_key_with(None).is_none());
+        assert!(resolve_notify_interface_for_context(None).is_none());
         assert!(!publish_oidc_handle_with(None, context_oidc));
         assert!(resolve_bucket_metadata_handle_with(None).is_none());
         assert!(resolve_bucket_monitor_handle_with(None).is_none());
@@ -1192,16 +1176,8 @@ mod tests {
         assert!(resolve_tier_config_handle_with(None).is_none());
         assert!(resolve_expiry_state_handle_with(None).is_none());
         assert!(resolve_server_config_with(None).is_none());
-        publish_server_config_with(None, Config::new(), |config| {
-            drop(config);
-            fallback_server_config_published.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(fallback_server_config_published.load(Ordering::SeqCst), 1);
-        publish_storage_class_config_with(None, StorageClassConfig::default(), |config| {
-            drop(config);
-            fallback_storage_class_published.fetch_add(1, Ordering::SeqCst);
-        });
-        assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 1);
+        assert!(!publish_server_config_with(None, Config::new()));
+        assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));
         assert!(resolve_buffer_config_with(None).is_none());
     }
 }
