@@ -220,8 +220,8 @@ setup_output() {
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
   COMPARE_CSV="$OUT_DIR/baseline_compare.csv"
 
-  echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file" > "$ROUND_CSV"
-  echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms" > "$MEDIAN_CSV"
+  echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms" > "$ROUND_CSV"
+  echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,median_req_p90_ms,median_req_p99_ms" > "$MEDIAN_CSV"
 }
 
 trim() {
@@ -288,13 +288,32 @@ extract_first() {
   rg -o "$regex" "$file" | head -n1 || true
 }
 
+normalize_duration_metric() {
+  local value="$1"
+  value="$(trim "${value:-N/A}")"
+
+  if [[ -z "$value" || "$value" == "N/A" ]]; then
+    echo "N/A"
+    return
+  fi
+
+  if [[ "$value" =~ ^([0-9]+(\.[0-9]+)?)(ms|us|µs|s)$ ]]; then
+    echo "${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"
+    return
+  fi
+
+  echo "$value" | awk '{ if ($1 == "" || $1 == "N/A") print "N/A"; else print $1" "$2 }'
+}
+
 extract_metrics() {
   local log_file="$1"
 
-  local throughput reqps latency
+  local throughput reqps latency req_p90 req_p99
   throughput="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(GiB/s|MiB/s|KiB/s|GB/s|MB/s|KB/s|B/s)' "$log_file")"
   reqps="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(obj/s|req/s|ops/s|requests/s)' "$log_file")"
   latency="$(rg -o 'Reqs:[[:space:]]+Avg:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^Reqs:[[:space:]]+Avg:[[:space:]]+//')"
+  req_p90="$(rg -o '90%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^90%:[[:space:]]+//')"
+  req_p99="$(rg -o '99%:[[:space:]]+[0-9]+(\.[0-9]+)?(ms|us|µs|s)' "$log_file" | head -n1 | sed -E 's/^99%:[[:space:]]+//')"
 
   if [[ -z "$latency" ]]; then
     latency="$(extract_first '[0-9]+(\.[0-9]+)?[[:space:]]*(ms|us|µs|s)' "$log_file")"
@@ -303,16 +322,16 @@ extract_metrics() {
   throughput="$(trim "${throughput:-N/A}")"
   reqps="$(trim "${reqps:-N/A}")"
   latency="$(trim "${latency:-N/A}")"
+  req_p90="$(trim "${req_p90:-N/A}")"
+  req_p99="$(trim "${req_p99:-N/A}")"
 
   # Normalize to "<num> <unit>" shape for downstream conversion helpers.
-  if [[ "$latency" =~ ^([0-9]+(\.[0-9]+)?)(ms|us|µs|s)$ ]]; then
-    latency="${BASH_REMATCH[1]} ${BASH_REMATCH[3]}"
-  else
-    latency="$(echo "$latency" | awk '{print $1" "$2}')"
-  fi
+  latency="$(normalize_duration_metric "$latency")"
+  req_p90="$(normalize_duration_metric "$req_p90")"
+  req_p99="$(normalize_duration_metric "$req_p99")"
   reqps_num="$(echo "$reqps" | awk '{print $1}')"
 
-  echo "$throughput,${reqps_num:-N/A},$latency"
+  echo "$throughput,${reqps_num:-N/A},$latency,$req_p90,$req_p99"
 }
 
 median_from_numbers() {
@@ -414,20 +433,28 @@ run_one_attempt() {
   fi
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-  local metrics throughput_human reqps latency_human throughput_bps latency_ms
+  local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms
   if [[ "$DRY_RUN" == "true" ]]; then
     throughput_human="N/A"
     reqps="N/A"
     latency_human="N/A"
     throughput_bps="N/A"
     latency_ms="N/A"
+    req_p90_human="N/A"
+    req_p90_ms="N/A"
+    req_p99_human="N/A"
+    req_p99_ms="N/A"
   else
     metrics="$(extract_metrics "$log_file")"
     throughput_human="$(echo "$metrics" | cut -d',' -f1)"
     reqps="$(echo "$metrics" | cut -d',' -f2)"
     latency_human="$(echo "$metrics" | cut -d',' -f3)"
+    req_p90_human="$(echo "$metrics" | cut -d',' -f4)"
+    req_p99_human="$(echo "$metrics" | cut -d',' -f5)"
     throughput_bps="$(to_bps "$throughput_human")"
     latency_ms="$(to_ms "$latency_human")"
+    req_p90_ms="$(to_ms "$req_p90_human")"
+    req_p99_ms="$(to_ms "$req_p99_human")"
   fi
 
   if [[ "$DRY_RUN" != "true" && "$status" == "ok" ]]; then
@@ -437,7 +464,7 @@ run_one_attempt() {
     fi
   fi
 
-  echo "$size,$TOOL,$round,$attempt,$CONCURRENCY,$status,$exit_code,$started_at_utc,$finished_at_utc,$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$log_file" >> "$ROUND_CSV"
+  echo "$size,$TOOL,$round,$attempt,$CONCURRENCY,$status,$exit_code,$started_at_utc,$finished_at_utc,$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$log_file,$req_p90_human,$req_p90_ms,$req_p99_human,$req_p99_ms" >> "$ROUND_CSV"
   echo "$status"
 }
 
@@ -481,20 +508,24 @@ build_median_summary() {
     size="$(trim "$raw")"
     [[ -z "$size" ]] && continue
 
-    local ok_rounds fail_rounds t_vals r_vals l_vals
+    local ok_rounds fail_rounds t_vals r_vals l_vals p90_vals p99_vals
     ok_rounds="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" {c++} END{print c+0}' "$ROUND_CSV")"
     fail_rounds="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6!="ok" {c++} END{print c+0}' "$ROUND_CSV")"
 
     t_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $11!="N/A" {print $11}' "$ROUND_CSV")"
     r_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $12!="N/A" {print $12}' "$ROUND_CSV")"
     l_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $14!="N/A" {print $14}' "$ROUND_CSV")"
+    p90_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $17!="N/A" {print $17}' "$ROUND_CSV")"
+    p99_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $19!="N/A" {print $19}' "$ROUND_CSV")"
 
-    local m_t m_r m_l
+    local m_t m_r m_l m_p90 m_p99
     m_t="$(median_from_numbers "$t_vals")"
     m_r="$(median_from_numbers "$r_vals")"
     m_l="$(median_from_numbers "$l_vals")"
+    m_p90="$(median_from_numbers "$p90_vals")"
+    m_p99="$(median_from_numbers "$p99_vals")"
 
-    echo "$size,$TOOL,$CONCURRENCY,$ok_rounds,$fail_rounds,$m_t,$m_r,$m_l" >> "$MEDIAN_CSV"
+    echo "$size,$TOOL,$CONCURRENCY,$ok_rounds,$fail_rounds,$m_t,$m_r,$m_l,$m_p90,$m_p99" >> "$MEDIAN_CSV"
   done
 }
 

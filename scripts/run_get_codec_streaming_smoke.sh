@@ -933,7 +933,7 @@ write_service_metrics_acceptance() {
   local service_csv="${OUT_DIR}/service_metrics_summary.csv"
 
   "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" \
-    "$COMPRESSED_FALLBACK_PROBE" <<'PY'
+    "$COMPRESSED_FALLBACK_PROBE" "${OUT_DIR}/metrics_summary.csv" <<'PY'
 import csv
 import pathlib
 import sys
@@ -944,6 +944,7 @@ diagnostic_enabled = sys.argv[3] == "true"
 mode = sys.argv[4]
 codec_engines = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
 compressed_fallback_probe_enabled = sys.argv[6] == "true"
+metrics_path = pathlib.Path(sys.argv[7])
 
 
 def expected_profiles():
@@ -959,6 +960,11 @@ rows = []
 if service_path.exists():
     with service_path.open(encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle))
+
+metrics_rows = []
+if metrics_path.exists():
+    with metrics_path.open(encoding="utf-8", newline="") as handle:
+        metrics_rows = list(csv.DictReader(handle))
 
 
 def delta_for(profile, metric, *label_fragments):
@@ -1006,6 +1012,14 @@ def add(profile, check, expected, delta, note):
             "note": note,
         }
     )
+
+
+def p99_available():
+    for row in metrics_rows:
+        value = row.get("median_req_p99_ms", "")
+        if value and value != "N/A":
+            return True
+    return False
 
 
 rows_out = []
@@ -1172,14 +1186,15 @@ else:
             "note": "use --diagnostic-metrics for path proof; omit it for throughput acceptance runs",
         }
     )
+    p99_status = p99_available()
     rows_out.append(
         {
             "profile": "all",
             "check": "p95_p99",
-            "expected": "available or explicitly marked unavailable",
-            "status": "unavailable",
-            "observed_delta": "N/A",
-            "note": "warp median_summary.csv does not currently aggregate p95/p99; raw logs remain in raw_output_paths.txt",
+            "expected": "p99 available from warp request percentile output; p95 explicitly marked unavailable when warp does not emit it",
+            "status": "pass" if p99_status else "unavailable",
+            "observed_delta": "p99_available" if p99_status else "N/A",
+            "note": "median_req_p99_ms is aggregated in metrics_summary.csv; p95 remains unavailable because current warp text output emits 90% and 99%, not 95%",
         }
     )
 
@@ -2059,6 +2074,10 @@ def performance_note(throughput_delta, latency_delta):
     return "at_or_better_than_legacy"
 
 
+def row_value(row, key):
+    return row.get(key, "")
+
+
 rows = []
 by_profile = {}
 for profile_dir in profile_dirs:
@@ -2088,6 +2107,8 @@ for profile_dir in profile_dirs:
                 "median_throughput_bps": row["median_throughput_bps"],
                 "median_reqps": row["median_reqps"],
                 "median_latency_ms": row["median_latency_ms"],
+                "median_req_p90_ms": row_value(row, "median_req_p90_ms"),
+                "median_req_p99_ms": row_value(row, "median_req_p99_ms"),
             }
         )
 
@@ -2104,10 +2125,14 @@ for row in rows:
     throughput_delta = delta_pct(parse_float(row["median_throughput_bps"]), parse_float(baseline["median_throughput_bps"]))
     reqps_delta = delta_pct(parse_float(row["median_reqps"]), parse_float(baseline["median_reqps"]))
     latency_delta = delta_pct(parse_float(row["median_latency_ms"]), parse_float(baseline["median_latency_ms"]))
+    p90_delta = delta_pct(parse_float(row.get("median_req_p90_ms", "")), parse_float(baseline.get("median_req_p90_ms", "")))
+    p99_delta = delta_pct(parse_float(row.get("median_req_p99_ms", "")), parse_float(baseline.get("median_req_p99_ms", "")))
     row["baseline_profile"] = "legacy"
     row["delta_throughput_pct_vs_legacy"] = throughput_delta
     row["delta_reqps_pct_vs_legacy"] = reqps_delta
     row["delta_latency_pct_vs_legacy"] = latency_delta
+    row["delta_req_p90_pct_vs_legacy"] = p90_delta
+    row["delta_req_p99_pct_vs_legacy"] = p99_delta
     row["performance_note"] = performance_note(throughput_delta, latency_delta)
 
 fieldnames = [
@@ -2129,10 +2154,14 @@ fieldnames = [
     "median_throughput_bps",
     "median_reqps",
     "median_latency_ms",
+    "median_req_p90_ms",
+    "median_req_p99_ms",
     "baseline_profile",
     "delta_throughput_pct_vs_legacy",
     "delta_reqps_pct_vs_legacy",
     "delta_latency_pct_vs_legacy",
+    "delta_req_p90_pct_vs_legacy",
+    "delta_req_p99_pct_vs_legacy",
     "performance_note",
 ]
 with open(metrics_csv, "w", encoding="utf-8", newline="") as handle:
@@ -2163,6 +2192,12 @@ baseline_fields = [
     "new_median_latency_ms",
     "baseline_median_latency_ms",
     "delta_latency_pct_vs_legacy",
+    "new_median_req_p90_ms",
+    "baseline_median_req_p90_ms",
+    "delta_req_p90_pct_vs_legacy",
+    "new_median_req_p99_ms",
+    "baseline_median_req_p99_ms",
+    "delta_req_p99_pct_vs_legacy",
     "new_median_throughput_bps",
     "baseline_median_throughput_bps",
     "delta_throughput_pct_vs_legacy",
@@ -2199,6 +2234,12 @@ for row in rows:
             "new_median_latency_ms": row["median_latency_ms"],
             "baseline_median_latency_ms": baseline.get("median_latency_ms", ""),
             "delta_latency_pct_vs_legacy": row["delta_latency_pct_vs_legacy"],
+            "new_median_req_p90_ms": row.get("median_req_p90_ms", ""),
+            "baseline_median_req_p90_ms": baseline.get("median_req_p90_ms", ""),
+            "delta_req_p90_pct_vs_legacy": row.get("delta_req_p90_pct_vs_legacy", ""),
+            "new_median_req_p99_ms": row.get("median_req_p99_ms", ""),
+            "baseline_median_req_p99_ms": baseline.get("median_req_p99_ms", ""),
+            "delta_req_p99_pct_vs_legacy": row.get("delta_req_p99_pct_vs_legacy", ""),
             "new_median_throughput_bps": row["median_throughput_bps"],
             "baseline_median_throughput_bps": baseline.get("median_throughput_bps", ""),
             "delta_throughput_pct_vs_legacy": row["delta_throughput_pct_vs_legacy"],
@@ -2227,12 +2268,24 @@ compare_fields = [
     "legacy_median_latency_ms",
     "codec_legacy_median_latency_ms",
     "codec_rustfs_median_latency_ms",
+    "legacy_median_req_p90_ms",
+    "codec_legacy_median_req_p90_ms",
+    "codec_rustfs_median_req_p90_ms",
+    "legacy_median_req_p99_ms",
+    "codec_legacy_median_req_p99_ms",
+    "codec_rustfs_median_req_p99_ms",
     "codec_legacy_delta_throughput_pct_vs_legacy",
     "codec_rustfs_delta_throughput_pct_vs_legacy",
     "codec_rustfs_delta_throughput_pct_vs_codec_legacy",
     "codec_legacy_delta_latency_pct_vs_legacy",
     "codec_rustfs_delta_latency_pct_vs_legacy",
     "codec_rustfs_delta_latency_pct_vs_codec_legacy",
+    "codec_legacy_delta_req_p90_pct_vs_legacy",
+    "codec_rustfs_delta_req_p90_pct_vs_legacy",
+    "codec_rustfs_delta_req_p90_pct_vs_codec_legacy",
+    "codec_legacy_delta_req_p99_pct_vs_legacy",
+    "codec_rustfs_delta_req_p99_pct_vs_legacy",
+    "codec_rustfs_delta_req_p99_pct_vs_codec_legacy",
 ]
 compare_rows = []
 for size, legacy in legacy_by_size.items():
@@ -2250,6 +2303,12 @@ for size, legacy in legacy_by_size.items():
             "legacy_median_latency_ms": legacy.get("median_latency_ms", ""),
             "codec_legacy_median_latency_ms": codec_legacy.get("median_latency_ms", ""),
             "codec_rustfs_median_latency_ms": codec_rustfs.get("median_latency_ms", ""),
+            "legacy_median_req_p90_ms": legacy.get("median_req_p90_ms", ""),
+            "codec_legacy_median_req_p90_ms": codec_legacy.get("median_req_p90_ms", ""),
+            "codec_rustfs_median_req_p90_ms": codec_rustfs.get("median_req_p90_ms", ""),
+            "legacy_median_req_p99_ms": legacy.get("median_req_p99_ms", ""),
+            "codec_legacy_median_req_p99_ms": codec_legacy.get("median_req_p99_ms", ""),
+            "codec_rustfs_median_req_p99_ms": codec_rustfs.get("median_req_p99_ms", ""),
             "codec_legacy_delta_throughput_pct_vs_legacy": delta_pct(
                 parse_float(codec_legacy.get("median_throughput_bps", "")),
                 parse_float(legacy.get("median_throughput_bps", "")),
@@ -2273,6 +2332,30 @@ for size, legacy in legacy_by_size.items():
             "codec_rustfs_delta_latency_pct_vs_codec_legacy": delta_pct(
                 parse_float(codec_rustfs.get("median_latency_ms", "")),
                 parse_float(codec_legacy.get("median_latency_ms", "")),
+            ),
+            "codec_legacy_delta_req_p90_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_req_p90_ms", "")),
+                parse_float(legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p90_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p90_ms", "")),
+                parse_float(legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p90_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p90_ms", "")),
+                parse_float(codec_legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_legacy_delta_req_p99_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_req_p99_ms", "")),
+                parse_float(legacy.get("median_req_p99_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p99_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p99_ms", "")),
+                parse_float(legacy.get("median_req_p99_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p99_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p99_ms", "")),
+                parse_float(codec_legacy.get("median_req_p99_ms", "")),
             ),
         }
     )
@@ -2341,7 +2424,7 @@ write_default_switch_readiness_report() {
           if ($19 == "" || $22 == "" || ($19 + 0.0) < 0.0 || ($22 + 0.0) > 0.0) {
             not_worse = 0
           }
-          if ($25 != "" && ($25 + 0.0) > 5.0) {
+          if ($31 != "" && ($31 + 0.0) > 5.0) {
             improved++
           }
         }
@@ -2443,7 +2526,7 @@ PY
     echo "| multi-round cooled A/B stable | ${stable} | expected rounds per target size: ${ROUNDS} |"
     echo "| 1MiB / 4MiB / 10MiB not worse than legacy | ${not_worse} | derived from baseline_compare.csv |"
     echo "| at least two sizes improve by more than 5% | ${two_sizes_gt_five} | qualifying sizes: ${improved_over_five} |"
-    echo "| p95 / p99 do not regress | ${p95_p99_ok} | current harness retains raw output paths but does not aggregate p95/p99 yet |"
+    echo "| p95 / p99 do not regress | ${p95_p99_ok} | p99 is aggregated in metrics_summary.csv; p95 remains unavailable in current warp text output |"
     echo "| CPU and RSS acceptable | ${cpu_rss_ok} | see cpu_rss_notes.txt |"
     echo "| runtime server metrics prove path and fallback deltas | ${runtime_metrics_ok} | see service_metrics_acceptance.csv; skipped for observability-off performance runs |"
     echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
