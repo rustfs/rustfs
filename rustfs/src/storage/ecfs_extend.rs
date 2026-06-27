@@ -42,8 +42,8 @@ use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::ops::Add;
-use std::sync::{Arc, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
@@ -748,32 +748,33 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
 
 /// Bucket 验证缓存：避免每次 GET 都执行 stat_volume()
 ///
-/// 缓存 bucket 验证结果，TTL 内跳过重复验证。
+/// 使用 moka 缓存 bucket 验证结果，TTL 5 秒。
 /// 写操作（delete/make bucket）会清除对应缓存。
-static BUCKET_VALIDATED_CACHE: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+static BUCKET_VALIDATED_CACHE: OnceLock<moka::sync::Cache<String, ()>> = OnceLock::new();
 const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
+
+fn bucket_cache() -> &'static moka::sync::Cache<String, ()> {
+    BUCKET_VALIDATED_CACHE.get_or_init(|| {
+        moka::sync::Cache::builder()
+            .time_to_live(BUCKET_VALIDATION_TTL)
+            .max_capacity(1024)
+            .build()
+    })
+}
 
 /// 清除指定 bucket 的验证缓存
 pub fn invalidate_bucket_validation_cache(bucket: &str) {
-    if let Some(cache) = BUCKET_VALIDATED_CACHE.get() {
-        if let Ok(mut map) = cache.write() {
-            map.remove(bucket);
-        }
-    }
+    bucket_cache().invalidate(bucket);
 }
 
 /// 清除所有 bucket 验证缓存
 pub fn invalidate_all_bucket_validation_cache() {
-    if let Some(cache) = BUCKET_VALIDATED_CACHE.get() {
-        if let Ok(mut map) = cache.write() {
-            map.clear();
-        }
-    }
+    bucket_cache().invalidate_all();
 }
 
 /// Helper function to get store and validate bucket exists
 ///
-/// 使用短期缓存（5s TTL）避免每次 GET 都执行 stat_volume()。
+/// 使用 moka 缓存（5s TTL）避免每次 GET 都执行 stat_volume()。
 /// 缓存命中时直接返回 store，不调用 get_bucket_info()。
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
@@ -781,13 +782,8 @@ pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECS
     };
 
     // 检查缓存
-    let cache = BUCKET_VALIDATED_CACHE.get_or_init(|| RwLock::new(HashMap::new()));
-    if let Ok(map) = cache.read() {
-        if let Some(entry_time) = map.get(bucket) {
-            if entry_time.elapsed() < BUCKET_VALIDATION_TTL {
-                return Ok(store); // 缓存命中，跳过验证
-            }
-        }
+    if bucket_cache().get(bucket).is_some() {
+        return Ok(store); // 缓存命中，跳过验证
     }
 
     // 缓存未命中或过期，执行验证
@@ -797,9 +793,7 @@ pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECS
         .map_err(ApiError::from)?;
 
     // 更新缓存
-    if let Ok(mut map) = cache.write() {
-        map.insert(bucket.to_string(), Instant::now());
-    }
+    bucket_cache().insert(bucket.to_string(), ());
 
     Ok(store)
 }
