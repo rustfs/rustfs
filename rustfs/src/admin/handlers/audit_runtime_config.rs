@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::handlers::target_descriptor::AdminTargetSpec;
-use crate::admin::runtime_sources::{AppContext, current_app_context, resolve_object_store_handle_for_context};
+use crate::admin::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
 use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
 use rustfs_audit::{audit_system, start_audit_system as start_global_audit_system, system::AuditSystemState};
 use rustfs_config::DEFAULT_DELIMITER;
@@ -21,7 +21,7 @@ use rustfs_config::server_config::Config;
 use s3s::{S3Result, s3_error};
 
 pub(crate) async fn load_server_config_from_store_for_context(context: Option<&AppContext>) -> S3Result<Config> {
-    let Some(store) = resolve_object_store_handle_for_context(context) else {
+    let Some(store) = current_object_store_handle_for_context(context) else {
         return Ok(Config::new());
     };
 
@@ -88,7 +88,7 @@ async fn update_audit_config_and_reload_for_context<F>(
 where
     F: FnMut(&mut Config) -> bool,
 {
-    let Some(store) = resolve_object_store_handle_for_context(context) else {
+    let Some(store) = current_object_store_handle_for_context(context) else {
         return Err(s3_error!(InternalError, "server storage not initialized"));
     };
 

@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::{
-    AppContext, current_app_context, publish_server_config, publish_storage_class_config,
-    resolve_notification_system_for_context, resolve_object_store_handle_for_context,
+    AppContext, current_app_context, current_notification_system_for_context, current_object_store_handle_for_context,
+    publish_server_config, publish_storage_class_config,
 };
 use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
@@ -68,7 +68,7 @@ fn invalid_request(message: impl Into<String>) -> S3Error {
 }
 
 fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3Result<std::sync::Arc<ECStore>> {
-    resolve_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
+    current_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 
 async fn apply_storage_class_runtime_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
@@ -372,7 +372,7 @@ pub async fn signal_dynamic_config_reload_for_context(context: Option<&AppContex
         return;
     }
 
-    let Some(notification_sys) = resolve_notification_system_for_context(context) else {
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
         return;
     };
 
@@ -389,7 +389,7 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
 }
 
 pub async fn signal_config_snapshot_reload_for_context(context: Option<&AppContext>) {
-    let Some(notification_sys) = resolve_notification_system_for_context(context) else {
+    let Some(notification_sys) = current_notification_system_for_context(context) else {
         return;
     };
 

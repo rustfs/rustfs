@@ -171,10 +171,6 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_expiry_state()
     }
 
-    pub(crate) fn new_object_layer_fn() -> Option<Arc<crate::storage::storage_api::ECStore>> {
-        crate::storage::storage_api::new_object_layer_fn()
-    }
-
     pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
         crate::storage::storage_api::set_object_store_resolver(resolver)
     }
