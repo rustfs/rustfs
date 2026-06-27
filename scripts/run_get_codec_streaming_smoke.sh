@@ -1116,6 +1116,17 @@ else:
                 delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="encrypted"'),
                 "proves runtime encrypted object fallback reason delta",
             )
+            add(
+                profile,
+                "fallback_read_quorum_not_safe",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="read_quorum_not_safe"} delta > 0',
+                delta_for(
+                    profile,
+                    "rustfs_io_get_object_codec_streaming_fallback_total",
+                    'reason="read_quorum_not_safe"',
+                ),
+                "proves degraded-but-readable shard setup uses the legacy fallback path",
+            )
             compressed_delta = delta_for(
                 profile,
                 "rustfs_io_get_object_codec_streaming_fallback_total",
@@ -1286,6 +1297,7 @@ ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
 ${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,multipart,dry-run only
 ${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
+${profile},read_quorum_not_safe,${COMPAT_OBJECT_KEY}.degraded-read,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
 EOF
       if [[ "$COMPRESSED_FALLBACK_PROBE" == "true" ]]; then
         printf '%s,%s,%s%s,%s,%s,%s,%s,%s\n' \
@@ -1597,6 +1609,72 @@ else:
             "note": "Enable --compressed-fallback-probe to generate a runtime compressed fallback delta",
         }
     )
+
+degraded_key = object_key + ".degraded-read"
+degraded_path = bucket_path + "/" + urllib.parse.quote(degraded_key, safe="/-_.~")
+degraded_body = payload(max(object_size, 8 * 1024 * 1024))
+degraded_put, _ = request("PUT", degraded_path, degraded_body, [("content-type", "application/octet-stream")])
+if degraded_put["status"] not in (200, 204):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "read_quorum_not_safe",
+            "object_key": degraded_key,
+            "status": "put_failed",
+            "status_code": degraded_put["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": "read_quorum_not_safe",
+            "note": "degraded-read probe upload failed",
+        }
+    )
+else:
+    profile_dir = out_dir.parent
+    data_root = profile_dir / "data"
+    degraded_rel = pathlib.Path(*degraded_key.split("/"))
+    part_candidates = []
+    for disk_dir in sorted(data_root.glob("disk*")):
+        object_dir = disk_dir / bucket / degraded_rel
+        part_candidates.extend(sorted(object_dir.glob("*/part.1")))
+
+    if not part_candidates:
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "read_quorum_not_safe",
+                "object_key": degraded_key,
+                "status": "part_file_missing",
+                "status_code": "N/A",
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                "note": "degraded-read probe could not find an on-disk part.1 shard to move",
+            }
+        )
+    else:
+        degraded_part = part_candidates[0]
+        missing_dir = out_dir / "degraded-missing-shards"
+        missing_dir.mkdir(parents=True, exist_ok=True)
+        missing_part = missing_dir / f"{degraded_part.parent.name}-{degraded_part.name}"
+        if missing_part.exists():
+            missing_part.unlink()
+        degraded_part.rename(missing_part)
+        try:
+            degraded_part.parent.rmdir()
+        except OSError:
+            pass
+        degraded_get, degraded_get_body = request("GET", degraded_path)
+        degraded_ok = degraded_get["status"] == 200 and sha256_hex(degraded_get_body) == sha256_hex(degraded_body)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "read_quorum_not_safe",
+                "object_key": degraded_key,
+                "status": "ok" if degraded_ok else "unexpected_status_or_body",
+                "status_code": degraded_get["status"],
+                "body_len": len(degraded_get_body),
+                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                "note": f"Moved one shard to {missing_part}; degraded GET should stay on the legacy fallback path for codec profiles",
+            }
+        )
 
 multipart_key = object_key + ".multipart"
 multipart_path = bucket_path + "/" + urllib.parse.quote(multipart_key, safe="/-_.~")
