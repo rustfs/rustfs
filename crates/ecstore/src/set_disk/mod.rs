@@ -24,8 +24,10 @@ use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::diagnostics::get::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
-    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
+    GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX,
+    GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error,
+    record_get_object_pipeline_failure,
 };
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
@@ -407,6 +409,13 @@ fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io:
     match get_codec_streaming_engine() {
         GetCodecStreamingEngine::Legacy => Ok(CodecStreamingDecodeEngine::legacy(erasure)),
         GetCodecStreamingEngine::Rustfs => CodecStreamingDecodeEngine::rustfs(&erasure),
+    }
+}
+
+fn get_codec_streaming_metrics_path() -> &'static str {
+    match get_codec_streaming_engine() {
+        GetCodecStreamingEngine::Legacy => GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
+        GetCodecStreamingEngine::Rustfs => GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE,
     }
 }
 
