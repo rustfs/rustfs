@@ -14,7 +14,6 @@
 
 use super::ECStore;
 use super::ecfs::FS;
-use super::resolve_object_store_handle;
 use super::{
     PolicySys, StorageError, get_bucket_metadata, get_bucket_policy_raw, get_public_access_block_config, is_err_bucket_not_found,
 };
@@ -328,7 +327,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     let version_id = req_info.version_id.clone();
 
     if let Some(cred) = &cred {
-        let Ok(iam_store) = runtime_sources::ready_iam_handle() else {
+        let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("authorize_request {:?}", IamError::IamSysNotInitialized),
@@ -785,7 +784,8 @@ fn table_data_plane_admin_action(action: Action) -> Option<AdminAction> {
 }
 
 fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStoreTableCatalogStore<ECStore>> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store =
+        runtime_sources::current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
     Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
 }
@@ -841,7 +841,7 @@ async fn authorize_table_data_plane_if_needed(
     let Some(resource) = table_data_plane_resource_for_request(bucket, object).await? else {
         return Ok(());
     };
-    let Ok(iam_store) = runtime_sources::ready_iam_handle() else {
+    let Ok(iam_store) = runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
 
@@ -931,7 +931,7 @@ impl S3Access for FS {
         let req_info = ReqInfo {
             cred,
             is_owner,
-            region: runtime_sources::region(),
+            region: runtime_sources::current_region(),
             request_context,
             ..Default::default()
         };
@@ -1184,7 +1184,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn delete_object(&self, req: &mut S3Request<DeleteObjectInput>) -> S3Result<()> {
-        if let Some(store) = resolve_object_store_handle()
+        if let Some(store) = runtime_sources::current_object_store_handle()
             && let Err(err) = store.get_bucket_info(&req.input.bucket, &Default::default()).await
             && is_err_bucket_not_found(&err)
         {

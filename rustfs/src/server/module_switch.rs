@@ -159,7 +159,7 @@ pub(crate) fn validate_module_switch_update(requested: PersistedModuleSwitches) 
 }
 
 pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<PersistedModuleSwitches, String> {
-    let Some(store) = runtime_sources::object_store_handle() else {
+    let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err("storage layer not initialized".to_string());
     };
 
@@ -180,7 +180,7 @@ pub(crate) async fn refresh_persisted_module_switches_from_store() -> Result<Per
 }
 
 pub(crate) async fn save_persisted_module_switches_to_store(config: PersistedModuleSwitches) -> Result<(), String> {
-    let Some(store) = runtime_sources::object_store_handle() else {
+    let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err("storage layer not initialized".to_string());
     };
 

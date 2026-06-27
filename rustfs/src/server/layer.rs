@@ -906,7 +906,7 @@ fn is_public_health_endpoint_request(method: &Method, path: &str) -> bool {
 }
 
 async fn health_kms_ready() -> bool {
-    let Some(service_manager) = runtime_sources::kms_runtime_service_manager() else {
+    let Some(service_manager) = runtime_sources::current_kms_runtime_service_manager() else {
         return true;
     };
 
