@@ -45,6 +45,9 @@ The same facade also owns static pool-state, local-node storage, and peer-health
 status projections. Peer health remains explicitly unknown until a later slice
 wires real health signals; this document does not authorize background probes or
 RPC-based health checks.
+Readiness impact for storage, lock quorum, peer health, probes, admin routes,
+RPC, and the S3 data plane is recorded in
+[`readiness-matrix.md`](readiness-matrix.md).
 
 Risk controls:
 

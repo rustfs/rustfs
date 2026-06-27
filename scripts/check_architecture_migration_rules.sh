@@ -41,6 +41,28 @@ require_source_contains() {
   fi
 }
 
+require_source_contains "docs/architecture/overview.md" "## Baseline" "architecture overview baseline section"
+require_source_contains "docs/architecture/overview.md" "## Core Principle" "architecture overview core principle section"
+require_source_contains "docs/architecture/overview.md" "## Phase Order" "architecture overview phase order section"
+require_source_contains "docs/architecture/runtime-lifecycle.md" "## Startup And Readiness" "runtime lifecycle startup readiness section"
+require_source_contains "docs/architecture/runtime-lifecycle.md" "## Shutdown Lifecycle Boundary" "runtime lifecycle shutdown boundary section"
+require_source_contains "docs/architecture/runtime-lifecycle.md" "## AppContext Foundation" "runtime lifecycle AppContext section"
+require_source_contains "docs/architecture/storage-control-data-plane.md" "## Storage API Contracts" "storage control/data plane contracts section"
+require_source_contains "docs/architecture/storage-control-data-plane.md" "## Cluster Control Plane" "storage control/data plane cluster section"
+require_source_contains "docs/architecture/storage-control-data-plane.md" "## Background Controllers" "storage control/data plane background controllers section"
+require_source_contains "docs/architecture/crate-boundaries.md" "## Dependency Direction" "crate boundaries dependency direction section"
+require_source_contains "docs/architecture/crate-boundaries.md" "storage-api -> ecstore" "crate boundaries storage dependency rule"
+require_source_contains "docs/architecture/crate-boundaries.md" "extension-schema -> rustfs" "crate boundaries extension dependency rule"
+require_source_contains "docs/architecture/readiness-matrix.md" "## Request Behavior Matrix" "readiness matrix request behavior section"
+require_source_contains "docs/architecture/readiness-matrix.md" "## Runtime Dependency Matrix" "readiness matrix runtime dependency section"
+require_source_contains "docs/architecture/readiness-matrix.md" "## Probe Semantics" "readiness matrix probe semantics section"
+require_source_contains "docs/architecture/readiness-matrix.md" "S3 data plane" "readiness matrix S3 data plane behavior"
+require_source_contains "docs/architecture/readiness-matrix.md" "Internode RPC and gRPC" "readiness matrix internode RPC behavior"
+require_source_contains "docs/architecture/readiness-matrix.md" "StorageReady" "readiness matrix storage dependency"
+require_source_contains "docs/architecture/readiness-matrix.md" "IamReady" "readiness matrix IAM dependency"
+require_source_contains "docs/architecture/readiness-matrix.md" "FullReady" "readiness matrix full readiness dependency"
+require_source_contains "docs/architecture/readiness-matrix.md" "RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE" "readiness matrix peer health gate"
+
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
 

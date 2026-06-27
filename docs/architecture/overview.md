@@ -20,6 +20,8 @@ hot-path behavior must not drift during this migration.
 
 - [`runtime-lifecycle.md`](runtime-lifecycle.md): runtime, AppContext,
   startup/readiness, and shutdown contracts.
+- [`readiness-matrix.md`](readiness-matrix.md): request-surface behavior,
+  runtime dependency readiness, probe semantics, and preservation rules.
 - [`s3-tables-support-matrix.md`](s3-tables-support-matrix.md): supported,
   preview, reference-only, and not-claimed S3 Tables and Iceberg REST Catalog
   surfaces.
