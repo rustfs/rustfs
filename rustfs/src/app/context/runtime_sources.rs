@@ -12,15 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
     ScannerMetricsReport, StorageClassConfig, TierConfigMgr, collect_scanner_metrics_report, get_daily_all_tier_stats,
     get_global_boot_time, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_expiry_state,
     get_global_lock_client, get_global_lock_clients, get_global_notification_sys, get_global_region, get_global_replication_pool,
-    get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port, new_object_layer_fn, set_global_storage_class,
+    get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
 };
-use super::super::storage_api::context::{ECStore, EndpointServerPools};
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_credentials::{Credentials, get_global_action_cred};
@@ -30,7 +30,7 @@ use rustfs_io_metrics::{
     global_metrics::get_global_metrics,
     internode_metrics::{InternodeMetrics, global_internode_metrics},
 };
-use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
+use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
@@ -50,10 +50,6 @@ pub fn init_kms_service_manager() -> Arc<KmsServiceManager> {
     rustfs_kms::init_global_kms_service_manager()
 }
 
-pub async fn encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    rustfs_kms::get_global_encryption_service().await
-}
-
 pub fn outbound_tls_generation() -> TlsGeneration {
     load_global_outbound_tls_generation()
 }
@@ -65,14 +61,6 @@ pub fn set_outbound_tls_generation(generation: u64) {
 
 pub async fn outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     load_global_outbound_tls_state().await
-}
-
-pub fn iam_is_ready() -> bool {
-    rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
-}
-
-pub fn iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    rustfs_iam::get_global_iam_sys()
 }
 
 pub fn ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
@@ -204,8 +192,4 @@ pub fn set_storage_class(config: StorageClassConfig) {
 
 pub fn buffer_config() -> RustFSBufferConfig {
     get_global_buffer_config().clone()
-}
-
-pub fn object_store() -> Option<Arc<ECStore>> {
-    new_object_layer_fn()
 }

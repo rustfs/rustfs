@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::resolve_action_credentials;
+use crate::runtime_sources::current_action_credentials;
 use crate::storage_api::protocols::client::{FS, ReqInfo, RequestContext};
 use http::{HeaderMap, Method};
 use percent_encoding::{AsciiSet, CONTROLS, utf8_percent_encode};
@@ -140,7 +140,7 @@ impl ProtocolStorageClient {
     ) -> S3Result<S3Request<T>> {
         let mut extensions = http::Extensions::default();
 
-        let is_owner = if let Some(global_cred) = resolve_action_credentials() {
+        let is_owner = if let Some(global_cred) = current_action_credentials() {
             params.access_key == global_cred.access_key
         } else {
             false

@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::runtime_sources::resolve_action_credentials;
+use crate::runtime_sources::{current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
 use http::Uri;
 use rustfs_credentials::Credentials;
@@ -186,7 +186,7 @@ impl S3Auth for IAMAuth {
             return Ok(key);
         }
 
-        if let Ok(iam_store) = crate::runtime_sources::resolve_ready_iam_handle() {
+        if let Ok(iam_store) = current_ready_iam_handle() {
             // Use check_key instead of get_user to ensure user is loaded from disk if not in cache
             // This is important for newly created users that may not be in cache yet.
             // check_key will automatically attempt to load the user from disk if not found in cache.
@@ -331,7 +331,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
         return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
     }
 
-    let Some(mut cred) = resolve_action_credentials() else {
+    let Some(mut cred) = current_action_credentials() else {
         return Err(S3Error::with_message(
             S3ErrorCode::InternalError,
             format!("get_global_action_cred {:?}", IamError::IamSysNotInitialized),
@@ -341,7 +341,7 @@ pub async fn check_key_valid(session_token: &str, access_key: &str) -> S3Result<
     let sys_cred = cred.clone();
 
     if !constant_time_eq(&cred.access_key, access_key) {
-        let Ok(iam_store) = crate::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = current_ready_iam_handle() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 format!("check_key_valid {:?}", IamError::IamSysNotInitialized),
@@ -435,7 +435,7 @@ pub fn check_claims_from_token(token: &str, cred: &Credentials) -> S3Result<Hash
         return Err(s3_error!(InvalidRequest, "invalid access key is temp and expired"));
     }
 
-    let Some(sys_cred) = resolve_action_credentials() else {
+    let Some(sys_cred) = current_action_credentials() else {
         return Err(s3_error!(InternalError, "action cred not init"));
     };
 
@@ -611,7 +611,7 @@ pub fn get_condition_values_with_query_and_client_info(
         cred.access_key.clone()
     };
 
-    let sys_cred = resolve_action_credentials().unwrap_or_default();
+    let sys_cred = current_action_credentials().unwrap_or_default();
 
     let claims = &cred.claims;
 

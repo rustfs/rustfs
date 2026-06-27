@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-global-app-runtime-consumer-batch`
+- Branch: `overtrue/arch-runtime-default-resolver-fallback-removal`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -14,19 +14,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   GLOB-005/CRATE-001/CRATE-002 from PR #3939, GLOB-006 from PR #3941,
   the first GLOB-007 admin runtime context handoff from PR #3942, and the
   GLOB-007 admin object-store/notification/server-config consumer batch from
-  PR #3943, the GLOB-007 admin runtime helper alias batch from PR #3944, and
-  the GLOB-007 storage/server runtime facade consumer batch from PR #3946.
-- Current phase PR: GLOB-007 app runtime facade consumer batch.
-- Based on: `origin/main` after PR #3946 merged.
+  PR #3943, the GLOB-007 admin runtime helper alias batch from PR #3944, the
+  GLOB-007 storage/server runtime facade consumer batch from PR #3946, the
+  GLOB-007 app runtime facade consumer batch from PR #3947, the GLOB-007 core
+  runtime facade consumer batch from PR #3948, the GLOB-007 runtime facade
+  alias sweep from PR #3949, the GLOB-007 object-store fallback removal from
+  PR #3950, the GLOB-007 notification-system/server-config fallback removal
+  from PR #3951, the GLOB-007 optional runtime handle fallback removal from
+  PR #3952, the GLOB-007 AppContext-only fallback signature cleanup from
+  PR #3953, and the GLOB-007 runtime resolver fallback boundary cleanup from
+  PR #3954.
+- Current phase PR: GLOB-007 service/credential resolver fallback removal.
+- Based on: current `origin/main` after PR #3954 merged.
 - PR type for this branch: `ci-gate`.
-- Runtime behavior changes: none intended.
-- Rust code changes: expose app runtime facade aliases as `current_*` and route
-  bucket, admin, object, multipart, select-object, and lifecycle test
-  consumers through those names while keeping the underlying root resolvers and
-  fallback behavior unchanged.
+- Runtime behavior changes: when no AppContext is published, service/credential
+  resolvers for KMS manager lookup, encryption service, IAM readiness/handle,
+  ready IAM handle, and action credentials now return their empty/error state
+  instead of consulting legacy globals.
+- Rust code changes: remove those public no-AppContext fallbacks, delete the
+  now-unused legacy runtime-source adapters, and pass object ZIP download token
+  signing credentials explicitly after resolving them at handler boundaries.
+  SSE/KMS tests now inject their test KMS service manager explicitly instead of
+  relying on no-AppContext fallback reads.
 - CI/script changes: none intended.
-- Docs changes: update this progress ledger for the app runtime facade consumer
-  batch.
+- Docs changes: update this progress ledger for the service/credential fallback
+  removal.
 
 ## Phase 0 Tasks
 
@@ -2797,9 +2809,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Current slice: expose app runtime-source facade reads as `current_*`
     aliases and move app bucket/admin/object/multipart/select-object consumers
     plus the lifecycle transition test off direct resolver names.
-  - Remaining work: remove one fallback family per PR only after scans prove no
-    production caller depends on it; this slice keeps the fallback behavior
-    because broader app/storage/server consumers still use the root resolvers.
+  - Current slice: expose root runtime-source facade reads as `current_*`
+    aliases and move auth, init, startup, protocols, config info, and workload
+    admission consumers off direct resolver names.
+  - Current slice: expose the remaining root runtime-source `current_*`
+    aliases, route admin/app/server/storage facade modules through alias names,
+    and move admin context-aware object-store, notification-system, and
+    server-config consumers off direct resolver names.
+  - Current slice: remove the legacy global object-store fallback from the
+    AppContext object-store resolver family after production consumers were
+    routed through current runtime facade helpers.
+  - Current slice: remove the legacy global notification-system and
+    server-config read fallbacks from the AppContext resolver family while
+    preserving the server-config publish path used during startup.
+  - Current slice: remove the legacy global fallbacks from optional runtime
+    handle/read resolvers for token signing key, bucket metadata, endpoints,
+    bucket monitor, replication handles, boot time, deployment ID, lock
+    clients, and region.
+  - Current slice: remove stale fallback closure parameters from
+    AppContext-only resolver helpers after their no-context behavior no longer
+    consults legacy globals.
+  - Current slice: move the remaining resolver helper fallback parameters to
+    public runtime facade boundaries, preserving no-AppContext fallback behavior
+    while making private helpers context-only.
+  - Current slice: remove the public no-AppContext legacy fallbacks from
+    service/credential resolvers for KMS manager lookup, encryption service,
+    IAM readiness/handle, ready IAM handle, and action credentials.
+  - Remaining work: remove the next fallback family per PR only after scans
+    prove no production caller depends on it.
   - Verification: focused RustFS compile and admin test-target compile,
     resolver residual scan, formatting, diff hygiene, architecture guard, Rust
     risk scan, and full PR gate.
@@ -6066,6 +6103,30 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | GLOB-007 removes the next cohesive service/credential fallback family without changing public resolver signatures or caller-side error handling contracts. |
+| Migration preservation | pass | AppContext-backed behavior is unchanged; absent AppContext now returns `None`, `false`, or `IamSysNotInitialized` for the affected service/credential resolvers instead of consulting legacy globals. |
+| Testing/verification | pass | Focused resolver, object ZIP download, and SSE/KMS tests passed; compile, formatting, architecture guard, service/credential fallback residual scan, diff hygiene, Rust risk scan, Rust quality scan, and full `make pre-pr` are required before PR. |
+| Quality/architecture | pass | GLOB-007 moves the remaining resolver helper fallback parameters out to public facade boundaries, making private helper paths context-only without hiding fallback closures. |
+| Migration preservation | pass | Public runtime facade names, return types, and no-AppContext fallback behavior are preserved; only helper signatures and focused resolver tests change. |
+| Testing/verification | pass | Focused resolver test, compile, formatting, architecture guard, fallback-boundary residual scan, diff hygiene, diff-added Rust risk scan, Rust quality scan, and full `make pre-pr` passed before PR. |
+| Quality/architecture | pass | GLOB-007 removes stale fallback closure parameters from resolver helpers whose no-context behavior is already AppContext-only, making hidden fallback reintroduction harder. |
+| Migration preservation | pass | Public runtime facade names and return types stay unchanged; this is a signature cleanup for private helper paths and test coverage after PR #3952. |
+| Testing/verification | pass | Focused resolver test passed; compile, formatting, architecture guard, fallback-parameter residual scan, diff hygiene, diff-added Rust risk scan, and full `make pre-pr` are required before PR. |
+| Quality/architecture | pass | GLOB-007 removes a broad optional-handle resolver fallback batch, keeping absent AppContext from consulting legacy globals for token signing key, bucket metadata, endpoints, bucket monitor, replication, boot, deployment, lock, and region reads. |
+| Migration preservation | pass | Action credentials, concrete default-returning runtime families, startup publishers, KMS/TLS/IAM readiness initialization, scanner metrics, S3 Select, local node name, tier config, expiry state, performance metrics, and buffer config fallbacks are intentionally left unchanged for later slices. |
+| Testing/verification | pass | Focused RustFS compile/test, formatting, architecture guard, optional-handle fallback residual scan, diff hygiene, diff-added Rust risk scan, and full `make pre-pr` are required before PR. |
+| Quality/architecture | pass | GLOB-007 removes the notification-system and server-config resolver read fallbacks, keeping no-context reads from consulting legacy globals while preserving explicit AppContext interfaces. |
+| Migration preservation | pass | Server-config publishing keeps the no-context startup write path; notification-system and server-config consumers already route through current runtime facades, so initialized AppContext behavior remains unchanged. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, notification/server-config fallback residual scan, diff hygiene, diff-added Rust risk scan, and full `make pre-pr` passed before PR. |
+| Quality/architecture | pass | GLOB-007 removes the object-store resolver family's legacy global fallback and keeps object-store access behind AppContext-backed current runtime facades. |
+| Migration preservation | pass | All production object-store consumers resolve through admin, app, server, storage, or root current-runtime helpers; absent AppContext now returns `None` instead of consulting the legacy object layer. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, object-store fallback residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
+| Quality/architecture | pass | GLOB-007 exposes the remaining root runtime-source `current_*` aliases and routes admin, app, server, and storage facade modules plus admin context-aware consumers through alias names. |
+| Migration preservation | pass | The alias sweep delegates to the same root AppContext-first resolvers, so object-store, notification-system, server-config, KMS, IAM, endpoint, tier, scanner, lock, and metrics behavior stays unchanged. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, facade residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
+| Quality/architecture | pass | GLOB-007 adds root runtime-source `current_*` aliases for core consumers and moves auth, init, startup, protocols, config info, and workload admission callers off direct resolver names. |
+| Migration preservation | pass | The aliases delegate to the same root AppContext-first resolvers, so owner credentials, IAM ready lookup, notification startup, region selection, TLS generation, replication pool, buffer config, and workload admission behavior stay unchanged. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, core resolver residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
 | Quality/architecture | pass | GLOB-007 exposes app runtime-source facade reads as `current_*` aliases and moves bucket, admin, object, multipart, select-object, and lifecycle test consumers off direct resolver names. |
 | Migration preservation | pass | The aliases delegate to the same root runtime resolvers, so AppContext object-store selection, notification dispatch, expiry/tier handles, endpoint snapshots, encryption service, and S3 Select DB behavior stay unchanged. |
 | Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, app resolver residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
@@ -6437,6 +6498,131 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 GLOB-007 service/credential resolver fallback removal:
+  - Branch freshness check: rebased onto current `origin/main` after PR #3954
+    merged.
+  - `cargo test -p rustfs --lib app::context::tests::resolver_helpers_are_context_first_and_empty_when_context_is_absent`:
+    passed.
+  - `cargo test -p rustfs --lib admin::handlers::object_zip_download::tests`:
+    passed.
+  - `cargo test -p rustfs --lib storage::sse::tests::test_kms_sse_dek_provider_uses_latest_reconfigured_service`:
+    passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Service/credential fallback residual scan: passed.
+  - Removed runtime-source fallback adapter scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Rust code quality scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests
+    passed).
+
+- Issue #660 GLOB-007 runtime resolver fallback boundary cleanup:
+  - Branch freshness check: moved onto `origin/main` after PR #3953 merged.
+  - `cargo test -p rustfs --lib app::context::tests::resolver_helpers_are_context_first_and_empty_when_context_is_absent`:
+    passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Resolver fallback-boundary residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Rust code quality scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests passed).
+
+- Issue #660 GLOB-007 AppContext-only fallback signature cleanup:
+  - Branch freshness check: rebased onto `origin/main` after PR #3952 merged.
+  - `cargo test -p rustfs --lib app::context::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent`:
+    passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - AppContext-only fallback parameter residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests passed).
+
+- Issue #660 GLOB-007 optional runtime handle fallback removal:
+  - Branch freshness check: rebased onto `origin/main` after PR #3951 merged.
+  - `cargo test -p rustfs --lib app::context::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent`:
+    passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Optional-handle fallback residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests passed).
+
+- Issue #660 GLOB-007 notification-system/server-config fallback removal:
+  - Branch freshness check: prepared from
+    `overtrue/arch-runtime-object-store-fallback-removal`, then based on
+    `origin/overtrue/arch-global-core-runtime-consumer-batch` after PR #3950
+    merged into that pending base branch.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Notification/server-config fallback residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests
+    passed).
+
+- Issue #660 GLOB-007 object-store fallback removal:
+  - Branch freshness check: rebased onto
+    `origin/overtrue/arch-global-core-runtime-consumer-batch` after PR #3949
+    merged into that base branch; full PR gate passed before the rebase.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Object-store fallback residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests
+    passed).
+
+- Issue #660 GLOB-007 runtime facade alias sweep:
+  - Branch freshness check: created from
+    `overtrue/arch-global-core-runtime-consumer-batch` while PR #3948 is
+    pending.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Runtime facade resolver residual scan: passed.
+  - Diff-added Rust risk scan: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed (`nextest`: 6917 passed, 112 skipped; doctests
+    passed).
+
+- Issue #660 GLOB-007 core runtime facade consumer slice:
+  - Branch freshness check: rebased onto `origin/main` after PR #3947 merged.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - Core runtime resolver residual scan: passed.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    panic/todo/dbg, or ad-hoc stdout/stderr.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed, including 6912 nextest tests passed, 112 skipped,
+    and doctests.
 
 - Issue #660 GLOB-007 app runtime facade consumer slice:
   - Branch freshness check: rebased onto `origin/main` after PR #3946 merged.
