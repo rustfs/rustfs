@@ -44,6 +44,7 @@ struct FillResult<S, W> {
     workspace: W,
     result: io::Result<Option<Vec<u8>>>,
     queued_buffers: VecDeque<Vec<u8>>,
+    reusable_buffers: Vec<Vec<u8>>,
     deferred_error: Option<io::Error>,
 }
 
@@ -95,6 +96,7 @@ where
     workspace: Option<E::Workspace>,
     output_buf: Vec<u8>,
     output_pos: usize,
+    reusable_output_bufs: Vec<Vec<u8>>,
     prefetched_bufs: VecDeque<Vec<u8>>,
     prefetch_error: Option<io::Error>,
     prefetch_wait_started_at: Option<Instant>,
@@ -148,6 +150,7 @@ where
             workspace: Some(workspace),
             output_buf: Vec::new(),
             output_pos: 0,
+            reusable_output_bufs: Vec::new(),
             prefetched_bufs: VecDeque::new(),
             prefetch_error: None,
             prefetch_wait_started_at: None,
@@ -155,6 +158,34 @@ where
             remaining: total_length,
             fill: None,
         })
+    }
+
+    fn max_reusable_output_bufs(&self) -> usize {
+        self.fill_policy.max_inflight() + 1
+    }
+
+    fn push_reusable_output_buf(&mut self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || self.reusable_output_bufs.len() >= self.max_reusable_output_bufs() {
+            return;
+        }
+        buf.clear();
+        self.reusable_output_bufs.push(buf);
+    }
+
+    fn recycle_drained_output_buf(&mut self) {
+        if self.output_pos < self.output_buf.len() {
+            return;
+        }
+
+        let buf = std::mem::take(&mut self.output_buf);
+        self.output_pos = 0;
+        self.push_reusable_output_buf(buf);
+    }
+
+    fn extend_reusable_output_bufs(&mut self, bufs: Vec<Vec<u8>>) {
+        for buf in bufs {
+            self.push_reusable_output_buf(buf);
+        }
     }
 
     #[cfg(test)]
@@ -183,6 +214,7 @@ where
             let stage_metrics_enabled = self.stage_metrics_enabled;
             let fill_policy = self.fill_policy;
             let remaining = self.remaining;
+            let mut reusable_buffers = std::mem::take(&mut self.reusable_output_bufs);
             self.fill = Some(tokio::spawn(async move {
                 let mut queued_buffers = VecDeque::new();
                 let mut deferred_error = None;
@@ -191,7 +223,26 @@ where
                 let state = source.read_next_stripe().await;
                 record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
                 let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                let result = decode_stripe(metrics_path, stage_metrics_enabled, &engine, &mut workspace, state, remaining);
+                let mut output_buf = reusable_buffers.pop().unwrap_or_default();
+                let result = match decode_stripe_into(
+                    metrics_path,
+                    stage_metrics_enabled,
+                    &engine,
+                    &mut workspace,
+                    state,
+                    remaining,
+                    &mut output_buf,
+                ) {
+                    Ok(true) => Ok(Some(output_buf)),
+                    Ok(false) => {
+                        reusable_buffers.push(output_buf);
+                        Ok(None)
+                    }
+                    Err(err) => {
+                        reusable_buffers.push(output_buf);
+                        Err(err)
+                    }
+                };
                 record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
                 if let Ok(Some(first_buf)) = result.as_ref() {
                     let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
@@ -203,27 +254,31 @@ where
                         let state = source.read_next_stripe().await;
                         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
                         let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                        let queued_result = decode_stripe(
+                        let mut queued_buf = reusable_buffers.pop().unwrap_or_default();
+                        let queued_result = decode_stripe_into(
                             metrics_path,
                             stage_metrics_enabled,
                             &engine,
                             &mut workspace,
                             state,
                             remaining_after_first,
+                            &mut queued_buf,
                         );
                         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
                         match queued_result {
-                            Ok(Some(buf)) => {
-                                remaining_after_first = remaining_after_first.saturating_sub(buf.len());
-                                queued_buffers.push_back(buf);
+                            Ok(true) => {
+                                remaining_after_first = remaining_after_first.saturating_sub(queued_buf.len());
+                                queued_buffers.push_back(queued_buf);
                             }
-                            Ok(None) => {
+                            Ok(false) => {
+                                reusable_buffers.push(queued_buf);
                                 if remaining_after_first > 0 {
                                     deferred_error = Some(DiskError::LessData.into());
                                 }
                                 break;
                             }
                             Err(err) => {
+                                reusable_buffers.push(queued_buf);
                                 deferred_error = Some(err);
                                 break;
                             }
@@ -236,6 +291,7 @@ where
                     workspace,
                     result,
                     queued_buffers,
+                    reusable_buffers,
                     deferred_error,
                 }
             }));
@@ -251,6 +307,7 @@ where
             workspace,
             result,
             queued_buffers,
+            reusable_buffers,
             deferred_error,
         } = match fill_result {
             Ok(result) => result,
@@ -263,6 +320,7 @@ where
         self.source = Some(source);
         self.workspace = Some(workspace);
         self.fill = None;
+        self.extend_reusable_output_bufs(reusable_buffers);
         if let Some(deferred_error) = deferred_error {
             self.prefetch_error = Some(deferred_error);
         }
@@ -433,6 +491,8 @@ where
                 continue;
             }
 
+            self.recycle_drained_output_buf();
+
             if let Some(next_buf) = self.prefetched_bufs.pop_front() {
                 rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, next_buf.len());
                 self.output_buf = next_buf;
@@ -538,19 +598,21 @@ where
     }
 }
 
-fn decode_stripe<E>(
+fn decode_stripe_into<E>(
     metrics_path: &'static str,
     stage_metrics_enabled: bool,
     engine: &E,
     workspace: &mut E::Workspace,
     state: StripeReadState,
     remaining: usize,
-) -> io::Result<Option<Vec<u8>>>
+    output: &mut Vec<u8>,
+) -> io::Result<bool>
 where
     E: ErasureDecodeEngine,
 {
+    output.clear();
     if state.slots().is_empty() {
-        return Ok(None);
+        return Ok(false);
     }
     if !state.can_decode() {
         return Err(DiskError::ErasureReadQuorum.into());
@@ -560,9 +622,9 @@ where
     if state.data_shards_complete(engine.data_shards()) {
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
         let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let output = emit_data_shards(&state, engine.data_shards(), engine.block_size(), remaining)?;
+        emit_data_shards_into(&state, engine.data_shards(), engine.block_size(), remaining, output)?;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_EMIT, emit_stage_start);
-        return Ok(Some(output));
+        return Ok(true);
     }
 
     let (mut shards, _errs) = state.into_parts();
@@ -580,7 +642,7 @@ where
     }
 
     let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-    let mut output = Vec::with_capacity(engine.block_size().min(remaining));
+    reserve_output_capacity(output, engine.block_size().min(remaining));
     for shard in shards.iter().take(engine.data_shards()) {
         if output.len() >= remaining {
             break;
@@ -593,11 +655,30 @@ where
     }
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_EMIT, emit_stage_start);
 
-    Ok(Some(output))
+    Ok(true)
 }
 
 fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(block_size.min(remaining));
+    let mut output = Vec::new();
+    emit_data_shards_into(state, data_shards, block_size, remaining, &mut output)?;
+    Ok(output)
+}
+
+fn reserve_output_capacity(output: &mut Vec<u8>, target_capacity: usize) {
+    if output.capacity() < target_capacity {
+        output.reserve(target_capacity - output.capacity());
+    }
+}
+
+fn emit_data_shards_into(
+    state: &StripeReadState,
+    data_shards: usize,
+    block_size: usize,
+    remaining: usize,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    output.clear();
+    reserve_output_capacity(output, block_size.min(remaining));
     for index in 0..data_shards {
         if output.len() >= remaining {
             break;
@@ -611,7 +692,7 @@ fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usi
         let copy_len = shard.len().min(remaining - output.len());
         output.extend_from_slice(&shard[..copy_len]);
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1190,5 +1271,39 @@ mod tests {
         })
         .await
         .expect("reader should start reading the next stripe before the current output buffer is fully consumed");
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_reuses_output_buffers_after_drain() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..128u16)
+            .map(|value| value.wrapping_mul(5).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let source = source_from_data(&erasure, &data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("reader should decode all stripes");
+
+        assert_eq!(decoded, data);
+        assert!(reader.reusable_output_bufs.len() <= reader.max_reusable_output_bufs());
+        assert!(
+            reader
+                .reusable_output_bufs
+                .iter()
+                .any(|buf| buf.capacity() >= erasure.block_size),
+            "drained stripe output buffers should be available for reuse"
+        );
     }
 }
