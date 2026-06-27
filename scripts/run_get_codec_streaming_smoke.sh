@@ -31,6 +31,13 @@ SHARD_LOCALITY_PREFERENCE="off"
 OUTPUT_HANDOFF_ATTRIBUTION=false
 DIAGNOSTIC_METRICS=false
 DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
+DIAGNOSTIC_PROMETHEUS_QUERY_URL=""
+DIAGNOSTIC_PROMETHEUS_QUERY='{__name__=~"rustfs_io_get_object_.*"}'
+DIAGNOSTIC_METRICS_SETTLE_SECS="${RUSTFS_DIAGNOSTIC_METRICS_SETTLE_SECS:-2}"
+DIAGNOSTIC_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
+DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
+DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
+DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-codec}"
 SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
 COMPRESSED_FALLBACK_PROBE=false
 COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
@@ -73,6 +80,24 @@ Core options:
   --diagnostic-metrics           Enable observability metrics export and capture server-side metrics
   --diagnostic-metrics-url <url> Prometheus scrape URL for diagnostic captures
                                  (default: http://127.0.0.1:8889/metrics)
+  --diagnostic-prometheus-query-url <url>
+                                 Prometheus HTTP API query endpoint for OTLP-exported metrics,
+                                 e.g. http://localhost:9090/api/v1/query
+  --diagnostic-prometheus-query <promql>
+                                 PromQL used with --diagnostic-prometheus-query-url
+                                 (default: {__name__=~"rustfs_io_get_object_.*"})
+  --diagnostic-metrics-settle-secs <n>
+                                 Seconds to wait before the after snapshot so OTLP periodic
+                                 metrics can export probe counters (default: 2)
+  --diagnostic-obs-endpoint <url>
+                                 RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
+  --diagnostic-obs-metric-endpoint <url>
+                                 RUSTFS_OBS_METRIC_ENDPOINT passed to RustFS during diagnostic runs
+  --diagnostic-obs-meter-interval <secs>
+                                 RUSTFS_OBS_METER_INTERVAL passed during diagnostic runs (default: 1)
+  --diagnostic-obs-service-name-prefix <name>
+                                 Prefix used for unique per-profile RUSTFS_OBS_SERVICE_NAME
+                                 (default: RustFS-get-codec, or existing RUSTFS_OBS_SERVICE_NAME)
   --compressed-fallback-probe    Enable disk compression only for the compressed fallback probe object
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
@@ -182,6 +207,13 @@ parse_args() {
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
       --diagnostic-metrics) DIAGNOSTIC_METRICS=true; shift ;;
       --diagnostic-metrics-url) DIAGNOSTIC_METRICS_URL="$2"; shift 2 ;;
+      --diagnostic-prometheus-query-url) DIAGNOSTIC_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
+      --diagnostic-prometheus-query) DIAGNOSTIC_PROMETHEUS_QUERY="$2"; shift 2 ;;
+      --diagnostic-metrics-settle-secs) DIAGNOSTIC_METRICS_SETTLE_SECS="$2"; shift 2 ;;
+      --diagnostic-obs-endpoint) DIAGNOSTIC_OBS_ENDPOINT="$2"; shift 2 ;;
+      --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
+      --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
+      --diagnostic-obs-service-name-prefix) DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="$2"; shift 2 ;;
       --compressed-fallback-probe) COMPRESSED_FALLBACK_PROBE=true; shift ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
@@ -252,7 +284,10 @@ validate_args() {
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
+  validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
+  validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
+  [[ -n "$DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX" ]] || die "--diagnostic-obs-service-name-prefix must not be empty"
   [[ -n "$DIAGNOSTIC_METRICS_URL" ]] || die "--diagnostic-metrics-url must not be empty"
 
   [[ -x "$ENHANCED_BENCH" ]] || die "enhanced benchmark script is not executable: $ENHANCED_BENCH"
@@ -282,6 +317,17 @@ bool_from_on_off() {
 
 command_line_string() {
   printf '%q ' "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+}
+
+sanitize_metric_label_value() {
+  printf '%s' "$1" | tr -c '[:alnum:]_-' '-'
+}
+
+diagnostic_service_name() {
+  local profile="$1"
+  local run_id
+  run_id="$(sanitize_metric_label_value "$(basename "$OUT_DIR")")"
+  echo "${DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX}-${run_id}-${profile}"
 }
 
 detect_cpu_summary() {
@@ -414,6 +460,13 @@ codec_header_compat_confirmed_codec_profile=true
 output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
 diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
+diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
+diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
+diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
+diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
+diagnostic_obs_service_name_prefix=${DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
 compressed_fallback_probe=${COMPRESSED_FALLBACK_PROBE}
 compressed_probe_extension=${COMPRESSED_PROBE_EXTENSION}
@@ -524,11 +577,12 @@ write_manifest() {
   local volumes="$4"
   local codec_engine="$5"
   local metrics_path="$6"
-  local rollout_target body_compat_confirmed header_compat_confirmed
+  local rollout_target body_compat_confirmed header_compat_confirmed obs_service_name
   local git_head git_dirty_count
   rollout_target="$(profile_rollout_target "$profile")"
   body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
   header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
+  obs_service_name="$(diagnostic_service_name "$profile")"
 
   git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
   git_dirty_count="$(git -C "$PROJECT_ROOT" status --porcelain | awk 'END { print NR + 0 }')"
@@ -565,11 +619,18 @@ RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
+RUSTFS_OBS_ENDPOINT=${DIAGNOSTIC_OBS_ENDPOINT}
+RUSTFS_OBS_METRIC_ENDPOINT=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
+RUSTFS_OBS_METER_INTERVAL=${DIAGNOSTIC_OBS_METER_INTERVAL}
+RUSTFS_OBS_SERVICE_NAME=${obs_service_name}
 RUSTFS_COMPRESSION_ENABLED=${COMPRESSED_FALLBACK_PROBE}
 RUSTFS_COMPRESSION_EXTENSIONS=${COMPRESSED_PROBE_EXTENSION}
 RUSTFS_COMPRESSION_MIME_TYPES=${COMPRESSED_PROBE_MIME_TYPE}
 diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
+diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
+diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
@@ -631,6 +692,7 @@ start_server() {
   local rollout_target
   local body_compat_confirmed
   local header_compat_confirmed
+  local obs_service_name
   local rustfs_log
 
   data_root="$(profile_data_root "$profile")"
@@ -641,6 +703,7 @@ start_server() {
   rollout_target="$(profile_rollout_target "$profile")"
   body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
   header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
+  obs_service_name="$(diagnostic_service_name "$profile")"
   rustfs_log="${profile_dir}/rustfs.log"
 
   mkdir -p "${data_root}/disk1" "${data_root}/disk2" "${data_root}/disk3" "${data_root}/disk4"
@@ -671,6 +734,16 @@ start_server() {
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
+    if [[ "$DIAGNOSTIC_METRICS" == "true" ]]; then
+      export RUSTFS_OBS_METER_INTERVAL="$DIAGNOSTIC_OBS_METER_INTERVAL"
+      export RUSTFS_OBS_SERVICE_NAME="$obs_service_name"
+      if [[ -n "$DIAGNOSTIC_OBS_ENDPOINT" ]]; then
+        export RUSTFS_OBS_ENDPOINT="$DIAGNOSTIC_OBS_ENDPOINT"
+      fi
+      if [[ -n "$DIAGNOSTIC_OBS_METRIC_ENDPOINT" ]]; then
+        export RUSTFS_OBS_METRIC_ENDPOINT="$DIAGNOSTIC_OBS_METRIC_ENDPOINT"
+      fi
+    fi
     export RUSTFS_COMPRESSION_ENABLED="$COMPRESSED_FALLBACK_PROBE"
     export RUSTFS_COMPRESSION_EXTENSIONS="$COMPRESSED_PROBE_EXTENSION"
     export RUSTFS_COMPRESSION_MIME_TYPES="$COMPRESSED_PROBE_MIME_TYPE"
@@ -739,6 +812,90 @@ service_metrics_dir() {
   echo "${OUT_DIR}/${profile}/service-metrics"
 }
 
+capture_prometheus_query_snapshot() {
+  local phase="$1"
+  local snapshot_file="$2"
+  local status_file="$3"
+  local service_name="$4"
+
+  "$PYTHON_BIN" - "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" "$DIAGNOSTIC_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$service_name" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+query_url, query, phase, snapshot_raw, status_raw, service_name = sys.argv[1:]
+snapshot_path = pathlib.Path(snapshot_raw)
+status_path = pathlib.Path(status_raw)
+
+
+def write_status(status):
+    status_path.write_text(
+        "\n".join(
+            [
+                f"phase={phase}",
+                f"status={status}",
+                f"url={query_url}",
+                f"query={query}",
+                f"service_name={service_name}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def escape_label(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def sample_to_line(sample):
+    metric = dict(sample.get("metric", {}))
+    name = metric.pop("__name__", "")
+    if not name:
+        return None
+    labels = ",".join(f'{key}="{escape_label(value)}"' for key, value in sorted(metric.items()))
+    value = sample.get("value", [None, None])[1]
+    if value is None:
+        return None
+    if labels:
+        return f"{name}{{{labels}}} {value}"
+    return f"{name} {value}"
+
+
+try:
+    separator = "&" if "?" in query_url else "?"
+    url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as err:  # noqa: BLE001 - shell harness reports the failure in status files.
+    snapshot_path.write_text(f"# prometheus_query_failed error={err}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+if payload.get("status") != "success":
+    snapshot_path.write_text(f"# prometheus_query_failed payload_status={payload.get('status')}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+samples = [
+    sample
+    for sample in payload.get("data", {}).get("result", [])
+    if not service_name or sample.get("metric", {}).get("service.name") == service_name
+]
+lines = [line for sample in samples if (line := sample_to_line(sample))]
+if not lines:
+    snapshot_path.write_text(f"# no_matching_metrics service_name={service_name}\n", encoding="utf-8")
+    write_status("no_matching_metrics")
+    raise SystemExit(0)
+
+snapshot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+write_status("ok")
+PY
+}
+
 capture_service_metrics_snapshot() {
   local profile="$1"
   local phase="$2"
@@ -760,6 +917,11 @@ phase=${phase}
 status=not_run_dry_run
 url=${DIAGNOSTIC_METRICS_URL}
 EOF
+    return 0
+  fi
+
+  if [[ -n "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    capture_prometheus_query_snapshot "$phase" "$snapshot_file" "$status_file" "$(diagnostic_service_name "$profile")"
     return 0
   fi
 
@@ -967,10 +1129,16 @@ if metrics_path.exists():
         metrics_rows = list(csv.DictReader(handle))
 
 
+def metric_matches(actual, expected):
+    return actual == expected or actual == f"{expected}_total"
+
+
 def delta_for(profile, metric, *label_fragments):
     total = 0.0
     for row in rows:
-        if row.get("profile") != profile or row.get("status") != "ok" or row.get("metric") != metric:
+        if row.get("profile") != profile or row.get("status") != "ok":
+            continue
+        if not metric_matches(row.get("metric", ""), metric):
             continue
         labels = row.get("labels", "")
         if all(fragment in labels for fragment in label_fragments):
@@ -2572,6 +2740,9 @@ run_profile() {
   fi
   write_metrics_summary "$profile"
   run_compat_probe "$profile"
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && "$DIAGNOSTIC_METRICS_SETTLE_SECS" -gt 0 ]]; then
+    sleep "$DIAGNOSTIC_METRICS_SETTLE_SECS"
+  fi
   capture_service_metrics_snapshot "$profile" after
   write_profile_service_metrics_summary "$profile"
   stop_server
