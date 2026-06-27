@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::{
-    AppContext, current_app_context, publish_server_config, publish_storage_class_config, resolve_notification_system,
-    resolve_object_store_handle, resolve_object_store_handle_for_context,
+    AppContext, current_app_context, publish_server_config, publish_storage_class_config,
+    resolve_notification_system_for_context, resolve_object_store_handle_for_context,
 };
 use crate::admin::storage_api::config::{STORAGE_CLASS_SUB_SYS, read_admin_config_without_migrate, storageclass};
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
@@ -71,10 +71,8 @@ fn resolve_runtime_config_store_for_context(context: Option<&AppContext>) -> S3R
     resolve_object_store_handle_for_context(context).ok_or_else(|| internal_error("storage layer not initialized"))
 }
 
-async fn apply_storage_class_runtime_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+async fn apply_storage_class_runtime_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let store = resolve_runtime_config_store_for_context(context)?;
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
     let set_drive_count = StorageAdminApi::set_drive_counts(store.as_ref())
@@ -96,10 +94,8 @@ fn validate_storage_class_kvs(kvs: &KVS, set_drive_counts: &[usize]) -> S3Result
     Ok(())
 }
 
-async fn validate_storage_class_config(config: &ServerConfig) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
-        return Err(internal_error("storage layer not initialized"));
-    };
+async fn validate_storage_class_config_for_context(context: Option<&AppContext>, config: &ServerConfig) -> S3Result<()> {
+    let store = resolve_runtime_config_store_for_context(context)?;
 
     let kvs = config.get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER).unwrap_or_default();
     let set_drive_counts = StorageAdminApi::set_drive_counts(store.as_ref());
@@ -252,9 +248,13 @@ fn validate_identity_openid_config(config: &ServerConfig) -> S3Result<()> {
     Ok(())
 }
 
-pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
+pub async fn validate_server_config_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+    sub_system: Option<&str>,
+) -> S3Result<()> {
     match sub_system {
-        Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config(config).await,
+        Some(STORAGE_CLASS_SUB_SYS) => validate_storage_class_config_for_context(context, config).await,
         Some(NOTIFY_WEBHOOK_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS),
         Some(NOTIFY_MQTT_SUB_SYS) => validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS),
         Some(AUDIT_WEBHOOK_SUB_SYS) => validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS),
@@ -264,7 +264,7 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
             .map_err(|err| invalid_request(format!("invalid scanner config: {err}"))),
         Some(_) => Ok(()),
         None => {
-            validate_storage_class_config(config).await?;
+            validate_storage_class_config_for_context(context, config).await?;
             validate_notify_subsystem_config(config, NOTIFY_WEBHOOK_SUB_SYS)?;
             validate_notify_subsystem_config(config, NOTIFY_MQTT_SUB_SYS)?;
             validate_audit_subsystem_config(config, AUDIT_WEBHOOK_SUB_SYS)?;
@@ -277,13 +277,22 @@ pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&s
     }
 }
 
-pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
+pub async fn validate_server_config(config: &ServerConfig, sub_system: Option<&str>) -> S3Result<()> {
+    let context = current_app_context();
+    validate_server_config_for_context(context.as_deref(), config, sub_system).await
+}
+
+pub async fn apply_dynamic_config_for_subsystem_for_context(
+    context: Option<&AppContext>,
+    config: &ServerConfig,
+    sub_system: &str,
+) -> S3Result<bool> {
     if dynamic_config_reload_plan(sub_system).is_none() {
         return Ok(false);
     }
 
     match sub_system {
-        STORAGE_CLASS_SUB_SYS => apply_storage_class_runtime_config(config).await?,
+        STORAGE_CLASS_SUB_SYS => apply_storage_class_runtime_config_for_context(context, config).await?,
         AUDIT_WEBHOOK_SUB_SYS | AUDIT_MQTT_SUB_SYS => reload_audit_config(config.clone())
             .await
             .map_err(|err| internal_error(format!("failed to reload audit config: {err}")))?,
@@ -297,6 +306,11 @@ pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_syste
     Ok(true)
 }
 
+pub async fn apply_dynamic_config_for_subsystem(config: &ServerConfig, sub_system: &str) -> S3Result<bool> {
+    let context = current_app_context();
+    apply_dynamic_config_for_subsystem_for_context(context.as_deref(), config, sub_system).await
+}
+
 pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&AppContext>, sub_system: &str) -> S3Result<()> {
     if !is_dynamic_config_subsystem(sub_system) {
         return Err(internal_error(format!("unsupported dynamic config subsystem: {sub_system}")));
@@ -308,10 +322,12 @@ pub async fn reload_dynamic_config_runtime_state_for_context(context: Option<&Ap
         warn!("peer reload_dynamic_config: failed to load server config for {sub_system}: {err}");
         internal_error(format!("failed to load server config: {err}"))
     })?;
-    apply_dynamic_config_for_subsystem(&config, sub_system).await.map_err(|err| {
-        warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
-        err
-    })?;
+    apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system)
+        .await
+        .map_err(|err| {
+            warn!("peer reload_dynamic_config: failed to apply {sub_system}: {err}");
+            err
+        })?;
     Ok(())
 }
 
@@ -337,7 +353,7 @@ pub async fn reload_runtime_config_snapshot_for_context(context: Option<&AppCont
         SCANNER_SUB_SYS,
         HEAL_SUB_SYS,
     ] {
-        if let Err(err) = apply_dynamic_config_for_subsystem(&config, sub_system).await {
+        if let Err(err) = apply_dynamic_config_for_subsystem_for_context(context, &config, sub_system).await {
             warn!("peer reload_runtime_config_snapshot: failed to apply {sub_system}: {err}");
         }
     }
@@ -351,12 +367,12 @@ pub async fn reload_runtime_config_snapshot() -> S3Result<()> {
     reload_runtime_config_snapshot_for_context(context.as_deref()).await
 }
 
-pub async fn signal_dynamic_config_reload(sub_system: &str) {
+pub async fn signal_dynamic_config_reload_for_context(context: Option<&AppContext>, sub_system: &str) {
     if !is_dynamic_config_subsystem(sub_system) {
         return;
     }
 
-    let Some(notification_sys) = resolve_notification_system() else {
+    let Some(notification_sys) = resolve_notification_system_for_context(context) else {
         return;
     };
 
@@ -367,8 +383,13 @@ pub async fn signal_dynamic_config_reload(sub_system: &str) {
     }
 }
 
-pub async fn signal_config_snapshot_reload() {
-    let Some(notification_sys) = resolve_notification_system() else {
+pub async fn signal_dynamic_config_reload(sub_system: &str) {
+    let context = current_app_context();
+    signal_dynamic_config_reload_for_context(context.as_deref(), sub_system).await;
+}
+
+pub async fn signal_config_snapshot_reload_for_context(context: Option<&AppContext>) {
+    let Some(notification_sys) = resolve_notification_system_for_context(context) else {
         return;
     };
 
@@ -377,6 +398,11 @@ pub async fn signal_config_snapshot_reload() {
             tracing::warn!("peer config snapshot refresh failed for {}: {}", failure.host, err);
         }
     }
+}
+
+pub async fn signal_config_snapshot_reload() {
+    let context = current_app_context();
+    signal_config_snapshot_reload_for_context(context.as_deref()).await;
 }
 
 #[cfg(test)]

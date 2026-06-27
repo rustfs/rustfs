@@ -14,7 +14,9 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{publish_server_config, resolve_object_store_handle, resolve_server_config};
+use crate::admin::runtime_sources::{
+    current_app_context, publish_server_config, resolve_object_store_handle_for_context, resolve_server_config_for_context,
+};
 use crate::admin::service::config::{
     apply_dynamic_config_for_subsystem, is_dynamic_config_subsystem, signal_config_snapshot_reload, signal_dynamic_config_reload,
     validate_server_config,
@@ -709,7 +711,9 @@ fn success_response(config_applied: bool) -> S3Result<S3Response<(StatusCode, Bo
 }
 
 fn object_store() -> S3Result<std::sync::Arc<crate::admin::storage_api::runtime::ECStore>> {
-    resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
+    let context = current_app_context();
+    resolve_object_store_handle_for_context(context.as_deref())
+        .ok_or_else(|| s3_error!(InternalError, "server storage not initialized"))
 }
 
 async fn load_server_config_from_store() -> S3Result<ServerConfig> {
@@ -725,7 +729,9 @@ async fn load_active_server_config() -> S3Result<ServerConfig> {
         return Ok(config);
     }
 
-    resolve_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))
+    let context = current_app_context();
+    resolve_server_config_for_context(context.as_deref())
+        .ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))
 }
 
 async fn save_server_config_to_store(config: &ServerConfig) -> S3Result<()> {
