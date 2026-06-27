@@ -222,6 +222,7 @@ pub async fn publish_ready_when_runtime_ready(
                 target: "rustfs::server::readiness",
                 storage_ready = dependency_readiness.storage_ready,
                 iam_ready = dependency_readiness.iam_ready,
+                lock_quorum_ready = dependency_readiness.lock_quorum_ready,
                 "Runtime node readiness reached; publishing ready state"
             );
         },
@@ -558,10 +559,6 @@ fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) ->
     }
 }
 
-pub async fn collect_dependency_readiness() -> DependencyReadiness {
-    collect_dependency_readiness_report().await.readiness
-}
-
 pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport {
     let iam_ready_raw = runtime_sources::iam_ready();
     let storage_ready = if let Some(cached) = load_cached_storage_readiness().await {
@@ -595,7 +592,7 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let readiness = DependencyReadiness {
         storage_ready: runtime_sources::object_store_handle().is_some(),
         iam_ready: runtime_sources::iam_ready(),
-        lock_quorum_ready: true,
+        lock_quorum_ready: collect_lock_quorum_status().await.ready,
     };
     let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
@@ -813,7 +810,7 @@ where
 
     loop {
         let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready {
+        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
             on_ready(readiness);
             return Ok(());
         }
@@ -970,11 +967,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn wait_for_runtime_readiness_with_publishes_ready_without_lock_quorum() {
+    async fn wait_for_runtime_readiness_with_does_not_publish_ready_without_lock_quorum() {
         let readiness = GlobalReadiness::new();
         let state_manager = ServiceStateManager::new();
 
-        let result = wait_for_runtime_readiness_with(
+        let err = wait_for_runtime_readiness_with(
             Duration::ZERO,
             Duration::from_millis(1),
             || {
@@ -989,9 +986,37 @@ mod tests {
                 state_manager.update(ServiceState::Ready);
             },
         )
+        .await
+        .expect_err("startup readiness should require lock quorum");
+
+        assert!(err.to_string().contains("lock_quorum_ready=false"));
+        assert!(!readiness.is_ready());
+        assert_eq!(state_manager.current_state(), ServiceState::Starting);
+    }
+
+    #[tokio::test]
+    async fn wait_for_runtime_readiness_with_publishes_ready_when_dependencies_are_ready() {
+        let readiness = GlobalReadiness::new();
+        let state_manager = ServiceStateManager::new();
+
+        let result = wait_for_runtime_readiness_with(
+            Duration::ZERO,
+            Duration::from_millis(1),
+            || {
+                future::ready(DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                })
+            },
+            |_| {
+                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                state_manager.update(ServiceState::Ready);
+            },
+        )
         .await;
 
-        assert!(result.is_ok(), "lock quorum must not block node readiness publication");
+        assert!(result.is_ok(), "all runtime dependencies should publish readiness");
         assert!(readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Ready);
     }
@@ -1264,30 +1289,34 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn lock_quorum_status_cache_roundtrip() {
-        let cache = lock_quorum_status_cache();
-        {
-            let mut guard = cache.lock().await;
-            *guard = None;
-        }
+        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
+            let cache = lock_quorum_status_cache();
+            {
+                let mut guard = cache.lock().await;
+                *guard = None;
+            }
 
-        update_lock_quorum_status_cache(LockQuorumStatus {
-            ready: true,
-            connected_clients: 2,
-            total_clients: 3,
-            required_quorum: 2,
-        })
-        .await;
-
-        let cached = load_cached_lock_quorum_status().await;
-        assert_eq!(
-            cached,
-            Some(LockQuorumStatus {
+            update_lock_quorum_status_cache(LockQuorumStatus {
                 ready: true,
                 connected_clients: 2,
                 total_clients: 3,
                 required_quorum: 2,
             })
-        );
+            .await;
+
+            let cached = load_cached_lock_quorum_status().await;
+            assert_eq!(
+                cached,
+                Some(LockQuorumStatus {
+                    ready: true,
+                    connected_clients: 2,
+                    total_clients: 3,
+                    required_quorum: 2,
+                })
+            );
+        })
+        .await;
     }
 }

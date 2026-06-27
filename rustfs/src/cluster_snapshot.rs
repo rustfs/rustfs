@@ -21,7 +21,7 @@ use crate::storage_api::cluster::contract::observability::ObservabilitySnapshot;
 use crate::storage_api::cluster::contract::topology::TopologySnapshot;
 use crate::storage_api::cluster::control_plane::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
-    ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
+    ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
 };
 use crate::workload_admission::workload_admission_registry_snapshot;
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot};
@@ -33,6 +33,7 @@ pub struct ClusterReadOnlySnapshot {
     pub pool_state: ClusterPoolStateSnapshot,
     pub local_storage: ClusterLocalNodeStorageSnapshot,
     pub peer_health: ClusterPeerHealthSnapshot,
+    pub rpc_boundary: ClusterRpcBoundarySnapshot,
     pub observability: ObservabilitySnapshot,
     pub workload_admission: WorkloadAdmissionRegistrySnapshot,
     pub runtime_status: ClusterRuntimeStatusSnapshot,
@@ -94,6 +95,7 @@ pub fn cluster_read_only_snapshot_from_control_plane(
         pool_state: control_plane.pool_state,
         local_storage: control_plane.local_storage,
         peer_health: control_plane.peer_health,
+        rpc_boundary: control_plane.rpc_boundary,
         observability: runtime_observability_snapshot(),
         workload_admission: workload_admission_registry_snapshot(),
         runtime_status,
@@ -165,6 +167,8 @@ mod tests {
         assert_eq!(snapshot.pool_state.pools[0].endpoint_count, 4);
         assert_eq!(snapshot.local_storage.nodes.len(), 1);
         assert_eq!(snapshot.peer_health.peers.len(), 2);
+        assert_eq!(snapshot.rpc_boundary.control_channels.len(), 4);
+        assert_eq!(snapshot.rpc_boundary.data_channels.len(), 1);
         assert_eq!(snapshot.runtime_status.state, ClusterRuntimeReadinessState::Degraded);
         assert_eq!(
             snapshot.runtime_status.degraded_reasons,
@@ -193,6 +197,7 @@ mod tests {
             pool_state: ClusterPoolStateSnapshot::default(),
             local_storage: ClusterLocalNodeStorageSnapshot::default(),
             peer_health: ClusterPeerHealthSnapshot::default(),
+            rpc_boundary: ClusterRpcBoundarySnapshot::default(),
             observability: ObservabilitySnapshot::default(),
             workload_admission: WorkloadAdmissionRegistrySnapshot::new(vec![WorkloadAdmissionSnapshot::new(
                 WorkloadClass::ForegroundRead,

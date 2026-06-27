@@ -18,7 +18,8 @@ pub(crate) mod rpc;
 pub use control_plane::{
     ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage,
     ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth,
-    ClusterPeerHealthSnapshot, ClusterPoolState, ClusterPoolStateSnapshot, local_node_storage_snapshot_from_membership,
-    membership_snapshot_from_endpoint_pools, peer_health_snapshot_from_membership, pool_state_snapshot_from_endpoint_pools,
+    ClusterPeerHealthSnapshot, ClusterPoolState, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot,
+    ClusterRpcPlane, ClusterRpcTransport, local_node_storage_snapshot_from_membership, membership_snapshot_from_endpoint_pools,
+    peer_health_snapshot_from_membership, pool_state_snapshot_from_endpoint_pools, rpc_boundary_snapshot,
     topology_snapshot_from_endpoint_pools, topology_snapshot_from_endpoint_pools_with_capabilities,
 };

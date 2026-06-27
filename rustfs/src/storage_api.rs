@@ -52,7 +52,7 @@ pub(crate) mod cluster {
     pub(crate) mod control_plane {
         pub(crate) use crate::storage::storage_api::ecstore_cluster::{
             ClusterControlPlane, ClusterControlPlaneSnapshot, ClusterLocalNodeStorageSnapshot, ClusterMembershipSnapshot,
-            ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot,
+            ClusterPeerHealthSnapshot, ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot,
         };
     }
 }
