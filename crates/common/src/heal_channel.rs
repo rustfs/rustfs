@@ -657,7 +657,7 @@ pub async fn send_heal_disk(set_disk_id: String, priority: Option<HealChannelPri
         disk: Some(set_disk_id),
         object_version_id: None,
         force_start: false,
-        priority: priority.unwrap_or_default(),
+        priority: priority.unwrap_or(HealChannelPriority::Low),
         pool_index: None,
         set_index: None,
         scan_mode: None,

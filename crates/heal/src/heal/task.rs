@@ -2125,8 +2125,14 @@ impl HealTask {
             pool: self.options.pool_index,
             set: self.options.set_index,
         };
-        let erasure_healer =
-            ErasureSetHealer::new(self.storage.clone(), self.progress.clone(), self.cancel_token.clone(), disk, heal_opts);
+        let erasure_healer = ErasureSetHealer::new(
+            self.storage.clone(),
+            self.progress.clone(),
+            self.cancel_token.clone(),
+            disk,
+            heal_opts,
+            self.source,
+        );
 
         {
             let mut progress = self.progress.write().await;

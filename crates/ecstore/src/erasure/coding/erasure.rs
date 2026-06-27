@@ -182,6 +182,34 @@ impl LegacyReedSolomonEncoder {
         self.encode_parity(shards)
     }
 
+    fn verify(&self, shards: &[&[u8]]) -> io::Result<bool> {
+        let expected_shards = self.data_shards + self.parity_shards;
+        if shards.len() != expected_shards {
+            return Err(io::Error::other(format!(
+                "invalid shard count: got {}, expected {}",
+                shards.len(),
+                expected_shards
+            )));
+        }
+        if shards.iter().all(|shard| shard.is_empty()) {
+            return Ok(true);
+        }
+
+        let mut expected = shards.iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        self.encode_parity(&mut expected)?;
+
+        for index in self.data_shards..expected_shards {
+            let Some(expected_parity) = expected[index].as_ref() else {
+                return Err(io::Error::other(format!("missing parity shard {index} after verification encode")));
+            };
+            if expected_parity.as_slice() != shards[index] {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         encode_parity_shards(shards, self.data_shards, self.parity_shards, |shards| self.encode(shards))
     }
@@ -255,6 +283,19 @@ impl ReedSolomonEncoder {
     pub fn reconstruct(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
         self.reconstruct_data(shards)?;
         self.encode_parity(shards)
+    }
+
+    pub fn verify(&self, shards: &[&[u8]]) -> io::Result<bool> {
+        if shards.iter().all(|shard| shard.is_empty()) {
+            return Ok(true);
+        }
+
+        if let Some(ref rs) = self.encoder {
+            rs.verify(shards)
+                .map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")))
+        } else {
+            Ok(true)
+        }
     }
 
     fn encode_parity(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
@@ -654,6 +695,92 @@ impl Erasure {
         }
 
         Ok(())
+    }
+
+    pub(crate) fn decode_data_with_reconstruction_verification(&self, shards: &mut [Option<Vec<u8>>]) -> io::Result<()> {
+        let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
+        let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        let source_parity = if missing_data_source && available_shards > self.data_shards {
+            shards
+                .iter()
+                .enumerate()
+                .skip(self.data_shards)
+                .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+
+        if source_parity.is_empty() {
+            return self.decode_data(shards);
+        }
+
+        self.decode_data_and_parity(shards)?;
+        for (index, source) in source_parity {
+            let Some(rebuilt) = shards[index].as_ref() else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing rebuilt parity shard after read verification",
+                ));
+            };
+            if rebuilt != &source {
+                warn!(
+                    shard_index = index,
+                    data_shards = self.data_shards,
+                    parity_shards = self.parity_shards,
+                    "erasure decode rejected inconsistent read source shards"
+                );
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "inconsistent read source shards"));
+            }
+        }
+
+        Ok(())
+    }
+
+    pub(crate) fn verify_data_and_parity(&self, shards: &[Option<Vec<u8>>]) -> io::Result<bool> {
+        let expected_shards = self.total_shard_count();
+        if shards.len() != expected_shards {
+            return Err(io::Error::other(format!(
+                "invalid shard count: got {}, expected {}",
+                shards.len(),
+                expected_shards
+            )));
+        }
+        if self.parity_shards == 0 {
+            return Ok(true);
+        }
+
+        let mut shard_refs = Vec::with_capacity(expected_shards);
+        let mut shard_len = None;
+        for (index, shard) in shards.iter().enumerate() {
+            let shard = shard
+                .as_deref()
+                .ok_or_else(|| io::Error::other(format!("missing shard {index} for data/parity verification")))?;
+            if let Some(expected_len) = shard_len {
+                if shard.len() != expected_len {
+                    return Err(io::Error::other(format!(
+                        "inconsistent shard length at index {index}: got {}, expected {}",
+                        shard.len(),
+                        expected_len
+                    )));
+                }
+            } else {
+                shard_len = Some(shard.len());
+            }
+            shard_refs.push(shard);
+        }
+
+        if self.uses_legacy {
+            if let Some(encoder) = self.legacy_encoder.as_ref() {
+                encoder.verify(&shard_refs)
+            } else {
+                Err(io::Error::other("parity_shards > 0, uses_legacy but legacy_encoder is None"))
+            }
+        } else if let Some(encoder) = self.encoder.as_ref() {
+            encoder.verify(&shard_refs)
+        } else {
+            Err(io::Error::other("parity_shards > 0, but encoder is None"))
+        }
     }
 
     /// Get the total number of shards (data + parity).

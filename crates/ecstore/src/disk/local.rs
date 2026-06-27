@@ -14,6 +14,7 @@
 
 use crate::config::storageclass::DEFAULT_INLINE_BLOCK;
 use crate::data_usage::local_snapshot::ensure_data_usage_layout;
+use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
@@ -56,9 +57,9 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::fs::{self, File};
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ErrorKind, ReadBuf};
 use tokio::sync::{Notify, RwLock};
-use tokio::time::{Instant, interval_at, timeout};
+use tokio::time::{Instant, Sleep, interval_at, timeout};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -143,6 +144,63 @@ struct FileCacheReclaimReader {
     reclaim_len: usize,
     reclaim_on_drop: bool,
     reclaimed: bool,
+}
+
+struct StallTimeoutReader<R> {
+    inner: R,
+    timeout: Duration,
+    timer: Option<std::pin::Pin<Box<Sleep>>>,
+}
+
+impl<R> StallTimeoutReader<R> {
+    fn new(inner: R, timeout: Duration) -> Self {
+        Self {
+            inner,
+            timeout,
+            timer: None,
+        }
+    }
+}
+
+impl<R: AsyncRead + Unpin> AsyncRead for StallTimeoutReader<R> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let filled_before = buf.filled().len();
+        match std::pin::Pin::new(&mut self.inner).poll_read(cx, buf) {
+            std::task::Poll::Ready(result) => {
+                self.timer = None;
+                std::task::Poll::Ready(result)
+            }
+            std::task::Poll::Pending => {
+                if self.timeout.is_zero() {
+                    return std::task::Poll::Pending;
+                }
+
+                if self.timer.is_none() {
+                    self.timer = Some(Box::pin(tokio::time::sleep(self.timeout)));
+                }
+
+                if let Some(timer) = self.timer.as_mut()
+                    && std::future::Future::poll(timer.as_mut(), cx).is_ready()
+                {
+                    self.timer = None;
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        ErrorKind::TimedOut,
+                        "local disk read stall timeout",
+                    )));
+                }
+
+                if buf.filled().len() > filled_before {
+                    self.timer = None;
+                }
+
+                std::task::Poll::Pending
+            }
+        }
+    }
 }
 
 fn record_file_cache_reclaim_success(kind: &'static str, reclaim_len: usize, started: std::time::Instant) {
@@ -247,11 +305,11 @@ impl Drop for FileCacheReclaimReader {
     }
 }
 
-impl tokio::io::AsyncRead for FileCacheReclaimReader {
+impl AsyncRead for FileCacheReclaimReader {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
+        buf: &mut ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
     }
@@ -1767,6 +1825,7 @@ impl LocalDisk {
                         error = ?er,
                         "Disk local scan failed"
                     );
+                    return Err(er);
                 }
             }
 
@@ -1836,9 +1895,20 @@ impl LocalDisk {
                             meta.name.push_str(SLASH_SEPARATOR);
                             schedule_dir(&mut dir_stack, meta.name, false, None);
                         }
+
+                        continue;
                     }
 
-                    continue;
+                    error!(
+                        event = EVENT_DISK_LOCAL_SCAN_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        path = %fname,
+                        operation = "read_metadata",
+                        error = ?err,
+                        "Disk local scan failed"
+                    );
+                    return Err(err);
                 }
             };
         }
@@ -1859,7 +1929,7 @@ impl LocalDisk {
                 && let Err(er) =
                     Box::pin(self.scan_dir(dir, prefix.clone(), opts, out, objs_returned, skip_object, dir_to_skip)).await
             {
-                warn!(
+                error!(
                     event = EVENT_DISK_LOCAL_SCAN_FAILED,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
@@ -1868,6 +1938,7 @@ impl LocalDisk {
                     error = ?er,
                     "Disk local recursive scan failed"
                 );
+                return Err(er);
             }
         }
 
@@ -2652,7 +2723,8 @@ impl DiskAPI for LocalDisk {
         }
 
         let reclaim_on_drop = should_reclaim_file_cache_after_read(length);
-        Ok(Box::new(FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop)))
+        let reader = FileCacheReclaimReader::new(f, offset as u64, length, reclaim_on_drop);
+        Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
     }
 
     /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
@@ -3737,6 +3809,10 @@ async fn get_disk_info(drive_path: PathBuf) -> Result<(rustfs_utils::os::DiskInf
 #[cfg(test)]
 mod test {
     use super::*;
+    use std::io;
+    use std::pin::Pin;
+    use std::task::{Context, Poll};
+    use tokio::io::{AsyncReadExt, ReadBuf};
 
     #[tokio::test]
     async fn test_skip_access_checks() {
@@ -3754,6 +3830,28 @@ mod test {
         for p in paths.iter() {
             assert!(skip_access_checks(p.to_str().unwrap()));
         }
+    }
+
+    #[derive(Debug, Default)]
+    struct PendingTestReader;
+
+    impl AsyncRead for PendingTestReader {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, _buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            Poll::Pending
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_read_timeout_reader_times_out_when_inner_stalls() {
+        let mut reader = StallTimeoutReader::new(PendingTestReader, Duration::from_secs(10));
+        let mut buf = [0; 1];
+
+        let err = reader
+            .read(&mut buf)
+            .await
+            .expect_err("stalled local reader should return a timeout error");
+
+        assert_eq!(err.kind(), ErrorKind::TimedOut);
     }
 
     #[tokio::test]
@@ -4238,6 +4336,51 @@ mod test {
 
         assert!(has_visible_object);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_scan_dir_propagates_metadata_read_errors() {
+        use std::fs::Permissions;
+        use std::os::unix::fs::PermissionsExt;
+        use tempfile::tempdir;
+
+        let dir = tempdir().unwrap();
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        let object_dir = bucket_dir.join("broken");
+        let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        fs::create_dir_all(&object_dir).await.unwrap();
+        fs::write(&meta_path, b"meta").await.unwrap();
+
+        let original_permissions = fs::metadata(&meta_path).await.unwrap().permissions();
+        fs::set_permissions(&meta_path, Permissions::from_mode(0o000)).await.unwrap();
+        if fs::File::open(&meta_path).await.is_ok() {
+            fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+            return;
+        }
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+
+        let (_reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_string(),
+            base_dir: "".to_string(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut objs_returned = 0;
+
+        let result = disk
+            .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
+            .await;
+
+        fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+
+        assert!(matches!(result, Err(DiskError::FileAccessDenied)));
     }
 
     #[tokio::test]

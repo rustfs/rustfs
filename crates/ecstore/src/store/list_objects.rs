@@ -109,6 +109,12 @@ pub fn max_keys_plus_one(max_keys: i32, add_one: bool) -> i32 {
     max_keys
 }
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum GatherResultsState {
+    LimitReached,
+    InputClosed,
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
     pub id: Option<String>,
@@ -738,13 +744,15 @@ impl ECStore {
         let opts = o.clone();
         let job2 = tokio::spawn(
             async move {
-                if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    error!("gather_results err {:?}", err);
-                    let _ = err_tx2.send(Arc::new(err));
+                match gather_results(cancel_rx2, opts, recv, result_tx).await {
+                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
+                    Ok(GatherResultsState::InputClosed) => {}
+                    Err(err) => {
+                        error!("gather_results err {:?}", err);
+                        let _ = err_tx2.send(Arc::new(err));
+                        cancel.cancel();
+                    }
                 }
-
-                // cancel call exit spawns
-                cancel.cancel();
             }
             .instrument(tracing::Span::current()),
         );
@@ -1199,7 +1207,7 @@ async fn gather_results(
     opts: ListPathOptions,
     recv: Receiver<MetaCacheEntry>,
     results_tx: Sender<MetaCacheEntriesSortedResult>,
-) -> Result<()> {
+) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
     while let Some(mut entry) = recv.recv().await {
@@ -1256,7 +1264,7 @@ async fn gather_results(
                 })
                 .await
                 .map_err(Error::other)?;
-            return Ok(());
+            return Ok(GatherResultsState::LimitReached);
         }
     }
 
@@ -1272,7 +1280,7 @@ async fn gather_results(
         .await
         .map_err(Error::other)?;
 
-    Ok(())
+    Ok(GatherResultsState::InputClosed)
 }
 
 async fn select_from(
@@ -1847,11 +1855,15 @@ impl Sets {
         let opts = o.clone();
         let job2 = tokio::spawn(
             async move {
-                if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    error!("gather_results err {:?}", err);
-                    let _ = err_tx2.send(Arc::new(err));
+                match gather_results(cancel_rx2, opts, recv, result_tx).await {
+                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
+                    Ok(GatherResultsState::InputClosed) => {}
+                    Err(err) => {
+                        error!("gather_results err {:?}", err);
+                        let _ = err_tx2.send(Arc::new(err));
+                        cancel.cancel();
+                    }
                 }
-                cancel.cancel();
             }
             .instrument(tracing::Span::current()),
         );
@@ -2738,11 +2750,15 @@ impl SetDisks {
         let opts = o.clone();
         let job2 = tokio::spawn(
             async move {
-                if let Err(err) = gather_results(cancel_rx2, opts, recv, result_tx).await {
-                    error!("gather_results err {:?}", err);
-                    let _ = err_tx2.send(Arc::new(err));
+                match gather_results(cancel_rx2, opts, recv, result_tx).await {
+                    Ok(GatherResultsState::LimitReached) => cancel.cancel(),
+                    Ok(GatherResultsState::InputClosed) => {}
+                    Err(err) => {
+                        error!("gather_results err {:?}", err);
+                        let _ = err_tx2.send(Arc::new(err));
+                        cancel.cancel();
+                    }
                 }
-                cancel.cancel();
             }
             .instrument(tracing::Span::current()),
         );
@@ -2943,9 +2959,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_QUORUM, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results, list_metadata_resolution_params,
-        list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum, parse_version_marker,
-        version_marker_for_entries, walk_result_from_set_errors,
+        ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results,
+        list_metadata_resolution_params, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        parse_version_marker, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -2970,14 +2986,18 @@ mod test {
     }
 
     #[tokio::test]
-    async fn gather_results_returns_after_limit_without_waiting_for_input_close() {
+    async fn list_path_gather_results_returns_after_limit_without_waiting_for_input_close() {
         let (entry_tx, entry_rx) = mpsc::channel(4);
         let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
 
-        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("test entry should be queued");
 
         let handle = tokio::spawn(gather_results(
-            CancellationToken::new(),
+            cancel.clone(),
             ListPathOptions {
                 bucket: "bucket".to_owned(),
                 limit: 1,
@@ -2994,23 +3014,32 @@ mod test {
             .expect("limited result should be present");
         assert_eq!(result.entries.unwrap().entries().len(), 1);
 
-        timeout(Duration::from_secs(1), handle)
+        let state = timeout(Duration::from_secs(1), handle)
             .await
             .expect("gather_results should finish after sending a limited result")
             .expect("gather_results task should not panic")
             .expect("gather_results should succeed");
+        assert_eq!(state, GatherResultsState::LimitReached);
+        assert!(cancel.is_cancelled());
     }
 
     #[tokio::test]
-    async fn gather_results_keeps_marker_entry_for_version_marker_listing() {
+    async fn list_path_gather_results_keeps_marker_entry_for_version_marker_listing() {
         let (entry_tx, entry_rx) = mpsc::channel(4);
         let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
 
-        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
-        entry_tx.send(test_meta_entry("obj-b")).await.unwrap();
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("first test entry should be queued");
+        entry_tx
+            .send(test_meta_entry("obj-b"))
+            .await
+            .expect("second test entry should be queued");
 
         let handle = tokio::spawn(gather_results(
-            CancellationToken::new(),
+            cancel.clone(),
             ListPathOptions {
                 bucket: "bucket".to_owned(),
                 marker: Some("obj-a".to_owned()),
@@ -3037,11 +3066,13 @@ mod test {
 
         assert_eq!(names, ["obj-a", "obj-b"]);
 
-        timeout(Duration::from_secs(1), handle)
+        let state = timeout(Duration::from_secs(1), handle)
             .await
             .expect("gather_results should finish after sending a limited result")
             .expect("gather_results task should not panic")
             .expect("gather_results should succeed");
+        assert_eq!(state, GatherResultsState::LimitReached);
+        assert!(cancel.is_cancelled());
     }
 
     #[test]
@@ -3062,16 +3093,23 @@ mod test {
     }
 
     #[tokio::test]
-    async fn gather_results_skips_marker_entry_by_default() {
+    async fn list_path_gather_results_skips_marker_entry_by_default() {
         let (entry_tx, entry_rx) = mpsc::channel(4);
         let (result_tx, mut result_rx) = mpsc::channel(1);
+        let cancel = CancellationToken::new();
 
-        entry_tx.send(test_meta_entry("obj-a")).await.unwrap();
-        entry_tx.send(test_meta_entry("obj-b")).await.unwrap();
+        entry_tx
+            .send(test_meta_entry("obj-a"))
+            .await
+            .expect("first test entry should be queued");
+        entry_tx
+            .send(test_meta_entry("obj-b"))
+            .await
+            .expect("second test entry should be queued");
         drop(entry_tx);
 
         let handle = tokio::spawn(gather_results(
-            CancellationToken::new(),
+            cancel.clone(),
             ListPathOptions {
                 bucket: "bucket".to_owned(),
                 marker: Some("obj-a".to_owned()),
@@ -3097,11 +3135,13 @@ mod test {
         assert_eq!(names, ["obj-b"]);
         assert!(result.err.is_some());
 
-        timeout(Duration::from_secs(1), handle)
+        let state = timeout(Duration::from_secs(1), handle)
             .await
             .expect("gather_results should finish after input closes")
             .expect("gather_results task should not panic")
             .expect("gather_results should succeed");
+        assert_eq!(state, GatherResultsState::InputClosed);
+        assert!(!cancel.is_cancelled());
     }
 
     #[test]

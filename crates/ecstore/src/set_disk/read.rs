@@ -24,7 +24,10 @@ use crate::diagnostics::get::{
     GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path,
 };
+use crate::erasure::coding::BitrotReader;
+use crate::io_support::bitrot::create_deferred_bitrot_reader;
 use crate::set_disk::shard_source::ShardReadCost;
+use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
@@ -38,6 +41,8 @@ use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
+const EVENT_SET_DISK_READ: &str = "set_disk_read";
+const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
 const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
 
@@ -690,6 +695,165 @@ async fn submit_read_repair_heal_with_submitter(
             }
         }
     });
+}
+
+type ObjectBitrotReader = BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>;
+
+struct BitrotReaderSetup {
+    readers: Vec<Option<ObjectBitrotReader>>,
+    errors: Vec<Option<DiskError>>,
+    attempted: Vec<bool>,
+    ready: Vec<bool>,
+}
+
+#[derive(Clone, Copy)]
+enum BitrotReaderSetupMode {
+    ReadQuorum,
+    VerifyReconstruction,
+}
+
+impl BitrotReaderSetup {
+    fn available_shards(&self) -> usize {
+        self.ready.iter().filter(|ready| **ready).count()
+    }
+
+    fn available_data_shards(&self, data_shards: usize) -> usize {
+        self.ready.iter().take(data_shards).filter(|ready| **ready).count()
+    }
+
+    fn completed_failed_shards(&self) -> usize {
+        self.attempted
+            .iter()
+            .zip(&self.errors)
+            .filter(|(attempted, err)| **attempted && err.is_some())
+            .count()
+    }
+
+    fn data_shards_attempted(&self, data_shards: usize) -> bool {
+        self.attempted.iter().take(data_shards).all(|attempted| *attempted)
+    }
+
+    fn reconstruction_verification_target(&self, data_shards: usize, parity_shards: usize) -> usize {
+        let missing_data_sources = data_shards.saturating_sub(self.available_data_shards(data_shards));
+        if missing_data_sources > 0 && missing_data_sources < parity_shards {
+            data_shards.saturating_add(1).min(data_shards.saturating_add(parity_shards))
+        } else {
+            data_shards
+        }
+    }
+
+    fn has_setup_quorum(&self, data_shards: usize, parity_shards: usize, mode: BitrotReaderSetupMode) -> bool {
+        let target = match mode {
+            BitrotReaderSetupMode::ReadQuorum => data_shards,
+            BitrotReaderSetupMode::VerifyReconstruction => self.reconstruction_verification_target(data_shards, parity_shards),
+        };
+        self.available_shards() >= target
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_bitrot_readers_until_quorum(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_zero_copy: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+) -> BitrotReaderSetup {
+    let mut setup = BitrotReaderSetup {
+        readers: (0..disks.len()).map(|_| None).collect(),
+        errors: vec![Some(DiskError::DiskNotFound); disks.len()],
+        attempted: vec![false; disks.len()],
+        ready: vec![false; disks.len()],
+    };
+    let mut reader_tasks = FuturesUnordered::new();
+
+    for (idx, disk_op) in disks.iter().enumerate() {
+        let inline_data = files[idx].data.as_deref();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let disk = disk_op.as_ref();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        let checksum_algo = checksum_algo.clone();
+
+        reader_tasks.push(async move {
+            let result = create_bitrot_reader(
+                inline_data,
+                disk,
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo,
+                skip_verify_bitrot,
+                use_zero_copy,
+            )
+            .await;
+            (idx, result)
+        });
+    }
+
+    while let Some((idx, result)) = reader_tasks.next().await {
+        setup.attempted[idx] = true;
+        match result {
+            Ok(Some(reader)) => {
+                setup.readers[idx] = Some(reader);
+                setup.errors[idx] = None;
+                setup.ready[idx] = true;
+            }
+            Ok(None) => {
+                setup.readers[idx] = None;
+                setup.errors[idx] = Some(DiskError::DiskNotFound);
+                setup.ready[idx] = false;
+            }
+            Err(e) => {
+                setup.readers[idx] = None;
+                setup.errors[idx] = Some(e);
+                setup.ready[idx] = false;
+            }
+        }
+
+        if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+            break;
+        }
+    }
+
+    if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+        for idx in 0..disks.len() {
+            if setup.attempted[idx] {
+                continue;
+            }
+
+            let inline_data = files[idx].data.clone();
+            let disk = disks[idx].clone();
+            let data_dir = files[idx].data_dir.unwrap_or_default();
+            let path = format!("{object}/{data_dir}/part.{part_number}");
+            setup.readers[idx] = Some(create_deferred_bitrot_reader(
+                inline_data,
+                disk,
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_zero_copy,
+            ));
+            setup.errors[idx] = None;
+        }
+    }
+    drop(reader_tasks);
+
+    setup
 }
 
 async fn collect_read_multiple_results<F>(
@@ -1615,6 +1779,7 @@ impl SetDisks {
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
     {
+        let pipeline_started = Instant::now();
         debug!(bucket, object, requested_length = length, offset, "get_object_with_fileinfo start");
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
 
@@ -1745,56 +1910,68 @@ impl SetDisks {
                 } else {
                     checksum_info.algorithm
                 };
+            let read_length = till_offset.saturating_sub(read_offset);
 
             // Read zero-copy configuration from environment variable
             // Default: enabled (true) for performance
             let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
-            let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-            let mut readers = Vec::with_capacity(disks.len());
-            let mut read_costs = Vec::with_capacity(disks.len());
-            let mut errors = Vec::with_capacity(disks.len());
-            for (idx, disk_op) in disks.iter().enumerate() {
-                read_costs.push(shard_read_cost_for_disk(disk_op.as_ref()));
-                match create_bitrot_reader(
-                    files[idx].data.as_deref(),
-                    disk_op.as_ref(),
+            let reader_setup_stage_start = Instant::now();
+            let read_costs = disks
+                .iter()
+                .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
+                .collect::<Vec<_>>();
+            let reader_setup = create_bitrot_readers_until_quorum(
+                &files,
+                &disks,
+                bucket,
+                object,
+                part_number,
+                read_offset,
+                read_length,
+                erasure.shard_size(),
+                checksum_algo,
+                skip_verify_bitrot,
+                use_zero_copy,
+                erasure.data_shards,
+                erasure.parity_shards,
+                BitrotReaderSetupMode::ReadQuorum,
+            )
+            .await;
+            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+            let setup_available_readers = reader_setup.available_shards();
+            if reader_setup_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
+                warn!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
                     bucket,
-                    &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
+                    object,
+                    part_index = current_part,
+                    part_number,
                     read_offset,
-                    till_offset.saturating_sub(read_offset),
-                    erasure.shard_size(),
-                    checksum_algo.clone(),
-                    skip_verify_bitrot,
-                    use_zero_copy,
-                )
-                .await
-                {
-                    Ok(Some(reader)) => {
-                        readers.push(Some(reader));
-                        errors.push(None);
-                    }
-                    Ok(None) => {
-                        readers.push(None);
-                        errors.push(Some(DiskError::DiskNotFound));
-                    }
-                    Err(e) => {
-                        readers.push(None);
-                        errors.push(Some(e));
-                    }
-                }
-            }
-            if let Some(reader_setup_stage_start) = reader_setup_stage_start {
-                rustfs_io_metrics::record_get_object_shard_reader_setup_duration(
-                    reader_setup_stage_start.elapsed().as_secs_f64(),
+                    read_length,
+                    available_shards = setup_available_readers,
+                    total_shards = reader_setup.errors.len(),
+                    data_shards = erasure.data_shards,
+                    parity_shards = erasure.parity_shards,
+                    elapsed_ms = reader_setup_elapsed.as_millis(),
+                    errors = ?reader_setup.errors,
+                    state = "reader_setup_slow",
+                    "Set disk object reader setup is slow"
                 );
             }
 
-            let nil_count = errors.iter().filter(|&e| e.is_none()).count();
+            let nil_count = reader_setup.available_shards();
             if nil_count < erasure.data_shards {
-                if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+                if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards)
+                {
                     let reason = classify_disk_error(&read_err);
                     error!(
+                        event = EVENT_SET_DISK_READ,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_SET_DISK,
                         bucket,
                         object,
                         part_index = current_part,
@@ -1808,7 +1985,8 @@ impl SetDisks {
                         data_shards = erasure.data_shards,
                         stage = GET_STAGE_READER_SETUP,
                         reason = reason.as_str(),
-                        errors = ?errors,
+                        errors = ?reader_setup.errors,
+                        state = "read_quorum_unavailable",
                         "Create bitrot reader failed read quorum"
                     );
                     record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
@@ -1816,6 +1994,9 @@ impl SetDisks {
                 }
                 let reason = GetObjectFailureReason::ReadQuorum;
                 error!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
                     bucket,
                     object,
                     part_index = current_part,
@@ -1829,18 +2010,19 @@ impl SetDisks {
                     data_shards = erasure.data_shards,
                     stage = GET_STAGE_READER_SETUP,
                     reason = reason.as_str(),
-                    errors = ?errors,
+                    errors = ?reader_setup.errors,
+                    state = "not_enough_readers",
                     "Create bitrot reader did not have enough disks"
                 );
                 record_get_object_pipeline_failure(GET_STAGE_READER_SETUP, reason);
-                return Err(Error::other(format!("not enough disks to read: {errors:?}")));
+                return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
             }
 
             // Check if we have missing shards even though we can read successfully
             // This happens when a node was offline during write and comes back online
             let total_shards = erasure.data_shards + erasure.parity_shards;
             let available_shards = nil_count;
-            let missing_shards = total_shards - available_shards;
+            let missing_shards = reader_setup.completed_failed_shards();
 
             debug!(
                 bucket,
@@ -1848,6 +2030,7 @@ impl SetDisks {
                 part_number,
                 total_shards,
                 available_shards,
+                attempted_shards = reader_setup.attempted.iter().filter(|attempted| **attempted).count(),
                 missing_shards,
                 data_shards = erasure.data_shards,
                 parity_shards = erasure.parity_shards,
@@ -1883,12 +2066,34 @@ impl SetDisks {
             //     "read part {} part_offset {},part_length {},part_size {}  ",
             //     part_number, part_offset, part_length, part_size
             // );
-            let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+            let decode_stage_start = Instant::now();
+            let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
+            let readers = reader_setup.readers;
             let (written, err) = erasure
                 .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
                 .await;
-            if let Some(decode_stage_start) = decode_stage_start {
-                rustfs_io_metrics::record_get_object_decode_duration(decode_stage_start.elapsed().as_secs_f64());
+            let decode_elapsed = decode_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
+                warn!(
+                    event = EVENT_SET_DISK_READ,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    bucket,
+                    object,
+                    part_index = current_part,
+                    part_number,
+                    part_offset,
+                    part_size,
+                    part_length,
+                    bytes_written = written,
+                    available_shards,
+                    missing_shards,
+                    elapsed_ms = decode_elapsed.as_millis(),
+                    error = ?err,
+                    state = if err.is_some() { "decode_failed_or_slow" } else { "decode_slow" },
+                    "Set disk object decode stage is slow or failed"
+                );
             }
             debug!(
                 bucket,
@@ -1903,29 +2108,28 @@ impl SetDisks {
                 let de_err: DiskError = e.into();
                 let mut has_err = true;
                 if written == part_length {
-                    match de_err {
-                        DiskError::FileNotFound | DiskError::FileCorrupt => {
-                            debug!(
-                                bucket,
-                                object,
-                                part_number,
-                                error = ?de_err,
-                                "Recoverable decode error triggered read repair"
-                            );
-                            let version_id = fi.version_id.as_ref().map(ToString::to_string);
-                            submit_read_repair_heal(
-                                bucket,
-                                object,
-                                version_id.as_deref(),
-                                pool_index,
-                                set_index,
-                                Some(part_number),
-                                "decode_error",
-                            )
-                            .await;
-                            has_err = false;
-                        }
-                        _ => {}
+                    let should_enqueue_heal = matches!(de_err, DiskError::FileCorrupt)
+                        || (matches!(de_err, DiskError::FileNotFound) && !unattempted_data_shards);
+                    if should_enqueue_heal {
+                        debug!(
+                            bucket,
+                            object,
+                            part_number,
+                            error = ?de_err,
+                            "Recoverable decode error triggered read repair"
+                        );
+                        let version_id = fi.version_id.as_ref().map(ToString::to_string);
+                        submit_read_repair_heal(
+                            bucket,
+                            object,
+                            version_id.as_deref(),
+                            pool_index,
+                            set_index,
+                            Some(part_number),
+                            "decode_error",
+                        )
+                        .await;
+                        has_err = false;
                     }
                 }
 
@@ -1958,6 +2162,22 @@ impl SetDisks {
         // debug!("read end");
 
         debug!(bucket, object, total_read, expected_length = length, "Multipart read finished");
+        let pipeline_elapsed = pipeline_started.elapsed();
+        if pipeline_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
+            warn!(
+                event = EVENT_SET_DISK_READ,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_SET_DISK,
+                bucket,
+                object,
+                offset,
+                total_read,
+                expected_length = length,
+                elapsed_ms = pipeline_elapsed.as_millis(),
+                state = "pipeline_slow",
+                "Set disk object read pipeline is slow"
+            );
+        }
 
         Ok(())
     }
@@ -2002,51 +2222,37 @@ impl SetDisks {
         let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
         let till_offset = erasure.shard_file_offset(0, part_length, part_size);
 
-        let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-        let mut readers = Vec::with_capacity(disks.len());
-        let mut read_costs = Vec::with_capacity(disks.len());
-        let mut errors = Vec::with_capacity(disks.len());
-        for (idx, disk_op) in disks.iter().enumerate() {
-            read_costs.push(shard_read_cost_for_disk(disk_op.as_ref()));
-            match create_bitrot_reader(
-                files[idx].data.as_deref(),
-                disk_op.as_ref(),
-                bucket,
-                &format!("{}/{}/part.{}", object, files[idx].data_dir.unwrap_or_default(), part_number),
-                0,
-                till_offset,
-                erasure.shard_size(),
-                checksum_algo.clone(),
-                skip_verify_bitrot,
-                use_zero_copy,
-            )
-            .await
-            {
-                Ok(Some(reader)) => {
-                    readers.push(Some(reader));
-                    errors.push(None);
-                }
-                Ok(None) => {
-                    readers.push(None);
-                    errors.push(Some(DiskError::DiskNotFound));
-                }
-                Err(e) => {
-                    readers.push(None);
-                    errors.push(Some(e));
-                }
-            }
-        }
-        if let Some(reader_setup_stage_start) = reader_setup_stage_start {
-            rustfs_io_metrics::record_get_object_stage_duration(
-                GET_OBJECT_PATH_CODEC_STREAMING,
-                GET_STAGE_READER_SETUP,
-                reader_setup_stage_start.elapsed().as_secs_f64(),
-            );
-        }
+        let reader_setup_stage_start = Instant::now();
+        let read_costs = disks
+            .iter()
+            .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
+            .collect::<Vec<_>>();
+        let reader_setup = create_bitrot_readers_until_quorum(
+            &files,
+            &disks,
+            bucket,
+            object,
+            part_number,
+            0,
+            till_offset,
+            erasure.shard_size(),
+            checksum_algo,
+            skip_verify_bitrot,
+            use_zero_copy,
+            erasure.data_shards,
+            erasure.parity_shards,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            GET_STAGE_READER_SETUP,
+            reader_setup_stage_start.elapsed().as_secs_f64(),
+        );
 
-        let available_shards = errors.iter().filter(|err| err.is_none()).count();
+        let available_shards = reader_setup.available_shards();
         if available_shards < erasure.data_shards {
-            if let Some(read_err) = reduce_read_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
+            if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                 let reason = classify_disk_error(&read_err);
                 record_get_object_pipeline_failure_for_path(GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_READER_SETUP, reason);
                 return Err(to_object_err(read_err.into(), vec![bucket, object]));
@@ -2056,11 +2262,10 @@ impl SetDisks {
                 GET_STAGE_READER_SETUP,
                 GetObjectFailureReason::ReadQuorum,
             );
-            return Err(Error::other(format!("not enough disks to read: {errors:?}")));
+            return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
         }
 
-        let total_shards = erasure.data_shards + erasure.parity_shards;
-        let missing_shards = total_shards.saturating_sub(available_shards);
+        let missing_shards = reader_setup.completed_failed_shards();
         if missing_shards > 0 {
             let version_id = fi.version_id.as_ref().map(ToString::to_string);
             submit_read_repair_heal(
@@ -2075,14 +2280,16 @@ impl SetDisks {
             .await;
         }
 
-        let source = crate::erasure::coding::decode::ParallelReader::new_with_metrics_path_and_read_costs(
-            readers,
-            erasure.clone(),
-            0,
-            part_size,
-            Some(GET_OBJECT_PATH_CODEC_STREAMING),
-            read_costs,
-        );
+        let readers = reader_setup.readers;
+        let source =
+            crate::erasure::coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
+                readers,
+                erasure.clone(),
+                0,
+                part_size,
+                Some(GET_OBJECT_PATH_CODEC_STREAMING),
+                read_costs,
+            );
         let engine = build_get_codec_streaming_decode_engine(erasure)?;
         let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
         Ok(Box::new(crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new(reader)))
@@ -2904,6 +3111,137 @@ mod tests {
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {
         ObjectInfo::from_file_info(fi, "bucket", "object", false)
+    }
+
+    fn inline_reader_setup_fileinfo(data: Option<&'static [u8]>) -> FileInfo {
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = data.map_or(0, |data| i64::try_from(data.len()).expect("test data length should fit i64"));
+        fi.data = data.map(Bytes::from_static);
+        fi
+    }
+
+    async fn setup_inline_bitrot_readers(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+    ) -> BitrotReaderSetup {
+        let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
+        let disks = vec![None; files.len()];
+
+        create_bitrot_readers_until_quorum(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            1,
+            0,
+            4,
+            4,
+            HashAlgorithm::None,
+            false,
+            false,
+            data_shards,
+            parity_shards,
+            mode,
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_stops_at_read_quorum() {
+        let setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert!(setup.data_shards_attempted(2));
+        assert_eq!(setup.completed_failed_shards(), 0);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_retains_unattempted_fallback_readers() {
+        let mut setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+
+        let fallback_index = setup
+            .attempted
+            .iter()
+            .position(|attempted| !*attempted)
+            .expect("read quorum should leave at least one deferred fallback");
+        assert!(!setup.ready[fallback_index]);
+
+        let mut fallback = setup.readers[fallback_index]
+            .take()
+            .expect("deferred fallback reader should be retained");
+        let mut out = [0u8; 4];
+        let n = fallback
+            .read(&mut out)
+            .await
+            .expect("deferred fallback reader should open on read");
+
+        assert_eq!(n, 4);
+        assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_verify_mode_stops_when_data_quorum_is_available() {
+        let setup = setup_inline_bitrot_readers(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.available_data_shards(2), 2);
+        assert_eq!(setup.completed_failed_shards(), 0);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_verify_mode_collects_extra_source_for_reconstruction() {
+        let setup = setup_inline_bitrot_readers(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert!(setup.data_shards_attempted(2));
+        assert_eq!(setup.completed_failed_shards(), 1);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_verify_mode_does_not_wait_for_impossible_extra_source() {
+        let setup = setup_inline_bitrot_readers(
+            vec![None, Some(b"bbbb"), Some(b"cccc")],
+            2,
+            1,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert_eq!(setup.completed_failed_shards(), 1);
     }
 
     #[test]

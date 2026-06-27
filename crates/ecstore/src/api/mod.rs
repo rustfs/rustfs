@@ -77,6 +77,7 @@ pub mod data_usage {
 }
 
 pub mod disk {
+    pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::endpoint::Endpoint;
     pub use crate::disk::error::DiskError;
     pub use crate::disk::error_reduce::is_all_buckets_not_found;

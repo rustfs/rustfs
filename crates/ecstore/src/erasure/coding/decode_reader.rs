@@ -479,9 +479,12 @@ mod tests {
     use crate::erasure::codec::bridge::{
         CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
     };
-    use crate::erasure::coding::Erasure;
+    use crate::erasure::coding::decode::ParallelReader;
+    use crate::erasure::coding::{BitrotReader, Erasure};
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
+    use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
+    use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tokio::io::AsyncReadExt;
@@ -612,6 +615,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn erasure_decode_reader_rejects_inconsistent_reconstruction_sources() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let data = (0u8..64u8).collect::<Vec<_>>();
+        let encoded = erasure.encode_data(&data).expect("test stripe should encode");
+        let mut corrupt_parity = encoded[DATA_SHARDS].to_vec();
+        corrupt_parity[0] ^= 0x80;
+
+        let source = VecStripeSource {
+            stripes: VecDeque::from([StripeReadState::from_parts(
+                vec![
+                    None,
+                    Some(encoded[1].to_vec()),
+                    Some(corrupt_parity),
+                    Some(encoded[DATA_SHARDS + 1].to_vec()),
+                ],
+                Vec::new(),
+                DATA_SHARDS,
+            )]),
+            read_quorum: DATA_SHARDS,
+            read_count: None,
+        };
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        let err = reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("streaming reader must reject inconsistent reconstruction sources");
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
+        assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
     async fn erasure_decode_reader_rustfs_engine_matches_legacy_with_missing_data() {
         let erasure = Erasure::new(4, 2, 32);
         let data = b"rustfs codec reader output must match legacy reader output exactly";
@@ -638,6 +681,55 @@ mod tests {
             .await
             .expect("empty object should decode");
 
+        assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_verifying_parallel_source_rejects_inconsistent_reconstruction_sources() {
+        const DATA_SHARDS: usize = 2;
+        const PARITY_SHARDS: usize = 2;
+        const BLOCK_SIZE: usize = 64;
+
+        let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+        let data = (0u8..64u8).collect::<Vec<_>>();
+        let shard_size = erasure.shard_size();
+        let encoded = erasure.encode_data(&data).expect("test stripe should encode");
+        let mut corrupt_parity = encoded[DATA_SHARDS].to_vec();
+        corrupt_parity[0] ^= 0x80;
+        let readers = vec![
+            None,
+            Some(BitrotReader::new(
+                Cursor::new(encoded[1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+            Some(BitrotReader::new(Cursor::new(corrupt_parity), shard_size, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(
+                Cursor::new(encoded[DATA_SHARDS + 1].to_vec()),
+                shard_size,
+                HashAlgorithm::None,
+                false,
+            )),
+        ];
+        let source = ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            data.len(),
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        let err = reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("streaming reader must reject inconsistent reconstruction sources");
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
         assert!(decoded.is_empty());
     }
 

@@ -2251,7 +2251,7 @@ impl HealManager {
                                     timeout: None,
                                     ..HealOptions::default()
                                 },
-                                HealPriority::Normal,
+                                HealPriority::Low,
                             );
                             req.source = HealRequestSource::AutoHeal;
                             let config = config.read().await;
