@@ -12,6 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RustfsCodecDecodeWorkspace {
+    shard_len: usize,
+}
+
+impl RustfsCodecDecodeWorkspace {
+    #[inline]
+    pub(crate) fn new(shard_len: usize) -> Self {
+        Self { shard_len }
+    }
+
+    #[inline]
+    pub(crate) fn shard_len(&self) -> usize {
+        self.shard_len
+    }
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ShardBufferPool {
     buffers: Vec<Option<Vec<u8>>>,

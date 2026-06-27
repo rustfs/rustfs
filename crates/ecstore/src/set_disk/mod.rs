@@ -33,6 +33,9 @@ use crate::disk::{
     conv_part_err_to_int, has_part_err,
 };
 use crate::disk::{STORAGE_FORMAT_FILE, count_part_not_success};
+use crate::erasure_codec::bridge::{
+    CodecStreamingDecodeEngine, GET_CODEC_STREAMING_ENGINE_LEGACY, GET_CODEC_STREAMING_ENGINE_RUSTFS,
+};
 use crate::erasure_coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
@@ -301,8 +304,10 @@ const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
 const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
+const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -381,6 +386,28 @@ fn is_get_metadata_early_stop_enabled() -> bool {
 
 fn get_codec_streaming_min_size() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingEngine {
+    Legacy,
+    Rustfs,
+}
+
+fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
+    let engine = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE);
+    match engine.trim() {
+        value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_RUSTFS) => GetCodecStreamingEngine::Rustfs,
+        value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_LEGACY) => GetCodecStreamingEngine::Legacy,
+        _ => GetCodecStreamingEngine::Legacy,
+    }
+}
+
+fn build_get_codec_streaming_decode_engine(erasure: erasure_coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
+    match get_codec_streaming_engine() {
+        GetCodecStreamingEngine::Legacy => Ok(CodecStreamingDecodeEngine::legacy(erasure)),
+        GetCodecStreamingEngine::Rustfs => CodecStreamingDecodeEngine::rustfs(&erasure),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
