@@ -244,12 +244,11 @@ impl MetadataQuorumAccumulator {
         self.valid_responses = self.valid_responses.saturating_add(1);
 
         // Track version match for versioned requests
-        if !self.requested_version_id.is_empty() {
-            if let Some(ref vid) = file_info.version_id {
-                if vid.to_string() == self.requested_version_id {
-                    self.matching_version_votes = self.matching_version_votes.saturating_add(1);
-                }
-            }
+        if !self.requested_version_id.is_empty()
+            && let Some(ref vid) = file_info.version_id
+            && vid.to_string() == self.requested_version_id
+        {
+            self.matching_version_votes = self.matching_version_votes.saturating_add(1);
         }
 
         if file_info.deleted {
@@ -3156,9 +3155,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_gate_defaults_to_enabled() {
+    fn metadata_early_stop_gate_defaults_to_disabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
-            assert!(is_get_metadata_early_stop_enabled());
+            assert!(!is_get_metadata_early_stop_enabled());
         });
     }
 

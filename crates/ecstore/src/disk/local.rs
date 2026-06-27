@@ -99,18 +99,12 @@ const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
 
 /// Check if O_DIRECT reads are enabled.
 fn is_direct_io_read_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE,
-        DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE,
-    )
+    rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
 }
 
 /// Get the O_DIRECT read threshold size.
 fn get_direct_io_read_threshold() -> usize {
-    rustfs_utils::get_env_usize(
-        ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD,
-        DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD,
-    )
+    rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
 }
 
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {

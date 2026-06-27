@@ -358,7 +358,7 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true; // Enabled by default
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
@@ -515,7 +515,10 @@ fn get_codec_streaming_rollout_pct() -> u32 {
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT)
+        rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+        )
     })
 }
 
