@@ -48,7 +48,6 @@ use tokio::sync::RwLock;
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager_with(get_global_app_context())
-        .or_else(|| default_kms_runtime_interface().service_manager())
 }
 
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
@@ -59,11 +58,7 @@ pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
 
 /// Resolve KMS encryption service using AppContext-first precedence.
 pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    if let Some(service) = resolve_encryption_service_with(get_global_app_context()).await {
-        return Some(service);
-    }
-
-    runtime_sources::encryption_service().await
+    resolve_encryption_service_with(get_global_app_context()).await
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
@@ -84,12 +79,12 @@ pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
 
 /// Resolve IAM readiness using AppContext-first precedence.
 pub fn resolve_iam_ready() -> bool {
-    resolve_iam_ready_with(get_global_app_context()).unwrap_or_else(runtime_sources::iam_is_ready)
+    resolve_iam_ready_with(get_global_app_context()).unwrap_or(false)
 }
 
 /// Resolve IAM system handle using AppContext-first precedence.
 pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    resolve_iam_handle_with(get_global_app_context()).or_else(runtime_sources::iam_handle)
+    resolve_iam_handle_with(get_global_app_context())
 }
 
 /// Resolve OIDC system handle using AppContext-first precedence.
@@ -108,7 +103,7 @@ pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<Object
         return resolve_ready_iam_handle_with(context);
     }
 
-    runtime_sources::ready_iam_handle()
+    Err(IamError::IamSysNotInitialized)
 }
 
 /// Resolve token signing key using AppContext-first precedence.
@@ -247,11 +242,7 @@ pub async fn resolve_local_node_name() -> String {
 
 /// Resolve action credentials using AppContext-first precedence.
 pub fn resolve_action_credentials() -> Option<Credentials> {
-    if let Some(context) = get_global_app_context() {
-        return resolve_action_credentials_with(context);
-    }
-
-    default_action_credential_interface().get()
+    get_global_app_context().and_then(resolve_action_credentials_with)
 }
 
 /// Resolve region using AppContext-first precedence.

@@ -1792,18 +1792,43 @@ pub trait SseDekProvider: Send + Sync {
 
 /// Production KMS-backed DEK provider
 /// Resolves the latest ObjectEncryptionService on each call.
-struct KmsSseDekProvider;
+struct KmsSseDekProvider {
+    #[cfg(test)]
+    service_manager: Option<Arc<rustfs_kms::KmsServiceManager>>,
+}
 
 impl KmsSseDekProvider {
     /// Create a new KMS-backed provider
     pub async fn new() -> Result<Self, ApiError> {
-        Self::current_service()
+        let provider = Self {
+            #[cfg(test)]
+            service_manager: None,
+        };
+        provider
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
-        Ok(Self)
+        Ok(provider)
     }
 
-    async fn current_service() -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
+    #[cfg(test)]
+    async fn new_with_service_manager(service_manager: Arc<rustfs_kms::KmsServiceManager>) -> Result<Self, ApiError> {
+        let provider = Self {
+            service_manager: Some(service_manager),
+        };
+        provider
+            .current_service()
+            .await
+            .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
+        Ok(provider)
+    }
+
+    async fn current_service(&self) -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
+        #[cfg(test)]
+        if let Some(service_manager) = &self.service_manager {
+            return service_manager.get_encryption_service().await;
+        }
+
         runtime_sources::current_encryption_service().await
     }
 }
@@ -1816,7 +1841,8 @@ impl SseDekProvider for KmsSseDekProvider {
         kms_key_id: &str,
     ) -> Result<(DataKey, Vec<u8>), ApiError> {
         let kms_key_option = Some(kms_key_id.to_string());
-        let service = Self::current_service()
+        let service = self
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         let (data_key, encrypted_data_key) = service
@@ -1833,7 +1859,8 @@ impl SseDekProvider for KmsSseDekProvider {
         _kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError> {
-        let service = Self::current_service()
+        let service = self
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         let data_key = service
@@ -1851,7 +1878,8 @@ impl SseDekProvider for KmsSseDekProvider {
         _kms_key_id: &str,
         _context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError> {
-        let service = Self::current_service()
+        let service = self
+            .current_service()
             .await
             .ok_or_else(|| ApiError::from(StorageError::other("KMS encryption service is not initialized")))?;
         let data_key = service
@@ -3725,7 +3753,9 @@ mod tests {
             .await
             .expect("first key should be created");
 
-        let provider = KmsSseDekProvider::new().await.expect("provider should initialize");
+        let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+            .await
+            .expect("provider should initialize");
         let context = ObjectEncryptionContext::new("bucket".to_string(), "object".to_string());
         provider
             .generate_sse_dek(&context, "first-key")
