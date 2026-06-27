@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
+#![warn(dead_code)] // Gradually clean up; see https://github.com/rustfs/backlog/issues/742
 
 use crate::{MetricDescriptor, MetricName, MetricSubsystem, new_counter_md, new_gauge_md, subsystems};
 use std::sync::LazyLock;
