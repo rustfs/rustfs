@@ -1073,6 +1073,13 @@ else:
                 delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="multipart"'),
                 "proves runtime multipart object fallback reason delta",
             )
+            add(
+                profile,
+                "fallback_encrypted",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="encrypted"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="encrypted"'),
+                "proves runtime encrypted object fallback reason delta",
+            )
             below_delta = delta_for(
                 profile,
                 "rustfs_io_get_object_codec_streaming_fallback_total",
@@ -1222,6 +1229,7 @@ profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_r
 ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
 ${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,multipart,dry-run only
+${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
 EOF
     cat >"${compat_dir}/snapshot.json" <<EOF
 {
@@ -1248,6 +1256,7 @@ EOF
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
     "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" <<'PY'
+import base64
 import csv
 import datetime as dt
 import hashlib
@@ -1552,6 +1561,46 @@ else:
                         "note": "Multipart object GET should stay on the legacy fallback path for codec profiles",
                     }
                 )
+
+encrypted_key = object_key + ".encrypted"
+encrypted_path = bucket_path + "/" + urllib.parse.quote(encrypted_key, safe="/-_.~")
+ssec_key = b"0123456789abcdef0123456789abcdef"
+ssec_key_b64 = base64.b64encode(ssec_key).decode()
+ssec_key_md5_b64 = base64.b64encode(hashlib.md5(ssec_key).digest()).decode()
+ssec_headers = [
+    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+    ("x-amz-server-side-encryption-customer-key", ssec_key_b64),
+    ("x-amz-server-side-encryption-customer-key-md5", ssec_key_md5_b64),
+]
+encrypted_put, _ = request("PUT", encrypted_path, body, [("content-type", "application/octet-stream"), *ssec_headers])
+if encrypted_put["status"] not in (200, 204):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "encrypted",
+            "object_key": encrypted_key,
+            "status": "put_failed",
+            "status_code": encrypted_put["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": "encrypted",
+            "note": "SSE-C encrypted object upload failed",
+        }
+    )
+else:
+    encrypted_get, encrypted_body = request("GET", encrypted_path, extra_headers=ssec_headers)
+    encrypted_ok = encrypted_get["status"] == 200 and sha256_hex(encrypted_body) == sha256_hex(body)
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "encrypted",
+            "object_key": encrypted_key,
+            "status": "ok" if encrypted_ok else "unexpected_status_or_body",
+            "status_code": encrypted_get["status"],
+            "body_len": len(encrypted_body),
+            "expected_runtime_fallback_reason": "encrypted",
+            "note": "SSE-C encrypted object GET should stay on the legacy fallback path for codec profiles",
+        }
+    )
 
 body_sha = sha256_hex(get_body)
 expected_sha = sha256_hex(body)
