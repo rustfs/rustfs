@@ -35,7 +35,7 @@ jobs:
     steps:
       - name: Report CLA result for merge queue
         if: github.event_name == 'merge_group'
-        uses: actions/github-script@v8
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         with:
           script: |
             await github.rest.checks.create({
@@ -54,7 +54,7 @@ jobs:
       - name: Create token for rustfs/cla
         if: github.event_name != 'merge_group'
         id: registry-token
-        uses: actions/create-github-app-token@v3
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3
         with:
           app-id: ${{ vars.CLA_BOT_APP_ID }}
           private-key: ${{ secrets.CLA_BOT_APP_PRIVATE_KEY }}
@@ -64,7 +64,7 @@ jobs:
 
       - name: Run CLA Bot
         if: github.event_name != 'merge_group'
-        uses: overtrue/cla-bot@v0.0.9
+        uses: overtrue/cla-bot@5e5929846a60cfb42b16d0d38e135ef67d94fc88 # v0.0.9
         with:
           github-token: ${{ github.token }}
           registry-token: ${{ steps.registry-token.outputs.token }}
