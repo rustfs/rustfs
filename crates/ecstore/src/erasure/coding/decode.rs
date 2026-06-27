@@ -133,6 +133,7 @@ fn shard_role(index: usize, data_shards: usize) -> &'static str {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn read_shard<'a, R>(
     index: usize,
     read_cost: ShardReadCost,
@@ -408,6 +409,7 @@ where
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn new_with_metrics_path_read_costs_timeout_and_reconstruction_verification(
         readers: Vec<Option<BitrotReader<R>>>,
         e: Erasure,
@@ -444,6 +446,7 @@ where
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_shard_read_result(
     shards: &mut [Option<Vec<u8>>],
     errs: &mut [Option<Error>],
