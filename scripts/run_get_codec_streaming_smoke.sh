@@ -1402,130 +1402,142 @@ write_raw_output_paths() {
 }
 
 write_default_switch_readiness_report() {
-  "$PYTHON_BIN" - \
-    "${OUT_DIR}/default_switch_readiness.md" \
-    "${OUT_DIR}/baseline_compare.csv" \
-    "${OUT_DIR}/compat_summary.csv" \
-    "${OUT_DIR}/metrics_summary.csv" \
-    "${OUT_DIR}/cpu_rss_notes.txt" \
-    "${OUT_DIR}/fallback_coverage.txt" \
-    "${OUT_DIR}/tracking_issues.txt" \
-    "$ROUNDS" <<'PY'
-import csv
-import pathlib
-import sys
+  local report_path="${OUT_DIR}/default_switch_readiness.md"
+  local baseline_compare_path="${OUT_DIR}/baseline_compare.csv"
+  local compat_summary_path="${OUT_DIR}/compat_summary.csv"
+  local cpu_rss_notes_path="${OUT_DIR}/cpu_rss_notes.txt"
+  local fallback_coverage_path="${OUT_DIR}/fallback_coverage.txt"
+  local tracking_issues_path="${OUT_DIR}/tracking_issues.txt"
 
-report_path = pathlib.Path(sys.argv[1])
-baseline_compare_path = pathlib.Path(sys.argv[2])
-compat_summary_path = pathlib.Path(sys.argv[3])
-metrics_summary_path = pathlib.Path(sys.argv[4])
-cpu_rss_notes_path = pathlib.Path(sys.argv[5])
-fallback_coverage_path = pathlib.Path(sys.argv[6])
-tracking_issues_path = pathlib.Path(sys.argv[7])
-expected_rounds = int(sys.argv[8])
+  local stable not_worse improved_over_five two_sizes_gt_five
+  local headers_compatible p95_p99_ok cpu_rss_ok fallback_proven kill_switch_verified correctness_matrix_ok
+  local all_pass decision
 
+  if [[ -f "$baseline_compare_path" ]]; then
+    read -r stable not_worse improved_over_five < <(
+      awk -F',' -v expected_rounds="$ROUNDS" '
+        BEGIN {
+          rows = 0
+          stable = 1
+          not_worse = 1
+          improved = 0
+        }
+        NR == 1 { next }
+        $11 == "1MiB" || $11 == "4MiB" || $11 == "10MiB" {
+          rows++
+          if ($14 != expected_rounds || $15 != "0") {
+            stable = 0
+          }
+          if ($19 == "" || $22 == "" || ($19 + 0.0) < 0.0 || ($22 + 0.0) > 0.0) {
+            not_worse = 0
+          }
+          if ($25 != "" && ($25 + 0.0) > 5.0) {
+            improved++
+          }
+        }
+        END {
+          if (rows == 0) {
+            stable = 0
+            not_worse = 0
+          }
+          printf "%s %s %d\n", stable ? "pass" : "fail", not_worse ? "pass" : "fail", improved
+        }
+      ' "$baseline_compare_path"
+    )
+  else
+    stable="fail"
+    not_worse="fail"
+    improved_over_five=0
+  fi
 
-def load_csv(path):
-    if not path.exists():
-        return []
-    with open(path, encoding="utf-8", newline="") as handle:
-        return list(csv.DictReader(handle))
+  if [[ "$improved_over_five" -ge 2 ]]; then
+    two_sizes_gt_five="pass"
+  else
+    two_sizes_gt_five="fail"
+  fi
 
+  if [[ -f "$compat_summary_path" ]] && awk -F',' 'NR > 1 && $10 != "0" { exit 1 } END { exit (NR > 1 ? 0 : 1) }' "$compat_summary_path"; then
+    headers_compatible="pass"
+  else
+    headers_compatible="fail"
+  fi
 
-baseline_rows = load_csv(baseline_compare_path)
-compat_rows = load_csv(compat_summary_path)
-metrics_rows = load_csv(metrics_summary_path)
-cpu_rss_notes = cpu_rss_notes_path.read_text(encoding="utf-8") if cpu_rss_notes_path.exists() else ""
-fallback_notes = fallback_coverage_path.read_text(encoding="utf-8") if fallback_coverage_path.exists() else ""
-tracking_issues = tracking_issues_path.read_text(encoding="utf-8") if tracking_issues_path.exists() else ""
+  p95_p99_ok="fail"
+  correctness_matrix_ok="fail"
 
+  if [[ -f "$cpu_rss_notes_path" ]] && grep -q 'cpu_rss_acceptability=acceptable' "$cpu_rss_notes_path"; then
+    cpu_rss_ok="pass"
+  else
+    cpu_rss_ok="fail"
+  fi
 
-def parse_float(value):
-    if value in ("", "N/A", None):
-        return None
-    return float(value)
+  if [[ -f "$fallback_coverage_path" ]] \
+    && grep -q 'read_quorum_not_safe' "$fallback_coverage_path" \
+    && grep -q 'range / encrypted / compressed / multipart / remote' "$fallback_coverage_path"; then
+    fallback_proven="pass"
+  else
+    fallback_proven="fail"
+  fi
 
+  if [[ -f "$fallback_coverage_path" ]] && grep -q 'codec_streaming_reader_gate_defaults_to_disabled' "$fallback_coverage_path"; then
+    kill_switch_verified="pass"
+  else
+    kill_switch_verified="fail"
+  fi
 
-target_sizes = {"1MiB", "4MiB", "10MiB"}
-target_rows = [row for row in baseline_rows if row.get("size") in target_sizes]
+  if [[ "$stable" == "pass" \
+     && "$not_worse" == "pass" \
+     && "$two_sizes_gt_five" == "pass" \
+     && "$p95_p99_ok" == "pass" \
+     && "$cpu_rss_ok" == "pass" \
+     && "$correctness_matrix_ok" == "pass" \
+     && "$headers_compatible" == "pass" \
+     && "$fallback_proven" == "pass" \
+     && "$kill_switch_verified" == "pass" ]]; then
+    all_pass="pass"
+    decision="Default enablement prerequisites passed; scoped default enablement may be considered."
+  else
+    all_pass="fail"
+    decision="Default enablement is not ready; keep opt-in only."
+  fi
 
-stable = bool(target_rows) and all(
-    row.get("successful_rounds") == str(expected_rounds) and row.get("failed_rounds") == "0"
-    for row in target_rows
-)
-
-not_worse = bool(target_rows)
-improved_over_five = 0
-for row in target_rows:
-    throughput_delta = parse_float(row.get("delta_throughput_pct_vs_legacy"))
-    latency_delta = parse_float(row.get("delta_latency_pct_vs_legacy"))
-    if throughput_delta is None or latency_delta is None or throughput_delta < 0.0 or latency_delta > 0.0:
-        not_worse = False
-    if throughput_delta is not None and throughput_delta > 5.0:
-        improved_over_five += 1
-
-two_sizes_gt_five = improved_over_five >= 2
-headers_compatible = bool(compat_rows) and all(row.get("error_count") == "0" for row in compat_rows)
-p95_p99_ok = False
-cpu_rss_ok = "cpu_rss_acceptability=acceptable" in cpu_rss_notes
-fallback_proven = "read_quorum_not_safe" in fallback_notes and "range / encrypted / compressed / multipart / remote" in fallback_notes
-kill_switch_verified = "codec_streaming_reader_gate_defaults_to_disabled" in fallback_notes
-correctness_matrix_ok = False
-
-all_pass = all(
-    [
-        stable,
-        not_worse,
-        two_sizes_gt_five,
-        p95_p99_ok,
-        cpu_rss_ok,
-        correctness_matrix_ok,
-        headers_compatible,
-        fallback_proven,
-        kill_switch_verified,
-    ]
-)
-
-decision = "Default enablement is not ready; keep opt-in only." if not all_pass else "Default enablement prerequisites passed; scoped default enablement may be considered."
-
-lines = [
-    "# GET V2 PR-35 Default Switch Readiness",
-    "",
-    f"Decision: **{decision}**",
-    "",
-    "## Hard Prerequisite Status",
-    "",
-    "| Prerequisite | Status | Notes |",
-    "| --- | --- | --- |",
-    f"| multi-round cooled A/B stable | {'pass' if stable else 'fail'} | expected rounds per target size: {expected_rounds} |",
-    f"| 1MiB / 4MiB / 10MiB not worse than legacy | {'pass' if not_worse else 'fail'} | derived from baseline_compare.csv |",
-    f"| at least two sizes improve by more than 5% | {'pass' if two_sizes_gt_five else 'fail'} | qualifying sizes: {improved_over_five} |",
-    f"| p95 / p99 do not regress | {'pass' if p95_p99_ok else 'fail'} | current harness retains raw output paths but does not aggregate p95/p99 yet |",
-    f"| CPU and RSS acceptable | {'pass' if cpu_rss_ok else 'fail'} | see cpu_rss_notes.txt |",
-    f"| correctness matrix passes | {'pass' if correctness_matrix_ok else 'fail'} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |",
-    f"| response headers compatible | {'pass' if headers_compatible else 'fail'} | see compat_summary.csv |",
-    f"| range / encrypted / compressed / multipart / remote fallback proven | {'pass' if fallback_proven else 'fail'} | see fallback_coverage.txt |",
-    f"| kill switch verified | {'pass' if kill_switch_verified else 'fail'} | see fallback_coverage.txt |",
-    "",
-    "## Evidence Files",
-    "",
-    "- `baseline_compare.csv`",
-    "- `compat_summary.csv`",
-    "- `metrics_summary.csv`",
-    "- `cpu_rss_notes.txt`",
-    "- `fallback_coverage.txt`",
-    "- `tracking_issues.txt`",
-    "- `raw_output_paths.txt`",
-    "",
-    "## Tracking Issues",
-    "",
-    "```text",
-    tracking_issues.rstrip(),
-    "```",
-]
-
-report_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
-PY
+  {
+    echo "# GET V2 PR-35 Default Switch Readiness"
+    echo
+    echo "Decision: **${decision}**"
+    echo
+    echo "## Hard Prerequisite Status"
+    echo
+    echo "| Prerequisite | Status | Notes |"
+    echo "| --- | --- | --- |"
+    echo "| multi-round cooled A/B stable | ${stable} | expected rounds per target size: ${ROUNDS} |"
+    echo "| 1MiB / 4MiB / 10MiB not worse than legacy | ${not_worse} | derived from baseline_compare.csv |"
+    echo "| at least two sizes improve by more than 5% | ${two_sizes_gt_five} | qualifying sizes: ${improved_over_five} |"
+    echo "| p95 / p99 do not regress | ${p95_p99_ok} | current harness retains raw output paths but does not aggregate p95/p99 yet |"
+    echo "| CPU and RSS acceptable | ${cpu_rss_ok} | see cpu_rss_notes.txt |"
+    echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
+    echo "| response headers compatible | ${headers_compatible} | see compat_summary.csv |"
+    echo "| range / encrypted / compressed / multipart / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
+    echo "| kill switch verified | ${kill_switch_verified} | see fallback_coverage.txt |"
+    echo
+    echo "## Evidence Files"
+    echo
+    echo "- \`baseline_compare.csv\`"
+    echo "- \`compat_summary.csv\`"
+    echo "- \`metrics_summary.csv\`"
+    echo "- \`cpu_rss_notes.txt\`"
+    echo "- \`fallback_coverage.txt\`"
+    echo "- \`tracking_issues.txt\`"
+    echo "- \`raw_output_paths.txt\`"
+    echo
+    echo "## Tracking Issues"
+    echo
+    echo '```text'
+    if [[ -f "$tracking_issues_path" ]]; then
+      cat "$tracking_issues_path"
+    fi
+    echo '```'
+  } >"$report_path"
 }
 
 run_profile() {
