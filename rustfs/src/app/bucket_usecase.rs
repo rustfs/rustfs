@@ -60,8 +60,8 @@ use crate::admin::handlers::site_replication::{
     site_replication_bucket_meta_hook, site_replication_delete_bucket_hook, site_replication_make_bucket_hook,
 };
 use crate::app::runtime_sources::{
-    AppContext, current_app_context, resolve_encryption_service, resolve_notification_system,
-    resolve_notify_interface_for_context, resolve_object_store_handle_for_context,
+    AppContext, current_app_context, current_encryption_service, current_notification_system,
+    current_notify_interface_for_context, current_object_store_handle_for_context,
 };
 use crate::auth::get_condition_values_with_client_info;
 use crate::error::ApiError;
@@ -238,7 +238,7 @@ fn notify_bucket_metadata_reload(
     request_context: Option<request_context::RequestContext>,
 ) {
     spawn_background_with_context(request_context, async move {
-        if let Some(notification_sys) = resolve_notification_system()
+        if let Some(notification_sys) = current_notification_system()
             && let Err(err) = notification_sys.load_bucket_metadata(&bucket).await
         {
             warn!(bucket = %bucket, error = %err, "failed to notify peers after {operation}");
@@ -778,7 +778,7 @@ impl DefaultBucketUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     #[instrument(
@@ -1594,7 +1594,7 @@ impl DefaultBucketUsecase {
             && by_default.sse_algorithm.as_str() == ServerSideEncryption::AWS_KMS
             && by_default.kms_master_key_id.as_deref().is_none_or(str::is_empty)
         {
-            let service = resolve_encryption_service()
+            let service = current_encryption_service()
                 .await
                 .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "KMS service not initialized".to_string()))?;
             let default_key = service
@@ -1746,7 +1746,7 @@ impl DefaultBucketUsecase {
             .map_err(ApiError::from)?;
 
         let region = resolve_notification_region(self.global_region(), request_region);
-        let notify = resolve_notify_interface_for_context(self.context.as_deref());
+        let notify = current_notify_interface_for_context(self.context.as_deref());
         let clear_rules = notify.clear_bucket_notification_rules(&bucket);
         let parse_rules = async {
             let mut event_rules = Vec::new();

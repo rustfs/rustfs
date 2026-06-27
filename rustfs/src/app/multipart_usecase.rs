@@ -56,7 +56,7 @@ use super::storage_api::multipart_usecase::sse::{
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::app::runtime_sources::{AppContext, current_app_context, resolve_object_store_handle_for_context};
+use crate::app::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
@@ -295,7 +295,7 @@ impl DefaultMultipartUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     #[instrument(level = "debug", skip(self))]
