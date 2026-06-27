@@ -328,6 +328,9 @@ codec_engines=${CODEC_ENGINES}
 metadata_early_stop=${METADATA_EARLY_STOP}
 shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
 codec_max_inflight=${CODEC_MAX_INFLIGHT}
+codec_rollout_codec_profile=benchmark
+codec_body_compat_confirmed_codec_profile=true
+codec_header_compat_confirmed_codec_profile=true
 output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
 address=${ADDRESS}
 bucket=${BUCKET}
@@ -377,6 +380,33 @@ profile_codec_engine() {
   esac
 }
 
+profile_rollout_target() {
+  local profile="$1"
+  case "$profile" in
+    legacy) echo "off" ;;
+    codec-legacy|codec-rustfs) echo "benchmark" ;;
+    *) die "unknown profile: $profile" ;;
+  esac
+}
+
+profile_body_compat_confirmed() {
+  local profile="$1"
+  case "$profile" in
+    legacy) echo "false" ;;
+    codec-legacy|codec-rustfs) echo "true" ;;
+    *) die "unknown profile: $profile" ;;
+  esac
+}
+
+profile_header_compat_confirmed() {
+  local profile="$1"
+  case "$profile" in
+    legacy) echo "false" ;;
+    codec-legacy|codec-rustfs) echo "true" ;;
+    *) die "unknown profile: $profile" ;;
+  esac
+}
+
 profile_metrics_path() {
   local profile="$1"
   case "$profile" in
@@ -408,7 +438,11 @@ write_manifest() {
   local volumes="$4"
   local codec_engine="$5"
   local metrics_path="$6"
+  local rollout_target body_compat_confirmed header_compat_confirmed
   local git_head git_dirty_count
+  rollout_target="$(profile_rollout_target "$profile")"
+  body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
+  header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
 
   git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
   git_dirty_count="$(git -C "$PROJECT_ROOT" status --porcelain | awk 'END { print NR + 0 }')"
@@ -436,6 +470,9 @@ compat_object_size=${COMPAT_OBJECT_SIZE}
 rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
 RUSTFS_GET_CODEC_STREAMING_ENGINE=${codec_engine}
+RUSTFS_GET_CODEC_STREAMING_ROLLOUT=${rollout_target}
+RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED=${body_compat_confirmed}
+RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=${header_compat_confirmed}
 RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
@@ -489,6 +526,9 @@ start_server() {
   local codec_enabled
   local codec_engine
   local metrics_path
+  local rollout_target
+  local body_compat_confirmed
+  local header_compat_confirmed
   local rustfs_log
 
   data_root="$(profile_data_root "$profile")"
@@ -496,6 +536,9 @@ start_server() {
   codec_enabled="$(profile_codec_enabled "$profile")"
   codec_engine="$(profile_codec_engine "$profile")"
   metrics_path="$(profile_metrics_path "$profile")"
+  rollout_target="$(profile_rollout_target "$profile")"
+  body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
+  header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
   rustfs_log="${profile_dir}/rustfs.log"
 
   mkdir -p "${data_root}/disk1" "${data_root}/disk2" "${data_root}/disk3" "${data_root}/disk4"
@@ -517,6 +560,9 @@ start_server() {
     export RUSTFS_CONSOLE_ENABLE=false
     export RUSTFS_GET_CODEC_STREAMING_ENABLE="$codec_enabled"
     export RUSTFS_GET_CODEC_STREAMING_ENGINE="$codec_engine"
+    export RUSTFS_GET_CODEC_STREAMING_ROLLOUT="$rollout_target"
+    export RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED="$body_compat_confirmed"
+    export RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED="$header_compat_confirmed"
     export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
     export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"

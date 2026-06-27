@@ -48,6 +48,15 @@ const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
 
 static READ_REPAIR_HEAL_CACHE: OnceLock<RwLock<HashMap<ReadRepairHealCacheKey, Instant>>> = OnceLock::new();
 
+pub(super) enum GetCodecStreamingReaderBuildOutcome {
+    Reader(Box<dyn AsyncRead + Unpin + Send + Sync>),
+    Fallback(GetCodecStreamingFallbackReason),
+}
+
+pub(super) fn codec_streaming_reader_setup_fallback_reason(missing_shards: usize) -> Option<GetCodecStreamingFallbackReason> {
+    (missing_shards > 0).then_some(GetCodecStreamingFallbackReason::ReadQuorumNotSafe)
+}
+
 #[derive(Clone, Copy, Debug)]
 struct MetadataFanoutObservation {
     outcome: &'static str,
@@ -1646,16 +1655,19 @@ impl SetDisks {
         opts: &ObjectOptions,
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
+        let vid = opts.version_id.clone().unwrap_or_default();
+
         let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
-        if use_metadata_cache && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await {
+        if use_metadata_cache
+            && vid.is_empty()
+            && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await
+        {
             return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
         }
 
         let disks = self.disks.read().await;
 
         let disks = disks.clone();
-
-        let vid = opts.version_id.clone().unwrap_or_default();
 
         // TODO: optimize concurrency and break once enough slots are available
         let (parts_metadata, errs, metadata_fanout_diagnostics) = Self::read_all_fileinfo_observed(
@@ -2186,14 +2198,14 @@ impl SetDisks {
     pub(super) async fn get_object_decode_reader_with_fileinfo(
         bucket: &str,
         object: &str,
-        fi: FileInfo,
-        files: Vec<FileInfo>,
+        fi: &FileInfo,
+        files: &[FileInfo],
         disks: &[Option<DiskStore>],
-        set_index: usize,
-        pool_index: usize,
+        _set_index: usize,
+        _pool_index: usize,
         skip_verify_bitrot: bool,
-    ) -> Result<Box<dyn AsyncRead + Unpin + Send + Sync>> {
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
         if fi.parts.len() != 1 {
             return Err(Error::other("codec streaming reader only supports single-part plain objects"));
         }
@@ -2263,18 +2275,8 @@ impl SetDisks {
         }
 
         let missing_shards = reader_setup.completed_failed_shards();
-        if missing_shards > 0 {
-            let version_id = fi.version_id.as_ref().map(ToString::to_string);
-            submit_read_repair_heal(
-                bucket,
-                object,
-                version_id.as_deref(),
-                pool_index,
-                set_index,
-                Some(part_number),
-                "missing_shards_streaming",
-            )
-            .await;
+        if let Some(reason) = codec_streaming_reader_setup_fallback_reason(missing_shards) {
+            return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
         }
 
         let readers = reader_setup.readers;
@@ -2294,9 +2296,9 @@ impl SetDisks {
             part_length,
             metrics_path,
         )?;
-        Ok(Box::new(
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
             crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
-        ))
+        )))
     }
 }
 
@@ -3253,18 +3255,21 @@ mod tests {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
             ],
             || {
                 let fi = codec_streaming_test_fileinfo(1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Use
                 );
 
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &object_info, &fi, false),
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, false).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled)
                 );
 
@@ -3274,14 +3279,14 @@ mod tests {
                     end: 1,
                 });
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&range, &object_info, &fi, true),
+                    get_codec_streaming_reader_gate(&range, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range)
                 );
 
                 let multipart_fi = codec_streaming_test_fileinfo(1024, 2);
                 let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &multipart_object_info, &multipart_fi, true),
+                    get_codec_streaming_reader_gate(&None, &multipart_object_info, &multipart_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
                 );
 
@@ -3291,7 +3296,7 @@ mod tests {
                     .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
                 let encrypted = codec_streaming_test_object_info(&encrypted_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &encrypted, &fi, true),
+                    get_codec_streaming_reader_gate(&None, &encrypted, &encrypted_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
                 );
 
@@ -3299,14 +3304,14 @@ mod tests {
                 insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
                 let compressed = codec_streaming_test_object_info(&compressed_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &compressed, &fi, true),
+                    get_codec_streaming_reader_gate(&None, &compressed, &compressed_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
                 );
 
                 let small_fi = codec_streaming_test_fileinfo(0, 1);
                 let small_object_info = codec_streaming_test_object_info(&small_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &small_object_info, &small_fi, true),
+                    get_codec_streaming_reader_gate(&None, &small_object_info, &small_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
                 );
 
@@ -3314,7 +3319,7 @@ mod tests {
                 remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
                 let remote = codec_streaming_test_object_info(&remote_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &remote, &remote_fi, true),
+                    get_codec_streaming_reader_gate(&None, &remote, &remote_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
                 );
             },
@@ -3341,6 +3346,9 @@ mod tests {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
             ],
@@ -3349,7 +3357,7 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
                 );
             },
@@ -3386,6 +3394,15 @@ mod tests {
     #[test]
     fn codec_streaming_fallback_metric_labels_are_stable() {
         assert_eq!(GetCodecStreamingFallbackReason::Disabled.as_str(), "disabled");
+        assert_eq!(GetCodecStreamingFallbackReason::RolloutNotOptedIn.as_str(), "rollout_not_opted_in");
+        assert_eq!(
+            GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed.as_str(),
+            "body_compatibility_unconfirmed"
+        );
+        assert_eq!(
+            GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed.as_str(),
+            "header_compatibility_unconfirmed"
+        );
         assert_eq!(
             GetCodecStreamingFallbackReason::LockOptimizationDisabled.as_str(),
             "lock_optimization_disabled"
@@ -3397,6 +3414,13 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::Remote.as_str(), "remote");
         assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
         assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
+        assert_eq!(GetCodecStreamingFallbackReason::ReadQuorumNotSafe.as_str(), "read_quorum_not_safe");
+        assert_eq!(GetCodecStreamingObjectClass::PlainSinglePart.as_str(), "plain_single_part");
+        assert_eq!(GetCodecStreamingObjectClass::Range.as_str(), "range");
+        assert_eq!(GetCodecStreamingObjectClass::Encrypted.as_str(), "encrypted");
+        assert_eq!(GetCodecStreamingObjectClass::Compressed.as_str(), "compressed");
+        assert_eq!(GetCodecStreamingObjectClass::Remote.as_str(), "remote");
+        assert_eq!(GetCodecStreamingObjectClass::Multipart.as_str(), "multipart");
     }
 
     #[test]
@@ -3404,6 +3428,9 @@ mod tests {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
                 (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
             ],
             || {
@@ -3411,10 +3438,118 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_decision(&None, &object_info, &fi, true),
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
                 );
             },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_requires_explicit_rollout_and_compat_confirmation() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("off")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, None::<&str>),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, None::<&str>),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn)
+                );
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("false")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed)
+                );
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("false")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_records_object_classes() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+                assert_eq!(
+                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).object_class,
+                    GetCodecStreamingObjectClass::PlainSinglePart
+                );
+
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: 1,
+                });
+                assert_eq!(
+                    get_codec_streaming_reader_gate(&range, &object_info, &fi, true).object_class,
+                    GetCodecStreamingObjectClass::Range
+                );
+            },
+        );
+    }
+
+    #[tokio::test]
+    async fn codec_streaming_reader_build_falls_back_when_read_quorum_is_not_safe() {
+        let setup = setup_inline_bitrot_readers(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+        )
+        .await;
+
+        assert_eq!(setup.completed_failed_shards(), 1);
+        assert_eq!(
+            codec_streaming_reader_setup_fallback_reason(setup.completed_failed_shards()),
+            Some(GetCodecStreamingFallbackReason::ReadQuorumNotSafe)
         );
     }
 

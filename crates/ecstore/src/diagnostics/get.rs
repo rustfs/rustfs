@@ -22,6 +22,15 @@ pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE: &str = "codec_st
 pub(crate) const GET_OBJECT_PATH_EMPTY: &str = "empty";
 pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
 pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
+pub(crate) const GET_CODEC_STREAMING_DECISION_USE: &str = "use";
+pub(crate) const GET_CODEC_STREAMING_DECISION_FALLBACK: &str = "fallback";
+pub(crate) const GET_CODEC_STREAMING_REASON_NONE: &str = "none";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART: &str = "plain_single_part";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_RANGE: &str = "range";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_ENCRYPTED: &str = "encrypted";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_COMPRESSED: &str = "compressed";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_REMOTE: &str = "remote";
+pub(crate) const GET_CODEC_STREAMING_OBJECT_CLASS_MULTIPART: &str = "multipart";
 
 pub(crate) const GET_STAGE_DECODE: &str = "decode";
 pub(crate) const GET_STAGE_EMIT: &str = "emit";
@@ -220,6 +229,15 @@ mod tests {
         assert_eq!(GET_READER_BUFFER_PREFETCH, "prefetch");
         assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, "codec_streaming_legacy_engine");
         assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, "codec_streaming_rustfs_engine");
+        assert_eq!(GET_CODEC_STREAMING_DECISION_USE, "use");
+        assert_eq!(GET_CODEC_STREAMING_DECISION_FALLBACK, "fallback");
+        assert_eq!(GET_CODEC_STREAMING_REASON_NONE, "none");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, "plain_single_part");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_RANGE, "range");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_ENCRYPTED, "encrypted");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_COMPRESSED, "compressed");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_REMOTE, "remote");
+        assert_eq!(GET_CODEC_STREAMING_OBJECT_CLASS_MULTIPART, "multipart");
         assert_eq!(GET_READER_PREFETCH_DIRECT, "direct");
         assert_eq!(GET_READER_PREFETCH_STORED, "stored");
         assert_eq!(GET_READER_PREFETCH_EOF, "eof");
