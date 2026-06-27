@@ -120,6 +120,13 @@ pub mod global {
     };
 }
 
+pub mod runtime {
+    pub use crate::runtime::sources::{
+        bucket_monitor, first_cluster_node_is_local, global_tier_config_mgr, local_disk_map_read, object_store_handle,
+        setup_is_erasure, setup_is_erasure_sd,
+    };
+}
+
 pub mod layout {
     pub use crate::layout::disks_layout::DisksLayout;
     pub use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints, SetupType};

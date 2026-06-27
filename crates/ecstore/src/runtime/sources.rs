@@ -50,7 +50,7 @@ use rustfs_kms::{ObjectEncryptionService, get_global_encryption_service};
 use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, RwLockReadGuard};
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -108,7 +108,7 @@ pub(crate) async fn object_encryption_service() -> Option<Arc<ObjectEncryptionSe
     get_global_encryption_service().await
 }
 
-pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
+pub fn object_store_handle() -> Option<Arc<ECStore>> {
     resolve_object_store_handle()
 }
 
@@ -131,11 +131,11 @@ pub(crate) fn endpoint_pool_is_local(pool_index: usize) -> bool {
         .is_some_and(|pool| pool.endpoints.as_ref().first().is_some_and(|endpoint| endpoint.is_local))
 }
 
-pub(crate) async fn first_cluster_node_is_local() -> bool {
+pub async fn first_cluster_node_is_local() -> bool {
     is_first_cluster_node_local().await
 }
 
-pub(crate) async fn setup_is_erasure() -> bool {
+pub async fn setup_is_erasure() -> bool {
     is_erasure().await
 }
 
@@ -143,7 +143,7 @@ pub(crate) async fn setup_is_dist_erasure() -> bool {
     is_dist_erasure().await
 }
 
-pub(crate) async fn setup_is_erasure_sd() -> bool {
+pub async fn setup_is_erasure_sd() -> bool {
     *GLOBAL_IsErasureSD.read().await
 }
 
@@ -336,7 +336,7 @@ pub(crate) fn batch_processors() -> &'static GlobalBatchProcessors {
     get_global_processors()
 }
 
-pub(crate) fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
+pub fn global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
     get_global_tier_config_mgr()
 }
 
@@ -350,8 +350,12 @@ pub(crate) fn delete_bucket_monitor_entry(bucket: &str) {
     }
 }
 
-pub(crate) fn bucket_monitor() -> Option<Arc<Monitor>> {
+pub fn bucket_monitor() -> Option<Arc<Monitor>> {
     get_global_bucket_monitor()
+}
+
+pub async fn local_disk_map_read() -> RwLockReadGuard<'static, HashMap<String, Option<DiskStore>>> {
+    GLOBAL_LOCAL_DISK_MAP.read().await
 }
 
 pub(crate) fn init_bucket_monitor_for_current_endpoints() {

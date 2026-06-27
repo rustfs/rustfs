@@ -24,9 +24,9 @@ pub mod task;
 pub mod utils;
 
 use storage_api::owner::{
-    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_GLOBAL_LOCAL_DISK_MAP, ECSTORE_RUSTFS_META_BUCKET,
-    EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
-    EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
+    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_RUSTFS_META_BUCKET, EcstoreDeleteOptions, EcstoreDiskAPI,
+    EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
+    EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations, ecstore_local_disk_map_read,
 };
 #[cfg(test)]
 use storage_api::owner::{EcstoreDiskOption, ecstore_new_disk};
@@ -55,7 +55,7 @@ pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap
 
 impl GlobalLocalDiskMap {
     pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
-        ECSTORE_GLOBAL_LOCAL_DISK_MAP.read().await
+        ecstore_local_disk_map_read().await
     }
 }
 

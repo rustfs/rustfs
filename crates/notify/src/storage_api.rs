@@ -18,7 +18,7 @@ use rustfs_ecstore::api::config::com::{
     read_config_without_migrate as read_notify_config_without_migrate_from_backend,
     save_server_config as save_notify_server_config_to_backend,
 };
-use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_notify_object_store_handle_from_backend;
+use rustfs_ecstore::api::runtime::object_store_handle as resolve_notify_object_store_handle_from_backend;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as NotifyStore;
 
 pub(crate) fn resolve_notify_object_store_handle() -> Option<Arc<NotifyStore>> {

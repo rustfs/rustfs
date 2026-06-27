@@ -1526,14 +1526,6 @@ if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
 fi
 
 cat >"$GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE" <<'EOF'
-crates/heal/src/heal/storage_api.rs
-crates/iam/src/storage_api.rs
-crates/notify/src/storage_api.rs
-crates/obs/src/metrics/storage_api.rs
-crates/protocols/src/swift/storage_api.rs
-crates/s3select-api/src/storage_api.rs
-crates/scanner/src/storage_api.rs
-crates/scanner/tests/storage_api/mod.rs
 rustfs/src/storage/storage_api.rs
 EOF
 
