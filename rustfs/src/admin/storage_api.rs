@@ -36,7 +36,7 @@ pub(crate) mod ecstore_cluster {
     pub(crate) use crate::storage::storage_api::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
-        ClusterPoolStateSnapshot,
+        ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     };
 }
 
@@ -447,7 +447,7 @@ pub(crate) mod cluster {
     pub(crate) use super::ecstore_cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
-        ClusterPoolStateSnapshot,
+        ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     };
     pub(crate) use super::storage_contracts::{
         CapabilitySnapshotError, CapabilityState, CapabilityStatus, ObservabilitySnapshot, ObservabilitySnapshotProvider,

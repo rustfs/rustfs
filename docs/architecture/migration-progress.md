@@ -5,23 +5,31 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-ecstore-services-domain-batch`
+- Branch: `overtrue/arch-cluster-readonly-control-plane-batch`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, and CFG-009 from PR #3927.
-- Current phase PR: E-035/E-008 ECStore services domain batch.
-- Based on: E-034 branch while PR #3932 and follow-up ECStore owner PRs are
-  pending; rebase onto `origin/main` after E-019 through E-034 merge before
-  opening this PR.
-- PR type for this branch: `pure-move`.
-- Runtime behavior changes: none expected for E-035/E-008; production changes
-  only move the ECStore rebalance and tier owner modules under `services` while
-  retaining the public `api::rebalance` and `api::tier` facades.
-- Rust code changes: move the ECStore root `rebalance` and `tier` directories
-  into `services`, remove the root `lib.rs` declarations, and migrate
-  crate-internal imports to `services::{rebalance,tier}` without function-body
-  changes.
-- CI/script changes: reject restoring ECStore root `store.rs`, `set_disk.rs`,
+- Current phase PR: C-007/C-009 cluster read-only control-plane consumer, RPC
+  boundary, and readiness invariant batch.
+- Based on: E-035/E-008 branch while PR #3933 and the E-031 through E-035
+  follow-up ECStore owner batch are pending; rebase onto `origin/main` after
+  those PRs merge before opening this PR.
+- PR type for this branch: `contract`.
+- Runtime behavior changes: admin readiness reads keep the existing readiness
+  report collector and, when endpoint context is available, project that same
+  report through the read-only cluster snapshot runtime status before returning
+  readiness; `FullReady` publication now uses the existing storage, IAM, and
+  lock quorum readiness invariant.
+- Rust code changes: add a read-only cluster RPC boundary snapshot that models
+  metadata/lock/health/admin control RPC as gRPC and remote-disk streams as the
+  internode data transport, expose it through the ECStore public cluster facade,
+  include it in RustFS cluster snapshots and admin JSON views, route admin
+  readiness usecase reads through the snapshot runtime status using the existing
+  readiness report collector, and require lock quorum before publishing
+  `FullReady`.
+- CI/script changes: guard that the ECStore RPC boundary snapshot and
+  internode data-transport control-plane separation note remain present; reject
+  restoring ECStore root `store.rs`, `set_disk.rs`,
   `store_list_objects.rs`, `store_utils.rs`, `store_init.rs`,
   `disks_layout.rs`, `endpoints.rs`, `storage_api_contracts.rs`,
   `batch_processor.rs`, `event_notification.rs`, `metrics_realtime.rs`, or
@@ -92,7 +100,8 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   codec or coding modules after E-033/E-004, and reject restoring ECStore root
   RPC facade modules or ECStore-internal `crate::rpc` consumers after E-034,
   and reject restoring ECStore root rebalance/tier service-domain modules or
-  ECStore-internal `crate::rebalance`/`crate::tier` consumers after E-035/E-008.
+  ECStore-internal `crate::rebalance`/`crate::tier` consumers after E-035/E-008,
+  and reject losing the C-009 cluster RPC boundary model.
 
 ## Phase 0 Tasks
 
@@ -1385,6 +1394,34 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     no readiness impact, and no lock/object behavior changes.
   - Verification: ECStore peer-health tests, compile coverage, formatting, diff
     hygiene, risk scan, pre-commit quality gate, and three-expert review.
+
+- [x] `C-007` Route admin readiness reads to snapshot.
+  - Completed slice: route the admin readiness usecase through the read-only
+    cluster snapshot runtime status when endpoint context is available, while
+    retaining the existing readiness report collector.
+  - Acceptance: admin readiness reads use the same runtime status that the
+    cluster snapshot exposes; systems without endpoint context keep the old
+    fallback.
+  - Must preserve: health endpoint semantics, readiness metrics, startup
+    readiness publication, storage/IAM/lock readiness calculations, and all
+    S3/RPC gate behavior.
+  - Verification: focused RustFS cluster snapshot/admin usecase tests, compile
+    coverage, migration guard, formatting, diff hygiene, risk scan, PR quality
+    gate, and three-expert review.
+
+- [x] `C-009` Model control RPC separately.
+  - Completed slice: add a read-only RPC boundary snapshot that keeps
+    metadata, lock, health, and administrative control RPC on the gRPC control
+    plane while modeling remote-disk streams as internode data transport.
+  - Acceptance: cluster snapshots expose separate control and data channel
+    groups, and migration rules fail if the RPC boundary model or
+    data-transport separation note is removed.
+  - Must preserve: internode data stream behavior, remote lock behavior, peer
+    health behavior, metadata/admin RPC behavior, and all transport selection
+    defaults.
+  - Verification: ECStore cluster tests, RustFS cluster snapshot handler tests,
+    compile coverage, migration guard, formatting, diff hygiene, risk scan, PR
+    quality gate, and three-expert review.
 
 - [x] `TEST-PRTYPE-001` Check PR type enum consistency.
   - Acceptance: `./scripts/check_architecture_migration_rules.sh` parses the
@@ -9342,6 +9379,21 @@ Notes:
     passed.
   - ECStore services domain scan: passed; no root `rebalance`/`tier` modules
     or ECStore-internal `crate::rebalance`/`crate::tier` consumers remain.
+  - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
+    public APIs, boxed public errors, production println/eprintln, or relaxed
+    ordering introduced in changed Rust files.
+
+- Issue #660 C-007/C-009 current slice:
+  - `cargo check -p rustfs-ecstore --lib`: passed.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo test -p rustfs-ecstore --lib cluster`: passed, 98 passed.
+  - `cargo test -p rustfs --lib cluster_snapshot`: passed, 9 passed including
+    admin cluster snapshot handler coverage.
+  - `cargo fmt --all --check`: passed.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check overtrue/arch-ecstore-services-domain-batch...HEAD`:
+    passed.
   - Rust risk scan: passed; no new unwrap/expect, numeric casts, string error
     public APIs, boxed public errors, production println/eprintln, or relaxed
     ordering introduced in changed Rust files.

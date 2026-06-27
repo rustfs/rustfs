@@ -32,6 +32,8 @@ const FAILURE_DOMAIN_NOT_REPORTED: &str = "failure domain labels not reported by
 const NUMA_NOT_WIRED: &str = "NUMA topology not wired into runtime";
 const PROFILING_NOT_WIRED: &str = "profiling capability not wired into ECStore";
 const PEER_HEALTH_NOT_REPORTED: &str = "peer health not reported by endpoints";
+const CONTROL_RPC_SEPARATED: &str = "control RPC remains on the gRPC control plane";
+const DATA_STREAM_RPC_SEPARATED: &str = "remote disk data streams remain on the internode data transport";
 
 #[derive(Debug, Clone)]
 pub struct ClusterControlPlane {
@@ -65,6 +67,10 @@ impl ClusterControlPlane {
         peer_health_snapshot_from_membership(&membership)
     }
 
+    pub fn rpc_boundary_snapshot(&self) -> ClusterRpcBoundarySnapshot {
+        rpc_boundary_snapshot()
+    }
+
     pub fn read_snapshot(&self) -> ClusterControlPlaneSnapshot {
         let membership = self.membership_snapshot();
 
@@ -73,6 +79,7 @@ impl ClusterControlPlane {
             pool_state: self.pool_state_snapshot(),
             local_storage: local_node_storage_snapshot_from_membership(&membership),
             peer_health: peer_health_snapshot_from_membership(&membership),
+            rpc_boundary: self.rpc_boundary_snapshot(),
             membership,
         }
     }
@@ -84,6 +91,7 @@ pub struct ClusterControlPlaneSnapshot {
     pub pool_state: ClusterPoolStateSnapshot,
     pub local_storage: ClusterLocalNodeStorageSnapshot,
     pub peer_health: ClusterPeerHealthSnapshot,
+    pub rpc_boundary: ClusterRpcBoundarySnapshot,
     pub membership: ClusterMembershipSnapshot,
 }
 
@@ -152,6 +160,32 @@ pub struct ClusterPeerHealth {
     pub node_id: String,
     pub is_local: bool,
     pub status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClusterRpcBoundarySnapshot {
+    pub control_channels: Vec<ClusterRpcChannelSnapshot>,
+    pub data_channels: Vec<ClusterRpcChannelSnapshot>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClusterRpcChannelSnapshot {
+    pub name: String,
+    pub plane: ClusterRpcPlane,
+    pub transport: ClusterRpcTransport,
+    pub status: CapabilityStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterRpcPlane {
+    Control,
+    Data,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClusterRpcTransport {
+    Grpc,
+    InternodeDataTransport,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -310,6 +344,35 @@ pub fn peer_health_snapshot_from_membership(membership: &ClusterMembershipSnapsh
                 status: CapabilityStatus::unknown().with_reason(PEER_HEALTH_NOT_REPORTED),
             })
             .collect(),
+    }
+}
+
+pub fn rpc_boundary_snapshot() -> ClusterRpcBoundarySnapshot {
+    ClusterRpcBoundarySnapshot {
+        control_channels: ["metadata", "lock", "health", "administrative"]
+            .into_iter()
+            .map(|name| rpc_channel_snapshot(name, ClusterRpcPlane::Control, ClusterRpcTransport::Grpc, CONTROL_RPC_SEPARATED))
+            .collect(),
+        data_channels: vec![rpc_channel_snapshot(
+            "remote_disk_stream",
+            ClusterRpcPlane::Data,
+            ClusterRpcTransport::InternodeDataTransport,
+            DATA_STREAM_RPC_SEPARATED,
+        )],
+    }
+}
+
+fn rpc_channel_snapshot(
+    name: &str,
+    plane: ClusterRpcPlane,
+    transport: ClusterRpcTransport,
+    reason: &'static str,
+) -> ClusterRpcChannelSnapshot {
+    ClusterRpcChannelSnapshot {
+        name: name.to_owned(),
+        plane,
+        transport,
+        status: CapabilityStatus::supported().with_reason(reason),
     }
 }
 
@@ -552,7 +615,23 @@ mod tests {
         assert_eq!(snapshot.pool_state.pools[0].endpoint_count, 4);
         assert_eq!(snapshot.local_storage.nodes.len(), 2);
         assert_eq!(snapshot.peer_health.peers.len(), 3);
+        assert_eq!(snapshot.rpc_boundary.control_channels.len(), 4);
+        assert_eq!(snapshot.rpc_boundary.data_channels.len(), 1);
         assert_eq!(node_ids, BTreeSet::from([LOCAL_NODE_ID, "node1.example:9000", "node2.example:9000"]));
+    }
+
+    #[test]
+    fn rpc_boundary_snapshot_keeps_control_rpc_separate_from_data_streams() {
+        let snapshot = rpc_boundary_snapshot();
+
+        assert!(
+            snapshot
+                .control_channels
+                .iter()
+                .all(|channel| channel.plane == ClusterRpcPlane::Control && channel.transport == ClusterRpcTransport::Grpc)
+        );
+        assert_eq!(snapshot.data_channels[0].plane, ClusterRpcPlane::Data);
+        assert_eq!(snapshot.data_channels[0].transport, ClusterRpcTransport::InternodeDataTransport);
     }
 
     fn sample_path_endpoint_pools() -> EndpointServerPools {

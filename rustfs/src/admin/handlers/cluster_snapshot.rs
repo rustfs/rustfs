@@ -20,7 +20,7 @@ use crate::admin::{
     storage_api::cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
-        ClusterPoolStateSnapshot,
+        ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     },
     system,
 };
@@ -60,6 +60,7 @@ pub(crate) struct ClusterSnapshotDiscoveryResponse {
     pub summary: Option<CapabilityStatus>,
     pub topology: Option<CapabilityStatus>,
     pub peer_health: Option<CapabilityStatus>,
+    pub rpc_boundary: Option<CapabilityStatus>,
     pub workload_admission: Option<CapabilityStatus>,
     pub runtime: Option<CapabilityStatus>,
 }
@@ -124,6 +125,7 @@ pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapsh
                 summary: Some(summary.actionable_pressure.clone()),
                 topology: Some(summary.topology),
                 peer_health: Some(summary.peer_health),
+                rpc_boundary: Some(summary.rpc_boundary),
                 workload_admission: Some(summary.workload_admission),
                 runtime: Some(summary.runtime),
             }
@@ -133,6 +135,7 @@ pub(crate) async fn build_cluster_snapshot_discovery_response() -> ClusterSnapsh
             summary: None,
             topology: None,
             peer_health: None,
+            rpc_boundary: None,
             workload_admission: None,
             runtime: None,
         },
@@ -149,6 +152,7 @@ pub(crate) struct ClusterSnapshotView {
     pub pool_state: ClusterPoolStateView,
     pub local_storage: ClusterLocalStorageView,
     pub peer_health: ClusterPeerHealthView,
+    pub rpc_boundary: ClusterRpcBoundaryView,
     pub observability: ObservabilitySnapshot,
     pub workload_admission: Vec<WorkloadAdmissionView>,
     pub runtime_status: ClusterRuntimeStatusView,
@@ -167,6 +171,7 @@ impl From<ClusterReadOnlySnapshot> for ClusterSnapshotView {
             pool_state: ClusterPoolStateView::from(snapshot.pool_state),
             local_storage: ClusterLocalStorageView::from(snapshot.local_storage),
             peer_health: ClusterPeerHealthView::from(snapshot.peer_health),
+            rpc_boundary: ClusterRpcBoundaryView::from(snapshot.rpc_boundary),
             observability: snapshot.observability,
             workload_admission: workload_admission_views(snapshot.workload_admission),
             runtime_status: ClusterRuntimeStatusView::from(snapshot.runtime_status),
@@ -181,6 +186,7 @@ pub(crate) struct ClusterSnapshotSummary {
     pub topology: CapabilityStatus,
     pub membership: CapabilityStatus,
     pub peer_health: CapabilityStatus,
+    pub rpc_boundary: CapabilityStatus,
     pub observability: CapabilityStatus,
     pub workload_admission: CapabilityStatus,
     pub actionable_pressure: CapabilityStatus,
@@ -191,6 +197,7 @@ impl From<&ClusterReadOnlySnapshot> for ClusterSnapshotSummary {
         let topology = summarize_topology(snapshot);
         let membership = summarize_membership(snapshot);
         let peer_health = summarize_peer_health(snapshot);
+        let rpc_boundary = summarize_rpc_boundary(snapshot);
         let observability = summarize_observability(snapshot);
         let workload_admission = summarize_workload_admission(snapshot);
         let actionable_pressure = if cluster_has_actionable_pressure(snapshot) {
@@ -204,6 +211,7 @@ impl From<&ClusterReadOnlySnapshot> for ClusterSnapshotSummary {
             topology,
             membership,
             peer_health,
+            rpc_boundary,
             observability,
             workload_admission,
             actionable_pressure,
@@ -373,6 +381,44 @@ impl From<ClusterPeerHealth> for ClusterPeerHealthItemView {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ClusterRpcBoundaryView {
+    pub control_channels: Vec<ClusterRpcChannelView>,
+    pub data_channels: Vec<ClusterRpcChannelView>,
+}
+
+impl From<ClusterRpcBoundarySnapshot> for ClusterRpcBoundaryView {
+    fn from(snapshot: ClusterRpcBoundarySnapshot) -> Self {
+        Self {
+            control_channels: snapshot
+                .control_channels
+                .into_iter()
+                .map(ClusterRpcChannelView::from)
+                .collect(),
+            data_channels: snapshot.data_channels.into_iter().map(ClusterRpcChannelView::from).collect(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct ClusterRpcChannelView {
+    pub name: String,
+    pub plane: &'static str,
+    pub transport: &'static str,
+    pub status: CapabilityStatus,
+}
+
+impl From<ClusterRpcChannelSnapshot> for ClusterRpcChannelView {
+    fn from(channel: ClusterRpcChannelSnapshot) -> Self {
+        Self {
+            name: channel.name,
+            plane: rpc_plane_label(channel.plane),
+            transport: rpc_transport_label(channel.transport),
+            status: channel.status,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct WorkloadAdmissionView {
     pub class: &'static str,
     pub state: &'static str,
@@ -424,6 +470,20 @@ fn endpoint_type_label(endpoint_type: ClusterEndpointType) -> &'static str {
     match endpoint_type {
         ClusterEndpointType::Path => "path",
         ClusterEndpointType::Url => "url",
+    }
+}
+
+fn rpc_plane_label(plane: ClusterRpcPlane) -> &'static str {
+    match plane {
+        ClusterRpcPlane::Control => "control",
+        ClusterRpcPlane::Data => "data",
+    }
+}
+
+fn rpc_transport_label(transport: ClusterRpcTransport) -> &'static str {
+    match transport {
+        ClusterRpcTransport::Grpc => "grpc",
+        ClusterRpcTransport::InternodeDataTransport => "internode_data_transport",
     }
 }
 
@@ -506,6 +566,16 @@ fn summarize_peer_health(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus
         CapabilityStatus::unknown().with_reason(format!("cluster peer health has {unknown} unresolved peers"))
     } else {
         CapabilityStatus::supported().with_reason("cluster peer health resolved for all peers")
+    }
+}
+
+fn summarize_rpc_boundary(snapshot: &ClusterReadOnlySnapshot) -> CapabilityStatus {
+    let has_control = !snapshot.rpc_boundary.control_channels.is_empty();
+    let has_data = !snapshot.rpc_boundary.data_channels.is_empty();
+    if has_control && has_data {
+        CapabilityStatus::supported().with_reason("cluster control RPC and data streams are modeled as separate planes")
+    } else {
+        CapabilityStatus::unknown().with_reason("cluster RPC boundary snapshot is incomplete")
     }
 }
 
@@ -595,7 +665,7 @@ mod tests {
     use crate::admin::storage_api::cluster::{
         ClusterDriveMembership, ClusterEndpointType, ClusterLocalNodeStorage, ClusterLocalNodeStorageSnapshot,
         ClusterMembershipSnapshot, ClusterNodeMembership, ClusterPeerHealth, ClusterPeerHealthSnapshot, ClusterPoolState,
-        ClusterPoolStateSnapshot,
+        ClusterPoolStateSnapshot, ClusterRpcBoundarySnapshot, ClusterRpcChannelSnapshot, ClusterRpcPlane, ClusterRpcTransport,
     };
     use crate::cluster_snapshot::{ClusterReadOnlySnapshot, ClusterRuntimeReadinessState, ClusterRuntimeStatusSnapshot};
     use crate::server::{DependencyReadiness, ReadinessDegradedReason};
@@ -632,6 +702,7 @@ mod tests {
         assert_eq!(response.summary, None);
         assert_eq!(response.topology, None);
         assert_eq!(response.peer_health, None);
+        assert_eq!(response.rpc_boundary, None);
         assert_eq!(response.workload_admission, None);
         assert_eq!(response.runtime, None);
     }
@@ -684,6 +755,7 @@ mod tests {
                     status: CapabilityStatus::unknown().with_reason("peer state unavailable"),
                 }],
             },
+            rpc_boundary: sample_rpc_boundary_snapshot(),
             observability: ObservabilitySnapshot::default(),
             workload_admission: WorkloadAdmissionRegistrySnapshot::new(vec![
                 WorkloadAdmissionSnapshot::new(WorkloadClass::Repair, AdmissionState::Unknown)
@@ -707,8 +779,12 @@ mod tests {
         assert_eq!(value["membership"]["drives"][0]["endpoint_type"], "url");
         assert_eq!(value["workload_admission"][0]["class"], "repair");
         assert_eq!(value["workload_admission"][0]["state"], "unknown");
+        assert_eq!(value["rpc_boundary"]["control_channels"][0]["name"], "metadata");
+        assert_eq!(value["rpc_boundary"]["control_channels"][0]["transport"], "grpc");
+        assert_eq!(value["rpc_boundary"]["data_channels"][0]["transport"], "internode_data_transport");
         assert_eq!(value["runtime_status"]["state"], "degraded");
         assert_eq!(value["summary"]["runtime"]["state"], "unknown");
+        assert_eq!(value["summary"]["rpc_boundary"]["state"], "supported");
         assert_eq!(value["runtime_status"]["degraded_reasons"][0], "storage_and_lock_unavailable");
         assert_eq!(value["actionable_pressure"], true);
     }
@@ -721,6 +797,7 @@ mod tests {
             pool_state: ClusterPoolStateSnapshot::default(),
             local_storage: ClusterLocalNodeStorageSnapshot::default(),
             peer_health: ClusterPeerHealthSnapshot::default(),
+            rpc_boundary: sample_rpc_boundary_snapshot(),
             observability: ObservabilitySnapshot::default(),
             workload_admission: WorkloadAdmissionRegistrySnapshot::new(vec![WorkloadAdmissionSnapshot::new(
                 WorkloadClass::ForegroundRead,
@@ -741,8 +818,26 @@ mod tests {
         assert_eq!(summary.runtime.state, CapabilityState::Supported);
         assert_eq!(summary.membership.state, CapabilityState::Unknown);
         assert_eq!(summary.peer_health.state, CapabilityState::Unknown);
+        assert_eq!(summary.rpc_boundary.state, CapabilityState::Supported);
         assert_eq!(summary.workload_admission.state, CapabilityState::Supported);
         assert_eq!(summary.actionable_pressure.state, CapabilityState::Disabled);
+    }
+
+    fn sample_rpc_boundary_snapshot() -> ClusterRpcBoundarySnapshot {
+        ClusterRpcBoundarySnapshot {
+            control_channels: vec![ClusterRpcChannelSnapshot {
+                name: "metadata".to_string(),
+                plane: ClusterRpcPlane::Control,
+                transport: ClusterRpcTransport::Grpc,
+                status: CapabilityStatus::supported().with_reason("control RPC remains on gRPC"),
+            }],
+            data_channels: vec![ClusterRpcChannelSnapshot {
+                name: "remote_disk_stream".to_string(),
+                plane: ClusterRpcPlane::Data,
+                transport: ClusterRpcTransport::InternodeDataTransport,
+                status: CapabilityStatus::supported().with_reason("remote disk data streams remain separate"),
+            }],
+        }
     }
 
     fn extract_block_between_markers(src: &str, start: &str, end: &str) -> String {
