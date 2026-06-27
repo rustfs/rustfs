@@ -2294,7 +2294,9 @@ impl SetDisks {
             part_length,
             metrics_path,
         )?;
-        Ok(Box::new(crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new(reader)))
+        Ok(Box::new(
+            crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
+        ))
     }
 }
 
