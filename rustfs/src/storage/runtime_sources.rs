@@ -37,15 +37,15 @@ pub(crate) fn current_object_store_handle_for_context(context: Option<&AppContex
 }
 
 pub(crate) fn current_buffer_config() -> RustFSBufferConfig {
-    root_runtime_sources::current_buffer_config()
+    root_runtime_sources::current_buffer_config().unwrap_or_default()
 }
 
 pub(crate) fn current_internode_metrics() -> Arc<InternodeMetrics> {
-    root_runtime_sources::current_internode_metrics()
+    root_runtime_sources::current_internode_metrics().unwrap_or_else(|| Arc::new(InternodeMetrics::default()))
 }
 
 pub(crate) async fn current_local_node_name() -> String {
-    root_runtime_sources::current_local_node_name().await
+    root_runtime_sources::current_local_node_name().await.unwrap_or_default()
 }
 
 pub(crate) fn current_action_credentials() -> Option<Credentials> {
@@ -53,11 +53,11 @@ pub(crate) fn current_action_credentials() -> Option<Credentials> {
 }
 
 pub(crate) fn current_notify_interface() -> Arc<dyn root_runtime_sources::NotifyInterface> {
-    root_runtime_sources::current_notify_interface()
+    root_runtime_sources::current_notify_interface().unwrap_or_else(root_runtime_sources::fallback_notify_interface)
 }
 
 pub(crate) fn current_performance_metrics() -> Arc<PerformanceMetrics> {
-    root_runtime_sources::current_performance_metrics()
+    root_runtime_sources::current_performance_metrics().unwrap_or_else(|| Arc::new(PerformanceMetrics::new()))
 }
 
 pub(crate) async fn current_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
