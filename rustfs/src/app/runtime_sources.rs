@@ -13,16 +13,13 @@
 // limitations under the License.
 
 pub(crate) use crate::runtime_sources::{
-    AppContext, resolve_encryption_service as current_encryption_service, resolve_endpoints_handle as current_endpoints_handle,
-    resolve_expiry_state_handle as current_expiry_state_handle, resolve_notification_system as current_notification_system,
-    resolve_notify_interface_for_context as current_notify_interface_for_context,
-    resolve_object_store_handle_for_context as current_object_store_handle_for_context,
-    resolve_s3select_db as current_s3select_db,
+    AppContext, current_encryption_service, current_endpoints_handle, current_expiry_state_handle, current_notification_system,
+    current_notify_interface_for_context, current_object_store_handle_for_context, current_s3select_db,
 };
 use std::sync::Arc;
 
 #[cfg(test)]
-pub(crate) use crate::runtime_sources::resolve_tier_config_handle as current_tier_config_handle;
+pub(crate) use crate::runtime_sources::current_tier_config_handle;
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     crate::runtime_sources::current_app_context()

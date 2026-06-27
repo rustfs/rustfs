@@ -17,8 +17,8 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager,
-    resolve_object_store_handle_for_context,
+    current_app_context, current_kms_runtime_service_manager, current_object_store_handle_for_context,
+    current_or_init_kms_runtime_service_manager,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
 use crate::auth::{check_key_valid, get_session_token};
@@ -107,7 +107,7 @@ fn normalize_configure_request_auth(
 #[instrument(skip(config))]
 async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
     let context = current_app_context();
-    let Some(store) = resolve_object_store_handle_for_context(context.as_deref()) else {
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
         return Err("Storage layer not initialized".to_string());
     };
 
@@ -132,7 +132,7 @@ async fn save_kms_config(config: &KmsConfig) -> Result<(), String> {
 #[instrument]
 pub async fn load_kms_config() -> Option<KmsConfig> {
     let context = current_app_context();
-    let Some(store) = resolve_object_store_handle_for_context(context.as_deref()) else {
+    let Some(store) = current_object_store_handle_for_context(context.as_deref()) else {
         warn!(
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,

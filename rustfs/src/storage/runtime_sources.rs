@@ -29,53 +29,53 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 }
 
 pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
-    root_runtime_sources::resolve_object_store_handle()
+    root_runtime_sources::current_object_store_handle()
 }
 
 pub(crate) fn current_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
-    root_runtime_sources::resolve_object_store_handle_for_context(context)
+    root_runtime_sources::current_object_store_handle_for_context(context)
 }
 
 pub(crate) fn current_buffer_config() -> RustFSBufferConfig {
-    root_runtime_sources::resolve_buffer_config()
+    root_runtime_sources::current_buffer_config()
 }
 
 pub(crate) fn current_internode_metrics() -> Arc<InternodeMetrics> {
-    root_runtime_sources::resolve_internode_metrics()
+    root_runtime_sources::current_internode_metrics()
 }
 
 pub(crate) async fn current_local_node_name() -> String {
-    root_runtime_sources::resolve_local_node_name().await
+    root_runtime_sources::current_local_node_name().await
 }
 
 pub(crate) fn current_action_credentials() -> Option<Credentials> {
-    root_runtime_sources::resolve_action_credentials()
+    root_runtime_sources::current_action_credentials()
 }
 
 pub(crate) fn current_notify_interface() -> Arc<dyn root_runtime_sources::NotifyInterface> {
-    root_runtime_sources::resolve_notify_interface()
+    root_runtime_sources::current_notify_interface()
 }
 
 pub(crate) fn current_performance_metrics() -> Arc<PerformanceMetrics> {
-    root_runtime_sources::resolve_performance_metrics()
+    root_runtime_sources::current_performance_metrics()
 }
 
 pub(crate) async fn current_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    root_runtime_sources::resolve_encryption_service().await
+    root_runtime_sources::current_encryption_service().await
 }
 
 pub(crate) fn current_region() -> Option<s3s::region::Region> {
-    root_runtime_sources::resolve_region()
+    root_runtime_sources::current_region()
 }
 
 pub(crate) fn current_ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
-    root_runtime_sources::resolve_ready_iam_handle()
+    root_runtime_sources::current_ready_iam_handle()
 }
 
 pub(crate) fn current_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    root_runtime_sources::resolve_iam_handle()
+    root_runtime_sources::current_iam_handle()
 }
 
 pub(crate) fn current_lock_client() -> Option<Arc<dyn LockClient>> {
-    root_runtime_sources::resolve_lock_client()
+    root_runtime_sources::current_lock_client()
 }
