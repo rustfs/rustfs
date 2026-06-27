@@ -17,6 +17,13 @@ use std::future::Future;
 use std::time::Duration;
 use tokio::task::JoinSet;
 
+fn map_upload_id_metadata_error(bucket: &str, object: &str, upload_id: &str, err: DiskError) -> Error {
+    if err == DiskError::FileNotFound {
+        return StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
+    }
+    err.into()
+}
+
 fn empty_upload_fallback_possible(successful_responses: usize, errs: &[Option<DiskError>]) -> bool {
     successful_responses == 0
         && errs.iter().any(|err| matches!(err, Some(DiskError::FileNotFound)))
@@ -165,15 +172,8 @@ impl SetDisks {
             Self::read_all_fileinfo(&disks, bucket, RUSTFS_META_MULTIPART_BUCKET, &upload_id_path, "", false, false, false)
                 .await?;
 
-        let map_err_notfound = |err: DiskError| {
-            if err == DiskError::FileNotFound {
-                return StorageError::InvalidUploadID(bucket.to_owned(), object.to_owned(), upload_id.to_owned());
-            }
-            err.into()
-        };
-
-        let (read_quorum, write_quorum) =
-            Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count).map_err(map_err_notfound)?;
+        let (read_quorum, write_quorum) = Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+            .map_err(|err| map_upload_id_metadata_error(bucket, object, upload_id, err))?;
 
         if read_quorum < 0 {
             error!("check_upload_id_exists: read_quorum < 0, errs={:?}", errs);
@@ -189,10 +189,22 @@ impl SetDisks {
             quorum = write_quorum as usize;
 
             if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
-                return Err(map_err_notfound(err));
+                log_multipart_write_quorum_failure(
+                    MultipartWriteQuorumContext {
+                        stage: MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
+                        bucket,
+                        object,
+                        upload_id,
+                        part_number: None,
+                    },
+                    &errs,
+                    quorum,
+                    &err,
+                );
+                return Err(map_upload_id_metadata_error(bucket, object, upload_id, err));
             }
         } else if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
-            return Err(map_err_notfound(err));
+            return Err(map_upload_id_metadata_error(bucket, object, upload_id, err));
         }
 
         let (_, mod_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, quorum);
@@ -319,5 +331,59 @@ mod tests {
 
         let parts = reduce_quorum_part_numbers(object_parts, 2);
         assert_eq!(parts, vec![1, 2]);
+    }
+
+    fn test_multipart_fileinfo(object: &str, data_blocks: usize, parity_blocks: usize, index: usize) -> FileInfo {
+        let mut file_info = FileInfo::new(object, data_blocks, parity_blocks);
+        file_info.erasure.index = index;
+        file_info.data_dir = Some(Uuid::new_v4());
+        file_info
+    }
+
+    #[test]
+    fn upload_id_write_quorum_fails_when_only_read_quorum_metadata_is_visible() {
+        let parts_metadata = vec![
+            test_multipart_fileinfo("bucket/object", 2, 2, 1),
+            test_multipart_fileinfo("bucket/object", 2, 2, 2),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        let errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+
+        let (read_quorum, write_quorum) =
+            SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2).expect("read quorum should resolve metadata geometry");
+
+        assert_eq!(read_quorum, 2);
+        assert_eq!(write_quorum, 3);
+        assert!(reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum as usize).is_none());
+
+        let err = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum as usize)
+            .expect("write quorum should fail with only two writable metadata copies");
+
+        assert_eq!(err, DiskError::ErasureWriteQuorum);
+    }
+
+    #[test]
+    fn upload_id_all_not_found_maps_to_invalid_upload_id() {
+        let parts_metadata = vec![
+            FileInfo::default(),
+            FileInfo::default(),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        let errs = vec![
+            Some(DiskError::FileNotFound),
+            Some(DiskError::FileNotFound),
+            Some(DiskError::FileNotFound),
+            Some(DiskError::FileNotFound),
+        ];
+
+        let err = SetDisks::object_quorum_from_meta(&parts_metadata, &errs, 2)
+            .map(|_| ())
+            .map_err(|err| map_upload_id_metadata_error("bucket", "object", "upload-id", err))
+            .expect_err("all missing upload metadata should remain an invalid upload id");
+
+        assert!(matches!(err, StorageError::InvalidUploadID(bucket, object, upload_id)
+            if bucket == "bucket" && object == "object" && upload_id == "upload-id"));
     }
 }

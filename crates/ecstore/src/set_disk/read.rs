@@ -362,6 +362,112 @@ fn is_metadata_fanout_ignored_error(err: &DiskError) -> bool {
     OBJECT_OP_IGNORED_ERRS.iter().any(|ignored| ignored == err)
 }
 
+fn is_confirmed_missing_part_error(err: Option<&str>) -> bool {
+    let Some(err) = err else {
+        return false;
+    };
+
+    err.contains("file not found")
+        || err.contains("No such file or directory")
+        || err.contains("Specified part could not be found")
+        || (err.starts_with("part.") && err.ends_with(" not found"))
+}
+
+fn resolve_read_part_from_responses(
+    bucket: &str,
+    part_meta_path: &str,
+    part_number: usize,
+    part_idx: usize,
+    expected_part_count: usize,
+    responses: &[Option<Vec<ObjectPartInfo>>],
+    read_quorum: usize,
+) -> disk::error::Result<ObjectPartInfo> {
+    let mut etag_quorum = HashMap::new();
+    let mut part_infos = Vec::new();
+    let mut present_count = 0usize;
+    let mut missing_count = 0usize;
+    let mut transient_error_count = 0usize;
+    let mut mismatched_response_count = 0usize;
+    for response in responses.iter() {
+        let Some(parts) = response else {
+            transient_error_count += 1;
+            continue;
+        };
+
+        if parts.len() != expected_part_count {
+            mismatched_response_count += 1;
+            continue;
+        }
+
+        if !parts[part_idx].etag.is_empty() {
+            present_count += 1;
+            *etag_quorum.entry(parts[part_idx].etag.clone()).or_insert(0) += 1;
+            part_infos.push(parts[part_idx].clone());
+            continue;
+        }
+
+        if is_confirmed_missing_part_error(parts[part_idx].error.as_deref()) {
+            missing_count += 1;
+        } else {
+            transient_error_count += 1;
+        }
+    }
+
+    let mut max_etag_quorum = 0;
+    let mut max_etag = None;
+    for (etag, quorum) in etag_quorum.iter() {
+        if quorum > &max_etag_quorum {
+            max_etag_quorum = *quorum;
+            max_etag = Some(etag);
+        }
+    }
+    let max_quorum = max_etag_quorum.max(missing_count);
+
+    let mut found = None;
+    for info in part_infos.iter() {
+        if let Some(etag) = max_etag
+            && info.etag == *etag
+        {
+            found = Some(info.clone());
+            break;
+        }
+    }
+
+    if let (Some(found), Some(max_etag)) = (found, max_etag)
+        && !found.etag.is_empty()
+        && etag_quorum.get(max_etag).unwrap_or(&0) >= &read_quorum
+    {
+        return Ok(found);
+    }
+
+    if missing_count >= read_quorum {
+        return Ok(ObjectPartInfo {
+            number: part_number,
+            error: Some(format!("part.{part_number} not found")),
+            ..Default::default()
+        });
+    }
+
+    if issue3031_diag_enabled() {
+        warn!(
+            target: "rustfs_ecstore::set_disk",
+            bucket = %bucket,
+            part_meta_path = %part_meta_path,
+            part_id = part_number,
+            read_quorum = read_quorum,
+            max_quorum = max_quorum,
+            disk_response_count = responses.len(),
+            present_count = present_count,
+            missing_count = missing_count,
+            transient_error_count = transient_error_count,
+            mismatched_response_count = mismatched_response_count,
+            "issue3031_read_parts_part_quorum"
+        );
+    }
+
+    Err(DiskError::ErasureReadQuorum)
+}
+
 fn shard_read_cost_for_disk(disk: Option<&DiskStore>) -> ShardReadCost {
     match disk {
         Some(disk) if disk.is_local() => ShardReadCost::Local,
@@ -723,8 +829,6 @@ impl SetDisks {
         part_numbers: &[usize],
         read_quorum: usize,
     ) -> disk::error::Result<Vec<ObjectPartInfo>> {
-        let mut errs = Vec::with_capacity(disks.len());
-        let mut object_parts = Vec::with_capacity(disks.len());
         let bucket = bucket.to_string();
         let part_meta_paths = part_meta_paths.to_vec();
 
@@ -750,96 +854,22 @@ impl SetDisks {
             Err(()) => return Err(DiskError::ErasureReadQuorum),
         };
 
-        errs.extend(collected_errors);
-        object_parts.extend(responses.into_iter().map(|resp| resp.unwrap_or_default()));
-
-        if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
+        if let Some(err) = reduce_read_quorum_errs(&collected_errors, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(err);
         }
 
         let mut ret = vec![ObjectPartInfo::default(); part_meta_paths.len()];
 
         for (part_idx, part_info) in part_meta_paths.iter().enumerate() {
-            let mut part_meta_quorum = HashMap::new();
-            let mut part_infos = Vec::new();
-            let mut present_count = 0usize;
-            let mut missing_or_empty_count = 0usize;
-            let mut mismatched_response_count = 0usize;
-            for parts in object_parts.iter() {
-                if parts.len() != part_meta_paths.len() {
-                    mismatched_response_count += 1;
-                    *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
-                    continue;
-                }
-
-                if !parts[part_idx].etag.is_empty() {
-                    present_count += 1;
-                    *part_meta_quorum.entry(parts[part_idx].etag.clone()).or_insert(0) += 1;
-                    part_infos.push(parts[part_idx].clone());
-                    continue;
-                }
-
-                missing_or_empty_count += 1;
-                *part_meta_quorum.entry(part_info.clone()).or_insert(0) += 1;
-            }
-
-            let mut max_quorum = 0;
-            let mut max_etag = None;
-            let mut max_part_meta = None;
-            for (etag, quorum) in part_meta_quorum.iter() {
-                if quorum > &max_quorum {
-                    max_quorum = *quorum;
-                    max_etag = Some(etag);
-                    max_part_meta = Some(etag);
-                }
-            }
-
-            let mut found = None;
-            for info in part_infos.iter() {
-                if let Some(etag) = max_etag
-                    && info.etag == *etag
-                {
-                    found = Some(info.clone());
-                    break;
-                }
-
-                if let Some(part_meta) = max_part_meta
-                    && info.etag.is_empty()
-                    && part_meta.ends_with(format!("part.{0}.meta", info.number).as_str())
-                {
-                    found = Some(info.clone());
-                    break;
-                }
-            }
-
-            if let (Some(found), Some(max_etag)) = (found, max_etag)
-                && !found.etag.is_empty()
-                && part_meta_quorum.get(max_etag).unwrap_or(&0) >= &read_quorum
-            {
-                ret[part_idx] = found.clone();
-            } else {
-                if issue3031_diag_enabled() {
-                    warn!(
-                        target: "rustfs_ecstore::set_disk",
-                        bucket = %bucket,
-                        part_meta_path = %part_info,
-                        part_id = part_numbers[part_idx],
-                        read_quorum = read_quorum,
-                        max_quorum = max_quorum,
-                        disk_response_count = object_parts.len(),
-                        present_count = present_count,
-                        missing_or_empty_count = missing_or_empty_count,
-                        mismatched_response_count = mismatched_response_count,
-                        max_vote_is_missing_marker = max_etag.map(|etag| etag == part_info).unwrap_or(false),
-                        "issue3031_read_parts_part_quorum"
-                    );
-                }
-                ret[part_idx] = ObjectPartInfo {
-                    number: part_numbers[part_idx],
-                    error: Some(format!("part.{} not found", part_numbers[part_idx])),
-                    ..Default::default()
-                };
-            }
+            ret[part_idx] = resolve_read_part_from_responses(
+                &bucket,
+                part_info,
+                part_numbers[part_idx],
+                part_idx,
+                part_meta_paths.len(),
+                &responses,
+                read_quorum,
+            )?;
         }
 
         Ok(ret)
@@ -2469,6 +2499,118 @@ mod tests {
         }
 
         fi
+    }
+
+    fn read_part_test_part(number: usize, etag: &str) -> ObjectPartInfo {
+        ObjectPartInfo {
+            number,
+            etag: etag.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn read_part_test_missing(number: usize) -> ObjectPartInfo {
+        ObjectPartInfo {
+            number,
+            error: Some("file not found".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn resolve_read_part_returns_part_when_etag_reaches_quorum() {
+        let part = read_part_test_part(1, "etag-1");
+        let responses = vec![
+            Some(vec![part.clone()]),
+            Some(vec![part]),
+            Some(vec![read_part_test_missing(1)]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("etag quorum should resolve part");
+
+        assert_eq!(resolved.etag, "etag-1");
+        assert!(resolved.error.is_none());
+    }
+
+    #[test]
+    fn resolve_read_part_returns_missing_only_when_missing_reaches_quorum() {
+        let responses = vec![
+            Some(vec![read_part_test_missing(1)]),
+            Some(vec![read_part_test_missing(1)]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("missing quorum should resolve as a confirmed missing part");
+
+        assert_eq!(resolved.number, 1);
+        assert_eq!(resolved.error.as_deref(), Some("part.1 not found"));
+    }
+
+    #[test]
+    fn resolve_read_part_treats_os_not_found_as_confirmed_missing() {
+        let responses = vec![
+            Some(vec![ObjectPartInfo {
+                number: 9999,
+                error: Some("No such file or directory (os error 2)".to_string()),
+                ..Default::default()
+            }]),
+            Some(vec![ObjectPartInfo {
+                number: 9999,
+                error: Some("No such file or directory (os error 2)".to_string()),
+                ..Default::default()
+            }]),
+            Some(vec![read_part_test_part(1, "stale-etag")]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.9999.meta", 9999, 0, 1, &responses, 2)
+            .expect("OS not-found quorum should resolve as a missing part");
+
+        assert_eq!(resolved.number, 9999);
+        assert_eq!(resolved.error.as_deref(), Some("part.9999 not found"));
+    }
+
+    #[test]
+    fn resolve_read_part_returns_missing_when_missing_quorum_beats_stale_present_part() {
+        let responses = vec![
+            Some(vec![read_part_test_missing(1)]),
+            Some(vec![read_part_test_missing(1)]),
+            Some(vec![read_part_test_part(1, "stale-etag")]),
+            None,
+        ];
+
+        let resolved = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("confirmed missing quorum should resolve as a missing part despite stale metadata");
+
+        assert_eq!(resolved.number, 1);
+        assert_eq!(resolved.error.as_deref(), Some("part.1 not found"));
+    }
+
+    #[test]
+    fn resolve_read_part_preserves_read_quorum_when_present_part_lacks_quorum() {
+        let responses = vec![
+            Some(vec![read_part_test_part(1, "etag-1")]),
+            Some(vec![read_part_test_missing(1)]),
+            None,
+        ];
+
+        let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect_err("mixed present and missing observations should not become InvalidPart");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_read_part_does_not_count_mismatched_response_as_missing() {
+        let responses = vec![Some(Vec::new()), Some(vec![read_part_test_missing(1)]), None];
+
+        let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect_err("invalid disk responses must not vote for a missing part");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]

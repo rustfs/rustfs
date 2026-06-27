@@ -316,6 +316,7 @@ impl SetDisks {
         dst_object: &str,
         meta: Bytes,
         write_quorum: usize,
+        quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -380,7 +381,11 @@ impl SetDisks {
         }
 
         if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-            warn!("rename_part errs {:?}", &errs);
+            if let Some(context) = quorum_context {
+                log_multipart_write_quorum_failure(context, &errs, write_quorum, &err);
+            } else {
+                warn!("rename_part errs {:?}", &errs);
+            }
             self.cleanup_multipart_path(&[dst_object.to_string(), format!("{dst_object}.meta")])
                 .await;
             return Err(err);
