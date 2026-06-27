@@ -142,7 +142,9 @@ pub(crate) mod server {
     }
 
     pub(crate) mod runtime_sources {
-        pub(crate) use crate::storage::storage_api::{ECStore, EndpointServerPools};
+        pub(crate) use crate::storage::storage_api::{
+            DailyAllTierStats, ECStore, EndpointServerPools, ExpiryState, TierConfigMgr,
+        };
     }
 }
 
