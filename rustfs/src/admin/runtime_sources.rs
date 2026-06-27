@@ -18,19 +18,13 @@ pub(crate) use crate::app::admin_usecase::{
 };
 use crate::app::object_usecase::DefaultObjectUsecase;
 pub(crate) use crate::runtime_sources::{
-    AppContext, publish_server_config, publish_storage_class_config, resolve_action_credentials as current_action_credentials,
-    resolve_boot_time as current_boot_time, resolve_bucket_metadata_handle as current_bucket_metadata_handle,
-    resolve_bucket_monitor_handle as current_bucket_monitor_handle, resolve_daily_tier_stats as current_daily_tier_stats,
-    resolve_deployment_id as current_deployment_id, resolve_endpoints_handle as current_endpoints_handle,
-    resolve_iam_handle as current_iam_handle, resolve_kms_runtime_service_manager as current_kms_runtime_service_manager,
-    resolve_notification_system_for_context, resolve_object_store_handle_for_context, resolve_oidc_handle as current_oidc_handle,
-    resolve_or_init_kms_runtime_service_manager as current_or_init_kms_runtime_service_manager,
-    resolve_outbound_tls_generation as current_outbound_tls_generation, resolve_outbound_tls_state as current_outbound_tls_state,
-    resolve_ready_iam_handle as current_ready_iam_handle, resolve_region as current_region,
-    resolve_replication_pool_handle as current_replication_pool_handle,
-    resolve_replication_stats_handle as current_replication_stats_handle, resolve_runtime_port as current_runtime_port,
-    resolve_scanner_metrics_report as current_scanner_metrics_report, resolve_server_config_for_context,
-    resolve_tier_config_handle as current_tier_config_handle, resolve_token_signing_key as current_token_signing_key,
+    AppContext, current_action_credentials, current_boot_time, current_bucket_metadata_handle, current_bucket_monitor_handle,
+    current_daily_tier_stats, current_deployment_id, current_endpoints_handle, current_iam_handle,
+    current_kms_runtime_service_manager, current_notification_system_for_context, current_object_store_handle_for_context,
+    current_oidc_handle, current_or_init_kms_runtime_service_manager, current_outbound_tls_generation,
+    current_outbound_tls_state, current_ready_iam_handle, current_region, current_replication_pool_handle,
+    current_replication_stats_handle, current_runtime_port, current_scanner_metrics_report, current_server_config_for_context,
+    current_tier_config_handle, current_token_signing_key, publish_server_config, publish_storage_class_config,
 };
 use rustfs_config::server_config::Config;
 use std::sync::Arc;
@@ -52,15 +46,15 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
 
 pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
     let context = current_app_context();
-    resolve_object_store_handle_for_context(context.as_deref())
+    current_object_store_handle_for_context(context.as_deref())
 }
 
 pub(crate) fn current_notification_system() -> Option<&'static NotificationSys> {
     let context = current_app_context();
-    resolve_notification_system_for_context(context.as_deref())
+    current_notification_system_for_context(context.as_deref())
 }
 
 pub(crate) fn current_server_config() -> Option<Config> {
     let context = current_app_context();
-    resolve_server_config_for_context(context.as_deref())
+    current_server_config_for_context(context.as_deref())
 }
