@@ -24,6 +24,7 @@ ROUNDS=3
 RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=0
 MODE="both"
+CODEC_ENGINES="legacy"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -49,6 +50,7 @@ Purpose:
 
 Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
+  --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -76,13 +78,17 @@ Credentials:
 
 Output:
   <out-dir>/legacy/warp/median_summary.csv
-  <out-dir>/codec/warp/median_summary.csv
-  <out-dir>/codec/warp/baseline_compare.csv    when --mode both
-  <out-dir>/compat_summary.csv                  when --mode both
+  <out-dir>/codec-legacy/warp/median_summary.csv
+  <out-dir>/codec-rustfs/warp/median_summary.csv
+  <out-dir>/engine_compare.csv                  when legacy and codec profiles both run
+  <out-dir>/compat_summary.csv                  when legacy and codec profiles both run
+  <out-dir>/metrics_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
-  <out-dir>/body_sha256_new.txt                 when codec profile runs
+  <out-dir>/body_sha256_codec_legacy.txt        when codec-legacy profile runs
+  <out-dir>/body_sha256_codec_rustfs.txt        when codec-rustfs profile runs
   <out-dir>/response_headers_legacy.json        when legacy profile runs
-  <out-dir>/response_headers_new.json           when codec profile runs
+  <out-dir>/response_headers_codec_legacy.json  when codec-legacy profile runs
+  <out-dir>/response_headers_codec_rustfs.json  when codec-rustfs profile runs
   <out-dir>/<profile>/manifest.env
   <out-dir>/<profile>/metrics_summary.csv
   <out-dir>/<profile>/compat/compat_summary.csv
@@ -92,7 +98,7 @@ Output:
 
 Example:
   scripts/run_get_codec_streaming_smoke.sh \
-    --mode both --sizes 1MiB,4MiB,10MiB --concurrency 64 --duration 30s
+    --mode both --codec-engine legacy,rustfs --sizes 1MiB,4MiB,10MiB --concurrency 64 --duration 30s
 USAGE
 }
 
@@ -131,6 +137,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode) MODE="$2"; shift 2 ;;
+      --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -165,6 +172,17 @@ validate_args() {
     legacy|codec|both) ;;
     *) die "--mode must be legacy, codec, or both" ;;
   esac
+
+  local raw engine
+  IFS=',' read -r -a engines <<< "$CODEC_ENGINES"
+  [[ "${#engines[@]}" -gt 0 ]] || die "--codec-engine must not be empty"
+  for raw in "${engines[@]}"; do
+    engine="${raw//[[:space:]]/}"
+    case "$engine" in
+      legacy|rustfs) ;;
+      *) die "--codec-engine supports only legacy,rustfs, got: $engine" ;;
+    esac
+  done
 
   [[ -n "$ADDRESS" ]] || die "--address must not be empty"
   [[ -n "$ACCESS_KEY" ]] || die "--access-key must not be empty"
@@ -210,7 +228,26 @@ profile_codec_enabled() {
   local profile="$1"
   case "$profile" in
     legacy) echo "false" ;;
-    codec) echo "true" ;;
+    codec-legacy|codec-rustfs) echo "true" ;;
+    *) die "unknown profile: $profile" ;;
+  esac
+}
+
+profile_codec_engine() {
+  local profile="$1"
+  case "$profile" in
+    legacy|codec-legacy) echo "legacy" ;;
+    codec-rustfs) echo "rustfs" ;;
+    *) die "unknown profile: $profile" ;;
+  esac
+}
+
+profile_metrics_path() {
+  local profile="$1"
+  case "$profile" in
+    legacy) echo "legacy_duplex" ;;
+    codec-legacy) echo "codec_streaming_legacy_engine" ;;
+    codec-rustfs) echo "codec_streaming_rustfs_engine" ;;
     *) die "unknown profile: $profile" ;;
   esac
 }
@@ -234,6 +271,8 @@ write_manifest() {
   local profile_dir="$2"
   local codec_enabled="$3"
   local volumes="$4"
+  local codec_engine="$5"
+  local metrics_path="$6"
   local git_head git_dirty_count
 
   git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
@@ -261,7 +300,9 @@ compat_object_key=${COMPAT_OBJECT_KEY}
 compat_object_size=${COMPAT_OBJECT_SIZE}
 rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
+RUSTFS_GET_CODEC_STREAMING_ENGINE=${codec_engine}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
 RUSTFS_SCANNER_START_DELAY_SECS=3600
 RUSTFS_SCANNER_CYCLE=3600
@@ -307,15 +348,19 @@ start_server() {
   local data_root
   local volumes
   local codec_enabled
+  local codec_engine
+  local metrics_path
   local rustfs_log
 
   data_root="$(profile_data_root "$profile")"
   volumes="$(profile_volumes "$data_root")"
   codec_enabled="$(profile_codec_enabled "$profile")"
+  codec_engine="$(profile_codec_engine "$profile")"
+  metrics_path="$(profile_metrics_path "$profile")"
   rustfs_log="${profile_dir}/rustfs.log"
 
   mkdir -p "${data_root}/disk1" "${data_root}/disk2" "${data_root}/disk3" "${data_root}/disk4"
-  write_manifest "$profile" "$profile_dir" "$codec_enabled" "$volumes"
+  write_manifest "$profile" "$profile_dir" "$codec_enabled" "$volumes" "$codec_engine" "$metrics_path"
 
   if [[ "$DRY_RUN" == "true" ]]; then
     log "[DRY-RUN] start RustFS profile=${profile} endpoint=$(endpoint_url)"
@@ -332,6 +377,7 @@ start_server() {
     export RUSTFS_VOLUMES="$volumes"
     export RUSTFS_CONSOLE_ENABLE=false
     export RUSTFS_GET_CODEC_STREAMING_ENABLE="$codec_enabled"
+    export RUSTFS_GET_CODEC_STREAMING_ENGINE="$codec_engine"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
@@ -440,6 +486,7 @@ import http.client
 import json
 import pathlib
 import sys
+from typing import Dict, List, Optional, Tuple
 import urllib.parse
 
 endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, out_dir_raw, profile = sys.argv[1:]
@@ -481,7 +528,7 @@ def canonical_uri(path: str) -> str:
     return "/".join(urllib.parse.quote(part, safe="-_.~/") for part in path.split("/")) or "/"
 
 
-def signed_headers(method: str, path: str, body: bytes, extra_headers: list[tuple[str, str]]) -> dict[str, str]:
+def signed_headers(method: str, path: str, body: bytes, extra_headers: List[Tuple[str, str]]) -> Dict[str, str]:
     parsed = urllib.parse.urlsplit(endpoint)
     amz_date = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     date_stamp = amz_date[:8]
@@ -509,7 +556,7 @@ def signed_headers(method: str, path: str, body: bytes, extra_headers: list[tupl
     return result
 
 
-def request(method: str, path: str, body: bytes = b"", extra_headers: list[tuple[str, str]] | None = None):
+def request(method: str, path: str, body: bytes = b"", extra_headers: Optional[List[Tuple[str, str]]] = None):
     parsed = urllib.parse.urlsplit(endpoint)
     headers = signed_headers(method, path, body, extra_headers or [])
     if body and "content-length" not in headers:
@@ -529,8 +576,8 @@ def request(method: str, path: str, body: bytes = b"", extra_headers: list[tuple
     return snapshot, response_body
 
 
-def header_map(headers: list[list[str] | tuple[str, str]]) -> dict[str, list[str]]:
-    result: dict[str, list[str]] = {}
+def header_map(headers) -> Dict[str, List[str]]:
+    result: Dict[str, List[str]] = {}
     for name, value in headers:
         result.setdefault(name.lower(), []).append(value)
     for value in result.values():
@@ -609,22 +656,33 @@ copy_profile_compat_artifacts() {
   fi
 }
 
-write_ab_compat_summary() {
+write_root_compat_summary() {
   local legacy_snapshot="${OUT_DIR}/legacy/compat/snapshot.json"
-  local codec_snapshot="${OUT_DIR}/codec/compat/snapshot.json"
+  local codec_snapshots=()
+  local profile snapshot
 
-  if [[ ! -f "$legacy_snapshot" || ! -f "$codec_snapshot" ]]; then
-    return
-  fi
+  [[ -f "$legacy_snapshot" ]] || return
 
-  "$PYTHON_BIN" - "$legacy_snapshot" "$codec_snapshot" "${OUT_DIR}/compat_summary.csv" <<'PY'
+  for profile in "$@"; do
+    [[ "$profile" == legacy ]] && continue
+    snapshot="${OUT_DIR}/${profile}/compat/snapshot.json"
+    if [[ -f "$snapshot" ]]; then
+      codec_snapshots+=("$snapshot")
+    fi
+  done
+
+  [[ "${#codec_snapshots[@]}" -gt 0 ]] || return 0
+
+  "$PYTHON_BIN" - "${OUT_DIR}/compat_summary.csv" "$legacy_snapshot" "${codec_snapshots[@]}" <<'PY'
 import csv
 import json
 import sys
 
-legacy_path, codec_path, out_csv = sys.argv[1:]
+out_csv = sys.argv[1]
+legacy_path = sys.argv[2]
+codec_paths = sys.argv[3:]
 legacy = json.load(open(legacy_path, encoding="utf-8"))
-codec = json.load(open(codec_path, encoding="utf-8"))
+codecs = [json.load(open(path, encoding="utf-8")) for path in codec_paths]
 
 
 def values(snapshot, name):
@@ -635,23 +693,6 @@ def prefixed(snapshot, prefix):
     headers = snapshot.get("get_headers", {})
     return {key: headers[key] for key in sorted(headers) if key.startswith(prefix)}
 
-
-body_match = legacy.get("body_sha256") == codec.get("body_sha256")
-content_length_match = values(legacy, "content-length") == values(codec, "content-length")
-etag_match = values(legacy, "etag") == values(codec, "etag")
-content_range_match = values(legacy, "content-range") == values(codec, "content-range")
-checksum_headers_match = prefixed(legacy, "x-amz-checksum") == prefixed(codec, "x-amz-checksum")
-sse_headers_match = prefixed(legacy, "x-amz-server-side-encryption") == prefixed(codec, "x-amz-server-side-encryption")
-status_code_match = legacy.get("get_status") == codec.get("get_status") and legacy.get("head_status") == codec.get("head_status")
-checks = [
-    body_match,
-    content_length_match,
-    etag_match,
-    content_range_match,
-    checksum_headers_match,
-    sse_headers_match,
-    status_code_match,
-]
 
 with open(out_csv, "w", encoding="utf-8", newline="") as handle:
     writer = csv.writer(handle)
@@ -673,24 +714,239 @@ with open(out_csv, "w", encoding="utf-8", newline="") as handle:
             "new_status_code",
         ]
     )
-    writer.writerow(
-        [
-            codec.get("size", legacy.get("size", "")),
-            "codec_streaming",
-            str(body_match).lower(),
-            str(content_length_match).lower(),
-            str(etag_match).lower(),
-            str(content_range_match).lower(),
-            str(checksum_headers_match).lower(),
-            str(sse_headers_match).lower(),
-            str(status_code_match).lower(),
-            sum(1 for check in checks if not check),
-            legacy.get("body_sha256", ""),
-            codec.get("body_sha256", ""),
-            legacy.get("get_status", ""),
-            codec.get("get_status", ""),
+    for codec in codecs:
+        body_match = legacy.get("body_sha256") == codec.get("body_sha256")
+        content_length_match = values(legacy, "content-length") == values(codec, "content-length")
+        etag_match = values(legacy, "etag") == values(codec, "etag")
+        content_range_match = values(legacy, "content-range") == values(codec, "content-range")
+        checksum_headers_match = prefixed(legacy, "x-amz-checksum") == prefixed(codec, "x-amz-checksum")
+        sse_headers_match = prefixed(legacy, "x-amz-server-side-encryption") == prefixed(codec, "x-amz-server-side-encryption")
+        status_code_match = legacy.get("get_status") == codec.get("get_status") and legacy.get("head_status") == codec.get("head_status")
+        checks = [
+            body_match,
+            content_length_match,
+            etag_match,
+            content_range_match,
+            checksum_headers_match,
+            sse_headers_match,
+            status_code_match,
         ]
+        writer.writerow(
+            [
+                codec.get("size", legacy.get("size", "")),
+                codec.get("path", ""),
+                str(body_match).lower(),
+                str(content_length_match).lower(),
+                str(etag_match).lower(),
+                str(content_range_match).lower(),
+                str(checksum_headers_match).lower(),
+                str(sse_headers_match).lower(),
+                str(status_code_match).lower(),
+                sum(1 for check in checks if not check),
+                legacy.get("body_sha256", ""),
+                codec.get("body_sha256", ""),
+                legacy.get("get_status", ""),
+                codec.get("get_status", ""),
+            ]
+        )
+PY
+}
+
+write_root_metrics_summary() {
+  local profile_dirs=()
+  local profile
+
+  for profile in "$@"; do
+    profile_dirs+=("${OUT_DIR}/${profile}")
+  done
+
+  [[ "${#profile_dirs[@]}" -gt 0 ]] || return
+
+  "$PYTHON_BIN" - "${OUT_DIR}/metrics_summary.csv" "${OUT_DIR}/engine_compare.csv" "${profile_dirs[@]}" <<'PY'
+import csv
+import pathlib
+import sys
+
+metrics_csv = pathlib.Path(sys.argv[1])
+engine_compare_csv = pathlib.Path(sys.argv[2])
+profile_dirs = [pathlib.Path(value) for value in sys.argv[3:]]
+
+
+def load_manifest(path):
+    data = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        data[key] = value
+    return data
+
+
+def parse_float(value):
+    if value in ("", "N/A", None):
+        return None
+    return float(value)
+
+
+def delta_pct(new_value, baseline_value):
+    if new_value is None or baseline_value in (None, 0.0):
+        return ""
+    return f"{((new_value - baseline_value) / baseline_value) * 100:.2f}"
+
+
+def performance_note(throughput_delta, latency_delta):
+    if throughput_delta == "" or latency_delta == "":
+        return ""
+    throughput_delta = float(throughput_delta)
+    latency_delta = float(latency_delta)
+    if throughput_delta < 0 and latency_delta > 0:
+        return "slower_than_legacy_and_higher_latency"
+    if throughput_delta < 0:
+        return "slower_than_legacy"
+    if latency_delta > 0:
+        return "higher_latency_than_legacy"
+    return "at_or_better_than_legacy"
+
+
+rows = []
+by_profile = {}
+for profile_dir in profile_dirs:
+    manifest = load_manifest(profile_dir / "manifest.env")
+    profile = manifest["profile"]
+    with open(profile_dir / "warp" / "median_summary.csv", encoding="utf-8", newline="") as handle:
+        profile_rows = list(csv.DictReader(handle))
+    by_profile[profile] = profile_rows
+    for row in profile_rows:
+        rows.append(
+            {
+                "profile": profile,
+                "read_path": manifest.get("metrics_path", profile),
+                "codec_streaming_enabled": manifest.get("RUSTFS_GET_CODEC_STREAMING_ENABLE", ""),
+                "codec_engine": manifest.get("RUSTFS_GET_CODEC_STREAMING_ENGINE", ""),
+                "size": row["size"],
+                "tool": row["tool"],
+                "concurrency": row["concurrency"],
+                "successful_rounds": row["successful_rounds"],
+                "failed_rounds": row["failed_rounds"],
+                "median_throughput_bps": row["median_throughput_bps"],
+                "median_reqps": row["median_reqps"],
+                "median_latency_ms": row["median_latency_ms"],
+            }
+        )
+
+legacy_by_size = {row["size"]: row for row in by_profile.get("legacy", [])}
+for row in rows:
+    baseline = legacy_by_size.get(row["size"])
+    if baseline is None or row["profile"] == "legacy":
+        row["baseline_profile"] = ""
+        row["delta_throughput_pct_vs_legacy"] = ""
+        row["delta_reqps_pct_vs_legacy"] = ""
+        row["delta_latency_pct_vs_legacy"] = ""
+        row["performance_note"] = ""
+        continue
+    throughput_delta = delta_pct(parse_float(row["median_throughput_bps"]), parse_float(baseline["median_throughput_bps"]))
+    reqps_delta = delta_pct(parse_float(row["median_reqps"]), parse_float(baseline["median_reqps"]))
+    latency_delta = delta_pct(parse_float(row["median_latency_ms"]), parse_float(baseline["median_latency_ms"]))
+    row["baseline_profile"] = "legacy"
+    row["delta_throughput_pct_vs_legacy"] = throughput_delta
+    row["delta_reqps_pct_vs_legacy"] = reqps_delta
+    row["delta_latency_pct_vs_legacy"] = latency_delta
+    row["performance_note"] = performance_note(throughput_delta, latency_delta)
+
+fieldnames = [
+    "profile",
+    "read_path",
+    "codec_streaming_enabled",
+    "codec_engine",
+    "size",
+    "tool",
+    "concurrency",
+    "successful_rounds",
+    "failed_rounds",
+    "median_throughput_bps",
+    "median_reqps",
+    "median_latency_ms",
+    "baseline_profile",
+    "delta_throughput_pct_vs_legacy",
+    "delta_reqps_pct_vs_legacy",
+    "delta_latency_pct_vs_legacy",
+    "performance_note",
+]
+with open(metrics_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows)
+
+codec_legacy_by_size = {row["size"]: row for row in by_profile.get("codec-legacy", [])}
+codec_rustfs_by_size = {row["size"]: row for row in by_profile.get("codec-rustfs", [])}
+if not legacy_by_size:
+    raise SystemExit(0)
+
+compare_fields = [
+    "size",
+    "legacy_median_throughput_bps",
+    "codec_legacy_median_throughput_bps",
+    "codec_rustfs_median_throughput_bps",
+    "legacy_median_reqps",
+    "codec_legacy_median_reqps",
+    "codec_rustfs_median_reqps",
+    "legacy_median_latency_ms",
+    "codec_legacy_median_latency_ms",
+    "codec_rustfs_median_latency_ms",
+    "codec_legacy_delta_throughput_pct_vs_legacy",
+    "codec_rustfs_delta_throughput_pct_vs_legacy",
+    "codec_rustfs_delta_throughput_pct_vs_codec_legacy",
+    "codec_legacy_delta_latency_pct_vs_legacy",
+    "codec_rustfs_delta_latency_pct_vs_legacy",
+    "codec_rustfs_delta_latency_pct_vs_codec_legacy",
+]
+compare_rows = []
+for size, legacy in legacy_by_size.items():
+    codec_legacy = codec_legacy_by_size.get(size, {})
+    codec_rustfs = codec_rustfs_by_size.get(size, {})
+    compare_rows.append(
+        {
+            "size": size,
+            "legacy_median_throughput_bps": legacy.get("median_throughput_bps", ""),
+            "codec_legacy_median_throughput_bps": codec_legacy.get("median_throughput_bps", ""),
+            "codec_rustfs_median_throughput_bps": codec_rustfs.get("median_throughput_bps", ""),
+            "legacy_median_reqps": legacy.get("median_reqps", ""),
+            "codec_legacy_median_reqps": codec_legacy.get("median_reqps", ""),
+            "codec_rustfs_median_reqps": codec_rustfs.get("median_reqps", ""),
+            "legacy_median_latency_ms": legacy.get("median_latency_ms", ""),
+            "codec_legacy_median_latency_ms": codec_legacy.get("median_latency_ms", ""),
+            "codec_rustfs_median_latency_ms": codec_rustfs.get("median_latency_ms", ""),
+            "codec_legacy_delta_throughput_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_throughput_bps", "")),
+                parse_float(legacy.get("median_throughput_bps", "")),
+            ),
+            "codec_rustfs_delta_throughput_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_throughput_bps", "")),
+                parse_float(legacy.get("median_throughput_bps", "")),
+            ),
+            "codec_rustfs_delta_throughput_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_throughput_bps", "")),
+                parse_float(codec_legacy.get("median_throughput_bps", "")),
+            ),
+            "codec_legacy_delta_latency_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_latency_ms", "")),
+                parse_float(legacy.get("median_latency_ms", "")),
+            ),
+            "codec_rustfs_delta_latency_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_latency_ms", "")),
+                parse_float(legacy.get("median_latency_ms", "")),
+            ),
+            "codec_rustfs_delta_latency_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_latency_ms", "")),
+                parse_float(codec_legacy.get("median_latency_ms", "")),
+            ),
+        }
     )
+
+with open(engine_compare_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.DictWriter(handle, fieldnames=compare_fields)
+    writer.writeheader()
+    writer.writerows(compare_rows)
 PY
 }
 
@@ -722,26 +978,51 @@ main() {
   trap stop_server EXIT INT TERM
 
   log "Output dir: $OUT_DIR"
+  local codec_profiles=()
+  local profiles=()
+  local raw engine profile
+  IFS=',' read -r -a engines <<< "$CODEC_ENGINES"
+  for raw in "${engines[@]}"; do
+    engine="${raw//[[:space:]]/}"
+    [[ -n "$engine" ]] || continue
+    profile="codec-${engine}"
+    codec_profiles+=("$profile")
+  done
+
   case "$MODE" in
     legacy)
-      run_profile legacy
-      copy_profile_compat_artifacts legacy legacy
+      profiles=("legacy")
       ;;
     codec)
-      run_profile codec
-      copy_profile_compat_artifacts codec new
+      profiles=("${codec_profiles[@]}")
       ;;
     both)
-      run_profile legacy
-      copy_profile_compat_artifacts legacy legacy
-      run_profile codec "${OUT_DIR}/legacy/warp/median_summary.csv"
-      copy_profile_compat_artifacts codec new
-      write_ab_compat_summary
+      profiles=("legacy" "${codec_profiles[@]}")
       ;;
   esac
 
+  local legacy_baseline_csv=""
+  for profile in "${profiles[@]}"; do
+    if [[ "$profile" == "legacy" ]]; then
+      run_profile "$profile"
+      legacy_baseline_csv="${OUT_DIR}/legacy/warp/median_summary.csv"
+    else
+      run_profile "$profile" "$legacy_baseline_csv"
+    fi
+    copy_profile_compat_artifacts "$profile" "${profile//-/_}"
+  done
+
+  write_root_metrics_summary "${profiles[@]}"
+  write_root_compat_summary "${profiles[@]}"
+
   if [[ -f "${OUT_DIR}/compat_summary.csv" ]]; then
     log "Compatibility compare: ${OUT_DIR}/compat_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/engine_compare.csv" ]]; then
+    log "Engine compare: ${OUT_DIR}/engine_compare.csv"
+  fi
+  if [[ -f "${OUT_DIR}/metrics_summary.csv" ]]; then
+    log "Metrics summary: ${OUT_DIR}/metrics_summary.csv"
   fi
   log "GET codec streaming smoke finished."
 }

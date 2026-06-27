@@ -2244,8 +2244,9 @@ impl SetDisks {
             BitrotReaderSetupMode::VerifyReconstruction,
         )
         .await;
+        let metrics_path = get_codec_streaming_metrics_path();
         rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
+            metrics_path,
             GET_STAGE_READER_SETUP,
             reader_setup_stage_start.elapsed().as_secs_f64(),
         );
@@ -2254,14 +2255,10 @@ impl SetDisks {
         if available_shards < erasure.data_shards {
             if let Some(read_err) = reduce_read_quorum_errs(&reader_setup.errors, OBJECT_OP_IGNORED_ERRS, erasure.data_shards) {
                 let reason = classify_disk_error(&read_err);
-                record_get_object_pipeline_failure_for_path(GET_OBJECT_PATH_CODEC_STREAMING, GET_STAGE_READER_SETUP, reason);
+                record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, reason);
                 return Err(to_object_err(read_err.into(), vec![bucket, object]));
             }
-            record_get_object_pipeline_failure_for_path(
-                GET_OBJECT_PATH_CODEC_STREAMING,
-                GET_STAGE_READER_SETUP,
-                GetObjectFailureReason::ReadQuorum,
-            );
+            record_get_object_pipeline_failure_for_path(metrics_path, GET_STAGE_READER_SETUP, GetObjectFailureReason::ReadQuorum);
             return Err(Error::other(format!("not enough disks to read: {:?}", reader_setup.errors)));
         }
 
@@ -2287,11 +2284,16 @@ impl SetDisks {
                 erasure.clone(),
                 0,
                 part_size,
-                Some(GET_OBJECT_PATH_CODEC_STREAMING),
+                Some(metrics_path),
                 read_costs,
             );
         let engine = build_get_codec_streaming_decode_engine(erasure)?;
-        let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new(source, engine, part_length)?;
+        let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(
+            source,
+            engine,
+            part_length,
+            metrics_path,
+        )?;
         Ok(Box::new(crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new(reader)))
     }
 }
@@ -3359,6 +3361,23 @@ mod tests {
             let engine = build_get_codec_streaming_decode_engine(erasure).expect("engine should be built");
 
             assert!(matches!(engine, CodecStreamingDecodeEngine::Rustfs(_)));
+        });
+    }
+
+    #[test]
+    fn codec_streaming_metrics_path_matches_selected_engine() {
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, None::<&str>, || {
+            assert_eq!(
+                get_codec_streaming_metrics_path(),
+                crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE
+            );
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
+            assert_eq!(
+                get_codec_streaming_metrics_path(),
+                crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE
+            );
         });
     }
 

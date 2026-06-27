@@ -39,6 +39,7 @@ allow-git = [
     # Custom S3 server library with minio compatibility patches not yet upstreamed.
     # Pinned to a specific commit in workspace Cargo.toml.
     "https://github.com/rustfs/s3s",
+    "https://github.com/apache/datafusion.git",
 ]
 
 [bans]

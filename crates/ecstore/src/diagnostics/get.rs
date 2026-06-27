@@ -17,6 +17,8 @@ use crate::error::StorageError;
 use std::io;
 
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING: &str = "codec_streaming";
+pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE: &str = "codec_streaming_legacy_engine";
+pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE: &str = "codec_streaming_rustfs_engine";
 pub(crate) const GET_OBJECT_PATH_EMPTY: &str = "empty";
 pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
 pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
@@ -216,6 +218,8 @@ mod tests {
         assert_eq!(GetObjectFailureReason::DecodeError.as_str(), "decode_error");
         assert_eq!(GET_READER_BUFFER_OUTPUT, "output");
         assert_eq!(GET_READER_BUFFER_PREFETCH, "prefetch");
+        assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, "codec_streaming_legacy_engine");
+        assert_eq!(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, "codec_streaming_rustfs_engine");
         assert_eq!(GET_READER_PREFETCH_DIRECT, "direct");
         assert_eq!(GET_READER_PREFETCH_STORED, "stored");
         assert_eq!(GET_READER_PREFETCH_EOF, "eof");

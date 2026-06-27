@@ -43,6 +43,7 @@ pub(crate) struct ErasureDecodeReader<S, E>
 where
     E: ErasureDecodeEngine,
 {
+    metrics_path: &'static str,
     source: Option<S>,
     engine: E,
     workspace: Option<E::Workspace>,
@@ -62,6 +63,15 @@ where
     E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
 {
     pub(crate) fn new(source: S, engine: E, total_length: usize) -> io::Result<Self> {
+        Self::new_with_metrics_path(source, engine, total_length, GET_OBJECT_PATH_CODEC_STREAMING)
+    }
+
+    pub(crate) fn new_with_metrics_path(
+        source: S,
+        engine: E,
+        total_length: usize,
+        metrics_path: &'static str,
+    ) -> io::Result<Self> {
         if engine.data_shards() == 0 {
             return Err(io::Error::new(ErrorKind::InvalidInput, "erasure reader requires data shards"));
         }
@@ -73,6 +83,7 @@ where
         let workspace = engine.prepare_workspace(shard_len)?;
 
         Ok(Self {
+            metrics_path,
             source: Some(source),
             engine,
             workspace: Some(workspace),
@@ -97,25 +108,26 @@ where
             };
 
             let engine = self.engine.clone();
+            let metrics_path = self.metrics_path;
             let remaining = self.remaining;
             self.fill = Some(tokio::spawn(async move {
                 let fill_stage_start = Instant::now();
                 let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
                 rustfs_io_metrics::record_get_object_stage_duration(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    metrics_path,
                     GET_STAGE_STRIPE_READ,
                     stripe_read_stage_start.elapsed().as_secs_f64(),
                 );
                 let decode_stage_start = Instant::now();
-                let result = decode_stripe(&engine, &mut workspace, state, remaining);
+                let result = decode_stripe(metrics_path, &engine, &mut workspace, state, remaining);
                 rustfs_io_metrics::record_get_object_stage_duration(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    metrics_path,
                     GET_STAGE_DECODE,
                     decode_stage_start.elapsed().as_secs_f64(),
                 );
                 rustfs_io_metrics::record_get_object_stage_duration(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    metrics_path,
                     GET_STAGE_FILL,
                     fill_stage_start.elapsed().as_secs_f64(),
                 );
@@ -153,8 +165,8 @@ where
                 if buf.is_empty() && self.remaining > 0 {
                     return Poll::Ready(Err(DiskError::LessData.into()));
                 }
-                rustfs_io_metrics::record_get_object_reader_stripe(GET_OBJECT_PATH_CODEC_STREAMING);
-                rustfs_io_metrics::record_get_object_reader_bytes(GET_OBJECT_PATH_CODEC_STREAMING, buf.len());
+                rustfs_io_metrics::record_get_object_reader_stripe(self.metrics_path);
+                rustfs_io_metrics::record_get_object_reader_bytes(self.metrics_path, buf.len());
                 self.remaining -= buf.len();
                 Poll::Ready(Ok(Some(buf)))
             }
@@ -182,7 +194,7 @@ where
             Poll::Ready(result) => {
                 if let Some(started_at) = self.prefetch_wait_started_at.take() {
                     rustfs_io_metrics::record_get_object_reader_prefetch_wait(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        self.metrics_path,
                         started_at.elapsed().as_secs_f64(),
                     );
                 }
@@ -194,48 +206,28 @@ where
         match fill {
             Ok(Some(buf)) => {
                 if self.output_pos < self.output_buf.len() {
-                    rustfs_io_metrics::record_get_object_reader_prefetch(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_PREFETCH_STORED,
-                    );
-                    rustfs_io_metrics::record_get_object_reader_buffer(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_BUFFER_PREFETCH,
-                        buf.len(),
-                    );
+                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_STORED);
+                    rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_PREFETCH, buf.len());
                     self.prefetched_buf = Some(buf);
                 } else {
-                    rustfs_io_metrics::record_get_object_reader_prefetch(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_PREFETCH_DIRECT,
-                    );
-                    rustfs_io_metrics::record_get_object_reader_buffer(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_BUFFER_OUTPUT,
-                        buf.len(),
-                    );
+                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_DIRECT);
+                    rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, buf.len());
                     self.output_buf = buf;
                     self.output_pos = 0;
                 }
                 Poll::Ready(Ok(()))
             }
             Ok(None) => {
-                rustfs_io_metrics::record_get_object_reader_prefetch(GET_OBJECT_PATH_CODEC_STREAMING, GET_READER_PREFETCH_EOF);
+                rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_EOF);
                 Poll::Ready(Ok(()))
             }
             Err(err) => {
                 if self.output_pos < self.output_buf.len() {
-                    rustfs_io_metrics::record_get_object_reader_prefetch(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_PREFETCH_ERROR_DEFERRED,
-                    );
+                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_ERROR_DEFERRED);
                     self.prefetch_error = Some(err);
                     Poll::Ready(Ok(()))
                 } else {
-                    rustfs_io_metrics::record_get_object_reader_prefetch(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
-                        GET_READER_PREFETCH_ERROR_IMMEDIATE,
-                    );
+                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_ERROR_IMMEDIATE);
                     Poll::Ready(Err(err))
                 }
             }
@@ -281,7 +273,7 @@ where
                 self.output_pos += copy_len;
                 if copy_len > 0 {
                     rustfs_io_metrics::record_get_object_reader_copy(
-                        GET_OBJECT_PATH_CODEC_STREAMING,
+                        self.metrics_path,
                         copy_len,
                         read_buf_remaining_before,
                         output_remaining_before,
@@ -292,11 +284,7 @@ where
             }
 
             if let Some(next_buf) = self.prefetched_buf.take() {
-                rustfs_io_metrics::record_get_object_reader_buffer(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
-                    GET_READER_BUFFER_OUTPUT,
-                    next_buf.len(),
-                );
+                rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, next_buf.len());
                 self.output_buf = next_buf;
                 self.output_pos = 0;
                 continue;
@@ -380,6 +368,7 @@ where
 }
 
 fn decode_stripe<E>(
+    metrics_path: &'static str,
     engine: &E,
     workspace: &mut E::Workspace,
     state: StripeReadState,
@@ -398,14 +387,14 @@ where
     let reconstruct_stage_start = Instant::now();
     if state.data_shards_complete(engine.data_shards()) {
         rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
+            metrics_path,
             GET_STAGE_RECONSTRUCT,
             reconstruct_stage_start.elapsed().as_secs_f64(),
         );
         let emit_stage_start = Instant::now();
         let output = emit_data_shards(&state, engine.data_shards(), engine.block_size(), remaining)?;
         rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
+            metrics_path,
             GET_STAGE_EMIT,
             emit_stage_start.elapsed().as_secs_f64(),
         );
@@ -415,14 +404,14 @@ where
     let (mut shards, _errs) = state.into_parts();
     if let Err(err) = engine.reconstruct_into(&mut shards, workspace) {
         rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
+            metrics_path,
             GET_STAGE_RECONSTRUCT,
             reconstruct_stage_start.elapsed().as_secs_f64(),
         );
         return Err(err);
     }
     rustfs_io_metrics::record_get_object_stage_duration(
-        GET_OBJECT_PATH_CODEC_STREAMING,
+        metrics_path,
         GET_STAGE_RECONSTRUCT,
         reconstruct_stage_start.elapsed().as_secs_f64(),
     );
@@ -446,11 +435,7 @@ where
         let copy_len = shard.len().min(remaining - output.len());
         output.extend_from_slice(&shard[..copy_len]);
     }
-    rustfs_io_metrics::record_get_object_stage_duration(
-        GET_OBJECT_PATH_CODEC_STREAMING,
-        GET_STAGE_EMIT,
-        emit_stage_start.elapsed().as_secs_f64(),
-    );
+    rustfs_io_metrics::record_get_object_stage_duration(metrics_path, GET_STAGE_EMIT, emit_stage_start.elapsed().as_secs_f64());
 
     Ok(Some(output))
 }
