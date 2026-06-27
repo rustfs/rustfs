@@ -307,9 +307,13 @@ const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
+const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
+const ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
+const ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
@@ -362,28 +366,48 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 /// Check if lock optimization is enabled.
 /// When enabled, read locks are released after metadata read instead of
 /// being held for the entire data transfer duration.
+///
+/// **Note**: Cached via `OnceLock` — env var changes require process restart.
 pub fn is_lock_optimization_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
-    )
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+        )
+    })
 }
 
 /// Check if deadlock detection is enabled.
 /// When enabled, lock operations are recorded for deadlock analysis.
+///
+/// **Note**: Cached via `OnceLock` — env var changes require process restart.
 pub fn is_deadlock_detection_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
-        rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
-    )
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_DEADLOCK_DETECTION_ENABLE,
+            rustfs_config::DEFAULT_OBJECT_DEADLOCK_DETECTION_ENABLE,
+        )
+    })
 }
 
+/// **Note**: Cached via `OnceLock` — env var changes require process restart.
 fn is_get_codec_streaming_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+    #[cfg(test)]
+    let enabled = rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE);
+    #[cfg(not(test))]
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    #[cfg(not(test))]
+    let enabled =
+        *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE));
+    enabled
 }
 
+/// **Note**: Cached via `OnceLock` — env var changes require process restart.
 fn is_get_metadata_early_stop_enabled() -> bool {
-    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE)
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE))
 }
 
 fn get_codec_streaming_min_size() -> usize {
@@ -403,6 +427,23 @@ fn get_codec_streaming_engine() -> GetCodecStreamingEngine {
         value if value.eq_ignore_ascii_case(GET_CODEC_STREAMING_ENGINE_LEGACY) => GetCodecStreamingEngine::Legacy,
         _ => GetCodecStreamingEngine::Legacy,
     }
+}
+
+fn get_codec_streaming_rollout() -> GetCodecStreamingRollout {
+    let rollout = rustfs_utils::get_env_str(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT);
+    match rollout.trim() {
+        value if value.eq_ignore_ascii_case("internal") => GetCodecStreamingRollout::Internal,
+        value if value.eq_ignore_ascii_case("benchmark") => GetCodecStreamingRollout::Benchmark,
+        _ => GetCodecStreamingRollout::Off,
+    }
+}
+
+fn is_get_codec_streaming_body_compat_confirmed() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, false)
+}
+
+fn is_get_codec_streaming_header_compat_confirmed() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, false)
 }
 
 fn build_get_codec_streaming_decode_engine(erasure: coding::Erasure) -> std::io::Result<CodecStreamingDecodeEngine> {
@@ -426,8 +467,24 @@ enum GetCodecStreamingDecision {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingRollout {
+    Off,
+    Internal,
+    Benchmark,
+}
+
+impl GetCodecStreamingRollout {
+    const fn is_opted_in(self) -> bool {
+        !matches!(self, Self::Off)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GetCodecStreamingFallbackReason {
     Disabled,
+    RolloutNotOptedIn,
+    BodyCompatibilityUnconfirmed,
+    HeaderCompatibilityUnconfirmed,
     LockOptimizationDisabled,
     Range,
     BelowMinSize,
@@ -436,12 +493,16 @@ enum GetCodecStreamingFallbackReason {
     Remote,
     Multipart,
     InvalidMinSize,
+    ReadQuorumNotSafe,
 }
 
 impl GetCodecStreamingFallbackReason {
     const fn as_str(self) -> &'static str {
         match self {
             Self::Disabled => "disabled",
+            Self::RolloutNotOptedIn => "rollout_not_opted_in",
+            Self::BodyCompatibilityUnconfirmed => "body_compatibility_unconfirmed",
+            Self::HeaderCompatibilityUnconfirmed => "header_compatibility_unconfirmed",
             Self::LockOptimizationDisabled => "lock_optimization_disabled",
             Self::Range => "range",
             Self::BelowMinSize => "below_min_size",
@@ -450,46 +511,166 @@ impl GetCodecStreamingFallbackReason {
             Self::Remote => "remote",
             Self::Multipart => "multipart",
             Self::InvalidMinSize => "invalid_min_size",
+            Self::ReadQuorumNotSafe => "read_quorum_not_safe",
         }
     }
 }
 
-fn get_codec_streaming_reader_decision(
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum GetCodecStreamingObjectClass {
+    PlainSinglePart,
+    Range,
+    Encrypted,
+    Compressed,
+    Remote,
+    Multipart,
+}
+
+impl GetCodecStreamingObjectClass {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PlainSinglePart => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+            Self::Range => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_RANGE,
+            Self::Encrypted => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_ENCRYPTED,
+            Self::Compressed => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_COMPRESSED,
+            Self::Remote => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_REMOTE,
+            Self::Multipart => crate::diagnostics::get::GET_CODEC_STREAMING_OBJECT_CLASS_MULTIPART,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct GetCodecStreamingGate {
+    object_class: GetCodecStreamingObjectClass,
+    decision: GetCodecStreamingDecision,
+}
+
+fn record_get_codec_streaming_gate_decision(
+    object_class: GetCodecStreamingObjectClass,
+    decision: GetCodecStreamingDecision,
+) {
+    let (outcome, reason) = match decision {
+        GetCodecStreamingDecision::Use => (
+            crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_USE,
+            crate::diagnostics::get::GET_CODEC_STREAMING_REASON_NONE,
+        ),
+        GetCodecStreamingDecision::Fallback(reason) => (
+            crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_FALLBACK,
+            reason.as_str(),
+        ),
+    };
+    rustfs_io_metrics::record_get_object_codec_streaming_decision(outcome, object_class.as_str(), reason);
+}
+
+fn classify_get_codec_streaming_object_class(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+) -> GetCodecStreamingObjectClass {
+    if range.is_some() {
+        return GetCodecStreamingObjectClass::Range;
+    }
+    if object_info.is_encrypted() {
+        return GetCodecStreamingObjectClass::Encrypted;
+    }
+    if object_info.is_compressed() {
+        return GetCodecStreamingObjectClass::Compressed;
+    }
+    if object_info.is_remote() {
+        return GetCodecStreamingObjectClass::Remote;
+    }
+    if fi.parts.len() != 1 {
+        return GetCodecStreamingObjectClass::Multipart;
+    }
+    GetCodecStreamingObjectClass::PlainSinglePart
+}
+
+fn get_codec_streaming_reader_gate(
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
     lock_optimization_enabled: bool,
-) -> GetCodecStreamingDecision {
+) -> GetCodecStreamingGate {
+    let object_class = classify_get_codec_streaming_object_class(range, object_info, fi);
+
     if !is_get_codec_streaming_enabled() {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled);
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
+        };
+    }
+    if !get_codec_streaming_rollout().is_opted_in() {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
+        };
+    }
+    if !is_get_codec_streaming_body_compat_confirmed() {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed),
+        };
+    }
+    if !is_get_codec_streaming_header_compat_confirmed() {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed),
+        };
+    }
+    if object_class == GetCodecStreamingObjectClass::Range {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range),
+        };
     }
     if !lock_optimization_enabled {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled);
-    }
-    if range.is_some() {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range);
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled),
+        };
     }
 
     let Ok(min_size) = i64::try_from(get_codec_streaming_min_size()) else {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize);
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
+        };
     };
     if object_info.size < min_size {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize);
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize),
+        };
     }
-    if object_info.is_encrypted() {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted);
+    if object_class == GetCodecStreamingObjectClass::Encrypted {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted),
+        };
     }
-    if object_info.is_compressed() {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed);
+    if object_class == GetCodecStreamingObjectClass::Compressed {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed),
+        };
     }
-    if object_info.is_remote() {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote);
+    if object_class == GetCodecStreamingObjectClass::Remote {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote),
+        };
     }
-    if fi.parts.len() != 1 {
-        return GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart);
+    if object_class == GetCodecStreamingObjectClass::Multipart {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+        };
     }
 
-    GetCodecStreamingDecision::Use
+    GetCodecStreamingGate {
+        object_class,
+        decision: GetCodecStreamingDecision::Use,
+    }
 }
 
 fn is_confirmed_complete_part_missing(err: &str) -> bool {
@@ -1233,10 +1414,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        let codec_streaming_decision = get_codec_streaming_reader_decision(&range, &object_info, &fi, lock_optimization_enabled);
+        let codec_streaming_gate = get_codec_streaming_reader_gate(&range, &object_info, &fi, lock_optimization_enabled);
 
         if object_info.is_remote() {
-            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_decision {
+            if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
+                record_get_codec_streaming_gate_decision(codec_streaming_gate.object_class, codec_streaming_gate.decision);
                 rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
             }
             rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_REMOTE_TRANSITION);
@@ -1267,24 +1449,39 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             read_lock_guard
         };
 
-        match codec_streaming_decision {
+        match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
-                rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_CODEC_STREAMING);
-                let stream = Self::get_object_decode_reader_with_fileinfo(
+                match Self::get_object_decode_reader_with_fileinfo(
                     bucket,
                     object,
-                    fi,
-                    files,
+                    &fi,
+                    &files,
                     &disks,
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
                 )
-                .await?;
-                let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
-                return Ok(reader);
+                .await? {
+                    read::GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
+                        record_get_codec_streaming_gate_decision(
+                            codec_streaming_gate.object_class,
+                            GetCodecStreamingDecision::Use,
+                        );
+                        rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_CODEC_STREAMING);
+                        let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
+                        return Ok(reader);
+                    }
+                    read::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                        record_get_codec_streaming_gate_decision(
+                            codec_streaming_gate.object_class,
+                            GetCodecStreamingDecision::Fallback(reason),
+                        );
+                        rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
+                    }
+                }
             }
             GetCodecStreamingDecision::Fallback(reason) => {
+                record_get_codec_streaming_gate_decision(codec_streaming_gate.object_class, codec_streaming_gate.decision);
                 rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
             }
         }

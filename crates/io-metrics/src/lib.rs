@@ -597,6 +597,25 @@ pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
     counter!("rustfs_io_get_object_codec_streaming_fallback_total", "reason" => reason).increment(1);
 }
 
+/// Record the final codec-streaming rollout decision for a GET request.
+#[inline(always)]
+pub fn record_get_object_codec_streaming_decision(
+    outcome: &'static str,
+    object_class: &'static str,
+    reason: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_codec_streaming_decision_total",
+        "outcome" => outcome,
+        "object_class" => object_class,
+        "reason" => reason
+    )
+    .increment(1);
+}
+
 /// Record one decoded reader stripe processed by a GetObject read path.
 #[inline(always)]
 pub fn record_get_object_reader_stripe(path: &'static str) {
@@ -1568,6 +1587,8 @@ mod tests {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
         record_get_object_reader_path("codec_streaming");
         record_get_object_codec_streaming_fallback("range");
+        record_get_object_codec_streaming_decision("fallback", "range", "range");
+        record_get_object_codec_streaming_decision("use", "plain_single_part", "none");
         record_get_object_reader_stripe("codec_streaming");
         record_get_object_reader_bytes("codec_streaming", 1024);
         record_get_object_reader_buffer("codec_streaming", "output", 1024);
