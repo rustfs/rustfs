@@ -44,6 +44,9 @@ update this plan and the guard in the same reviewed migration PR.
    cover both paths.
 2. Move one remaining consumer group at a time to explicit context or
    owner-local runtime-source handles.
+   - Current handoff: admin config, OIDC config, audit runtime config, and
+     dynamic KMS config storage reads/writes resolve through current
+     AppContext-aware boundaries before using the legacy object-store fallback.
 3. Remove one fallback family per PR only after scans prove no production caller
    depends on it.
 4. Keep embedded startup and tests working before deleting any fallback.

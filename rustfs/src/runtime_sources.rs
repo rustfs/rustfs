@@ -21,11 +21,13 @@ pub(crate) use context::{
     resolve_buffer_config, resolve_daily_tier_stats, resolve_deployment_id, resolve_encryption_service, resolve_endpoints_handle,
     resolve_expiry_state_handle, resolve_iam_handle, resolve_iam_ready, resolve_internode_metrics,
     resolve_kms_runtime_service_manager, resolve_local_node_name, resolve_lock_client, resolve_lock_clients_handle,
-    resolve_notification_system, resolve_notify_interface, resolve_notify_interface_for_context, resolve_object_store_handle,
-    resolve_object_store_handle_for_context, resolve_oidc_handle, resolve_or_init_kms_runtime_service_manager,
-    resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_performance_metrics, resolve_ready_iam_handle,
-    resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_runtime_port, resolve_s3select_db,
-    resolve_scanner_metrics_report, resolve_server_config, resolve_tier_config_handle, resolve_token_signing_key,
+    resolve_notification_system, resolve_notification_system_for_context, resolve_notify_interface,
+    resolve_notify_interface_for_context, resolve_object_store_handle, resolve_object_store_handle_for_context,
+    resolve_oidc_handle, resolve_or_init_kms_runtime_service_manager, resolve_outbound_tls_generation,
+    resolve_outbound_tls_state, resolve_performance_metrics, resolve_ready_iam_handle, resolve_region,
+    resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_runtime_port, resolve_s3select_db,
+    resolve_scanner_metrics_report, resolve_server_config, resolve_server_config_for_context, resolve_tier_config_handle,
+    resolve_token_signing_key,
 };
 
 #[cfg(test)]

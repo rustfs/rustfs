@@ -141,6 +141,13 @@ pub fn resolve_notification_system() -> Option<&'static NotificationSys> {
     resolve_notification_system_with(get_global_app_context(), || default_notification_system_interface().handle())
 }
 
+/// Resolve notification system handle using an explicit AppContext, falling back to the legacy global notification system.
+pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> Option<&'static NotificationSys> {
+    context
+        .and_then(|context| context.notification_system().handle())
+        .or_else(|| default_notification_system_interface().handle())
+}
+
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
@@ -246,6 +253,11 @@ pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
     resolve_server_config_with(get_global_app_context(), || default_server_config_interface().get())
+}
+
+/// Resolve server config using an explicit AppContext, falling back to the legacy global server config.
+pub fn resolve_server_config_for_context(context: Option<&AppContext>) -> Option<Config> {
+    context.map_or_else(|| default_server_config_interface().get(), |context| context.server_config().get())
 }
 
 /// Publish server config using AppContext-first precedence.

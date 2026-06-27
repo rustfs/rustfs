@@ -5,24 +5,24 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-global-runtime-boundary-batch`
+- Branch: `overtrue/arch-global-fallback-removal-batch`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
   from PR #3936, and DOC-001/DOC-002/DOC-003/DOC-004/DOC-005/
-  TEST-DOC-001 from PR #3938, plus GLOB-001/GLOB-002/GLOB-003/GLOB-004/
-  GLOB-005/GLOB-006/CRATE-001/CRATE-002 from PR #3939.
-- Current phase PR: GLOB-006 ECStore runtime facade boundary batch.
-- Based on: `origin/main` after PR #3939 merged.
+  TEST-DOC-001 from PR #3938, GLOB-001/GLOB-002/GLOB-003/GLOB-004/
+  GLOB-005/CRATE-001/CRATE-002 from PR #3939, and GLOB-006 from PR #3941.
+- Current phase PR: GLOB-007 admin runtime context handoff batch.
+- Based on: `origin/main` after PR #3941 merged.
 - PR type for this branch: `ci-gate`.
 - Runtime behavior changes: none intended.
-- Rust code changes: add the selected `rustfs_ecstore::api::runtime` facade and
-  route external crate-local `storage_api` boundaries away from direct
-  `rustfs_ecstore::api::global` imports.
-- CI/script changes: shrink the direct ECStore global facade allowlist to the
-  root storage owner boundary.
+- Rust code changes: add context-aware notification-system and server-config
+  resolution, then route admin config, OIDC config, audit runtime config, and
+  dynamic KMS config storage access through current AppContext-aware resolver
+  boundaries before falling back to legacy globals.
+- CI/script changes: none intended.
 - Docs changes: update the global-state plan and this progress ledger for the
-  runtime facade batch.
+  admin runtime context handoff batch.
 
 ## Phase 0 Tasks
 
@@ -2764,20 +2764,27 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md) to
     record the remaining owner boundaries and fallback removal sequence.
   - Verification: architecture migration guard and diff hygiene.
-- [~] `GLOB-006` Shrink `ecstore::global`.
-  - Current slice: expose selected ECStore runtime-source reads through
+- [x] `GLOB-006` Shrink `ecstore::global`.
+  - Completed slice: expose selected ECStore runtime-source reads through
     `rustfs_ecstore::api::runtime`, migrate heal, IAM, notify, observability,
     Swift, S3 Select, and scanner storage API boundaries away from direct
     `rustfs_ecstore::api::global` imports, and keep the direct global facade
     confined to the root storage owner boundary.
   - Remaining work: move additional ECStore bootstrap/runtime globals behind
-    explicit owner handles where safe; do not remove bootstrap state in this
-    runtime facade PR.
+    explicit owner handles where safe; do not remove bootstrap state until all
+    dependent runtime owners have explicit handles.
   - Verification: focused compile coverage, architecture migration guard, diff
     hygiene, Rust risk scan, and full PR gate.
-- [ ] `GLOB-007` Remove fallbacks.
+- [~] `GLOB-007` Remove fallbacks.
+  - Current slice: move admin config, OIDC config, audit runtime config, and
+    dynamic KMS config storage access paths to current AppContext-aware
+    resolver boundaries, and expose notification-system/server-config
+    resolution for explicit AppContext handoff.
   - Remaining work: remove one fallback family per PR only after scans prove no
-    production caller depends on it.
+    production caller depends on it; this slice keeps the fallback behavior
+    because broader admin/server consumers still use the root resolvers.
+  - Verification: focused RustFS compile, resolver residual scan, formatting,
+    diff hygiene, architecture guard, Rust risk scan, and full PR gate.
 - [~] `CRATE-001/CRATE-002` Evaluate future crate splits.
   - Current slice: record evidence required before `ecstore-erasure` or
     `storage-cluster` split proposals.
@@ -6041,6 +6048,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | GLOB-007 adds AppContext-aware notification-system and server-config resolver boundaries, then routes admin config, OIDC config, audit runtime config, and dynamic KMS config storage access through current AppContext-aware owners before legacy fallbacks. |
+| Migration preservation | pass | Existing admin config reload, OIDC restart detection, audit config writes, and dynamic KMS config load/save behavior stay unchanged because context lookup falls back to the same root object-store, notification, and server-config owners. |
+| Testing/verification | pass | Focused RustFS compile/tests, resolver residual scan, formatting, architecture guard, diff hygiene, Rust risk scan, and full `make pre-pr` passed before PR. |
 | Quality/architecture | pass | GLOB-006 exposes selected ECStore runtime-source reads through `rustfs_ecstore::api::runtime` and removes external crate direct global facade imports while leaving ECStore owner state intact. |
 | Migration preservation | pass | Object-store, bucket-monitor, tier-config, erasure flags, IAM first-node, and local-disk-map reads delegate to the same ECStore runtime/global owners; startup, readiness, IAM/KMS, lock quorum, scanner, heal, Swift, S3 Select, and notification behavior stay unchanged. |
 | Testing/verification | pass | Focused compile, formatting, shell syntax, architecture guard, global facade scan, diff hygiene, Rust risk scan, full `make pre-pr`, and post-rebase focused checks passed before PR. |
@@ -6397,6 +6407,22 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 GLOB-007 current slice:
+  - Branch freshness check: rebased onto `origin/main` after PR #3941 merged.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - Resolver residual scan over migrated admin files: passed.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    unchecked narrow casts, stringly errors, or ad-hoc stdout/stderr.
+  - `cargo check -p rustfs --lib`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `cargo test -p rustfs --lib app::context::tests::resolver_helpers_are_context_first_and_fallback_when_context_is_absent`:
+    passed.
+  - `cargo test -p rustfs --lib admin::service::config`: passed.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed, including 6911 nextest tests passed, 112 skipped,
+    and doctests.
 
 - Issue #660 GLOB-001/GLOB-002/GLOB-003/GLOB-004/GLOB-005/GLOB-006/
   CRATE-001/CRATE-002 current slice:
