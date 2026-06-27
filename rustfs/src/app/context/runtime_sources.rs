@@ -30,7 +30,7 @@ use rustfs_io_metrics::{
     global_metrics::get_global_metrics,
     internode_metrics::{InternodeMetrics, global_internode_metrics},
 };
-use rustfs_kms::{KmsServiceManager, ObjectEncryptionService};
+use rustfs_kms::KmsServiceManager;
 use rustfs_lock::LockClient;
 use rustfs_notify::{EventArgs, NotificationError, notifier_global};
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
@@ -50,10 +50,6 @@ pub fn init_kms_service_manager() -> Arc<KmsServiceManager> {
     rustfs_kms::init_global_kms_service_manager()
 }
 
-pub async fn encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    rustfs_kms::get_global_encryption_service().await
-}
-
 pub fn outbound_tls_generation() -> TlsGeneration {
     load_global_outbound_tls_generation()
 }
@@ -65,14 +61,6 @@ pub fn set_outbound_tls_generation(generation: u64) {
 
 pub async fn outbound_tls_state() -> GlobalPublishedOutboundTlsState {
     load_global_outbound_tls_state().await
-}
-
-pub fn iam_is_ready() -> bool {
-    rustfs_iam::get_global_iam_sys().is_some_and(|sys| sys.is_ready())
-}
-
-pub fn iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    rustfs_iam::get_global_iam_sys()
 }
 
 pub fn ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
