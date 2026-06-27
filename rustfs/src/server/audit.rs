@@ -20,7 +20,7 @@ use tracing::{info, warn};
 static AUDIT_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_AUDIT_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
-    runtime_sources::server_config()
+    runtime_sources::current_server_config()
 }
 
 pub fn refresh_audit_module_enabled() -> bool {

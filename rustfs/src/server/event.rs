@@ -25,7 +25,7 @@ use tracing::{error, info, instrument, warn};
 static NOTIFY_MODULE_ENABLED: AtomicBool = AtomicBool::new(rustfs_config::DEFAULT_NOTIFY_ENABLE);
 
 fn server_config_from_context() -> Option<rustfs_config::server_config::Config> {
-    runtime_sources::server_config()
+    runtime_sources::current_server_config()
 }
 
 pub fn refresh_notify_module_enabled() -> bool {
@@ -117,7 +117,7 @@ fn install_ecstore_event_dispatch_hook() {
             return;
         };
         spawn(async move {
-            runtime_sources::notify_interface().notify(notify_args).await;
+            runtime_sources::current_notify_interface().notify(notify_args).await;
         });
     });
 

@@ -75,11 +75,11 @@ pub(crate) use storage_api::{
     is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found, is_valid_storage_class, load_bucket_metadata,
     new_global_notification_sys, new_object_layer_fn, options_consumer, prewarm_local_disk_id_map, read_config,
     record_replication_proxy, register_event_dispatch_hook, reload_transition_tier_config, replication_queue_current_count,
-    resolve_object_store_handle, rpc_consumer, runtime_sources_consumer, s3_api_consumer, save_config, serialize,
-    set_bucket_metadata, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
-    set_workload_admission_snapshot_provider, shutdown_background_services, table_catalog_path_hash, to_s3s_etag,
-    topology_snapshot_from_endpoint_pools_with_capabilities, try_migrate_bucket_metadata, try_migrate_iam_config,
-    try_migrate_server_config, update_bucket_metadata_config, update_erasure_type, verify_rpc_signature, wrap_reader,
+    rpc_consumer, runtime_sources_consumer, s3_api_consumer, save_config, serialize, set_bucket_metadata, set_global_endpoints,
+    set_global_region, set_global_rustfs_port, set_object_store_resolver, set_workload_admission_snapshot_provider,
+    shutdown_background_services, table_catalog_path_hash, to_s3s_etag, topology_snapshot_from_endpoint_pools_with_capabilities,
+    try_migrate_bucket_metadata, try_migrate_iam_config, try_migrate_server_config, update_bucket_metadata_config,
+    update_erasure_type, verify_rpc_signature, wrap_reader,
 };
 
 #[cfg(test)]

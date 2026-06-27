@@ -1533,7 +1533,7 @@ async fn apply_managed_encryption_material(
     let mut kms_key_candidate = kms_key_id.clone();
     if kms_key_candidate.is_none() {
         // Try to get default key from KMS service (if available)
-        if let Some(service) = runtime_sources::encryption_service().await {
+        if let Some(service) = runtime_sources::current_encryption_service().await {
             kms_key_candidate = service.get_default_key_id().cloned();
         }
     }
@@ -1626,7 +1626,7 @@ async fn apply_managed_decryption_material(
                 .cloned()
                 .unwrap_or_else(|| "AES256".to_string()),
         )
-    } else if let Some(service) = runtime_sources::encryption_service().await {
+    } else if let Some(service) = runtime_sources::current_encryption_service().await {
         // Production mode: use service for metadata parsing
         let parsed = service
             .headers_to_metadata(&normalized_metadata)
@@ -1804,7 +1804,7 @@ impl KmsSseDekProvider {
     }
 
     async fn current_service() -> Option<Arc<rustfs_kms::service::ObjectEncryptionService>> {
-        runtime_sources::encryption_service().await
+        runtime_sources::current_encryption_service().await
     }
 }
 
@@ -2082,7 +2082,7 @@ static GLOBAL_SSE_DEK_PROVIDER: LazyLock<RwLock<Option<Arc<dyn SseDekProvider>>>
 ///     .await?;
 /// ```
 pub async fn get_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
-    if runtime_sources::encryption_service().await.is_some() {
+    if runtime_sources::current_encryption_service().await.is_some() {
         debug!("Using KmsSseDekProvider (KMS configured)");
         return Ok(Arc::new(KmsSseDekProvider::new().await?));
     }
