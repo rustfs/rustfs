@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::{
-    global::global_rustfs_port,
     layout::{
         disks_layout::DisksLayout,
         endpoint::{Endpoint, EndpointType},
     },
+    runtime::global::global_rustfs_port,
 };
 use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_MINIO_CI, ENV_UNSAFE_BYPASS_DISK_CHECK};
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};

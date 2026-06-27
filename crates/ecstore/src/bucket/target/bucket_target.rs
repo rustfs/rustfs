@@ -23,7 +23,9 @@ use std::{
 use time::OffsetDateTime;
 use url::Url;
 
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+const REDACTED_CREDENTIAL: &str = "<redacted>";
+
+#[derive(Deserialize, Serialize, Default, Clone)]
 pub struct Credentials {
     #[serde(rename = "accessKey")]
     pub access_key: String,
@@ -31,6 +33,28 @@ pub struct Credentials {
     pub secret_key: String,
     pub session_token: Option<String>,
     pub expiration: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Credentials {
+    pub fn redacted(&self) -> Self {
+        Self {
+            access_key: self.access_key.clone(),
+            secret_key: String::new(),
+            session_token: None,
+            expiration: self.expiration,
+        }
+    }
+}
+
+impl fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Credentials")
+            .field("access_key", &self.access_key)
+            .field("secret_key", &REDACTED_CREDENTIAL)
+            .field("session_token", &self.session_token.as_ref().map(|_| REDACTED_CREDENTIAL))
+            .field("expiration", &self.expiration)
+            .finish()
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize, Default, Clone)]
@@ -131,7 +155,7 @@ impl fmt::Display for BucketTargetType {
 }
 
 // Define BucketTarget structure
-#[derive(Debug, Deserialize, Serialize, Default, Clone)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 pub struct BucketTarget {
     #[serde(rename = "sourcebucket", default)]
     pub source_bucket: String,
@@ -201,12 +225,52 @@ pub struct BucketTarget {
 }
 
 impl BucketTarget {
+    pub fn redacted_credentials(&self) -> Self {
+        let mut target = self.clone();
+        target.credentials = target.credentials.as_ref().map(Credentials::redacted);
+        target
+    }
+
     pub fn is_empty(self) -> bool {
         self.target_bucket.is_empty() && self.endpoint.is_empty() && self.arn.is_empty()
     }
     pub fn url(&self) -> Result<Url> {
         let scheme = if self.secure { "https" } else { "http" };
         Url::parse(&format!("{}://{}", scheme, self.endpoint)).map_err(Error::other)
+    }
+}
+
+impl fmt::Debug for BucketTarget {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("BucketTarget")
+            .field("source_bucket", &self.source_bucket)
+            .field("endpoint", &self.endpoint)
+            .field("credentials", &self.credentials)
+            .field("target_bucket", &self.target_bucket)
+            .field("secure", &self.secure)
+            .field("path", &self.path)
+            .field("api", &self.api)
+            .field("arn", &self.arn)
+            .field("target_type", &self.target_type)
+            .field("region", &self.region)
+            .field("bandwidth_limit", &self.bandwidth_limit)
+            .field("replication_sync", &self.replication_sync)
+            .field("storage_class", &self.storage_class)
+            .field("skip_tls_verify", &self.skip_tls_verify)
+            .field("has_custom_ca", &!self.ca_cert_pem.trim().is_empty())
+            .field("health_check_duration", &self.health_check_duration)
+            .field("disable_proxy", &self.disable_proxy)
+            .field("reset_before_date", &self.reset_before_date)
+            .field("reset_id", &self.reset_id)
+            .field("total_downtime", &self.total_downtime)
+            .field("last_online", &self.last_online)
+            .field("online", &self.online)
+            .field("latency", &self.latency)
+            .field("deployment_id", &self.deployment_id)
+            .field("edge", &self.edge)
+            .field("edge_sync_before_expiry", &self.edge_sync_before_expiry)
+            .field("offline_count", &self.offline_count)
+            .finish()
     }
 }
 
@@ -224,6 +288,12 @@ pub struct BucketTargets {
 }
 
 impl BucketTargets {
+    pub fn redacted_credentials(&self) -> Self {
+        Self {
+            targets: self.targets.iter().map(BucketTarget::redacted_credentials).collect(),
+        }
+    }
+
     pub fn marshal_msg(&self) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
 
@@ -412,6 +482,52 @@ mod tests {
         assert_eq!(original.online, deserialized.online);
         assert_eq!(original.edge, deserialized.edge);
         assert_eq!(original.offline_count, deserialized.offline_count);
+    }
+
+    #[test]
+    fn test_bucket_target_debug_redacts_credentials() {
+        let target = BucketTarget {
+            credentials: Some(Credentials {
+                access_key: "visible-access-key".to_string(),
+                secret_key: "must-not-leak-secret".to_string(),
+                session_token: Some("must-not-leak-token".to_string()),
+                expiration: None,
+            }),
+            ..Default::default()
+        };
+
+        let debug = format!("{target:?}");
+
+        assert!(debug.contains("visible-access-key"));
+        assert!(!debug.contains("must-not-leak-secret"));
+        assert!(!debug.contains("must-not-leak-token"));
+        assert!(debug.contains(REDACTED_CREDENTIAL));
+    }
+
+    #[test]
+    fn test_bucket_targets_redacted_credentials_removes_secrets() {
+        let targets = BucketTargets {
+            targets: vec![BucketTarget {
+                credentials: Some(Credentials {
+                    access_key: "visible-access-key".to_string(),
+                    secret_key: "must-not-leak-secret".to_string(),
+                    session_token: Some("must-not-leak-token".to_string()),
+                    expiration: None,
+                }),
+                ..Default::default()
+            }],
+        };
+
+        let raw_json = serde_json::to_string(&targets).expect("serialize raw targets");
+        let redacted_json = serde_json::to_string(&targets.redacted_credentials()).expect("serialize redacted targets");
+
+        assert!(raw_json.contains("must-not-leak-secret"));
+        assert!(raw_json.contains("must-not-leak-token"));
+        assert!(redacted_json.contains("visible-access-key"));
+        assert!(!redacted_json.contains("must-not-leak-secret"));
+        assert!(!redacted_json.contains("must-not-leak-token"));
+        assert!(redacted_json.contains(r#""secretKey":"""#));
+        assert!(redacted_json.contains(r#""session_token":null"#));
     }
 
     #[test]

@@ -33,11 +33,11 @@ pub const FORMAT_CONFIG_FILE: &str = "format.json";
 pub const STORAGE_FORMAT_FILE: &str = "xl.meta";
 pub const STORAGE_FORMAT_FILE_BACKUP: &str = "xl.meta.bkp";
 
+use crate::cluster::rpc::RemoteDisk;
+use crate::cluster::rpc::build_internode_data_transport_from_env;
 use crate::disk::disk_store::LocalDiskWrapper;
 use crate::disk::health_state::RuntimeDriveHealthState;
 use crate::disk::local::ScanGuard;
-use crate::rpc::RemoteDisk;
-use crate::rpc::build_internode_data_transport_from_env;
 use bytes::Bytes;
 use endpoint::Endpoint;
 use error::DiskError;
@@ -1170,7 +1170,7 @@ mod tests {
                 cleanup: false,
                 health_check: false,
             },
-            Arc::new(crate::rpc::TcpHttpInternodeDataTransport),
+            Arc::new(crate::cluster::rpc::TcpHttpInternodeDataTransport),
         )
         .await
         .unwrap();

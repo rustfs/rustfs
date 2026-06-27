@@ -977,6 +977,51 @@ pub struct SRMetricsSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SRPeerError {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub name: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub endpoint: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub error: String,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SRPendingOperation {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub operation: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub id: String,
+    #[serde(rename = "pendingPeers", default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_peers: Vec<String>,
+    #[serde(rename = "ackedPeers", default, skip_serializing_if = "Vec::is_empty")]
+    pub acked_peers: Vec<String>,
+    #[serde(
+        rename = "updatedAt",
+        default,
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub updated_at: Option<OffsetDateTime>,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SRRetryStats {
+    #[serde(default)]
+    pub pending: usize,
+    #[serde(default)]
+    pub failed: usize,
+    #[serde(rename = "lastError", default, skip_serializing_if = "String::is_empty")]
+    pub last_error: String,
+    #[serde(rename = "apiVersion", skip_serializing_if = "Option::is_none")]
+    pub api_version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SRStatusInfo {
     #[serde(default)]
     pub enabled: bool,
@@ -1004,6 +1049,12 @@ pub struct SRStatusInfo {
     pub group_stats: BTreeMap<String, BTreeMap<String, SRGroupStatsSummary>>,
     #[serde(rename = "PeerStates", default, skip_serializing_if = "BTreeMap::is_empty")]
     pub peer_states: BTreeMap<String, SRStateInfo>,
+    #[serde(rename = "PeerErrors", default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub peer_errors: BTreeMap<String, SRPeerError>,
+    #[serde(rename = "PendingOperation", default, skip_serializing_if = "Option::is_none")]
+    pub pending_operation: Option<SRPendingOperation>,
+    #[serde(rename = "RetryStats", default, skip_serializing_if = "Option::is_none")]
+    pub retry_stats: Option<SRRetryStats>,
     #[serde(rename = "Metrics", default)]
     pub metrics: SRMetricsSummary,
     #[serde(rename = "ILMExpiryStats", default, skip_serializing_if = "BTreeMap::is_empty")]

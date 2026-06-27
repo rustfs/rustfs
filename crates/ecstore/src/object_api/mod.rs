@@ -16,12 +16,12 @@ use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
-use crate::rio::{HashReader, LimitReader};
+use crate::io_support::rio::{HashReader, LimitReader};
 use crate::storage_api_contracts::{
     lifecycle::{ExpirationOptions, TransitionedObject},
     range::HTTPRangeSpec,
 };
-use crate::store_utils::clean_metadata;
+use crate::store::utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};

@@ -16,7 +16,7 @@ use crate::config::{audit, notify, oidc, storageclass};
 use crate::disk::{MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,
     object::{DeletedObject, EcstoreObjectIO, ObjectIO, ObjectOperations, ObjectToDelete},
@@ -1313,10 +1313,10 @@ mod tests {
     };
     use crate::config::{audit, notify, oidc};
     use crate::disk::endpoint::Endpoint;
-    use crate::endpoints::SetupType;
     use crate::error::{Error, Result};
+    use crate::layout::endpoints::SetupType;
     use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-    use crate::runtime_sources;
+    use crate::runtime::sources as runtime_sources;
     use crate::set_disk::SetDisks;
     use crate::storage_api_contracts::{admin::StorageAdminApi, namespace::NamespaceLocking as _, range::HTTPRangeSpec};
     use http::HeaderMap;

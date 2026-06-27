@@ -23,7 +23,7 @@ use crate::disk::{
     },
     local::{LocalDisk, ScanGuard},
 };
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use bytes::Bytes;
 use metrics::counter;
 use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};

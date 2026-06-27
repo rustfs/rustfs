@@ -21,7 +21,7 @@ use sha2::Sha256;
 use std::collections::HashMap;
 use std::env;
 
-use crate::rio::Index;
+use crate::io_support::rio::Index;
 
 const INTERNAL_ENCRYPTION_KEY_ID_HEADER: &str = "x-rustfs-encryption-key-id";
 const INTERNAL_ENCRYPTION_KEY_HEADER: &str = "x-rustfs-encryption-key";
@@ -123,7 +123,7 @@ fn restore_request_active(opts: &ObjectOptions) -> bool {
 }
 
 fn decode_compression_index(index: Option<&bytes::Bytes>) -> Option<Index> {
-    crate::rio::decode_compression_index_bytes(index?)
+    crate::io_support::rio::decode_compression_index_bytes(index?)
 }
 
 fn get_compressed_offsets(oi: &ObjectInfo, offset: i64) -> (i64, i64, usize, i64, u64) {
@@ -270,7 +270,7 @@ struct EncryptionMaterial {
     key_bytes: [u8; 32],
     base_nonce: [u8; 12],
     key_kind: EncryptionKeyKind,
-    reader_backend: crate::rio::ReadEncryptionBackend,
+    reader_backend: crate::io_support::rio::ReadEncryptionBackend,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -287,7 +287,7 @@ enum ReadTransform {
     },
     Compressed {
         algorithm: CompressionAlgorithm,
-        backend: crate::rio::ReadCompressionBackend,
+        backend: crate::io_support::rio::ReadCompressionBackend,
         decompressed_offset: usize,
         decompressed_length: i64,
         total_plaintext_size: usize,
@@ -301,7 +301,7 @@ enum ReadTransform {
         plaintext_offset: usize,
         plaintext_length: i64,
         total_plaintext_size: usize,
-        compression: Option<(CompressionAlgorithm, crate::rio::ReadCompressionBackend)>,
+        compression: Option<(CompressionAlgorithm, crate::io_support::rio::ReadCompressionBackend)>,
     },
 }
 
@@ -398,7 +398,7 @@ impl ReadPlan {
                 let (requested_offset, requested_length) = rs.get_offset_length(plaintext_size)?;
                 #[cfg(feature = "rio-v2")]
                 {
-                    if encryption_backend == crate::rio::ReadEncryptionBackend::Legacy {
+                    if encryption_backend == crate::io_support::rio::ReadEncryptionBackend::Legacy {
                         (
                             0,
                             oi.size,
@@ -526,7 +526,7 @@ impl ReadPlan {
                 decompressed_length,
                 total_plaintext_size,
             } => {
-                let dec_reader = crate::rio::decompression_reader(reader, algorithm, backend);
+                let dec_reader = crate::io_support::rio::decompression_reader(reader, algorithm, backend);
                 #[cfg(feature = "rio-v2")]
                 let dec_reader = StreamConsumer::new(dec_reader);
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if decompressed_offset > 0
@@ -588,13 +588,13 @@ impl ReadPlan {
                 let _ = sequence_number;
                 let decrypted_reader: Box<dyn AsyncRead + Unpin + Send + Sync> = if is_multipart {
                     match material.key_kind {
-                        EncryptionKeyKind::Object => crate::rio::decrypt_multipart_reader_with_object_key(
+                        EncryptionKeyKind::Object => crate::io_support::rio::decrypt_multipart_reader_with_object_key(
                             reader,
                             material.key_bytes,
                             part_numbers,
                             sequence_number,
                         ),
-                        EncryptionKeyKind::Direct => crate::rio::decrypt_multipart_reader(
+                        EncryptionKeyKind::Direct => crate::io_support::rio::decrypt_multipart_reader(
                             reader,
                             material.key_bytes,
                             material.base_nonce,
@@ -606,9 +606,9 @@ impl ReadPlan {
                 } else {
                     match material.key_kind {
                         EncryptionKeyKind::Object => {
-                            crate::rio::decrypt_reader_with_object_key(reader, material.key_bytes, sequence_number)
+                            crate::io_support::rio::decrypt_reader_with_object_key(reader, material.key_bytes, sequence_number)
                         }
-                        EncryptionKeyKind::Direct => crate::rio::decrypt_reader(
+                        EncryptionKeyKind::Direct => crate::io_support::rio::decrypt_reader(
                             reader,
                             material.key_bytes,
                             material.base_nonce,
@@ -627,7 +627,8 @@ impl ReadPlan {
 
                 let final_reader: Box<dyn AsyncRead + Unpin + Send + Sync> =
                     if let Some((algo, compression_backend)) = compression {
-                        let decompressed_reader = crate::rio::decompression_reader(decrypted_reader, algo, compression_backend);
+                        let decompressed_reader =
+                            crate::io_support::rio::decompression_reader(decrypted_reader, algo, compression_backend);
                         #[cfg(feature = "rio-v2")]
                         let decompressed_reader = StreamConsumer::new(decompressed_reader);
                         if plaintext_offset > 0 || plaintext_length != total_plaintext_size_i64 {
@@ -1276,7 +1277,7 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
             key_bytes: object_key,
             base_nonce: [0u8; 12],
             key_kind: EncryptionKeyKind::Object,
-            reader_backend: crate::rio::ReadEncryptionBackend::V2,
+            reader_backend: crate::io_support::rio::ReadEncryptionBackend::V2,
         });
     }
 
@@ -1284,7 +1285,7 @@ fn resolve_ssec_material(oi: &ObjectInfo, headers: &HeaderMap<HeaderValue>) -> R
         key_bytes,
         base_nonce: generate_ssec_nonce(&oi.bucket, &oi.name),
         key_kind: EncryptionKeyKind::Direct,
-        reader_backend: crate::rio::ReadEncryptionBackend::Legacy,
+        reader_backend: crate::io_support::rio::ReadEncryptionBackend::Legacy,
     })
 }
 
@@ -1308,7 +1309,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
     let kms_context: Option<HashMap<String, String>> = None;
     let object_context = build_object_encryption_context(bucket, object, kms_context.as_ref());
 
-    let decrypted_key = if let Some(service) = crate::runtime_sources::object_encryption_service().await {
+    let decrypted_key = if let Some(service) = crate::runtime::sources::object_encryption_service().await {
         #[cfg(feature = "rio-v2")]
         let data_key = if is_legacy_rustfs_managed_metadata(&normalized_metadata) {
             service.decrypt_legacy_data_key(&encrypted_dek).await
@@ -1331,7 +1332,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
             key_bytes: object_key,
             base_nonce: [0u8; 12],
             key_kind: EncryptionKeyKind::Object,
-            reader_backend: crate::rio::ReadEncryptionBackend::V2,
+            reader_backend: crate::io_support::rio::ReadEncryptionBackend::V2,
         });
     }
 
@@ -1349,7 +1350,7 @@ async fn resolve_managed_material(bucket: &str, object: &str, metadata: &HashMap
         key_bytes: decrypted_key,
         base_nonce,
         key_kind: EncryptionKeyKind::Direct,
-        reader_backend: crate::rio::ReadEncryptionBackend::Legacy,
+        reader_backend: crate::io_support::rio::ReadEncryptionBackend::Legacy,
     })
 }
 
@@ -1932,12 +1933,13 @@ mod tests {
     async fn test_ranged_decompress_reader_with_rio_v2_s2_stream() {
         let plaintext = b"abcdefghijklmnopqrstuvwxyz".to_vec();
         let mut compressed = Vec::new();
-        crate::rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
+        crate::io_support::rio::CompressReader::new(Cursor::new(plaintext.clone()), CompressionAlgorithm::default())
             .read_to_end(&mut compressed)
             .await
             .expect("compress plaintext into rio_v2 stream");
 
-        let decompress_reader = crate::rio::DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
+        let decompress_reader =
+            crate::io_support::rio::DecompressReader::new(Cursor::new(compressed), CompressionAlgorithm::default());
         let mut ranged_reader =
             RangedDecompressReader::new(decompress_reader, 5, 7, plaintext.len()).expect("create ranged reader");
 
@@ -2322,7 +2324,7 @@ mod tests {
             let user_defined = {
                 let object_key = [0x41; 32];
                 let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+                crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
                     .read_to_end(&mut encrypted)
                     .await
                     .expect("encrypt managed object");
@@ -2344,7 +2346,7 @@ mod tests {
             #[cfg(not(feature = "rio-v2"))]
             let user_defined = {
                 let base_nonce = [0x11; 12];
-                crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                     .read_to_end(&mut encrypted)
                     .await
                     .expect("encrypt managed object");
@@ -2399,7 +2401,7 @@ mod tests {
             let user_defined = {
                 let object_key = [0x43; 32];
                 let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+                crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
                     .read_to_end(&mut encrypted)
                     .await
                     .expect("encrypt managed ranged object");
@@ -2421,7 +2423,7 @@ mod tests {
             #[cfg(not(feature = "rio-v2"))]
             let user_defined = {
                 let base_nonce = [0x13; 12];
-                crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                     .read_to_end(&mut encrypted)
                     .await
                     .expect("encrypt managed ranged object");
@@ -2486,7 +2488,7 @@ mod tests {
                 let user_defined = {
                     let object_key = [0x42; 32];
                     let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
-                    crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+                    crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
                         .read_to_end(&mut encrypted)
                         .await
                         .expect("encrypt managed object with local fallback key");
@@ -2508,7 +2510,7 @@ mod tests {
                 #[cfg(not(feature = "rio-v2"))]
                 let user_defined = {
                     let base_nonce = [0x12; 12];
-                    crate::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
+                    crate::io_support::rio::EncryptReader::new(Cursor::new(plaintext.clone()), data_key, base_nonce)
                         .read_to_end(&mut encrypted)
                         .await
                         .expect("encrypt managed object with local fallback key");
@@ -2561,7 +2563,7 @@ mod tests {
             let (sealing_iv, sealed_key) = seal_managed_s3_object_key_for_test(bucket, object, data_key, object_key);
 
             let mut encrypted = Vec::new();
-            crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+            crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
                 .read_to_end(&mut encrypted)
                 .await
                 .expect("encrypt managed object");
@@ -2614,7 +2616,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
-        let mut index = crate::rio::Index::new();
+        let mut index = crate::io_support::rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
 
@@ -2635,7 +2637,7 @@ mod tests {
             ..Default::default()
         };
 
-        let decoded = crate::rio::decode_compression_index_bytes(object_info.parts[0].index.as_ref().unwrap())
+        let decoded = crate::io_support::rio::decode_compression_index_bytes(object_info.parts[0].index.as_ref().unwrap())
             .expect("headerless MinIO-style compression index should decode");
         let (compressed_offset, uncompressed_offset) = decoded.find(2_097_152).expect("seek into decoded index");
         assert!(compressed_offset > 0);
@@ -2668,7 +2670,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_plan_compressed_range_tracks_storage_and_visible_offsets() {
-        let mut index = crate::rio::Index::new();
+        let mut index = crate::io_support::rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
 
@@ -2744,10 +2746,10 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[tokio::test]
     async fn test_read_plan_accepts_minio_headerless_compression_index() {
-        let mut index = crate::rio::Index::new();
+        let mut index = crate::io_support::rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
-        let headerless_index = crate::rio::compression_index_storage_bytes(&index);
+        let headerless_index = crate::io_support::rio::compression_index_storage_bytes(&index);
         assert!(
             !headerless_index.starts_with(&[0x50, 0x2A, 0x4D, 0x18]),
             "rio_v2 should store MinIO-style headerless compression indexes"
@@ -2776,7 +2778,7 @@ mod tests {
             end: 2_097_161,
         };
 
-        let decoded = crate::rio::decode_compression_index_bytes(object_info.parts[0].index.as_ref().unwrap())
+        let decoded = crate::io_support::rio::decode_compression_index_bytes(object_info.parts[0].index.as_ref().unwrap())
             .expect("headerless MinIO-style compression index should decode");
         let (compressed_offset, uncompressed_offset) = decoded.find(range.start).expect("seek into decoded index");
         assert!(compressed_offset > 0);
@@ -2798,11 +2800,11 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[test]
     fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
-        let mut index = crate::rio::Index::new();
+        let mut index = crate::io_support::rio::Index::new();
         index.add(0, 0).unwrap();
         index.add(200_000, 2_097_152).unwrap();
-        let stored_index = crate::rio::compression_index_storage_bytes(&index);
-        let expected_comp_off = crate::rio::decode_compression_index_bytes(&stored_index)
+        let stored_index = crate::io_support::rio::compression_index_storage_bytes(&index);
+        let expected_comp_off = crate::io_support::rio::decode_compression_index_bytes(&stored_index)
             .expect("decode stored index")
             .find(2_097_152)
             .expect("find offset in stored index")
@@ -2823,7 +2825,7 @@ mod tests {
                 ("x-amz-server-side-encryption-customer-original-size".to_string(), "4194304".to_string()),
                 (
                     "x-minio-internal-compression".to_string(),
-                    crate::rio::compression_metadata_value(CompressionAlgorithm::default()),
+                    crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
                 ),
                 ("x-minio-internal-actual-size".to_string(), "4194304".to_string()),
             ])),
@@ -2904,7 +2906,7 @@ mod tests {
         let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+        crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt object with rio-v2 object key");
@@ -3029,7 +3031,7 @@ mod tests {
         let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
+        crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(plaintext.clone()), object_key)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt large ranged object");
@@ -3159,7 +3161,7 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[tokio::test]
     async fn test_get_object_reader_uses_compression_index_for_encrypted_ranges() {
-        use crate::rio::TryGetIndex;
+        use crate::io_support::rio::TryGetIndex;
 
         let plaintext: Vec<u8> = (0..(10 * 1024 * 1024 + 123_456))
             .map(|i| (((i as u64).wrapping_mul(1_103_515_245).wrapping_add(12_345) >> 16) & 0xFF) as u8)
@@ -3169,8 +3171,10 @@ mod tests {
         let bucket = "bucket";
         let object = "compressed-large-object";
         let (sealing_iv, sealed_key) = seal_ssec_object_key_for_test(bucket, object, customer_key, object_key);
-        let mut compressor =
-            crate::rio::CompressReader::with_encrypted_padding(Cursor::new(plaintext.clone()), CompressionAlgorithm::default());
+        let mut compressor = crate::io_support::rio::CompressReader::with_encrypted_padding(
+            Cursor::new(plaintext.clone()),
+            CompressionAlgorithm::default(),
+        );
         let mut compressed = Vec::new();
         compressor
             .read_to_end(&mut compressed)
@@ -3181,9 +3185,9 @@ mod tests {
             .try_get_index()
             .cloned()
             .expect("large rio_v2 encrypted+compressed object should expose a compression index");
-        let stored_index = crate::rio::compression_index_storage_bytes(&index);
-        let decoded_index =
-            crate::rio::decode_compression_index_bytes(&stored_index).expect("decode stored encrypted compression index");
+        let stored_index = crate::io_support::rio::compression_index_storage_bytes(&index);
+        let decoded_index = crate::io_support::rio::decode_compression_index_bytes(&stored_index)
+            .expect("decode stored encrypted compression index");
 
         let range = HTTPRangeSpec {
             is_suffix_length: false,
@@ -3206,7 +3210,7 @@ mod tests {
         assert!(expected_decrypt_skip >= 0);
 
         let mut encrypted = Vec::new();
-        crate::rio::EncryptReader::new_with_object_key(Cursor::new(compressed.clone()), object_key)
+        crate::io_support::rio::EncryptReader::new_with_object_key(Cursor::new(compressed.clone()), object_key)
             .read_to_end(&mut encrypted)
             .await
             .expect("encrypt compressed plaintext");
@@ -3221,7 +3225,7 @@ mod tests {
         assert!(chunk_offset + 4 + chunk_len <= compressed.len());
 
         let mut decrypted_tail = Vec::new();
-        crate::rio::DecryptReader::new_with_object_key_and_sequence(
+        crate::io_support::rio::DecryptReader::new_with_object_key_and_sequence(
             Cursor::new(encrypted[expected_storage_offset..].to_vec()),
             object_key,
             expected_sequence_number,
@@ -3235,7 +3239,7 @@ mod tests {
             "package-aligned decryption plus decrypt_skip must land on the indexed S2 chunk boundary"
         );
 
-        let mut direct_reader = crate::rio::DecompressReader::new(
+        let mut direct_reader = crate::io_support::rio::DecompressReader::new(
             Cursor::new(decrypted_tail[expected_decrypt_skip as usize..].to_vec()),
             CompressionAlgorithm::default(),
         );
@@ -3279,7 +3283,7 @@ mod tests {
                 ),
                 (
                     "x-minio-internal-compression".to_string(),
-                    crate::rio::compression_metadata_value(CompressionAlgorithm::default()),
+                    crate::io_support::rio::compression_metadata_value(CompressionAlgorithm::default()),
                 ),
                 ("x-minio-internal-actual-size".to_string(), plaintext.len().to_string()),
             ])),

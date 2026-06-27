@@ -13,54 +13,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-extern crate core;
-
-mod admin_server_info;
 pub mod api;
-mod batch_processor;
-mod bitrot;
 mod bucket;
 mod cache_value;
 mod cluster;
-mod compress;
 mod config;
+mod core;
 mod data_movement;
-mod data_movement_backpressure;
 mod data_usage;
+mod diagnostics;
 mod disk;
-mod disks_layout;
-mod endpoints;
-mod erasure_codec;
-mod erasure_coding;
+mod erasure;
 mod error;
-mod get_diagnostics;
-mod global;
+mod io_support;
 pub(crate) mod layout;
-mod metrics_realtime;
-mod notification_sys;
 mod object_api;
-mod pools;
-mod rebalance;
-mod rio;
-mod rpc;
-mod runtime_sources;
+mod runtime;
+mod services;
 mod set_disk;
-mod sets;
 mod storage_api_contracts;
 mod store;
-mod store_init;
-mod store_list_objects;
-mod store_utils;
 
 // pub mod checksum;
 mod client;
 mod event;
-mod event_notification;
-#[cfg(test)]
-mod pools_test;
-#[cfg(test)]
-mod store_test;
-mod tier;
 
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use std::sync::Arc;
@@ -70,7 +46,7 @@ pub type WorkloadAdmissionSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapsho
 pub fn set_workload_admission_snapshot_provider(
     provider: WorkloadAdmissionSnapshotProviderRef,
 ) -> std::result::Result<(), WorkloadAdmissionSnapshotProviderRef> {
-    runtime_sources::set_workload_admission_snapshot_provider(provider)
+    runtime::sources::set_workload_admission_snapshot_provider(provider)
 }
 
 #[cfg(test)]
@@ -78,6 +54,6 @@ mod rio_tests {
     #[test]
     fn uses_expected_rio_backend() {
         let expected = if cfg!(feature = "rio-v2") { "rio-v2" } else { "legacy-rio" };
-        assert_eq!(crate::rio::backend_name(), expected);
+        assert_eq!(crate::io_support::rio::backend_name(), expected);
     }
 }

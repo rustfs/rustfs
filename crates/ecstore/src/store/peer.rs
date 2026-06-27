@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::*;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use tracing::{debug, error};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";

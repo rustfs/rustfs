@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::disk::health_state::DriveMembershipSnapshot;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 
 impl SetDisks {
     pub(super) fn format_lock_error(&self, bucket: &str, object: &str, mode: &str, err: &LockResult) -> String {
@@ -417,7 +417,7 @@ impl SetDisks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store_init::save_format_file;
+    use crate::store::init_format::save_format_file;
     use tempfile::TempDir;
     use tokio::sync::RwLock;
 

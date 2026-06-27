@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::error::Error;
-use crate::runtime_sources;
+use crate::runtime::sources as runtime_sources;
 use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
