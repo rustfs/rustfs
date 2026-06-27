@@ -22,6 +22,7 @@ use crate::diagnostics::get::{
 use crate::disk::error::Error as DiskError;
 use crate::erasure::codec::bridge::ErasureDecodeEngine;
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
+use std::collections::VecDeque;
 use std::io;
 use std::io::ErrorKind;
 use std::pin::Pin;
@@ -31,12 +32,55 @@ use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
 use tokio::task::JoinHandle;
 
+const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 1;
+const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
+const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
+
 type FillTask<S, W> = JoinHandle<FillResult<S, W>>;
 
 struct FillResult<S, W> {
     source: S,
     workspace: W,
     result: io::Result<Option<Vec<u8>>>,
+    queued_buffers: VecDeque<Vec<u8>>,
+    deferred_error: Option<io::Error>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FillPolicy {
+    SingleInFlight,
+    DualInFlight,
+}
+
+impl FillPolicy {
+    fn from_env() -> Self {
+        match rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT,
+        ) {
+            2 => Self::DualInFlight,
+            _ => Self::SingleInFlight,
+        }
+    }
+
+    const fn max_inflight(self) -> usize {
+        match self {
+            Self::SingleInFlight => 1,
+            Self::DualInFlight => 2,
+        }
+    }
+
+    const fn additional_queued_buffers(self) -> usize {
+        self.max_inflight().saturating_sub(1)
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::SingleInFlight => FILL_POLICY_SINGLE_INFLIGHT,
+            Self::DualInFlight => FILL_POLICY_DUAL_INFLIGHT,
+        }
+    }
 }
 
 pub(crate) struct ErasureDecodeReader<S, E>
@@ -44,16 +88,18 @@ where
     E: ErasureDecodeEngine,
 {
     metrics_path: &'static str,
+    fill_policy: FillPolicy,
     source: Option<S>,
     engine: E,
     workspace: Option<E::Workspace>,
     output_buf: Vec<u8>,
     output_pos: usize,
-    prefetched_buf: Option<Vec<u8>>,
+    prefetched_bufs: VecDeque<Vec<u8>>,
     prefetch_error: Option<io::Error>,
     prefetch_wait_started_at: Option<Instant>,
+    output_wait_started_at: Option<Instant>,
     remaining: usize,
-    // Bounded lookahead: at most one background stripe read/decode is in flight.
+    // Bounded lookahead controlled by `FillPolicy`.
     fill: Option<FillTask<S, E::Workspace>>,
 }
 
@@ -72,6 +118,16 @@ where
         total_length: usize,
         metrics_path: &'static str,
     ) -> io::Result<Self> {
+        Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, FillPolicy::from_env())
+    }
+
+    fn new_with_fill_policy_inner(
+        source: S,
+        engine: E,
+        total_length: usize,
+        metrics_path: &'static str,
+        fill_policy: FillPolicy,
+    ) -> io::Result<Self> {
         if engine.data_shards() == 0 {
             return Err(io::Error::new(ErrorKind::InvalidInput, "erasure reader requires data shards"));
         }
@@ -84,17 +140,30 @@ where
 
         Ok(Self {
             metrics_path,
+            fill_policy,
             source: Some(source),
             engine,
             workspace: Some(workspace),
             output_buf: Vec::new(),
             output_pos: 0,
-            prefetched_buf: None,
+            prefetched_bufs: VecDeque::new(),
             prefetch_error: None,
             prefetch_wait_started_at: None,
+            output_wait_started_at: None,
             remaining: total_length,
             fill: None,
         })
+    }
+
+    #[cfg(test)]
+    fn new_with_fill_policy(
+        source: S,
+        engine: E,
+        total_length: usize,
+        metrics_path: &'static str,
+        fill_policy: FillPolicy,
+    ) -> io::Result<Self> {
+        Self::new_with_fill_policy_inner(source, engine, total_length, metrics_path, fill_policy)
     }
 
     fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
@@ -109,8 +178,11 @@ where
 
             let engine = self.engine.clone();
             let metrics_path = self.metrics_path;
+            let fill_policy = self.fill_policy;
             let remaining = self.remaining;
             self.fill = Some(tokio::spawn(async move {
+                let mut queued_buffers = VecDeque::new();
+                let mut deferred_error = None;
                 let fill_stage_start = Instant::now();
                 let stripe_read_stage_start = Instant::now();
                 let state = source.read_next_stripe().await;
@@ -126,6 +198,44 @@ where
                     GET_STAGE_DECODE,
                     decode_stage_start.elapsed().as_secs_f64(),
                 );
+                if let Ok(Some(first_buf)) = result.as_ref() {
+                    let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
+                    for _ in 0..fill_policy.additional_queued_buffers() {
+                        if remaining_after_first == 0 {
+                            break;
+                        }
+                        let stripe_read_stage_start = Instant::now();
+                        let state = source.read_next_stripe().await;
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            metrics_path,
+                            GET_STAGE_STRIPE_READ,
+                            stripe_read_stage_start.elapsed().as_secs_f64(),
+                        );
+                        let decode_stage_start = Instant::now();
+                        let queued_result = decode_stripe(metrics_path, &engine, &mut workspace, state, remaining_after_first);
+                        rustfs_io_metrics::record_get_object_stage_duration(
+                            metrics_path,
+                            GET_STAGE_DECODE,
+                            decode_stage_start.elapsed().as_secs_f64(),
+                        );
+                        match queued_result {
+                            Ok(Some(buf)) => {
+                                remaining_after_first = remaining_after_first.saturating_sub(buf.len());
+                                queued_buffers.push_back(buf);
+                            }
+                            Ok(None) => {
+                                if remaining_after_first > 0 {
+                                    deferred_error = Some(DiskError::LessData.into());
+                                }
+                                break;
+                            }
+                            Err(err) => {
+                                deferred_error = Some(err);
+                                break;
+                            }
+                        }
+                    }
+                }
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics_path,
                     GET_STAGE_FILL,
@@ -135,6 +245,8 @@ where
                     source,
                     workspace,
                     result,
+                    queued_buffers,
+                    deferred_error,
                 }
             }));
         }
@@ -148,6 +260,8 @@ where
             source,
             workspace,
             result,
+            queued_buffers,
+            deferred_error,
         } = match fill_result {
             Ok(result) => result,
             Err(err) => {
@@ -159,6 +273,10 @@ where
         self.source = Some(source);
         self.workspace = Some(workspace);
         self.fill = None;
+        if let Some(deferred_error) = deferred_error {
+            self.prefetch_error = Some(deferred_error);
+        }
+        self.prefetched_bufs.extend(queued_buffers);
 
         match result {
             Ok(Some(buf)) => {
@@ -182,7 +300,7 @@ where
     }
 
     fn poll_prefetch(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        if self.prefetched_buf.is_some() || self.prefetch_error.is_some() || self.remaining == 0 {
+        if self.prefetched_bufs.len() >= self.fill_policy.max_inflight() || self.prefetch_error.is_some() || self.remaining == 0 {
             return Poll::Ready(Ok(()));
         }
 
@@ -205,15 +323,47 @@ where
 
         match fill {
             Ok(Some(buf)) => {
-                if self.output_pos < self.output_buf.len() {
-                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_STORED);
-                    rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_PREFETCH, buf.len());
-                    self.prefetched_buf = Some(buf);
+                let output_has_remaining = self.output_pos < self.output_buf.len();
+                let mut queued_count = 0usize;
+                let mut queued_bytes = 0usize;
+
+                if output_has_remaining {
+                    rustfs_io_metrics::record_get_object_fill_completed_before_output_drained(
+                        self.metrics_path,
+                        self.fill_policy.as_str(),
+                    );
+                    queued_bytes += buf.len();
+                    queued_count += 1;
+                    self.prefetched_bufs.push_back(buf);
                 } else {
                     rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_DIRECT);
                     rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, buf.len());
                     self.output_buf = buf;
                     self.output_pos = 0;
+                }
+
+                if !self.prefetched_bufs.is_empty() {
+                    let total_prefetched_bytes = self.prefetched_bufs.iter().map(Vec::len).sum::<usize>();
+                    if total_prefetched_bytes > queued_bytes {
+                        queued_bytes = total_prefetched_bytes;
+                    }
+                    if self.prefetched_bufs.len() > queued_count {
+                        queued_count = self.prefetched_bufs.len();
+                    }
+                }
+                if queued_count > 0 {
+                    rustfs_io_metrics::record_get_object_fill_queued(self.metrics_path, self.fill_policy.as_str(), queued_count);
+                    rustfs_io_metrics::record_get_object_reader_prefetch_bytes(
+                        self.metrics_path,
+                        self.fill_policy.as_str(),
+                        queued_bytes,
+                    );
+                    rustfs_io_metrics::record_get_object_reader_prefetch(self.metrics_path, GET_READER_PREFETCH_STORED);
+                    rustfs_io_metrics::record_get_object_reader_buffer(
+                        self.metrics_path,
+                        GET_READER_BUFFER_PREFETCH,
+                        queued_bytes,
+                    );
                 }
                 Poll::Ready(Ok(()))
             }
@@ -241,6 +391,7 @@ where
 {
     fn drop(&mut self) {
         if let Some(fill) = self.fill.take() {
+            rustfs_io_metrics::record_get_object_fill_cancelled_on_drop(self.metrics_path, self.fill_policy.as_str());
             fill.abort();
         }
     }
@@ -256,7 +407,7 @@ where
     fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         loop {
             if self.output_pos < self.output_buf.len() {
-                if self.prefetched_buf.is_none()
+                if self.prefetched_bufs.len() < self.fill_policy.max_inflight()
                     && self.prefetch_error.is_none()
                     && self.remaining > 0
                     && let Poll::Ready(result) = self.poll_prefetch(cx)
@@ -283,7 +434,7 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            if let Some(next_buf) = self.prefetched_buf.take() {
+            if let Some(next_buf) = self.prefetched_bufs.pop_front() {
                 rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, next_buf.len());
                 self.output_buf = next_buf;
                 self.output_pos = 0;
@@ -298,19 +449,36 @@ where
                 return Poll::Ready(Ok(()));
             }
 
-            ready!(self.poll_prefetch(cx))?;
+            if self.output_wait_started_at.is_none() {
+                self.output_wait_started_at = Some(Instant::now());
+            }
+            let prefetch = ready!(self.poll_prefetch(cx));
+            if let Some(started_at) = self.output_wait_started_at.take() {
+                rustfs_io_metrics::record_get_object_fill_waited_by_output(
+                    self.metrics_path,
+                    self.fill_policy.as_str(),
+                    started_at.elapsed().as_secs_f64(),
+                );
+            }
+            prefetch?;
         }
     }
 }
 
 pub(crate) struct SyncErasureDecodeReader<R> {
     inner: Mutex<R>,
+    metrics_path: &'static str,
 }
 
 impl<R> SyncErasureDecodeReader<R> {
     pub(crate) fn new(inner: R) -> Self {
+        Self::new_with_metrics_path(inner, GET_OBJECT_PATH_CODEC_STREAMING)
+    }
+
+    pub(crate) fn new_with_metrics_path(inner: R, metrics_path: &'static str) -> Self {
         Self {
             inner: Mutex::new(inner),
+            metrics_path,
         }
     }
 }
@@ -324,7 +492,7 @@ where
         let mut inner = match self.inner.lock() {
             Ok(inner) => {
                 rustfs_io_metrics::record_get_object_stage_duration(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    self.metrics_path,
                     GET_STAGE_OUTPUT_LOCK_WAIT,
                     lock_wait_start.elapsed().as_secs_f64(),
                 );
@@ -332,7 +500,7 @@ where
             }
             Err(_) => {
                 rustfs_io_metrics::record_get_object_stage_duration(
-                    GET_OBJECT_PATH_CODEC_STREAMING,
+                    self.metrics_path,
                     GET_STAGE_OUTPUT_LOCK_WAIT,
                     lock_wait_start.elapsed().as_secs_f64(),
                 );
@@ -351,13 +519,9 @@ where
             Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
             Poll::Pending => GET_READER_POLL_PENDING,
         };
-        rustfs_io_metrics::record_get_object_stage_duration(
-            GET_OBJECT_PATH_CODEC_STREAMING,
-            GET_STAGE_OUTPUT_POLL,
-            poll_duration,
-        );
+        rustfs_io_metrics::record_get_object_stage_duration(self.metrics_path, GET_STAGE_OUTPUT_POLL, poll_duration);
         rustfs_io_metrics::record_get_object_reader_poll(
-            GET_OBJECT_PATH_CODEC_STREAMING,
+            self.metrics_path,
             poll_outcome,
             read_buf_remaining_before,
             filled_bytes,
@@ -469,10 +633,13 @@ mod tests {
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
+    use std::future::pending;
     use std::io::Cursor;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use temp_env::with_var;
     use tokio::io::AsyncReadExt;
+    use tokio::sync::Notify;
     use tokio::task::yield_now;
     use tokio::time::{Duration, timeout};
 
@@ -480,6 +647,22 @@ mod tests {
         stripes: VecDeque<StripeReadState>,
         read_quorum: usize,
         read_count: Option<Arc<AtomicUsize>>,
+    }
+
+    struct BlockingSource {
+        started: Arc<Notify>,
+        dropped: Arc<AtomicUsize>,
+        read_quorum: usize,
+    }
+
+    struct BlockingSourceDropGuard {
+        dropped: Arc<AtomicUsize>,
+    }
+
+    impl Drop for BlockingSourceDropGuard {
+        fn drop(&mut self) {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
     }
 
     #[async_trait::async_trait]
@@ -491,6 +674,18 @@ mod tests {
             self.stripes
                 .pop_front()
                 .unwrap_or_else(|| StripeReadState::new(Vec::new(), self.read_quorum))
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ShardStripeSource for BlockingSource {
+        async fn read_next_stripe(&mut self) -> StripeReadState {
+            let _guard = BlockingSourceDropGuard {
+                dropped: Arc::clone(&self.dropped),
+            };
+            self.started.notify_one();
+            pending::<()>().await;
+            StripeReadState::new(Vec::new(), self.read_quorum)
         }
     }
 
@@ -533,7 +728,13 @@ mod tests {
         E: ErasureDecodeEngine + Clone + Send + Sync + 'static,
     {
         let source = source_from_data(erasure, data, missing_indexes);
-        let mut reader = ErasureDecodeReader::new(source, engine, data.len())?;
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )?;
         let mut decoded = Vec::new();
         reader.read_to_end(&mut decoded).await?;
         Ok(decoded)
@@ -542,6 +743,21 @@ mod tests {
     async fn decode_all(erasure: Erasure, data: &[u8], missing_indexes: &[usize]) -> io::Result<Vec<u8>> {
         let engine = LegacyEcDecodeEngine::new(erasure.clone());
         decode_all_with_engine(&erasure, engine, data, missing_indexes).await
+    }
+
+    #[test]
+    fn fill_policy_defaults_to_single_inflight() {
+        with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, None::<&str>, || {
+            assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
+        });
+
+        with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("2"), || {
+            assert_eq!(FillPolicy::from_env(), FillPolicy::DualInFlight);
+        });
+
+        with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("99"), || {
+            assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
+        });
     }
 
     #[tokio::test]
@@ -573,7 +789,14 @@ mod tests {
         let erasure = Erasure::new(4, 2, 32);
         let source = source_from_data(&erasure, &[], &[]);
         let engine = LegacyEcDecodeEngine::new(erasure);
-        let mut reader = ErasureDecodeReader::new(source, engine, 0).expect("empty reader should be constructed");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            0,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("empty reader should be constructed");
         let mut decoded = Vec::new();
 
         let read = reader
@@ -597,6 +820,107 @@ mod tests {
             .expect("reader should reconstruct one missing data shard");
 
         assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_dual_inflight_prefetches_an_extra_stripe() {
+        let erasure = Erasure::new(4, 2, 16);
+        let data = (0..48u8).collect::<Vec<_>>();
+        let read_count = Arc::new(AtomicUsize::new(0));
+        let mut source = source_from_data(&erasure, &data, &[]);
+        source.read_count = Some(Arc::clone(&read_count));
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::DualInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut first_read = [0u8; 1];
+
+        let read = reader.read(&mut first_read).await.expect("first read should succeed");
+
+        assert_eq!(read, 1);
+        timeout(Duration::from_secs(1), async {
+            while read_count.load(Ordering::SeqCst) < 3 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("dual inflight policy should prefetch two future stripes before current output drains");
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_defers_short_read_error_until_buffer_drains() {
+        let erasure = Erasure::new(4, 2, 32);
+        let first_stripe = (0..32u8).collect::<Vec<_>>();
+        let source = VecStripeSource {
+            stripes: VecDeque::from([
+                source_from_data(&erasure, &first_stripe, &[])
+                    .stripes
+                    .pop_front()
+                    .expect("first stripe should exist"),
+                StripeReadState::new(Vec::new(), erasure.data_shards),
+            ]),
+            read_quorum: erasure.data_shards,
+            read_count: None,
+        };
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            first_stripe.len() + 1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        let err = reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect_err("short-read error should surface after buffered output drains");
+
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(decoded, first_stripe);
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_drop_aborts_inflight_fill_task() {
+        let started = Arc::new(Notify::new());
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let source = BlockingSource {
+            started: Arc::clone(&started),
+            dropped: Arc::clone(&dropped),
+            read_quorum: 1,
+        };
+        let engine = LegacyEcDecodeEngine::new(Erasure::new(1, 0, 32));
+        let task = tokio::spawn(async move {
+            let mut reader = ErasureDecodeReader::new_with_fill_policy(
+                source,
+                engine,
+                1,
+                GET_OBJECT_PATH_CODEC_STREAMING,
+                FillPolicy::SingleInFlight,
+            )
+            .expect("reader should be constructed");
+            let mut first_read = [0u8; 1];
+            let _ = reader.read(&mut first_read).await;
+        });
+
+        started.notified().await;
+        task.abort();
+        let _ = task.await;
+
+        timeout(Duration::from_secs(1), async {
+            while dropped.load(Ordering::SeqCst) == 0 {
+                yield_now().await;
+            }
+        })
+        .await
+        .expect("reader drop should abort the in-flight fill task");
     }
 
     #[tokio::test]
@@ -626,7 +950,14 @@ mod tests {
             read_count: None,
         };
         let engine = LegacyEcDecodeEngine::new(erasure);
-        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
         let mut decoded = Vec::new();
 
         let err = reader
@@ -705,7 +1036,14 @@ mod tests {
             Some(GET_OBJECT_PATH_CODEC_STREAMING),
         );
         let engine = LegacyEcDecodeEngine::new(erasure);
-        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
         let mut decoded = Vec::new();
 
         let err = reader
@@ -775,7 +1113,14 @@ mod tests {
             read_count: None,
         };
         let engine = LegacyEcDecodeEngine::new(erasure);
-        let mut reader = ErasureDecodeReader::new(source, engine, 1).expect("reader should be constructed");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            1,
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
         let mut decoded = Vec::new();
 
         let err = reader
@@ -797,7 +1142,14 @@ mod tests {
         let mut source = source_from_data(&erasure, &data, &[]);
         source.read_count = Some(Arc::clone(&read_count));
         let engine = LegacyEcDecodeEngine::new(erasure);
-        let mut reader = ErasureDecodeReader::new(source, engine, data.len()).expect("reader should be constructed");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
         let mut first_read = [0u8; 1];
 
         let read = reader.read(&mut first_read).await.expect("first read should succeed");

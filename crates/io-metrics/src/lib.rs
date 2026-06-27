@@ -624,6 +624,57 @@ pub fn record_get_object_reader_prefetch_wait(path: &'static str, duration_secs:
     histogram!("rustfs_io_get_object_reader_prefetch_wait_seconds", "path" => path).record(duration_secs);
 }
 
+/// Record how many decoded fills were queued ahead of the current output.
+#[inline(always)]
+pub fn record_get_object_fill_queued(path: &'static str, policy: &'static str, queued: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_queued_total", "path" => path, "policy" => policy)
+        .increment(u64::try_from(queued).unwrap_or(u64::MAX));
+    histogram!("rustfs_io_get_object_fill_queued", "path" => path, "policy" => policy).record(usize_to_f64(queued));
+}
+
+/// Record that a fill completed while the current output buffer still had unread bytes.
+#[inline(always)]
+pub fn record_get_object_fill_completed_before_output_drained(path: &'static str, policy: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_completed_before_output_drained_total", "path" => path, "policy" => policy).increment(1);
+}
+
+/// Record how long output polling waited on the fill pipeline.
+#[inline(always)]
+pub fn record_get_object_fill_waited_by_output(path: &'static str, policy: &'static str, duration_secs: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_waited_by_output_total", "path" => path, "policy" => policy).increment(1);
+    histogram!("rustfs_io_get_object_fill_waited_by_output_seconds", "path" => path, "policy" => policy).record(duration_secs);
+}
+
+/// Record that a background fill task was cancelled during reader drop.
+#[inline(always)]
+pub fn record_get_object_fill_cancelled_on_drop(path: &'static str, policy: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_cancelled_on_drop_total", "path" => path, "policy" => policy).increment(1);
+}
+
+/// Record bytes staged into the prefetch queue.
+#[inline(always)]
+pub fn record_get_object_reader_prefetch_bytes(path: &'static str, policy: &'static str, bytes: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!("rustfs_io_get_object_reader_prefetch_bytes_total", "path" => path, "policy" => policy).increment(bytes);
+    histogram!("rustfs_io_get_object_reader_prefetch_bytes", "path" => path, "policy" => policy)
+        .record(usize_to_f64(bytes as usize));
+}
+
 /// Record one underlying shard read attempt for GetObject read-path attribution.
 #[inline(always)]
 pub fn record_get_object_shard_read(
@@ -1488,6 +1539,17 @@ mod tests {
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
 
         assert!(0.005_f64.is_sign_positive());
+    }
+
+    #[test]
+    fn test_record_get_object_fill_metrics() {
+        record_get_object_fill_queued("codec_streaming", "single_inflight", 1);
+        record_get_object_fill_completed_before_output_drained("codec_streaming", "single_inflight");
+        record_get_object_fill_waited_by_output("codec_streaming", "single_inflight", 0.0003);
+        record_get_object_fill_cancelled_on_drop("codec_streaming", "single_inflight");
+        record_get_object_reader_prefetch_bytes("codec_streaming", "single_inflight", 4096);
+
+        assert!(0.0003_f64.is_sign_positive());
     }
 
     #[test]

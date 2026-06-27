@@ -25,6 +25,7 @@ RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=0
 MODE="both"
 CODEC_ENGINES="legacy"
+CODEC_MAX_INFLIGHT=1
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -51,6 +52,7 @@ Purpose:
 Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
   --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
+  --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -138,6 +140,7 @@ parse_args() {
     case "$1" in
       --mode) MODE="$2"; shift 2 ;;
       --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
+      --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -190,6 +193,7 @@ validate_args() {
   [[ -n "$BUCKET" ]] || die "--bucket must not be empty"
   [[ -n "$SIZES" ]] || die "--sizes must not be empty"
   validate_positive_int "$CONCURRENCY" "--concurrency"
+  validate_positive_int "$CODEC_MAX_INFLIGHT" "--codec-max-inflight"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
@@ -301,6 +305,7 @@ compat_object_size=${COMPAT_OBJECT_SIZE}
 rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
 RUSTFS_GET_CODEC_STREAMING_ENGINE=${codec_engine}
+RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
@@ -378,6 +383,7 @@ start_server() {
     export RUSTFS_CONSOLE_ENABLE=false
     export RUSTFS_GET_CODEC_STREAMING_ENABLE="$codec_enabled"
     export RUSTFS_GET_CODEC_STREAMING_ENGINE="$codec_engine"
+    export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
@@ -661,7 +667,7 @@ write_root_compat_summary() {
   local codec_snapshots=()
   local profile snapshot
 
-  [[ -f "$legacy_snapshot" ]] || return
+  [[ -f "$legacy_snapshot" ]] || return 0
 
   for profile in "$@"; do
     [[ "$profile" == legacy ]] && continue
