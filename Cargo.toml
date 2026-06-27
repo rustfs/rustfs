@@ -206,7 +206,7 @@ tokio-postgres = { version = "0.7.18", default-features = false, features = ["ru
 tokio-postgres-rustls = "0.14.0"
 
 # Utilities and Tools
-anyhow = "1.0.103"
+anyhow = "1.0.102"
 arc-swap = "1.9.1"
 astral-tokio-tar = "0.6.3"
 atoi = "3.1.0"
@@ -312,7 +312,7 @@ opentelemetry = { version = "0.32.0" }
 opentelemetry-appender-tracing = { version = "0.32.0", features = ["experimental_span_attributes", "experimental_metadata_attributes"] }
 opentelemetry-otlp = { version = "0.32.0", features = ["gzip-http", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.32.1", features = ["rt-tokio"] }
-opentelemetry-semantic-conventions = { version = "0.32.1", features = ["semconv_experimental"] }
+opentelemetry-semantic-conventions = { version = "0.32.0", features = ["semconv_experimental"] }
 opentelemetry-stdout = { version = "0.32.0" }
 pyroscope = { version = "=2.0.5", features = ["backend-pprof-rs", "backend-jemalloc"] }
 
