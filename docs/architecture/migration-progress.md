@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-global-storage-runtime-consumer-batch`
+- Branch: `overtrue/arch-global-app-runtime-consumer-batch`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -14,18 +14,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   GLOB-005/CRATE-001/CRATE-002 from PR #3939, GLOB-006 from PR #3941,
   the first GLOB-007 admin runtime context handoff from PR #3942, and the
   GLOB-007 admin object-store/notification/server-config consumer batch from
-  PR #3943.
-- Current phase PR: GLOB-007 storage/server runtime facade consumer batch.
-- Based on: `origin/main` after PR #3944 merged.
+  PR #3943, the GLOB-007 admin runtime helper alias batch from PR #3944, and
+  the GLOB-007 storage/server runtime facade consumer batch from PR #3946.
+- Current phase PR: GLOB-007 app runtime facade consumer batch.
+- Based on: `origin/main` after PR #3946 merged.
 - PR type for this branch: `ci-gate`.
 - Runtime behavior changes: none intended.
-- Rust code changes: rename storage and server runtime facade accessors to
-  `current_*`, route storage access, ECFS extension, and node-service RPC
-  object-store lookups through the storage runtime facade, and remove the old
-  storage object-store resolver re-export.
+- Rust code changes: expose app runtime facade aliases as `current_*` and route
+  bucket, admin, object, multipart, select-object, and lifecycle test
+  consumers through those names while keeping the underlying root resolvers and
+  fallback behavior unchanged.
 - CI/script changes: none intended.
-- Docs changes: update this progress ledger for the storage/server runtime
-  facade consumer batch.
+- Docs changes: update this progress ledger for the app runtime facade consumer
+  batch.
 
 ## Phase 0 Tasks
 
@@ -2793,6 +2794,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   - Current slice: route storage and server runtime consumers through
     `current_*` facade helpers, remove the old storage object-store resolver
     re-export, and keep all resolver fallback behavior unchanged.
+  - Current slice: expose app runtime-source facade reads as `current_*`
+    aliases and move app bucket/admin/object/multipart/select-object consumers
+    plus the lifecycle transition test off direct resolver names.
   - Remaining work: remove one fallback family per PR only after scans prove no
     production caller depends on it; this slice keeps the fallback behavior
     because broader app/storage/server consumers still use the root resolvers.
@@ -6062,6 +6066,9 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | GLOB-007 exposes app runtime-source facade reads as `current_*` aliases and moves bucket, admin, object, multipart, select-object, and lifecycle test consumers off direct resolver names. |
+| Migration preservation | pass | The aliases delegate to the same root runtime resolvers, so AppContext object-store selection, notification dispatch, expiry/tier handles, endpoint snapshots, encryption service, and S3 Select DB behavior stay unchanged. |
+| Testing/verification | pass | Focused RustFS compile, formatting, architecture guard, app resolver residual scan, diff hygiene, and diff-added Rust risk scan are required before the full PR gate. |
 | Quality/architecture | pass | GLOB-007 renames storage and server runtime-source facade reads to `current_*`, moves remaining storage access/ECFS extension/RPC node-service object-store lookups behind the storage runtime facade, and removes the old storage object-store resolver re-export. |
 | Migration preservation | pass | The facade helpers still delegate to the same root runtime resolvers, so storage authorization, ECFS validation, decommission RPC, server readiness, audit, event, layer, and module-switch behavior stays unchanged. |
 | Testing/verification | pass | Focused compile, formatting, architecture guard, diff hygiene, storage/server resolver residual scan, and diff-added Rust risk scan are required before the full PR gate. |
@@ -6430,6 +6437,20 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Verification Notes
 
 Passed before push:
+
+- Issue #660 GLOB-007 app runtime facade consumer slice:
+  - Branch freshness check: rebased onto `origin/main` after PR #3946 merged.
+  - `cargo check -p rustfs --lib`: passed.
+  - `cargo fmt --all`: passed.
+  - `cargo fmt --all --check`: passed.
+  - `git diff --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - App runtime resolver residual scan: passed.
+  - Diff-added Rust risk scan: passed; no new production unwrap/expect,
+    panic/todo/dbg, or ad-hoc stdout/stderr.
+  - Three-expert review: passed.
+  - `make pre-pr`: passed, including 6912 nextest tests passed, 112 skipped,
+    and doctests.
 
 - Issue #660 GLOB-007 storage/server runtime facade consumer slice:
   - Branch freshness check: rebased onto `origin/main` after PR #3944 merged.

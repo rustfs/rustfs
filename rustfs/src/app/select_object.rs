@@ -2,7 +2,7 @@ use super::storage_api::select_object::contract::object::ObjectOperations as _;
 use super::storage_api::select_object::options::get_opts;
 use super::storage_api::select_object::request_context::spawn_traced;
 use super::storage_api::select_object::{get_validated_store, validate_sse_headers_for_read, validate_ssec_for_read};
-use crate::app::runtime_sources::resolve_s3select_db;
+use crate::app::runtime_sources::current_s3select_db;
 use crate::error::ApiError;
 use bytes::Bytes;
 use datafusion::arrow::{
@@ -60,7 +60,7 @@ pub async fn execute_select_object_content(
     validate_scan_range_for_object_size(&input.request, metadata.size)?;
 
     let input = Arc::new(input);
-    let db = resolve_s3select_db((*input).clone(), false)
+    let db = current_s3select_db((*input).clone(), false)
         .await
         .map_err(map_query_error_to_s3)?;
     let query = Query::new(Context { input: input.clone() }, input.request.expression.clone());

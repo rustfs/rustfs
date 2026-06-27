@@ -25,7 +25,7 @@ use super::storage_api::admin_usecase::data_usage::{
 };
 use super::storage_api::admin_usecase::{ECStore, EndpointServerPools};
 use crate::app::runtime_sources::{
-    AppContext, current_app_context, resolve_endpoints_handle, resolve_object_store_handle_for_context,
+    AppContext, current_app_context, current_endpoints_handle, current_object_store_handle_for_context,
 };
 use crate::capacity::resolve_admin_used_capacity;
 use crate::cluster_snapshot::{
@@ -196,7 +196,7 @@ impl DefaultAdminUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     fn app_error(code: S3ErrorCode, message: impl Into<String>) -> ApiError {
@@ -583,7 +583,7 @@ impl DefaultAdminUsecase {
 
     pub async fn execute_collect_dependency_readiness(&self) -> DependencyReadiness {
         let report = collect_runtime_dependency_readiness_report().await;
-        if let Some(endpoint_pools) = resolve_endpoints_handle() {
+        if let Some(endpoint_pools) = current_endpoints_handle() {
             let runtime_status = ClusterRuntimeStatusSnapshot::from_readiness_report(report);
             return cluster_read_only_snapshot_from_endpoint_pools(&endpoint_pools, runtime_status)
                 .runtime_status
@@ -593,7 +593,7 @@ impl DefaultAdminUsecase {
     }
 
     pub async fn execute_collect_cluster_read_only_snapshot(&self) -> Option<ClusterReadOnlySnapshot> {
-        let endpoint_pools = resolve_endpoints_handle()?;
+        let endpoint_pools = current_endpoints_handle()?;
         collect_cluster_read_only_snapshot(&endpoint_pools).await
     }
 

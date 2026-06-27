@@ -90,8 +90,8 @@ use super::storage_api::object_usecase::{
     validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
-    AppContext, current_app_context, resolve_expiry_state_handle, resolve_notify_interface_for_context,
-    resolve_object_store_handle_for_context,
+    AppContext, current_app_context, current_expiry_state_handle, current_notify_interface_for_context,
+    current_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -376,7 +376,7 @@ async fn enqueue_transitioned_delete_cleanup(
 
     tier_delete_journal::persist_tier_delete_journal_entry(store, &je).await?;
 
-    let expiry_state = resolve_expiry_state_handle();
+    let expiry_state = current_expiry_state_handle();
     let mut expiry_state = expiry_state.write().await;
     if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
         warn!(
@@ -1845,7 +1845,7 @@ impl DefaultObjectUsecase {
     }
 
     fn object_store(&self) -> Option<Arc<ECStore>> {
-        resolve_object_store_handle_for_context(self.context.as_deref())
+        current_object_store_handle_for_context(self.context.as_deref())
     }
 
     fn base_buffer_size(&self) -> usize {
@@ -4313,7 +4313,7 @@ impl DefaultObjectUsecase {
         }
 
         let req_headers = req.headers.clone();
-        let notify = resolve_notify_interface_for_context(self.context.as_deref());
+        let notify = current_notify_interface_for_context(self.context.as_deref());
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let deleted_any = delete_results.iter().any(|result| result.delete_object.is_some());
         let notify_bucket = bucket.clone();
@@ -5318,7 +5318,7 @@ impl DefaultObjectUsecase {
             None => String::new(),
         };
 
-        let notify = resolve_notify_interface_for_context(self.context.as_deref());
+        let notify = current_notify_interface_for_context(self.context.as_deref());
         let req_params = extract_params_header(&req.headers);
         let host = get_request_host(&req.headers);
         let port = get_request_port(&req.headers);
