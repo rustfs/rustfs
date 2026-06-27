@@ -102,12 +102,12 @@ pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<Object
 
 /// Resolve token signing key using AppContext-first precedence.
 pub fn resolve_token_signing_key() -> Option<String> {
-    resolve_token_signing_key_with(get_global_app_context(), runtime_sources::token_signing_key)
+    resolve_token_signing_key_with(get_global_app_context(), || None)
 }
 
 /// Resolve bucket metadata handle using AppContext-first precedence.
 pub fn resolve_bucket_metadata_handle() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    resolve_bucket_metadata_handle_with(get_global_app_context(), || default_bucket_metadata_interface().handle())
+    resolve_bucket_metadata_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve object store handle using AppContext-first precedence.
@@ -146,27 +146,27 @@ pub fn resolve_notification_system_for_context(context: Option<&AppContext>) -> 
 
 /// Resolve endpoints using AppContext-first precedence.
 pub fn resolve_endpoints_handle() -> Option<EndpointServerPools> {
-    resolve_endpoints_handle_with(get_global_app_context(), || default_endpoints_interface().handle())
+    resolve_endpoints_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve bucket bandwidth monitor using AppContext-first precedence.
 pub fn resolve_bucket_monitor_handle() -> Option<Arc<BucketBandwidthMonitor>> {
-    resolve_bucket_monitor_handle_with(get_global_app_context(), || default_bucket_monitor_interface().handle())
+    resolve_bucket_monitor_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve replication pool handle using AppContext-first precedence.
 pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
-    resolve_replication_pool_handle_with(get_global_app_context(), || default_replication_pool_interface().handle())
+    resolve_replication_pool_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve replication statistics handle using AppContext-first precedence.
 pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
-    resolve_replication_stats_handle_with(get_global_app_context(), || default_replication_stats_interface().handle())
+    resolve_replication_stats_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve boot time using AppContext-first precedence.
 pub fn resolve_boot_time() -> Option<SystemTime> {
-    resolve_boot_time_with(get_global_app_context(), || default_boot_time_interface().get())
+    resolve_boot_time_with(get_global_app_context(), || None)
 }
 
 /// Resolve daily tier transition statistics using AppContext-first precedence.
@@ -182,7 +182,7 @@ pub async fn resolve_scanner_metrics_report() -> ScannerMetricsReport {
 
 /// Resolve deployment identity using AppContext-first precedence.
 pub fn resolve_deployment_id() -> Option<String> {
-    resolve_deployment_id_with(get_global_app_context(), || default_deployment_id_interface().get())
+    resolve_deployment_id_with(get_global_app_context(), || None)
 }
 
 /// Resolve runtime port using AppContext-first precedence.
@@ -192,12 +192,12 @@ pub fn resolve_runtime_port() -> u16 {
 
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
-    resolve_lock_client_with(get_global_app_context(), || default_lock_client_interface().handle())
+    resolve_lock_client_with(get_global_app_context(), || None)
 }
 
 /// Resolve lock clients using AppContext-first precedence.
 pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    resolve_lock_clients_handle_with(get_global_app_context(), || default_lock_clients_interface().handle())
+    resolve_lock_clients_handle_with(get_global_app_context(), || None)
 }
 
 /// Resolve performance metrics using AppContext-first precedence.
@@ -233,7 +233,7 @@ pub fn resolve_action_credentials() -> Option<Credentials> {
 
 /// Resolve region using AppContext-first precedence.
 pub fn resolve_region() -> Option<s3s::region::Region> {
-    resolve_region_with(get_global_app_context(), || default_region_interface().get())
+    resolve_region_with(get_global_app_context(), || None)
 }
 
 /// Resolve tier config handle using AppContext-first precedence.
@@ -355,19 +355,18 @@ fn resolve_ready_iam_handle_with(
     fallback()
 }
 
-fn resolve_token_signing_key_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<String>) -> Option<String> {
-    context
-        .and_then(|context| context.iam().token_signing_key())
-        .or_else(fallback)
+fn resolve_token_signing_key_with(
+    context: Option<Arc<AppContext>>,
+    _fallback: impl FnOnce() -> Option<String>,
+) -> Option<String> {
+    context.and_then(|context| context.iam().token_signing_key())
 }
 
 fn resolve_bucket_metadata_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<RwLock<BucketMetadataSys>>>,
+    _fallback: impl FnOnce() -> Option<Arc<RwLock<BucketMetadataSys>>>,
 ) -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    context
-        .and_then(|context| context.bucket_metadata().handle())
-        .or_else(fallback)
+    context.and_then(|context| context.bucket_metadata().handle())
 }
 
 fn resolve_notification_system_with(
@@ -379,33 +378,30 @@ fn resolve_notification_system_with(
 
 fn resolve_bucket_monitor_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<BucketBandwidthMonitor>>,
+    _fallback: impl FnOnce() -> Option<Arc<BucketBandwidthMonitor>>,
 ) -> Option<Arc<BucketBandwidthMonitor>> {
-    context
-        .and_then(|context| context.bucket_monitor().handle())
-        .or_else(fallback)
+    context.and_then(|context| context.bucket_monitor().handle())
 }
 
 fn resolve_replication_pool_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<DynReplicationPool>>,
+    _fallback: impl FnOnce() -> Option<Arc<DynReplicationPool>>,
 ) -> Option<Arc<DynReplicationPool>> {
-    context
-        .and_then(|context| context.replication_pool().handle())
-        .or_else(fallback)
+    context.and_then(|context| context.replication_pool().handle())
 }
 
 fn resolve_replication_stats_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<ReplicationStats>>,
+    _fallback: impl FnOnce() -> Option<Arc<ReplicationStats>>,
 ) -> Option<Arc<ReplicationStats>> {
-    context
-        .and_then(|context| context.replication_stats().handle())
-        .or_else(fallback)
+    context.and_then(|context| context.replication_stats().handle())
 }
 
-fn resolve_boot_time_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<SystemTime>) -> Option<SystemTime> {
-    context.and_then(|context| context.boot_time().get()).or_else(fallback)
+fn resolve_boot_time_with(
+    context: Option<Arc<AppContext>>,
+    _fallback: impl FnOnce() -> Option<SystemTime>,
+) -> Option<SystemTime> {
+    context.and_then(|context| context.boot_time().get())
 }
 
 fn resolve_daily_tier_stats_with(
@@ -437,13 +433,13 @@ fn resolve_object_store_handle_with(
 
 fn resolve_endpoints_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<EndpointServerPools>,
+    _fallback: impl FnOnce() -> Option<EndpointServerPools>,
 ) -> Option<EndpointServerPools> {
-    context.and_then(|context| context.endpoints().handle()).or_else(fallback)
+    context.and_then(|context| context.endpoints().handle())
 }
 
-fn resolve_deployment_id_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> Option<String>) -> Option<String> {
-    context.and_then(|context| context.deployment_id().get()).or_else(fallback)
+fn resolve_deployment_id_with(context: Option<Arc<AppContext>>, _fallback: impl FnOnce() -> Option<String>) -> Option<String> {
+    context.and_then(|context| context.deployment_id().get())
 }
 
 fn resolve_runtime_port_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> u16) -> u16 {
@@ -452,16 +448,16 @@ fn resolve_runtime_port_with(context: Option<Arc<AppContext>>, fallback: impl Fn
 
 fn resolve_lock_client_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<dyn LockClient>>,
+    _fallback: impl FnOnce() -> Option<Arc<dyn LockClient>>,
 ) -> Option<Arc<dyn LockClient>> {
-    context.and_then(|context| context.lock_client().handle()).or_else(fallback)
+    context.and_then(|context| context.lock_client().handle())
 }
 
 fn resolve_lock_clients_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
+    _fallback: impl FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
 ) -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    context.and_then(|context| context.lock_clients().handle()).or_else(fallback)
+    context.and_then(|context| context.lock_clients().handle())
 }
 
 fn resolve_performance_metrics_with(
@@ -518,9 +514,9 @@ fn resolve_action_credentials_with(
 
 fn resolve_region_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<s3s::region::Region>,
+    _fallback: impl FnOnce() -> Option<s3s::region::Region>,
 ) -> Option<s3s::region::Region> {
-    context.map(|context| context.region().get()).unwrap_or_else(fallback)
+    context.and_then(|context| context.region().get())
 }
 
 fn resolve_tier_config_handle_with(
@@ -1306,21 +1302,14 @@ mod tests {
         assert!(!resolve_iam_ready_with(None, || false));
         assert!(resolve_iam_handle_with(None, || None).is_none());
         assert!(resolve_oidc_handle_with(None).is_none());
+        assert!(resolve_token_signing_key_with(None, || Some(fallback_token_signing_key.clone())).is_none());
         assert!(!publish_oidc_handle_with(None, context_oidc));
-        assert!(Arc::ptr_eq(
-            &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
-            &bucket_metadata
-        ));
+        assert!(resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).is_none());
+        assert!(resolve_bucket_monitor_handle_with(None, || default_bucket_monitor_interface().handle()).is_none());
+        assert!(resolve_replication_pool_handle_with(None, || default_replication_pool_interface().handle()).is_none());
         assert!(resolve_object_store_handle_with(None, || Some(object_store.clone())).is_none());
-        assert!(Arc::ptr_eq(
-            &resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone()))
-                .expect("fallback replication stats"),
-            &fallback_replication_stats
-        ));
-        assert_eq!(
-            resolve_boot_time_with(None, || Some(fallback_boot_time)).expect("fallback boot time"),
-            fallback_boot_time
-        );
+        assert!(resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone())).is_none());
+        assert!(resolve_boot_time_with(None, || Some(fallback_boot_time)).is_none());
         assert!(resolve_daily_tier_stats_with(None, || fallback_daily_tier_stats.clone()).contains_key("FALLBACK"));
         assert_eq!(
             resolve_scanner_metrics_report_with(None, || async { fallback_scanner_metrics.clone() })
@@ -1328,29 +1317,11 @@ mod tests {
                 .current_cycle,
             fallback_scanner_metrics.current_cycle
         );
-        assert_eq!(
-            resolve_endpoints_handle_with(None, || Some(endpoints.clone()))
-                .expect("fallback endpoints")
-                .as_ref()[0]
-                .drives_per_set,
-            endpoints.as_ref()[0].drives_per_set
-        );
-        assert_eq!(
-            resolve_deployment_id_with(None, || Some(fallback_deployment_id.clone())).expect("fallback deployment id"),
-            fallback_deployment_id
-        );
+        assert!(resolve_endpoints_handle_with(None, || Some(endpoints.clone())).is_none());
+        assert!(resolve_deployment_id_with(None, || Some(fallback_deployment_id.clone())).is_none());
         assert_eq!(resolve_runtime_port_with(None, || fallback_runtime_port), fallback_runtime_port);
-        assert!(Arc::ptr_eq(
-            &resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).expect("fallback lock client"),
-            &fallback_lock_client
-        ));
-        assert!(Arc::ptr_eq(
-            resolve_lock_clients_handle_with(None, || Some(fallback_lock_clients.clone()))
-                .expect("fallback lock clients")
-                .get("fallback-node:9000")
-                .expect("fallback lock client entry"),
-            &fallback_lock_client
-        ));
+        assert!(resolve_lock_client_with(None, || Some(fallback_lock_client.clone())).is_none());
+        assert!(resolve_lock_clients_handle_with(None, || Some(fallback_lock_clients.clone())).is_none());
         assert!(Arc::ptr_eq(
             &resolve_performance_metrics_with(None, || fallback_performance_metrics.clone()),
             &fallback_performance_metrics
@@ -1377,10 +1348,7 @@ mod tests {
                 .access_key,
             fallback_credentials.access_key
         );
-        assert_eq!(
-            resolve_region_with(None, || Some(fallback_region.clone())).expect("fallback region"),
-            fallback_region
-        );
+        assert!(resolve_region_with(None, || Some(fallback_region.clone())).is_none());
         assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
         assert!(Arc::ptr_eq(
             &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
