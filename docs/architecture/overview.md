@@ -35,6 +35,9 @@ hot-path behavior must not drift during this migration.
   future read-only BackgroundController work.
 - [`crate-boundaries.md`](crate-boundaries.md): PR types, crate direction,
   compatibility rules, and migration guardrails.
+- [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md): late
+  global-state cleanup, runtime-source boundaries, fallback removal rules, and
+  crate-split evaluation criteria.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
   current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
   migration risks, and do-not-change contract.
