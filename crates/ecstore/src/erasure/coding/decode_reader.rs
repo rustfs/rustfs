@@ -758,9 +758,9 @@ mod tests {
     }
 
     #[test]
-    fn fill_policy_defaults_to_single_inflight() {
+    fn fill_policy_defaults_to_dual_inflight() {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, None::<&str>, || {
-            assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
+            assert_eq!(FillPolicy::from_env(), FillPolicy::DualInFlight);
         });
 
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("2"), || {
