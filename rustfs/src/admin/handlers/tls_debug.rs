@@ -14,7 +14,7 @@
 
 use super::profile::authorize_profile_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::resolve_outbound_tls_state;
+use crate::admin::runtime_sources::current_outbound_tls_state;
 use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
 use http::{HeaderMap, HeaderValue};
@@ -45,7 +45,7 @@ impl Operation for TlsStatusHandler {
         authorize_profile_request(&req).await?;
 
         let tls_path = rustfs_utils::get_env_opt_str(rustfs_config::ENV_RUSTFS_TLS_PATH).unwrap_or_default();
-        let outbound = resolve_outbound_tls_state().await;
+        let outbound = current_outbound_tls_state().await;
         let generation = outbound.generation.0;
         let has_root_ca = outbound.root_ca_pem.as_ref().is_some_and(|pem| !pem.is_empty());
         let has_mtls_identity = outbound.mtls_identity.is_some();

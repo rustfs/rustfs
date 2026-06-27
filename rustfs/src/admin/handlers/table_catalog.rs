@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::default_admin_usecase;
-use crate::admin::runtime_sources::{current_object_store_handle, resolve_token_signing_key};
+use crate::admin::runtime_sources::{current_object_store_handle, current_token_signing_key};
 use crate::admin::storage_api::bucket::{metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::{
@@ -709,13 +709,13 @@ impl TableCredentialIssuer for IamTableCredentialIssuer {
             serde_json::Value::String(request.scope_prefix.clone()),
         );
 
-        let secret = resolve_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
+        let secret = current_token_signing_key().ok_or_else(|| s3_error!(InternalError, "token signing key not initialized"))?;
         let mut credential = get_new_credentials_with_metadata(&claims, &secret)
             .map_err(|err| s3_error!(InternalError, "failed to generate table credentials: {}", err))?;
         bind_table_credential_parent(&mut credential, principal);
 
         let iam_store =
-            crate::admin::runtime_sources::resolve_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
+            crate::admin::runtime_sources::current_ready_iam_handle().map_err(|_| s3_error!(InternalError, "iam not init"))?;
         iam_store
             .set_temp_user(&credential.access_key, &credential, None)
             .await

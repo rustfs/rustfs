@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::router::Operation;
-use crate::admin::runtime_sources::resolve_endpoints_handle;
+use crate::admin::runtime_sources::current_endpoints_handle;
 use crate::admin::storage_api::runtime::PeerRestClient;
 use http::StatusCode;
 use hyper::Uri;
@@ -40,7 +40,7 @@ impl Operation for Trace {
         let _trace_opts = extract_trace_options(&req.uri)?;
 
         // let (tx, rx) = mpsc::channel(10000);
-        let _peers = match resolve_endpoints_handle() {
+        let _peers = match current_endpoints_handle() {
             Some(ep) => PeerRestClient::new_clients(ep.clone()).await,
             None => (Vec::new(), Vec::new()),
         };

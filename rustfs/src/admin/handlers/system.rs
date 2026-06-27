@@ -16,7 +16,7 @@ use super::{cluster_snapshot, metrics};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    DefaultAdminUsecase, QueryServerInfoRequest, default_admin_usecase, resolve_endpoints_handle,
+    DefaultAdminUsecase, QueryServerInfoRequest, current_endpoints_handle, default_admin_usecase,
 };
 use crate::admin::storage_api::cluster::{
     CapabilityState, CapabilityStatus, ObservabilitySnapshotProvider, TopologySnapshot, TopologySnapshotProvider,
@@ -314,7 +314,7 @@ pub(crate) async fn build_runtime_capabilities_response()
     let workload_admission = workload_admission_registry_snapshot();
     let cluster_snapshot_discovery = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
 
-    let (topology, topology_status) = if let Some(endpoint_pools) = resolve_endpoints_handle() {
+    let (topology, topology_status) = if let Some(endpoint_pools) = current_endpoints_handle() {
         let topology_provider = EndpointTopologySnapshotProvider::new(endpoint_pools);
         let topology = topology_provider.topology_snapshot().await?;
         (Some(topology), CapabilityStatus::supported())

@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     admin::runtime_sources::{
-        AdminPoolStatus, QueryPoolStatusRequest, current_notification_system, current_object_store_handle, default_admin_usecase,
-        resolve_endpoints_handle,
+        AdminPoolStatus, QueryPoolStatusRequest, current_endpoints_handle, current_notification_system,
+        current_object_store_handle, default_admin_usecase,
     },
     admin::{
         auth::validate_admin_request,
@@ -214,7 +214,7 @@ macro_rules! log_pool_response_emitted {
 }
 
 fn endpoints_from_context() -> Option<crate::admin::storage_api::runtime::EndpointServerPools> {
-    resolve_endpoints_handle()
+    current_endpoints_handle()
 }
 
 fn validate_start_decommission_guards(decommission_running: bool, rebalance_running: bool) -> s3s::S3Result<()> {

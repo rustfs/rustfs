@@ -14,7 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_object_store_handle, resolve_action_credentials};
+use crate::admin::runtime_sources::{current_action_credentials, current_object_store_handle};
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -70,7 +70,7 @@ impl Operation for AccountInfoHandler {
 
         let (cred, owner) = authenticate_request(&req.headers, &req.uri, &input_cred).await?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -145,7 +145,7 @@ impl Operation for AccountInfoHandler {
             cred.access_key.clone()
         };
 
-        let Some(admin_cred) = resolve_action_credentials() else {
+        let Some(admin_cred) = current_action_credentials() else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InternalError,
                 "action credentials are not initialized".to_string(),

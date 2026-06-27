@@ -20,7 +20,7 @@ use crate::admin::storage_api::tier::{
 };
 use crate::{
     admin::runtime_sources::{
-        current_notification_system, current_object_store_handle, resolve_daily_tier_stats, resolve_tier_config_handle,
+        current_daily_tier_stats, current_notification_system, current_object_store_handle, current_tier_config_handle,
     },
     admin::{
         auth::validate_admin_request,
@@ -297,7 +297,7 @@ impl Operation for AddTier {
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -444,7 +444,7 @@ impl Operation for EditTier {
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -545,7 +545,7 @@ impl Operation for ListTiers {
         )
         .await?;
 
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let tier_config_mgr = tier_config_mgr_handle.read().await;
         let tiers = tier_config_mgr.list_tiers();
 
@@ -614,7 +614,7 @@ impl Operation for RemoveTier {
         };
 
         {
-            let tier_config_mgr_handle = resolve_tier_config_handle();
+            let tier_config_mgr_handle = current_tier_config_handle();
             let mut tier_config_mgr = tier_config_mgr_handle.write().await;
             if let Err(err) = tier_config_mgr.reload(store).await {
                 warn!(
@@ -702,7 +702,7 @@ impl Operation for VerifyTier {
         .await?;
 
         let tier = resolve_tier_name(&req.uri, &params)?;
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         tier_config_mgr.verify(&tier).await.map_err(map_tier_verify_error)?;
 
@@ -749,7 +749,7 @@ impl Operation for GetTierInfo {
         } else {
             None
         };
-        let info = filter_tier_stats(resolve_daily_tier_stats(), tier_name);
+        let info = filter_tier_stats(current_daily_tier_stats(), tier_name);
 
         let data = serde_json::to_vec(&info)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
@@ -891,7 +891,7 @@ impl Operation for ClearTier {
             return Err(s3_error!(InvalidRequest, "invalid clear-tier confirmation token"));
         };
 
-        let tier_config_mgr_handle = resolve_tier_config_handle();
+        let tier_config_mgr_handle = current_tier_config_handle();
         let mut tier_config_mgr = tier_config_mgr_handle.write().await;
         //tier_config_mgr.reload(api);
         if let Err(err) = tier_config_mgr.clear_tier(force).await {

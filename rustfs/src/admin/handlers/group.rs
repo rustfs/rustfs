@@ -14,7 +14,7 @@
 
 use super::iam_error::iam_error_to_s3_error;
 use crate::{
-    admin::runtime_sources::resolve_action_credentials,
+    admin::runtime_sources::current_action_credentials,
     admin::{
         auth::validate_admin_request,
         handlers::site_replication::site_replication_iam_change_hook,
@@ -115,7 +115,7 @@ impl Operation for ListGroups {
         )
         .await?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -180,7 +180,7 @@ impl Operation for GetGroup {
                 GroupQuery::default()
             }
         };
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -256,7 +256,7 @@ impl Operation for DeleteGroup {
 
         let group = decode_delete_group_name(&params)?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -394,7 +394,7 @@ impl Operation for SetGroupStatus {
             return Err(s3_error!(InvalidArgument, "group is required"));
         }
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -537,7 +537,7 @@ impl Operation for UpdateGroupMembers {
             "admin group state"
         );
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InternalError, "iam is not initialized"));
         };
 
@@ -551,7 +551,7 @@ impl Operation for UpdateGroupMembers {
                         ));
                     }
 
-                    resolve_action_credentials()
+                    current_action_credentials()
                         .map(|cred| {
                             if constant_time_eq(&cred.access_key, member) {
                                 return Err(S3Error::with_message(

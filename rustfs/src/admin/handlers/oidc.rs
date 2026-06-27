@@ -16,7 +16,7 @@ use super::sts::create_oidc_sts_credentials;
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, resolve_object_store_handle_for_context, resolve_oidc_handle, resolve_server_config_for_context,
+    current_app_context, current_oidc_handle, resolve_object_store_handle_for_context, resolve_server_config_for_context,
 };
 use crate::admin::storage_api::config::{read_admin_config_without_migrate, save_admin_server_config};
 use crate::auth::{check_key_valid, get_session_token};
@@ -270,7 +270,7 @@ pub struct ListOidcProvidersHandler {}
 #[async_trait::async_trait]
 impl Operation for ListOidcProvidersHandler {
     async fn call(&self, _req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let providers = oidc_sys.list_visible_providers();
         let json_body = serde_json::to_vec(&providers)
@@ -441,7 +441,7 @@ impl Operation for OidcAuthorizeHandler {
             return Err(s3_error!(InvalidRequest, "invalid provider_id"));
         }
 
-        let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         // Derive the callback redirect URI from the request
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
@@ -514,7 +514,7 @@ impl Operation for OidcCallbackHandler {
             ));
         }
 
-        let oidc_sys = resolve_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
+        let oidc_sys = current_oidc_handle().ok_or_else(|| s3_error!(InternalError, "OIDC not initialized"))?;
 
         let redirect_uri = derive_callback_uri(&req, provider_id)?;
 
@@ -601,7 +601,7 @@ impl Operation for OidcLogoutHandler {
             return redirect_response(&fallback_location);
         };
 
-        let location = match resolve_oidc_handle() {
+        let location = match current_oidc_handle() {
             Some(oidc_sys) => match oidc_sys.build_logout_url(&logout_token, &fallback_location).await {
                 Ok(Some(url)) => url,
                 Ok(None) => fallback_location.clone(),
@@ -630,7 +630,7 @@ impl Operation for OidcLogoutHandler {
 /// an explicit redirect_uri is recommended to prevent header manipulation.
 fn derive_callback_uri(req: &S3Request<Body>, provider_id: &str) -> S3Result<String> {
     // Use explicitly configured redirect_uri if available
-    if let Some(oidc_sys) = resolve_oidc_handle()
+    if let Some(oidc_sys) = current_oidc_handle()
         && let Some(config) = oidc_sys.get_provider_config(provider_id)
     {
         if let Some(ref uri) = config.redirect_uri {

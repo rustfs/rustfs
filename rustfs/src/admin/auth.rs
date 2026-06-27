@@ -56,7 +56,7 @@ pub async fn validate_admin_request(
     actions: Vec<Action>,
     remote_addr: Option<std::net::SocketAddr>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
     let ctx = AuthContext {
@@ -146,7 +146,7 @@ pub async fn validate_admin_request_with_bucket_object(
     remote_addr: Option<std::net::SocketAddr>,
     resource: AdminResourceScope<'_>,
 ) -> S3Result<()> {
-    let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+    let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InternalError, "iam not init"));
     };
     let ctx = AuthContext {

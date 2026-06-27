@@ -17,8 +17,8 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_app_context, resolve_kms_runtime_service_manager, resolve_object_store_handle_for_context,
-    resolve_or_init_kms_runtime_service_manager,
+    current_app_context, current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager,
+    resolve_object_store_handle_for_context,
 };
 use crate::admin::storage_api::config::{read_admin_config, save_admin_config};
 use crate::auth::{check_key_valid, get_session_token};
@@ -41,7 +41,7 @@ const LOG_SUBSYSTEM_KMS: &str = "kms";
 const EVENT_ADMIN_KMS_DYNAMIC_STATE: &str = "admin_kms_dynamic_state";
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
-    resolve_kms_runtime_service_manager().unwrap_or_else(|| {
+    current_kms_runtime_service_manager().unwrap_or_else(|| {
         warn!(
             component = LOG_COMPONENT_ADMIN,
             subsystem = LOG_SUBSYSTEM_KMS,
@@ -49,7 +49,7 @@ fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceMa
             result = "service_manager_fallback_initialized",
             "admin kms dynamic state"
         );
-        resolve_or_init_kms_runtime_service_manager()
+        current_or_init_kms_runtime_service_manager()
     })
 }
 

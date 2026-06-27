@@ -16,7 +16,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
+use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use base64::Engine;
@@ -117,11 +117,11 @@ fn extract_key_id(uri: &hyper::Uri) -> Option<String> {
 }
 
 fn kms_service_manager_from_context() -> Option<std::sync::Arc<rustfs_kms::KmsServiceManager>> {
-    resolve_kms_runtime_service_manager()
+    current_kms_runtime_service_manager()
 }
 
 async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_kms::ObjectEncryptionService>> {
-    let manager = resolve_or_init_kms_runtime_service_manager();
+    let manager = current_or_init_kms_runtime_service_manager();
     manager.get_encryption_service().await
 }
 
