@@ -3156,9 +3156,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_gate_defaults_to_disabled() {
+    fn metadata_early_stop_gate_defaults_to_enabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
-            assert!(!is_get_metadata_early_stop_enabled());
+            assert!(is_get_metadata_early_stop_enabled());
         });
     }
 
