@@ -329,8 +329,8 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
 
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
-const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
-const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
+const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 
 // --- Codec Streaming Configuration ---
 
