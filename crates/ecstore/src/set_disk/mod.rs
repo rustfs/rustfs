@@ -506,16 +506,26 @@ fn is_version_early_stop_enabled() -> bool {
 // --- Rollout Percentage Functions ---
 
 fn get_codec_streaming_rollout_pct() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<u32> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
+        })
+    }
 }
 
 fn get_metadata_early_stop_rollout_pct() -> u32 {
     static CACHED: OnceLock<u32> = OnceLock::new();
     *CACHED.get_or_init(|| {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT)
+        rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+        )
     })
 }
 
@@ -630,6 +640,7 @@ impl GetCodecStreamingRollout {
 enum GetCodecStreamingFallbackReason {
     Disabled,
     RolloutNotOptedIn,
+    RolloutPctNotSelected,
     BodyCompatibilityUnconfirmed,
     HeaderCompatibilityUnconfirmed,
     LockOptimizationDisabled,
@@ -648,6 +659,7 @@ impl GetCodecStreamingFallbackReason {
         match self {
             Self::Disabled => "disabled",
             Self::RolloutNotOptedIn => "rollout_not_opted_in",
+            Self::RolloutPctNotSelected => "rollout_pct_not_selected",
             Self::BodyCompatibilityUnconfirmed => "body_compatibility_unconfirmed",
             Self::HeaderCompatibilityUnconfirmed => "header_compatibility_unconfirmed",
             Self::LockOptimizationDisabled => "lock_optimization_disabled",
@@ -729,6 +741,8 @@ fn classify_get_codec_streaming_object_class(
 }
 
 fn get_codec_streaming_reader_gate(
+    bucket: &str,
+    object: &str,
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
@@ -746,6 +760,12 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
+        };
+    }
+    if !should_use_codec_streaming(bucket, object) {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
         };
     }
     if !is_get_codec_streaming_body_compat_confirmed() {
@@ -1554,7 +1574,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        let codec_streaming_gate = get_codec_streaming_reader_gate(&range, &object_info, &fi, lock_optimization_enabled);
+        let codec_streaming_gate =
+            get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
 
         if object_info.is_remote() {
             if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
