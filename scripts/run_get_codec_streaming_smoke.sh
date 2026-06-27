@@ -32,6 +32,9 @@ OUTPUT_HANDOFF_ATTRIBUTION=false
 DIAGNOSTIC_METRICS=false
 DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
 SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
+COMPRESSED_FALLBACK_PROBE=false
+COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
+COMPRESSED_PROBE_MIME_TYPE="text/plain"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -70,6 +73,7 @@ Core options:
   --diagnostic-metrics           Enable observability metrics export and capture server-side metrics
   --diagnostic-metrics-url <url> Prometheus scrape URL for diagnostic captures
                                  (default: http://127.0.0.1:8889/metrics)
+  --compressed-fallback-probe    Enable disk compression only for the compressed fallback probe object
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -178,6 +182,7 @@ parse_args() {
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
       --diagnostic-metrics) DIAGNOSTIC_METRICS=true; shift ;;
       --diagnostic-metrics-url) DIAGNOSTIC_METRICS_URL="$2"; shift 2 ;;
+      --compressed-fallback-probe) COMPRESSED_FALLBACK_PROBE=true; shift ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -410,6 +415,9 @@ output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
 diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
+compressed_fallback_probe=${COMPRESSED_FALLBACK_PROBE}
+compressed_probe_extension=${COMPRESSED_PROBE_EXTENSION}
+compressed_probe_mime_type=${COMPRESSED_PROBE_MIME_TYPE}
 address=${ADDRESS}
 bucket=${BUCKET}
 region=${REGION}
@@ -557,6 +565,9 @@ RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
+RUSTFS_COMPRESSION_ENABLED=${COMPRESSED_FALLBACK_PROBE}
+RUSTFS_COMPRESSION_EXTENSIONS=${COMPRESSED_PROBE_EXTENSION}
+RUSTFS_COMPRESSION_MIME_TYPES=${COMPRESSED_PROBE_MIME_TYPE}
 diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
@@ -660,6 +671,9 @@ start_server() {
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
+    export RUSTFS_COMPRESSION_ENABLED="$COMPRESSED_FALLBACK_PROBE"
+    export RUSTFS_COMPRESSION_EXTENSIONS="$COMPRESSED_PROBE_EXTENSION"
+    export RUSTFS_COMPRESSION_MIME_TYPES="$COMPRESSED_PROBE_MIME_TYPE"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
     export RUSTFS_SCANNER_ENABLED=false
@@ -750,6 +764,15 @@ EOF
   fi
 
   if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$snapshot_file"; then
+    if [[ ! -s "$snapshot_file" ]]; then
+      cat >"$status_file" <<EOF
+phase=${phase}
+status=empty_response
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+      log "WARN: captured empty service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
+      return 0
+    fi
     cat >"$status_file" <<EOF
 phase=${phase}
 status=ok
@@ -909,7 +932,8 @@ write_service_metrics_acceptance() {
   local out_csv="${OUT_DIR}/service_metrics_acceptance.csv"
   local service_csv="${OUT_DIR}/service_metrics_summary.csv"
 
-  "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" <<'PY'
+  "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" \
+    "$COMPRESSED_FALLBACK_PROBE" <<'PY'
 import csv
 import pathlib
 import sys
@@ -919,6 +943,7 @@ service_path = pathlib.Path(sys.argv[2])
 diagnostic_enabled = sys.argv[3] == "true"
 mode = sys.argv[4]
 codec_engines = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
+compressed_fallback_probe_enabled = sys.argv[6] == "true"
 
 
 def expected_profiles():
@@ -1006,6 +1031,17 @@ elif rows and all(row.get("status") == "not_run_dry_run" for row in rows):
             "note": "dry-run only validates artifact wiring; runtime deltas require a real server run",
         }
     )
+elif rows and all(row.get("status") == "snapshot_missing" for row in rows):
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_capture",
+            "expected": "non-empty service metrics snapshots",
+            "status": "fail",
+            "observed_delta": "N/A",
+            "note": "metrics endpoint returned empty or missing snapshots; verify --diagnostic-metrics-url and exporter setup",
+        }
+    )
 else:
     for profile in expected_profiles():
         if profile == "legacy":
@@ -1079,6 +1115,25 @@ else:
                 'rustfs_io_get_object_codec_streaming_fallback_total{reason="encrypted"} delta > 0',
                 delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="encrypted"'),
                 "proves runtime encrypted object fallback reason delta",
+            )
+            compressed_delta = delta_for(
+                profile,
+                "rustfs_io_get_object_codec_streaming_fallback_total",
+                'reason="compressed"',
+            )
+            rows_out.append(
+                {
+                    "profile": profile,
+                    "check": "fallback_compressed",
+                    "expected": 'rustfs_io_get_object_codec_streaming_fallback_total{reason="compressed"} delta > 0',
+                    "status": "pass"
+                    if compressed_delta > 0
+                    else ("fail" if compressed_fallback_probe_enabled else "unavailable"),
+                    "observed_delta": f"{compressed_delta:.12g}",
+                    "note": "Enable --compressed-fallback-probe to generate a runtime compressed fallback delta"
+                    if not compressed_fallback_probe_enabled
+                    else "proves runtime disk-compressed object fallback reason delta",
+                }
             )
             below_delta = delta_for(
                 profile,
@@ -1224,13 +1279,24 @@ ${COMPAT_OBJECT_SIZE},${profile},true,true,true,true,true,true,true,0,DRY_RUN,20
 EOF
     printf '%s\n' "DRY_RUN" >"${compat_dir}/body_sha256.txt"
     printf '{}\n' >"${compat_dir}/response_headers.json"
-    cat >"${compat_dir}/fallback_probe_summary.csv" <<EOF
+    {
+      cat <<EOF
 profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
 ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
 ${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,multipart,dry-run only
 ${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
 EOF
+      if [[ "$COMPRESSED_FALLBACK_PROBE" == "true" ]]; then
+        printf '%s,%s,%s%s,%s,%s,%s,%s,%s\n' \
+          "$profile" "compressed" "$COMPAT_OBJECT_KEY" "$COMPRESSED_PROBE_EXTENSION" \
+          "not_run_dry_run" "200" "N/A" "compressed" "dry-run only"
+      else
+        printf '%s,%s,%s%s,%s,%s,%s,%s,%s\n' \
+          "$profile" "compressed" "$COMPAT_OBJECT_KEY" "$COMPRESSED_PROBE_EXTENSION" \
+          "skipped" "N/A" "N/A" "compressed" "use --compressed-fallback-probe"
+      fi
+    } >"${compat_dir}/fallback_probe_summary.csv"
     cat >"${compat_dir}/snapshot.json" <<EOF
 {
   "profile": "${profile}",
@@ -1255,7 +1321,8 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" <<'PY'
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" \
+    "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" <<'PY'
 import base64
 import csv
 import datetime as dt
@@ -1270,9 +1337,24 @@ import urllib.parse
 import xml.etree.ElementTree as ET
 from xml.sax.saxutils import escape as xml_escape
 
-endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, codec_min_size_raw, out_dir_raw, profile = sys.argv[1:]
+(
+    endpoint,
+    access_key,
+    secret_key,
+    region,
+    bucket,
+    object_key,
+    object_size_raw,
+    codec_min_size_raw,
+    out_dir_raw,
+    profile,
+    compressed_fallback_probe_raw,
+    compressed_probe_extension,
+    compressed_probe_mime_type,
+) = sys.argv[1:]
 object_size = int(object_size_raw)
 codec_min_size = int(codec_min_size_raw)
+compressed_fallback_probe = compressed_fallback_probe_raw == "true"
 out_dir = pathlib.Path(out_dir_raw)
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1461,6 +1543,58 @@ else:
             "body_len": "N/A",
             "expected_runtime_fallback_reason": "below_min_size",
             "note": "Set --codec-min-size greater than 1 to generate a runtime below_min_size fallback delta",
+        }
+    )
+
+compressed_key = object_key + compressed_probe_extension
+compressed_path = bucket_path + "/" + urllib.parse.quote(compressed_key, safe="/-_.~")
+if compressed_fallback_probe:
+    compressed_body = (b"RustFS compressed fallback probe\n" * 4096)[:128 * 1024]
+    compressed_put, _ = request(
+        "PUT",
+        compressed_path,
+        compressed_body,
+        [("content-type", compressed_probe_mime_type)],
+    )
+    if compressed_put["status"] not in (200, 204):
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "compressed",
+                "object_key": compressed_key,
+                "status": "put_failed",
+                "status_code": compressed_put["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "compressed",
+                "note": "compressed probe upload failed",
+            }
+        )
+    else:
+        compressed_get, compressed_get_body = request("GET", compressed_path)
+        compressed_ok = compressed_get["status"] == 200 and sha256_hex(compressed_get_body) == sha256_hex(compressed_body)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "compressed",
+                "object_key": compressed_key,
+                "status": "ok" if compressed_ok else "unexpected_status_or_body",
+                "status_code": compressed_get["status"],
+                "body_len": len(compressed_get_body),
+                "expected_runtime_fallback_reason": "compressed",
+                "note": "Disk-compressed object GET should stay on the legacy fallback path for codec profiles",
+            }
+        )
+else:
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "compressed",
+            "object_key": compressed_key,
+            "status": "skipped",
+            "status_code": "N/A",
+            "body_len": "N/A",
+            "expected_runtime_fallback_reason": "compressed",
+            "note": "Enable --compressed-fallback-probe to generate a runtime compressed fallback delta",
         }
     )
 
