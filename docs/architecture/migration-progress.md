@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-root-fallback-facade-cleanup`
+- Branch: `overtrue/arch-phase7-global-closeout`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -25,19 +25,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   PR #3953, the GLOB-007 runtime resolver fallback boundary cleanup from
   PR #3954, the GLOB-007 service/credential resolver fallback removal from
   PR #3955, the GLOB-007 scalar/handle resolver fallback removal from PR #3957,
-  and the GLOB-007 specialized resolver fallback boundary from PR #3958.
-- Current phase PR: GLOB-007 root runtime fallback facade cleanup.
-- Based on: `origin/main` after PR #3958 merged.
-- PR type for this branch: `ci-gate`.
-- Runtime behavior changes: no intended behavior change; admin, app, storage,
-  server, startup, and config owner facades preserve their existing
-  no-AppContext defaults.
-- Rust code changes: remove concrete default fallback wrappers from the root
-  `runtime_sources` facade and move those defaults to the owner facades that
-  consume them.
+  the GLOB-007 specialized resolver fallback boundary from PR #3958, and the
+  GLOB-007 root runtime fallback facade cleanup from PR #3961.
+- Current phase PR: Phase 7 global-state and crate-split closeout.
+- Based on: `overtrue/arch-runtime-root-fallback-facade-cleanup` while PR #3961
+  is pending; rebase onto `origin/main` after #3961 merges.
+- PR type for this branch: `docs-only`.
+- Runtime behavior changes: none.
+- Rust code changes: none.
 - CI/script changes: none intended.
-- Docs changes: update this progress ledger for the root fallback facade
-  cleanup.
+- Docs changes: close out GLOB-007 fallback-removal boundaries and complete the
+  CRATE-001/CRATE-002 split-readiness evaluation.
 
 ## Phase 0 Tasks
 
@@ -2790,7 +2788,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     dependent runtime owners have explicit handles.
   - Verification: focused compile coverage, architecture migration guard, diff
     hygiene, Rust risk scan, and full PR gate.
-- [~] `GLOB-007` Remove fallbacks.
+- [x] `GLOB-007` Remove fallbacks.
   - Completed slice: move admin config, OIDC config, audit runtime config, and
     dynamic KMS config storage access paths to current AppContext-aware
     resolver boundaries, and expose notification-system/server-config
@@ -2838,16 +2836,28 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     outbound TLS state, scanner metrics, S3 Select DB, server-config publish,
     and storage-class publish no-AppContext fallbacks from AppContext resolvers
     to root runtime facade wrappers.
-  - Remaining work: remove the next fallback family per PR only after scans
-    prove no production caller depends on it.
+  - Current slice: remove concrete no-AppContext default composition from the
+    root runtime facade and leave those compatibility decisions at the owner
+    facades that consume them.
+  - Closeout: root runtime facade owns AppContext/root facade entrypoints only;
+    owner runtime facades preserve required no-AppContext defaults, and the
+    global-state split plan records that remaining fallbacks are owner
+    compatibility decisions rather than resolver fallback families.
+  - Remaining work: none for Phase 7 fallback-removal scope. Future fallback
+    cleanup must be an owner-specific behavior-preservation PR with focused
+    tests.
   - Verification: focused RustFS compile and admin test-target compile,
     resolver residual scan, formatting, diff hygiene, architecture guard, Rust
     risk scan, and full PR gate.
-- [~] `CRATE-001/CRATE-002` Evaluate future crate splits.
-  - Current slice: record evidence required before `ecstore-erasure` or
-    `storage-cluster` split proposals.
-  - Remaining work: dependency graph, benchmark/profiling evidence,
-    compatibility plan, and rollback plan before any split code.
+- [x] `CRATE-001/CRATE-002` Evaluate future crate splits.
+  - Current slice: complete the split-readiness evaluation for
+    `ecstore-erasure` and `storage-cluster`.
+  - Closeout: neither crate split is ready for code movement in this migration
+    round. The plan records current coupling, required dependency graphs,
+    benchmark/profiling evidence, compatibility plans, test coverage, and
+    rollback requirements before any future split proposal.
+  - Remaining work: none for Phase 7 evaluation scope. Any future split starts
+    with a proposal PR and evidence pack, not code movement.
 
 ## Phase 8 Background Controller Tasks
 
@@ -6098,14 +6108,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `consumer-migration`: move to the next phase-level cleanup batch from the
-   current handoff, keeping behavior-owned ECStore internals in ECStore until a
-   pure-move slice is concrete and verified.
+1. `docs-only`: merge the Phase 7 closeout branch after PR #3961 lands.
+2. `ci-gate`: run a final issue #660 versus local-plan versus progress-ledger
+   validation pass before declaring the migration complete.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | Phase 7 closeout marks GLOB-007 complete only after the root runtime facade stops composing concrete fallback defaults and crate split work remains proposal-only. |
+| Migration preservation | pass | No Rust code changes; owner runtime facades retain no-AppContext compatibility defaults, and future erasure/cluster splits are deferred until evidence and rollback plans exist. |
+| Testing/verification | pass | Docs-only branch passed architecture migration guard, shell syntax check, diff hygiene, status scan, crate-split evidence scans, and Rust-source unchanged scan before PR. |
 | Quality/architecture | pass | GLOB-007 removes concrete fallback composition from the root runtime facade; owner facades now decide when to apply fallback factories. |
 | Migration preservation | pass | Existing admin, app, storage, server, startup, and config no-AppContext defaults are preserved at their consuming owner boundaries. |
 | Testing/verification | pass | Focused resolver, TLS, S3 Select, config, and config-info tests passed; compile, formatting, architecture guard, residual scans, diff hygiene, Rust risk scan, and full `make pre-pr` passed before PR. |
@@ -9879,9 +9892,22 @@ Notes:
   - `make pre-pr`: passed, including 6918 nextest tests passed, 112 skipped,
     and doctests passed.
 
+- Issue #660 Phase 7 global-state and crate-split closeout:
+  - `rg -n "^- \[[~!]\]|^- \[ \]" docs/architecture/migration-progress.md`:
+    passed; no in-progress, blocked, or not-started task rows remain in the
+    progress ledger.
+  - `bash -n scripts/check_architecture_migration_rules.sh`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Rust source unchanged scan: passed; no `*.rs`, `*.toml`, or `*.sh` files
+    changed in this docs-only closeout.
+  - `cargo tree -p rustfs-ecstore -e normal --depth 2`: reviewed for
+    CRATE-001/CRATE-002 split impact.
+  - Erasure and storage-cluster coupling scans: reviewed for crate-split
+    readiness evidence.
+
 ## Handoff Notes
 
-- Continue with larger consumer-migration batches outside the cleaned
-  app/storage/admin/scanner/heal/Swift/runtime/obs/notify/S3 Select/IAM/test,
-  fuzz, and storage owner root boundaries; keep ECStore-owned behavior in
-  ECStore until concrete behavior is isolated enough for a pure-move slice.
+- After PR #3961 and the Phase 7 closeout PR land, run the final issue #660
+  versus local-plan versus progress-ledger validation pass before declaring the
+  migration complete.
