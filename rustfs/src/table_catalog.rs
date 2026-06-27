@@ -2079,6 +2079,34 @@ where
         Ok(())
     }
 
+    fn ensure_table_warehouse_prefix_available_locked(
+        state: &StrongTableCatalogState,
+        candidate: &TableEntry,
+        candidate_key: &StrongResourceKey,
+    ) -> TableCatalogStoreResult<()> {
+        if candidate.state != TableCatalogEntryState::Active {
+            return Ok(());
+        }
+        let candidate_prefix = table_warehouse_object_prefix(candidate)?;
+        for (existing_key, existing) in &state.tables {
+            if existing_key == candidate_key
+                || existing.table_bucket != candidate.table_bucket
+                || existing.state != TableCatalogEntryState::Active
+            {
+                continue;
+            }
+            let Ok(existing_prefix) = table_warehouse_object_prefix(existing) else {
+                continue;
+            };
+            if existing_prefix == candidate_prefix {
+                return Err(TableCatalogStoreError::Conflict(format!(
+                    "table warehouse location is already registered: {candidate_prefix}"
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn table_commit_recovery_report_for_entry_locked(
         state: &StrongTableCatalogState,
         entry: &TableEntry,
@@ -2263,6 +2291,7 @@ where
         if let Some(warehouse_location) = next_warehouse_location {
             next.warehouse_location = warehouse_location;
         }
+        Self::ensure_table_warehouse_prefix_available_locked(state, &next, &key)?;
         next.version_token = commit_log.new_version_token.clone();
         next.generation = next.generation.saturating_add(1);
 
@@ -2479,6 +2508,7 @@ where
                     entry.table_bucket, entry.namespace, entry.table
                 )));
             }
+            Self::ensure_table_warehouse_prefix_available_locked(&state, &entry, &key)?;
             let (precondition, rollback_state) = Self::snapshot_write_context_locked(&state);
             state.tables.insert(key, entry);
             (Self::snapshot_from_state_locked(&state), precondition, rollback_state)
@@ -14042,6 +14072,105 @@ mod tests {
 
         assert_matches!(err, TableCatalogStoreError::Invalid(_));
         assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn strong_catalog_backing_rejects_duplicate_table_warehouse_location_on_register() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = StrongTableCatalogStore::new(backend);
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let orders = IdentifierSegment::parse("orders").unwrap();
+        let customers = IdentifierSegment::parse("customers").unwrap();
+        let orders_metadata = default_table_metadata_file_path(&namespace, &orders, "00001.metadata.json");
+        let customers_metadata = default_table_metadata_file_path(&namespace, &customers, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &orders, orders_metadata))
+            .await
+            .unwrap();
+        let mut duplicate = test_table_entry(bucket, &namespace, &customers, customers_metadata);
+        duplicate.table_id = "table-id-2".to_string();
+        duplicate.table_uuid = "table-uuid-2".to_string();
+        duplicate.warehouse_location = format!("s3://{bucket}/tables/table-id");
+
+        let err = store.register_table(duplicate).await.unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Conflict(_));
+        assert!(store.load_table(bucket, "sales", "customers").await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn strong_catalog_backing_rejects_duplicate_table_warehouse_location_on_commit_relocation() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = StrongTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let orders = IdentifierSegment::parse("orders").unwrap();
+        let customers = IdentifierSegment::parse("customers").unwrap();
+        let orders_metadata = default_table_metadata_file_path(&namespace, &orders, "00001.metadata.json");
+        let relocated_metadata = default_table_metadata_file_path(&namespace, &orders, "00002.metadata.json");
+        let customers_metadata = default_table_metadata_file_path(&namespace, &customers, "00001.metadata.json");
+
+        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
+        store
+            .create_namespace(test_namespace_entry(bucket, &namespace))
+            .await
+            .unwrap();
+        store
+            .create_table(test_table_entry(bucket, &namespace, &orders, orders_metadata.clone()))
+            .await
+            .unwrap();
+        let mut customers_entry = test_table_entry(bucket, &namespace, &customers, customers_metadata);
+        customers_entry.table_id = "table-id-2".to_string();
+        customers_entry.table_uuid = "table-uuid-2".to_string();
+        customers_entry.warehouse_location = format!("s3://{bucket}/tables/customer-id");
+        store.create_table(customers_entry).await.unwrap();
+        backend
+            .seed_object(
+                bucket,
+                &relocated_metadata,
+                serde_json::to_vec(&serde_json::json!({
+                    "location": "s3://analytics/tables/customer-id",
+                    "table-uuid": "table-uuid"
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let err = store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: orders.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("client-request".to_string()),
+                operation: "set-location".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: orders_metadata.clone(),
+                new_metadata_location: relocated_metadata,
+                requirements: Vec::new(),
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap_err();
+
+        assert_matches!(err, TableCatalogStoreError::Conflict(_));
+        let loaded = store.load_table(bucket, "sales", "orders").await.unwrap().unwrap();
+        assert_eq!(loaded.metadata_location, orders_metadata);
+        assert_eq!(loaded.warehouse_location, format!("s3://{bucket}/tables/table-id"));
+        assert!(
+            store
+                .get_commit_by_id(bucket, "table-id", "commit-1")
+                .await
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[tokio::test]
