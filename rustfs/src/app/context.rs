@@ -42,27 +42,34 @@ use rustfs_lock::LockClient;
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use rustfs_tls_runtime::{GlobalPublishedOutboundTlsState, TlsGeneration};
 use s3s::dto::SelectObjectContentInput;
-use std::{collections::HashMap, future::Future, sync::Arc, time::SystemTime};
+use std::{collections::HashMap, sync::Arc, time::SystemTime};
 use tokio::sync::RwLock;
 
 /// Resolve KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
-    resolve_kms_runtime_service_manager_with(get_global_app_context(), || default_kms_runtime_interface().service_manager())
+    resolve_kms_runtime_service_manager_with(get_global_app_context())
+        .or_else(|| default_kms_runtime_interface().service_manager())
 }
 
 /// Resolve or initialize the KMS runtime service manager using AppContext-first precedence.
 pub fn resolve_or_init_kms_runtime_service_manager() -> Arc<KmsServiceManager> {
-    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context(), runtime_sources::init_kms_service_manager)
+    resolve_or_init_kms_runtime_service_manager_with(get_global_app_context())
+        .unwrap_or_else(runtime_sources::init_kms_service_manager)
 }
 
 /// Resolve KMS encryption service using AppContext-first precedence.
 pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
-    resolve_encryption_service_with(get_global_app_context(), runtime_sources::encryption_service).await
+    if let Some(service) = resolve_encryption_service_with(get_global_app_context()).await {
+        return Some(service);
+    }
+
+    runtime_sources::encryption_service().await
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
 pub fn resolve_outbound_tls_generation() -> TlsGeneration {
-    resolve_outbound_tls_generation_with(get_global_app_context(), || default_outbound_tls_runtime_interface().generation())
+    resolve_outbound_tls_generation_with(get_global_app_context())
+        .unwrap_or_else(|| default_outbound_tls_runtime_interface().generation())
 }
 
 #[cfg(test)]
@@ -77,12 +84,12 @@ pub async fn resolve_outbound_tls_state() -> GlobalPublishedOutboundTlsState {
 
 /// Resolve IAM readiness using AppContext-first precedence.
 pub fn resolve_iam_ready() -> bool {
-    resolve_iam_ready_with(get_global_app_context(), runtime_sources::iam_is_ready)
+    resolve_iam_ready_with(get_global_app_context()).unwrap_or_else(runtime_sources::iam_is_ready)
 }
 
 /// Resolve IAM system handle using AppContext-first precedence.
 pub fn resolve_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
-    resolve_iam_handle_with(get_global_app_context(), runtime_sources::iam_handle)
+    resolve_iam_handle_with(get_global_app_context()).or_else(runtime_sources::iam_handle)
 }
 
 /// Resolve OIDC system handle using AppContext-first precedence.
@@ -97,7 +104,11 @@ pub fn publish_oidc_handle(oidc: Arc<OidcSys>) -> bool {
 
 /// Resolve a ready IAM system handle using AppContext-first precedence.
 pub fn resolve_ready_iam_handle() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    resolve_ready_iam_handle_with(get_global_app_context(), runtime_sources::ready_iam_handle)
+    if let Some(context) = get_global_app_context() {
+        return resolve_ready_iam_handle_with(context);
+    }
+
+    runtime_sources::ready_iam_handle()
 }
 
 /// Resolve token signing key using AppContext-first precedence.
@@ -171,13 +182,16 @@ pub fn resolve_boot_time() -> Option<SystemTime> {
 
 /// Resolve daily tier transition statistics using AppContext-first precedence.
 pub fn resolve_daily_tier_stats() -> DailyAllTierStats {
-    resolve_daily_tier_stats_with(get_global_app_context(), || default_tier_stats_interface().daily_all())
+    resolve_daily_tier_stats_with(get_global_app_context()).unwrap_or_else(|| default_tier_stats_interface().daily_all())
 }
 
 /// Resolve scanner metrics report using AppContext-first precedence.
 pub async fn resolve_scanner_metrics_report() -> ScannerMetricsReport {
-    resolve_scanner_metrics_report_with(get_global_app_context(), || async { default_scanner_metrics_interface().report().await })
-        .await
+    if let Some(report) = resolve_scanner_metrics_report_with(get_global_app_context()).await {
+        return report;
+    }
+
+    default_scanner_metrics_interface().report().await
 }
 
 /// Resolve deployment identity using AppContext-first precedence.
@@ -187,7 +201,7 @@ pub fn resolve_deployment_id() -> Option<String> {
 
 /// Resolve runtime port using AppContext-first precedence.
 pub fn resolve_runtime_port() -> u16 {
-    resolve_runtime_port_with(get_global_app_context(), || default_runtime_port_interface().get())
+    resolve_runtime_port_with(get_global_app_context()).unwrap_or_else(|| default_runtime_port_interface().get())
 }
 
 /// Resolve lock client using AppContext-first precedence.
@@ -202,12 +216,12 @@ pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClien
 
 /// Resolve performance metrics using AppContext-first precedence.
 pub fn resolve_performance_metrics() -> Arc<PerformanceMetrics> {
-    resolve_performance_metrics_with(get_global_app_context(), || default_performance_metrics_interface().handle())
+    resolve_performance_metrics_with(get_global_app_context()).unwrap_or_else(|| default_performance_metrics_interface().handle())
 }
 
 /// Resolve internode metrics using AppContext-first precedence.
 pub fn resolve_internode_metrics() -> Arc<InternodeMetrics> {
-    resolve_internode_metrics_with(get_global_app_context(), || default_internode_metrics_interface().handle())
+    resolve_internode_metrics_with(get_global_app_context()).unwrap_or_else(|| default_internode_metrics_interface().handle())
 }
 
 /// Resolve S3 Select database using AppContext-first precedence.
@@ -215,20 +229,29 @@ pub async fn resolve_s3select_db(
     input: SelectObjectContentInput,
     enable_debug: bool,
 ) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
-    resolve_s3select_db_with(get_global_app_context(), input, enable_debug, |input, enable_debug| async move {
-        default_s3select_db_interface().get(input, enable_debug).await
-    })
-    .await
+    if let Some(context) = get_global_app_context() {
+        return resolve_s3select_db_with(context, input, enable_debug).await;
+    }
+
+    default_s3select_db_interface().get(input, enable_debug).await
 }
 
 /// Resolve local node name using AppContext-first precedence.
 pub async fn resolve_local_node_name() -> String {
-    resolve_local_node_name_with(get_global_app_context(), runtime_sources::local_node_name).await
+    if let Some(node_name) = resolve_local_node_name_with(get_global_app_context()).await {
+        return node_name;
+    }
+
+    runtime_sources::local_node_name().await
 }
 
 /// Resolve action credentials using AppContext-first precedence.
 pub fn resolve_action_credentials() -> Option<Credentials> {
-    resolve_action_credentials_with(get_global_app_context(), || default_action_credential_interface().get())
+    if let Some(context) = get_global_app_context() {
+        return resolve_action_credentials_with(context);
+    }
+
+    default_action_credential_interface().get()
 }
 
 /// Resolve region using AppContext-first precedence.
@@ -238,12 +261,12 @@ pub fn resolve_region() -> Option<s3s::region::Region> {
 
 /// Resolve tier config handle using AppContext-first precedence.
 pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
-    resolve_tier_config_handle_with(get_global_app_context(), || default_tier_config_interface().handle())
+    resolve_tier_config_handle_with(get_global_app_context()).unwrap_or_else(|| default_tier_config_interface().handle())
 }
 
 /// Resolve lifecycle expiry state using AppContext-first precedence.
 pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
-    resolve_expiry_state_handle_with(get_global_app_context(), || default_expiry_state_interface().handle())
+    resolve_expiry_state_handle_with(get_global_app_context()).unwrap_or_else(|| default_expiry_state_interface().handle())
 }
 
 /// Resolve server config using AppContext-first precedence.
@@ -270,47 +293,24 @@ pub fn publish_storage_class_config(config: StorageClassConfig) {
 
 /// Resolve buffer profile config using AppContext-first precedence.
 pub fn resolve_buffer_config() -> RustFSBufferConfig {
-    resolve_buffer_config_with(get_global_app_context(), || default_buffer_config_interface().get())
+    resolve_buffer_config_with(get_global_app_context()).unwrap_or_else(|| default_buffer_config_interface().get())
 }
 
-fn resolve_kms_runtime_service_manager_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<KmsServiceManager>>,
-) -> Option<Arc<KmsServiceManager>> {
-    context
-        .and_then(|context| context.kms_runtime().service_manager())
-        .or_else(fallback)
+fn resolve_kms_runtime_service_manager_with(context: Option<Arc<AppContext>>) -> Option<Arc<KmsServiceManager>> {
+    context.and_then(|context| context.kms_runtime().service_manager())
 }
 
-fn resolve_or_init_kms_runtime_service_manager_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Arc<KmsServiceManager>,
-) -> Arc<KmsServiceManager> {
-    context
-        .and_then(|context| context.kms_runtime().service_manager())
-        .unwrap_or_else(fallback)
+fn resolve_or_init_kms_runtime_service_manager_with(context: Option<Arc<AppContext>>) -> Option<Arc<KmsServiceManager>> {
+    context.and_then(|context| context.kms_runtime().service_manager())
 }
 
-async fn resolve_encryption_service_with<F, Fut>(
-    context: Option<Arc<AppContext>>,
-    fallback: F,
-) -> Option<Arc<ObjectEncryptionService>>
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<Arc<ObjectEncryptionService>>>,
-{
-    if let Some(manager) = context.and_then(|context| context.kms_runtime().service_manager()) {
-        return manager.get_encryption_service().await;
-    }
-
-    fallback().await
+async fn resolve_encryption_service_with(context: Option<Arc<AppContext>>) -> Option<Arc<ObjectEncryptionService>> {
+    let manager = context.and_then(|context| context.kms_runtime().service_manager())?;
+    manager.get_encryption_service().await
 }
 
-fn resolve_outbound_tls_generation_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> TlsGeneration,
-) -> TlsGeneration {
-    context.map_or_else(fallback, |context| context.outbound_tls_runtime().generation())
+fn resolve_outbound_tls_generation_with(context: Option<Arc<AppContext>>) -> Option<TlsGeneration> {
+    context.map(|context| context.outbound_tls_runtime().generation())
 }
 
 async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> GlobalPublishedOutboundTlsState {
@@ -321,15 +321,12 @@ async fn resolve_outbound_tls_state_with(context: Option<Arc<AppContext>>) -> Gl
     default_outbound_tls_runtime_interface().state().await
 }
 
-fn resolve_iam_ready_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> bool) -> bool {
-    context.map_or_else(fallback, |context| context.iam().is_ready())
+fn resolve_iam_ready_with(context: Option<Arc<AppContext>>) -> Option<bool> {
+    context.map(|context| context.iam().is_ready())
 }
 
-fn resolve_iam_handle_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<IamSys<ObjectStore>>>,
-) -> Option<Arc<IamSys<ObjectStore>>> {
-    context.map(|context| context.iam().handle()).or_else(fallback)
+fn resolve_iam_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<IamSys<ObjectStore>>> {
+    context.map(|context| context.iam().handle())
 }
 
 fn resolve_oidc_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<OidcSys>> {
@@ -340,19 +337,12 @@ fn publish_oidc_handle_with(context: Option<Arc<AppContext>>, oidc: Arc<OidcSys>
     context.is_some_and(|context| context.publish_oidc_handle(oidc))
 }
 
-fn resolve_ready_iam_handle_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>>,
-) -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
-    if let Some(context) = context {
-        if context.iam().is_ready() {
-            return Ok(context.iam().handle());
-        }
-
-        return Err(IamError::IamSysNotInitialized);
+fn resolve_ready_iam_handle_with(context: Arc<AppContext>) -> rustfs_iam::error::Result<Arc<IamSys<ObjectStore>>> {
+    if context.iam().is_ready() {
+        return Ok(context.iam().handle());
     }
 
-    fallback()
+    Err(IamError::IamSysNotInitialized)
 }
 
 fn resolve_token_signing_key_with(context: Option<Arc<AppContext>>) -> Option<String> {
@@ -383,23 +373,16 @@ fn resolve_boot_time_with(context: Option<Arc<AppContext>>) -> Option<SystemTime
     context.and_then(|context| context.boot_time().get())
 }
 
-fn resolve_daily_tier_stats_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> DailyAllTierStats,
-) -> DailyAllTierStats {
-    context.map_or_else(fallback, |context| context.tier_stats().daily_all())
+fn resolve_daily_tier_stats_with(context: Option<Arc<AppContext>>) -> Option<DailyAllTierStats> {
+    context.map(|context| context.tier_stats().daily_all())
 }
 
-async fn resolve_scanner_metrics_report_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> ScannerMetricsReport
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = ScannerMetricsReport>,
-{
+async fn resolve_scanner_metrics_report_with(context: Option<Arc<AppContext>>) -> Option<ScannerMetricsReport> {
     if let Some(context) = context {
-        return context.scanner_metrics().report().await;
+        return Some(context.scanner_metrics().report().await);
     }
 
-    fallback().await
+    None
 }
 
 #[cfg(test)]
@@ -415,8 +398,8 @@ fn resolve_deployment_id_with(context: Option<Arc<AppContext>>) -> Option<String
     context.and_then(|context| context.deployment_id().get())
 }
 
-fn resolve_runtime_port_with(context: Option<Arc<AppContext>>, fallback: impl FnOnce() -> u16) -> u16 {
-    context.map_or_else(fallback, |context| context.runtime_port().get())
+fn resolve_runtime_port_with(context: Option<Arc<AppContext>>) -> Option<u16> {
+    context.map(|context| context.runtime_port().get())
 }
 
 fn resolve_lock_client_with(context: Option<Arc<AppContext>>) -> Option<Arc<dyn LockClient>> {
@@ -427,76 +410,44 @@ fn resolve_lock_clients_handle_with(context: Option<Arc<AppContext>>) -> Option<
     context.and_then(|context| context.lock_clients().handle())
 }
 
-fn resolve_performance_metrics_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Arc<PerformanceMetrics>,
-) -> Arc<PerformanceMetrics> {
-    context.map_or_else(fallback, |context| context.performance_metrics().handle())
+fn resolve_performance_metrics_with(context: Option<Arc<AppContext>>) -> Option<Arc<PerformanceMetrics>> {
+    context.map(|context| context.performance_metrics().handle())
 }
 
-fn resolve_internode_metrics_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Arc<InternodeMetrics>,
-) -> Arc<InternodeMetrics> {
-    context.map_or_else(fallback, |context| context.internode_metrics().handle())
+fn resolve_internode_metrics_with(context: Option<Arc<AppContext>>) -> Option<Arc<InternodeMetrics>> {
+    context.map(|context| context.internode_metrics().handle())
 }
 
-async fn resolve_s3select_db_with<F, Fut>(
-    context: Option<Arc<AppContext>>,
+async fn resolve_s3select_db_with(
+    context: Arc<AppContext>,
     input: SelectObjectContentInput,
     enable_debug: bool,
-    fallback: F,
-) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>
-where
-    F: FnOnce(SelectObjectContentInput, bool) -> Fut,
-    Fut: Future<Output = QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>>>,
-{
-    if let Some(context) = context {
-        return context.s3select_db().get(input, enable_debug).await;
-    }
-
-    fallback(input, enable_debug).await
+) -> QueryResult<Arc<dyn DatabaseManagerSystem + Send + Sync>> {
+    context.s3select_db().get(input, enable_debug).await
 }
 
-async fn resolve_local_node_name_with<F, Fut>(context: Option<Arc<AppContext>>, fallback: F) -> String
-where
-    F: FnOnce() -> Fut,
-    Fut: Future<Output = String>,
-{
+async fn resolve_local_node_name_with(context: Option<Arc<AppContext>>) -> Option<String> {
     if let Some(context) = context {
-        return context.local_node_name().get().await;
+        return Some(context.local_node_name().get().await);
     }
 
-    fallback().await
+    None
 }
 
-fn resolve_action_credentials_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Credentials>,
-) -> Option<Credentials> {
-    context
-        .map(|context| context.action_credentials().get())
-        .unwrap_or_else(fallback)
+fn resolve_action_credentials_with(context: Arc<AppContext>) -> Option<Credentials> {
+    context.action_credentials().get()
 }
 
 fn resolve_region_with(context: Option<Arc<AppContext>>) -> Option<s3s::region::Region> {
     context.and_then(|context| context.region().get())
 }
 
-fn resolve_tier_config_handle_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Arc<RwLock<TierConfigMgr>>,
-) -> Arc<RwLock<TierConfigMgr>> {
-    context.map(|context| context.tier_config().handle()).unwrap_or_else(fallback)
+fn resolve_tier_config_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<RwLock<TierConfigMgr>>> {
+    context.map(|context| context.tier_config().handle())
 }
 
-fn resolve_expiry_state_handle_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Arc<RwLock<ExpiryState>>,
-) -> Arc<RwLock<ExpiryState>> {
-    context
-        .map(|context| context.expiry_state().handle())
-        .unwrap_or_else(fallback)
+fn resolve_expiry_state_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<RwLock<ExpiryState>>> {
+    context.map(|context| context.expiry_state().handle())
 }
 
 fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config> {
@@ -523,11 +474,8 @@ fn publish_storage_class_config_with(
     }
 }
 
-fn resolve_buffer_config_with(
-    context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> RustFSBufferConfig,
-) -> RustFSBufferConfig {
-    context.map_or_else(fallback, |context| context.buffer_config().get())
+fn resolve_buffer_config_with(context: Option<Arc<AppContext>>) -> Option<RustFSBufferConfig> {
+    context.map(|context| context.buffer_config().get())
 }
 
 #[cfg(test)]
@@ -954,28 +902,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolver_helpers_are_context_first_and_fallback_when_context_is_absent() {
+    async fn resolver_helpers_are_context_first_and_empty_when_context_is_absent() {
         let (_temp_dir, object_store, endpoints) = test_store().await;
         let context_kms = Arc::new(KmsServiceManager::new());
-        let fallback_kms = Arc::new(KmsServiceManager::new());
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
         let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
         let mut context_daily_tier_stats = DailyAllTierStats::new();
         context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
-        let mut fallback_daily_tier_stats = DailyAllTierStats::new();
-        fallback_daily_tier_stats.insert("FALLBACK".to_string(), Default::default());
         let context_scanner_metrics = ScannerMetricsReport {
             current_cycle: 7,
             ..Default::default()
         };
-        let fallback_scanner_metrics = ScannerMetricsReport {
-            current_cycle: 13,
-            ..Default::default()
-        };
         let tier_config = TierConfigMgr::new();
         let context_expiry_state = ExpiryState::new();
-        let fallback_expiry_state = ExpiryState::new();
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let fallback_server_config_published = Arc::new(AtomicUsize::new(0));
@@ -984,18 +924,13 @@ mod tests {
         let buffer_config = RustFSBufferConfig::new(WorkloadProfile::AiTraining);
         let context_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
         let context_node_name = "context-node".to_string();
-        let fallback_node_name = "fallback-node".to_string();
         let context_deployment_id = "context-deployment".to_string();
         let context_runtime_port = 19000;
-        let fallback_runtime_port = 29000;
         let mut context_lock_clients = HashMap::new();
         context_lock_clients.insert("context-node:9000".to_string(), context_lock_client.clone());
         let context_performance_metrics = Arc::new(PerformanceMetrics::new());
-        let fallback_performance_metrics = Arc::new(PerformanceMetrics::new());
         let context_internode_metrics = Arc::new(InternodeMetrics::default());
-        let fallback_internode_metrics = Arc::new(InternodeMetrics::default());
         let context_s3select_db: Arc<dyn DatabaseManagerSystem + Send + Sync> = Arc::new(TestS3SelectDb);
-        let fallback_s3select_db: Arc<dyn DatabaseManagerSystem + Send + Sync> = Arc::new(TestS3SelectDb);
         let context_outbound_tls_state = GlobalPublishedOutboundTlsState {
             generation: TlsGeneration(41),
             root_ca_pem: Some(b"context-root-ca".to_vec()),
@@ -1003,10 +938,6 @@ mod tests {
         };
         let context_credentials = Credentials {
             access_key: "context-access-key".to_string(),
-            ..Default::default()
-        };
-        let fallback_credentials = Credentials {
-            access_key: "fallback-access-key".to_string(),
             ..Default::default()
         };
         let context_region: s3s::region::Region = "context-region".parse().expect("test region");
@@ -1109,23 +1040,22 @@ mod tests {
         ));
 
         assert!(Arc::ptr_eq(
-            &resolve_kms_runtime_service_manager_with(Some(context.clone()), || Some(fallback_kms.clone()))
-                .expect("context KMS runtime"),
+            &resolve_kms_runtime_service_manager_with(Some(context.clone())).expect("context KMS runtime"),
             &context_kms
         ));
         assert!(Arc::ptr_eq(
-            &resolve_or_init_kms_runtime_service_manager_with(Some(context.clone()), || fallback_kms.clone()),
+            &resolve_or_init_kms_runtime_service_manager_with(Some(context.clone())).expect("context KMS runtime"),
             &context_kms
         ));
         assert_eq!(
-            resolve_outbound_tls_generation_with(Some(context.clone()), || TlsGeneration(99)),
+            resolve_outbound_tls_generation_with(Some(context.clone())).expect("context outbound TLS generation"),
             context_outbound_tls_state.generation
         );
         assert_eq!(
             resolve_outbound_tls_state_with(Some(context.clone())).await.generation,
             context_outbound_tls_state.generation
         );
-        assert!(resolve_iam_ready_with(Some(context.clone()), || false));
+        assert!(resolve_iam_ready_with(Some(context.clone())).expect("context IAM ready"));
         let resolved_oidc = resolve_oidc_handle_with(Some(context.clone()));
         assert!(resolved_oidc.as_ref().is_some_and(|oidc| Arc::ptr_eq(oidc, &context_oidc)));
         assert!(publish_oidc_handle_with(Some(context.clone()), fallback_oidc.clone()));
@@ -1152,11 +1082,14 @@ mod tests {
             context_boot_time
         );
         assert!(
-            resolve_daily_tier_stats_with(Some(context.clone()), || fallback_daily_tier_stats.clone()).contains_key("CONTEXT")
+            resolve_daily_tier_stats_with(Some(context.clone()))
+                .expect("context daily tier stats")
+                .contains_key("CONTEXT")
         );
         assert_eq!(
-            resolve_scanner_metrics_report_with(Some(context.clone()), || async { fallback_scanner_metrics.clone() })
+            resolve_scanner_metrics_report_with(Some(context.clone()))
                 .await
+                .expect("context scanner metrics")
                 .current_cycle,
             context_scanner_metrics.current_cycle
         );
@@ -1172,7 +1105,7 @@ mod tests {
             context_deployment_id
         );
         assert_eq!(
-            resolve_runtime_port_with(Some(context.clone()), || fallback_runtime_port),
+            resolve_runtime_port_with(Some(context.clone())).expect("context runtime port"),
             context_runtime_port
         );
         assert!(Arc::ptr_eq(
@@ -1187,38 +1120,38 @@ mod tests {
             &context_lock_client
         ));
         assert!(Arc::ptr_eq(
-            &resolve_performance_metrics_with(Some(context.clone()), || fallback_performance_metrics.clone()),
+            &resolve_performance_metrics_with(Some(context.clone())).expect("context performance metrics"),
             &context_performance_metrics
         ));
         assert!(Arc::ptr_eq(
-            &resolve_internode_metrics_with(Some(context.clone()), || fallback_internode_metrics.clone()),
+            &resolve_internode_metrics_with(Some(context.clone())).expect("context internode metrics"),
             &context_internode_metrics
         ));
         assert!(Arc::ptr_eq(
-            &resolve_s3select_db_with(Some(context.clone()), test_select_input(), false, |_input, _enable_debug| async {
-                Ok(fallback_s3select_db.clone())
-            })
-            .await
-            .expect("context S3 Select DB"),
+            &resolve_s3select_db_with(context.clone(), test_select_input(), false)
+                .await
+                .expect("context S3 Select DB"),
             &context_s3select_db
         ));
         assert_eq!(
-            resolve_local_node_name_with(Some(context.clone()), || async { fallback_node_name.clone() }).await,
+            resolve_local_node_name_with(Some(context.clone()))
+                .await
+                .expect("context local node name"),
             context_node_name
         );
         assert_eq!(
-            resolve_action_credentials_with(Some(context.clone()), || Some(fallback_credentials.clone()))
+            resolve_action_credentials_with(context.clone())
                 .expect("context action credentials")
                 .access_key,
             context_credentials.access_key
         );
         assert_eq!(resolve_region_with(Some(context.clone())).expect("context region"), context_region);
         assert!(Arc::ptr_eq(
-            &resolve_tier_config_handle_with(Some(context.clone()), TierConfigMgr::new),
+            &resolve_tier_config_handle_with(Some(context.clone())).expect("context tier config"),
             &tier_config
         ));
         assert!(Arc::ptr_eq(
-            &resolve_expiry_state_handle_with(Some(context.clone()), || fallback_expiry_state.clone()),
+            &resolve_expiry_state_handle_with(Some(context.clone())).expect("context expiry state"),
             &context_expiry_state
         ));
         assert_eq!(
@@ -1238,21 +1171,17 @@ mod tests {
         assert_eq!(context_storage_class_published.load(Ordering::SeqCst), 1);
         assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 0);
         assert_eq!(
-            resolve_buffer_config_with(Some(context), || RustFSBufferConfig::new(WorkloadProfile::GeneralPurpose)).workload,
+            resolve_buffer_config_with(Some(context))
+                .expect("context buffer config")
+                .workload,
             WorkloadProfile::AiTraining
         );
 
-        assert!(Arc::ptr_eq(
-            &resolve_kms_runtime_service_manager_with(None, || Some(fallback_kms.clone())).expect("fallback KMS runtime"),
-            &fallback_kms
-        ));
-        assert!(Arc::ptr_eq(
-            &resolve_or_init_kms_runtime_service_manager_with(None, || fallback_kms.clone()),
-            &fallback_kms
-        ));
-        assert_eq!(resolve_outbound_tls_generation_with(None, || TlsGeneration(99)), TlsGeneration(99));
-        assert!(!resolve_iam_ready_with(None, || false));
-        assert!(resolve_iam_handle_with(None, || None).is_none());
+        assert!(resolve_kms_runtime_service_manager_with(None).is_none());
+        assert!(resolve_or_init_kms_runtime_service_manager_with(None).is_none());
+        assert!(resolve_outbound_tls_generation_with(None).is_none());
+        assert!(resolve_iam_ready_with(None).is_none());
+        assert!(resolve_iam_handle_with(None).is_none());
         assert!(resolve_oidc_handle_with(None).is_none());
         assert!(resolve_token_signing_key_with(None).is_none());
         assert!(!publish_oidc_handle_with(None, context_oidc));
@@ -1262,50 +1191,20 @@ mod tests {
         assert!(resolve_object_store_handle_with(None).is_none());
         assert!(resolve_replication_stats_handle_with(None).is_none());
         assert!(resolve_boot_time_with(None).is_none());
-        assert!(resolve_daily_tier_stats_with(None, || fallback_daily_tier_stats.clone()).contains_key("FALLBACK"));
-        assert_eq!(
-            resolve_scanner_metrics_report_with(None, || async { fallback_scanner_metrics.clone() })
-                .await
-                .current_cycle,
-            fallback_scanner_metrics.current_cycle
-        );
+        assert!(resolve_daily_tier_stats_with(None).is_none());
+        assert!(resolve_scanner_metrics_report_with(None).await.is_none());
         assert!(resolve_endpoints_handle_with(None).is_none());
         assert!(resolve_deployment_id_with(None).is_none());
-        assert_eq!(resolve_runtime_port_with(None, || fallback_runtime_port), fallback_runtime_port);
+        assert!(resolve_runtime_port_with(None).is_none());
         assert!(resolve_lock_client_with(None).is_none());
         assert!(resolve_lock_clients_handle_with(None).is_none());
-        assert!(Arc::ptr_eq(
-            &resolve_performance_metrics_with(None, || fallback_performance_metrics.clone()),
-            &fallback_performance_metrics
-        ));
-        assert!(Arc::ptr_eq(
-            &resolve_internode_metrics_with(None, || fallback_internode_metrics.clone()),
-            &fallback_internode_metrics
-        ));
-        assert!(Arc::ptr_eq(
-            &resolve_s3select_db_with(None, test_select_input(), false, |_input, _enable_debug| async {
-                Ok(fallback_s3select_db.clone())
-            })
-            .await
-            .expect("fallback S3 Select DB"),
-            &fallback_s3select_db
-        ));
-        assert_eq!(
-            resolve_local_node_name_with(None, || async { fallback_node_name.clone() }).await,
-            fallback_node_name
-        );
-        assert_eq!(
-            resolve_action_credentials_with(None, || Some(fallback_credentials.clone()))
-                .expect("fallback action credentials")
-                .access_key,
-            fallback_credentials.access_key
-        );
+        assert!(resolve_performance_metrics_with(None).is_none());
+        assert!(resolve_internode_metrics_with(None).is_none());
+        assert!(resolve_local_node_name_with(None).await.is_none());
+        assert!(resolve_action_credentials().is_none());
         assert!(resolve_region_with(None).is_none());
-        assert!(Arc::ptr_eq(&resolve_tier_config_handle_with(None, || tier_config.clone()), &tier_config));
-        assert!(Arc::ptr_eq(
-            &resolve_expiry_state_handle_with(None, || fallback_expiry_state.clone()),
-            &fallback_expiry_state
-        ));
+        assert!(resolve_tier_config_handle_with(None).is_none());
+        assert!(resolve_expiry_state_handle_with(None).is_none());
         assert!(resolve_server_config_with(None).is_none());
         publish_server_config_with(None, Config::new(), |config| {
             drop(config);
@@ -1317,9 +1216,6 @@ mod tests {
             fallback_storage_class_published.fetch_add(1, Ordering::SeqCst);
         });
         assert_eq!(fallback_storage_class_published.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            resolve_buffer_config_with(None, || RustFSBufferConfig::new(WorkloadProfile::DataAnalytics)).workload,
-            WorkloadProfile::DataAnalytics
-        );
+        assert!(resolve_buffer_config_with(None).is_none());
     }
 }
