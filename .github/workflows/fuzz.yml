@@ -65,7 +65,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -76,7 +76,7 @@ jobs:
           cache-save-if: ${{ github.ref == 'refs/heads/main' || github.event_name == 'schedule' }}
 
       - name: Install cargo-fuzz
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@bffeee26d4db9be238a4ea78d8826604ebcb594d # v2
         with:
           tool: cargo-fuzz
 
@@ -92,7 +92,7 @@ jobs:
           done
 
       - name: Upload prebuilt fuzz binaries
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fuzz-prebuilt-binaries-${{ github.run_number }}
           path: |
@@ -123,10 +123,10 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download prebuilt fuzz binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fuzz-prebuilt-binaries-${{ github.run_number }}
           path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
@@ -145,7 +145,7 @@ jobs:
 
       - name: Upload fuzz smoke artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fuzz-smoke-${{ matrix.target }}-${{ github.run_number }}
           path: |
@@ -174,10 +174,10 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download prebuilt fuzz binaries
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: fuzz-prebuilt-binaries-${{ github.run_number }}
           path: fuzz/prebuilt/${{ env.CARGO_BUILD_TARGET }}/release
@@ -196,7 +196,7 @@ jobs:
 
       - name: Upload nightly fuzz artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: fuzz-nightly-${{ matrix.target }}-${{ github.run_number }}
           path: |

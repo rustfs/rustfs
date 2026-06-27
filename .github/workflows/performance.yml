@@ -46,7 +46,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -60,7 +60,7 @@ jobs:
         run: rustup component add llvm-tools-preview
 
       - name: Install samply profiler
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:
           tool: samply
 
@@ -109,7 +109,7 @@ jobs:
 
       - name: Upload profile data
         if: steps.profiling.outputs.profile_generated == 'true'
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: performance-profile-${{ github.run_number }}
           path: samply-profile.json
@@ -123,7 +123,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -139,7 +139,7 @@ jobs:
           tee benchmark-results.json
 
       - name: Upload benchmark results
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: benchmark-results-${{ github.run_number }}
           path: benchmark-results.json

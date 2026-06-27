@@ -21,6 +21,7 @@ use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_di
 #[cfg(test)]
 use crate::storage_api::server::readiness::{Endpoints, PoolEndpoints};
 use bytes::Bytes;
+use http::HeaderValue;
 use http::{Request as HttpRequest, Response, StatusCode};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
@@ -160,8 +161,32 @@ fn is_probe_path(path: &str) -> bool {
     is_exact_probe || is_prefix_probe
 }
 
+fn readiness_gate_blocks_path(path: &str, readiness: &GlobalReadiness) -> bool {
+    !is_probe_path(path) && !readiness.is_ready()
+}
+
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type BoxBody = http_body_util::combinators::UnsyncBoxBody<Bytes, BoxError>;
+
+fn service_not_ready_response() -> Response<BoxBody> {
+    let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
+        .map_err(|e| -> BoxError { Box::new(e) })
+        .boxed_unsync();
+
+    let mut response = Response::new(body);
+    *response.status_mut() = StatusCode::SERVICE_UNAVAILABLE;
+    response
+        .headers_mut()
+        .insert(http::header::RETRY_AFTER, HeaderValue::from_static("5"));
+    response
+        .headers_mut()
+        .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("text/plain; charset=utf-8"));
+    response
+        .headers_mut()
+        .insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
+}
+
 impl<S, B> Service<HttpRequest<Incoming>> for ReadinessGateService<S>
 where
     S: Service<HttpRequest<Incoming>, Response = Response<B>> + Clone + Send + 'static,
@@ -184,20 +209,8 @@ where
         Box::pin(async move {
             let path = req.uri().path();
             debug!("ReadinessGateService: Received request for path: {}", path);
-            let is_probe = is_probe_path(path);
-            if !is_probe && !readiness.is_ready() {
-                let body: BoxBody = Full::new(Bytes::from_static(b"Service not ready"))
-                    .map_err(|e| -> BoxError { Box::new(e) })
-                    .boxed_unsync();
-
-                let resp = Response::builder()
-                    .status(StatusCode::SERVICE_UNAVAILABLE)
-                    .header(http::header::RETRY_AFTER, "5")
-                    .header(http::header::CONTENT_TYPE, "text/plain; charset=utf-8")
-                    .header(http::header::CACHE_CONTROL, "no-store")
-                    .body(body)
-                    .expect("failed to build not ready response");
-                return Ok(resp);
+            if readiness_gate_blocks_path(path, &readiness) {
+                return Ok(service_not_ready_response());
             }
             let resp = inner.call(req).await?;
             // System is ready, forward to the actual S3/RPC handlers
@@ -1128,6 +1141,51 @@ mod tests {
         assert!(!is_probe_path("/minio/adminx/object"));
         assert!(!is_probe_path("/rustfs/adminx/object"));
         assert!(!is_probe_path("/bucket/object"));
+    }
+
+    #[test]
+    fn readiness_gate_blocks_normal_paths_until_runtime_ready() {
+        let readiness = GlobalReadiness::new();
+
+        assert!(readiness_gate_blocks_path("/bucket/object", &readiness));
+        assert!(!readiness_gate_blocks_path(crate::server::HEALTH_READY_PATH, &readiness));
+        assert!(!readiness_gate_blocks_path("/minio/admin/v3/info", &readiness));
+
+        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+        assert!(!readiness_gate_blocks_path("/bucket/object", &readiness));
+    }
+
+    #[tokio::test]
+    async fn service_not_ready_response_preserves_observable_contract() {
+        let response = service_not_ready_response();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok()),
+            Some("5")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CACHE_CONTROL)
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("text/plain; charset=utf-8")
+        );
+        let body = match response.into_body().collect().await {
+            Ok(body) => body.to_bytes(),
+            Err(err) => panic!("not-ready body should collect: {err}"),
+        };
+        assert_eq!(body, Bytes::from_static(b"Service not ready"));
     }
 
     #[test]
