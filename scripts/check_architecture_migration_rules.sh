@@ -62,6 +62,11 @@ require_source_contains "docs/architecture/readiness-matrix.md" "StorageReady" "
 require_source_contains "docs/architecture/readiness-matrix.md" "IamReady" "readiness matrix IAM dependency"
 require_source_contains "docs/architecture/readiness-matrix.md" "FullReady" "readiness matrix full readiness dependency"
 require_source_contains "docs/architecture/readiness-matrix.md" "RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE" "readiness matrix peer health gate"
+require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Remaining Global Owners" "global state plan owner inventory"
+require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Runtime Source Boundaries" "global state plan runtime source section"
+require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Fallback Removal Plan" "global state plan fallback section"
+require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Crate Split Evaluation" "global state plan crate split section"
+require_source_contains "docs/architecture/global-state-crate-split-plan.md" "rustfs_ecstore::api::global" "global state plan facade boundary"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -144,6 +149,9 @@ RUSTFS_APP_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_app_ecstore_source_hits.t
 RUSTFS_ADMIN_ECSTORE_SOURCE_HITS_FILE="${TMP_DIR}/rustfs_admin_ecstore_source_hits.txt"
 EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_ecstore_compat_bypass_hits.txt"
 EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_storage_api_bypass_hits.txt"
+GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE="${TMP_DIR}/global_facade_boundary_expected.txt"
+GLOBAL_FACADE_BOUNDARY_ACTUAL_FILE="${TMP_DIR}/global_facade_boundary_actual.txt"
+GLOBAL_FACADE_BOUNDARY_DIFF_FILE="${TMP_DIR}/global_facade_boundary_diff.txt"
 EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/external_storage_api_domain_bypass_hits.txt"
 EXTERNAL_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/external_storage_api_root_reexport_hits.txt"
 RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_api_root_reexport_hits.txt"
@@ -1515,6 +1523,27 @@ fi
 
 if [[ -s "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
   report_failure "external runtime crates must source ECStore API symbols through their local storage_api boundary: $(paste -sd '; ' "$EXTERNAL_RUNTIME_ECSTORE_COMPAT_BYPASS_HITS_FILE")"
+fi
+
+cat >"$GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE" <<'EOF'
+crates/heal/src/heal/storage_api.rs
+crates/iam/src/storage_api.rs
+crates/notify/src/storage_api.rs
+crates/obs/src/metrics/storage_api.rs
+crates/protocols/src/swift/storage_api.rs
+crates/s3select-api/src/storage_api.rs
+crates/scanner/src/storage_api.rs
+crates/scanner/tests/storage_api/mod.rs
+rustfs/src/storage/storage_api.rs
+EOF
+
+(
+  cd "$ROOT_DIR"
+  rg -l 'rustfs_ecstore::api::global' crates rustfs/src --glob '*.rs' | LC_ALL=C sort
+) >"$GLOBAL_FACADE_BOUNDARY_ACTUAL_FILE"
+
+if ! diff -u "$GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE" "$GLOBAL_FACADE_BOUNDARY_ACTUAL_FILE" >"$GLOBAL_FACADE_BOUNDARY_DIFF_FILE"; then
+  report_failure "ECStore global facade access must stay inside reviewed local storage_api boundaries: $(tr '\n' '; ' <"$GLOBAL_FACADE_BOUNDARY_DIFF_FILE")"
 fi
 
 (

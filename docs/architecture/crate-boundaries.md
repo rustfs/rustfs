@@ -50,6 +50,9 @@ their required sections:
   Required Architecture Documents.
 - `docs/architecture/readiness-matrix.md`: Request Behavior Matrix, Runtime
   Dependency Matrix, Probe Semantics.
+- `docs/architecture/global-state-crate-split-plan.md`: Remaining Global
+  Owners, Runtime Source Boundaries, Fallback Removal Plan, Crate Split
+  Evaluation.
 
 ## Pre-Push Expert Review
 
