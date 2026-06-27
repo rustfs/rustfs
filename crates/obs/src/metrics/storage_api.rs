@@ -26,8 +26,8 @@ pub(crate) use rustfs_ecstore::api::capacity::{
 };
 pub(crate) use rustfs_ecstore::api::data_usage::load_data_usage_from_backend as obs_load_data_usage_from_backend;
 pub(crate) use rustfs_ecstore::api::error::Result as ObsEcstoreResult;
-pub(crate) use rustfs_ecstore::api::global::{
-    get_global_bucket_monitor as obs_get_global_bucket_monitor, resolve_object_store_handle as obs_resolve_object_store_handle,
+pub(crate) use rustfs_ecstore::api::runtime::{
+    bucket_monitor as obs_get_global_bucket_monitor, object_store_handle as obs_resolve_object_store_handle,
 };
 pub(crate) use rustfs_ecstore::api::storage::ECStore as ObsStore;
 use rustfs_storage_api as storage_contracts;

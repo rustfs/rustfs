@@ -19,7 +19,7 @@ use rustfs_ecstore::api::bucket::metadata_sys::{
     get as get_swift_bucket_metadata_from_backend, set_bucket_metadata as set_swift_bucket_metadata_in_backend,
 };
 pub(crate) use rustfs_ecstore::api::error::Result as SwiftStorageResult;
-pub(crate) use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_swift_object_store_handle;
+pub(crate) use rustfs_ecstore::api::runtime::object_store_handle as resolve_swift_object_store_handle;
 use rustfs_ecstore::api::storage::ECStore as SwiftStore;
 use rustfs_storage_api as storage_contracts;
 

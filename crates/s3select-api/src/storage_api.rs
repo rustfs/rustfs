@@ -20,7 +20,7 @@ use rustfs_ecstore::api::error::{
     is_err_object_not_found as select_is_err_object_not_found_from_backend,
     is_err_version_not_found as select_is_err_version_not_found_from_backend,
 };
-use rustfs_ecstore::api::global::resolve_object_store_handle as resolve_select_object_store_handle_from_backend;
+use rustfs_ecstore::api::runtime::object_store_handle as resolve_select_object_store_handle_from_backend;
 pub(crate) use rustfs_ecstore::api::set_disk::DEFAULT_READ_BUFFER_SIZE as SELECT_DEFAULT_READ_BUFFER_SIZE;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as SelectStore;
 use rustfs_storage_api as storage_contracts;
