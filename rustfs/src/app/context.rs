@@ -116,11 +116,9 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
     resolve_object_store_handle_for_context(context.as_deref())
 }
 
-/// Resolve object store handle using an explicit AppContext, falling back to the legacy global object layer.
+/// Resolve object store handle using an explicit AppContext.
 pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
-    context
-        .map(|context| context.object_store())
-        .or_else(runtime_sources::object_store)
+    context.map(|context| context.object_store())
 }
 
 /// Resolve notify interface using AppContext-first precedence.
@@ -436,9 +434,9 @@ where
 #[cfg(test)]
 fn resolve_object_store_handle_with(
     context: Option<Arc<AppContext>>,
-    fallback: impl FnOnce() -> Option<Arc<ECStore>>,
+    _fallback: impl FnOnce() -> Option<Arc<ECStore>>,
 ) -> Option<Arc<ECStore>> {
-    context.map(|context| context.object_store()).or_else(fallback)
+    context.map(|context| context.object_store())
 }
 
 fn resolve_endpoints_handle_with(
@@ -940,11 +938,6 @@ mod tests {
     }
 
     async fn test_store() -> (TempDir, Arc<ECStore>, EndpointServerPools) {
-        if let Some(store) = runtime_sources::object_store() {
-            let endpoints = EndpointServerPools(store.pools.iter().map(|pool| pool.endpoints.clone()).collect());
-            return (tempfile::tempdir().expect("compat test temp dir"), store, endpoints);
-        }
-
         let temp_dir = tempfile::tempdir().expect("test temp dir");
         let disk_paths = (0..4)
             .map(|index| temp_dir.path().join(format!("disk{index}")))
@@ -972,10 +965,6 @@ mod tests {
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
-
-        if let Some(store) = runtime_sources::object_store() {
-            return (temp_dir, store, endpoint_pools);
-        }
 
         init_local_disks(endpoint_pools.clone()).await.expect("test local disks");
         let store = ECStore::new(
@@ -1326,10 +1315,7 @@ mod tests {
             &resolve_bucket_metadata_handle_with(None, || Some(bucket_metadata.clone())).expect("fallback bucket metadata"),
             &bucket_metadata
         ));
-        assert!(Arc::ptr_eq(
-            &resolve_object_store_handle_with(None, || Some(object_store.clone())).expect("fallback object store"),
-            &object_store
-        ));
+        assert!(resolve_object_store_handle_with(None, || Some(object_store.clone())).is_none());
         assert!(Arc::ptr_eq(
             &resolve_replication_stats_handle_with(None, || Some(fallback_replication_stats.clone()))
                 .expect("fallback replication stats"),
