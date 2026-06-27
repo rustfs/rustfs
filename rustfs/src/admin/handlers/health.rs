@@ -92,7 +92,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_ready() {
-        let state = health_check_state(true, true, true, HealthProbe::Readiness);
+        let state = health_check_state(true, true, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
@@ -100,7 +100,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_storage_not_ready() {
-        let state = health_check_state(false, true, true, HealthProbe::Readiness);
+        let state = health_check_state(false, true, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -108,7 +108,7 @@ mod tests {
 
     #[test]
     fn test_liveness_state_iam_not_ready() {
-        let state = health_check_state(true, false, true, HealthProbe::Liveness);
+        let state = health_check_state(true, false, true, true, HealthProbe::Liveness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
@@ -116,7 +116,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_iam_not_ready() {
-        let state = health_check_state(true, false, true, HealthProbe::Readiness);
+        let state = health_check_state(true, false, true, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -124,7 +124,7 @@ mod tests {
 
     #[test]
     fn test_readiness_state_lock_not_ready() {
-        let state = health_check_state(true, true, false, HealthProbe::Readiness);
+        let state = health_check_state(true, true, false, true, HealthProbe::Readiness);
         assert_eq!(state.status_code, StatusCode::OK);
         assert_eq!(state.status, "ok");
         assert!(state.ready);
@@ -132,7 +132,7 @@ mod tests {
 
     #[test]
     fn test_cluster_write_state_lock_not_ready() {
-        let state = health_check_state(true, true, false, HealthProbe::ClusterWrite);
+        let state = health_check_state(true, true, false, true, HealthProbe::ClusterWrite);
         assert_eq!(state.status_code, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(state.status, "degraded");
         assert!(!state.ready);
@@ -197,6 +197,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
         };
@@ -218,6 +219,7 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };
@@ -239,6 +241,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
@@ -265,6 +268,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: false,
                 lock_quorum_ready: false,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageAndIamUnavailable],
         };
@@ -282,7 +286,7 @@ mod tests {
 
     #[test]
     fn test_build_health_payload_minimal_mode_returns_status_and_ready_only() {
-        let health = health_check_state(true, false, true, HealthProbe::Readiness);
+        let health = health_check_state(true, false, true, true, HealthProbe::Readiness);
         with_var(rustfs_config::ENV_HEALTH_MINIMAL_RESPONSE_ENABLE, Some("true"), || {
             let payload = build_health_payload(HealthPayloadContext {
                 health,
@@ -306,7 +310,7 @@ mod tests {
 
     #[test]
     fn test_build_health_payload_includes_degraded_reasons() {
-        let health = health_check_state(false, false, false, HealthProbe::Readiness);
+        let health = health_check_state(false, false, false, true, HealthProbe::Readiness);
         let payload = build_health_payload(HealthPayloadContext {
             health,
             storage_ready: false,
@@ -328,6 +332,7 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };
@@ -344,6 +349,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![crate::server::ReadinessDegradedReason::StorageQuorumUnavailable],
         };
@@ -363,6 +369,7 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         };

@@ -88,6 +88,7 @@ pub(crate) fn health_check_state(
     storage_ready: bool,
     iam_ready: bool,
     lock_quorum_ready: bool,
+    peer_health_ready: bool,
     probe: HealthProbe,
 ) -> HealthCheckState {
     if probe == HealthProbe::Liveness {
@@ -98,7 +99,7 @@ pub(crate) fn health_check_state(
         };
     }
 
-    let ready = storage_ready && iam_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
+    let ready = storage_ready && iam_ready && peer_health_ready && (!probe.requires_lock_quorum() || lock_quorum_ready);
     let status = if ready { "ok" } else { "degraded" };
 
     let status_code = if ready {
@@ -184,11 +185,12 @@ pub(crate) fn build_health_response_parts(
                 let storage_ready = readiness_report.readiness.storage_ready;
                 let iam_ready = readiness_report.readiness.iam_ready;
                 let lock_quorum_ready = readiness_report.readiness.lock_quorum_ready;
+                let peer_health_ready = readiness_report.readiness.peer_health_ready;
                 (
                     storage_ready,
                     iam_ready,
                     lock_quorum_ready,
-                    health_check_state(storage_ready, iam_ready, lock_quorum_ready, probe),
+                    health_check_state(storage_ready, iam_ready, lock_quorum_ready, peer_health_ready, probe),
                     readiness_report.degraded_reasons.clone(),
                     true,
                 )
@@ -205,9 +207,14 @@ pub(crate) fn build_health_response_parts(
                 vec![ReadinessDegradedReason::StorageIamAndLockUnavailable],
                 true,
             ),
-            (HealthProbe::Liveness, _) => {
-                (false, false, false, health_check_state(false, false, false, probe), Vec::new(), false)
-            }
+            (HealthProbe::Liveness, _) => (
+                false,
+                false,
+                false,
+                health_check_state(false, false, false, false, probe),
+                Vec::new(),
+                false,
+            ),
         };
 
     if probe == HealthProbe::Readiness && matches!(kms_ready, Some(false)) {

@@ -434,6 +434,7 @@ pub(crate) struct ClusterRuntimeStatusView {
     pub storage_ready: bool,
     pub iam_ready: bool,
     pub lock_quorum_ready: bool,
+    pub peer_health_ready: bool,
     pub degraded_reasons: Vec<&'static str>,
 }
 
@@ -444,6 +445,7 @@ impl From<ClusterRuntimeStatusSnapshot> for ClusterRuntimeStatusView {
             storage_ready: runtime.readiness.storage_ready,
             iam_ready: runtime.readiness.iam_ready,
             lock_quorum_ready: runtime.readiness.lock_quorum_ready,
+            peer_health_ready: runtime.readiness.peer_health_ready,
             degraded_reasons: runtime.degraded_reasons.into_iter().map(|reason| reason.as_str()).collect(),
         }
     }
@@ -767,6 +769,7 @@ mod tests {
                     storage_ready: false,
                     iam_ready: true,
                     lock_quorum_ready: false,
+                    peer_health_ready: true,
                 },
                 state: ClusterRuntimeReadinessState::Degraded,
                 degraded_reasons: vec![ReadinessDegradedReason::StorageAndLockUnavailable],
@@ -808,6 +811,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: true,
+                    peer_health_ready: true,
                 },
                 state: ClusterRuntimeReadinessState::Ready,
                 degraded_reasons: Vec::new(),

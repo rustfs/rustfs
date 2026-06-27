@@ -15,6 +15,7 @@
 use crate::server::runtime_sources;
 use crate::server::{ServiceState, ServiceStateManager};
 use crate::server::{has_path_prefix, is_table_catalog_path};
+use crate::storage_api::cluster::control_plane::ClusterControlPlane;
 use crate::storage_api::server::readiness::contract::admin::StorageAdminApi;
 use crate::storage_api::server::readiness::{Endpoint, EndpointServerPools, is_dist_erasure};
 #[cfg(test)]
@@ -51,6 +52,7 @@ pub struct DependencyReadiness {
     pub storage_ready: bool,
     pub iam_ready: bool,
     pub lock_quorum_ready: bool,
+    pub peer_health_ready: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,7 @@ pub enum ReadinessDegradedReason {
     LockQuorumUnavailable,
     KmsNotReady,
     ClusterHealthTimeout,
+    PeerHealthUnavailable,
     StorageAndIamUnavailable,
     StorageAndLockUnavailable,
     IamAndLockUnavailable,
@@ -74,6 +77,7 @@ impl ReadinessDegradedReason {
             ReadinessDegradedReason::LockQuorumUnavailable => "lock_quorum_unavailable",
             ReadinessDegradedReason::KmsNotReady => "kms_not_ready",
             ReadinessDegradedReason::ClusterHealthTimeout => "cluster_health_timeout",
+            ReadinessDegradedReason::PeerHealthUnavailable => "peer_health_unavailable",
             ReadinessDegradedReason::StorageAndIamUnavailable => "storage_and_iam_unavailable",
             ReadinessDegradedReason::StorageAndLockUnavailable => "storage_and_lock_unavailable",
             ReadinessDegradedReason::IamAndLockUnavailable => "iam_and_lock_unavailable",
@@ -223,6 +227,7 @@ pub async fn publish_ready_when_runtime_ready(
                 storage_ready = dependency_readiness.storage_ready,
                 iam_ready = dependency_readiness.iam_ready,
                 lock_quorum_ready = dependency_readiness.lock_quorum_ready,
+                peer_health_ready = dependency_readiness.peer_health_ready,
                 "Runtime node readiness reached; publishing ready state"
             );
         },
@@ -531,7 +536,36 @@ fn storage_read_ready_from_runtime_state(info: &StorageInfo) -> bool {
     storage_ready_from_runtime_state_with_quorum(info, pool_read_quorum)
 }
 
-fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
+fn peer_health_ready_check_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE,
+        rustfs_config::DEFAULT_HEALTH_PEER_READY_CHECK_ENABLE,
+    )
+}
+
+fn peer_health_ready_from_endpoint_pools(endpoint_pools: &EndpointServerPools) -> bool {
+    if !peer_health_ready_check_enabled() {
+        return true;
+    }
+
+    ClusterControlPlane::new(endpoint_pools.clone())
+        .peer_health_snapshot()
+        .peers
+        .iter()
+        .all(|peer| peer.status.state.is_supported())
+}
+
+fn collect_peer_health_readiness() -> bool {
+    if !peer_health_ready_check_enabled() {
+        return true;
+    }
+
+    runtime_sources::endpoints_handle()
+        .as_ref()
+        .is_some_and(peer_health_ready_from_endpoint_pools)
+}
+
+fn base_degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready: bool) -> Vec<ReadinessDegradedReason> {
     match (storage_ready, iam_ready_raw, lock_quorum_ready) {
         (true, true, true) => Vec::new(),
         (false, false, false) => vec![ReadinessDegradedReason::StorageIamAndLockUnavailable],
@@ -544,8 +578,19 @@ fn degraded_reasons(storage_ready: bool, iam_ready_raw: bool, lock_quorum_ready:
     }
 }
 
+fn degraded_reasons(readiness: DependencyReadiness) -> Vec<ReadinessDegradedReason> {
+    let mut reasons = base_degraded_reasons(readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready);
+    if !readiness.peer_health_ready {
+        reasons.push(ReadinessDegradedReason::PeerHealthUnavailable);
+    }
+    reasons
+}
+
 fn record_readiness_report(report: &DependencyReadinessReport) {
-    let ready = report.readiness.storage_ready && report.readiness.iam_ready && report.readiness.lock_quorum_ready;
+    let ready = report.readiness.storage_ready
+        && report.readiness.iam_ready
+        && report.readiness.lock_quorum_ready
+        && report.readiness.peer_health_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
@@ -554,7 +599,7 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
 
 fn dependency_readiness_report_from_readiness(readiness: DependencyReadiness) -> DependencyReadinessReport {
     DependencyReadinessReport {
-        degraded_reasons: degraded_reasons(readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready),
+        degraded_reasons: degraded_reasons(readiness),
         readiness,
     }
 }
@@ -574,6 +619,7 @@ pub async fn collect_dependency_readiness_report() -> DependencyReadinessReport 
         storage_ready,
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
+        peer_health_ready: collect_peer_health_readiness(),
     };
     let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
@@ -593,6 +639,7 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
         storage_ready: runtime_sources::object_store_handle().is_some(),
         iam_ready: runtime_sources::iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status().await.ready,
+        peer_health_ready: collect_peer_health_readiness(),
     };
     let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
@@ -630,6 +677,7 @@ fn cluster_health_timeout_report() -> DependencyReadinessReport {
             storage_ready: false,
             iam_ready: false,
             lock_quorum_ready: false,
+            peer_health_ready: false,
         },
         degraded_reasons: vec![ReadinessDegradedReason::ClusterHealthTimeout],
     }
@@ -648,6 +696,7 @@ pub async fn collect_cluster_read_dependency_readiness_report() -> DependencyRea
         storage_ready,
         iam_ready: iam_ready_raw,
         lock_quorum_ready: lock_quorum_status.ready,
+        peer_health_ready: collect_peer_health_readiness(),
     };
     let report = dependency_readiness_report_from_readiness(readiness);
     record_readiness_report(&report);
@@ -659,6 +708,7 @@ pub(crate) async fn snapshot_dependency_readiness_report() -> DependencyReadines
         storage_ready: collect_storage_readiness_uncached().await,
         iam_ready: runtime_sources::iam_ready(),
         lock_quorum_ready: collect_lock_quorum_status_uncached().await.ready,
+        peer_health_ready: collect_peer_health_readiness(),
     };
 
     dependency_readiness_report_from_readiness(readiness)
@@ -810,18 +860,19 @@ where
 
     loop {
         let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready {
+        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready && readiness.peer_health_ready {
             on_ready(readiness);
             return Ok(());
         }
 
         if tokio::time::Instant::now() >= startup_deadline {
             let reason = format!(
-                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}",
+                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
                 max_wait.as_secs(),
                 readiness.storage_ready,
                 readiness.iam_ready,
-                readiness.lock_quorum_ready
+                readiness.lock_quorum_ready,
+                readiness.peer_health_ready
             );
             return Err(std::io::Error::other(reason));
         }
@@ -831,6 +882,7 @@ where
             storage_ready = readiness.storage_ready,
             iam_ready = readiness.iam_ready,
             lock_quorum_ready = readiness.lock_quorum_ready,
+            peer_health_ready = readiness.peer_health_ready,
             "Runtime node readiness has not been reached yet; delaying ready state publication"
         );
         tokio::time::sleep(poll_interval).await;
@@ -844,13 +896,53 @@ mod tests {
     use serial_test::serial;
     use std::future;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use temp_env::async_with_vars;
+    use temp_env::{async_with_vars, with_var};
 
     #[test]
     fn startup_runtime_readiness_wait_constants_are_ordered() {
         assert!(STARTUP_RUNTIME_READINESS_MAX_WAIT > STARTUP_RUNTIME_READINESS_POLL_INTERVAL);
         assert_eq!(STARTUP_RUNTIME_READINESS_MAX_WAIT.as_secs(), 30);
         assert_eq!(STARTUP_RUNTIME_READINESS_POLL_INTERVAL.as_secs(), 1);
+    }
+
+    fn peer_health_test_pools() -> EndpointServerPools {
+        EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(vec![
+                Endpoint {
+                    url: url::Url::parse("http://node1:9000/data1").expect("test endpoint url"),
+                    is_local: true,
+                    pool_idx: 0,
+                    set_idx: 0,
+                    disk_idx: 0,
+                },
+                Endpoint {
+                    url: url::Url::parse("http://node2:9000/data2").expect("test endpoint url"),
+                    is_local: false,
+                    pool_idx: 0,
+                    set_idx: 0,
+                    disk_idx: 1,
+                },
+            ]),
+            cmd_line: String::new(),
+            platform: String::new(),
+        }])
+    }
+
+    #[test]
+    fn peer_health_gate_defaults_to_ready() {
+        with_var(rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE, Some("false"), || {
+            assert!(peer_health_ready_from_endpoint_pools(&peer_health_test_pools()));
+        });
+    }
+
+    #[test]
+    fn peer_health_gate_degrades_unknown_peer_health_when_enabled() {
+        with_var(rustfs_config::ENV_HEALTH_PEER_READY_CHECK_ENABLE, Some("true"), || {
+            assert!(!peer_health_ready_from_endpoint_pools(&peer_health_test_pools()));
+        });
     }
 
     #[tokio::test]
@@ -869,6 +961,7 @@ mod tests {
                         storage_ready: true,
                         iam_ready: true,
                         lock_quorum_ready: true,
+                        peer_health_ready: true,
                     },
                     degraded_reasons: Vec::new(),
                 };
@@ -924,6 +1017,7 @@ mod tests {
                             storage_ready: true,
                             iam_ready: true,
                             lock_quorum_ready: true,
+                            peer_health_ready: true,
                         },
                         degraded_reasons: Vec::new(),
                     }
@@ -951,6 +1045,7 @@ mod tests {
                     storage_ready: false,
                     iam_ready: false,
                     lock_quorum_ready: false,
+                    peer_health_ready: true,
                 })
             },
             |_| {
@@ -979,6 +1074,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: false,
+                    peer_health_ready: true,
                 })
             },
             |_| {
@@ -1007,6 +1103,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: true,
+                    peer_health_ready: true,
                 })
             },
             |_| {
@@ -1276,16 +1373,34 @@ mod tests {
 
     #[test]
     fn degraded_reasons_include_lock_quorum_failures() {
-        assert_eq!(degraded_reasons(true, true, false), vec![ReadinessDegradedReason::LockQuorumUnavailable]);
         assert_eq!(
-            degraded_reasons(false, true, false),
+            base_degraded_reasons(true, true, false),
+            vec![ReadinessDegradedReason::LockQuorumUnavailable]
+        );
+        assert_eq!(
+            base_degraded_reasons(false, true, false),
             vec![ReadinessDegradedReason::StorageAndLockUnavailable]
         );
-        assert_eq!(degraded_reasons(true, false, false), vec![ReadinessDegradedReason::IamAndLockUnavailable]);
         assert_eq!(
-            degraded_reasons(false, false, false),
+            base_degraded_reasons(true, false, false),
+            vec![ReadinessDegradedReason::IamAndLockUnavailable]
+        );
+        assert_eq!(
+            base_degraded_reasons(false, false, false),
             vec![ReadinessDegradedReason::StorageIamAndLockUnavailable]
         );
+    }
+
+    #[test]
+    fn degraded_reasons_append_peer_health_gate_failures() {
+        let readiness = DependencyReadiness {
+            storage_ready: true,
+            iam_ready: true,
+            lock_quorum_ready: true,
+            peer_health_ready: false,
+        };
+
+        assert_eq!(degraded_reasons(readiness), vec![ReadinessDegradedReason::PeerHealthUnavailable]);
     }
 
     #[tokio::test]
