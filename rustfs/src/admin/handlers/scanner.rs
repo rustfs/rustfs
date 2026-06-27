@@ -14,7 +14,7 @@
 
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::resolve_scanner_metrics_report;
+use crate::admin::runtime_sources::current_scanner_metrics_report;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use http::{HeaderMap, HeaderValue};
@@ -85,7 +85,7 @@ impl Operation for ScannerStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let _cred = validate_scanner_status_request(&req).await?;
         let response = ScannerStatusResponse {
-            metrics: resolve_scanner_metrics_report().await,
+            metrics: current_scanner_metrics_report().await,
             runtime_config: rustfs_scanner::scanner_runtime_config_status(),
         };
         let body = serde_json::to_vec(&response).map_err(|err| {

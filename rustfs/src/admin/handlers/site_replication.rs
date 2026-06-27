@@ -15,9 +15,9 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{
-    current_object_store_handle, current_server_config, resolve_deployment_id, resolve_endpoints_handle, resolve_iam_handle,
-    resolve_oidc_handle, resolve_outbound_tls_generation, resolve_outbound_tls_state, resolve_region,
-    resolve_replication_pool_handle, resolve_replication_stats_handle, resolve_runtime_port, resolve_token_signing_key,
+    current_deployment_id, current_endpoints_handle, current_iam_handle, current_object_store_handle, current_oidc_handle,
+    current_outbound_tls_generation, current_outbound_tls_state, current_region, current_replication_pool_handle,
+    current_replication_stats_handle, current_runtime_port, current_server_config, current_token_signing_key,
 };
 use crate::admin::site_replication_identity::{
     canonical_endpoint, deployment_id_for_endpoint, normalize_peer_map_by_identity_with, same_identity_endpoint,
@@ -687,14 +687,14 @@ fn build_site_replication_peer_client(outbound_tls: &GlobalPublishedOutboundTlsS
 }
 
 async fn site_replication_peer_client() -> S3Result<reqwest::Client> {
-    let generation = resolve_outbound_tls_generation().0;
+    let generation = current_outbound_tls_generation().0;
     let cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
     if let Some(hit) = site_replication_peer_client_cache_hit(&cache, generation) {
         return hit;
     }
     drop(cache);
 
-    let outbound_tls = resolve_outbound_tls_state().await;
+    let outbound_tls = current_outbound_tls_state().await;
     let built = build_site_replication_peer_client(&outbound_tls);
     let cache_entry = match &built {
         Ok(client) => SiteReplicationPeerClientCacheEntry::Ready(client.clone()),
@@ -732,7 +732,7 @@ fn runtime_tls_enabled_with(endpoints: Option<&crate::admin::storage_api::runtim
 }
 
 fn runtime_tls_enabled() -> bool {
-    let endpoints = resolve_endpoints_handle();
+    let endpoints = current_endpoints_handle();
     runtime_tls_enabled_with(endpoints.as_ref())
 }
 
@@ -883,7 +883,7 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
         .map(str::to_string)
         .or_else(|| uri.authority().map(|value| value.as_str().to_string()))
         .or_else(|| {
-            resolve_endpoints_handle().and_then(|endpoints| {
+            current_endpoints_handle().and_then(|endpoints| {
                 endpoints
                     .as_ref()
                     .iter()
@@ -892,7 +892,7 @@ fn request_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
                     .map(|endpoint| endpoint.host_port())
             })
         })
-        .unwrap_or_else(|| format!("127.0.0.1:{}", resolve_runtime_port()));
+        .unwrap_or_else(|| format!("127.0.0.1:{}", current_runtime_port()));
 
     format!("{scheme}://{host}")
 }
@@ -920,7 +920,7 @@ fn site_replication_local_endpoint(uri: &Uri, headers: &HeaderMap) -> String {
             if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
                 return request_endpoint(&Uri::from_static("/"), &HeaderMap::new());
             }
-            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(resolve_runtime_port())).is_ok() {
+            if parsed.port_or_known_default() == runtime_console_port() && parsed.set_port(Some(current_runtime_port())).is_ok() {
                 parsed.to_string().trim_end_matches('/').to_string()
             } else {
                 endpoint
@@ -960,7 +960,7 @@ fn non_negative_u64(value: i64) -> u64 {
 
 fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> PeerInfo {
     let endpoint = site_replication_local_endpoint(&req.uri, &req.headers);
-    let deployment_id = resolve_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
+    let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
 
     PeerInfo {
@@ -984,7 +984,7 @@ fn current_local_peer(req: &S3Request<Body>, state: &SiteReplicationState) -> Pe
 
 fn current_local_runtime_peer(state: &SiteReplicationState) -> PeerInfo {
     let endpoint = current_local_runtime_endpoint();
-    let deployment_id = resolve_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
+    let deployment_id = current_deployment_id().unwrap_or_else(|| deployment_id_for_endpoint(&endpoint));
     let stored_peer = state.peers.get(&deployment_id);
 
     PeerInfo {
@@ -1567,7 +1567,7 @@ fn reconcile_peer_with_actual_identity(mut state: SiteReplicationState, actual_p
 }
 
 async fn site_replicator_service_account_secret(access_key: &str) -> S3Result<String> {
-    let Some(iam_sys) = resolve_iam_handle() else {
+    let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
 
@@ -1584,7 +1584,7 @@ fn legacy_site_replicator_state_secret(state: &SiteReplicationState) -> Option<S
 }
 
 async fn set_site_replicator_service_account_secret(parent_user: &str, secret_key: String) -> S3Result<String> {
-    let Some(iam_sys) = resolve_iam_handle() else {
+    let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
 
@@ -1630,7 +1630,7 @@ async fn set_site_replicator_service_account_secret(parent_user: &str, secret_ke
 }
 
 async fn ensure_site_replicator_service_account(parent_user: &str, rotate_secret: bool) -> S3Result<(String, String)> {
-    let Some(iam_sys) = resolve_iam_handle() else {
+    let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
 
@@ -1716,7 +1716,7 @@ async fn send_peer_admin_request<T: Serialize>(
         access_key,
         secret_key,
         "",
-        resolve_region()
+        current_region()
             .map(|region| region.to_string())
             .as_deref()
             .unwrap_or("us-east-1"),
@@ -1830,7 +1830,7 @@ async fn send_peer_admin_get_request(endpoint: &str, path: &str, access_key: &st
         access_key,
         secret_key,
         "",
-        resolve_region()
+        current_region()
             .map(|region| region.to_string())
             .as_deref()
             .unwrap_or("us-east-1"),
@@ -2204,7 +2204,7 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
         let mut entry = SRBucketInfo {
             bucket: bucket.name.clone(),
             created_at: bucket.created,
-            location: resolve_region().map(|region| region.to_string()).unwrap_or_default(),
+            location: current_region().map(|region| region.to_string()).unwrap_or_default(),
             api_version: Some(SITE_REPL_API_VERSION.to_string()),
             ..Default::default()
         };
@@ -2233,7 +2233,7 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
         info.buckets.insert(bucket.name, entry);
     }
 
-    if let Some(iam_sys) = resolve_iam_handle() {
+    if let Some(iam_sys) = current_iam_handle() {
         for (name, policy_doc) in iam_sys.list_policy_docs("").await.map_err(ApiError::from)? {
             info.policies.insert(
                 name,
@@ -2292,10 +2292,10 @@ async fn build_sr_info(state: &SiteReplicationState, local_peer: &PeerInfo) -> S
 
 fn local_idp_settings() -> IDPSettings {
     let mut settings = IDPSettings::default();
-    if let Some(oidc) = resolve_oidc_handle() {
+    if let Some(oidc) = current_oidc_handle() {
         let providers = oidc.list_providers();
         settings.open_id.enabled = !providers.is_empty();
-        settings.open_id.region = resolve_region().map(|region| region.to_string()).unwrap_or_default();
+        settings.open_id.region = current_region().map(|region| region.to_string()).unwrap_or_default();
 
         for provider in providers {
             let Some(config) = oidc.get_provider_config(&provider.provider_id) else {
@@ -2391,7 +2391,7 @@ fn filter_sr_info(mut info: SRInfo, opts: &SRStatusOptions) -> SRInfo {
 }
 
 async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
-    let Some(stats) = resolve_replication_stats_handle() else {
+    let Some(stats) = current_replication_stats_handle() else {
         return SRMetricsSummary::default();
     };
 
@@ -3608,7 +3608,7 @@ fn site_replication_bucket_target_for_peer(
     let port = parsed.port_or_known_default().ok_or_else(|| {
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("peer endpoint missing port: {}", peer.endpoint))
     })?;
-    let region = resolve_region()
+    let region = current_region()
         .map(|region| region.to_string())
         .filter(|region| !region.is_empty())
         .unwrap_or_else(|| "us-east-1".to_string());
@@ -4282,7 +4282,7 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
     }
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = resolve_replication_pool_handle() else {
+    let Some(pool) = current_replication_pool_handle() else {
         bucket_status.status = "failed".to_string();
         bucket_status.err_detail = "replication pool is not initialized".to_string();
         return bucket_status;
@@ -4350,7 +4350,7 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
     }
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = resolve_replication_pool_handle() else {
+    let Some(pool) = current_replication_pool_handle() else {
         bucket_status.status = "failed".to_string();
         bucket_status.err_detail = "replication pool is not initialized".to_string();
         return bucket_status;
@@ -4569,7 +4569,7 @@ fn group_info_requires_upsert(update: &rustfs_madmin::GroupAddRemove) -> bool {
 }
 
 async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
-    let Some(iam_sys) = resolve_iam_handle() else {
+    let Some(iam_sys) = current_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
     let incoming_updated_at = item.updated_at;
@@ -4623,7 +4623,7 @@ async fn apply_iam_item(item: SRIAMItem) -> S3Result<()> {
             let Some(sts_credential) = item.sts_credential else {
                 return Err(s3_error!(InvalidRequest, "stsCredential is required"));
             };
-            let Some(secret) = resolve_token_signing_key() else {
+            let Some(secret) = current_token_signing_key() else {
                 return Err(s3_error!(InvalidRequest, "token signing key not initialized"));
             };
             let claims = get_claims_from_token_with_secret(&sts_credential.session_token, &secret)
@@ -5109,7 +5109,7 @@ impl Operation for SRPeerJoinHandler {
         }
 
         if !join_req.svc_acct_access_key.is_empty() && !join_req.svc_acct_secret_key.is_empty() {
-            let Some(iam_sys) = resolve_iam_handle() else {
+            let Some(iam_sys) = current_iam_handle() else {
                 return Err(s3_error!(InvalidRequest, "iam not init"));
             };
 
@@ -5353,7 +5353,7 @@ impl Operation for SiteReplicationEditHandler {
             };
 
             for target in current_state.peers.values() {
-                let local_target = resolve_deployment_id()
+                let local_target = current_deployment_id()
                     .as_ref()
                     .is_some_and(|deployment_id| deployment_id == &target.deployment_id);
                 if local_target {
@@ -5726,7 +5726,7 @@ impl Operation for SRRotateServiceAccountHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::admin::runtime_sources::{resolve_outbound_tls_generation, set_test_outbound_tls_generation};
+    use crate::admin::runtime_sources::{current_outbound_tls_generation, set_test_outbound_tls_generation};
     use crate::admin::storage_api::runtime::Endpoint;
     use crate::admin::storage_api::runtime::{EndpointServerPools, Endpoints, PoolEndpoints};
     use http::{HeaderMap, HeaderValue, Uri};
@@ -7566,7 +7566,7 @@ mod tests {
     #[tokio::test]
     #[serial]
     async fn test_site_replication_peer_client_rebuilds_when_generation_changes() {
-        let previous_generation = resolve_outbound_tls_generation().0;
+        let previous_generation = current_outbound_tls_generation().0;
         let previous_cache = {
             let mut cache = SITE_REPLICATION_PEER_CLIENT.lock().await;
             let snapshot = cache.clone();

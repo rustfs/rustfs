@@ -28,9 +28,9 @@ use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    current_notification_system, current_object_store_handle, current_server_config, default_object_usecase, resolve_boot_time,
-    resolve_bucket_monitor_handle, resolve_deployment_id, resolve_region, resolve_replication_pool_handle,
-    resolve_replication_stats_handle,
+    current_boot_time, current_bucket_monitor_handle, current_deployment_id, current_notification_system,
+    current_object_store_handle, current_region, current_replication_pool_handle, current_replication_stats_handle,
+    current_server_config, default_object_usecase,
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -750,7 +750,7 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     let region = req
         .region
         .clone()
-        .or_else(resolve_region)
+        .or_else(current_region)
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| "us-east-1".to_string());
     let session_token = get_session_token(&req.uri, &req.headers).unwrap_or_default().to_string();
@@ -1422,7 +1422,7 @@ async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
 }
 
 async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtRoute) -> S3Result<S3Response<Body>> {
-    let bucket_stats = match resolve_replication_stats_handle() {
+    let bucket_stats = match current_replication_stats_handle() {
         Some(stats) => stats.get_latest_replication_stats(bucket).await,
         None => BucketStats::default(),
     };
@@ -1438,14 +1438,14 @@ async fn build_replication_metrics_response(bucket: &str, route: ReplicationExtR
 }
 
 fn replication_metrics_uptime_seconds() -> i64 {
-    resolve_boot_time()
+    current_boot_time()
         .and_then(|boot_time| SystemTime::now().duration_since(boot_time).ok())
         .map(|uptime| uptime.as_secs() as i64)
         .unwrap_or_default()
 }
 
 fn collect_replication_metrics_bandwidth(bucket: &str) -> HashMap<String, BandwidthDetails> {
-    resolve_bucket_monitor_handle()
+    current_bucket_monitor_handle()
         .map(|monitor| {
             monitor
                 .get_report(|name| name == bucket)
@@ -1513,7 +1513,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         bucket: Some(ext_req.bucket.clone()),
         object: None,
         version_id: None,
-        region: resolve_region(),
+        region: current_region(),
         ..Default::default()
     });
 
@@ -1828,7 +1828,7 @@ async fn check_replication_target(bucket: &str, target: &BucketTarget) -> Replic
 
     if target.target_bucket == bucket
         && !target.deployment_id.is_empty()
-        && resolve_deployment_id().as_deref() == Some(target.deployment_id.as_str())
+        && current_deployment_id().as_deref() == Some(target.deployment_id.as_str())
     {
         result.status = "FAILED".to_string();
         result.error = Some("target bucket must not match source bucket on the same deployment".to_string());
@@ -2149,7 +2149,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
         .map_err(ApiError::from)?;
     BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
 
-    let Some(pool) = resolve_replication_pool_handle() else {
+    let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
@@ -2169,7 +2169,7 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
 }
 
 async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
-    let Some(pool) = resolve_replication_pool_handle() else {
+    let Some(pool) = current_replication_pool_handle() else {
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
@@ -2242,7 +2242,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
         bucket,
         object,
         version_id: None,
-        region: resolve_region(),
+        region: current_region(),
         ..Default::default()
     });
 
@@ -3661,7 +3661,7 @@ mod tests {
                 access_key: "rustfsadmin".to_string(),
                 secret_key: s3s::auth::SecretKey::from("rustfssecret"),
             }),
-            region: resolve_region(),
+            region: current_region(),
             service: None,
             trailing_headers: None,
         };

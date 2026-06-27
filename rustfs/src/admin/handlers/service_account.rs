@@ -15,7 +15,7 @@
 use super::iam_error::iam_error_to_s3_error;
 use crate::admin::access_key_identity;
 use crate::admin::handlers::site_replication::site_replication_iam_change_hook;
-use crate::admin::runtime_sources::resolve_action_credentials;
+use crate::admin::runtime_sources::current_action_credentials;
 use crate::admin::utils::{encode_compatible_admin_payload, has_space_be, is_compat_admin_request, read_compatible_admin_body};
 use crate::auth::{constant_time_eq, get_condition_values, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
@@ -268,7 +268,7 @@ impl Operation for AddServiceAccount {
             None
         };
 
-        let Some(sys_cred) = resolve_action_credentials() else {
+        let Some(sys_cred) = current_action_credentials() else {
             return Err(s3_error!(InvalidRequest, "get sys cred failed"));
         };
 
@@ -292,7 +292,7 @@ impl Operation for AddServiceAccount {
             req_is_derived_cred = true;
         }
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -513,7 +513,7 @@ impl Operation for UpdateServiceAccount {
             return Err(s3_error!(InvalidRequest, "get cred failed"));
         };
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -642,7 +642,7 @@ impl Operation for InfoServiceAccount {
 
         let access_key = query.access_key;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -719,7 +719,7 @@ impl Operation for TemporaryAccountInfo {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -789,7 +789,7 @@ impl Operation for InfoAccessKey {
             query.access_key
         };
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -912,7 +912,7 @@ impl Operation for ListServiceAccount {
         //     cred.parent_user
         // };
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1049,7 +1049,7 @@ impl Operation for ListAccessKeysBulk {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &input_cred.access_key).await?;
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 
@@ -1121,7 +1121,7 @@ impl Operation for ListAccessKeysBulk {
                 .into_keys()
                 .collect::<Vec<_>>();
 
-            if let Some(sys_cred) = resolve_action_credentials() {
+            if let Some(sys_cred) = current_action_credentials() {
                 users.push(sys_cred.access_key);
             }
             users
@@ -1252,7 +1252,7 @@ impl Operation for DeleteServiceAccount {
             return Err(s3_error!(InvalidArgument, "access key is empty"));
         }
 
-        let Ok(iam_store) = crate::admin::runtime_sources::resolve_ready_iam_handle() else {
+        let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
             return Err(s3_error!(InvalidRequest, "iam not init"));
         };
 

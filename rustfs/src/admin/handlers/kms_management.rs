@@ -17,7 +17,7 @@
 use super::kms_keys::{CreateKeyHandler, DescribeKeyHandler, GenerateDataKeyHandler, ListKeysHandler};
 use crate::admin::auth::validate_admin_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{resolve_kms_runtime_service_manager, resolve_or_init_kms_runtime_service_manager};
+use crate::admin::runtime_sources::{current_kms_runtime_service_manager, current_or_init_kms_runtime_service_manager};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
 use hyper::{HeaderMap, Method, StatusCode};
@@ -35,11 +35,11 @@ async fn kms_encryption_service_from_context() -> Option<std::sync::Arc<rustfs_k
 }
 
 fn kms_service_manager_from_context() -> std::sync::Arc<rustfs_kms::KmsServiceManager> {
-    match resolve_kms_runtime_service_manager() {
+    match current_kms_runtime_service_manager() {
         Some(manager) => manager,
         None => {
             warn!("KMS service manager not initialized, initializing now as fallback");
-            resolve_or_init_kms_runtime_service_manager()
+            current_or_init_kms_runtime_service_manager()
         }
     }
 }

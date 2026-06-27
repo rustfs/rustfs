@@ -15,7 +15,7 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{current_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
+use crate::admin::runtime_sources::{current_object_store_handle, current_replication_stats_handle, current_runtime_port};
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -175,7 +175,7 @@ impl Operation for GetReplicationMetricsHandler {
         // TODO cluster cache
         // In actual implementation, statistics would be obtained from cluster
         // This is simplified to get from local cache
-        let bucket_stats = match resolve_replication_stats_handle() {
+        let bucket_stats = match current_replication_stats_handle() {
             Some(s) => s.get_latest_replication_stats(bucket).await,
             None => BucketStats::default(),
         };
@@ -240,7 +240,7 @@ impl Operation for SetRemoteTargetHandler {
         let same_target = rustfs_utils::net::is_local_host(
             target_url.host().unwrap_or(Host::Domain("localhost")),
             target_url.port().unwrap_or(80),
-            resolve_runtime_port(),
+            current_runtime_port(),
         )
         .unwrap_or_default();
 

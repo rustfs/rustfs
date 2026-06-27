@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::admin::runtime_sources::{default_admin_usecase, resolve_oidc_handle};
+use crate::admin::runtime_sources::{current_oidc_handle, default_admin_usecase};
 use crate::admin::storage_api::access::RequestContext;
 use crate::license::has_valid_license;
 use crate::server::has_path_prefix;
@@ -134,7 +134,7 @@ impl Config {
         let http_prefix = rustfs_config::RUSTFS_HTTP_PREFIX;
 
         // Collect OIDC provider info if available
-        let oidc = resolve_oidc_handle()
+        let oidc = current_oidc_handle()
             .map(|sys| {
                 sys.list_visible_providers()
                     .into_iter()
