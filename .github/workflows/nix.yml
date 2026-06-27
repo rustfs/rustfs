@@ -52,10 +52,10 @@ jobs:
       NIX_CURL_FLAGS: -A cargo/stable
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Install Nix
-        uses: DeterminateSystems/determinate-nix-action@v3.21.0
+        uses: DeterminateSystems/determinate-nix-action@4eea0b33e3d1f02ecfe37cf16e7204c424009606 # v3.21.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           extra-conf: |
@@ -64,10 +64,10 @@ jobs:
             max-jobs = 1
 
       - name: Cache Nix
-        uses: DeterminateSystems/flakehub-cache-action@v3.21.0
+        uses: DeterminateSystems/flakehub-cache-action@c01e819d047464c3edf6ba778f075952af5a3aa7 # v3.21.0
 
       - name: Check Nix Flake Inputs
-        uses: DeterminateSystems/flake-checker-action@v12
+        uses: DeterminateSystems/flake-checker-action@3164002371bc90729c68af0e24d5aacf20d7c9f6 # v12
         with:
           fail-mode: true
           ignore-missing-flake-lock: false
