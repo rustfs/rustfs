@@ -4236,6 +4236,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_submit_heal_request_returns_full_for_normal_priority_when_full() {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new(
+            storage,
+            Some(HealConfig {
+                queue_size: 1,
+                ..HealConfig::default()
+            }),
+        );
+
+        let accepted = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-a".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+        let full = HealRequest::new(
+            HealType::Bucket {
+                bucket: "bucket-b".to_string(),
+            },
+            HealOptions::default(),
+            HealPriority::Normal,
+        );
+
+        assert_eq!(
+            manager
+                .submit_heal_request(accepted)
+                .await
+                .expect("first request should be accepted"),
+            HealAdmissionResult::Accepted
+        );
+        assert_eq!(
+            manager
+                .submit_heal_request(full)
+                .await
+                .expect("normal priority request should surface full admission"),
+            HealAdmissionResult::Full
+        );
+    }
+
+    #[tokio::test]
     async fn test_high_priority_request_displaces_lower_priority_when_queue_full() {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
         let manager = HealManager::new(

@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-phase7-global-closeout`
+- Branch: `overtrue/arch-runtime-repair-preservation-tests`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -25,17 +25,19 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   PR #3953, the GLOB-007 runtime resolver fallback boundary cleanup from
   PR #3954, the GLOB-007 service/credential resolver fallback removal from
   PR #3955, the GLOB-007 scalar/handle resolver fallback removal from PR #3957,
-  the GLOB-007 specialized resolver fallback boundary from PR #3958, and the
-  GLOB-007 root runtime fallback facade cleanup from PR #3961.
-- Current phase PR: Phase 7 global-state and crate-split closeout.
-- Based on: `overtrue/arch-runtime-root-fallback-facade-cleanup` while PR #3961
-  is pending; rebase onto `origin/main` after #3961 merges.
-- PR type for this branch: `docs-only`.
+  the GLOB-007 specialized resolver fallback
+  boundary from PR #3958, the GLOB-007 root runtime fallback facade cleanup
+  from PR #3961, and the Phase 7 global-state/crate-split closeout from
+  PR #3962.
+- Current phase PR: combined `TEST-RUN-001` and `TEST-REP-001` preservation
+  tests for backlog sub-issues #668 and #669.
+- Based on: `origin/main` at PR #3962 (`66ad13850`).
+- PR type for this branch: `test-only`.
 - Runtime behavior changes: none.
-- Rust code changes: none.
+- Rust code changes: test coverage plus a private heal-channel admission
+  response helper used by production and tests.
 - CI/script changes: none intended.
-- Docs changes: close out GLOB-007 fallback-removal boundaries and complete the
-  CRATE-001/CRATE-002 split-readiness evaluation.
+- Docs changes: record the remaining #660 test-preservation backlog slice.
 
 ## Phase 0 Tasks
 
@@ -841,6 +843,33 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
     behavior changes.
 
 ## Issue #660 Capability Contract Tasks
+
+- [x] `TEST-RUN-001` Add runtime preservation tests.
+  - Completed slice: pin readiness gate blocking for normal object paths,
+    public/admin/health probe pass-through behavior, not-ready HTTP response
+    status/headers/body, FullReady publication dependency checks, shutdown
+    ordering state progression, and per-set lock quorum behavior.
+  - Acceptance: runtime readiness remains observable and normal traffic is
+    blocked until dependency readiness is complete, while documented public and
+    exempt routes keep their current behavior.
+  - Must preserve: readiness formula, health/admin route exemptions, service
+    state ordering, shutdown ordering, and per-set lock quorum behavior.
+  - Verification: focused server readiness/startup-shutdown tests, formatting,
+    diff hygiene, migration guard, full PR gate, and three-expert review.
+
+- [x] `TEST-REP-001` Add repair preservation tests.
+  - Completed slice: pin heal admission Accepted/Merged/Full/Dropped response
+    mapping, normal-priority Full admission, dropped best-effort admission,
+    scanner budget cancellation reason preservation, and runtime drive health
+    state boundaries for snapshot eligibility, strict online membership, and
+    admin probing.
+  - Acceptance: heal admission, scanner budget cancellation, set-level lock
+    quorum, and suspect/offline drive runtime-state distinctions remain
+    observable before final migration closeout.
+  - Must preserve: heal admission semantics, scanner cancellation reason
+    semantics, per-set lock quorum, and drive runtime-state classification.
+  - Verification: focused heal/scanner/ecstore tests, formatting, diff hygiene,
+    migration guard, full PR gate, and three-expert review.
 
 - [x] `PR-08/API-013` Add observability snapshot contract.
   - Completed slice: add `CapabilityState`, `CapabilityStatus`,
@@ -6108,14 +6137,18 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `docs-only`: merge the Phase 7 closeout branch after PR #3961 lands.
-2. `ci-gate`: run a final issue #660 versus local-plan versus progress-ledger
-   validation pass before declaring the migration complete.
+1. `test-only`: merge the combined `TEST-RUN-001`/`TEST-REP-001`
+   preservation test branch.
+2. `ci-gate`: run final issue #660 versus local-plan versus progress-ledger
+   validation after backlog sub-issues #668 and #669 are closed.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | The combined TEST-RUN-001/TEST-REP-001 slice adds preservation tests and a private heal-channel response helper without widening runtime APIs, storage APIs, or migration guard scope. |
+| Migration preservation | pass | Readiness gating, public/admin probe exemptions, service-state publication, shutdown ordering, per-set lock quorum, heal admission, scanner cancellation reason, and runtime drive-state boundaries are pinned without behavior changes. |
+| Testing/verification | pass | Focused rustfs, rustfs-heal, rustfs-scanner, and rustfs-ecstore tests passed; formatting, diff hygiene, architecture guard, and diff-only Rust risk scan passed before the full PR gate. |
 | Quality/architecture | pass | Phase 7 closeout marks GLOB-007 complete only after the root runtime facade stops composing concrete fallback defaults and crate split work remains proposal-only. |
 | Migration preservation | pass | No Rust code changes; owner runtime facades retain no-AppContext compatibility defaults, and future erasure/cluster splits are deferred until evidence and rollback plans exist. |
 | Testing/verification | pass | Docs-only branch passed architecture migration guard, shell syntax check, diff hygiene, status scan, crate-split evidence scans, and Rust-source unchanged scan before PR. |
@@ -9906,8 +9939,34 @@ Notes:
   - Erasure and storage-cluster coupling scans: reviewed for crate-split
     readiness evidence.
 
+- Issue #660 TEST-RUN-001 and TEST-REP-001 preservation tests:
+  - `cargo test -p rustfs --lib server::readiness::tests`: passed, 22 passed.
+  - `cargo test -p rustfs --lib readiness_gate_blocks_normal_paths_until_runtime_ready`:
+    passed.
+  - `cargo test -p rustfs --lib service_not_ready_response_preserves_observable_contract`:
+    passed.
+  - `cargo test -p rustfs-heal --lib admission_response_preserves_all_admission_outcomes`:
+    passed.
+  - `cargo test -p rustfs-heal --lib test_submit_heal_request_returns_full_for_normal_priority_when_full`:
+    passed.
+  - `cargo test -p rustfs-scanner --lib first_budget_cancellation_reason_remains_observable`:
+    passed.
+  - `cargo test -p rustfs-ecstore --lib runtime_drive_health_state`: passed, 3
+    passed.
+  - `cargo test -p rustfs --lib startup_shutdown::tests::background_shutdown_plan_keeps_scanner_before_ahm`:
+    passed.
+  - `cargo fmt --all --check`: passed.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Rust risk scan: passed; no new production unwrap/expect, numeric casts,
+    string error public APIs, boxed public errors, or production
+    println/eprintln introduced in changed Rust files.
+  - `make pre-pr`: passed, including 6925 nextest tests passed, 112 skipped,
+    and doctests passed.
+
 ## Handoff Notes
 
-- After PR #3961 and the Phase 7 closeout PR land, run the final issue #660
-  versus local-plan versus progress-ledger validation pass before declaring the
-  migration complete.
+- PR #3951, PR #3961, and PR #3962 are merged. The remaining issue #660
+  blockers are backlog sub-issues #668 (`TEST-RUN-001`) and #669
+  (`TEST-REP-001`); do not declare the migration complete until this
+  preservation-test branch lands and final validation closes those issues.

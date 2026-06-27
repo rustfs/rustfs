@@ -35,6 +35,21 @@ const EVENT_HEAL_CHANNEL_STATE: &str = "heal_channel_state";
 const EVENT_HEAL_CHANNEL_REQUEST: &str = "heal_channel_request";
 const EVENT_HEAL_CHANNEL_RESPONSE: &str = "heal_channel_response";
 
+fn admission_response(request_id: String, admission: HealAdmissionResult) -> HealChannelResponse {
+    let (success, error) = match admission {
+        HealAdmissionResult::Accepted | HealAdmissionResult::Merged => (true, None),
+        HealAdmissionResult::Full => (false, Some("Heal request queue is full".to_string())),
+        HealAdmissionResult::Dropped(reason) => (false, Some(format!("Heal request dropped: {}", reason.as_str()))),
+    };
+
+    HealChannelResponse {
+        request_id,
+        success,
+        data: Some(format!("admission={},reason={}", admission.result_label(), admission.reason_label()).into_bytes()),
+        error,
+    }
+}
+
 /// Heal channel processor
 pub struct HealChannelProcessor {
     /// Heal manager
@@ -201,22 +216,7 @@ impl HealChannelProcessor {
 
                 let _ = response_tx.send(Ok(admission));
 
-                let (success, error) = match admission {
-                    HealAdmissionResult::Accepted | HealAdmissionResult::Merged => (true, None),
-                    HealAdmissionResult::Full => (false, Some("Heal request queue is full".to_string())),
-                    HealAdmissionResult::Dropped(reason) => (false, Some(format!("Heal request dropped: {}", reason.as_str()))),
-                };
-
-                let response = HealChannelResponse {
-                    request_id: request.id,
-                    success,
-                    data: Some(
-                        format!("admission={},reason={}", admission.result_label(), admission.reason_label()).into_bytes(),
-                    ),
-                    error,
-                };
-
-                self.publish_response(response);
+                self.publish_response(admission_response(request.id, admission));
             }
             Err(e) => {
                 let error_text = e.to_string();
@@ -534,7 +534,7 @@ mod tests {
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{HealObjectInfo, HealStorageAPI};
     use rustfs_common::heal_channel::{
-        HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
+        HealAdmissionDropReason, HealAdmissionResult, HealChannelPriority, HealChannelRequest, HealRequestSource, HealScanMode,
     };
     use std::sync::Arc;
 
@@ -635,6 +635,35 @@ mod tests {
         // Verify processor is created successfully
         let _sender = processor.get_response_sender();
         // If we can get the sender, processor was created correctly
+    }
+
+    #[test]
+    fn admission_response_preserves_all_admission_outcomes() {
+        let cases = [
+            (HealAdmissionResult::Accepted, true, None, "admission=accepted,reason=none"),
+            (HealAdmissionResult::Merged, true, None, "admission=merged,reason=none"),
+            (
+                HealAdmissionResult::Full,
+                false,
+                Some("Heal request queue is full"),
+                "admission=full,reason=none",
+            ),
+            (
+                HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped),
+                false,
+                Some("Heal request dropped: policy_dropped"),
+                "admission=dropped,reason=policy_dropped",
+            ),
+        ];
+
+        for (admission, success, error, data) in cases {
+            let response = admission_response("request-id".to_string(), admission);
+
+            assert_eq!(response.request_id, "request-id");
+            assert_eq!(response.success, success);
+            assert_eq!(response.error.as_deref(), error);
+            assert_eq!(response.data.as_deref(), Some(data.as_bytes()));
+        }
     }
 
     #[tokio::test]
