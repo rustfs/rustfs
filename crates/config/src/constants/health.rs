@@ -48,3 +48,8 @@ pub const DEFAULT_HEALTH_COMPAT_BUSY_MAX_ACTIVE_REQUESTS: usize = 0;
 /// in running state if a global KMS manager exists.
 pub const ENV_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE";
 pub const DEFAULT_HEALTH_COMPAT_KMS_READY_CHECK_ENABLE: bool = false;
+
+/// Enable peer-health readiness impact.
+/// When disabled, peer-health state is reported but does not affect readiness.
+pub const ENV_HEALTH_PEER_READY_CHECK_ENABLE: &str = "RUSTFS_HEALTH_PEER_READY_CHECK_ENABLE";
+pub const DEFAULT_HEALTH_PEER_READY_CHECK_ENABLE: bool = false;

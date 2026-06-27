@@ -55,7 +55,11 @@ pub enum ClusterRuntimeReadinessState {
 
 impl ClusterRuntimeReadinessState {
     fn from_report(report: &DependencyReadinessReport) -> Self {
-        if report.readiness.storage_ready && report.readiness.iam_ready && report.readiness.lock_quorum_ready {
+        if report.readiness.storage_ready
+            && report.readiness.iam_ready
+            && report.readiness.lock_quorum_ready
+            && report.readiness.peer_health_ready
+        {
             Self::Ready
         } else if report.degraded_reasons.is_empty() {
             Self::Unknown
@@ -131,6 +135,7 @@ mod tests {
                 storage_ready: true,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: Vec::new(),
         });
@@ -141,6 +146,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: true,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageQuorumUnavailable],
         });
@@ -156,6 +162,7 @@ mod tests {
                 storage_ready: false,
                 iam_ready: true,
                 lock_quorum_ready: false,
+                peer_health_ready: true,
             },
             degraded_reasons: vec![ReadinessDegradedReason::StorageAndLockUnavailable],
         });
@@ -208,6 +215,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: true,
+                    peer_health_ready: true,
                 },
                 state: ClusterRuntimeReadinessState::Ready,
                 degraded_reasons: Vec::new(),
@@ -221,6 +229,7 @@ mod tests {
                     storage_ready: false,
                     iam_ready: true,
                     lock_quorum_ready: true,
+                    peer_health_ready: true,
                 },
                 state: ClusterRuntimeReadinessState::Degraded,
                 degraded_reasons: vec![ReadinessDegradedReason::StorageQuorumUnavailable],
@@ -270,6 +279,7 @@ mod tests {
                     storage_ready: true,
                     iam_ready: true,
                     lock_quorum_ready: true,
+                    peer_health_ready: true,
                 },
                 state: ClusterRuntimeReadinessState::Ready,
                 degraded_reasons: Vec::new(),

@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, OnceLock},
     time::SystemTime,
 };
@@ -58,6 +58,35 @@ use uuid::Uuid;
 const TEST_RPC_SECRET: &str = "test-rpc-secret";
 
 pub(crate) type WorkloadSnapshotProviderRef = Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>;
+
+#[derive(Clone, Default)]
+pub(crate) struct LockRegistry {
+    clients: HashMap<String, Arc<dyn LockClient>>,
+}
+
+impl LockRegistry {
+    pub(crate) fn new(clients: HashMap<String, Arc<dyn LockClient>>) -> Self {
+        Self { clients }
+    }
+
+    pub(crate) fn clients_for_endpoints(&self, endpoints: &[Endpoint]) -> Vec<Arc<dyn LockClient>> {
+        let mut seen_hosts = HashSet::with_capacity(endpoints.len());
+        let mut clients = Vec::with_capacity(endpoints.len());
+
+        for endpoint in endpoints {
+            let host_port = endpoint.host_port();
+            if host_port.is_empty() || !seen_hosts.insert(host_port.clone()) {
+                continue;
+            }
+
+            if let Some(client) = self.clients.get(&host_port) {
+                clients.push(client.clone());
+            }
+        }
+
+        clients
+    }
+}
 
 static WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER: OnceLock<WorkloadSnapshotProviderRef> = OnceLock::new();
 
@@ -254,6 +283,11 @@ pub(crate) fn global_lock_manager() -> Arc<rustfs_lock::GlobalLockManager> {
 
 pub(crate) fn global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
     get_global_lock_clients()
+}
+
+pub(crate) fn lock_registry() -> Option<LockRegistry> {
+    global_lock_clients()
+        .map(|clients| LockRegistry::new(clients.iter().map(|(host, client)| (host.clone(), client.clone())).collect()))
 }
 
 pub(crate) fn set_primary_lock_client(client: Arc<dyn LockClient>) -> std::result::Result<(), Arc<dyn LockClient>> {
@@ -468,4 +502,44 @@ pub(crate) async fn initialize_local_disk_maps(endpoint_pools: EndpointServerPoo
 
 pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
     GLOBAL_TierConfigMgr.write().await.init(store).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::LockRegistry;
+    use crate::disk::endpoint::Endpoint;
+    use rustfs_lock::{LocalClient, LockClient};
+    use std::{collections::HashMap, sync::Arc};
+
+    fn url_endpoint(raw: &str) -> Endpoint {
+        Endpoint {
+            url: url::Url::parse(raw).expect("test endpoint url"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        }
+    }
+
+    #[test]
+    fn lock_registry_selects_unique_clients_in_endpoint_order() {
+        let client_a: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let client_b: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let registry = LockRegistry::new(HashMap::from([
+            ("node-a:9000".to_string(), client_a.clone()),
+            ("node-b:9000".to_string(), client_b.clone()),
+        ]));
+        let endpoints = vec![
+            url_endpoint("http://node-a:9000/data-a"),
+            url_endpoint("http://node-a:9000/data-b"),
+            url_endpoint("http://node-missing:9000/data"),
+            url_endpoint("http://node-b:9000/data"),
+        ];
+
+        let clients = registry.clients_for_endpoints(&endpoints);
+
+        assert_eq!(clients.len(), 2);
+        assert!(Arc::ptr_eq(&clients[0], &client_a));
+        assert!(Arc::ptr_eq(&clients[1], &client_b));
+    }
 }

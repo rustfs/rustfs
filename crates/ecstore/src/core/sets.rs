@@ -46,7 +46,6 @@ use rustfs_common::heal_channel::HealOpts;
 use rustfs_common::heal_channel::{DriveState, HealItemType};
 use rustfs_filemeta::FileInfo;
 use rustfs_lock::NamespaceLockWrapper;
-use rustfs_lock::client::LockClient;
 use rustfs_madmin::heal_commands::{HealDriveInfo, HealResultItem};
 use rustfs_utils::{crc_hash, path::path_join_buf, sip_hash};
 use std::{collections::HashMap, sync::Arc};
@@ -102,27 +101,16 @@ impl Sets {
 
         let mut disk_set = Vec::with_capacity(set_count);
 
-        // Get lock clients from global storage
-        let lock_clients = runtime_sources::global_lock_clients();
+        let lock_registry = runtime_sources::lock_registry();
 
         for i in 0..set_count {
             let mut set_drive = Vec::with_capacity(set_drive_count);
             let mut set_endpoints = Vec::with_capacity(set_drive_count);
-            let mut set_lock_clients: HashMap<String, Arc<dyn LockClient>> = HashMap::new();
             for j in 0..set_drive_count {
                 let idx = i * set_drive_count + j;
                 let mut disk = disks[idx].clone();
 
                 let endpoint = endpoints.endpoints.as_ref()[idx].clone();
-
-                if let Some(lock_clients_map) = lock_clients {
-                    let host_port = endpoint.host_port();
-                    if let Some(lock_client) = lock_clients_map.get(&host_port)
-                        && !set_lock_clients.contains_key(&host_port)
-                    {
-                        set_lock_clients.insert(host_port, lock_client.clone());
-                    }
-                }
 
                 set_endpoints.push(endpoint);
 
@@ -164,7 +152,10 @@ impl Sets {
                 }
             }
 
-            let lockers = set_lock_clients.values().cloned().collect::<Vec<Arc<dyn LockClient>>>();
+            let lockers = lock_registry
+                .as_ref()
+                .map(|registry| registry.clients_for_endpoints(&set_endpoints))
+                .unwrap_or_default();
             let set_disks = SetDisks::new(
                 runtime_sources::local_node_name().await,
                 Arc::new(RwLock::new(set_drive)),
