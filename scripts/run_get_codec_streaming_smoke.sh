@@ -29,6 +29,9 @@ CODEC_MAX_INFLIGHT=1
 METADATA_EARLY_STOP="off"
 SHARD_LOCALITY_PREFERENCE="off"
 OUTPUT_HANDOFF_ATTRIBUTION=false
+DIAGNOSTIC_METRICS=false
+DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
+SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -64,6 +67,9 @@ Core options:
                                  Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
   --handoff-attribution          Enable output handoff attribution metrics
+  --diagnostic-metrics           Enable observability metrics export and capture server-side metrics
+  --diagnostic-metrics-url <url> Prometheus scrape URL for diagnostic captures
+                                 (default: http://127.0.0.1:8889/metrics)
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -104,6 +110,9 @@ Output:
   <out-dir>/engine_compare.csv                  when legacy and codec profiles both run
   <out-dir>/compat_summary.csv                  when legacy and codec profiles both run
   <out-dir>/metrics_summary.csv
+  <out-dir>/service_metrics_summary.csv         when --diagnostic-metrics is set
+  <out-dir>/service_metrics_acceptance.csv      when --diagnostic-metrics is set
+  <out-dir>/fallback_probe_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
   <out-dir>/body_sha256_codec_legacy.txt        when codec-legacy profile runs
   <out-dir>/body_sha256_codec_rustfs.txt        when codec-rustfs profile runs
@@ -112,7 +121,10 @@ Output:
   <out-dir>/response_headers_codec_rustfs.json  when codec-rustfs profile runs
   <out-dir>/<profile>/manifest.env
   <out-dir>/<profile>/metrics_summary.csv
+  <out-dir>/<profile>/service_metrics_summary.csv
+  <out-dir>/<profile>/service-metrics/*.prom     before/after snapshots when --diagnostic-metrics is set
   <out-dir>/<profile>/compat/compat_summary.csv
+  <out-dir>/<profile>/compat/fallback_probe_summary.csv
   <out-dir>/<profile>/compat/response_headers.json
   <out-dir>/<profile>/compat/body_sha256.txt
   <out-dir>/<profile>/rustfs.log
@@ -164,6 +176,8 @@ parse_args() {
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
+      --diagnostic-metrics) DIAGNOSTIC_METRICS=true; shift ;;
+      --diagnostic-metrics-url) DIAGNOSTIC_METRICS_URL="$2"; shift 2 ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -234,6 +248,7 @@ validate_args() {
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
+  [[ -n "$DIAGNOSTIC_METRICS_URL" ]] || die "--diagnostic-metrics-url must not be empty"
 
   [[ -x "$ENHANCED_BENCH" ]] || die "enhanced benchmark script is not executable: $ENHANCED_BENCH"
   require_cmd curl
@@ -343,6 +358,7 @@ codec_streaming rollout fallback coverage proof
 Static gate reasons:
 - disabled
 - rollout_not_opted_in
+- rollout_pct_not_selected
 - body_compatibility_unconfirmed
 - header_compatibility_unconfirmed
 - lock_optimization_disabled
@@ -391,6 +407,9 @@ codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
 output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
+diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
+diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+service_metric_prefix=${SERVICE_METRIC_PREFIX}
 address=${ADDRESS}
 bucket=${BUCKET}
 region=${REGION}
@@ -537,6 +556,10 @@ RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
+diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
+diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+service_metric_prefix=${SERVICE_METRIC_PREFIX}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
 RUSTFS_SCANNER_START_DELAY_SECS=3600
@@ -636,6 +659,7 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
     export RUSTFS_SCANNER_ENABLED=false
@@ -694,6 +718,397 @@ write_metrics_summary() {
   if [[ -f "$median_csv" ]]; then
     cp "$median_csv" "${profile_dir}/metrics_summary.csv"
   fi
+}
+
+service_metrics_dir() {
+  local profile="$1"
+  echo "${OUT_DIR}/${profile}/service-metrics"
+}
+
+capture_service_metrics_snapshot() {
+  local profile="$1"
+  local phase="$2"
+  local metrics_dir snapshot_file status_file
+  metrics_dir="$(service_metrics_dir "$profile")"
+  snapshot_file="${metrics_dir}/${phase}.prom"
+  status_file="${metrics_dir}/${phase}.status"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$metrics_dir"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=not_run_dry_run
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+    return 0
+  fi
+
+  if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$snapshot_file"; then
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=ok
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+  else
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=capture_failed
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+    log "WARN: failed to capture service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
+  fi
+}
+
+write_profile_service_metrics_summary() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local out_csv="${profile_dir}/service_metrics_summary.csv"
+  local before_file="${profile_dir}/service-metrics/before.prom"
+  local after_file="${profile_dir}/service-metrics/after.prom"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},disabled,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled
+EOF
+    return
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},not_run_dry_run,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_dry_run
+EOF
+    return
+  fi
+
+  if [[ ! -s "$before_file" || ! -s "$after_file" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},snapshot_missing,N/A,N/A,N/A,N/A,N/A,service_metrics_snapshot_missing
+EOF
+    return
+  fi
+
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" <<'PY'
+import csv
+import pathlib
+import re
+import sys
+
+profile, metric_prefix, before_raw, after_raw, out_raw = sys.argv[1:]
+before_path = pathlib.Path(before_raw)
+after_path = pathlib.Path(after_raw)
+out_path = pathlib.Path(out_raw)
+
+LINE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$'
+)
+
+
+def classify(metric):
+    if metric == "rustfs_io_get_object_codec_streaming_decision_total":
+        return "codec_decision"
+    if metric == "rustfs_io_get_object_codec_streaming_fallback_total":
+        return "codec_fallback"
+    if metric == "rustfs_io_get_object_reader_path_total":
+        return "reader_path"
+    if metric.startswith("rustfs_io_get_object_stage_duration_seconds"):
+        return "stage_duration"
+    if metric.startswith("rustfs_io_get_object_reader_copy"):
+        return "reader_copy"
+    if metric.startswith("rustfs_io_get_object_reader_prefetch"):
+        return "reader_prefetch"
+    if metric.startswith("rustfs_io_get_object_fill_"):
+        return "fill_pipeline"
+    if metric.startswith("rustfs_io_get_object_shard_read"):
+        return "shard_read"
+    if metric.startswith("rustfs_io_get_object_metadata_"):
+        return "metadata"
+    if metric.startswith("rustfs_io_get_object_reader_"):
+        return "reader"
+    return "get_object"
+
+
+def read_metrics(path):
+    rows = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        match = LINE.match(raw)
+        if match is None:
+            continue
+        metric, labels, value = match.groups()
+        if not metric.startswith(metric_prefix):
+            continue
+        labels = labels or ""
+        rows[(metric, labels)] = float(value)
+    return rows
+
+
+before = read_metrics(before_path)
+after = read_metrics(after_path)
+keys = sorted(set(before) | set(after))
+
+with out_path.open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["profile", "status", "metric", "labels", "before", "after", "delta", "classification"])
+    if not keys:
+        writer.writerow([profile, "no_matching_metrics", "N/A", "N/A", "N/A", "N/A", "N/A", "service_metrics_empty"])
+    for metric, labels in keys:
+        before_value = before.get((metric, labels), 0.0)
+        after_value = after.get((metric, labels), 0.0)
+        writer.writerow(
+            [
+                profile,
+                "ok",
+                metric,
+                labels,
+                f"{before_value:.12g}",
+                f"{after_value:.12g}",
+                f"{after_value - before_value:.12g}",
+                classify(metric),
+            ]
+        )
+PY
+}
+
+write_root_service_metrics_summary() {
+  local out_csv="${OUT_DIR}/service_metrics_summary.csv"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/service_metrics_summary.csv"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,status,metric,labels,before,after,delta,classification
+N/A,missing,N/A,N/A,N/A,N/A,N/A,no_profile_service_metrics_summary
+EOF
+  fi
+}
+
+write_service_metrics_acceptance() {
+  local out_csv="${OUT_DIR}/service_metrics_acceptance.csv"
+  local service_csv="${OUT_DIR}/service_metrics_summary.csv"
+
+  "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" <<'PY'
+import csv
+import pathlib
+import sys
+
+out_path = pathlib.Path(sys.argv[1])
+service_path = pathlib.Path(sys.argv[2])
+diagnostic_enabled = sys.argv[3] == "true"
+mode = sys.argv[4]
+codec_engines = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
+
+
+def expected_profiles():
+    codec_profiles = [f"codec-{engine}" for engine in codec_engines]
+    if mode == "legacy":
+        return ["legacy"]
+    if mode == "codec":
+        return codec_profiles
+    return ["legacy", *codec_profiles]
+
+
+rows = []
+if service_path.exists():
+    with service_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+
+def delta_for(profile, metric, *label_fragments):
+    total = 0.0
+    for row in rows:
+        if row.get("profile") != profile or row.get("status") != "ok" or row.get("metric") != metric:
+            continue
+        labels = row.get("labels", "")
+        if all(fragment in labels for fragment in label_fragments):
+            try:
+                total += float(row.get("delta", "0") or 0)
+            except ValueError:
+                pass
+    return total
+
+
+def delta_prefix(profile, metric_prefix, *label_fragments):
+    total = 0.0
+    for row in rows:
+        if row.get("profile") != profile or row.get("status") != "ok":
+            continue
+        if not row.get("metric", "").startswith(metric_prefix):
+            continue
+        labels = row.get("labels", "")
+        if all(fragment in labels for fragment in label_fragments):
+            try:
+                total += float(row.get("delta", "0") or 0)
+            except ValueError:
+                pass
+    return total
+
+
+def status_for(delta):
+    return "pass" if delta > 0 else "fail"
+
+
+def add(profile, check, expected, delta, note):
+    rows_out.append(
+        {
+            "profile": profile,
+            "check": check,
+            "expected": expected,
+            "status": status_for(delta),
+            "observed_delta": f"{delta:.12g}",
+            "note": note,
+        }
+    )
+
+
+rows_out = []
+if not diagnostic_enabled:
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_enabled",
+            "expected": "true",
+            "status": "skipped",
+            "observed_delta": "N/A",
+            "note": "performance run: observability metrics export intentionally disabled",
+        }
+    )
+elif rows and all(row.get("status") == "not_run_dry_run" for row in rows):
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_enabled",
+            "expected": "non-dry-run service metrics snapshots",
+            "status": "skipped",
+            "observed_delta": "N/A",
+            "note": "dry-run only validates artifact wiring; runtime deltas require a real server run",
+        }
+    )
+else:
+    for profile in expected_profiles():
+        if profile == "legacy":
+            add(
+                profile,
+                "reader_path",
+                'rustfs_io_get_object_reader_path_total{path="legacy_duplex"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_path_total", 'path="legacy_duplex"'),
+                "proves legacy_duplex path was exercised",
+            )
+            add(
+                profile,
+                "fallback_disabled",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="disabled"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="disabled"'),
+                "proves kill-switch fallback reason at runtime",
+            )
+        else:
+            engine = profile[len("codec-") :] if profile.startswith("codec-") else profile
+            engine_path = "codec_streaming_rustfs_engine" if engine == "rustfs" else "codec_streaming_legacy_engine"
+            add(
+                profile,
+                "codec_decision_use",
+                'rustfs_io_get_object_codec_streaming_decision_total{outcome="use",reason="none"} delta > 0',
+                delta_for(
+                    profile,
+                    "rustfs_io_get_object_codec_streaming_decision_total",
+                    'outcome="use"',
+                    'reason="none"',
+                ),
+                "proves eligible GETs selected codec streaming",
+            )
+            add(
+                profile,
+                "reader_path",
+                'rustfs_io_get_object_reader_path_total{path="codec_streaming"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_path_total", 'path="codec_streaming"'),
+                "proves response reader used the codec streaming path",
+            )
+            add(
+                profile,
+                "engine_stage",
+                f'rustfs_io_get_object_stage_duration_seconds*{{path="{engine_path}"}} delta > 0',
+                delta_prefix(profile, "rustfs_io_get_object_stage_duration_seconds", f'path="{engine_path}"'),
+                "proves engine-specific codec path stage attribution",
+            )
+            add(
+                profile,
+                "reader_bytes",
+                f'rustfs_io_get_object_reader_bytes_total{{path="{engine_path}"}} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_bytes_total", f'path="{engine_path}"'),
+                "proves emitted reader bytes were attributed to the selected engine",
+            )
+            add(
+                profile,
+                "fallback_range",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="range"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="range"'),
+                "proves runtime Range GET fallback reason delta",
+            )
+            below_delta = delta_for(
+                profile,
+                "rustfs_io_get_object_codec_streaming_fallback_total",
+                'reason="below_min_size"',
+            )
+            rows_out.append(
+                {
+                    "profile": profile,
+                    "check": "fallback_below_min_size",
+                    "expected": 'rustfs_io_get_object_codec_streaming_fallback_total{reason="below_min_size"} delta > 0',
+                    "status": "pass" if below_delta > 0 else "unavailable",
+                    "observed_delta": f"{below_delta:.12g}",
+                    "note": "Set --codec-min-size greater than 1 to force this runtime fallback probe when unavailable",
+                }
+            )
+
+    rows_out.append(
+        {
+            "profile": "all",
+            "check": "diagnostic_vs_performance_separation",
+            "expected": "diagnostic artifacts are separate from performance conclusions",
+            "status": "pass",
+            "observed_delta": "N/A",
+            "note": "use --diagnostic-metrics for path proof; omit it for throughput acceptance runs",
+        }
+    )
+    rows_out.append(
+        {
+            "profile": "all",
+            "check": "p95_p99",
+            "expected": "available or explicitly marked unavailable",
+            "status": "unavailable",
+            "observed_delta": "N/A",
+            "note": "warp median_summary.csv does not currently aggregate p95/p99; raw logs remain in raw_output_paths.txt",
+        }
+    )
+
+with out_path.open("w", encoding="utf-8", newline="") as handle:
+    fieldnames = ["profile", "check", "expected", "status", "observed_delta", "note"]
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows_out)
+PY
 }
 
 start_server_sampler() {
@@ -795,6 +1210,11 @@ ${COMPAT_OBJECT_SIZE},${profile},true,true,true,true,true,true,true,0,DRY_RUN,20
 EOF
     printf '%s\n' "DRY_RUN" >"${compat_dir}/body_sha256.txt"
     printf '{}\n' >"${compat_dir}/response_headers.json"
+    cat >"${compat_dir}/fallback_probe_summary.csv" <<EOF
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
+${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
+EOF
     cat >"${compat_dir}/snapshot.json" <<EOF
 {
   "profile": "${profile}",
@@ -819,7 +1239,7 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$compat_dir" "$profile" <<'PY'
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" <<'PY'
 import datetime as dt
 import hashlib
 import hmac
@@ -830,8 +1250,9 @@ import sys
 from typing import Dict, List, Optional, Tuple
 import urllib.parse
 
-endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, out_dir_raw, profile = sys.argv[1:]
+endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, codec_min_size_raw, out_dir_raw, profile = sys.argv[1:]
 object_size = int(object_size_raw)
+codec_min_size = int(codec_min_size_raw)
 out_dir = pathlib.Path(out_dir_raw)
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -943,6 +1364,67 @@ get_object, get_body = request("GET", object_path)
 if get_object["status"] != 200:
     raise SystemExit(f"get object failed: {get_object['status']} {get_object['reason']}")
 
+range_object, range_body = request("GET", object_path, extra_headers=[("range", "bytes=0-0")])
+fallback_rows = [
+    {
+        "profile": profile,
+        "probe": "range",
+        "object_key": object_key,
+        "status": "ok" if range_object["status"] == 206 else "unexpected_status",
+        "status_code": range_object["status"],
+        "body_len": len(range_body),
+        "expected_runtime_fallback_reason": "range",
+        "note": "Range GET should stay on the legacy fallback path for codec profiles",
+    }
+]
+
+if codec_min_size > 1:
+    small_size = max(1, min(codec_min_size - 1, object_size))
+    small_key = object_key + ".below-min-size"
+    small_path = bucket_path + "/" + urllib.parse.quote(small_key, safe="/-_.~")
+    small_body = payload(small_size)
+    small_put, _ = request("PUT", small_path, small_body, [("content-type", "application/octet-stream")])
+    if small_put["status"] not in (200, 204):
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "below_min_size",
+                "object_key": small_key,
+                "status": "put_failed",
+                "status_code": small_put["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "below_min_size",
+                "note": "below-min-size probe upload failed",
+            }
+        )
+    else:
+        small_get, small_get_body = request("GET", small_path)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "below_min_size",
+                "object_key": small_key,
+                "status": "ok" if small_get["status"] == 200 else "unexpected_status",
+                "status_code": small_get["status"],
+                "body_len": len(small_get_body),
+                "expected_runtime_fallback_reason": "below_min_size",
+                "note": "Object smaller than codec-min-size should stay on the legacy fallback path for codec profiles",
+            }
+        )
+else:
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "below_min_size",
+            "object_key": object_key + ".below-min-size",
+            "status": "skipped",
+            "status_code": "N/A",
+            "body_len": "N/A",
+            "expected_runtime_fallback_reason": "below_min_size",
+            "note": "Set --codec-min-size greater than 1 to generate a runtime below_min_size fallback delta",
+        }
+    )
+
 body_sha = sha256_hex(get_body)
 expected_sha = sha256_hex(body)
 body_match = body_sha == expected_sha
@@ -969,6 +1451,26 @@ snapshot = {
 (out_dir / "response_headers.json").write_text(json.dumps(headers_report, indent=2, sort_keys=True) + "\n")
 (out_dir / "snapshot.json").write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
 (out_dir / "body_sha256.txt").write_text(body_sha + "\n")
+(out_dir / "fallback_probe_summary.csv").write_text(
+    "profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note\n"
+    + "\n".join(
+        ",".join(
+            str(row[field]).replace(",", ";")
+            for field in [
+                "profile",
+                "probe",
+                "object_key",
+                "status",
+                "status_code",
+                "body_len",
+                "expected_runtime_fallback_reason",
+                "note",
+            ]
+        )
+        for row in fallback_rows
+    )
+    + "\n"
+)
 
 get_headers = snapshot["get_headers"]
 content_length = ",".join(get_headers.get("content-length", []))
@@ -1091,6 +1593,30 @@ with open(out_csv, "w", encoding="utf-8", newline="") as handle:
             ]
         )
 PY
+}
+
+write_root_fallback_probe_summary() {
+  local out_csv="${OUT_DIR}/fallback_probe_summary.csv"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/compat/fallback_probe_summary.csv"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+N/A,missing,N/A,missing,N/A,N/A,N/A,no_profile_fallback_probe_summary
+EOF
+  fi
 }
 
 write_root_metrics_summary() {
@@ -1407,10 +1933,11 @@ write_default_switch_readiness_report() {
   local compat_summary_path="${OUT_DIR}/compat_summary.csv"
   local cpu_rss_notes_path="${OUT_DIR}/cpu_rss_notes.txt"
   local fallback_coverage_path="${OUT_DIR}/fallback_coverage.txt"
+  local service_metrics_acceptance_path="${OUT_DIR}/service_metrics_acceptance.csv"
   local tracking_issues_path="${OUT_DIR}/tracking_issues.txt"
 
   local stable not_worse improved_over_five two_sizes_gt_five
-  local headers_compatible p95_p99_ok cpu_rss_ok fallback_proven kill_switch_verified correctness_matrix_ok
+  local headers_compatible p95_p99_ok cpu_rss_ok runtime_metrics_ok fallback_proven kill_switch_verified correctness_matrix_ok
   local all_pass decision
 
   if [[ -f "$baseline_compare_path" ]]; then
@@ -1464,6 +1991,25 @@ write_default_switch_readiness_report() {
 
   p95_p99_ok="fail"
   correctness_matrix_ok="fail"
+  runtime_metrics_ok="fail"
+
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && -f "$service_metrics_acceptance_path" ]] \
+     && "$PYTHON_BIN" - "$service_metrics_acceptance_path" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+
+statuses = [row.get("status") for row in rows]
+if not rows or "fail" in statuses or "pass" not in statuses:
+    raise SystemExit(1)
+PY
+  then
+    runtime_metrics_ok="pass"
+  elif [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    runtime_metrics_ok="skipped"
+  fi
 
   if [[ -f "$cpu_rss_notes_path" ]] && grep -q 'cpu_rss_acceptability=acceptable' "$cpu_rss_notes_path"; then
     cpu_rss_ok="pass"
@@ -1490,6 +2036,7 @@ write_default_switch_readiness_report() {
      && "$two_sizes_gt_five" == "pass" \
      && "$p95_p99_ok" == "pass" \
      && "$cpu_rss_ok" == "pass" \
+     && "$runtime_metrics_ok" == "pass" \
      && "$correctness_matrix_ok" == "pass" \
      && "$headers_compatible" == "pass" \
      && "$fallback_proven" == "pass" \
@@ -1515,6 +2062,7 @@ write_default_switch_readiness_report() {
     echo "| at least two sizes improve by more than 5% | ${two_sizes_gt_five} | qualifying sizes: ${improved_over_five} |"
     echo "| p95 / p99 do not regress | ${p95_p99_ok} | current harness retains raw output paths but does not aggregate p95/p99 yet |"
     echo "| CPU and RSS acceptable | ${cpu_rss_ok} | see cpu_rss_notes.txt |"
+    echo "| runtime server metrics prove path and fallback deltas | ${runtime_metrics_ok} | see service_metrics_acceptance.csv; skipped for observability-off performance runs |"
     echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
     echo "| response headers compatible | ${headers_compatible} | see compat_summary.csv |"
     echo "| range / encrypted / compressed / multipart / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
@@ -1525,6 +2073,9 @@ write_default_switch_readiness_report() {
     echo "- \`baseline_compare.csv\`"
     echo "- \`compat_summary.csv\`"
     echo "- \`metrics_summary.csv\`"
+    echo "- \`service_metrics_summary.csv\`"
+    echo "- \`service_metrics_acceptance.csv\`"
+    echo "- \`fallback_probe_summary.csv\`"
     echo "- \`cpu_rss_notes.txt\`"
     echo "- \`fallback_coverage.txt\`"
     echo "- \`tracking_issues.txt\`"
@@ -1547,6 +2098,7 @@ run_profile() {
 
   stop_server
   start_server "$profile"
+  capture_service_metrics_snapshot "$profile" before
   if run_bench "$profile" "$baseline_csv"; then
     :
   else
@@ -1554,11 +2106,14 @@ run_profile() {
   fi
   write_metrics_summary "$profile"
   run_compat_probe "$profile"
+  capture_service_metrics_snapshot "$profile" after
+  write_profile_service_metrics_summary "$profile"
   stop_server
   write_profile_cpu_rss_notes "$profile"
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
   log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
+  log "Service metrics summary: ${OUT_DIR}/${profile}/service_metrics_summary.csv"
   log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
@@ -1623,7 +2178,10 @@ main() {
   done
 
   write_root_metrics_summary "${profiles[@]}"
+  write_root_service_metrics_summary "${profiles[@]}"
+  write_service_metrics_acceptance
   write_root_compat_summary "${profiles[@]}"
+  write_root_fallback_probe_summary "${profiles[@]}"
   write_root_cpu_rss_notes
   write_fallback_coverage
   write_tracking_issues
@@ -1638,6 +2196,15 @@ main() {
   fi
   if [[ -f "${OUT_DIR}/metrics_summary.csv" ]]; then
     log "Metrics summary: ${OUT_DIR}/metrics_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/service_metrics_summary.csv" ]]; then
+    log "Service metrics summary: ${OUT_DIR}/service_metrics_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/service_metrics_acceptance.csv" ]]; then
+    log "Service metrics acceptance: ${OUT_DIR}/service_metrics_acceptance.csv"
+  fi
+  if [[ -f "${OUT_DIR}/fallback_probe_summary.csv" ]]; then
+    log "Fallback probe summary: ${OUT_DIR}/fallback_probe_summary.csv"
   fi
   if [[ -f "${OUT_DIR}/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/baseline_compare.csv"
