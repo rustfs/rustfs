@@ -1228,7 +1228,7 @@ impl SetDisks {
             let bucket = bucket.clone();
             let object = object.clone();
             let version_id = version_id.clone();
-            tokio::spawn(async move {
+            async move {
                 let response_start = observe.then(Instant::now);
                 let result = if let Some(disk) = disk {
                     disk.read_version(&org_bucket, &bucket, &object, &version_id, &opts).await
@@ -1237,37 +1237,27 @@ impl SetDisks {
                 };
                 let elapsed = response_start.map(|start| start.elapsed());
                 (result, elapsed)
-            })
+            }
         });
 
-        // Wait for all tasks to complete
+        // Wait for all futures to complete
         let results = join_all(futures).await;
 
-        for result in results {
-            match result {
-                Ok((res, elapsed)) => match res {
-                    Ok(file_info) => {
-                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
-                            observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
-                        }
-                        ress.push(file_info);
-                        errors.push(None);
+        for (res, elapsed) in results {
+            match res {
+                Ok(file_info) => {
+                    if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                        observations.push(MetadataFanoutObservation::from_file_info(&file_info, elapsed));
                     }
-                    Err(e) => {
-                        if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
-                            observations.push(MetadataFanoutObservation::from_error(&e, elapsed));
-                        }
-                        ress.push(FileInfo::default());
-                        errors.push(Some(e));
-                    }
-                },
-                Err(_) => {
-                    let err = DiskError::Unexpected;
-                    if let (Some(observations), Some(fanout_start)) = (&mut observations, fanout_start) {
-                        observations.push(MetadataFanoutObservation::from_error(&err, fanout_start.elapsed()));
+                    ress.push(file_info);
+                    errors.push(None);
+                }
+                Err(e) => {
+                    if let (Some(observations), Some(elapsed)) = (&mut observations, elapsed) {
+                        observations.push(MetadataFanoutObservation::from_error(&e, elapsed));
                     }
                     ress.push(FileInfo::default());
-                    errors.push(Some(err));
+                    errors.push(Some(e));
                 }
             }
         }
