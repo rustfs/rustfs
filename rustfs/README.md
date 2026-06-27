@@ -21,7 +21,7 @@ English | <a href="https://github.com/rustfs/rustfs/blob/main/README_ZH.md">Simp
 </p>
 
 RustFS is a high-performance distributed object storage software built using Rust, one of the most popular languages
-worldwide. Along with MinIO, it shares a range of advantages such as simplicity, S3 compatibility, open-source nature,
+worldwide. Along with MinIO, it shares a range of advantages such as simplicity, broad S3 API compatibility for supported features, open-source nature,
 support for data lakes, AI, and big data. Furthermore, it has a better and more user-friendly open-source license in
 comparison to other storage systems, being constructed under the Apache license. As Rust serves as its foundation,
 RustFS provides faster speed and safer distributed features for high-performance object storage.
@@ -30,7 +30,7 @@ RustFS provides faster speed and safer distributed features for high-performance
 
 - **High Performance**: Built with Rust, ensuring speed and efficiency.
 - **Distributed Architecture**: Scalable and fault-tolerant design for large-scale deployments.
-- **S3 Compatibility**: Seamless integration with existing S3-compatible applications.
+- **S3 Compatibility**: Integration with common S3-compatible applications; current coverage is tracked in the S3 compatibility matrix.
 - **Data Lake Support**: Optimized for big data and AI workloads.
 - **Open Source**: Licensed under Apache 2.0, encouraging community contributions and transparency.
 - **User-Friendly**: Designed with simplicity in mind, making it easy to deploy and manage.
@@ -56,7 +56,7 @@ Stress test server parameters
 | Developed based on Rust language, memory is safer                               | Developed in Go or C, with potential issues like memory GC/leaks                                                        |
 | Does not report logs to third-party countries                                   | Reporting logs to other third countries may violate national security laws                                              |
 | Licensed under Apache, more business-friendly                                   | AGPL V3 License and other License, polluted open source and License traps, infringement of intellectual property rights |
-| Comprehensive S3 support, works with domestic and international cloud providers | Full support for S3, but no local cloud vendor support                                                                  |
+| S3-compatible core, with coverage tracked in the compatibility matrix          | Variable S3 support and local cloud vendor coverage                                                                     |
 | Rust-based development, strong support for secure and innovative devices        | Poor support for edge gateways and secure innovative devices                                                            |
 | Stable commercial prices, free community support                                | High pricing, with costs up to $250,000 for 1PiB                                                                        |
 | No risk                                                                         | Intellectual property risks and risks of prohibited uses                                                                |
