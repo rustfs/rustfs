@@ -3294,7 +3294,12 @@ impl DefaultObjectUsecase {
         });
 
         // x-amz-expiration: predict from lifecycle configuration
-        let expiration = resolve_put_object_expiration(bucket, &info).await;
+        // Only resolve if the object has an expiration marker
+        let expiration = if info.user_defined.contains_key("x-amz-expiration") {
+            resolve_put_object_expiration(bucket, &info).await
+        } else {
+            None
+        };
         let storage_class = response_storage_class(&info, &info.user_defined);
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
