@@ -9287,6 +9287,7 @@ dependencies = [
  "md-5 0.11.0",
  "memmap2 0.9.11",
  "metrics",
+ "moka",
  "num_cpus",
  "opentelemetry",
  "opentelemetry_sdk",
