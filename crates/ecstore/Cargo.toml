@@ -79,6 +79,7 @@ uuid = { workspace = true, features = ["v4", "fast-rng", "serde"] }
 reed-solomon-erasure = { workspace = true }
 reed-solomon-simd = { workspace = true }
 lazy_static.workspace = true
+moka = { workspace = true }
 rustfs-lock.workspace = true
 rustfs-io-metrics.workspace = true
 regex = { workspace = true }

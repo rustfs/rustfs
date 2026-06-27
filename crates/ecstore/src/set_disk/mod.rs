@@ -887,7 +887,7 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
-    get_object_metadata_cache: Arc<RwLock<HashMap<GetObjectMetadataCacheKey, GetObjectMetadataCacheEntry>>>,
+    get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, GetObjectMetadataCacheEntry>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
 }
@@ -909,17 +909,12 @@ impl GetObjectMetadataCacheKey {
 
 #[derive(Clone, Debug)]
 struct GetObjectMetadataCacheEntry {
+    #[allow(dead_code)] // Kept for debugging; moka handles TTL internally
     created_at: Instant,
     fi: FileInfo,
     parts_metadata: Vec<FileInfo>,
     online_disks: Vec<Option<DiskStore>>,
     read_quorum: usize,
-}
-
-impl GetObjectMetadataCacheEntry {
-    fn is_fresh(&self) -> bool {
-        self.created_at.elapsed() <= GET_OBJECT_METADATA_CACHE_TTL
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -941,9 +936,8 @@ impl DiskHealthEntry {
 impl SetDisks {
     async fn invalidate_get_object_metadata_cache(&self, bucket: &str, object: &str) {
         self.get_object_metadata_cache
-            .write()
-            .await
-            .remove(&GetObjectMetadataCacheKey::new(bucket, object));
+            .invalidate(&GetObjectMetadataCacheKey::new(bucket, object))
+            .await;
     }
 
     async fn acquire_read_lock_diag(&self, op: &'static str, bucket: &str, object: &str) -> Result<ObjectLockDiagGuard> {
@@ -1051,7 +1045,10 @@ impl SetDisks {
             format,
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
-            get_object_metadata_cache: Arc::new(RwLock::new(HashMap::new())),
+            get_object_metadata_cache: moka::future::Cache::builder()
+                .max_capacity(GET_OBJECT_METADATA_CACHE_MAX_ENTRIES as u64)
+                .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
+                .build(),
             lockers,
             local_lock_manager: runtime_sources::global_lock_manager(),
         })
@@ -3120,7 +3117,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 .await
                 .map_err(|e| to_object_err(e.into(), vec![bucket, object]))?;
 
-            self.get_object_metadata_cache.write().await.clear();
+            self.get_object_metadata_cache.invalidate_all();
             return Ok(ObjectInfo::default());
         }
 

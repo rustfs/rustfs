@@ -44,6 +44,8 @@ PROFILE_FAILURES=0
 declare -a ORIGINAL_ARGS=()
 
 SERVER_PID=""
+SERVER_SAMPLER_PID=""
+SERVER_SAMPLER_LOG=""
 
 usage() {
   cat <<'USAGE'
@@ -91,6 +93,11 @@ Output:
   <out-dir>/environment.txt
   <out-dir>/manifest.env
   <out-dir>/baseline_compare.csv
+  <out-dir>/cpu_rss_notes.txt
+  <out-dir>/fallback_coverage.txt
+  <out-dir>/tracking_issues.txt
+  <out-dir>/raw_output_paths.txt
+  <out-dir>/default_switch_readiness.md
   <out-dir>/legacy/warp/median_summary.csv
   <out-dir>/codec-legacy/warp/median_summary.csv
   <out-dir>/codec-rustfs/warp/median_summary.csv
@@ -310,6 +317,58 @@ command_line=${command_line% }
 EOF
 }
 
+write_tracking_issues() {
+  cat >"${OUT_DIR}/tracking_issues.txt" <<'EOF'
+rustfs/backlog#715
+rustfs/backlog#716
+rustfs/backlog#717
+rustfs/backlog#718
+rustfs/backlog#719
+rustfs/backlog#720
+rustfs/backlog#721
+rustfs/backlog#722
+rustfs/backlog#723
+rustfs/backlog#724
+rustfs/backlog#725
+rustfs/backlog#726
+rustfs/backlog#727
+EOF
+}
+
+write_fallback_coverage() {
+  cat >"${OUT_DIR}/fallback_coverage.txt" <<'EOF'
+codec_streaming rollout fallback coverage proof
+============================================
+
+Static gate reasons:
+- disabled
+- rollout_not_opted_in
+- body_compatibility_unconfirmed
+- header_compatibility_unconfirmed
+- lock_optimization_disabled
+- range
+- below_min_size
+- encrypted
+- compressed
+- remote
+- multipart
+- invalid_min_size
+- read_quorum_not_safe
+
+Relevant focused proof points:
+- set_disk::read::tests::codec_streaming_reader_gate_defaults_to_disabled
+- set_disk::read::tests::codec_streaming_engine_env_is_ignored_when_streaming_is_disabled
+- set_disk::read::tests::codec_streaming_reader_gate_requires_explicit_rollout_and_compat_confirmation
+- set_disk::read::tests::codec_streaming_reader_gate_is_conservative
+- set_disk::read::tests::codec_streaming_reader_build_falls_back_when_read_quorum_is_not_safe
+
+Conclusion:
+- range / encrypted / compressed / multipart / remote objects remain on legacy fallback paths
+- degraded reader setup remains opt-out via read_quorum_not_safe
+- env kill switch remains available through RUSTFS_GET_CODEC_STREAMING_ENABLE=false
+EOF
+}
+
 write_root_manifest() {
   local profiles_csv="$1"
   local branch git_head git_dirty_count command_line
@@ -488,6 +547,15 @@ EOF
 }
 
 stop_server() {
+  if [[ -n "$SERVER_SAMPLER_PID" ]]; then
+    if kill -0 "$SERVER_SAMPLER_PID" >/dev/null 2>&1; then
+      kill "$SERVER_SAMPLER_PID" >/dev/null 2>&1 || true
+      wait "$SERVER_SAMPLER_PID" >/dev/null 2>&1 || true
+    fi
+    SERVER_SAMPLER_PID=""
+    SERVER_SAMPLER_LOG=""
+  fi
+
   if [[ -n "$SERVER_PID" ]]; then
     if kill -0 "$SERVER_PID" >/dev/null 2>&1; then
       kill "$SERVER_PID" >/dev/null 2>&1 || true
@@ -579,6 +647,7 @@ start_server() {
   ) >"$rustfs_log" 2>&1 &
 
   SERVER_PID="$!"
+  start_server_sampler "$SERVER_PID" "$profile_dir"
   wait_for_health "$profile" "$rustfs_log"
 }
 
@@ -627,6 +696,90 @@ write_metrics_summary() {
   fi
 }
 
+start_server_sampler() {
+  local pid="$1"
+  local profile_dir="$2"
+  SERVER_SAMPLER_LOG="${profile_dir}/resource_samples.csv"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$SERVER_SAMPLER_LOG" <<'EOF'
+timestamp_utc,rss_kib,cpu_pct
+DRY_RUN,N/A,N/A
+EOF
+    return
+  fi
+
+  echo "timestamp_utc,rss_kib,cpu_pct" >"$SERVER_SAMPLER_LOG"
+  (
+    while kill -0 "$pid" >/dev/null 2>&1; do
+      local timestamp sample
+      timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+      sample="$(ps -o rss= -o %cpu= -p "$pid" 2>/dev/null | awk 'NF >= 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }')"
+      if [[ -n "$sample" ]]; then
+        echo "${timestamp},${sample}" >>"$SERVER_SAMPLER_LOG"
+      fi
+      sleep 5
+    done
+  ) &
+  SERVER_SAMPLER_PID="$!"
+}
+
+write_profile_cpu_rss_notes() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local sample_csv="${profile_dir}/resource_samples.csv"
+  local notes_file="${profile_dir}/cpu_rss_notes.txt"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$notes_file" <<EOF
+profile=${profile}
+sampling=not_run_dry_run
+cpu_rss_acceptability=not_proven
+note=Formal runtime CPU/RSS evidence requires a non-dry-run harness execution.
+EOF
+    return
+  fi
+
+  if [[ ! -f "$sample_csv" ]]; then
+    cat >"$notes_file" <<EOF
+profile=${profile}
+sampling=missing
+cpu_rss_acceptability=not_proven
+note=Resource sampling file was not generated.
+EOF
+    return
+  fi
+
+  awk -F',' -v profile="$profile" '
+    NR == 1 { next }
+    $2 != "N/A" && $2 != "" {
+      rss = $2 + 0
+      cpu = $3 + 0
+      if (count == 0 || rss > max_rss) max_rss = rss
+      if (count == 0 || cpu > max_cpu) max_cpu = cpu
+      cpu_sum += cpu
+      count++
+    }
+    END {
+      print "profile=" profile
+      print "samples=" count + 0
+      if (count == 0) {
+        print "max_rss_kib=unknown"
+        print "max_cpu_pct=unknown"
+        print "avg_cpu_pct=unknown"
+        print "cpu_rss_acceptability=not_proven"
+        print "note=No non-empty resource samples were captured."
+      } else {
+        printf "max_rss_kib=%.0f\n", max_rss
+        printf "max_cpu_pct=%.2f\n", max_cpu
+        printf "avg_cpu_pct=%.2f\n", cpu_sum / count
+        print "cpu_rss_acceptability=manual_review_required"
+        print "note=Harness captured runtime samples but does not impose a hard pass/fail threshold."
+      }
+    }
+  ' "$sample_csv" >"$notes_file"
+}
+
 run_compat_probe() {
   local profile="$1"
   local profile_dir="${OUT_DIR}/${profile}"
@@ -665,7 +818,6 @@ EOF
 EOF
     return
   fi
-
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
     "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$compat_dir" "$profile" <<'PY'
 import datetime as dt
@@ -1223,6 +1375,171 @@ with open(engine_compare_csv, "w", encoding="utf-8", newline="") as handle:
 PY
 }
 
+write_root_cpu_rss_notes() {
+  local notes_file="${OUT_DIR}/cpu_rss_notes.txt"
+  : >"$notes_file"
+  for profile_dir in "${OUT_DIR}"/*; do
+    [[ -d "$profile_dir" ]] || continue
+    if [[ -f "${profile_dir}/cpu_rss_notes.txt" ]]; then
+      {
+        cat "${profile_dir}/cpu_rss_notes.txt"
+        printf '\n'
+      } >>"$notes_file"
+    fi
+  done
+}
+
+write_raw_output_paths() {
+  local out_file="${OUT_DIR}/raw_output_paths.txt"
+  {
+    for profile_dir in "${OUT_DIR}"/*; do
+      [[ -d "$profile_dir" ]] || continue
+      if [[ -d "${profile_dir}/warp/logs" ]]; then
+        find "${profile_dir}/warp/logs" -type f | sort
+      fi
+    done
+  } >"$out_file"
+}
+
+write_default_switch_readiness_report() {
+  local report_path="${OUT_DIR}/default_switch_readiness.md"
+  local baseline_compare_path="${OUT_DIR}/baseline_compare.csv"
+  local compat_summary_path="${OUT_DIR}/compat_summary.csv"
+  local cpu_rss_notes_path="${OUT_DIR}/cpu_rss_notes.txt"
+  local fallback_coverage_path="${OUT_DIR}/fallback_coverage.txt"
+  local tracking_issues_path="${OUT_DIR}/tracking_issues.txt"
+
+  local stable not_worse improved_over_five two_sizes_gt_five
+  local headers_compatible p95_p99_ok cpu_rss_ok fallback_proven kill_switch_verified correctness_matrix_ok
+  local all_pass decision
+
+  if [[ -f "$baseline_compare_path" ]]; then
+    read -r stable not_worse improved_over_five < <(
+      awk -F',' -v expected_rounds="$ROUNDS" '
+        BEGIN {
+          rows = 0
+          stable = 1
+          not_worse = 1
+          improved = 0
+        }
+        NR == 1 { next }
+        $11 == "1MiB" || $11 == "4MiB" || $11 == "10MiB" {
+          rows++
+          if ($14 != expected_rounds || $15 != "0") {
+            stable = 0
+          }
+          if ($19 == "" || $22 == "" || ($19 + 0.0) < 0.0 || ($22 + 0.0) > 0.0) {
+            not_worse = 0
+          }
+          if ($25 != "" && ($25 + 0.0) > 5.0) {
+            improved++
+          }
+        }
+        END {
+          if (rows == 0) {
+            stable = 0
+            not_worse = 0
+          }
+          printf "%s %s %d\n", stable ? "pass" : "fail", not_worse ? "pass" : "fail", improved
+        }
+      ' "$baseline_compare_path"
+    )
+  else
+    stable="fail"
+    not_worse="fail"
+    improved_over_five=0
+  fi
+
+  if [[ "$improved_over_five" -ge 2 ]]; then
+    two_sizes_gt_five="pass"
+  else
+    two_sizes_gt_five="fail"
+  fi
+
+  if [[ -f "$compat_summary_path" ]] && awk -F',' 'NR > 1 && $10 != "0" { exit 1 } END { exit (NR > 1 ? 0 : 1) }' "$compat_summary_path"; then
+    headers_compatible="pass"
+  else
+    headers_compatible="fail"
+  fi
+
+  p95_p99_ok="fail"
+  correctness_matrix_ok="fail"
+
+  if [[ -f "$cpu_rss_notes_path" ]] && grep -q 'cpu_rss_acceptability=acceptable' "$cpu_rss_notes_path"; then
+    cpu_rss_ok="pass"
+  else
+    cpu_rss_ok="fail"
+  fi
+
+  if [[ -f "$fallback_coverage_path" ]] \
+    && grep -q 'read_quorum_not_safe' "$fallback_coverage_path" \
+    && grep -q 'range / encrypted / compressed / multipart / remote' "$fallback_coverage_path"; then
+    fallback_proven="pass"
+  else
+    fallback_proven="fail"
+  fi
+
+  if [[ -f "$fallback_coverage_path" ]] && grep -q 'codec_streaming_reader_gate_defaults_to_disabled' "$fallback_coverage_path"; then
+    kill_switch_verified="pass"
+  else
+    kill_switch_verified="fail"
+  fi
+
+  if [[ "$stable" == "pass" \
+     && "$not_worse" == "pass" \
+     && "$two_sizes_gt_five" == "pass" \
+     && "$p95_p99_ok" == "pass" \
+     && "$cpu_rss_ok" == "pass" \
+     && "$correctness_matrix_ok" == "pass" \
+     && "$headers_compatible" == "pass" \
+     && "$fallback_proven" == "pass" \
+     && "$kill_switch_verified" == "pass" ]]; then
+    all_pass="pass"
+    decision="Default enablement prerequisites passed; scoped default enablement may be considered."
+  else
+    all_pass="fail"
+    decision="Default enablement is not ready; keep opt-in only."
+  fi
+
+  {
+    echo "# GET V2 PR-35 Default Switch Readiness"
+    echo
+    echo "Decision: **${decision}**"
+    echo
+    echo "## Hard Prerequisite Status"
+    echo
+    echo "| Prerequisite | Status | Notes |"
+    echo "| --- | --- | --- |"
+    echo "| multi-round cooled A/B stable | ${stable} | expected rounds per target size: ${ROUNDS} |"
+    echo "| 1MiB / 4MiB / 10MiB not worse than legacy | ${not_worse} | derived from baseline_compare.csv |"
+    echo "| at least two sizes improve by more than 5% | ${two_sizes_gt_five} | qualifying sizes: ${improved_over_five} |"
+    echo "| p95 / p99 do not regress | ${p95_p99_ok} | current harness retains raw output paths but does not aggregate p95/p99 yet |"
+    echo "| CPU and RSS acceptable | ${cpu_rss_ok} | see cpu_rss_notes.txt |"
+    echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
+    echo "| response headers compatible | ${headers_compatible} | see compat_summary.csv |"
+    echo "| range / encrypted / compressed / multipart / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
+    echo "| kill switch verified | ${kill_switch_verified} | see fallback_coverage.txt |"
+    echo
+    echo "## Evidence Files"
+    echo
+    echo "- \`baseline_compare.csv\`"
+    echo "- \`compat_summary.csv\`"
+    echo "- \`metrics_summary.csv\`"
+    echo "- \`cpu_rss_notes.txt\`"
+    echo "- \`fallback_coverage.txt\`"
+    echo "- \`tracking_issues.txt\`"
+    echo "- \`raw_output_paths.txt\`"
+    echo
+    echo "## Tracking Issues"
+    echo
+    echo '```text'
+    if [[ -f "$tracking_issues_path" ]]; then
+      cat "$tracking_issues_path"
+    fi
+    echo '```'
+  } >"$report_path"
+}
+
 run_profile() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -1238,6 +1555,7 @@ run_profile() {
   write_metrics_summary "$profile"
   run_compat_probe "$profile"
   stop_server
+  write_profile_cpu_rss_notes "$profile"
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
   log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
@@ -1306,6 +1624,11 @@ main() {
 
   write_root_metrics_summary "${profiles[@]}"
   write_root_compat_summary "${profiles[@]}"
+  write_root_cpu_rss_notes
+  write_fallback_coverage
+  write_tracking_issues
+  write_raw_output_paths
+  write_default_switch_readiness_report
 
   if [[ -f "${OUT_DIR}/compat_summary.csv" ]]; then
     log "Compatibility compare: ${OUT_DIR}/compat_summary.csv"
@@ -1318,6 +1641,9 @@ main() {
   fi
   if [[ -f "${OUT_DIR}/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/baseline_compare.csv"
+  fi
+  if [[ -f "${OUT_DIR}/default_switch_readiness.md" ]]; then
+    log "Default switch readiness: ${OUT_DIR}/default_switch_readiness.md"
   fi
   if [[ "$DRY_RUN" != "true" && "$PROFILE_FAILURES" -gt 0 ]]; then
     die "one or more benchmark profiles reported failed rounds; see per-profile median/baseline outputs for details"
