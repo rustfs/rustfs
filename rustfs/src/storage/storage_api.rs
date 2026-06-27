@@ -189,7 +189,7 @@ pub(crate) mod rpc_consumer {
             LocalPeerS3Client, MetricType, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq, ReadMultipleResp, ReadOptions,
             SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt,
             UpdateMetadataOpts, all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, get_local_server_property,
-            load_bucket_metadata, reload_transition_tier_config, resolve_object_store_handle, set_bucket_metadata,
+            load_bucket_metadata, reload_transition_tier_config, set_bucket_metadata,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
@@ -378,8 +378,8 @@ pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
         GLOBAL_BOOT_TIME, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
         get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        is_dist_erasure, new_object_layer_fn, resolve_object_store_handle, set_global_endpoints, set_global_region,
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
+        is_dist_erasure, new_object_layer_fn, set_global_endpoints, set_global_region, set_global_rustfs_port,
+        set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
 }
 
@@ -1131,10 +1131,6 @@ pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> 
 
 pub(crate) async fn is_dist_erasure() -> bool {
     ecstore_global::is_dist_erasure().await
-}
-
-pub(crate) fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
-    ecstore_global::resolve_object_store_handle()
 }
 
 pub(crate) async fn collect_local_metrics(

@@ -28,54 +28,54 @@ pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     root_runtime_sources::current_app_context()
 }
 
-pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
+pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
     root_runtime_sources::resolve_object_store_handle()
 }
 
-pub(crate) fn object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
+pub(crate) fn current_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
     root_runtime_sources::resolve_object_store_handle_for_context(context)
 }
 
-pub(crate) fn buffer_config() -> RustFSBufferConfig {
+pub(crate) fn current_buffer_config() -> RustFSBufferConfig {
     root_runtime_sources::resolve_buffer_config()
 }
 
-pub(crate) fn internode_metrics() -> Arc<InternodeMetrics> {
+pub(crate) fn current_internode_metrics() -> Arc<InternodeMetrics> {
     root_runtime_sources::resolve_internode_metrics()
 }
 
-pub(crate) async fn local_node_name() -> String {
+pub(crate) async fn current_local_node_name() -> String {
     root_runtime_sources::resolve_local_node_name().await
 }
 
-pub(crate) fn action_credentials() -> Option<Credentials> {
+pub(crate) fn current_action_credentials() -> Option<Credentials> {
     root_runtime_sources::resolve_action_credentials()
 }
 
-pub(crate) fn notify_interface() -> Arc<dyn root_runtime_sources::NotifyInterface> {
+pub(crate) fn current_notify_interface() -> Arc<dyn root_runtime_sources::NotifyInterface> {
     root_runtime_sources::resolve_notify_interface()
 }
 
-pub(crate) fn performance_metrics() -> Arc<PerformanceMetrics> {
+pub(crate) fn current_performance_metrics() -> Arc<PerformanceMetrics> {
     root_runtime_sources::resolve_performance_metrics()
 }
 
-pub(crate) async fn encryption_service() -> Option<Arc<ObjectEncryptionService>> {
+pub(crate) async fn current_encryption_service() -> Option<Arc<ObjectEncryptionService>> {
     root_runtime_sources::resolve_encryption_service().await
 }
 
-pub(crate) fn region() -> Option<s3s::region::Region> {
+pub(crate) fn current_region() -> Option<s3s::region::Region> {
     root_runtime_sources::resolve_region()
 }
 
-pub(crate) fn ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
+pub(crate) fn current_ready_iam_handle() -> IamResult<Arc<IamSys<ObjectStore>>> {
     root_runtime_sources::resolve_ready_iam_handle()
 }
 
-pub(crate) fn iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
+pub(crate) fn current_iam_handle() -> Option<Arc<IamSys<ObjectStore>>> {
     root_runtime_sources::resolve_iam_handle()
 }
 
-pub(crate) fn lock_client() -> Option<Arc<dyn LockClient>> {
+pub(crate) fn current_lock_client() -> Option<Arc<dyn LockClient>> {
     root_runtime_sources::resolve_lock_client()
 }

@@ -312,7 +312,7 @@ impl OperationHelper {
                 final_builder = final_builder.error(err);
             }
 
-            if let Some(cred) = runtime_sources::action_credentials() {
+            if let Some(cred) = runtime_sources::current_action_credentials() {
                 final_builder = final_builder.access_key(&cred.access_key);
             }
 
@@ -383,7 +383,7 @@ impl Drop for OperationHelper {
             if !event_args.is_replication_request() {
                 let ctx = state.request_context.clone();
                 spawn_background_with_context(ctx, async move {
-                    runtime_sources::notify_interface().notify(event_args).await;
+                    runtime_sources::current_notify_interface().notify(event_args).await;
                 });
             }
         }

@@ -23,7 +23,7 @@ use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, LocalPeerS3Client, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, SERVICE_SIGNAL_REFRESH_CONFIG,
     SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref,
-    reload_transition_tier_config, resolve_object_store_handle,
+    reload_transition_tier_config,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
@@ -194,7 +194,7 @@ pub fn make_server_for_context(context: Option<Arc<runtime_sources::AppContext>>
 impl NodeService {
     fn resolve_object_store(&self) -> Option<Arc<ECStore>> {
         let context = self.context.clone().or_else(runtime_sources::current_app_context);
-        runtime_sources::object_store_handle_for_context(context.as_deref())
+        runtime_sources::current_object_store_handle_for_context(context.as_deref())
     }
 
     async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
@@ -207,7 +207,7 @@ impl NodeService {
 
     /// Get the lock client, returning an error if not initialized
     fn get_lock_client(&self) -> Result<Arc<dyn LockClient>, Status> {
-        runtime_sources::lock_client()
+        runtime_sources::current_lock_client()
             .ok_or_else(|| Status::internal("Lock client not initialized. Please ensure storage is initialized first."))
     }
 }
@@ -666,7 +666,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeletePolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -695,7 +695,7 @@ impl Node for NodeService {
                 error_info: Some("policy name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadPolicyResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -734,7 +734,7 @@ impl Node for NodeService {
             }));
         };
         let is_group = request.is_group;
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadPolicyMappingResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -762,7 +762,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeleteUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -794,7 +794,7 @@ impl Node for NodeService {
                 error_info: Some("access_key name is missing".to_string()),
             }));
         }
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(DeleteServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -824,7 +824,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadUserResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -860,7 +860,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadServiceAccountResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -891,7 +891,7 @@ impl Node for NodeService {
             }));
         }
 
-        let Some(iam_sys) = runtime_sources::iam_handle() else {
+        let Some(iam_sys) = runtime_sources::current_iam_handle() else {
             return Ok(Response::new(LoadGroupResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1094,7 +1094,7 @@ impl Node for NodeService {
         &self,
         request: Request<StartDecommissionRequest>,
     ) -> Result<Response<StartDecommissionResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(StartDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1125,7 +1125,7 @@ impl Node for NodeService {
         &self,
         request: Request<CancelDecommissionRequest>,
     ) -> Result<Response<CancelDecommissionResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(CancelDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),
@@ -1157,7 +1157,7 @@ impl Node for NodeService {
         &self,
         request: Request<ClearDecommissionRequest>,
     ) -> Result<Response<ClearDecommissionResponse>, Status> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = runtime_sources::current_object_store_handle() else {
             return Ok(Response::new(ClearDecommissionResponse {
                 success: false,
                 error_info: Some("errServerNotInitialized".to_string()),

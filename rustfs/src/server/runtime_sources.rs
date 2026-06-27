@@ -22,30 +22,30 @@ use rustfs_lock::LockClient;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-pub(crate) fn kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
+pub(crate) fn current_kms_runtime_service_manager() -> Option<Arc<KmsServiceManager>> {
     resolve_kms_runtime_service_manager()
 }
 
-pub(crate) fn server_config() -> Option<rustfs_config::server_config::Config> {
+pub(crate) fn current_server_config() -> Option<rustfs_config::server_config::Config> {
     resolve_server_config()
 }
 
-pub(crate) fn notify_interface() -> Arc<dyn NotifyInterface> {
+pub(crate) fn current_notify_interface() -> Arc<dyn NotifyInterface> {
     resolve_notify_interface()
 }
 
-pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
+pub(crate) fn current_object_store_handle() -> Option<Arc<ECStore>> {
     resolve_object_store_handle()
 }
 
-pub(crate) fn iam_ready() -> bool {
+pub(crate) fn current_iam_ready() -> bool {
     resolve_iam_ready()
 }
 
-pub(crate) fn endpoints_handle() -> Option<EndpointServerPools> {
+pub(crate) fn current_endpoints_handle() -> Option<EndpointServerPools> {
     resolve_endpoints_handle()
 }
 
-pub(crate) fn lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
+pub(crate) fn current_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
     resolve_lock_clients_handle()
 }

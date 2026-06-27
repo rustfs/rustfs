@@ -961,7 +961,7 @@ impl NodeService {
     pub(super) async fn handle_write_all(&self, request: Request<WriteAllRequest>) -> Result<Response<WriteAllResponse>, Status> {
         let request = request.into_inner();
         let data_len = request.data.len();
-        let metrics = runtime_sources::internode_metrics();
+        let metrics = runtime_sources::current_internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_WRITE_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
@@ -1001,7 +1001,7 @@ impl NodeService {
         debug!("read all");
 
         let request = request.into_inner();
-        let metrics = runtime_sources::internode_metrics();
+        let metrics = runtime_sources::current_internode_metrics();
         metrics.record_incoming_request_for_operation_and_backend(
             INTERNODE_OPERATION_GRPC_READ_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
