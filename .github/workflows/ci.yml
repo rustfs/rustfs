@@ -84,7 +84,7 @@ jobs:
     steps:
       - name: Skip duplicate actions
         id: skip_check
-        uses: fkirc/skip-duplicate-actions@v5
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5
         with:
           concurrent_skipping: "same_content_newer"
           cancel_others: true
@@ -97,10 +97,10 @@ jobs:
     if: needs.skip-check.outputs.should_skip != 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
       - name: Typos check with custom config file
-        uses: crate-ci/typos@master
+        uses: crate-ci/typos@37bb98842b0d8c4ffebdb75301a13db0267cef89 # master
 
   test-and-lint:
     name: Test and Lint
@@ -112,7 +112,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -160,7 +160,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -188,7 +188,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -204,7 +204,7 @@ jobs:
           cargo build -p rustfs --bins --jobs 2
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary
           path: target/debug/rustfs
@@ -221,7 +221,7 @@ jobs:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup
@@ -237,7 +237,7 @@ jobs:
           cargo build -p rustfs --bins --features rio-v2 --jobs 2
 
       - name: Upload debug binary
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: rustfs-debug-binary-rio-v2
           path: target/debug/rustfs
@@ -252,10 +252,10 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -264,13 +264,13 @@ jobs:
         run: chmod +x ./target/debug/rustfs
 
       - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Run delete-marker migration proof
         run: cargo test -p e2e_test delete_marker_migration_semantics -- --nocapture --test-threads=1
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
@@ -288,7 +288,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-test-logs-${{ github.run_number }}
           path: ${{ runner.temp }}/rustfs-e2e-*/rustfs.log
@@ -302,7 +302,7 @@ jobs:
     timeout-minutes: 30
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Clean up previous test run
         run: |
@@ -310,7 +310,7 @@ jobs:
           rm -f /tmp/rustfs.log
 
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary-rio-v2
           path: target/debug
@@ -319,10 +319,10 @@ jobs:
         run: chmod +x ./target/debug/rustfs
 
       - name: Setup Rust toolchain for s3s-e2e installation
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
 
       - name: Install s3s-e2e test tool
-        uses: taiki-e/cache-cargo-install-action@v2
+        uses: taiki-e/cache-cargo-install-action@7447f04c51f2ba27ca35e7f1e28fab848c5b3ba7 # v2
         with:
           tool: s3s-e2e
           git: https://github.com/s3s-project/s3s.git
@@ -335,7 +335,7 @@ jobs:
 
       - name: Upload test logs
         if: failure()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: e2e-test-logs-rio-v2-${{ github.run_number }}
           path: /tmp/rustfs.log
@@ -349,10 +349,10 @@ jobs:
     timeout-minutes: 60
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Download debug binary
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: rustfs-debug-binary
           path: target/debug
@@ -376,7 +376,7 @@ jobs:
 
       - name: Upload s3 test artifacts
         if: always()
-        uses: actions/upload-artifact@v6
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
           name: s3tests-implemented-${{ github.run_number }}
           path: artifacts/s3tests-single/**
