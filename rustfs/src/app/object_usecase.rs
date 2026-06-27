@@ -2207,11 +2207,14 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::record_zero_copy_read;
         let read_duration = read_start.elapsed();
-        record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
 
-        manager.record_disk_operation(info.size as u64, read_duration, true).await;
+        // Conditional metrics recording to reduce overhead
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            use rustfs_io_metrics::record_zero_copy_read;
+            record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
+            manager.record_disk_operation(info.size as u64, read_duration, true).await;
+        }
 
         check_preconditions(&req.headers, &info)?;
 
@@ -2351,14 +2354,17 @@ impl DefaultObjectUsecase {
             false
         };
 
-        if let Some(range_spec) = rs
-            && range_spec.start >= 0
-        {
-            manager.record_access(range_spec.start as u64, response_content_length as u64);
-        }
+        // Conditional metrics recording to reduce overhead
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            if let Some(range_spec) = rs
+                && range_spec.start >= 0
+            {
+                manager.record_access(range_spec.start as u64, response_content_length as u64);
+            }
 
-        if response_content_length > 0 {
-            manager.record_transfer(response_content_length as u64, permit_wait_duration);
+            if response_content_length > 0 {
+                manager.record_transfer(response_content_length as u64, permit_wait_duration);
+            }
         }
 
         let io_strategy =
