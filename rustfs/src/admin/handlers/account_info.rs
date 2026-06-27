@@ -14,7 +14,7 @@
 
 use crate::admin::auth::authenticate_request;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{resolve_action_credentials, resolve_object_store_handle};
+use crate::admin::runtime_sources::{current_object_store_handle, resolve_action_credentials};
 use crate::admin::storage_api::bucket::versioning_sys::BucketVersioningSys;
 use crate::admin::storage_api::contract::admin::StorageAdminApi;
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -60,7 +60,7 @@ fn resolve_bucket_access(can_list_bucket: bool, can_get_bucket_location: bool, c
 #[async_trait::async_trait]
 impl Operation for AccountInfoHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 

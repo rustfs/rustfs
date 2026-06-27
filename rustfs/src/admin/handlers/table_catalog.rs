@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::admin::runtime_sources::default_admin_usecase;
-use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_token_signing_key};
+use crate::admin::runtime_sources::{current_object_store_handle, resolve_token_signing_key};
 use crate::admin::storage_api::bucket::{metadata::table_catalog_path_hash, metadata_sys};
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::{
@@ -1258,7 +1258,7 @@ fn job_id_from_params(params: &Params<'_, '_>) -> S3Result<String> {
 }
 
 fn table_catalog_backend() -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
-    let store = resolve_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
+    let store = current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store))
 }
 

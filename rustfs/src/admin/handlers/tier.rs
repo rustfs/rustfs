@@ -20,7 +20,7 @@ use crate::admin::storage_api::tier::{
 };
 use crate::{
     admin::runtime_sources::{
-        resolve_daily_tier_stats, resolve_notification_system, resolve_object_store_handle, resolve_tier_config_handle,
+        current_notification_system, current_object_store_handle, resolve_daily_tier_stats, resolve_tier_config_handle,
     },
     admin::{
         auth::validate_admin_request,
@@ -81,7 +81,7 @@ pub struct AddTierQuery {
 pub struct AddTier {}
 
 fn spawn_transition_tier_config_propagation(action: &'static str) {
-    if let Some(notification_sys) = resolve_notification_system() {
+    if let Some(notification_sys) = current_notification_system() {
         spawn_traced(async move {
             for peer_result in notification_sys.load_transition_tier_config().await {
                 if let Some(err) = peer_result.err {
@@ -292,7 +292,7 @@ impl Operation for AddTier {
             &_ => (),
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -439,7 +439,7 @@ impl Operation for EditTier {
             "admin tier state"
         );
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 
@@ -609,7 +609,7 @@ impl Operation for RemoveTier {
 
         let tier_name = params.get("tiername").map(|s| s.to_string()).unwrap_or_default();
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(s3_error!(InternalError, "object store is not initialized"));
         };
 

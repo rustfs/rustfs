@@ -15,7 +15,7 @@
 use crate::admin::auth::validate_admin_request;
 use crate::admin::handlers::site_replication::site_replication_peer_deployment_id_for_endpoint;
 use crate::admin::router::{AdminOperation, Operation, S3Router};
-use crate::admin::runtime_sources::{resolve_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
+use crate::admin::runtime_sources::{current_object_store_handle, resolve_replication_stats_handle, resolve_runtime_port};
 use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
@@ -151,7 +151,7 @@ impl Operation for GetReplicationMetricsHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -209,7 +209,7 @@ impl Operation for SetRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "bucket is required"));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
@@ -355,7 +355,7 @@ impl Operation for ListRemoteTargetHandler {
                 return Err(s3_error!(InvalidRequest, "bucket is required"));
             }
 
-            let Some(store) = resolve_object_store_handle() else {
+            let Some(store) = current_object_store_handle() else {
                 return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
             };
 
@@ -416,7 +416,7 @@ impl Operation for RemoveRemoteTargetHandler {
             return Err(s3_error!(InvalidRequest, "arn is required"));
         };
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not initialized".to_string()));
         };
 

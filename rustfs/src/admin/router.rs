@@ -28,9 +28,9 @@ use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
 use crate::admin::runtime_sources::{
-    default_object_usecase, resolve_boot_time, resolve_bucket_monitor_handle, resolve_deployment_id, resolve_notification_system,
-    resolve_object_store_handle, resolve_region, resolve_replication_pool_handle, resolve_replication_stats_handle,
-    resolve_server_config,
+    current_notification_system, current_object_store_handle, current_server_config, default_object_usecase, resolve_boot_time,
+    resolve_bucket_monitor_handle, resolve_deployment_id, resolve_region, resolve_replication_pool_handle,
+    resolve_replication_stats_handle,
 };
 use crate::admin::storage_api::access::{ReqInfo, authorize_request, spawn_traced};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
@@ -631,7 +631,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         return Ok(system.config.read().await.clone());
     }
 
-    if let Some(store) = resolve_object_store_handle() {
+    if let Some(store) = current_object_store_handle() {
         match read_admin_config_without_migrate(store).await {
             Ok(config) => return Ok(config),
             Err(err) => {
@@ -647,7 +647,7 @@ async fn load_current_server_config() -> S3Result<Config> {
         }
     }
 
-    let config = resolve_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    let config = current_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
     Ok(config)
 }
 
@@ -1189,7 +1189,7 @@ fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<By
 }
 
 fn list_remote_live_event_peers() -> Vec<PeerLiveEventCursor> {
-    resolve_notification_system()
+    current_notification_system()
         .map(|system| {
             system
                 .peer_clients
@@ -1401,7 +1401,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
 }
 
 async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
-    let Some(store) = resolve_object_store_handle() else {
+    let Some(store) = current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
     };
 
@@ -2277,7 +2277,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
         }
         MiscExtRoute::ListenNotification { bucket } => {
             if let Some(bucket_name) = bucket {
-                let Some(store) = resolve_object_store_handle() else {
+                let Some(store) = current_object_store_handle() else {
                     return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init"));
                 };
                 store

@@ -26,8 +26,8 @@ use tracing::{error, info, warn};
 
 use crate::{
     admin::runtime_sources::{
-        AdminPoolStatus, QueryPoolStatusRequest, default_admin_usecase, resolve_endpoints_handle, resolve_notification_system,
-        resolve_object_store_handle,
+        AdminPoolStatus, QueryPoolStatusRequest, current_notification_system, current_object_store_handle, default_admin_usecase,
+        resolve_endpoints_handle,
     },
     admin::{
         auth::validate_admin_request,
@@ -279,7 +279,7 @@ fn decommission_peer_target(
     }
 
     let grid_host = endpoint.grid_host();
-    let Some(notification_sys) = resolve_notification_system() else {
+    let Some(notification_sys) = current_notification_system() else {
         log_pool_request_rejected_with_index_audit(
             operation_to_event(operation),
             "notification_sys_not_initialized",
@@ -741,7 +741,7 @@ impl Operation for StartDecommission {
             return Err(s3_error!(NotImplemented));
         }
 
-        let Some(store) = resolve_object_store_handle() else {
+        let Some(store) = current_object_store_handle() else {
             return Err(decommission_admin_not_initialized_error_with_audit("start decommission", audit));
         };
 
@@ -929,7 +929,7 @@ impl Operation for CancelDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "cancel decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = resolve_object_store_handle() else {
+            let Some(store) = current_object_store_handle() else {
                 return Err(decommission_admin_not_initialized_error_with_audit("cancel decommission", audit));
             };
 
@@ -1042,7 +1042,7 @@ impl Operation for ClearDecommission {
                 .map_err(ApiError::from)
                 .map_err(|err| contextualize_admin_pool_api_error(err, "clear decommission", format!("pool {idx}")))?;
         } else {
-            let Some(store) = resolve_object_store_handle() else {
+            let Some(store) = current_object_store_handle() else {
                 return Err(decommission_admin_not_initialized_error_with_audit("clear decommission", audit));
             };
 
