@@ -4,13 +4,18 @@ This document records the late global-state cleanup plan after the AppContext
 foundation, storage API contracts, ECStore layout, runtime lifecycle, and cluster
 control-plane boundaries are stable.
 
+As of the Phase 7 closeout, runtime resolver fallbacks have been pushed out of
+the root facade and into explicit owner-local boundaries. Future work should
+therefore treat broad fallback removal as complete and use this document for the
+remaining ECStore-owned bootstrap state and crate-split decisions.
+
 ## Remaining Global Owners
 
 | Owner | Current role | Migration stance |
 |---|---|---|
-| `rustfs/src/app/context.rs` | AppContext-first resolver facade with legacy fallback adapters. | Keep resolver entry points stable until every caller has an explicit context or owner-local runtime source. |
-| `rustfs/src/app/context/runtime_sources.rs` | Default AppContext fallback adapters for KMS, IAM, object store, endpoints, config, metrics, and notification state. | This is an allowed fallback boundary, not a business logic owner. |
-| `rustfs/src/*/runtime_sources.rs` | Root, admin, app, server, startup, and storage owner-local runtime-source boundaries. | Business modules use these boundaries instead of calling global state directly. |
+| `rustfs/src/app/context.rs` | AppContext-first resolver facade. | Resolver helpers stay context-first and do not construct concrete no-AppContext defaults. |
+| `rustfs/src/app/context/runtime_sources.rs` | Default adapters for KMS, IAM, object store, endpoints, config, metrics, and notification state used by AppContext construction. | This is an allowed adapter boundary, not a business logic owner. |
+| `rustfs/src/*/runtime_sources.rs` | Root, admin, app, server, startup, and storage owner-local runtime-source boundaries. | Business modules use these boundaries instead of calling global state directly; owner facades own any remaining no-AppContext compatibility defaults. |
 | `rustfs/src/*/storage_api.rs` | Root, admin, app, and storage owner-local storage contract/facade boundaries. | Storage helper and ECStore facade access remains visible at local owner boundaries. |
 | `crates/*/storage_api.rs` | External crate-local storage facade boundaries for IAM, scanner, heal, notify, observability, Swift, and S3 Select. | External runtime crates consume ECStore runtime state through `rustfs_ecstore::api::runtime` instead of the direct global facade. |
 | `crates/ecstore/src/runtime/global.rs` | ECStore bootstrap/runtime state owner. | Keep internal until ECStore has explicit owner handles for all remaining bootstrap state. |
@@ -40,37 +45,106 @@ update this plan and the guard in the same reviewed migration PR.
 
 ## Fallback Removal Plan
 
-1. Keep AppContext-first plus global fallback while compatibility tests still
-   cover both paths.
-2. Move one remaining consumer group at a time to explicit context or
-   owner-local runtime-source handles.
-   - Current handoff: admin config, OIDC config, audit runtime config, and
-     dynamic KMS config storage reads/writes resolve through current
-     AppContext-aware boundaries before using the legacy object-store fallback.
-3. Remove one fallback family per PR only after scans prove no production caller
-   depends on it.
-4. Keep embedded startup and tests working before deleting any fallback.
+1. Keep AppContext-first lookup as the stable resolver contract.
+2. Keep concrete no-AppContext compatibility defaults only at owner-local
+   runtime-source facades that consume them.
+3. Do not let business logic call `AppContext` or ECStore globals directly when
+   an owner-local runtime-source boundary exists.
+4. Keep embedded startup and tests working before deleting any remaining owner
+   fallback.
 5. Do not remove ECStore bootstrap globals until ownership handles exist for
    local disks, endpoint pools, lock clients, notification state, tier config,
    lifecycle state, and object-store publication.
 
+## GLOB-007 Closeout Boundary
+
+`GLOB-007` is complete when these invariants hold:
+
+- root `rustfs/src/runtime_sources.rs` is an AppContext/root facade entrypoint
+  and no longer composes concrete fallback defaults with `unwrap_or`,
+  `unwrap_or_else`, direct `init_global`, or direct `new_global` calls;
+- private AppContext resolver helpers are context-first and do not hide fallback
+  closure parameters;
+- admin, app, storage, server, startup, and config owner facades decide when to
+  apply no-AppContext compatibility defaults;
+- production callers outside runtime-source and storage-api boundary modules do
+  not import ECStore global state directly;
+- the architecture guard keeps the direct `rustfs_ecstore::api::global`
+  boundary list explicit.
+
+Allowed remaining fallbacks are owner compatibility decisions, not resolver
+fallback families. They are kept so embedded startup, tests, and no-context
+callers preserve the previous behavior while higher layers continue migrating
+to explicit AppContext ownership.
+
 ## Crate Split Evaluation
 
 `ecstore-erasure` and `storage-cluster` remain proposal-only until dependency
-cycles and hot-path risks are proven safe.
+cycles and hot-path risks are proven safe. The Phase 7 evaluation is complete
+for now: neither split is ready for code movement in this migration round.
 
-Required evidence before a split:
+### CRATE-001: `ecstore-erasure`
 
-- dependency graph showing no cycle with ECStore, storage API, runtime, or
-  cluster control-plane owners;
-- benchmark or profiling evidence for erasure and bitrot hot paths;
-- compatibility plan for public ECStore facade paths and test harnesses;
-- rollback plan that preserves quorum, remote disk, lock, and data movement
-  behavior.
+Current coupling:
+
+- erasure decoding depends on disk errors, disk read timeouts, and set-disk
+  shard sources;
+- set-disk read/write/heal paths construct erasure codecs in hot object I/O
+  paths;
+- bitrot readers/writers live in ECStore IO support and are used by both
+  erasure and set-disk code;
+- public compatibility still exposes erasure symbols through
+  `rustfs_ecstore::api::erasure`.
+
+Decision: do not split in code yet. The erasure boundary is a candidate only
+after the shard-source, disk-error, bitrot, and metrics contracts are explicit
+enough to avoid a dependency cycle back into ECStore.
+
+Required evidence before proposing the split:
+
+- `cargo tree -p rustfs-ecstore -e normal --depth 2` snapshot for dependency
+  impact;
+- focused benchmarks for encode/decode, read reconstruction, bitrot verification,
+  and large-object streaming;
+- contract sketch for shard sources, disk errors, bitrot IO, metrics, and file
+  metadata without importing ECStore implementation modules;
+- compatibility plan for `rustfs_ecstore::api::erasure` and test harnesses;
+- rollback plan that keeps object read/write quorum and old-version file decode
+  behavior unchanged.
+
+### CRATE-002: `storage-cluster`
+
+Current coupling:
+
+- cluster RPC remote disk code depends on disk stores, disk health tracking,
+  set-disk buffer sizing, local disk scan guards, internode metrics, and runtime
+  credential/signature sources;
+- peer S3 and peer REST clients share bucket metadata, disk quorum reduction,
+  endpoint layout, local disk initialization, and store helpers;
+- control-plane snapshots are separated from data-plane RPC, but remote disk and
+  peer clients still own data movement side effects inside ECStore.
+
+Decision: do not split in code yet. The storage-cluster boundary is a candidate
+only after remote disk, peer health, lock/quorum, runtime metrics, and endpoint
+layout contracts are explicit enough to stand below ECStore without circular
+dependencies.
+
+Required evidence before proposing the split:
+
+- dependency graph showing no cycle with ECStore, `rustfs-storage-api`, runtime
+  source owners, or cluster control-plane owners;
+- RPC contract sketch for remote disk, peer S3, peer REST, auth/signature,
+  internode metrics, and cancellation;
+- compatibility plan for `rustfs_ecstore::api::cluster`, `api::rpc`, and test
+  fixtures that build local disks or endpoint pools;
+- focused tests for remote disk error classification, peer health recovery,
+  per-pool quorum reduction, lock behavior, and data-stream request paths;
+- rollback plan that preserves quorum, remote disk IO, lock, peer health, and
+  data movement behavior.
 
 ## Preservation Rules
 
-- Do not remove AppContext fallback in a broad cleanup PR.
+- Do not reintroduce AppContext resolver fallback families in broad cleanup PRs.
 - Do not introduce direct global reads in admin, app, server, storage, scanner,
   heal, IAM, notify, observability, Swift, or S3 Select business logic.
 - Do not split crates in the same PR that moves runtime state.
