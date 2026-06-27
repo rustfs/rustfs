@@ -599,11 +599,7 @@ pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
 
 /// Record the final codec-streaming rollout decision for a GET request.
 #[inline(always)]
-pub fn record_get_object_codec_streaming_decision(
-    outcome: &'static str,
-    object_class: &'static str,
-    reason: &'static str,
-) {
+pub fn record_get_object_codec_streaming_decision(outcome: &'static str, object_class: &'static str, reason: &'static str) {
     if !get_stage_metrics_enabled() {
         return;
     }

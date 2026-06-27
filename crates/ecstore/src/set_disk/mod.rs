@@ -316,6 +316,10 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGI
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
+const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: u32 = 100;
+const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -399,15 +403,74 @@ fn is_get_codec_streaming_enabled() -> bool {
     #[cfg(not(test))]
     static CACHED: OnceLock<bool> = OnceLock::new();
     #[cfg(not(test))]
-    let enabled =
-        *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE));
+    let enabled = *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+    });
     enabled
 }
 
 /// **Note**: Cached via `OnceLock` — env var changes require process restart.
 fn is_get_metadata_early_stop_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE))
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE)
+    })
+}
+
+/// Determine if an optimization should be enabled for a specific request.
+///
+/// Uses a stable hash of `(bucket, object)` to ensure the same object
+/// always gets consistent behavior. This enables percentage-based gradual rollout.
+///
+/// **Note**: `base_enabled` must be pre-cached (via `OnceLock`) to avoid
+/// per-request `std::env::var()` calls.
+fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, bucket: &str, object: &str) -> bool {
+    if !base_enabled || rollout_pct == 0 {
+        return false;
+    }
+    if rollout_pct >= 100 {
+        return true;
+    }
+
+    // Stable hash: same (bucket, object) always produces the same result
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    bucket.hash(&mut hasher);
+    object.hash(&mut hasher);
+    let hash = hasher.finish() % 100;
+
+    (hash as u32) < rollout_pct
+}
+
+fn get_codec_streaming_rollout_pct() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
+    })
+}
+
+fn get_metadata_early_stop_rollout_pct() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_u32(
+            ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
+        )
+    })
+}
+
+/// Should this specific request use codec streaming?
+pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
+    let base = is_get_codec_streaming_enabled();
+    let pct = get_codec_streaming_rollout_pct();
+    is_optimization_enabled_for_request(base, pct, bucket, object)
+}
+
+/// Should this specific request use metadata early-stop?
+pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
+    let base = is_get_metadata_early_stop_enabled();
+    let pct = get_metadata_early_stop_rollout_pct();
+    is_optimization_enabled_for_request(base, pct, bucket, object)
 }
 
 fn get_codec_streaming_min_size() -> usize {
@@ -545,19 +608,15 @@ struct GetCodecStreamingGate {
     decision: GetCodecStreamingDecision,
 }
 
-fn record_get_codec_streaming_gate_decision(
-    object_class: GetCodecStreamingObjectClass,
-    decision: GetCodecStreamingDecision,
-) {
+fn record_get_codec_streaming_gate_decision(object_class: GetCodecStreamingObjectClass, decision: GetCodecStreamingDecision) {
     let (outcome, reason) = match decision {
         GetCodecStreamingDecision::Use => (
             crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_USE,
             crate::diagnostics::get::GET_CODEC_STREAMING_REASON_NONE,
         ),
-        GetCodecStreamingDecision::Fallback(reason) => (
-            crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_FALLBACK,
-            reason.as_str(),
-        ),
+        GetCodecStreamingDecision::Fallback(reason) => {
+            (crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_FALLBACK, reason.as_str())
+        }
     };
     rustfs_io_metrics::record_get_object_codec_streaming_decision(outcome, object_class.as_str(), reason);
 }
@@ -1461,7 +1520,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     self.pool_index,
                     opts.skip_verify_bitrot,
                 )
-                .await? {
+                .await?
+                {
                     read::GetCodecStreamingReaderBuildOutcome::Reader(stream) => {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,

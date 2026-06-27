@@ -53,9 +53,7 @@ pub(super) enum GetCodecStreamingReaderBuildOutcome {
     Fallback(GetCodecStreamingFallbackReason),
 }
 
-pub(super) fn codec_streaming_reader_setup_fallback_reason(
-    missing_shards: usize,
-) -> Option<GetCodecStreamingFallbackReason> {
+pub(super) fn codec_streaming_reader_setup_fallback_reason(missing_shards: usize) -> Option<GetCodecStreamingFallbackReason> {
     (missing_shards > 0).then_some(GetCodecStreamingFallbackReason::ReadQuorumNotSafe)
 }
 
@@ -1660,10 +1658,11 @@ impl SetDisks {
         let vid = opts.version_id.clone().unwrap_or_default();
 
         let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
-        if use_metadata_cache && vid.is_empty() {
-            if let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await {
-                return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
-            }
+        if use_metadata_cache
+            && vid.is_empty()
+            && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await
+        {
+            return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
         }
 
         let disks = self.disks.read().await;
@@ -2206,7 +2205,7 @@ impl SetDisks {
         _pool_index: usize,
         skip_verify_bitrot: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, &files, &fi);
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
         if fi.parts.len() != 1 {
             return Err(Error::other("codec streaming reader only supports single-part plain objects"));
         }
