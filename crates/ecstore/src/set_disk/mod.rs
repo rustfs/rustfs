@@ -294,32 +294,78 @@ fn record_capacity_scope_if_needed(scope_token: Option<Uuid>, disks: &[Option<Di
 /// when reading large objects (20-26MB) under high concurrency.
 ///
 /// Default: 4MB (4 * 1024 * 1024 bytes)
+/// Get duplex buffer size from environment variable.
+///
+/// **Deprecated**: Use `adaptive_duplex_buffer_size()` for object-size-aware sizing.
 pub fn get_duplex_buffer_size() -> usize {
     rustfs_utils::get_env_usize(
         rustfs_config::ENV_OBJECT_DUPLEX_BUFFER_SIZE,
         rustfs_config::DEFAULT_OBJECT_DUPLEX_BUFFER_SIZE,
     )
 }
+
+/// Get adaptive duplex buffer size based on object size.
+///
+/// Smaller objects get smaller buffers to reduce memory waste.
+/// Larger objects get larger buffers to prevent backpressure.
+fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
+    const KB: usize = 1024;
+    const MB: usize = 1024 * 1024;
+    match object_size {
+        0..=1_048_576 => 64 * KB,           // <= 1MB: 64KB
+        1_048_577..=16_777_216 => MB,       // <= 16MB: 1MB
+        16_777_217..=268_435_456 => 4 * MB, // <= 256MB: 4MB
+        _ => 8 * MB,                        // > 256MB: 8MB
+    }
+}
+
+// ============================================================================
+// GET Optimization Configuration
+//
+// All GET performance optimization flags are consolidated here.
+// Each flag uses `OnceLock` for caching — env var changes require process restart.
+// Each flag has a corresponding `*_ROLLOUT_PCT` for percentage-based gradual rollout.
+// ============================================================================
+
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
 const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+
+// --- Codec Streaming Configuration ---
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_ENABLE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false; // Disabled until rollout gates are ready
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED";
 const ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED: &str = "RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED";
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false;
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
-const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT: &str = "off";
-const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
+
 const ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: &str = "RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: u32 = 100;
+
+const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
+
+// --- Metadata Early-Stop Configuration ---
+
+const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true; // Enabled by default
+
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
+
+const ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE";
+const DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE: bool = false;
+
 static OBJECT_LOCK_DIAG_ENABLED: OnceLock<bool> = OnceLock::new();
 
 mod heal;
@@ -396,20 +442,46 @@ pub fn is_deadlock_detection_enabled() -> bool {
     })
 }
 
+// ============================================================================
+// GET Optimization Flag Functions
+//
+// All functions use `OnceLock` for caching. Environment variable changes
+// require process restart to take effect.
+// ============================================================================
+
+/// Check if codec streaming is enabled (base flag).
+///
 /// **Note**: Cached via `OnceLock` — env var changes require process restart.
+/// In test mode, bypasses cache to allow per-test env var overrides.
 fn is_get_codec_streaming_enabled() -> bool {
     #[cfg(test)]
-    let enabled = rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE);
-    #[cfg(not(test))]
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    #[cfg(not(test))]
-    let enabled = *CACHED.get_or_init(|| {
+    {
         rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
-    });
-    enabled
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE)
+        })
+    }
 }
 
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
+/// Check if multipart codec streaming is enabled.
+///
+/// When enabled, multipart objects use per-part codec streaming
+/// instead of falling back to the legacy duplex path.
+fn is_codec_streaming_multipart_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+        )
+    })
+}
+
+/// Check if metadata early-stop is enabled (base flag).
 fn is_get_metadata_early_stop_enabled() -> bool {
     static CACHED: OnceLock<bool> = OnceLock::new();
     *CACHED.get_or_init(|| {
@@ -417,13 +489,42 @@ fn is_get_metadata_early_stop_enabled() -> bool {
     })
 }
 
+/// Check if version-aware early-stop is enabled.
+///
+/// When enabled, versioned requests can early-stop when the requested
+/// version_id reaches quorum across disks.
+fn is_version_early_stop_enabled() -> bool {
+    static CACHED: OnceLock<bool> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+        )
+    })
+}
+
+// --- Rollout Percentage Functions ---
+
+fn get_codec_streaming_rollout_pct() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
+    })
+}
+
+fn get_metadata_early_stop_rollout_pct() -> u32 {
+    static CACHED: OnceLock<u32> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT)
+    })
+}
+
+// --- Request-Level Decision Functions ---
+
 /// Determine if an optimization should be enabled for a specific request.
 ///
 /// Uses a stable hash of `(bucket, object)` to ensure the same object
 /// always gets consistent behavior. This enables percentage-based gradual rollout.
-///
-/// **Note**: `base_enabled` must be pre-cached (via `OnceLock`) to avoid
-/// per-request `std::env::var()` calls.
 fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, bucket: &str, object: &str) -> bool {
     if !base_enabled || rollout_pct == 0 {
         return false;
@@ -440,23 +541,6 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
     let hash = hasher.finish() % 100;
 
     (hash as u32) < rollout_pct
-}
-
-fn get_codec_streaming_rollout_pct() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    })
-}
-
-fn get_metadata_early_stop_rollout_pct() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        rustfs_utils::get_env_u32(
-            ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
-            DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT,
-        )
-    })
 }
 
 /// Should this specific request use codec streaming?
@@ -1548,7 +1632,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_LEGACY_DUPLEX);
 
-        let duplex_buffer_size = get_duplex_buffer_size();
+        let duplex_buffer_size = adaptive_duplex_buffer_size(object_info.size);
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
         debug!(bucket, object, duplex_buffer_size, "Created duplex pipe for object data transfer");
 

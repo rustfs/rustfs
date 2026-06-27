@@ -14,3 +14,4 @@
 
 pub(crate) mod admin_server_info;
 pub(crate) mod get;
+pub(crate) mod pool;

@@ -84,6 +84,35 @@ const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 
+/// Enable O_DIRECT for large sequential reads.
+/// When enabled, shard reads bypass the page cache using O_DIRECT flag.
+/// Requires aligned buffers (typically 512 bytes or 4096 bytes).
+/// Default: false (uses page cache via mmap/pread).
+const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE";
+const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: bool = false;
+
+/// Minimum shard size threshold for O_DIRECT reads.
+/// Only shards larger than this threshold will use O_DIRECT.
+/// Default: 4MB.
+const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD";
+const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
+
+/// Check if O_DIRECT reads are enabled.
+fn is_direct_io_read_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE,
+        DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE,
+    )
+}
+
+/// Get the O_DIRECT read threshold size.
+fn get_direct_io_read_threshold() -> usize {
+    rustfs_utils::get_env_usize(
+        ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD,
+        DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD,
+    )
+}
+
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     warn!(
         event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,

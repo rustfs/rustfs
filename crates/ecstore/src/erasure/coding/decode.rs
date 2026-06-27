@@ -49,6 +49,36 @@ fn get_shard_locality_preference_enabled() -> bool {
     )
 }
 
+/// Number of stripes to prefetch in the legacy decode path.
+/// When > 1, stripe reads are batched to overlap disk I/O with decode.
+/// Default: 1 (no prefetch, current behavior).
+/// Set via environment variable RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT.
+const ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT: &str = "RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT";
+const DEFAULT_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT: usize = 1;
+
+/// Get the stripe prefetch count from environment variable.
+fn get_decode_stripe_prefetch_count() -> usize {
+    rustfs_utils::get_env_usize(
+        ENV_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT,
+        DEFAULT_RUSTFS_GET_DECODE_STRIPE_PREFETCH_COUNT,
+    )
+}
+
+/// Enable overlapping bitrot verification with stripe decode.
+/// When enabled, bitrot verification for stripe N+1 runs concurrently
+/// with decode of stripe N, reducing total pipeline latency.
+/// Default: false (sequential behavior, current implementation).
+const ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE: &str = "RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE";
+const DEFAULT_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE: bool = false;
+
+/// Get whether bitrot-decode overlap is enabled.
+fn is_bitrot_decode_overlap_enabled() -> bool {
+    rustfs_utils::get_env_bool(
+        ENV_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE,
+        DEFAULT_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE,
+    )
+}
+
 #[derive(Default)]
 struct ShardReadCostCounts {
     local: usize,

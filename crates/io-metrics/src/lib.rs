@@ -947,6 +947,31 @@ pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
     record_get_object_stage_duration("legacy_duplex", "metadata", duration_secs);
 }
 
+/// Record metadata phase duration with early-stop state label.
+#[inline(always)]
+pub fn record_get_object_metadata_phase_duration_with_early_stop(duration_secs: f64, early_stop_active: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_stage_duration_seconds",
+        "path" => "legacy_duplex",
+        "stage" => "metadata",
+        "early_stop_active" => early_stop_active
+    )
+    .record(duration_secs);
+}
+
+/// Record GET object total duration with reader path label.
+#[inline(always)]
+pub fn record_get_object_total_duration_with_path(duration_secs: f64, reader_path: &'static str) {
+    histogram!(
+        "rustfs_io_get_object_total_duration_seconds_with_path",
+        "reader_path" => reader_path
+    )
+    .record(duration_secs);
+}
+
 /// Record GetObject shard reader setup duration.
 #[inline(always)]
 pub fn record_get_object_shard_reader_setup_duration(duration_secs: f64) {
@@ -1073,6 +1098,34 @@ pub fn record_bytes_pool_allocated(tier: &str, bytes: u64) {
 #[inline(always)]
 pub fn record_bytes_pool_hit_rate(tier: &str, hit_rate: f64) {
     gauge!("rustfs_bytes_pool_hit_rate", "tier" => tier.to_string()).set(hit_rate * 100.0);
+}
+
+/// Record a BytesPool buffer acquisition attempt.
+///
+/// `outcome` = `"hit"` when a buffer is available in the pool, `"miss"` when the
+/// pool is empty and a new allocation is required.
+///
+/// # Arguments
+///
+/// * `tier` - Pool tier ("small", "medium", "large", "xlarge")
+/// * `outcome` - Acquisition outcome ("hit" or "miss")
+#[inline(always)]
+pub fn record_bytespool_acquisition(tier: &'static str, outcome: &'static str) {
+    counter!("rustfs_io_bytespool_acquisition_total", "tier" => tier, "outcome" => outcome).increment(1);
+}
+
+/// Record a BytesPool buffer return attempt.
+///
+/// `outcome` = `"recycled"` when the buffer is successfully returned to the
+/// pool, `"dropped"` when `try_lock` fails and the buffer is deallocated.
+///
+/// # Arguments
+///
+/// * `tier` - Pool tier ("small", "medium", "large", "xlarge")
+/// * `outcome` - Return outcome ("recycled" or "dropped")
+#[inline(always)]
+pub fn record_bytespool_return(tier: &'static str, outcome: &'static str) {
+    counter!("rustfs_io_bytespool_return_total", "tier" => tier, "outcome" => outcome).increment(1);
 }
 
 /// Record zero-copy write operation.
@@ -1565,6 +1618,21 @@ mod tests {
     }
 
     #[test]
+    fn test_record_bytespool_acquisition_and_return() {
+        // Acquisition outcomes
+        record_bytespool_acquisition("small", "hit");
+        record_bytespool_acquisition("medium", "miss");
+        record_bytespool_acquisition("large", "hit");
+        record_bytespool_acquisition("xlarge", "miss");
+
+        // Return outcomes
+        record_bytespool_return("small", "recycled");
+        record_bytespool_return("medium", "dropped");
+        record_bytespool_return("large", "recycled");
+        record_bytespool_return("xlarge", "dropped");
+    }
+
+    #[test]
     fn test_record_zero_copy_write() {
         record_zero_copy_write(1024, 10.5);
         record_zero_copy_write_fallback("test");
@@ -1612,6 +1680,8 @@ mod tests {
         record_get_object_full_body_latency("s3_handler", 0.009);
         record_get_object_response_handoff_duration("s3_handler", 0.0001);
         record_get_object_metadata_phase_duration(0.002);
+        record_get_object_metadata_phase_duration_with_early_stop(0.002, "hit");
+        record_get_object_total_duration_with_path(0.050, "legacy_duplex");
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
@@ -1747,6 +1817,8 @@ mod tests {
         record_get_object_first_byte_latency("s3_handler", 0.008);
         record_get_object_full_body_latency("s3_handler", 0.009);
         record_get_object_response_handoff_duration("s3_handler", 0.0001);
+        record_get_object_metadata_phase_duration_with_early_stop(0.002, "hit");
+        record_get_object_total_duration_with_path(0.050, "legacy_duplex");
         record_get_object_shard_reader_setup_duration(0.003);
         record_get_object_decode_duration(0.004);
         record_get_object_duplex_backpressure_duration(0.005);
