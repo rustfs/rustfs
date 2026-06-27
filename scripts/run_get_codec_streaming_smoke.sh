@@ -18,14 +18,16 @@ SECRET_KEY="rustfsadmin"
 BUCKET="rustfs-get-codec-smoke"
 REGION="us-east-1"
 SIZES="1MiB,4MiB,10MiB"
-CONCURRENCY=32
-DURATION="15s"
+CONCURRENCY=16
+DURATION="30s"
 ROUNDS=3
 RETRY_PER_ROUND=1
-ROUND_COOLDOWN_SECS=0
+ROUND_COOLDOWN_SECS=20
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+METADATA_EARLY_STOP="off"
+SHARD_LOCALITY_PREFERENCE="off"
 OUTPUT_HANDOFF_ATTRIBUTION=false
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
@@ -38,6 +40,8 @@ COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
 COMPAT_OBJECT_SIZE=65536
 DRY_RUN=false
 SKIP_BUILD=false
+PROFILE_FAILURES=0
+declare -a ORIGINAL_ARGS=()
 
 SERVER_PID=""
 
@@ -53,16 +57,19 @@ Purpose:
 Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
   --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
+  --metadata-early-stop <on|off> Enable metadata early-stop observe/opt-in env (default: off)
+  --shard-locality-preference <on|off>
+                                 Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
   --handoff-attribution          Enable output handoff attribution metrics
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
-  --concurrency <n>              warp concurrency (default: 32)
-  --duration <duration>          warp duration per round (default: 15s)
+  --concurrency <n>              warp concurrency (default: 16)
+  --duration <duration>          warp duration per round (default: 30s)
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
-  --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 0)
+  --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 20)
   --out-dir <path>               output directory (default: target/bench/get-codec-streaming-<timestamp>)
 
 Binary/options:
@@ -81,6 +88,9 @@ Credentials:
   --region <value>               S3 region (default: us-east-1)
 
 Output:
+  <out-dir>/environment.txt
+  <out-dir>/manifest.env
+  <out-dir>/baseline_compare.csv
   <out-dir>/legacy/warp/median_summary.csv
   <out-dir>/codec-legacy/warp/median_summary.csv
   <out-dir>/codec-rustfs/warp/median_summary.csv
@@ -99,6 +109,7 @@ Output:
   <out-dir>/<profile>/compat/response_headers.json
   <out-dir>/<profile>/compat/body_sha256.txt
   <out-dir>/<profile>/rustfs.log
+  <out-dir>/<profile>/warp/logs/*.log
 
 Example:
   scripts/run_get_codec_streaming_smoke.sh \
@@ -142,6 +153,8 @@ parse_args() {
     case "$1" in
       --mode) MODE="$2"; shift 2 ;;
       --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
+      --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
+      --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
       --address) ADDRESS="$2"; shift 2 ;;
@@ -177,6 +190,16 @@ validate_args() {
   case "$MODE" in
     legacy|codec|both) ;;
     *) die "--mode must be legacy, codec, or both" ;;
+  esac
+
+  case "$METADATA_EARLY_STOP" in
+    on|off) ;;
+    *) die "--metadata-early-stop must be on or off" ;;
+  esac
+
+  case "$SHARD_LOCALITY_PREFERENCE" in
+    on|off) ;;
+    *) die "--shard-locality-preference must be on or off" ;;
   esac
 
   local raw engine
@@ -220,6 +243,111 @@ setup_output() {
     OUT_DIR="${PROJECT_ROOT}/target/bench/get-codec-streaming-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "$OUT_DIR"
+}
+
+bool_from_on_off() {
+  case "$1" in
+    on) echo "true" ;;
+    off) echo "false" ;;
+    *) die "expected on/off value, got: $1" ;;
+  esac
+}
+
+command_line_string() {
+  printf '%q ' "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+}
+
+detect_cpu_summary() {
+  if command -v sysctl >/dev/null 2>&1; then
+    local brand logical
+    brand="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || true)"
+    logical="$(sysctl -n hw.logicalcpu 2>/dev/null || true)"
+    if [[ -n "$brand" && -n "$logical" ]]; then
+      printf '%s (%s logical cores)\n' "$brand" "$logical"
+      return
+    fi
+  fi
+
+  if command -v lscpu >/dev/null 2>&1; then
+    lscpu 2>/dev/null | awk -F: '
+      /^Model name:/ { model=$2 }
+      /^CPU\(s\):/ { cpus=$2 }
+      END {
+        gsub(/^[ \t]+|[ \t]+$/, "", model)
+        gsub(/^[ \t]+|[ \t]+$/, "", cpus)
+        if (model != "" && cpus != "") {
+          printf "%s (%s logical cores)\n", model, cpus
+        } else if (model != "") {
+          printf "%s\n", model
+        }
+      }
+    '
+    return
+  fi
+
+  echo "unknown"
+}
+
+write_root_environment() {
+  local branch git_head git_dirty_count rustc_version cargo_version command_line
+  branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD)"
+  git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+  git_dirty_count="$(git -C "$PROJECT_ROOT" status --porcelain | awk 'END { print NR + 0 }')"
+  rustc_version="$(rustc --version 2>/dev/null || echo unavailable)"
+  cargo_version="$(cargo --version 2>/dev/null || echo unavailable)"
+  command_line="$(command_line_string)"
+
+  cat >"${OUT_DIR}/environment.txt" <<EOF
+generated_at_utc=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+branch=${branch}
+git_head=${git_head}
+dirty_count=${git_dirty_count}
+rustc_version=${rustc_version}
+cargo_version=${cargo_version}
+os=$(uname -srmo 2>/dev/null || uname -a)
+cpu=$(detect_cpu_summary)
+command_line=${command_line% }
+EOF
+}
+
+write_root_manifest() {
+  local profiles_csv="$1"
+  local branch git_head git_dirty_count command_line
+  branch="$(git -C "$PROJECT_ROOT" rev-parse --abbrev-ref HEAD)"
+  git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
+  git_dirty_count="$(git -C "$PROJECT_ROOT" status --porcelain | awk 'END { print NR + 0 }')"
+  command_line="$(command_line_string)"
+
+  cat >"${OUT_DIR}/manifest.env" <<EOF
+branch=${branch}
+git_head=${git_head}
+git_dirty_count=${git_dirty_count}
+profiles=${profiles_csv}
+mode=${MODE}
+codec_engines=${CODEC_ENGINES}
+metadata_early_stop=${METADATA_EARLY_STOP}
+shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
+codec_max_inflight=${CODEC_MAX_INFLIGHT}
+output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
+address=${ADDRESS}
+bucket=${BUCKET}
+region=${REGION}
+sizes=${SIZES}
+concurrency=${CONCURRENCY}
+duration=${DURATION}
+rounds=${ROUNDS}
+retry_per_round=${RETRY_PER_ROUND}
+round_cooldown_secs=${ROUND_COOLDOWN_SECS}
+skip_build=${SKIP_BUILD}
+dry_run=${DRY_RUN}
+rustfs_bin=${RUSTFS_BIN}
+warp_bin=${WARP_BIN}
+python_bin=${PYTHON_BIN}
+codec_min_size=${CODEC_MIN_SIZE}
+compat_object_key=${COMPAT_OBJECT_KEY}
+compat_object_size=${COMPAT_OBJECT_SIZE}
+command_line=${command_line% }
+EOF
 }
 
 build_rustfs_if_needed() {
@@ -308,6 +436,8 @@ compat_object_size=${COMPAT_OBJECT_SIZE}
 rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
 RUSTFS_GET_CODEC_STREAMING_ENGINE=${codec_engine}
+RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
+RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
@@ -387,6 +517,8 @@ start_server() {
     export RUSTFS_CONSOLE_ENABLE=false
     export RUSTFS_GET_CODEC_STREAMING_ENABLE="$codec_enabled"
     export RUSTFS_GET_CODEC_STREAMING_ENGINE="$codec_engine"
+    export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
+    export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
@@ -773,14 +905,15 @@ write_root_metrics_summary() {
 
   [[ "${#profile_dirs[@]}" -gt 0 ]] || return
 
-  "$PYTHON_BIN" - "${OUT_DIR}/metrics_summary.csv" "${OUT_DIR}/engine_compare.csv" "${profile_dirs[@]}" <<'PY'
+  "$PYTHON_BIN" - "${OUT_DIR}/metrics_summary.csv" "${OUT_DIR}/engine_compare.csv" "${OUT_DIR}/baseline_compare.csv" "${profile_dirs[@]}" <<'PY'
 import csv
 import pathlib
 import sys
 
 metrics_csv = pathlib.Path(sys.argv[1])
 engine_compare_csv = pathlib.Path(sys.argv[2])
-profile_dirs = [pathlib.Path(value) for value in sys.argv[3:]]
+baseline_compare_csv = pathlib.Path(sys.argv[3])
+profile_dirs = [pathlib.Path(value) for value in sys.argv[4:]]
 
 
 def load_manifest(path):
@@ -834,6 +967,12 @@ for profile_dir in profile_dirs:
                 "read_path": manifest.get("metrics_path", profile),
                 "codec_streaming_enabled": manifest.get("RUSTFS_GET_CODEC_STREAMING_ENABLE", ""),
                 "codec_engine": manifest.get("RUSTFS_GET_CODEC_STREAMING_ENGINE", ""),
+                "metadata_early_stop": manifest.get("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", ""),
+                "shard_locality_preference": manifest.get("RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE", ""),
+                "codec_max_inflight": manifest.get("RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT", ""),
+                "output_handoff_attribution": manifest.get("RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE", ""),
+                "round_cooldown_secs": manifest.get("round_cooldown_secs", ""),
+                "duration": manifest.get("duration", ""),
                 "size": row["size"],
                 "tool": row["tool"],
                 "concurrency": row["concurrency"],
@@ -869,6 +1008,12 @@ fieldnames = [
     "read_path",
     "codec_streaming_enabled",
     "codec_engine",
+    "metadata_early_stop",
+    "shard_locality_preference",
+    "codec_max_inflight",
+    "output_handoff_attribution",
+    "round_cooldown_secs",
+    "duration",
     "size",
     "tool",
     "concurrency",
@@ -887,6 +1032,77 @@ with open(metrics_csv, "w", encoding="utf-8", newline="") as handle:
     writer = csv.DictWriter(handle, fieldnames=fieldnames)
     writer.writeheader()
     writer.writerows(rows)
+
+baseline_fields = [
+    "profile",
+    "read_path",
+    "codec_streaming_enabled",
+    "codec_engine",
+    "metadata_early_stop",
+    "shard_locality_preference",
+    "codec_max_inflight",
+    "output_handoff_attribution",
+    "round_cooldown_secs",
+    "duration",
+    "size",
+    "tool",
+    "concurrency",
+    "successful_rounds",
+    "failed_rounds",
+    "baseline_profile",
+    "new_median_reqps",
+    "baseline_median_reqps",
+    "delta_reqps_pct_vs_legacy",
+    "new_median_latency_ms",
+    "baseline_median_latency_ms",
+    "delta_latency_pct_vs_legacy",
+    "new_median_throughput_bps",
+    "baseline_median_throughput_bps",
+    "delta_throughput_pct_vs_legacy",
+    "performance_note",
+]
+baseline_rows = []
+for row in rows:
+    if row["profile"] == "legacy" or row["baseline_profile"] != "legacy":
+        continue
+    baseline = legacy_by_size.get(row["size"])
+    if baseline is None:
+        continue
+    baseline_rows.append(
+        {
+            "profile": row["profile"],
+            "read_path": row["read_path"],
+            "codec_streaming_enabled": row["codec_streaming_enabled"],
+            "codec_engine": row["codec_engine"],
+            "metadata_early_stop": row["metadata_early_stop"],
+            "shard_locality_preference": row["shard_locality_preference"],
+            "codec_max_inflight": row["codec_max_inflight"],
+            "output_handoff_attribution": row["output_handoff_attribution"],
+            "round_cooldown_secs": row["round_cooldown_secs"],
+            "duration": row["duration"],
+            "size": row["size"],
+            "tool": row["tool"],
+            "concurrency": row["concurrency"],
+            "successful_rounds": row["successful_rounds"],
+            "failed_rounds": row["failed_rounds"],
+            "baseline_profile": "legacy",
+            "new_median_reqps": row["median_reqps"],
+            "baseline_median_reqps": baseline.get("median_reqps", ""),
+            "delta_reqps_pct_vs_legacy": row["delta_reqps_pct_vs_legacy"],
+            "new_median_latency_ms": row["median_latency_ms"],
+            "baseline_median_latency_ms": baseline.get("median_latency_ms", ""),
+            "delta_latency_pct_vs_legacy": row["delta_latency_pct_vs_legacy"],
+            "new_median_throughput_bps": row["median_throughput_bps"],
+            "baseline_median_throughput_bps": baseline.get("median_throughput_bps", ""),
+            "delta_throughput_pct_vs_legacy": row["delta_throughput_pct_vs_legacy"],
+            "performance_note": row["performance_note"],
+        }
+    )
+
+with open(baseline_compare_csv, "w", encoding="utf-8", newline="") as handle:
+    writer = csv.DictWriter(handle, fieldnames=baseline_fields)
+    writer.writeheader()
+    writer.writerows(baseline_rows)
 
 codec_legacy_by_size = {row["size"]: row for row in by_profile.get("codec-legacy", [])}
 codec_rustfs_by_size = {row["size"]: row for row in by_profile.get("codec-rustfs", [])}
@@ -964,10 +1180,15 @@ PY
 run_profile() {
   local profile="$1"
   local baseline_csv="${2:-}"
+  local bench_rc=0
 
   stop_server
   start_server "$profile"
-  run_bench "$profile" "$baseline_csv"
+  if run_bench "$profile" "$baseline_csv"; then
+    :
+  else
+    bench_rc=$?
+  fi
   write_metrics_summary "$profile"
   run_compat_probe "$profile"
   stop_server
@@ -978,19 +1199,18 @@ run_profile() {
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
   fi
+
+  return "$bench_rc"
 }
 
 main() {
+  ORIGINAL_ARGS=("$@")
   parse_args "$@"
   validate_args
   setup_output
-  build_rustfs_if_needed
-
-  trap stop_server EXIT INT TERM
-
-  log "Output dir: $OUT_DIR"
   local codec_profiles=()
   local profiles=()
+  local profiles_csv=""
   local raw engine profile
   IFS=',' read -r -a engines <<< "$CODEC_ENGINES"
   for raw in "${engines[@]}"; do
@@ -1011,14 +1231,29 @@ main() {
       profiles=("legacy" "${codec_profiles[@]}")
       ;;
   esac
+  profiles_csv="$(IFS=,; echo "${profiles[*]}")"
+
+  write_root_environment
+  write_root_manifest "$profiles_csv"
+  build_rustfs_if_needed
+
+  trap stop_server EXIT INT TERM
+
+  log "Output dir: $OUT_DIR"
 
   local legacy_baseline_csv=""
   for profile in "${profiles[@]}"; do
     if [[ "$profile" == "legacy" ]]; then
-      run_profile "$profile"
-      legacy_baseline_csv="${OUT_DIR}/legacy/warp/median_summary.csv"
+      if ! run_profile "$profile"; then
+        PROFILE_FAILURES=$((PROFILE_FAILURES + 1))
+      fi
+      if [[ -f "${OUT_DIR}/legacy/warp/median_summary.csv" ]]; then
+        legacy_baseline_csv="${OUT_DIR}/legacy/warp/median_summary.csv"
+      fi
     else
-      run_profile "$profile" "$legacy_baseline_csv"
+      if ! run_profile "$profile" "$legacy_baseline_csv"; then
+        PROFILE_FAILURES=$((PROFILE_FAILURES + 1))
+      fi
     fi
     copy_profile_compat_artifacts "$profile" "${profile//-/_}"
   done
@@ -1034,6 +1269,12 @@ main() {
   fi
   if [[ -f "${OUT_DIR}/metrics_summary.csv" ]]; then
     log "Metrics summary: ${OUT_DIR}/metrics_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/baseline_compare.csv" ]]; then
+    log "Baseline compare: ${OUT_DIR}/baseline_compare.csv"
+  fi
+  if [[ "$DRY_RUN" != "true" && "$PROFILE_FAILURES" -gt 0 ]]; then
+    die "one or more benchmark profiles reported failed rounds; see per-profile median/baseline outputs for details"
   fi
   log "GET codec streaming smoke finished."
 }

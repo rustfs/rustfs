@@ -37,6 +37,7 @@ RETRY_SLEEP_SECS=2
 COOLDOWN_SECS=0
 BASELINE_CSV=""
 EXTRA_ARGS=()
+FAILED_FINAL_ROUNDS=0
 
 usage() {
   cat <<'USAGE'
@@ -219,7 +220,7 @@ setup_output() {
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
   COMPARE_CSV="$OUT_DIR/baseline_compare.csv"
 
-  echo "size,tool,round,attempt,concurrency,status,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file" > "$ROUND_CSV"
+  echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file" > "$ROUND_CSV"
   echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms" > "$MEDIAN_CSV"
 }
 
@@ -342,6 +343,9 @@ run_one_attempt() {
   local attempt="$3"
   local log_file="$OUT_DIR/logs/${TOOL}_${size}_r${round}_a${attempt}.log"
   local status="ok"
+  local exit_code=0
+  local started_at_utc finished_at_utc
+  started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
     local warp_host
@@ -369,7 +373,10 @@ run_one_attempt() {
       printf '\n'
       echo "dry run" > "$log_file"
     else
-      if ! "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
+      if "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
+        :
+      else
+        exit_code=$?
         status="failed"
       fi
     fi
@@ -397,27 +404,40 @@ run_one_attempt() {
       printf '\n'
       echo "dry run" > "$log_file"
     else
-      if ! "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
+      if "${cmd[@]}" 2>&1 | tee "$log_file" >&2; then
+        :
+      else
+        exit_code=$?
         status="failed"
       fi
     fi
   fi
+  finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms
-  metrics="$(extract_metrics "$log_file")"
-  throughput_human="$(echo "$metrics" | cut -d',' -f1)"
-  reqps="$(echo "$metrics" | cut -d',' -f2)"
-  latency_human="$(echo "$metrics" | cut -d',' -f3)"
-  throughput_bps="$(to_bps "$throughput_human")"
-  latency_ms="$(to_ms "$latency_human")"
+  if [[ "$DRY_RUN" == "true" ]]; then
+    throughput_human="N/A"
+    reqps="N/A"
+    latency_human="N/A"
+    throughput_bps="N/A"
+    latency_ms="N/A"
+  else
+    metrics="$(extract_metrics "$log_file")"
+    throughput_human="$(echo "$metrics" | cut -d',' -f1)"
+    reqps="$(echo "$metrics" | cut -d',' -f2)"
+    latency_human="$(echo "$metrics" | cut -d',' -f3)"
+    throughput_bps="$(to_bps "$throughput_human")"
+    latency_ms="$(to_ms "$latency_human")"
+  fi
 
   if [[ "$DRY_RUN" != "true" && "$status" == "ok" ]]; then
     if [[ "$throughput_bps" == "N/A" && "$reqps" == "N/A" ]]; then
       status="failed"
+      exit_code=1
     fi
   fi
 
-  echo "$size,$TOOL,$round,$attempt,$CONCURRENCY,$status,$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$log_file" >> "$ROUND_CSV"
+  echo "$size,$TOOL,$round,$attempt,$CONCURRENCY,$status,$exit_code,$started_at_utc,$finished_at_utc,$throughput_human,$throughput_bps,$reqps,$latency_human,$latency_ms,$log_file" >> "$ROUND_CSV"
   echo "$status"
 }
 
@@ -437,12 +457,13 @@ run_size() {
       fi
       if (( attempt < RETRY_PER_ROUND+1 )); then
         echo "Round failed, retry in ${RETRY_SLEEP_SECS}s..."
-        sleep "$RETRY_SLEEP_SECS"
+        cooldown_sleep "$RETRY_SLEEP_SECS"
       fi
     done
 
     if [[ "$success" == "no" ]]; then
       echo "WARN: size=$size round=$round failed after retries."
+      FAILED_FINAL_ROUNDS=$((FAILED_FINAL_ROUNDS + 1))
     fi
 
     if (( COOLDOWN_SECS > 0 && round < ROUNDS )); then
@@ -464,9 +485,9 @@ build_median_summary() {
     ok_rounds="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" {c++} END{print c+0}' "$ROUND_CSV")"
     fail_rounds="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6!="ok" {c++} END{print c+0}' "$ROUND_CSV")"
 
-    t_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $8!="N/A" {print $8}' "$ROUND_CSV")"
-    r_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $9!="N/A" {print $9}' "$ROUND_CSV")"
-    l_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $11!="N/A" {print $11}' "$ROUND_CSV")"
+    t_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $11!="N/A" {print $11}' "$ROUND_CSV")"
+    r_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $12!="N/A" {print $12}' "$ROUND_CSV")"
+    l_vals="$(awk -F',' -v s="$size" 'NR>1 && $1==s && $6=="ok" && $14!="N/A" {print $14}' "$ROUND_CSV")"
 
     local m_t m_r m_l
     m_t="$(median_from_numbers "$t_vals")"
@@ -558,6 +579,11 @@ main() {
     echo
     echo "=== Baseline Compare ==="
     cat "$COMPARE_CSV"
+  fi
+
+  if [[ "$DRY_RUN" != "true" && "$FAILED_FINAL_ROUNDS" -gt 0 ]]; then
+    echo "ERROR: ${FAILED_FINAL_ROUNDS} benchmark rounds failed after retries." >&2
+    exit 1
   fi
 }
 
