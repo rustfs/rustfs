@@ -8486,9 +8486,9 @@ dependencies = [
 
 [[package]]
 name = "redis"
-version = "1.2.4"
+version = "1.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bae41a63fd0b8a5372f82b21e810e09a316f5dd7efd96bf08e678fb240fc1918"
+checksum = "2fa6f8e4b491d7a8ef3a9550a4d71969bd0064f46e32b8dbbcc7fc60dad94fed"
 dependencies = [
  "arc-swap",
  "arcstr",
@@ -9357,9 +9357,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-erasure-codec"
-version = "7.0.0"
+version = "7.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fcda6886ece4bfc6917640007a6b9693dc8424a9412d18c3dda5be2431500f31"
+checksum = "c31c2f2ff65a5075aad1fe29d350f1a154bdb097ff0057ee846ec1faf5701098"
 dependencies = [
  "cc",
  "hashlink",

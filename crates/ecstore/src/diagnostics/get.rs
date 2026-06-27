@@ -94,6 +94,12 @@ pub(crate) const GET_METADATA_EARLY_STOP_REASON_NOT_FOUND: &str = "not_found";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST: &str = "unsafe_request";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM: &str = "valid_quorum";
 pub(crate) const GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND: &str = "version_not_found";
+pub(crate) const GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM: &str = "version_match_quorum";
+
+/// Early-stop active state labels
+pub(crate) const EARLY_STOP_ACTIVE_HIT: &str = "hit";
+pub(crate) const EARLY_STOP_ACTIVE_MISS: &str = "miss";
+pub(crate) const EARLY_STOP_ACTIVE_DISABLED: &str = "disabled";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum GetObjectFailureReason {
@@ -296,5 +302,9 @@ mod tests {
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST, "unsafe_request");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, "valid_quorum");
         assert_eq!(GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, "version_not_found");
+        assert_eq!(GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM, "version_match_quorum");
+        assert_eq!(EARLY_STOP_ACTIVE_HIT, "hit");
+        assert_eq!(EARLY_STOP_ACTIVE_MISS, "miss");
+        assert_eq!(EARLY_STOP_ACTIVE_DISABLED, "disabled");
     }
 }

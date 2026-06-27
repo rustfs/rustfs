@@ -34,6 +34,56 @@
 -   **高性能**: 针对批处理、压缩和内存管理进行了优化配置。
 -   **标准化协议**: 完全基于 OpenTelemetry 标准构建。
 
+## GET 性能优化仪表盘
+
+包含三个预构建的 Grafana 仪表盘，用于监控 RustFS GET 性能优化发布：
+
+### 可用仪表盘
+
+| 仪表盘 | 文件 | 描述 |
+|--------|------|------|
+| **GET 发布健康度** | `grafana-get-rollout-health.json` | 监控优化发布：按 reader path 的延迟、early-stop 命中率、codec streaming 使用率、pipeline 失败率 |
+| **GET 数据完整性** | `grafana-get-data-integrity.json` | 监控数据安全：bitrot 校验失败、decode 错误、short read、shard 读取结果 |
+| **GET 资源影响** | `grafana-get-resource-impact.json` | 监控资源使用：并发请求数、IO 队列利用率、disk permit 等待、RSS 趋势 |
+
+### Prometheus 告警规则
+
+文件 `prometheus-rules/rustfs-get-optimization-alerts.yaml` 包含预配置的告警规则：
+
+| 告警 | 级别 | 条件 |
+|------|------|------|
+| `GetP99Regression` | 严重 | GET p99 延迟 > 2x 基线，持续 10 分钟 |
+| `PipelineFailureSpike` | 严重 | Pipeline 失败率 > 5x 基线，持续 5 分钟 |
+| `BitrotMismatchSpike` | 严重 | Bitrot 不匹配率 > 3x 基线，持续 5 分钟 |
+| `EarlyStopInsufficientQuorum` | 警告 | Early-stop quorum 不足率 > 0.1/s，持续 5 分钟 |
+| `CodecStreamingFallbackSpike` | 警告 | Codec streaming 回退 > 10x 基线，持续 10 分钟 |
+| `IoQueueSaturation` | 警告 | IO 队列利用率 > 90%，持续 5 分钟 |
+
+### 启用告警规则
+
+在 Prometheus 配置中添加告警规则文件：
+
+```yaml
+# prometheus.yml
+rule_files:
+  - "/etc/prometheus/rules/*.yml"
+
+# 或在 docker-compose.yml 中挂载文件：
+# volumes:
+#   - ./prometheus-rules:/etc/prometheus/rules
+```
+
+### 仪表盘使用
+
+仪表盘在 Grafana 启动时自动预置。它们使用 `${DS_PROMETHEUS}` 数据源变量，因此需要在 Grafana 中配置 Prometheus 数据源。
+
+优化发布期间需要关注的关键面板：
+
+1. **GET 延迟按 Reader Path** - 对比 `codec_streaming` vs `legacy_duplex` 延迟
+2. **Early-Stop 命中率** - 验证 early-stop 是否有效触发
+3. **Pipeline 失败率** - 检测优化引入的新故障模式
+4. **Bitrot 校验失败** - 确保数据完整性
+
 ## 快速开始
 
 ### 前置条件

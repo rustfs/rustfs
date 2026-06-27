@@ -17,12 +17,12 @@ use crate::diagnostics::get::{
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
     GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
     GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
-    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT,
-    GET_METADATA_RESPONSE_DISK_NOT_FOUND, GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED,
-    GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT, GET_METADATA_RESPONSE_VALID,
-    GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE,
-    GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path,
+    GET_METADATA_EARLY_STOP_REASON_VALID_QUORUM, GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
+    GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
+    GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
+    GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
+    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::create_deferred_bitrot_reader;
@@ -204,6 +204,9 @@ struct MetadataQuorumAccumulator {
     candidate_votes: usize,
     conflicting_metadata: bool,
     delete_marker_seen: bool,
+    delete_marker_votes: usize,
+    requested_version_id: String,
+    matching_version_votes: usize,
 }
 
 impl MetadataQuorumAccumulator {
@@ -221,7 +224,15 @@ impl MetadataQuorumAccumulator {
             candidate_votes: 0,
             conflicting_metadata: false,
             delete_marker_seen: false,
+            delete_marker_votes: 0,
+            requested_version_id: String::new(),
+            matching_version_votes: 0,
         }
+    }
+
+    fn with_requested_version_id(mut self, version_id: &str) -> Self {
+        self.requested_version_id = version_id.to_string();
+        self
     }
 
     fn observe_file_info(&mut self, file_info: &FileInfo) {
@@ -231,7 +242,17 @@ impl MetadataQuorumAccumulator {
         }
 
         self.valid_responses = self.valid_responses.saturating_add(1);
+
+        // Track version match for versioned requests
+        if !self.requested_version_id.is_empty()
+            && let Some(ref vid) = file_info.version_id
+            && vid.to_string() == self.requested_version_id
+        {
+            self.matching_version_votes = self.matching_version_votes.saturating_add(1);
+        }
+
         if file_info.deleted {
+            self.delete_marker_votes = self.delete_marker_votes.saturating_add(1);
             self.delete_marker_seen = true;
             return;
         }
@@ -271,6 +292,11 @@ impl MetadataQuorumAccumulator {
         if !self.allow_early_stop {
             return None;
         }
+        if self.delete_marker_votes >= self.missing_response_quorum() {
+            return Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
+            });
+        }
         if self.conflicting_metadata
             || self.delete_marker_seen
             || self.not_found_responses > 0
@@ -290,6 +316,27 @@ impl MetadataQuorumAccumulator {
             });
         }
         None
+    }
+
+    /// Check if a versioned request can early-stop because the requested
+    /// version_id has reached quorum across disks.
+    fn version_early_stop_decision(&self) -> Option<MetadataEarlyStopDecision> {
+        if self.requested_version_id.is_empty() {
+            return None;
+        }
+        if self.matching_version_votes >= self.read_quorum_for_version() {
+            return Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
+            });
+        }
+        None
+    }
+
+    /// Compute the read quorum threshold for version-aware early-stop.
+    /// Uses `total_disks / 2` (like `missing_response_quorum`) when
+    /// `default_parity_count` is set, otherwise requires all disks.
+    fn read_quorum_for_version(&self) -> usize {
+        self.missing_response_quorum()
     }
 
     fn final_miss_reason(&self) -> &'static str {
@@ -1110,7 +1157,9 @@ impl SetDisks {
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
         let early_stop_enabled = observe && is_get_metadata_early_stop_enabled();
-        let allow_early_stop = early_stop_enabled && version_id.is_empty() && !healing && !incl_free_versions;
+        let allow_early_stop = observe
+            && ((is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
+                || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing));
         if allow_early_stop {
             return Self::read_all_fileinfo_early_stop(
                 disks,
@@ -1245,7 +1294,8 @@ impl SetDisks {
         let mut ress = vec![FileInfo::default(); disks.len()];
         let mut errors = vec![None; disks.len()];
         let mut observations = Vec::with_capacity(disks.len());
-        let mut accumulator = MetadataQuorumAccumulator::new(disks.len(), default_parity_count, true);
+        let mut accumulator =
+            MetadataQuorumAccumulator::new(disks.len(), default_parity_count, true).with_requested_version_id(version_id);
         let opts = Arc::new(ReadOptions {
             incl_free_versions,
             read_data,
@@ -1299,7 +1349,10 @@ impl SetDisks {
                 }
             }
 
-            if let Some(decision) = accumulator.early_stop_decision() {
+            if let Some(decision) = accumulator
+                .early_stop_decision()
+                .or_else(|| accumulator.version_early_stop_decision())
+            {
                 let saved_responses = join_set.len();
                 join_set.abort_all();
                 rustfs_io_metrics::record_get_object_metadata_early_stop_hit(GET_OBJECT_PATH_LEGACY_DUPLEX, decision.reason);
@@ -3014,12 +3067,28 @@ mod tests {
     }
 
     #[test]
-    fn metadata_quorum_accumulator_falls_back_on_delete_marker_latest() {
+    fn metadata_quorum_accumulator_hits_delete_marker_quorum_early_stop() {
         let mut accumulator = metadata_early_stop_accumulator();
         let mut deleted = metadata_early_stop_candidate("object", 1);
         deleted.deleted = true;
 
         accumulator.observe_file_info(&deleted);
+        accumulator.observe_file_info(&deleted);
+
+        assert_eq!(
+            accumulator.early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER
+            })
+        );
+    }
+
+    #[test]
+    fn metadata_quorum_accumulator_falls_back_on_delete_marker_below_quorum() {
+        let mut accumulator = metadata_early_stop_accumulator();
+        let mut deleted = metadata_early_stop_candidate("object", 1);
+        deleted.deleted = true;
+
         accumulator.observe_file_info(&deleted);
 
         assert!(accumulator.early_stop_decision().is_none());
@@ -3090,6 +3159,101 @@ mod tests {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
             assert!(!is_get_metadata_early_stop_enabled());
         });
+    }
+
+    #[test]
+    fn version_early_stop_gate_defaults_to_disabled() {
+        temp_env::with_var(ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, None::<&str>, || {
+            assert!(!is_version_early_stop_enabled());
+        });
+    }
+
+    fn version_early_stop_candidate(object: &str, disk_index: usize, version_id: Uuid) -> FileInfo {
+        let mut fi = metadata_early_stop_candidate(object, disk_index);
+        fi.version_id = Some(version_id);
+        fi
+    }
+
+    fn version_early_stop_accumulator(requested_version_id: &str) -> MetadataQuorumAccumulator {
+        MetadataQuorumAccumulator::new(4, 2, true).with_requested_version_id(requested_version_id)
+    }
+
+    #[test]
+    fn version_early_stop_hits_quorum_with_matching_versions() {
+        let vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&vid.to_string());
+
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 1, vid));
+        assert!(accumulator.version_early_stop_decision().is_none());
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 2, vid));
+
+        assert_eq!(
+            accumulator.version_early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM
+            })
+        );
+        assert_eq!(accumulator.matching_version_votes, 2);
+    }
+
+    #[test]
+    fn version_early_stop_does_not_fire_without_requested_version() {
+        let vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator("");
+
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 1, vid));
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 2, vid));
+
+        assert!(accumulator.version_early_stop_decision().is_none());
+    }
+
+    #[test]
+    fn version_early_stop_does_not_fire_with_mismatched_versions() {
+        let requested_vid = Uuid::new_v4();
+        let other_vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
+
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 1, requested_vid));
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 2, other_vid));
+
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.matching_version_votes, 1);
+    }
+
+    #[test]
+    fn version_early_stop_does_not_fire_below_quorum() {
+        let vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&vid.to_string());
+
+        accumulator.observe_file_info(&version_early_stop_candidate("object", 1, vid));
+
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.matching_version_votes, 1);
+    }
+
+    #[test]
+    fn version_early_stop_tracks_matching_votes_independently_of_candidate() {
+        let requested_vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
+
+        // Two valid responses with matching version_id but different erasure.index
+        // (so they conflict on the candidate path but still count for version votes)
+        let mut fi1 = version_early_stop_candidate("object", 1, requested_vid);
+        fi1.size = 100;
+        let mut fi2 = version_early_stop_candidate("object", 2, requested_vid);
+        fi2.size = 200; // different size → conflicting metadata on candidate path
+
+        accumulator.observe_file_info(&fi1);
+        accumulator.observe_file_info(&fi2);
+
+        // Candidate path sees conflict, but version path sees quorum
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(
+            accumulator.version_early_stop_decision(),
+            Some(MetadataEarlyStopDecision {
+                reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM
+            })
+        );
     }
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {

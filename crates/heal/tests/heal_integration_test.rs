@@ -22,7 +22,7 @@ use rustfs_heal::heal::{
 use serial_test::serial;
 use std::{
     path::{Path, PathBuf},
-    sync::{Arc, Once, OnceLock},
+    sync::{Arc, Once},
     time::Duration,
 };
 use tokio::fs;
@@ -59,7 +59,6 @@ async fn wait_for_path_exists(path: &Path, timeout: Duration, interval: Duration
     }
 }
 
-static GLOBAL_ENV: OnceLock<(Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>)> = OnceLock::new();
 static INIT: Once = Once::new();
 
 pub fn init_tracing() {
@@ -75,11 +74,6 @@ pub fn init_tracing() {
 /// Test helper: Create test environment with ECStore
 async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage>) {
     init_tracing();
-
-    // Fast path: already initialized, just clone and return
-    if let Some((paths, ecstore, heal_storage)) = GLOBAL_ENV.get() {
-        return (paths.clone(), ecstore.clone(), heal_storage.clone());
-    }
 
     // create temp dir as 4 disks with unique base dir
     let test_base_dir = format!("/tmp/rustfs_heal_heal_test_{}", uuid::Uuid::new_v4());
@@ -126,9 +120,9 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
     // format disks (only first time)
     init_local_disks(endpoint_pools.clone()).await.unwrap();
 
-    // create ECStore with dynamic port 0 (let OS assign) or fixed 9001 if free
-    let port = 9001; // for simplicity
-    let server_addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    // Use port 0 so nextest can run this integration binary in parallel
+    // with other ECStore-backed tests without sharing a fixed peer port.
+    let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
     let ecstore = ECStore::new(server_addr, endpoint_pools, CancellationToken::new())
         .await
         .unwrap();
@@ -146,9 +140,6 @@ async fn setup_test_env() -> (Vec<PathBuf>, Arc<ECStore>, Arc<ECStoreHealStorage
 
     // Create heal storage layer
     let heal_storage = Arc::new(ECStoreHealStorage::new(ecstore.clone()));
-
-    // Store in global once lock
-    let _ = GLOBAL_ENV.set((disk_paths.clone(), ecstore.clone(), heal_storage.clone()));
 
     (disk_paths, ecstore, heal_storage)
 }
