@@ -12,7 +12,7 @@ control-plane boundaries are stable.
 | `rustfs/src/app/context/runtime_sources.rs` | Default AppContext fallback adapters for KMS, IAM, object store, endpoints, config, metrics, and notification state. | This is an allowed fallback boundary, not a business logic owner. |
 | `rustfs/src/*/runtime_sources.rs` | Root, admin, app, server, startup, and storage owner-local runtime-source boundaries. | Business modules use these boundaries instead of calling global state directly. |
 | `rustfs/src/*/storage_api.rs` | Root, admin, app, and storage owner-local storage contract/facade boundaries. | Storage helper and ECStore facade access remains visible at local owner boundaries. |
-| `crates/*/storage_api.rs` | External crate-local storage facade boundaries for IAM, scanner, heal, notify, observability, Swift, and S3 Select. | External runtime crates may consume ECStore facade globals only through their local storage API boundary. |
+| `crates/*/storage_api.rs` | External crate-local storage facade boundaries for IAM, scanner, heal, notify, observability, Swift, and S3 Select. | External runtime crates consume ECStore runtime state through `rustfs_ecstore::api::runtime` instead of the direct global facade. |
 | `crates/ecstore/src/runtime/global.rs` | ECStore bootstrap/runtime state owner. | Keep internal until ECStore has explicit owner handles for all remaining bootstrap state. |
 | `crates/ecstore/src/runtime/sources.rs` | ECStore runtime-source adapter over global state. | Preferred ECStore-internal access path while shrinking direct `runtime::global` reads. |
 
@@ -33,14 +33,6 @@ consumers and process-global state. They must keep these properties:
 The architecture guard snapshots the files currently allowed to reference
 `rustfs_ecstore::api::global` directly:
 
-- `crates/heal/src/heal/storage_api.rs`
-- `crates/iam/src/storage_api.rs`
-- `crates/notify/src/storage_api.rs`
-- `crates/obs/src/metrics/storage_api.rs`
-- `crates/protocols/src/swift/storage_api.rs`
-- `crates/s3select-api/src/storage_api.rs`
-- `crates/scanner/src/storage_api.rs`
-- `crates/scanner/tests/storage_api/mod.rs`
 - `rustfs/src/storage/storage_api.rs`
 
 New direct uses must either move behind an existing owner-local boundary or

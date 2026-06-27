@@ -24,8 +24,8 @@ pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys;
 pub(crate) use rustfs_ecstore::api::capacity::path2_bucket_object_with_base_path;
 pub(crate) use rustfs_ecstore::api::client::transition_api::{ReadCloser, ReaderImpl};
 pub(crate) use rustfs_ecstore::api::disk::{DiskAPI, DiskOption, STORAGE_FORMAT_FILE, endpoint::Endpoint, new_disk};
-pub(crate) use rustfs_ecstore::api::global::get_global_tier_config_mgr;
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
+pub(crate) use rustfs_ecstore::api::runtime::global_tier_config_mgr as get_global_tier_config_mgr;
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 pub(crate) use rustfs_ecstore::api::tier::tier_config::{TierConfig, TierMinIO, TierType};
 pub(crate) use rustfs_ecstore::api::tier::warm_backend::{

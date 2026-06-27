@@ -65,9 +65,9 @@ pub(crate) use rustfs_ecstore::api::disk::{
 pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
-pub(crate) use rustfs_ecstore::api::global::{
-    get_global_tier_config_mgr as ecstore_get_global_tier_config_mgr, is_erasure as ecstore_is_erasure,
-    is_erasure_sd as ecstore_is_erasure_sd, resolve_object_store_handle as ecstore_resolve_object_store_handle,
+pub(crate) use rustfs_ecstore::api::runtime::{
+    global_tier_config_mgr as ecstore_get_global_tier_config_mgr, object_store_handle as ecstore_resolve_object_store_handle,
+    setup_is_erasure as ecstore_is_erasure, setup_is_erasure_sd as ecstore_is_erasure_sd,
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;

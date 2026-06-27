@@ -24,10 +24,10 @@ use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
     classify_system_path_failure_reason as ecstore_classify_system_path_failure_reason,
 };
-use rustfs_ecstore::api::global::is_first_cluster_node_local as ecstore_is_first_cluster_node_local;
 use rustfs_ecstore::api::notification::{
     NotificationPeerErr as EcstoreNotificationPeerErr, NotificationSys as EcstoreNotificationSys, get_global_notification_sys,
 };
+use rustfs_ecstore::api::runtime::first_cluster_node_is_local as ecstore_first_cluster_node_is_local;
 use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
 use rustfs_storage_api as storage_contracts;
 
@@ -74,7 +74,7 @@ pub(crate) fn classify_iam_system_path_failure_reason(err: &IamEcstoreError) -> 
 }
 
 pub(crate) async fn is_iam_first_cluster_node_local() -> bool {
-    ecstore_is_first_cluster_node_local().await
+    ecstore_first_cluster_node_is_local().await
 }
 
 pub(crate) fn notification_sys() -> Option<&'static IamNotificationSys> {
