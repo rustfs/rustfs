@@ -5,7 +5,7 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 ## Current Context
 
 - Issue: [`rustfs/backlog#660`](https://github.com/rustfs/backlog/issues/660)
-- Branch: `overtrue/arch-runtime-repair-preservation-tests`
+- Branch: `overtrue/arch-final-migration-validation`
 - Baseline: completed `C-011/C-012/C-013/API-055/API-059/API-079/API-080/API-081/API-082/API-083/API-084/API-085/API-086/API-087/API-088/API-089/API-090/API-091/API-092/API-093/API-094/API-095/API-096/API-097/API-098/API-099/API-100/API-101/API-102/API-103/API-104/API-105/API-106/API-107/API-108/API-109/API-110/API-111/API-112/API-113/API-114/API-115/API-116/API-117/API-118/API-119/API-120/API-121/API-122/API-123/API-124/API-125/API-126/API-127/API-128/API-129/API-130/API-131/API-132/API-133/API-134/API-135/API-136/API-137/API-138/API-139/API-140/API-141/API-142/API-143/API-144/API-145/API-146/API-147/API-148/API-149/API-150/API-151/API-152/API-153/API-154/API-155/API-156/API-157/API-158/API-159/API-160/API-161/API-162/API-163/API-164/API-165/API-166/API-167/API-168/API-169/API-170/API-171/API-172/API-173/API-174/API-175/API-176/API-177/API-178/API-179/API-180/API-181/API-182/API-183/API-184/API-185/API-186/API-187/API-188/API-189/API-190/API-191/API-192/API-193/API-194/API-195/API-196/API-197/API-198/API-199/API-200/API-201/API-202/API-203/API-204/API-205/API-206/API-207/API-208/API-209/API-210/API-211/API-212/API-213/API-214/API-215/API-216/API-217/API-218/API-219/API-220/API-221/API-222/API-223/API-224/API-225/API-226/API-227/API-228/API-229/API-230/API-231/API-232/API-233/API-234/API-235/API-236/API-237/API-238/API-239/API-240/API-241/API-242/API-243/API-244/API-245/API-246/API-247/API-248/API-249/API-250/API-251/API-252/API-253/API-254/CTX-002`.
 - Current baseline also includes API-255 from PR #3923, API-256 from PR
   #3925, CFG-009 from PR #3927, C-007/C-009 from PR #3935, C-008/C-010
@@ -27,17 +27,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
   PR #3955, the GLOB-007 scalar/handle resolver fallback removal from PR #3957,
   the GLOB-007 specialized resolver fallback
   boundary from PR #3958, the GLOB-007 root runtime fallback facade cleanup
-  from PR #3961, and the Phase 7 global-state/crate-split closeout from
-  PR #3962.
-- Current phase PR: combined `TEST-RUN-001` and `TEST-REP-001` preservation
-  tests for backlog sub-issues #668 and #669.
-- Based on: `origin/main` at PR #3962 (`66ad13850`).
-- PR type for this branch: `test-only`.
+  from PR #3961, the Phase 7 global-state/crate-split closeout from
+  PR #3962, and the combined `TEST-RUN-001`/`TEST-REP-001` preservation tests
+  from PR #3964.
+- Current phase PR: final issue #660 validation and closeout after backlog
+  sub-issues #668 and #669 were closed.
+- Based on: `origin/main` at PR #3964 (`82bbef0b6`).
+- PR type for this branch: `ci-gate`.
 - Runtime behavior changes: none.
-- Rust code changes: test coverage plus a private heal-channel admission
-  response helper used by production and tests.
+- Rust code changes: none.
 - CI/script changes: none intended.
-- Docs changes: record the remaining #660 test-preservation backlog slice.
+- Docs changes: record final #660 validation status and closeout handoff.
 
 ## Phase 0 Tasks
 
@@ -6137,15 +6137,17 @@ Status values: `[ ]` not started, `[~]` in progress, `[x]` complete, `[!]` block
 
 ## Next PRs
 
-1. `test-only`: merge the combined `TEST-RUN-001`/`TEST-REP-001`
-   preservation test branch.
-2. `ci-gate`: run final issue #660 versus local-plan versus progress-ledger
-   validation after backlog sub-issues #668 and #669 are closed.
+1. `ci-gate`: merge this final issue #660 validation closeout branch.
+2. No further issue #660 migration PRs remain after this branch lands; close
+   backlog #660 with the merged PR reference.
 
 ## Pre-Push Review Log
 
 | Expert | Status | Notes |
 |---|---|---|
+| Quality/architecture | pass | Final validation is docs-only and records the merged #3964 preservation-test closeout without changing runtime, storage, or migration guard code. |
+| Migration preservation | pass | The latest backlog #660 execution index and migration-progress agree that #668/#669 were the last incomplete sub-issues and are closed after #3964; older local plan files are historical. |
+| Testing/verification | pass | Ledger status scan, backlog issue-state check, architecture migration guard, diff hygiene, and docs-only source scan passed for the closeout. |
 | Quality/architecture | pass | The combined TEST-RUN-001/TEST-REP-001 slice adds preservation tests and a private heal-channel response helper without widening runtime APIs, storage APIs, or migration guard scope. |
 | Migration preservation | pass | Readiness gating, public/admin probe exemptions, service-state publication, shutdown ordering, per-set lock quorum, heal admission, scanner cancellation reason, and runtime drive-state boundaries are pinned without behavior changes. |
 | Testing/verification | pass | Focused rustfs, rustfs-heal, rustfs-scanner, and rustfs-ecstore tests passed; formatting, diff hygiene, architecture guard, and diff-only Rust risk scan passed before the full PR gate. |
@@ -9964,9 +9966,27 @@ Notes:
   - `make pre-pr`: passed, including 6925 nextest tests passed, 112 skipped,
     and doctests passed.
 
+- Issue #660 final validation closeout:
+  - `rg -n "^- \[[~! ]\]" docs/architecture/migration-progress.md`:
+    passed; no in-progress, blocked, or not-started task rows remain in the
+    progress ledger.
+  - Backlog issue-state check: passed; #668 and #669 are closed, while #660
+    remains open until this final validation branch lands.
+  - Historical plan reconciliation: passed; the original local plan files are
+    superseded by the latest backlog #660 execution index and this
+    `migration-progress.md` ledger.
+  - `./scripts/check_architecture_migration_rules.sh`: passed.
+  - `git diff --check`: passed.
+  - Docs-only scope scan: passed; only
+    `docs/architecture/migration-progress.md` changed.
+
 ## Handoff Notes
 
-- PR #3951, PR #3961, and PR #3962 are merged. The remaining issue #660
-  blockers are backlog sub-issues #668 (`TEST-RUN-001`) and #669
-  (`TEST-REP-001`); do not declare the migration complete until this
-  preservation-test branch lands and final validation closes those issues.
+- PR #3951, PR #3961, PR #3962, and PR #3964 are merged. Backlog sub-issues
+  #668 (`TEST-RUN-001`) and #669 (`TEST-REP-001`) are closed.
+- After this final validation branch lands, close backlog #660 with the merged
+  PR reference. No further issue #660 migration PRs remain in the progress
+  ledger.
+- Treat the original local plan files as historical context; the current source
+  of truth is this progress ledger plus the latest backlog #660 execution
+  index.
