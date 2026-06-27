@@ -62,9 +62,8 @@ pub async fn resolve_encryption_service() -> Option<Arc<ObjectEncryptionService>
 }
 
 /// Resolve outbound TLS generation using AppContext-first precedence.
-pub fn resolve_outbound_tls_generation() -> TlsGeneration {
+pub fn resolve_outbound_tls_generation() -> Option<TlsGeneration> {
     resolve_outbound_tls_generation_with(get_global_app_context())
-        .unwrap_or_else(|| default_outbound_tls_runtime_interface().generation())
 }
 
 #[cfg(test)]
@@ -176,8 +175,8 @@ pub fn resolve_boot_time() -> Option<SystemTime> {
 }
 
 /// Resolve daily tier transition statistics using AppContext-first precedence.
-pub fn resolve_daily_tier_stats() -> DailyAllTierStats {
-    resolve_daily_tier_stats_with(get_global_app_context()).unwrap_or_else(|| default_tier_stats_interface().daily_all())
+pub fn resolve_daily_tier_stats() -> Option<DailyAllTierStats> {
+    resolve_daily_tier_stats_with(get_global_app_context())
 }
 
 /// Resolve scanner metrics report using AppContext-first precedence.
@@ -195,8 +194,8 @@ pub fn resolve_deployment_id() -> Option<String> {
 }
 
 /// Resolve runtime port using AppContext-first precedence.
-pub fn resolve_runtime_port() -> u16 {
-    resolve_runtime_port_with(get_global_app_context()).unwrap_or_else(|| default_runtime_port_interface().get())
+pub fn resolve_runtime_port() -> Option<u16> {
+    resolve_runtime_port_with(get_global_app_context())
 }
 
 /// Resolve lock client using AppContext-first precedence.
@@ -210,13 +209,13 @@ pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClien
 }
 
 /// Resolve performance metrics using AppContext-first precedence.
-pub fn resolve_performance_metrics() -> Arc<PerformanceMetrics> {
-    resolve_performance_metrics_with(get_global_app_context()).unwrap_or_else(|| default_performance_metrics_interface().handle())
+pub fn resolve_performance_metrics() -> Option<Arc<PerformanceMetrics>> {
+    resolve_performance_metrics_with(get_global_app_context())
 }
 
 /// Resolve internode metrics using AppContext-first precedence.
-pub fn resolve_internode_metrics() -> Arc<InternodeMetrics> {
-    resolve_internode_metrics_with(get_global_app_context()).unwrap_or_else(|| default_internode_metrics_interface().handle())
+pub fn resolve_internode_metrics() -> Option<Arc<InternodeMetrics>> {
+    resolve_internode_metrics_with(get_global_app_context())
 }
 
 /// Resolve S3 Select database using AppContext-first precedence.
@@ -232,12 +231,8 @@ pub async fn resolve_s3select_db(
 }
 
 /// Resolve local node name using AppContext-first precedence.
-pub async fn resolve_local_node_name() -> String {
-    if let Some(node_name) = resolve_local_node_name_with(get_global_app_context()).await {
-        return node_name;
-    }
-
-    runtime_sources::local_node_name().await
+pub async fn resolve_local_node_name() -> Option<String> {
+    resolve_local_node_name_with(get_global_app_context()).await
 }
 
 /// Resolve action credentials using AppContext-first precedence.
@@ -251,13 +246,13 @@ pub fn resolve_region() -> Option<s3s::region::Region> {
 }
 
 /// Resolve tier config handle using AppContext-first precedence.
-pub fn resolve_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
-    resolve_tier_config_handle_with(get_global_app_context()).unwrap_or_else(|| default_tier_config_interface().handle())
+pub fn resolve_tier_config_handle() -> Option<Arc<RwLock<TierConfigMgr>>> {
+    resolve_tier_config_handle_with(get_global_app_context())
 }
 
 /// Resolve lifecycle expiry state using AppContext-first precedence.
-pub fn resolve_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
-    resolve_expiry_state_handle_with(get_global_app_context()).unwrap_or_else(|| default_expiry_state_interface().handle())
+pub fn resolve_expiry_state_handle() -> Option<Arc<RwLock<ExpiryState>>> {
+    resolve_expiry_state_handle_with(get_global_app_context())
 }
 
 /// Resolve server config using AppContext-first precedence.
@@ -283,8 +278,8 @@ pub fn publish_storage_class_config(config: StorageClassConfig) {
 }
 
 /// Resolve buffer profile config using AppContext-first precedence.
-pub fn resolve_buffer_config() -> RustFSBufferConfig {
-    resolve_buffer_config_with(get_global_app_context()).unwrap_or_else(|| default_buffer_config_interface().get())
+pub fn resolve_buffer_config() -> Option<RustFSBufferConfig> {
+    resolve_buffer_config_with(get_global_app_context())
 }
 
 fn resolve_kms_runtime_service_manager_with(context: Option<Arc<AppContext>>) -> Option<Arc<KmsServiceManager>> {
