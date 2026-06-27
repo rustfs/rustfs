@@ -14,7 +14,11 @@
 
 pub mod local_snapshot;
 
-use crate::storage_api_contracts::{list::ListOperations as _, object::ObjectIO as _};
+use crate::storage_api_contracts::{
+    bucket::{BucketOperations as _, BucketOptions},
+    list::ListOperations as _,
+    object::ObjectIO as _,
+};
 use crate::{
     bucket::{metadata_sys::get_replication_config, versioning::VersioningApi as _, versioning_sys::BucketVersioningSys},
     config::com::read_config,
@@ -463,7 +467,20 @@ pub async fn compute_bucket_usage(store: Arc<ECStore>, bucket_name: &str) -> Res
 }
 
 pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore>, data_usage_info: &mut DataUsageInfo) {
-    let buckets = data_usage_info.buckets_usage.keys().cloned().collect::<Vec<String>>();
+    let listed_bucket_names = match store
+        .list_bucket(&BucketOptions {
+            no_metadata: true,
+            ..Default::default()
+        })
+        .await
+    {
+        Ok(buckets) => buckets.into_iter().map(|bucket| bucket.name).collect::<Vec<_>>(),
+        Err(err) => {
+            debug!(error = %err, "failed to list buckets while refreshing versioned bucket usage");
+            Vec::new()
+        }
+    };
+    let buckets = bucket_names_for_versioned_refresh(data_usage_info, listed_bucket_names);
     let mut changed = false;
 
     for bucket in buckets {
@@ -475,6 +492,7 @@ pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore
             continue;
         }
 
+        let refresh_started_at = SystemTime::now();
         let usage = match compute_bucket_usage(store.clone(), &bucket).await {
             Ok(usage) => usage,
             Err(err) => {
@@ -487,6 +505,7 @@ pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore
             }
         };
 
+        replace_bucket_usage_memory_from_authoritative(&bucket, usage.clone(), refresh_started_at).await;
         data_usage_info.bucket_sizes.insert(bucket.clone(), usage.size);
         data_usage_info.buckets_usage.insert(bucket, usage);
         changed = true;
@@ -496,6 +515,18 @@ pub async fn refresh_versioned_bucket_usage_from_object_layer(store: Arc<ECStore
         set_buckets_count_from_usage(data_usage_info);
         data_usage_info.calculate_totals();
     }
+}
+
+fn bucket_names_for_versioned_refresh(
+    data_usage_info: &DataUsageInfo,
+    listed_bucket_names: impl IntoIterator<Item = String>,
+) -> Vec<String> {
+    let mut buckets = data_usage_info.buckets_usage.keys().cloned().collect::<HashSet<String>>();
+    buckets.extend(listed_bucket_names.into_iter().filter(|bucket| !bucket.is_empty()));
+
+    let mut buckets = buckets.into_iter().collect::<Vec<_>>();
+    buckets.sort();
+    buckets
 }
 
 async fn ensure_bucket_usage_cached(bucket: &str) {
@@ -538,6 +569,17 @@ fn bucket_usage_counts_match(left: &BucketUsageInfo, right: &BucketUsageInfo) ->
         && left.objects_count == right.objects_count
         && left.versions_count == right.versions_count
         && left.delete_markers_count == right.delete_markers_count
+}
+
+async fn replace_bucket_usage_memory_from_authoritative(bucket: &str, usage: BucketUsageInfo, refresh_started_at: SystemTime) {
+    let mut cache = memory_cache().write().await;
+    if let Some(existing) = cache.get(bucket)
+        && existing.usage_updated_at > refresh_started_at
+    {
+        return;
+    }
+
+    cache.insert(bucket.to_string(), cached_bucket_usage_from_backend(usage, refresh_started_at));
 }
 
 /// Fast in-memory update for immediate quota and admin usage consistency.
@@ -1260,6 +1302,105 @@ mod tests {
                 .get("bucket-a")
                 .map(|usage| { (usage.objects_count, usage.versions_count, usage.delete_markers_count, usage.size,) }),
             Some((2, 2, 1, 30))
+        );
+    }
+
+    #[test]
+    fn versioned_refresh_bucket_names_include_live_buckets_without_usage_snapshot() {
+        let mut persisted = DataUsageInfo::default();
+        persisted.buckets_usage.insert(
+            "bucket-a".to_string(),
+            BucketUsageInfo {
+                objects_count: 1,
+                versions_count: 1,
+                size: 10,
+                ..Default::default()
+            },
+        );
+
+        let buckets = bucket_names_for_versioned_refresh(&persisted, vec!["bucket-b".to_string(), "bucket-a".to_string()]);
+
+        assert_eq!(buckets, vec!["bucket-a".to_string(), "bucket-b".to_string()]);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn authoritative_versioned_refresh_replaces_stale_dirty_memory() {
+        clear_usage_memory_cache_for_test().await;
+
+        let old_persisted = data_usage_info_for_test("bucket-a", 0, 0, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&old_persisted).await;
+        record_bucket_object_write_memory("bucket-a", None, 15).await;
+
+        let authoritative = BucketUsageInfo {
+            objects_count: 1,
+            versions_count: 1,
+            delete_markers_count: 1,
+            size: 10,
+            ..Default::default()
+        };
+        replace_bucket_usage_memory_from_authoritative("bucket-a", authoritative.clone(), SystemTime::now()).await;
+
+        let mut response = old_persisted.clone();
+        response.buckets_usage.insert("bucket-a".to_string(), authoritative);
+        response.bucket_sizes.insert("bucket-a".to_string(), 10);
+        response.calculate_totals();
+
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 1);
+        assert_eq!(response.delete_markers_total_count, 1);
+        assert_eq!(response.objects_total_size, 10);
+        assert_eq!(
+            response.buckets_usage.get("bucket-a").map(|usage| (
+                usage.objects_count,
+                usage.versions_count,
+                usage.delete_markers_count,
+                usage.size
+            )),
+            Some((1, 1, 1, 10))
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn authoritative_versioned_refresh_preserves_newer_dirty_memory() {
+        clear_usage_memory_cache_for_test().await;
+
+        let old_persisted = data_usage_info_for_test("bucket-a", 0, 0, SystemTime::now() - Duration::from_secs(10));
+        replace_bucket_usage_memory_from_info(&old_persisted).await;
+        let refresh_started = SystemTime::now() - Duration::from_secs(1);
+        record_bucket_object_write_memory("bucket-a", None, 15).await;
+
+        replace_bucket_usage_memory_from_authoritative(
+            "bucket-a",
+            BucketUsageInfo {
+                objects_count: 1,
+                versions_count: 1,
+                delete_markers_count: 1,
+                size: 10,
+                ..Default::default()
+            },
+            refresh_started,
+        )
+        .await;
+
+        let mut response = old_persisted.clone();
+        apply_bucket_usage_memory_overlay(&mut response).await;
+
+        assert_eq!(response.objects_total_count, 1);
+        assert_eq!(response.versions_total_count, 1);
+        assert_eq!(response.delete_markers_total_count, 0);
+        assert_eq!(response.objects_total_size, 15);
+        assert_eq!(
+            response.buckets_usage.get("bucket-a").map(|usage| (
+                usage.objects_count,
+                usage.versions_count,
+                usage.delete_markers_count,
+                usage.size
+            )),
+            Some((1, 1, 0, 15))
         );
     }
 
