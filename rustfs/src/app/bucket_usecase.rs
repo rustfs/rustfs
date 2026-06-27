@@ -870,7 +870,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        // 清除 bucket 验证缓存
+        // Invalidate bucket validation cache
         crate::storage::invalidate_bucket_validation_cache(&input.bucket);
 
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);

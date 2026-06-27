@@ -746,10 +746,9 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
     false
 }
 
-/// Bucket 验证缓存：避免每次 GET 都执行 stat_volume()
+/// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
 ///
-/// 使用 moka 缓存 bucket 验证结果，TTL 5 秒。
-/// 写操作（delete/make bucket）会清除对应缓存。
+/// Uses moka cache with 5s TTL. Write operations (delete/make bucket) invalidate the cache.
 static BUCKET_VALIDATED_CACHE: OnceLock<moka::sync::Cache<String, ()>> = OnceLock::new();
 const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
 
@@ -762,37 +761,37 @@ fn bucket_cache() -> &'static moka::sync::Cache<String, ()> {
     })
 }
 
-/// 清除指定 bucket 的验证缓存
+/// Invalidate the validation cache for a specific bucket.
 pub fn invalidate_bucket_validation_cache(bucket: &str) {
     bucket_cache().invalidate(bucket);
 }
 
-/// 清除所有 bucket 验证缓存
+/// Invalidate all bucket validation cache entries.
 pub fn invalidate_all_bucket_validation_cache() {
     bucket_cache().invalidate_all();
 }
 
-/// Helper function to get store and validate bucket exists
+/// Helper function to get store and validate bucket exists.
 ///
-/// 使用 moka 缓存（5s TTL）避免每次 GET 都执行 stat_volume()。
-/// 缓存命中时直接返回 store，不调用 get_bucket_info()。
+/// Uses moka cache (5s TTL) to avoid repeated stat_volume() calls on every GET.
+/// Returns store directly on cache hit without calling get_bucket_info().
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    // 检查缓存
+    // Check cache
     if bucket_cache().get(bucket).is_some() {
-        return Ok(store); // 缓存命中，跳过验证
+        return Ok(store); // Cache hit, skip validation
     }
 
-    // 缓存未命中或过期，执行验证
+    // Cache miss or expired, perform validation
     store
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
         .map_err(ApiError::from)?;
 
-    // 更新缓存
+    // Update cache
     bucket_cache().insert(bucket.to_string(), ());
 
     Ok(store)
