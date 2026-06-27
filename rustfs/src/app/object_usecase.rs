@@ -6174,7 +6174,11 @@ mod tests {
         );
         assert_eq!(
             tune_reader_stream_buffer_size(512 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::Standard),
-            512 * 1024
+            LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(2 * MI_B, 10 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            2 * MI_B
         );
         assert_eq!(
             tune_reader_stream_buffer_size(128 * 1024, MI_B as i64, GetObjectStreamStrategy::Standard),
