@@ -546,7 +546,7 @@ fn collect_config_info_json() -> ConfigInfoJson {
     let workload_profile = {
         use super::workload_profiles::is_buffer_profile_enabled;
         if is_buffer_profile_enabled() {
-            let config = current_buffer_config();
+            let config = current_buffer_config().unwrap_or_default();
             let profile = config.workload_profile();
             let buffer_config = profile.config();
             Some(WorkloadProfileJson {
@@ -870,7 +870,7 @@ fn get_workload_profile_info() -> String {
         return "| Workload Profile | (disabled) |".to_string();
     }
 
-    let config = current_buffer_config();
+    let config = current_buffer_config().unwrap_or_default();
     let profile = config.workload_profile();
     let name = config.workload_name();
     let buffer_config = profile.config();

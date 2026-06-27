@@ -211,6 +211,12 @@ pub(crate) mod runtime {
     }
 }
 
+pub(crate) mod runtime_sources {
+    pub(crate) type ExpiryState = super::runtime::ExpiryState;
+    #[cfg(test)]
+    pub(crate) type TierConfigMgr = super::runtime::TierConfigMgr;
+}
+
 pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, ReqInfo, authorize_request, has_bypass_governance_header, req_info_mut, req_info_ref,
