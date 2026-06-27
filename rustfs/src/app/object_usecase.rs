@@ -325,9 +325,16 @@ impl GetObjectStreamStrategy {
 const LARGE_SEQUENTIAL_GET_THRESHOLD_BYTES: i64 = 1024 * 1024 * 1024;
 const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
+const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
+const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
+const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
 const GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE: &str = "env_override";
+const GET_READER_STREAM_POLL_PENDING: &str = "pending";
+const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
+const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
+const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
 
 fn get_reader_stream_buffer_size_override() -> Option<usize> {
     static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -339,12 +346,31 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
     })
 }
 
+fn is_get_output_handoff_attribution_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
 fn resolve_reader_stream_buffer_size(selected_size: usize, override_size: Option<usize>) -> (usize, &'static str) {
     if let Some(override_size) = override_size.filter(|value| *value > 0) {
         return (override_size, GET_READER_STREAM_BUFFER_SOURCE_ENV_OVERRIDE);
     }
 
     (selected_size.max(1), GET_READER_STREAM_BUFFER_SOURCE_SELECTED)
+}
+
+fn tune_reader_stream_buffer_size(
+    selected_size: usize,
+    response_content_length: i64,
+    stream_strategy: GetObjectStreamStrategy,
+) -> usize {
+    if stream_strategy == GetObjectStreamStrategy::Standard
+        && response_content_length >= LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES
+    {
+        return selected_size.max(LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES);
+    }
+
+    selected_size
 }
 
 async fn enqueue_transitioned_delete_cleanup(
@@ -414,6 +440,8 @@ pin_project! {
     struct GetObjectReaderStream<R> {
         #[pin]
         inner: ReaderStream<R>,
+        strategy: &'static str,
+        buffer_source: &'static str,
         remaining: usize,
         emitted: usize,
         expected: usize,
@@ -434,9 +462,14 @@ impl<R> GetObjectReaderStream<R>
 where
     R: AsyncRead,
 {
-    fn new(reader: R, capacity: usize, remaining: usize) -> Self {
+    fn new(reader: R, capacity: usize, remaining: usize, strategy: &'static str, buffer_source: &'static str) -> Self {
+        if is_get_output_handoff_attribution_enabled() {
+            rustfs_io_metrics::record_get_object_reader_stream_buffer_size(strategy, buffer_source, capacity);
+        }
         Self {
             inner: ReaderStream::with_capacity(reader, capacity),
+            strategy,
+            buffer_source,
             remaining,
             emitted: 0,
             expected: remaining,
@@ -470,7 +503,9 @@ where
             return Poll::Ready(None);
         }
 
-        match this.inner.as_mut().poll_next(cx) {
+        let remaining_before = *this.remaining;
+        let poll_start = std::time::Instant::now();
+        let result: Poll<Option<Self::Item>> = match this.inner.as_mut().poll_next(cx) {
             Poll::Ready(Some(Ok(mut bytes))) => {
                 if bytes.len() > *this.remaining {
                     bytes.truncate(*this.remaining);
@@ -500,11 +535,34 @@ where
                     error = %err,
                     "GetObject ReaderStream returned error"
                 );
-                Poll::Ready(Some(Err(Box::new(err))))
+                Poll::Ready(Some(Err(Box::new(err) as S3StdError)))
             }
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
+        };
+
+        let emitted_bytes = match &result {
+            Poll::Ready(Some(Ok(bytes))) => bytes.len(),
+            _ => 0,
+        };
+        let outcome = match &result {
+            Poll::Ready(Some(Ok(bytes))) if !bytes.is_empty() => GET_READER_STREAM_POLL_READY_DATA,
+            Poll::Ready(Some(Ok(_))) | Poll::Ready(None) => GET_READER_STREAM_POLL_READY_EMPTY,
+            Poll::Ready(Some(Err(_))) => GET_READER_STREAM_POLL_READY_ERROR,
+            Poll::Pending => GET_READER_STREAM_POLL_PENDING,
+        };
+        if is_get_output_handoff_attribution_enabled() {
+            rustfs_io_metrics::record_get_object_reader_stream_poll(
+                this.strategy,
+                this.buffer_source,
+                outcome,
+                remaining_before,
+                emitted_bytes,
+                poll_start.elapsed().as_secs_f64(),
+            );
         }
+
+        result
     }
 
     fn size_hint(&self) -> (usize, Option<usize>) {
@@ -1916,8 +1974,10 @@ impl DefaultObjectUsecase {
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let tuned_stream_buffer_size =
+            tune_reader_stream_buffer_size(stream_buffer_size, response_content_length, stream_strategy);
         let (stream_buffer_size, buffer_source) =
-            resolve_reader_stream_buffer_size(stream_buffer_size, get_reader_stream_buffer_size_override());
+            resolve_reader_stream_buffer_size(tuned_stream_buffer_size, get_reader_stream_buffer_size_override());
         let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         if get_stage_metrics_enabled {
             rustfs_io_metrics::record_get_object_stream_strategy(
@@ -1928,7 +1988,7 @@ impl DefaultObjectUsecase {
         }
         let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         let reader = GetObjectStreamingReader::new(reader, bucket, key, expected, get_object_disk_read_timeout());
-        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected);
+        let stream = GetObjectReaderStream::new(reader, stream_buffer_size, expected, stream_strategy.as_str(), buffer_source);
         let blob = StreamingBlob::new(stream);
         if let Some(handoff_start) = handoff_start {
             rustfs_io_metrics::record_get_object_response_handoff(
@@ -6107,6 +6167,26 @@ mod tests {
     }
 
     #[test]
+    fn tune_reader_stream_buffer_size_raises_large_standard_streams_only() {
+        assert_eq!(
+            tune_reader_stream_buffer_size(128 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(512 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::Standard),
+            512 * 1024
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(128 * 1024, MI_B as i64, GetObjectStreamStrategy::Standard),
+            128 * 1024
+        );
+        assert_eq!(
+            tune_reader_stream_buffer_size(128 * 1024, 10 * MI_B as i64, GetObjectStreamStrategy::LargeSequentialReadahead),
+            128 * 1024
+        );
+    }
+
+    #[test]
     fn resolve_reader_stream_buffer_size_keeps_selected_default() {
         let (buffer_size, source) = resolve_reader_stream_buffer_size(128 * 1024, None);
 
@@ -6273,7 +6353,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_object_reader_stream_tracks_remaining_length() {
-        let mut stream = GetObjectReaderStream::new(std::io::Cursor::new(b"hello".to_vec()), 2, 5);
+        let mut stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(b"hello".to_vec()),
+            2,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
 
         assert_eq!(stream.remaining_length().exact(), Some(5));
 
@@ -6289,7 +6375,13 @@ mod tests {
 
     #[tokio::test]
     async fn get_object_reader_stream_truncates_to_expected_length() {
-        let stream = GetObjectReaderStream::new(std::io::Cursor::new(b"hello!".to_vec()), 64, 5);
+        let stream = GetObjectReaderStream::new(
+            std::io::Cursor::new(b"hello!".to_vec()),
+            64,
+            5,
+            GetObjectStreamStrategy::Standard.as_str(),
+            GET_READER_STREAM_BUFFER_SOURCE_SELECTED,
+        );
 
         let chunks = stream
             .collect::<Vec<_>>()

@@ -26,6 +26,7 @@ ROUND_COOLDOWN_SECS=0
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+OUTPUT_HANDOFF_ATTRIBUTION=false
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -53,6 +54,7 @@ Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
   --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
+  --handoff-attribution          Enable output handoff attribution metrics
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -141,6 +143,7 @@ parse_args() {
       --mode) MODE="$2"; shift 2 ;;
       --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
+      --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -306,6 +309,7 @@ rustfs_volumes=${volumes}
 RUSTFS_GET_CODEC_STREAMING_ENABLE=${codec_enabled}
 RUSTFS_GET_CODEC_STREAMING_ENGINE=${codec_engine}
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
+RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
@@ -384,6 +388,7 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_ENABLE="$codec_enabled"
     export RUSTFS_GET_CODEC_STREAMING_ENGINE="$codec_engine"
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
+    export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
