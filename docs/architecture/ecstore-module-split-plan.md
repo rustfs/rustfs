@@ -137,7 +137,10 @@ Focused verification for the first code-bearing replication PR:
 ## Facade Shrink Plan
 
 The broad `rustfs_ecstore::api` facade remains a compatibility boundary, not a
-new architecture target. Shrinking it must be monotonic:
+new architecture target. The current facade groups and external consumers are
+recorded in
+[`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md).
+Shrinking it must be monotonic:
 
 1. Inventory every public facade group and consumer.
 2. Add compile-time coverage before removing or narrowing a facade item.
