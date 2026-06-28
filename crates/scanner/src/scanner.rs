@@ -1018,6 +1018,14 @@ impl Drop for ScannerScanModeGuard {
     }
 }
 
+fn stale_data_usage_update_reason(incoming: &DataUsageInfo, existing: &DataUsageInfo) -> Option<&'static str> {
+    match (incoming.last_update, existing.last_update) {
+        (Some(new_ts), Some(existing_ts)) if new_ts <= existing_ts => Some("older_or_equal_last_update"),
+        (None, Some(_)) => Some("missing_incoming_last_update"),
+        _ => None,
+    }
+}
+
 /// Store data usage info in backend. Will store all objects sent on the receiver until closed.
 #[instrument(skip(ctx, storeapi))]
 pub async fn store_data_usage_in_backend(
@@ -1035,8 +1043,7 @@ pub async fn store_data_usage_in_backend(
 
         if let Ok(buf) = read_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str()).await
             && let Ok(existing) = serde_json::from_slice::<DataUsageInfo>(&buf)
-            && let (Some(new_ts), Some(existing_ts)) = (data_usage_info.last_update, existing.last_update)
-            && new_ts <= existing_ts
+            && let Some(reason) = stale_data_usage_update_reason(&data_usage_info, &existing)
         {
             debug!(
                 target: "rustfs::scanner",
@@ -1044,8 +1051,9 @@ pub async fn store_data_usage_in_backend(
                 component = LOG_COMPONENT_SCANNER,
                 subsystem = LOG_SUBSYSTEM_RUNTIME,
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
-                incoming_last_update = ?new_ts,
-                existing_last_update = ?existing_ts,
+                incoming_last_update = ?data_usage_info.last_update,
+                existing_last_update = ?existing.last_update,
+                reason = reason,
                 state = "skip_stale_update",
                 "Scanner stale data usage update skipped"
             );
@@ -1456,6 +1464,45 @@ mod tests {
 
         sender.send(newer).await.expect("newer usage snapshot should enqueue");
         sender.send(older).await.expect("older usage snapshot should enqueue");
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        let saved = objects
+            .get(&memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str()))
+            .expect("data usage config should be saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+
+        assert_eq!(saved.buckets_count, 2);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_rejects_untimestamped_stale_snapshot() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(2);
+        let ctx = CancellationToken::new();
+
+        let timestamped = DataUsageInfo {
+            last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)),
+            buckets_count: 2,
+            ..Default::default()
+        };
+        let untimestamped = DataUsageInfo {
+            last_update: None,
+            buckets_count: 1,
+            ..Default::default()
+        };
+
+        sender
+            .send(timestamped)
+            .await
+            .expect("timestamped usage snapshot should enqueue");
+        sender
+            .send(untimestamped)
+            .await
+            .expect("untimestamped usage snapshot should enqueue");
         drop(sender);
 
         store_data_usage_in_backend(ctx, store.clone(), receiver).await;
