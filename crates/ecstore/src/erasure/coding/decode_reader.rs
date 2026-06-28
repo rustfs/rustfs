@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT";
@@ -37,11 +38,20 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 1;
 const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
 const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
 
-type FillTask<S, W> = JoinHandle<FillResult<S, W>>;
+type FillTask = oneshot::Receiver<FillResult>;
 
-struct FillResult<S, W> {
-    source: S,
-    workspace: W,
+struct FillWorker {
+    tx: mpsc::Sender<FillRequest>,
+    task: JoinHandle<()>,
+}
+
+struct FillRequest {
+    remaining: usize,
+    reusable_buffers: Vec<Vec<u8>>,
+    response: oneshot::Sender<FillResult>,
+}
+
+struct FillResult {
     result: io::Result<Option<Vec<u8>>>,
     queued_buffers: VecDeque<Vec<u8>>,
     reusable_buffers: Vec<Vec<u8>>,
@@ -92,8 +102,9 @@ where
     stage_metrics_enabled: bool,
     fill_policy: FillPolicy,
     source: Option<S>,
-    engine: E,
+    engine: Option<E>,
     workspace: Option<E::Workspace>,
+    worker: Option<FillWorker>,
     output_buf: Vec<u8>,
     output_pos: usize,
     reusable_output_bufs: Vec<Vec<u8>>,
@@ -103,7 +114,7 @@ where
     output_wait_started_at: Option<Instant>,
     remaining: usize,
     // Bounded lookahead controlled by `FillPolicy`.
-    fill: Option<FillTask<S, E::Workspace>>,
+    fill: Option<FillTask>,
 }
 
 impl<S, E> ErasureDecodeReader<S, E>
@@ -146,8 +157,9 @@ where
             stage_metrics_enabled: rustfs_io_metrics::get_stage_metrics_enabled(),
             fill_policy,
             source: Some(source),
-            engine,
+            engine: Some(engine),
             workspace: Some(workspace),
+            worker: None,
             output_buf: Vec::new(),
             output_pos: 0,
             reusable_output_bufs: Vec::new(),
@@ -188,6 +200,41 @@ where
         }
     }
 
+    fn fill_worker_tx(&mut self) -> io::Result<mpsc::Sender<FillRequest>> {
+        if self.worker.is_none() {
+            let Some(source) = self.source.take() else {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader source missing"));
+            };
+            let Some(engine) = self.engine.take() else {
+                self.source = Some(source);
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader engine missing"));
+            };
+            let Some(workspace) = self.workspace.take() else {
+                self.source = Some(source);
+                self.engine = Some(engine);
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader workspace missing"));
+            };
+
+            let (tx, rx) = mpsc::channel(1);
+            rustfs_io_metrics::record_get_object_fill_worker_started(self.metrics_path, self.fill_policy.as_str());
+            let task = tokio::spawn(run_fill_worker(
+                source,
+                engine,
+                workspace,
+                self.fill_policy,
+                self.metrics_path,
+                self.stage_metrics_enabled,
+                rx,
+            ));
+            self.worker = Some(FillWorker { tx, task });
+        }
+
+        self.worker
+            .as_ref()
+            .map(|worker| worker.tx.clone())
+            .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "erasure reader fill worker missing"))
+    }
+
     #[cfg(test)]
     fn new_with_fill_policy(
         source: S,
@@ -201,101 +248,31 @@ where
 
     fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
         if self.fill.is_none() {
-            let Some(mut source) = self.source.take() else {
-                return Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader source missing")));
+            let fill_worker_tx = match self.fill_worker_tx() {
+                Ok(tx) => tx,
+                Err(err) => return Poll::Ready(Err(err)),
             };
-            let Some(mut workspace) = self.workspace.take() else {
-                self.source = Some(source);
-                return Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader workspace missing")));
-            };
-
-            let engine = self.engine.clone();
             let metrics_path = self.metrics_path;
-            let stage_metrics_enabled = self.stage_metrics_enabled;
             let fill_policy = self.fill_policy;
             let remaining = self.remaining;
-            let mut reusable_buffers = std::mem::take(&mut self.reusable_output_bufs);
+            let reusable_buffers = std::mem::take(&mut self.reusable_output_bufs);
+            let (response, fill) = oneshot::channel();
+            let request = FillRequest {
+                remaining,
+                reusable_buffers,
+                response,
+            };
+
+            if let Err(err) = fill_worker_tx.try_send(request) {
+                self.extend_reusable_output_bufs(err.into_inner().reusable_buffers);
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "erasure reader fill worker request queue is closed or full",
+                )));
+            }
+
             rustfs_io_metrics::record_get_object_fill_started(metrics_path, fill_policy.as_str());
-            self.fill = Some(tokio::spawn(async move {
-                let mut queued_buffers = VecDeque::new();
-                let mut deferred_error = None;
-                let fill_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                let state = source.read_next_stripe().await;
-                record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
-                let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                let mut output_buf = reusable_buffers.pop().unwrap_or_default();
-                let result = match decode_stripe_into(
-                    metrics_path,
-                    stage_metrics_enabled,
-                    &engine,
-                    &mut workspace,
-                    state,
-                    remaining,
-                    &mut output_buf,
-                ) {
-                    Ok(true) => Ok(Some(output_buf)),
-                    Ok(false) => {
-                        reusable_buffers.push(output_buf);
-                        Ok(None)
-                    }
-                    Err(err) => {
-                        reusable_buffers.push(output_buf);
-                        Err(err)
-                    }
-                };
-                record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
-                if let Ok(Some(first_buf)) = result.as_ref() {
-                    let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
-                    for _ in 0..fill_policy.additional_queued_buffers() {
-                        if remaining_after_first == 0 {
-                            break;
-                        }
-                        let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                        let state = source.read_next_stripe().await;
-                        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
-                        let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-                        let mut queued_buf = reusable_buffers.pop().unwrap_or_default();
-                        let queued_result = decode_stripe_into(
-                            metrics_path,
-                            stage_metrics_enabled,
-                            &engine,
-                            &mut workspace,
-                            state,
-                            remaining_after_first,
-                            &mut queued_buf,
-                        );
-                        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
-                        match queued_result {
-                            Ok(true) => {
-                                remaining_after_first = remaining_after_first.saturating_sub(queued_buf.len());
-                                queued_buffers.push_back(queued_buf);
-                            }
-                            Ok(false) => {
-                                reusable_buffers.push(queued_buf);
-                                if remaining_after_first > 0 {
-                                    deferred_error = Some(DiskError::LessData.into());
-                                }
-                                break;
-                            }
-                            Err(err) => {
-                                reusable_buffers.push(queued_buf);
-                                deferred_error = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                }
-                record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_FILL, fill_stage_start);
-                FillResult {
-                    source,
-                    workspace,
-                    result,
-                    queued_buffers,
-                    reusable_buffers,
-                    deferred_error,
-                }
-            }));
+            self.fill = Some(fill);
         }
 
         let fill = self
@@ -304,8 +281,6 @@ where
             .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "erasure reader fill future missing"))?;
         let fill_result = ready!(Pin::new(fill).poll(cx));
         let FillResult {
-            source,
-            workspace,
             result,
             queued_buffers,
             reusable_buffers,
@@ -314,12 +289,10 @@ where
             Ok(result) => result,
             Err(err) => {
                 self.fill = None;
-                return Poll::Ready(Err(io::Error::other(format!("erasure reader fill task failed: {err}"))));
+                return Poll::Ready(Err(io::Error::other(format!("erasure reader fill worker stopped: {err}"))));
             }
         };
 
-        self.source = Some(source);
-        self.workspace = Some(workspace);
         self.fill = None;
         self.extend_reusable_output_bufs(reusable_buffers);
         if let Some(deferred_error) = deferred_error {
@@ -436,14 +409,131 @@ where
     }
 }
 
+async fn run_fill_worker<S, E>(
+    mut source: S,
+    engine: E,
+    mut workspace: E::Workspace,
+    fill_policy: FillPolicy,
+    metrics_path: &'static str,
+    stage_metrics_enabled: bool,
+    mut rx: mpsc::Receiver<FillRequest>,
+) where
+    S: ShardStripeSource + Send + 'static,
+    E: ErasureDecodeEngine + Send + Sync + 'static,
+{
+    while let Some(request) = rx.recv().await {
+        let response = request.response;
+        let result = run_fill_request(
+            &mut source,
+            &engine,
+            &mut workspace,
+            fill_policy,
+            metrics_path,
+            stage_metrics_enabled,
+            request.remaining,
+            request.reusable_buffers,
+        )
+        .await;
+        let _ = response.send(result);
+    }
+}
+
+async fn run_fill_request<S, E>(
+    source: &mut S,
+    engine: &E,
+    workspace: &mut E::Workspace,
+    fill_policy: FillPolicy,
+    metrics_path: &'static str,
+    stage_metrics_enabled: bool,
+    remaining: usize,
+    mut reusable_buffers: Vec<Vec<u8>>,
+) -> FillResult
+where
+    S: ShardStripeSource + Send,
+    E: ErasureDecodeEngine,
+{
+    let mut queued_buffers = VecDeque::new();
+    let mut deferred_error = None;
+    let fill_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let state = source.read_next_stripe().await;
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+    let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let mut output_buf = reusable_buffers.pop().unwrap_or_default();
+    let result =
+        match decode_stripe_into(metrics_path, stage_metrics_enabled, engine, workspace, state, remaining, &mut output_buf) {
+            Ok(true) => Ok(Some(output_buf)),
+            Ok(false) => {
+                reusable_buffers.push(output_buf);
+                Ok(None)
+            }
+            Err(err) => {
+                reusable_buffers.push(output_buf);
+                Err(err)
+            }
+        };
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
+    if let Ok(Some(first_buf)) = result.as_ref() {
+        let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
+        for _ in 0..fill_policy.additional_queued_buffers() {
+            if remaining_after_first == 0 {
+                break;
+            }
+            let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let state = source.read_next_stripe().await;
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+            let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let mut queued_buf = reusable_buffers.pop().unwrap_or_default();
+            let queued_result = decode_stripe_into(
+                metrics_path,
+                stage_metrics_enabled,
+                engine,
+                workspace,
+                state,
+                remaining_after_first,
+                &mut queued_buf,
+            );
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
+            match queued_result {
+                Ok(true) => {
+                    remaining_after_first = remaining_after_first.saturating_sub(queued_buf.len());
+                    queued_buffers.push_back(queued_buf);
+                }
+                Ok(false) => {
+                    reusable_buffers.push(queued_buf);
+                    if remaining_after_first > 0 {
+                        deferred_error = Some(DiskError::LessData.into());
+                    }
+                    break;
+                }
+                Err(err) => {
+                    reusable_buffers.push(queued_buf);
+                    deferred_error = Some(err);
+                    break;
+                }
+            }
+        }
+    }
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_FILL, fill_stage_start);
+
+    FillResult {
+        result,
+        queued_buffers,
+        reusable_buffers,
+        deferred_error,
+    }
+}
+
 impl<S, E> Drop for ErasureDecodeReader<S, E>
 where
     E: ErasureDecodeEngine,
 {
     fn drop(&mut self) {
-        if let Some(fill) = self.fill.take() {
+        if self.fill.take().is_some() {
             rustfs_io_metrics::record_get_object_fill_cancelled_on_drop(self.metrics_path, self.fill_policy.as_str());
-            fill.abort();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.task.abort();
         }
     }
 }
@@ -1306,5 +1396,41 @@ mod tests {
                 .any(|buf| buf.capacity() >= erasure.block_size),
             "drained stripe output buffers should be available for reuse"
         );
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_reuses_single_fill_worker_across_fills() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..128u16)
+            .map(|value| value.wrapping_mul(7).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let source = source_from_data(&erasure, &data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+        let mut first_read = [0u8; 1];
+
+        let read = reader.read(&mut first_read).await.expect("first read should succeed");
+        decoded.extend_from_slice(&first_read[..read]);
+
+        assert!(reader.worker.is_some());
+        assert!(reader.source.is_none());
+        assert!(reader.engine.is_none());
+        assert!(reader.workspace.is_none());
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("reader should continue using the fill worker");
+
+        assert_eq!(decoded, data);
+        assert!(reader.worker.is_some());
     }
 }
