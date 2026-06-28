@@ -333,6 +333,8 @@ mimalloc = "0.1"
 tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
 # Used to control and obtain statistics for jemalloc at runtime
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profiling"] }
+# Snapshot testing for output format regression detection
+insta = { version = "1.41", features = ["yaml", "json"] }
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams
