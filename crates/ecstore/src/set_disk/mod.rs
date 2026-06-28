@@ -355,6 +355,9 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: u32 = 100;
 const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 
+const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
+
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
@@ -472,13 +475,43 @@ fn is_get_codec_streaming_enabled() -> bool {
 /// When enabled, multipart objects use per-part codec streaming
 /// instead of falling back to the legacy duplex path.
 fn is_codec_streaming_multipart_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
             DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+            )
+        })
+    }
+}
+
+fn get_codec_streaming_multipart_max_parts() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+            )
+        })
+    }
 }
 
 /// Check if metadata early-stop is enabled (base flag).
@@ -506,10 +539,17 @@ fn is_version_early_stop_enabled() -> bool {
 // --- Rollout Percentage Functions ---
 
 fn get_codec_streaming_rollout_pct() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<u32> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
+        })
+    }
 }
 
 fn get_metadata_early_stop_rollout_pct() -> u32 {
@@ -545,7 +585,6 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
 
     (hash as u32) < rollout_pct
 }
-
 /// Should this specific request use codec streaming?
 pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
     let base = is_get_codec_streaming_enabled();
@@ -633,6 +672,7 @@ impl GetCodecStreamingRollout {
 enum GetCodecStreamingFallbackReason {
     Disabled,
     RolloutNotOptedIn,
+    RolloutPctNotSelected,
     BodyCompatibilityUnconfirmed,
     HeaderCompatibilityUnconfirmed,
     LockOptimizationDisabled,
@@ -644,6 +684,7 @@ enum GetCodecStreamingFallbackReason {
     Multipart,
     InvalidMinSize,
     ReadQuorumNotSafe,
+    MultipartPartLimit,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -651,6 +692,7 @@ impl GetCodecStreamingFallbackReason {
         match self {
             Self::Disabled => "disabled",
             Self::RolloutNotOptedIn => "rollout_not_opted_in",
+            Self::RolloutPctNotSelected => "rollout_pct_not_selected",
             Self::BodyCompatibilityUnconfirmed => "body_compatibility_unconfirmed",
             Self::HeaderCompatibilityUnconfirmed => "header_compatibility_unconfirmed",
             Self::LockOptimizationDisabled => "lock_optimization_disabled",
@@ -662,6 +704,7 @@ impl GetCodecStreamingFallbackReason {
             Self::Multipart => "multipart",
             Self::InvalidMinSize => "invalid_min_size",
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
+            Self::MultipartPartLimit => "multipart_part_limit",
         }
     }
 }
@@ -732,6 +775,8 @@ fn classify_get_codec_streaming_object_class(
 }
 
 fn get_codec_streaming_reader_gate(
+    bucket: &str,
+    object: &str,
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
@@ -749,6 +794,12 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
+        };
+    }
+    if !should_use_codec_streaming(bucket, object) {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
         };
     }
     if !is_get_codec_streaming_body_compat_confirmed() {
@@ -807,10 +858,18 @@ fn get_codec_streaming_reader_gate(
         };
     }
     if object_class == GetCodecStreamingObjectClass::Multipart {
-        return GetCodecStreamingGate {
-            object_class,
-            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
-        };
+        if !is_codec_streaming_multipart_enabled() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+            };
+        }
+        if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
+            };
+        }
     }
 
     GetCodecStreamingGate {
@@ -1557,7 +1616,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        let codec_streaming_gate = get_codec_streaming_reader_gate(&range, &object_info, &fi, lock_optimization_enabled);
+        let codec_streaming_gate =
+            get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
 
         if object_info.is_remote() {
             if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {

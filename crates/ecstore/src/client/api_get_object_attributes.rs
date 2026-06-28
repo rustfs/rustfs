@@ -133,11 +133,23 @@ struct ObjectAttributePart {
 
 impl ObjectAttributes {
     pub async fn parse_response(&mut self, h: &HeaderMap, body_vec: Vec<u8>) -> Result<(), std::io::Error> {
-        let mod_time = OffsetDateTime::parse(h.get("Last-Modified").unwrap().to_str().unwrap(), ISO8601_DATEFORMAT).unwrap(); //RFC7231Time
+        let last_modified = h.get("Last-Modified")
+            .ok_or_else(|| std::io::Error::other("missing Last-Modified header"))?
+            .to_str()
+            .map_err(|e| std::io::Error::other(format!("invalid Last-Modified header: {e}")))?;
+        let mod_time = OffsetDateTime::parse(last_modified, ISO8601_DATEFORMAT)
+            .map_err(|e| std::io::Error::other(format!("invalid Last-Modified date: {e}")))?;
         self.last_modified = mod_time;
-        self.version_id = h.get(X_AMZ_VERSION_ID).unwrap().to_str().unwrap().to_string();
 
-        let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&String::from_utf8(body_vec).unwrap()) {
+        let version_id = h.get(X_AMZ_VERSION_ID)
+            .ok_or_else(|| std::io::Error::other("missing version ID header"))?
+            .to_str()
+            .map_err(|e| std::io::Error::other(format!("invalid version ID header: {e}")))?;
+        self.version_id = version_id.to_string();
+
+        let body_str = String::from_utf8(body_vec)
+            .map_err(|e| std::io::Error::other(format!("invalid UTF-8 body: {e}")))?;
+        let mut response = match quick_xml::de::from_str::<ObjectAttributesResponse>(&body_str) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));
@@ -163,21 +175,21 @@ impl TransitionClient {
         }
 
         let mut headers = HeaderMap::new();
-        headers.insert(X_AMZ_OBJECT_ATTRIBUTES, HeaderValue::from_str(GET_OBJECT_ATTRIBUTES_TAGS).unwrap());
+        headers.insert(X_AMZ_OBJECT_ATTRIBUTES, HeaderValue::from_str(GET_OBJECT_ATTRIBUTES_TAGS).expect("valid header value"));
 
         if opts.part_number_marker > 0 {
             headers.insert(
                 X_AMZ_PART_NUMBER_MARKER,
-                HeaderValue::from_str(&opts.part_number_marker.to_string()).unwrap(),
+                HeaderValue::from_str(&opts.part_number_marker.to_string()).expect("valid header value"),
             );
         }
 
         if opts.max_parts > 0 {
-            headers.insert(X_AMZ_MAX_PARTS, HeaderValue::from_str(&opts.max_parts.to_string()).unwrap());
+            headers.insert(X_AMZ_MAX_PARTS, HeaderValue::from_str(&opts.max_parts.to_string()).expect("valid header value"));
         } else {
             headers.insert(
                 X_AMZ_MAX_PARTS,
-                HeaderValue::from_str(&GET_OBJECT_ATTRIBUTES_MAX_PARTS.to_string()).unwrap(),
+                HeaderValue::from_str(&GET_OBJECT_ATTRIBUTES_MAX_PARTS.to_string()).expect("valid header value"),
             );
         }
 
@@ -210,7 +222,9 @@ impl TransitionClient {
 
         let resp_status = resp.status();
         let h = resp.headers().clone();
-        let has_etag = h.get("ETag").unwrap().to_str().unwrap();
+        let has_etag = h.get("ETag")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
         if !has_etag.is_empty() {
             return Err(std::io::Error::other(
                 "get_object_attributes is not supported by the current endpoint version",
@@ -227,7 +241,8 @@ impl TransitionClient {
         }
 
         if resp_status != http::StatusCode::OK {
-            let err_body = String::from_utf8(body_vec).unwrap();
+            let err_body = String::from_utf8(body_vec)
+                .map_err(|e| std::io::Error::other(format!("invalid UTF-8 error body: {e}")))?;
             let mut er = match quick_xml::de::from_str::<AccessControlPolicy>(&err_body) {
                 Ok(result) => result,
                 Err(err) => {
