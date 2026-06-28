@@ -1621,6 +1621,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // inline data is actually present and no range request is in flight.
         if object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() {
             let data_shards = fi.erasure.data_blocks;
+            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
 
             // Check if we have enough inline data shards
             let inline_count = files
@@ -1631,28 +1632,50 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
             if inline_count >= data_shards {
                 // All data shards are inline - decode in memory
-                let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+                let erasure = coding::Erasure::new_with_options(
+                    fi.erasure.data_blocks,
+                    fi.erasure.parity_blocks,
+                    fi.erasure.block_size,
+                    fi.uses_legacy_checksum,
+                );
+                let object_size = usize::try_from(fi.size)
+                    .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
 
-                // Build bitrot readers from inline data
                 let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
-                let checksum_algo = checksum_info.algorithm;
+                let checksum_algo =
+                    if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                    } else {
+                        checksum_info.algorithm
+                    };
+                let read_length = erasure.shard_file_offset(0, object_size, object_size);
                 let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> =
                     Vec::new();
                 for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
                     if let Some(data) = &file.data {
-                        let cursor: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin> = Box::new(Cursor::new(data.to_vec()));
-                        let reader = coding::BitrotReader::new(cursor, fi.erasure.block_size, checksum_algo.clone(), false);
-                        readers.push(Some(reader));
+                        readers.push(
+                            create_bitrot_reader(
+                                Some(data),
+                                None,
+                                bucket,
+                                object,
+                                0,
+                                read_length,
+                                erasure.shard_size(),
+                                checksum_algo.clone(),
+                                opts.skip_verify_bitrot,
+                                false,
+                            )
+                            .await?,
+                        );
                     } else {
                         readers.push(None);
                     }
                 }
 
                 // Decode directly
-                let mut output = Cursor::new(Vec::with_capacity(fi.size as usize));
-                let (written, err) = erasure
-                    .decode(&mut output, readers, 0, fi.size as usize, fi.size as usize)
-                    .await;
+                let mut output = Cursor::new(Vec::with_capacity(object_size));
+                let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
 
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));
