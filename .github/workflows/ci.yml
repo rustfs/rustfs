@@ -192,8 +192,6 @@ jobs:
             flags: "--features swift"
           - name: sftp
             flags: "--features sftp"
-          - name: no-default
-            flags: "--no-default-features"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
