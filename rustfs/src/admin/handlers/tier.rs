@@ -220,31 +220,31 @@ impl Operation for AddTier {
 
         match args.tier_type {
             TierType::S3 => {
-                args.name = args.s3.clone().unwrap().name;
+                args.name = args.s3.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?.name;
             }
             TierType::RustFS => {
-                args.name = args.rustfs.clone().unwrap().name;
+                args.name = args.rustfs.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?.name;
             }
             TierType::MinIO => {
-                args.name = args.minio.clone().unwrap().name;
+                args.name = args.minio.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?.name;
             }
             TierType::Aliyun => {
-                args.name = args.aliyun.clone().unwrap().name;
+                args.name = args.aliyun.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?.name;
             }
             TierType::Tencent => {
-                args.name = args.tencent.clone().unwrap().name;
+                args.name = args.tencent.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?.name;
             }
             TierType::Huaweicloud => {
-                args.name = args.huaweicloud.clone().unwrap().name;
+                args.name = args.huaweicloud.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?.name;
             }
             TierType::Azure => {
-                args.name = args.azure.clone().unwrap().name;
+                args.name = args.azure.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?.name;
             }
             TierType::GCS => {
-                args.name = args.gcs.clone().unwrap().name;
+                args.name = args.gcs.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?.name;
             }
             TierType::R2 => {
-                args.name = args.r2.clone().unwrap().name;
+                args.name = args.r2.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?.name;
             }
             _ => (),
         }
@@ -370,8 +370,8 @@ impl Operation for AddTier {
         spawn_transition_tier_config_propagation("add");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -502,8 +502,8 @@ impl Operation for EditTier {
         spawn_transition_tier_config_propagation("edit");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -553,7 +553,7 @@ impl Operation for ListTiers {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tiers err {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -673,8 +673,8 @@ impl Operation for RemoveTier {
         spawn_transition_tier_config_propagation("remove");
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -707,8 +707,8 @@ impl Operation for VerifyTier {
         tier_config_mgr.verify(&tier).await.map_err(map_tier_verify_error)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -755,7 +755,7 @@ impl Operation for GetTierInfo {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("marshal tier err {e}")))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -923,8 +923,8 @@ impl Operation for ClearTier {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
