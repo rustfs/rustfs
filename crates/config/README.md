@@ -76,6 +76,11 @@ Current guidance:
 - `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` (canonical)
 - `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` (canonical)
 
+## Mmap read environment aliases
+
+- `RUSTFS_OBJECT_MMAP_READ_ENABLE` (canonical)
+- `RUSTFS_OBJECT_ZERO_COPY_ENABLE` (deprecated alias for compatibility)
+
 ## Health compatibility switches
 
 - `RUSTFS_HEALTH_ENDPOINT_ENABLE`
