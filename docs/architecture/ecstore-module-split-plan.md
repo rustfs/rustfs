@@ -130,6 +130,9 @@ First safe PR:
   each dependency;
 - keep global pool/stat initialization and queue behavior unchanged.
 
+The module-level inventory lives in
+`crates/ecstore/src/bucket/replication/README.md`.
+
 Focused verification for the first code-bearing replication PR:
 
 - `cargo test -p rustfs-ecstore replication --lib`
