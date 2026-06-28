@@ -110,6 +110,14 @@ pub(crate) mod data_usage {
     ) -> Result<(), crate::storage::storage_api::StorageError> {
         crate::storage::storage_api::ecstore_data_usage::remove_bucket_usage_from_backend(store, bucket).await
     }
+
+    pub(crate) async fn record_compression_total_memory(original_size: u64, compressed_size: u64) {
+        crate::storage::ecstore_data_usage::record_compression_total_memory(original_size, compressed_size).await;
+    }
+
+    pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<crate::storage::storage_api::ECStore>) {
+        crate::storage::ecstore_data_usage::init_compression_total_memory_from_backend(store).await
+    }
 }
 
 pub(crate) mod runtime {

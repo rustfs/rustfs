@@ -51,6 +51,7 @@ pub enum MetricSubsystem {
     Replication,
     Notification,
     Scanner,
+    Compression,
 
     // Custom paths
     Custom(String),
@@ -93,6 +94,7 @@ impl MetricSubsystem {
             Self::Replication => "/replication",
             Self::Notification => "/notification",
             Self::Scanner => "/scanner",
+            Self::Compression => "/compression",
 
             // Custom paths
             Self::Custom(path) => path,
@@ -141,6 +143,7 @@ impl MetricSubsystem {
             "/replication" => Self::Replication,
             "/notification" => Self::Notification,
             "/scanner" => Self::Scanner,
+            "/compression" => Self::Compression,
 
             // Treat other paths as custom subsystems
             _ => Self::Custom(path.to_string()),
@@ -203,6 +206,7 @@ pub mod subsystems {
     pub const REPLICATION: MetricSubsystem = MetricSubsystem::Replication;
     pub const NOTIFICATION: MetricSubsystem = MetricSubsystem::Notification;
     pub const SCANNER: MetricSubsystem = MetricSubsystem::Scanner;
+    pub const COMPRESSION: MetricSubsystem = MetricSubsystem::Compression;
 }
 
 #[cfg(test)]

@@ -125,6 +125,17 @@ pub(crate) async fn run_startup_shutdown_sequence(
         );
     }
 
+    // Persist in-memory compression totals to backend before subsystems shut down.
+    info!(
+        target: "rustfs::main::handle_shutdown",
+        event = "compression_total_persist",
+        component = LOG_COMPONENT_MAIN,
+        subsystem = LOG_SUBSYSTEM_STARTUP,
+        state = "persisting",
+        "Compression total persist started"
+    );
+    crate::storage::ecstore_data_usage::store_compression_total_in_backend().await;
+
     let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
 
     info!(

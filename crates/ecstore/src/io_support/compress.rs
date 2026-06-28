@@ -167,6 +167,10 @@ pub fn is_disk_compressible(headers: &http::HeaderMap, object_name: &str) -> boo
     is_disk_compressible_with_config(headers, object_name, DISK_COMPRESSION_CONFIG.get_or_init(parse_disk_compression_config))
 }
 
+pub fn is_disk_compression_enabled() -> bool {
+    DISK_COMPRESSION_CONFIG.get_or_init(parse_disk_compression_config).enabled
+}
+
 fn is_disk_compressible_with_config(headers: &http::HeaderMap, object_name: &str, config: &DiskCompressionConfig) -> bool {
     // Check if disk compression is enabled (read once at first use, then fixed for process lifetime)
     if !config.enabled {

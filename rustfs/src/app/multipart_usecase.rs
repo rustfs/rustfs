@@ -31,7 +31,7 @@ use super::storage_api::multipart_usecase::contract::multipart::{CompletePart, M
 use super::storage_api::multipart_usecase::contract::object::{ObjectIO as _, ObjectOperations as _};
 use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
-    record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+    record_bucket_object_version_write_memory, record_bucket_object_write_memory, record_compression_total_memory,
 };
 use super::storage_api::multipart_usecase::error::{StorageError, is_err_object_not_found, is_err_version_not_found};
 use super::storage_api::multipart_usecase::helper::OperationHelper;
@@ -948,6 +948,10 @@ impl DefaultMultipartUsecase {
             .put_object_part(&bucket, &key, &upload_id, part_id, &mut reader, &opts)
             .await
             .map_err(ApiError::from)?;
+
+        if is_disk_compressed {
+            record_compression_total_memory(actual_size as u64, info.size as u64).await;
+        }
 
         let mut checksum_crc32 = input.checksum_crc32;
         let mut checksum_crc32c = input.checksum_crc32c;

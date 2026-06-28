@@ -55,7 +55,7 @@ use super::storage_api::object_usecase::contract::object::{ObjectIO as _, Object
 use super::storage_api::object_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::object_usecase::data_usage::{
     record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-    record_bucket_object_write_memory,
+    record_bucket_object_write_memory, record_compression_total_memory,
 };
 use super::storage_api::object_usecase::deadlock_detector;
 use super::storage_api::object_usecase::ecfs::FS;
@@ -3020,6 +3020,10 @@ impl DefaultObjectUsecase {
             }
         };
 
+        if should_compress {
+            record_compression_total_memory(actual_size as u64, obj_info.size.max(0) as u64).await;
+        }
+
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
 
         let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
@@ -4013,6 +4017,10 @@ impl DefaultObjectUsecase {
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
             .await
             .map_err(ApiError::from)?;
+
+        if should_compress {
+            record_compression_total_memory(actual_size as u64, oi.size.max(0) as u64).await;
+        }
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
 

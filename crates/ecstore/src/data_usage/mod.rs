@@ -29,13 +29,14 @@ use crate::{
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
-    BucketTargetUsageInfo, BucketUsageInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus, SizeSummary,
+    BucketTargetUsageInfo, BucketUsageInfo, CompressionTotalInfo, DataUsageCache, DataUsageEntry, DataUsageInfo, DiskUsageStatus,
+    SizeSummary,
 };
 use rustfs_io_metrics::record_system_path_failure;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, HashSet, hash_map::Entry},
-    sync::{Arc, OnceLock},
+    sync::{Arc, LazyLock, OnceLock},
     time::{Duration, SystemTime},
 };
 use tokio::fs;
@@ -45,6 +46,7 @@ use tracing::{debug, error, info, instrument};
 // Data usage storage constants
 pub const DATA_USAGE_ROOT: &str = SLASH_SEPARATOR;
 const DATA_USAGE_OBJ_NAME: &str = ".usage.json";
+const DATA_COMPRESSION_TOTAL_NAME: &str = ".compression.json";
 const DATA_USAGE_BLOOM_NAME: &str = ".bloomcycle.bin";
 pub const DATA_USAGE_CACHE_NAME: &str = ".usage-cache.bin";
 const DATA_USAGE_CACHE_TTL_SECS: u64 = 30;
@@ -65,6 +67,37 @@ type CacheUpdating = Arc<RwLock<bool>>;
 
 static USAGE_MEMORY_CACHE: OnceLock<UsageMemoryCache> = OnceLock::new();
 static USAGE_CACHE_UPDATING: OnceLock<CacheUpdating> = OnceLock::new();
+
+/// Deferred persist thresholds for compression totals: persist after this many
+/// operations recorded, but no more often than the min interval.
+const COMPRESSION_PERSIST_BATCH_SIZE: u64 = 100;
+const COMPRESSION_PERSIST_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// In-memory compression accumulator with debounced persistence state.
+#[derive(Debug, Clone)]
+struct CompressionTotalState {
+    info: CompressionTotalInfo,
+    /// Operations recorded since the last persist attempt.
+    ops_since_persist: u64,
+    /// When the last persist was attempted (used for min-interval gating).
+    last_persist: tokio::time::Instant,
+    /// When `true`, recording is skipped (embedded mode without observability).
+    inited: bool,
+}
+
+impl Default for CompressionTotalState {
+    fn default() -> Self {
+        Self {
+            info: CompressionTotalInfo::default(),
+            ops_since_persist: 0,
+            last_persist: tokio::time::Instant::now(),
+            inited: false,
+        }
+    }
+}
+
+static COMPRESSION_TOTAL_MEMORY_CACHE: LazyLock<Arc<RwLock<Option<CompressionTotalState>>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(Some(CompressionTotalState::default()))));
 
 fn memory_cache() -> &'static UsageMemoryCache {
     USAGE_MEMORY_CACHE.get_or_init(|| Arc::new(RwLock::new(HashMap::new())))
@@ -90,6 +123,11 @@ lazy_static::lazy_static! {
         crate::disk::BUCKET_META_PREFIX,
         SLASH_SEPARATOR,
         DATA_USAGE_BLOOM_NAME
+    );
+    pub static ref DATA_COMPRESSION_TOTAL_NAME_PATH: String = format!("{}{}{}",
+        crate::disk::BUCKET_META_PREFIX,
+        SLASH_SEPARATOR,
+        DATA_COMPRESSION_TOTAL_NAME
     );
 }
 
@@ -1004,6 +1042,134 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
     Ok(())
 }
 
+/// Persist the current in-memory compression total to the backend.
+/// Resets the debounce counter so the next auto-persist won't fire
+/// immediately after this manual flush (intended for shutdown paths).
+pub async fn store_compression_total_in_backend() {
+    let snapshot = {
+        let mut guard = COMPRESSION_TOTAL_MEMORY_CACHE.write().await;
+        let Some(state) = guard.as_mut() else {
+            return;
+        };
+        state.ops_since_persist = 0;
+        state.last_persist = tokio::time::Instant::now();
+        state.info.clone()
+    };
+    try_flush_compression_total(&snapshot).await;
+}
+
+/// Load compression total info from backend storage
+#[instrument(skip(store))]
+pub async fn load_compression_total_from_backend(store: Arc<ECStore>) -> Result<CompressionTotalInfo, Error> {
+    let buf: Vec<u8> = match read_config(store.clone(), &DATA_COMPRESSION_TOTAL_NAME_PATH).await {
+        Ok(data) => data,
+        Err(e) => {
+            if e == Error::ConfigNotFound {
+                return Ok(CompressionTotalInfo::default());
+            }
+            let reason = classify_system_path_failure_reason(&e);
+            record_system_path_failure("compression_total", "read_primary", reason);
+            error!(
+                path_kind = "compression_total",
+                operation = "read_primary",
+                reason,
+                object = %DATA_COMPRESSION_TOTAL_NAME_PATH.as_str(),
+                error = %e,
+                "system path read failed"
+            );
+            return Err(Error::other(e));
+        }
+    };
+    let compression_total: CompressionTotalInfo =
+        serde_json::from_slice(&buf).map_err(|e| Error::other(format!("Failed to deserialize compression total info: {e}")))?;
+
+    info!(
+        "Loaded compression total info: original={}, compressed={}, operations={}",
+        compression_total.original_bytes_total,
+        compression_total.compressed_bytes_total,
+        compression_total.compression_operations_total
+    );
+
+    Ok(compression_total)
+}
+
+pub async fn load_compression_total_from_memory() -> Option<CompressionTotalInfo> {
+    COMPRESSION_TOTAL_MEMORY_CACHE.read().await.as_ref().map(|s| s.info.clone())
+}
+
+/// Record a compression operation. Accumulates totals in memory and triggers a
+/// background persist to backend after every `COMPRESSION_PERSIST_BATCH_SIZE`
+/// operations, gated by a minimum interval to avoid excessive IO under high
+/// throughput.
+pub async fn record_compression_total_memory(original_size: u64, compressed_size: u64) {
+    let mut guard = COMPRESSION_TOTAL_MEMORY_CACHE.write().await;
+    let Some(state) = guard.as_mut() else {
+        error!("compression total memory cache not initialized, discarding record");
+        return;
+    };
+    // Compression totals are only recorded while this cache is initialized.
+    if !state.inited {
+        return;
+    }
+    state.info.original_bytes_total = state.info.original_bytes_total.saturating_add(original_size);
+    state.info.compressed_bytes_total = state.info.compressed_bytes_total.saturating_add(compressed_size);
+    state.info.compression_operations_total = state.info.compression_operations_total.saturating_add(1);
+    state.ops_since_persist = state.ops_since_persist.saturating_add(1);
+    if state.ops_since_persist >= COMPRESSION_PERSIST_BATCH_SIZE
+        || state.last_persist.elapsed() >= COMPRESSION_PERSIST_MIN_INTERVAL
+    {
+        state.ops_since_persist = 0;
+        state.last_persist = tokio::time::Instant::now();
+        // Fire-and-forget: hold no lock during IO
+        let info = state.info.clone();
+        drop(guard);
+        tokio::spawn(async move {
+            try_flush_compression_total(&info).await;
+        });
+    }
+}
+
+/// Persist the given `CompressionTotalInfo` snapshot to backend storage.
+/// Used by both the debounce path and the manual flush path.
+async fn try_flush_compression_total(info: &CompressionTotalInfo) {
+    let Some(store) = runtime_sources::object_store_handle() else {
+        error!("object store not initialized, skipping compression total persist");
+        return;
+    };
+    match serde_json::to_vec(info) {
+        Ok(data) => {
+            if let Err(e) = crate::config::com::save_config(store.clone(), &DATA_COMPRESSION_TOTAL_NAME_PATH, data).await {
+                error!("Failed to persist compression total to backend: {}", e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to serialize compression total info: {}", e);
+        }
+    }
+}
+
+/// Initialize the compression total memory cache from backend storage.
+/// Should be called at startup after the store is available if compression is enabled.
+/// Compression totals are only recorded while this cache is initialized, so this must
+/// be called before any compression operations are recorded.
+#[instrument(skip(store))]
+pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
+    let info = match load_compression_total_from_backend(store).await {
+        Ok(info) => info,
+        Err(e) => {
+            // If load fails (e.g. ConfigNotFound or corrupt backup), start from zero.
+            info!("Failed to init compression total from backend, starting from zero: {}", e);
+            CompressionTotalInfo::default()
+        }
+    };
+    *COMPRESSION_TOTAL_MEMORY_CACHE.write().await = Some(CompressionTotalState {
+        info,
+        ops_since_persist: 0,
+        last_persist: tokio::time::Instant::now(),
+        inited: true,
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1511,5 +1677,116 @@ mod tests {
                 .map(|usage| (usage.objects_count, usage.size)),
             Some((1000, 10_000))
         );
+    }
+
+    // --- CompressionTotalState tests ---
+
+    /// Reset the compression total cache to a known state for isolated tests.
+    async fn reset_compression_cache(state: CompressionTotalState) {
+        *COMPRESSION_TOTAL_MEMORY_CACHE.write().await = Some(state);
+    }
+
+    #[test]
+    fn compression_state_default_values() {
+        let state = CompressionTotalState::default();
+        assert!(!state.inited, "default state should not be inited");
+        assert_eq!(state.ops_since_persist, 0);
+        assert_eq!(state.info.original_bytes_total, 0);
+        assert_eq!(state.info.compressed_bytes_total, 0);
+        assert_eq!(state.info.compression_operations_total, 0);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn record_compression_skips_when_not_inited() {
+        let mut pre_state = CompressionTotalState::default();
+        // Set known values that should remain unchanged when inited=false
+        pre_state.info.original_bytes_total = 42;
+        pre_state.info.compressed_bytes_total = 21;
+        pre_state.info.compression_operations_total = 7;
+        pre_state.ops_since_persist = 5;
+        // inited is already false from default()
+
+        reset_compression_cache(pre_state.clone()).await;
+
+        // Call with sizes that would be accumulated if inited were true
+        record_compression_total_memory(100, 50).await;
+
+        let guard = COMPRESSION_TOTAL_MEMORY_CACHE.read().await;
+        let state = guard.as_ref().expect("cache should contain a state");
+        assert!(!state.inited);
+        assert_eq!(state.info.original_bytes_total, 42, "original should be unchanged");
+        assert_eq!(state.info.compressed_bytes_total, 21, "compressed should be unchanged");
+        assert_eq!(state.info.compression_operations_total, 7, "operations should be unchanged");
+        assert_eq!(state.ops_since_persist, 5, "ops_since_persist should be unchanged");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn record_compression_accumulates_totals() {
+        let state = CompressionTotalState {
+            info: CompressionTotalInfo::default(),
+            ops_since_persist: 0,
+            last_persist: tokio::time::Instant::now(),
+            inited: true,
+        };
+
+        reset_compression_cache(state).await;
+
+        for _ in 0..3 {
+            record_compression_total_memory(100, 50).await;
+        }
+
+        let guard = COMPRESSION_TOTAL_MEMORY_CACHE.read().await;
+        let state = guard.as_ref().expect("cache should contain a state");
+        assert!(state.inited);
+        assert_eq!(state.info.original_bytes_total, 300);
+        assert_eq!(state.info.compressed_bytes_total, 150);
+        assert_eq!(state.info.compression_operations_total, 3);
+        assert_eq!(state.ops_since_persist, 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn record_compression_triggers_persist_on_batch_full() {
+        // Simulate 99 previous records, so the next (100th) hits the batch threshold.
+        let state = CompressionTotalState {
+            info: CompressionTotalInfo {
+                original_bytes_total: 9900,
+                compressed_bytes_total: 4950,
+                compression_operations_total: 99,
+            },
+            ops_since_persist: 99,
+            last_persist: tokio::time::Instant::now(),
+            inited: true,
+        };
+
+        reset_compression_cache(state).await;
+
+        // 100th record — should trigger the debounce flush.
+        record_compression_total_memory(100, 50).await;
+
+        let guard = COMPRESSION_TOTAL_MEMORY_CACHE.read().await;
+        let state = guard.as_ref().expect("cache should contain a state");
+
+        // Totals are correctly accumulated (not reset by the flush).
+        assert_eq!(state.info.original_bytes_total, 10_000); // 9900 + 100
+        assert_eq!(state.info.compressed_bytes_total, 5_000); // 4950 + 50
+        assert_eq!(state.info.compression_operations_total, 100); // 99 + 1
+
+        // Debounce counter is reset after the persist trigger.
+        assert_eq!(state.ops_since_persist, 0);
+
+        // last_persist was refreshed; it should be very recent.
+        assert!(
+            state.last_persist.elapsed() < Duration::from_secs(3),
+            "last_persist should have been refreshed to now"
+        );
+
+        // try_flush_compression_total is spawned asynchronously here.
+        // In a unit test, runtime_sources::object_store_handle() returns None,
+        // so the spawned task will hit the "object store not initialized" error
+        // path and return gracefully. The state mutation (counter reset + totals
+        // accumulation) is the critical behaviour verified above.
     }
 }

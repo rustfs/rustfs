@@ -22,9 +22,9 @@
 
 use crate::metrics::collectors::{
     BucketReplicationBandwidthStats, BucketReplicationStats, BucketReplicationTargetStats, BucketStats, BucketUsageStats,
-    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CpuStats, DiskStats, DriveCountStats,
-    DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats, ProcessStats,
-    ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
+    ClusterConfigStats, ClusterHealthStats, ClusterStats, ClusterUsageStats, CompressionClusterStats, CpuStats, DiskStats,
+    DriveCountStats, DriveDetailedStats, ErasureSetStats, HostNetworkStats, IamStats, IlmStats, MemoryStats, NetworkStats,
+    ProcessStats, ProcessStatusType, ReplicationStats, ResourceStats, ScannerStats,
 };
 use crate::metrics::runtime_sources::{
     ObsIlmRuntimeSnapshot, bucket_monitor_handle, iam_metrics_snapshot, ilm_runtime_snapshot, replication_stats_handle,
@@ -37,6 +37,7 @@ use crate::metrics::{
 use chrono::Utc;
 use rustfs_common::heal_channel::HealScanMode;
 use rustfs_common::metrics::global_metrics;
+use rustfs_ecstore::api::data_usage::load_compression_total_from_memory;
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
 use rustfs_io_metrics::{ProcessStatusSnapshot, snapshot_process_resource_and_system};
 use std::{collections::HashMap, sync::Arc, time::Duration};
@@ -1100,6 +1101,28 @@ pub async fn collect_scanner_metric_stats() -> Option<ScannerStats> {
     })
 }
 
+/// Collect cluster-level compression statistics.
+pub async fn collect_compression_cluster_stats() -> Option<CompressionClusterStats> {
+    let compression_data_usage = load_compression_total_from_memory().await?;
+
+    let original_bytes_total = compression_data_usage.original_bytes_total;
+    let compressed_bytes_total = compression_data_usage.compressed_bytes_total;
+    let bytes_saved_total = original_bytes_total.saturating_sub(compressed_bytes_total);
+    let compression_ratio = if original_bytes_total > 0 {
+        compressed_bytes_total as f64 / original_bytes_total as f64
+    } else {
+        0.0
+    };
+    let compression_operations_total = compression_data_usage.compression_operations_total;
+
+    Some(CompressionClusterStats {
+        original_bytes_total,
+        compressed_bytes_total,
+        bytes_saved_total,
+        compression_ratio,
+        compression_operations_total,
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
