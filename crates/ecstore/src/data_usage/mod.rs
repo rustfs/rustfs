@@ -1045,12 +1045,16 @@ pub async fn save_data_usage_cache(cache: &DataUsageCache, name: &str) -> crate:
 /// Persist the current in-memory compression total to the backend.
 /// Resets the debounce counter so the next auto-persist won't fire
 /// immediately after this manual flush (intended for shutdown paths).
+/// Storage will not be triggered when uninitialized.
 pub async fn store_compression_total_in_backend() {
     let snapshot = {
         let mut guard = COMPRESSION_TOTAL_MEMORY_CACHE.write().await;
         let Some(state) = guard.as_mut() else {
             return;
         };
+        if !state.inited {
+            return;
+        }
         state.ops_since_persist = 0;
         state.last_persist = tokio::time::Instant::now();
         state.info.clone()

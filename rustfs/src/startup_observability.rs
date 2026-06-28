@@ -14,10 +14,10 @@
 
 use std::sync::Arc;
 
-use crate::app::storage_api::data_usage::init_compression_total_memory_from_backend;
 use crate::init::{init_auto_tuner, init_update_check, print_server_info};
 use crate::startup_runtime_sources;
 use crate::storage::storage_api::ECStore;
+use crate::storage::storage_api::ecstore_data_usage::init_compression_total_memory_from_backend;
 use tokio_util::sync::CancellationToken;
 
 pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: CancellationToken) {
