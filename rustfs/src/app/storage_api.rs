@@ -213,6 +213,8 @@ pub(crate) mod runtime {
 
 pub(crate) mod runtime_sources {
     pub(crate) type ExpiryState = super::runtime::ExpiryState;
+    #[cfg(test)]
+    pub(crate) type TierConfigMgr = super::runtime::TierConfigMgr;
 }
 
 pub(crate) mod access {

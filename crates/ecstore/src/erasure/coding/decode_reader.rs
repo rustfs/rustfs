@@ -423,35 +423,50 @@ async fn run_fill_worker<S, E>(
 {
     while let Some(request) = rx.recv().await {
         let response = request.response;
-        let result = run_fill_request(
-            &mut source,
-            &engine,
-            &mut workspace,
+        let result = run_fill_request(FillRequestWork {
+            source: &mut source,
+            engine: &engine,
+            workspace: &mut workspace,
             fill_policy,
             metrics_path,
             stage_metrics_enabled,
-            request.remaining,
-            request.reusable_buffers,
-        )
+            remaining: request.remaining,
+            reusable_buffers: request.reusable_buffers,
+        })
         .await;
         let _ = response.send(result);
     }
 }
 
-async fn run_fill_request<S, E>(
-    source: &mut S,
-    engine: &E,
-    workspace: &mut E::Workspace,
+struct FillRequestWork<'a, S, E>
+where
+    E: ErasureDecodeEngine,
+{
+    source: &'a mut S,
+    engine: &'a E,
+    workspace: &'a mut E::Workspace,
     fill_policy: FillPolicy,
     metrics_path: &'static str,
     stage_metrics_enabled: bool,
     remaining: usize,
-    mut reusable_buffers: Vec<Vec<u8>>,
-) -> FillResult
+    reusable_buffers: Vec<Vec<u8>>,
+}
+
+async fn run_fill_request<S, E>(work: FillRequestWork<'_, S, E>) -> FillResult
 where
     S: ShardStripeSource + Send,
     E: ErasureDecodeEngine,
 {
+    let FillRequestWork {
+        source,
+        engine,
+        workspace,
+        fill_policy,
+        metrics_path,
+        stage_metrics_enabled,
+        remaining,
+        mut reusable_buffers,
+    } = work;
     let mut queued_buffers = VecDeque::new();
     let mut deferred_error = None;
     let fill_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);

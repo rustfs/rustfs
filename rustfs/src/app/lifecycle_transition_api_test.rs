@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::storage_api::runtime::get_global_tier_config_mgr;
 use super::storage_api::test::bucket::{
     lifecycle,
     metadata::{BUCKET_LIFECYCLE_CONFIG, OBJECT_LOCK_CONFIG},
@@ -34,6 +33,7 @@ use super::storage_api::test::{
 };
 use super::{multipart_usecase::DefaultMultipartUsecase, object_usecase::DefaultObjectUsecase};
 use crate::app::bucket_usecase::DefaultBucketUsecase;
+use crate::app::runtime_sources::current_tier_config_handle;
 use bytes::Bytes;
 use futures::FutureExt;
 use futures::stream;
@@ -348,7 +348,7 @@ impl AppWarmBackend for MockWarmBackend {
 
 async fn register_mock_tier(tier_name: &str) -> MockWarmBackend {
     let backend = MockWarmBackend::default();
-    let tier_config_mgr_handle = get_global_tier_config_mgr();
+    let tier_config_mgr_handle = current_tier_config_handle();
     let mut tier_config_mgr = tier_config_mgr_handle.write().await;
     tier_config_mgr.tiers.insert(
         tier_name.to_string(),

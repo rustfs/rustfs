@@ -13,6 +13,8 @@
 // limitations under the License.
 
 use crate::app::storage_api::runtime_sources::ExpiryState;
+#[cfg(test)]
+use crate::app::storage_api::runtime_sources::TierConfigMgr;
 use crate::runtime_sources as root_runtime_sources;
 pub(crate) use crate::runtime_sources::{
     AppContext, current_encryption_service, current_endpoints_handle, current_notification_system,
@@ -49,4 +51,9 @@ pub(crate) async fn current_s3select_db(
 
 pub(crate) fn current_expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
     root_runtime_sources::current_expiry_state_handle().unwrap_or_else(ExpiryState::new)
+}
+
+#[cfg(test)]
+pub(crate) fn current_tier_config_handle() -> Arc<RwLock<TierConfigMgr>> {
+    root_runtime_sources::current_tier_config_handle().unwrap_or_else(TierConfigMgr::new)
 }
