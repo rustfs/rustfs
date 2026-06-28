@@ -40,6 +40,10 @@ name = "manual-test-dial9"
 path = "tests/manual/test_dial9.rs"
 test = false
 bench = false
+
+[[bench]]
+name = "s3_operations"
+harness = false
 required-features = ["manual-test-runners"]
 
 [features]
@@ -212,6 +216,7 @@ tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 rsa = { workspace = true }
 rcgen = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [build-dependencies]
 http.workspace = true
