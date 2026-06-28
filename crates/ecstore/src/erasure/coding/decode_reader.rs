@@ -802,7 +802,7 @@ mod tests {
         CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
     };
     use crate::erasure::coding::decode::ParallelReader;
-    use crate::erasure::coding::{BitrotReader, Erasure};
+    use crate::erasure::coding::{BitrotReader, BitrotWriter, Erasure};
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
@@ -916,6 +916,40 @@ mod tests {
     async fn decode_all(erasure: Erasure, data: &[u8], missing_indexes: &[usize]) -> io::Result<Vec<u8>> {
         let engine = LegacyEcDecodeEngine::new(erasure.clone());
         decode_all_with_engine(&erasure, engine, data, missing_indexes).await
+    }
+
+    async fn bitrot_readers_from_encoded(
+        erasure: &Erasure,
+        data: &[u8],
+        missing_indexes: &[usize],
+        corrupt_indexes: &[usize],
+        hash_algo: HashAlgorithm,
+    ) -> Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> {
+        let shard_size = erasure.shard_size();
+        let mut readers = Vec::with_capacity(erasure.data_shards + erasure.parity_shards);
+        for (index, shard) in erasure
+            .encode_data(data)
+            .expect("test stripe should encode")
+            .into_iter()
+            .enumerate()
+        {
+            if missing_indexes.contains(&index) {
+                readers.push(None);
+                continue;
+            }
+
+            let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone());
+            writer.write(&shard).await.expect("test shard should write with bitrot hash");
+            let mut encoded = writer.into_inner().into_inner();
+            if corrupt_indexes.contains(&index) {
+                let data_offset = hash_algo.size();
+                if let Some(byte) = encoded.get_mut(data_offset) {
+                    *byte ^= 0x80;
+                }
+            }
+            readers.push(Some(BitrotReader::new(Cursor::new(encoded), shard_size, hash_algo.clone(), false)));
+        }
+        readers
     }
 
     #[test]
@@ -1206,6 +1240,39 @@ mod tests {
             .expect("empty object should decode");
 
         assert!(decoded.is_empty());
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_rustfs_engine_recovers_after_bitrot_source_mismatch() {
+        let erasure = Erasure::new(4, 2, 64);
+        let data = (0..64u16)
+            .map(|value| value.wrapping_mul(29).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let readers = bitrot_readers_from_encoded(&erasure, &data, &[0], &[1], HashAlgorithm::HighwayHash256).await;
+        let source = ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            data.len(),
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("rustfs reader should reconstruct from clean shards after bitrot mismatch");
+
+        assert_eq!(decoded, data);
     }
 
     #[tokio::test]

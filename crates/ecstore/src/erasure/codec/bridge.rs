@@ -541,6 +541,26 @@ mod tests {
     }
 
     #[test]
+    fn rustfs_codec_decode_engine_rejects_stale_data_source() {
+        let erasure = Erasure::new(4, 2, 32);
+        let encoded = erasure
+            .encode_data(&(0u8..128u8).collect::<Vec<_>>())
+            .expect("test stripe should encode");
+        let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        shards[0] = None;
+        let Some(stale_data) = shards[1].as_mut() else {
+            panic!("test data shard should be present");
+        };
+        stale_data[0] ^= 0x40;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let err = reconstruct_with(&engine, &mut shards).expect_err("rustfs codec should reject stale data sources");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
+    }
+
+    #[test]
     fn rustfs_codec_decode_engine_recovers_empty_data_shard() {
         let erasure = Erasure::new(4, 2, 16);
         let mut shards = encoded_shards(&erasure, b"");
