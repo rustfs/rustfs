@@ -82,6 +82,9 @@ First safe PR:
   each dependency;
 - add no code movement and no behavior changes.
 
+The module-level inventory lives in
+`crates/ecstore/src/bucket/lifecycle/README.md`.
+
 Focused verification for the first code-bearing lifecycle PR:
 
 - `cargo test -p rustfs-ecstore lifecycle --lib`
