@@ -472,13 +472,23 @@ fn is_get_codec_streaming_enabled() -> bool {
 /// When enabled, multipart objects use per-part codec streaming
 /// instead of falling back to the legacy duplex path.
 fn is_codec_streaming_multipart_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
             DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+            )
+        })
+    }
 }
 
 /// Check if metadata early-stop is enabled (base flag).
@@ -824,10 +834,12 @@ fn get_codec_streaming_reader_gate(
         };
     }
     if object_class == GetCodecStreamingObjectClass::Multipart {
-        return GetCodecStreamingGate {
-            object_class,
-            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
-        };
+        if !is_codec_streaming_multipart_enabled() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+            };
+        }
     }
 
     GetCodecStreamingGate {
