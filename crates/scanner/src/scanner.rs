@@ -896,6 +896,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
                 record_scanner_leader_lock_state("acquired");
+                global_metrics().record_scanner_leader_liveness("acquired", true, "").await;
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -909,6 +910,9 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
             }
             Err(e) => {
                 record_scanner_leader_lock_state("contended");
+                global_metrics()
+                    .record_scanner_leader_liveness("contended", false, e.to_string())
+                    .await;
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -924,6 +928,9 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
         },
         Err(e) => {
             record_scanner_leader_lock_state("create_failed");
+            global_metrics()
+                .record_scanner_leader_liveness("create_failed", false, e.to_string())
+                .await;
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_LOCK_STATE,
@@ -990,6 +997,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     }
 
     global_metrics().set_cycle(None).await;
+    global_metrics().record_scanner_leader_liveness("stopped", false, "").await;
 
     debug!(
         target: "rustfs::scanner",
