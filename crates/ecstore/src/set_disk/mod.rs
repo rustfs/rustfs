@@ -26,8 +26,8 @@ use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::diagnostics::get::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
     GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA,
-    classify_storage_error, record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error,
+    record_get_object_pipeline_failure,
 };
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
@@ -1571,32 +1571,25 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let data_shards = fi.erasure.data_blocks;
 
             // Check if we have enough inline data shards
-            let inline_count = files.iter()
+            let inline_count = files
+                .iter()
                 .take(data_shards)
                 .filter(|f| f.data.as_ref().is_some_and(|d| !d.is_empty()))
                 .count();
 
             if inline_count >= data_shards {
                 // All data shards are inline - decode in memory
-                let erasure = coding::Erasure::new(
-                    fi.erasure.data_blocks,
-                    fi.erasure.parity_blocks,
-                    fi.erasure.block_size,
-                );
+                let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
                 // Build bitrot readers from inline data
                 let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
                 let checksum_algo = checksum_info.algorithm;
-                let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> = Vec::new();
+                let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> =
+                    Vec::new();
                 for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
                     if let Some(data) = &file.data {
                         let cursor: Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin> = Box::new(Cursor::new(data.to_vec()));
-                        let reader = coding::BitrotReader::new(
-                            cursor,
-                            fi.erasure.block_size,
-                            checksum_algo.clone(),
-                            false,
-                        );
+                        let reader = coding::BitrotReader::new(cursor, fi.erasure.block_size, checksum_algo.clone(), false);
                         readers.push(Some(reader));
                     } else {
                         readers.push(None);
@@ -1605,13 +1598,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 // Decode directly
                 let mut output = Cursor::new(Vec::with_capacity(fi.size as usize));
-                let (written, err) = erasure.decode(
-                    &mut output,
-                    readers,
-                    0,
-                    fi.size as usize,
-                    fi.size as usize,
-                ).await;
+                let (written, err) = erasure
+                    .decode(&mut output, readers, 0, fi.size as usize, fi.size as usize)
+                    .await;
 
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));

@@ -767,6 +767,7 @@ pub fn invalidate_bucket_validation_cache(bucket: &str) {
 }
 
 /// Invalidate all bucket validation cache entries.
+#[allow(dead_code)]
 pub fn invalidate_all_bucket_validation_cache() {
     bucket_cache().invalidate_all();
 }
