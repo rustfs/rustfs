@@ -220,31 +220,67 @@ impl Operation for AddTier {
 
         match args.tier_type {
             TierType::S3 => {
-                args.name = args.s3.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?.name;
+                args.name = args
+                    .s3
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing S3 configuration"))?
+                    .name;
             }
             TierType::RustFS => {
-                args.name = args.rustfs.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?.name;
+                args.name = args
+                    .rustfs
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing RustFS configuration"))?
+                    .name;
             }
             TierType::MinIO => {
-                args.name = args.minio.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?.name;
+                args.name = args
+                    .minio
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing MinIO configuration"))?
+                    .name;
             }
             TierType::Aliyun => {
-                args.name = args.aliyun.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?.name;
+                args.name = args
+                    .aliyun
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Aliyun configuration"))?
+                    .name;
             }
             TierType::Tencent => {
-                args.name = args.tencent.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?.name;
+                args.name = args
+                    .tencent
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Tencent configuration"))?
+                    .name;
             }
             TierType::Huaweicloud => {
-                args.name = args.huaweicloud.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?.name;
+                args.name = args
+                    .huaweicloud
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Huawei Cloud configuration"))?
+                    .name;
             }
             TierType::Azure => {
-                args.name = args.azure.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?.name;
+                args.name = args
+                    .azure
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing Azure configuration"))?
+                    .name;
             }
             TierType::GCS => {
-                args.name = args.gcs.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?.name;
+                args.name = args
+                    .gcs
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing GCS configuration"))?
+                    .name;
             }
             TierType::R2 => {
-                args.name = args.r2.clone().ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?.name;
+                args.name = args
+                    .r2
+                    .clone()
+                    .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "missing R2 configuration"))?
+                    .name;
             }
             _ => (),
         }
