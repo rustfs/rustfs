@@ -17,10 +17,10 @@ use crate::diagnostics::get::{
     GET_READER_POLL_READY_DATA, GET_READER_POLL_READY_EMPTY, GET_READER_POLL_READY_ERROR, GET_READER_PREFETCH_DIRECT,
     GET_READER_PREFETCH_EOF, GET_READER_PREFETCH_ERROR_DEFERRED, GET_READER_PREFETCH_ERROR_IMMEDIATE, GET_READER_PREFETCH_STORED,
     GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_FILL, GET_STAGE_OUTPUT_LOCK_WAIT, GET_STAGE_OUTPUT_POLL, GET_STAGE_RECONSTRUCT,
-    GET_STAGE_STRIPE_READ,
+    GET_STAGE_STRIPE_READ, get_stage_timer_if_enabled, record_get_stage_duration_if_enabled,
 };
 use crate::disk::error::Error as DiskError;
-use crate::erasure::codec::bridge::ErasureDecodeEngine;
+use crate::erasure::codec::bridge::{ErasureDecodeEngine, GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::collections::VecDeque;
 use std::io;
@@ -30,6 +30,7 @@ use std::sync::Mutex;
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 use tokio::io::{AsyncRead, ReadBuf};
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: &str = "RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT";
@@ -37,13 +38,23 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT: usize = 2;
 const FILL_POLICY_SINGLE_INFLIGHT: &str = "single_inflight";
 const FILL_POLICY_DUAL_INFLIGHT: &str = "dual_inflight";
 
-type FillTask<S, W> = JoinHandle<FillResult<S, W>>;
+type FillTask = oneshot::Receiver<FillResult>;
 
-struct FillResult<S, W> {
-    source: S,
-    workspace: W,
+struct FillWorker {
+    tx: mpsc::Sender<FillRequest>,
+    task: JoinHandle<()>,
+}
+
+struct FillRequest {
+    remaining: usize,
+    reusable_buffers: Vec<Vec<u8>>,
+    response: oneshot::Sender<FillResult>,
+}
+
+struct FillResult {
     result: io::Result<Option<Vec<u8>>>,
     queued_buffers: VecDeque<Vec<u8>>,
+    reusable_buffers: Vec<Vec<u8>>,
     deferred_error: Option<io::Error>,
 }
 
@@ -88,19 +99,22 @@ where
     E: ErasureDecodeEngine,
 {
     metrics_path: &'static str,
+    stage_metrics_enabled: bool,
     fill_policy: FillPolicy,
     source: Option<S>,
-    engine: E,
+    engine: Option<E>,
     workspace: Option<E::Workspace>,
+    worker: Option<FillWorker>,
     output_buf: Vec<u8>,
     output_pos: usize,
+    reusable_output_bufs: Vec<Vec<u8>>,
     prefetched_bufs: VecDeque<Vec<u8>>,
     prefetch_error: Option<io::Error>,
     prefetch_wait_started_at: Option<Instant>,
     output_wait_started_at: Option<Instant>,
     remaining: usize,
     // Bounded lookahead controlled by `FillPolicy`.
-    fill: Option<FillTask<S, E::Workspace>>,
+    fill: Option<FillTask>,
 }
 
 impl<S, E> ErasureDecodeReader<S, E>
@@ -140,12 +154,15 @@ where
 
         Ok(Self {
             metrics_path,
+            stage_metrics_enabled: rustfs_io_metrics::get_stage_metrics_enabled(),
             fill_policy,
             source: Some(source),
-            engine,
+            engine: Some(engine),
             workspace: Some(workspace),
+            worker: None,
             output_buf: Vec::new(),
             output_pos: 0,
+            reusable_output_bufs: Vec::new(),
             prefetched_bufs: VecDeque::new(),
             prefetch_error: None,
             prefetch_wait_started_at: None,
@@ -153,6 +170,69 @@ where
             remaining: total_length,
             fill: None,
         })
+    }
+
+    fn max_reusable_output_bufs(&self) -> usize {
+        self.fill_policy.max_inflight() + 1
+    }
+
+    fn push_reusable_output_buf(&mut self, mut buf: Vec<u8>) {
+        if buf.capacity() == 0 || self.reusable_output_bufs.len() >= self.max_reusable_output_bufs() {
+            return;
+        }
+        buf.clear();
+        self.reusable_output_bufs.push(buf);
+    }
+
+    fn recycle_drained_output_buf(&mut self) {
+        if self.output_pos < self.output_buf.len() {
+            return;
+        }
+
+        let buf = std::mem::take(&mut self.output_buf);
+        self.output_pos = 0;
+        self.push_reusable_output_buf(buf);
+    }
+
+    fn extend_reusable_output_bufs(&mut self, bufs: Vec<Vec<u8>>) {
+        for buf in bufs {
+            self.push_reusable_output_buf(buf);
+        }
+    }
+
+    fn fill_worker_tx(&mut self) -> io::Result<mpsc::Sender<FillRequest>> {
+        if self.worker.is_none() {
+            let Some(source) = self.source.take() else {
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader source missing"));
+            };
+            let Some(engine) = self.engine.take() else {
+                self.source = Some(source);
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader engine missing"));
+            };
+            let Some(workspace) = self.workspace.take() else {
+                self.source = Some(source);
+                self.engine = Some(engine);
+                return Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader workspace missing"));
+            };
+
+            let (tx, rx) = mpsc::channel(1);
+            rustfs_io_metrics::record_get_object_fill_worker_started(self.metrics_path, self.fill_policy.as_str());
+            let task = tokio::spawn(run_fill_worker(
+                source,
+                engine,
+                workspace,
+                self.fill_policy,
+                self.metrics_path,
+                self.stage_metrics_enabled,
+                rx,
+            ));
+            self.worker = Some(FillWorker { tx, task });
+        }
+
+        self.worker
+            .as_ref()
+            .map(|worker| worker.tx.clone())
+            .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "erasure reader fill worker missing"))
     }
 
     #[cfg(test)]
@@ -168,87 +248,31 @@ where
 
     fn poll_fill_result(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<Option<Vec<u8>>>> {
         if self.fill.is_none() {
-            let Some(mut source) = self.source.take() else {
-                return Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader source missing")));
+            let fill_worker_tx = match self.fill_worker_tx() {
+                Ok(tx) => tx,
+                Err(err) => return Poll::Ready(Err(err)),
             };
-            let Some(mut workspace) = self.workspace.take() else {
-                self.source = Some(source);
-                return Poll::Ready(Err(io::Error::new(ErrorKind::BrokenPipe, "erasure reader workspace missing")));
-            };
-
-            let engine = self.engine.clone();
             let metrics_path = self.metrics_path;
             let fill_policy = self.fill_policy;
             let remaining = self.remaining;
-            self.fill = Some(tokio::spawn(async move {
-                let mut queued_buffers = VecDeque::new();
-                let mut deferred_error = None;
-                let fill_stage_start = Instant::now();
-                let stripe_read_stage_start = Instant::now();
-                let state = source.read_next_stripe().await;
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics_path,
-                    GET_STAGE_STRIPE_READ,
-                    stripe_read_stage_start.elapsed().as_secs_f64(),
-                );
-                let decode_stage_start = Instant::now();
-                let result = decode_stripe(metrics_path, &engine, &mut workspace, state, remaining);
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics_path,
-                    GET_STAGE_DECODE,
-                    decode_stage_start.elapsed().as_secs_f64(),
-                );
-                if let Ok(Some(first_buf)) = result.as_ref() {
-                    let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
-                    for _ in 0..fill_policy.additional_queued_buffers() {
-                        if remaining_after_first == 0 {
-                            break;
-                        }
-                        let stripe_read_stage_start = Instant::now();
-                        let state = source.read_next_stripe().await;
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics_path,
-                            GET_STAGE_STRIPE_READ,
-                            stripe_read_stage_start.elapsed().as_secs_f64(),
-                        );
-                        let decode_stage_start = Instant::now();
-                        let queued_result = decode_stripe(metrics_path, &engine, &mut workspace, state, remaining_after_first);
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            metrics_path,
-                            GET_STAGE_DECODE,
-                            decode_stage_start.elapsed().as_secs_f64(),
-                        );
-                        match queued_result {
-                            Ok(Some(buf)) => {
-                                remaining_after_first = remaining_after_first.saturating_sub(buf.len());
-                                queued_buffers.push_back(buf);
-                            }
-                            Ok(None) => {
-                                if remaining_after_first > 0 {
-                                    deferred_error = Some(DiskError::LessData.into());
-                                }
-                                break;
-                            }
-                            Err(err) => {
-                                deferred_error = Some(err);
-                                break;
-                            }
-                        }
-                    }
-                }
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    metrics_path,
-                    GET_STAGE_FILL,
-                    fill_stage_start.elapsed().as_secs_f64(),
-                );
-                FillResult {
-                    source,
-                    workspace,
-                    result,
-                    queued_buffers,
-                    deferred_error,
-                }
-            }));
+            let reusable_buffers = std::mem::take(&mut self.reusable_output_bufs);
+            let (response, fill) = oneshot::channel();
+            let request = FillRequest {
+                remaining,
+                reusable_buffers,
+                response,
+            };
+
+            if let Err(err) = fill_worker_tx.try_send(request) {
+                self.extend_reusable_output_bufs(err.into_inner().reusable_buffers);
+                return Poll::Ready(Err(io::Error::new(
+                    ErrorKind::BrokenPipe,
+                    "erasure reader fill worker request queue is closed or full",
+                )));
+            }
+
+            rustfs_io_metrics::record_get_object_fill_started(metrics_path, fill_policy.as_str());
+            self.fill = Some(fill);
         }
 
         let fill = self
@@ -257,22 +281,20 @@ where
             .ok_or_else(|| io::Error::new(ErrorKind::BrokenPipe, "erasure reader fill future missing"))?;
         let fill_result = ready!(Pin::new(fill).poll(cx));
         let FillResult {
-            source,
-            workspace,
             result,
             queued_buffers,
+            reusable_buffers,
             deferred_error,
         } = match fill_result {
             Ok(result) => result,
             Err(err) => {
                 self.fill = None;
-                return Poll::Ready(Err(io::Error::other(format!("erasure reader fill task failed: {err}"))));
+                return Poll::Ready(Err(io::Error::other(format!("erasure reader fill worker stopped: {err}"))));
             }
         };
 
-        self.source = Some(source);
-        self.workspace = Some(workspace);
         self.fill = None;
+        self.extend_reusable_output_bufs(reusable_buffers);
         if let Some(deferred_error) = deferred_error {
             self.prefetch_error = Some(deferred_error);
         }
@@ -304,13 +326,15 @@ where
             return Poll::Ready(Ok(()));
         }
 
-        if self.prefetch_wait_started_at.is_none() {
+        if self.stage_metrics_enabled && self.prefetch_wait_started_at.is_none() {
             self.prefetch_wait_started_at = Some(Instant::now());
         }
 
         let fill = match self.poll_fill_result(cx) {
             Poll::Ready(result) => {
-                if let Some(started_at) = self.prefetch_wait_started_at.take() {
+                if self.stage_metrics_enabled
+                    && let Some(started_at) = self.prefetch_wait_started_at.take()
+                {
                     rustfs_io_metrics::record_get_object_reader_prefetch_wait(
                         self.metrics_path,
                         started_at.elapsed().as_secs_f64(),
@@ -385,14 +409,146 @@ where
     }
 }
 
+async fn run_fill_worker<S, E>(
+    mut source: S,
+    engine: E,
+    mut workspace: E::Workspace,
+    fill_policy: FillPolicy,
+    metrics_path: &'static str,
+    stage_metrics_enabled: bool,
+    mut rx: mpsc::Receiver<FillRequest>,
+) where
+    S: ShardStripeSource + Send + 'static,
+    E: ErasureDecodeEngine + Send + Sync + 'static,
+{
+    while let Some(request) = rx.recv().await {
+        let response = request.response;
+        let result = run_fill_request(FillRequestWork {
+            source: &mut source,
+            engine: &engine,
+            workspace: &mut workspace,
+            fill_policy,
+            metrics_path,
+            stage_metrics_enabled,
+            remaining: request.remaining,
+            reusable_buffers: request.reusable_buffers,
+        })
+        .await;
+        let _ = response.send(result);
+    }
+}
+
+struct FillRequestWork<'a, S, E>
+where
+    E: ErasureDecodeEngine,
+{
+    source: &'a mut S,
+    engine: &'a E,
+    workspace: &'a mut E::Workspace,
+    fill_policy: FillPolicy,
+    metrics_path: &'static str,
+    stage_metrics_enabled: bool,
+    remaining: usize,
+    reusable_buffers: Vec<Vec<u8>>,
+}
+
+async fn run_fill_request<S, E>(work: FillRequestWork<'_, S, E>) -> FillResult
+where
+    S: ShardStripeSource + Send,
+    E: ErasureDecodeEngine,
+{
+    let FillRequestWork {
+        source,
+        engine,
+        workspace,
+        fill_policy,
+        metrics_path,
+        stage_metrics_enabled,
+        remaining,
+        mut reusable_buffers,
+    } = work;
+    let mut queued_buffers = VecDeque::new();
+    let mut deferred_error = None;
+    let fill_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let state = source.read_next_stripe().await;
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+    let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    let mut output_buf = reusable_buffers.pop().unwrap_or_default();
+    let result =
+        match decode_stripe_into(metrics_path, stage_metrics_enabled, engine, workspace, state, remaining, &mut output_buf) {
+            Ok(true) => Ok(Some(output_buf)),
+            Ok(false) => {
+                reusable_buffers.push(output_buf);
+                Ok(None)
+            }
+            Err(err) => {
+                reusable_buffers.push(output_buf);
+                Err(err)
+            }
+        };
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
+    if let Ok(Some(first_buf)) = result.as_ref() {
+        let mut remaining_after_first = remaining.saturating_sub(first_buf.len());
+        for _ in 0..fill_policy.additional_queued_buffers() {
+            if remaining_after_first == 0 {
+                break;
+            }
+            let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let state = source.read_next_stripe().await;
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
+            let decode_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+            let mut queued_buf = reusable_buffers.pop().unwrap_or_default();
+            let queued_result = decode_stripe_into(
+                metrics_path,
+                stage_metrics_enabled,
+                engine,
+                workspace,
+                state,
+                remaining_after_first,
+                &mut queued_buf,
+            );
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_DECODE, decode_stage_start);
+            match queued_result {
+                Ok(true) => {
+                    remaining_after_first = remaining_after_first.saturating_sub(queued_buf.len());
+                    queued_buffers.push_back(queued_buf);
+                }
+                Ok(false) => {
+                    reusable_buffers.push(queued_buf);
+                    if remaining_after_first > 0 {
+                        deferred_error = Some(DiskError::LessData.into());
+                    }
+                    break;
+                }
+                Err(err) => {
+                    reusable_buffers.push(queued_buf);
+                    deferred_error = Some(err);
+                    break;
+                }
+            }
+        }
+    }
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_FILL, fill_stage_start);
+
+    FillResult {
+        result,
+        queued_buffers,
+        reusable_buffers,
+        deferred_error,
+    }
+}
+
 impl<S, E> Drop for ErasureDecodeReader<S, E>
 where
     E: ErasureDecodeEngine,
 {
     fn drop(&mut self) {
-        if let Some(fill) = self.fill.take() {
+        if self.fill.take().is_some() {
             rustfs_io_metrics::record_get_object_fill_cancelled_on_drop(self.metrics_path, self.fill_policy.as_str());
-            fill.abort();
+        }
+        if let Some(worker) = self.worker.take() {
+            worker.task.abort();
         }
     }
 }
@@ -421,10 +577,12 @@ where
                 let read_buf_remaining_before = buf.remaining();
                 let output_remaining_before = available.len();
                 let copy_len = available.len().min(buf.remaining());
-                let copy_start = Instant::now();
+                let copy_start = get_stage_timer_if_enabled(self.stage_metrics_enabled);
                 buf.put_slice(&available[..copy_len]);
                 self.output_pos += copy_len;
-                if copy_len > 0 {
+                if copy_len > 0
+                    && let Some(copy_start) = copy_start
+                {
                     rustfs_io_metrics::record_get_object_reader_copy(
                         self.metrics_path,
                         copy_len,
@@ -438,6 +596,8 @@ where
                 }
                 continue;
             }
+
+            self.recycle_drained_output_buf();
 
             if let Some(next_buf) = self.prefetched_bufs.pop_front() {
                 rustfs_io_metrics::record_get_object_reader_buffer(self.metrics_path, GET_READER_BUFFER_OUTPUT, next_buf.len());
@@ -458,14 +618,16 @@ where
             }
 
             if self.output_wait_started_at.is_none() {
-                self.output_wait_started_at = Some(Instant::now());
+                self.output_wait_started_at = get_stage_timer_if_enabled(self.stage_metrics_enabled);
             }
             let prefetch = match self.poll_prefetch(cx) {
                 Poll::Ready(result) => result,
                 Poll::Pending if buf.filled().len() > filled_before_poll => return Poll::Ready(Ok(())),
                 Poll::Pending => return Poll::Pending,
             };
-            if let Some(started_at) = self.output_wait_started_at.take() {
+            if self.stage_metrics_enabled
+                && let Some(started_at) = self.output_wait_started_at.take()
+            {
                 rustfs_io_metrics::record_get_object_fill_waited_by_output(
                     self.metrics_path,
                     self.fill_policy.as_str(),
@@ -480,6 +642,7 @@ where
 pub(crate) struct SyncErasureDecodeReader<R> {
     inner: Mutex<R>,
     metrics_path: &'static str,
+    stage_metrics_enabled: bool,
 }
 
 impl<R> SyncErasureDecodeReader<R> {
@@ -491,6 +654,7 @@ impl<R> SyncErasureDecodeReader<R> {
         Self {
             inner: Mutex::new(inner),
             metrics_path,
+            stage_metrics_enabled: rustfs_io_metrics::get_stage_metrics_enabled(),
         }
     }
 }
@@ -500,97 +664,90 @@ where
     R: AsyncRead + Unpin + Send,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
-        let lock_wait_start = Instant::now();
+        let stage_metrics_enabled = self.stage_metrics_enabled;
+        let lock_wait_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let mut inner = match self.inner.lock() {
             Ok(inner) => {
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    self.metrics_path,
-                    GET_STAGE_OUTPUT_LOCK_WAIT,
-                    lock_wait_start.elapsed().as_secs_f64(),
-                );
+                record_get_stage_duration_if_enabled(self.metrics_path, GET_STAGE_OUTPUT_LOCK_WAIT, lock_wait_start);
                 inner
             }
             Err(_) => {
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    self.metrics_path,
-                    GET_STAGE_OUTPUT_LOCK_WAIT,
-                    lock_wait_start.elapsed().as_secs_f64(),
-                );
+                record_get_stage_duration_if_enabled(self.metrics_path, GET_STAGE_OUTPUT_LOCK_WAIT, lock_wait_start);
                 return Poll::Ready(Err(io::Error::other("erasure decode reader lock poisoned")));
             }
         };
-        let read_buf_remaining_before = buf.remaining();
-        let filled_before = buf.filled().len();
-        let poll_start = Instant::now();
+        let read_buf_remaining_before = stage_metrics_enabled.then(|| buf.remaining());
+        let filled_before = stage_metrics_enabled.then(|| buf.filled().len());
+        let poll_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let result = Pin::new(&mut *inner).poll_read(cx, buf);
-        let poll_duration = poll_start.elapsed().as_secs_f64();
-        let filled_bytes = buf.filled().len().saturating_sub(filled_before);
-        let poll_outcome = match &result {
-            Poll::Ready(Ok(())) if filled_bytes > 0 => GET_READER_POLL_READY_DATA,
-            Poll::Ready(Ok(())) => GET_READER_POLL_READY_EMPTY,
-            Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
-            Poll::Pending => GET_READER_POLL_PENDING,
-        };
-        rustfs_io_metrics::record_get_object_stage_duration(self.metrics_path, GET_STAGE_OUTPUT_POLL, poll_duration);
-        rustfs_io_metrics::record_get_object_reader_poll(
-            self.metrics_path,
-            poll_outcome,
-            read_buf_remaining_before,
-            filled_bytes,
-            poll_duration,
-        );
+        if let (Some(read_buf_remaining_before), Some(filled_before), Some(poll_start)) =
+            (read_buf_remaining_before, filled_before, poll_start)
+        {
+            let poll_duration = poll_start.elapsed().as_secs_f64();
+            let filled_bytes = buf.filled().len().saturating_sub(filled_before);
+            let poll_outcome = match &result {
+                Poll::Ready(Ok(())) if filled_bytes > 0 => GET_READER_POLL_READY_DATA,
+                Poll::Ready(Ok(())) => GET_READER_POLL_READY_EMPTY,
+                Poll::Ready(Err(_)) => GET_READER_POLL_READY_ERROR,
+                Poll::Pending => GET_READER_POLL_PENDING,
+            };
+            rustfs_io_metrics::record_get_object_stage_duration(self.metrics_path, GET_STAGE_OUTPUT_POLL, poll_duration);
+            rustfs_io_metrics::record_get_object_reader_poll(
+                self.metrics_path,
+                poll_outcome,
+                read_buf_remaining_before,
+                filled_bytes,
+                poll_duration,
+            );
+        }
         result
     }
 }
 
-fn decode_stripe<E>(
+fn decode_stripe_into<E>(
     metrics_path: &'static str,
+    stage_metrics_enabled: bool,
     engine: &E,
     workspace: &mut E::Workspace,
     state: StripeReadState,
     remaining: usize,
-) -> io::Result<Option<Vec<u8>>>
+    output: &mut Vec<u8>,
+) -> io::Result<bool>
 where
     E: ErasureDecodeEngine,
 {
+    output.clear();
     if state.slots().is_empty() {
-        return Ok(None);
+        return Ok(false);
     }
     if !state.can_decode() {
         return Err(DiskError::ErasureReadQuorum.into());
     }
 
-    let reconstruct_stage_start = Instant::now();
+    let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     if state.data_shards_complete(engine.data_shards()) {
-        rustfs_io_metrics::record_get_object_stage_duration(
+        rustfs_io_metrics::record_get_object_reconstruct_outcome(
             metrics_path,
-            GET_STAGE_RECONSTRUCT,
-            reconstruct_stage_start.elapsed().as_secs_f64(),
+            engine.engine_name(),
+            GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE,
         );
-        let emit_stage_start = Instant::now();
-        let output = emit_data_shards(&state, engine.data_shards(), engine.block_size(), remaining)?;
-        rustfs_io_metrics::record_get_object_stage_duration(
-            metrics_path,
-            GET_STAGE_EMIT,
-            emit_stage_start.elapsed().as_secs_f64(),
-        );
-        return Ok(Some(output));
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+        let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        emit_data_shards_into(&state, engine.data_shards(), engine.block_size(), remaining, output)?;
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_EMIT, emit_stage_start);
+        return Ok(true);
     }
 
     let (mut shards, _errs) = state.into_parts();
-    if let Err(err) = engine.reconstruct_into(&mut shards, workspace) {
-        rustfs_io_metrics::record_get_object_stage_duration(
-            metrics_path,
-            GET_STAGE_RECONSTRUCT,
-            reconstruct_stage_start.elapsed().as_secs_f64(),
-        );
-        return Err(err);
-    }
-    rustfs_io_metrics::record_get_object_stage_duration(
-        metrics_path,
-        GET_STAGE_RECONSTRUCT,
-        reconstruct_stage_start.elapsed().as_secs_f64(),
-    );
+    let reconstruct_outcome = match engine.reconstruct_into(&mut shards, workspace) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+            return Err(err);
+        }
+    };
+    rustfs_io_metrics::record_get_object_reconstruct_outcome(metrics_path, engine.engine_name(), reconstruct_outcome);
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
     if shards.len() < engine.data_shards() {
         return Err(io::Error::new(
@@ -599,8 +756,8 @@ where
         ));
     }
 
-    let emit_stage_start = Instant::now();
-    let mut output = Vec::with_capacity(engine.block_size().min(remaining));
+    let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    reserve_output_capacity(output, engine.block_size().min(remaining));
     for shard in shards.iter().take(engine.data_shards()) {
         if output.len() >= remaining {
             break;
@@ -611,13 +768,32 @@ where
         let copy_len = shard.len().min(remaining - output.len());
         output.extend_from_slice(&shard[..copy_len]);
     }
-    rustfs_io_metrics::record_get_object_stage_duration(metrics_path, GET_STAGE_EMIT, emit_stage_start.elapsed().as_secs_f64());
+    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_EMIT, emit_stage_start);
 
-    Ok(Some(output))
+    Ok(true)
 }
 
 fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usize, remaining: usize) -> io::Result<Vec<u8>> {
-    let mut output = Vec::with_capacity(block_size.min(remaining));
+    let mut output = Vec::new();
+    emit_data_shards_into(state, data_shards, block_size, remaining, &mut output)?;
+    Ok(output)
+}
+
+fn reserve_output_capacity(output: &mut Vec<u8>, target_capacity: usize) {
+    if output.capacity() < target_capacity {
+        output.reserve(target_capacity - output.capacity());
+    }
+}
+
+fn emit_data_shards_into(
+    state: &StripeReadState,
+    data_shards: usize,
+    block_size: usize,
+    remaining: usize,
+    output: &mut Vec<u8>,
+) -> io::Result<()> {
+    output.clear();
+    reserve_output_capacity(output, block_size.min(remaining));
     for index in 0..data_shards {
         if output.len() >= remaining {
             break;
@@ -631,7 +807,7 @@ fn emit_data_shards(state: &StripeReadState, data_shards: usize, block_size: usi
         let copy_len = shard.len().min(remaining - output.len());
         output.extend_from_slice(&shard[..copy_len]);
     }
-    Ok(output)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -641,7 +817,7 @@ mod tests {
         CodecStreamingDecodeEngine, ErasureDecodeEngine, LegacyEcDecodeEngine, RustfsCodecDecodeEngine,
     };
     use crate::erasure::coding::decode::ParallelReader;
-    use crate::erasure::coding::{BitrotReader, Erasure};
+    use crate::erasure::coding::{BitrotReader, BitrotWriter, Erasure};
     use crate::set_disk::shard_source::{ShardSlot, StripeReadState};
     use rustfs_utils::HashAlgorithm;
     use std::collections::VecDeque;
@@ -757,6 +933,40 @@ mod tests {
         decode_all_with_engine(&erasure, engine, data, missing_indexes).await
     }
 
+    async fn bitrot_readers_from_encoded(
+        erasure: &Erasure,
+        data: &[u8],
+        missing_indexes: &[usize],
+        corrupt_indexes: &[usize],
+        hash_algo: HashAlgorithm,
+    ) -> Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> {
+        let shard_size = erasure.shard_size();
+        let mut readers = Vec::with_capacity(erasure.data_shards + erasure.parity_shards);
+        for (index, shard) in erasure
+            .encode_data(data)
+            .expect("test stripe should encode")
+            .into_iter()
+            .enumerate()
+        {
+            if missing_indexes.contains(&index) {
+                readers.push(None);
+                continue;
+            }
+
+            let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone());
+            writer.write(&shard).await.expect("test shard should write with bitrot hash");
+            let mut encoded = writer.into_inner().into_inner();
+            if corrupt_indexes.contains(&index) {
+                let data_offset = hash_algo.size();
+                if let Some(byte) = encoded.get_mut(data_offset) {
+                    *byte ^= 0x80;
+                }
+            }
+            readers.push(Some(BitrotReader::new(Cursor::new(encoded), shard_size, hash_algo.clone(), false)));
+        }
+        readers
+    }
+
     #[test]
     fn fill_policy_defaults_to_dual_inflight() {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, None::<&str>, || {
@@ -770,6 +980,41 @@ mod tests {
         with_var(ENV_RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT, Some("99"), || {
             assert_eq!(FillPolicy::from_env(), FillPolicy::SingleInFlight);
         });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn erasure_decode_reader_caches_stage_metrics_enabled_at_construction() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = b"metrics switch cache";
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+        let source = source_from_data(&erasure, data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        assert!(!reader.stage_metrics_enabled);
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let source = source_from_data(&erasure, data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        assert!(reader.stage_metrics_enabled);
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
     }
 
     #[tokio::test]
@@ -1013,6 +1258,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn erasure_decode_reader_rustfs_engine_recovers_after_bitrot_source_mismatch() {
+        let erasure = Erasure::new(4, 2, 64);
+        let data = (0..64u16)
+            .map(|value| value.wrapping_mul(29).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let readers = bitrot_readers_from_encoded(&erasure, &data, &[0], &[1], HashAlgorithm::HighwayHash256).await;
+        let source = ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            data.len(),
+            Some(GET_OBJECT_PATH_CODEC_STREAMING),
+        );
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("rustfs reader should reconstruct from clean shards after bitrot mismatch");
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
     async fn erasure_decode_reader_verifying_parallel_source_rejects_inconsistent_reconstruction_sources() {
         const DATA_SHARDS: usize = 2;
         const PARITY_SHARDS: usize = 2;
@@ -1175,5 +1453,75 @@ mod tests {
         })
         .await
         .expect("reader should start reading the next stripe before the current output buffer is fully consumed");
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_reuses_output_buffers_after_drain() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..128u16)
+            .map(|value| value.wrapping_mul(5).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let source = source_from_data(&erasure, &data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure.clone());
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("reader should decode all stripes");
+
+        assert_eq!(decoded, data);
+        assert!(reader.reusable_output_bufs.len() <= reader.max_reusable_output_bufs());
+        assert!(
+            reader
+                .reusable_output_bufs
+                .iter()
+                .any(|buf| buf.capacity() >= erasure.block_size),
+            "drained stripe output buffers should be available for reuse"
+        );
+    }
+
+    #[tokio::test]
+    async fn erasure_decode_reader_reuses_single_fill_worker_across_fills() {
+        let erasure = Erasure::new(4, 2, 32);
+        let data = (0..128u16)
+            .map(|value| value.wrapping_mul(7).to_le_bytes()[0])
+            .collect::<Vec<_>>();
+        let source = source_from_data(&erasure, &data, &[]);
+        let engine = LegacyEcDecodeEngine::new(erasure);
+        let mut reader = ErasureDecodeReader::new_with_fill_policy(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING,
+            FillPolicy::SingleInFlight,
+        )
+        .expect("reader should be constructed");
+        let mut decoded = Vec::new();
+        let mut first_read = [0u8; 1];
+
+        let read = reader.read(&mut first_read).await.expect("first read should succeed");
+        decoded.extend_from_slice(&first_read[..read]);
+
+        assert!(reader.worker.is_some());
+        assert!(reader.source.is_none());
+        assert!(reader.engine.is_none());
+        assert!(reader.workspace.is_none());
+
+        reader
+            .read_to_end(&mut decoded)
+            .await
+            .expect("reader should continue using the fill worker");
+
+        assert_eq!(decoded, data);
+        assert!(reader.worker.is_some());
     }
 }

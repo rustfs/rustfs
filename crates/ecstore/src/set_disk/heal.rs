@@ -362,7 +362,7 @@ impl SetDisks {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
                                 // Read zero-copy configuration from environment variable
                                 // Default: enabled (true) for performance
-                                let use_zero_copy =
+                                let use_mmap_read =
                                     rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
@@ -402,7 +402,7 @@ impl SetDisks {
                                             erasure.shard_size(),
                                             checksum_algo.clone(),
                                             false,
-                                            use_zero_copy,
+                                            use_mmap_read,
                                         )
                                         .await
                                         {

@@ -441,7 +441,7 @@ impl Operation for AddServiceAccount {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -616,8 +616,8 @@ impl Operation for UpdateServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::NO_CONTENT, Body::empty()), header))
     }
 }
@@ -688,7 +688,7 @@ impl Operation for InfoServiceAccount {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -756,7 +756,7 @@ impl Operation for TemporaryAccountInfo {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -854,7 +854,7 @@ impl Operation for InfoAccessKey {
         let (body, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, body)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -980,7 +980,7 @@ impl Operation for ListServiceAccount {
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -1209,7 +1209,7 @@ impl Operation for ListAccessKeysBulk {
         let (data, content_type) = encode_compatible_admin_payload(req.uri.path(), &cred.secret_key, data)?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, content_type.parse().unwrap());
+        header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), header))
     }
@@ -1339,8 +1339,8 @@ impl Operation for DeleteServiceAccount {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers(
             (delete_service_account_success_status(req.uri.path()), Body::empty()),
             header,
