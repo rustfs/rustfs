@@ -3884,7 +3884,8 @@ mod test {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("operation should succeed");
-        let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let mut endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         endpoint.set_pool_index(0);
         endpoint.set_set_index(0);
         endpoint.set_disk_index(0);
@@ -3930,7 +3931,9 @@ mod test {
         let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let leftover = tmp.join("leftover").join("data");
-        fs::create_dir_all(leftover.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::create_dir_all(leftover.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
         fs::write(&leftover, b"temporary").await.expect("operation should succeed");
 
         LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
@@ -3949,7 +3952,9 @@ mod test {
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let stale = tmp.join("stale").join("data");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
-        fs::create_dir_all(stale.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::create_dir_all(stale.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
         fs::create_dir_all(&trash).await.expect("operation should succeed");
         fs::write(&stale, b"temporary").await.expect("operation should succeed");
 
@@ -3975,7 +3980,9 @@ mod test {
         let regular_file = tmp.join("note.txt");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
 
-        fs::create_dir_all(fresh_dir.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::create_dir_all(fresh_dir.parent().expect("operation should succeed"))
+            .await
+            .expect("operation should succeed");
         fs::create_dir_all(&trash).await.expect("operation should succeed");
         fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
         fs::write(&regular_file, b"keep").await.expect("operation should succeed");
@@ -4048,16 +4055,31 @@ mod test {
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.expect("operation should succeed");
-        fs::create_dir_all(bucket_dir.join("quux/thud")).await.expect("operation should succeed");
-        fs::create_dir_all(bucket_dir.join("asdf")).await.expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("quux/thud"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("asdf"))
+            .await
+            .expect("operation should succeed");
 
-        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.expect("operation should succeed");
-        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.expect("operation should succeed");
-        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.expect("operation should succeed");
-        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.expect("operation should succeed");
+        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
+        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4098,13 +4120,19 @@ mod test {
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.expect("operation should succeed");
-        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("marker/file.txt"))
+            .await
+            .expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt"))
+            .await
+            .expect("operation should succeed");
         fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
             .await
             .expect("operation should succeed");
 
-        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.expect("operation should succeed");
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta")
+            .await
+            .expect("operation should succeed");
         fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
             .await
             .expect("operation should succeed");
@@ -4112,7 +4140,8 @@ mod test {
             .await
             .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4167,10 +4196,13 @@ mod test {
         ] {
             let object_dir = bucket_dir.join(name);
             fs::create_dir_all(&object_dir).await.expect("operation should succeed");
-            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.expect("operation should succeed");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta")
+                .await
+                .expect("operation should succeed");
         }
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
@@ -4308,7 +4340,9 @@ mod test {
         }
 
         let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
-        fs::create_dir_all(&hidden_versioned_dir).await.expect("operation should succeed");
+        fs::create_dir_all(&hidden_versioned_dir)
+            .await
+            .expect("operation should succeed");
         fs::write(
             hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
             delete_marker_with_old_object_metadata(
@@ -4328,7 +4362,8 @@ mod test {
         .await
         .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4377,14 +4412,22 @@ mod test {
         fs::create_dir_all(&object_dir).await.expect("operation should succeed");
         fs::write(&meta_path, b"meta").await.expect("operation should succeed");
 
-        let original_permissions = fs::metadata(&meta_path).await.expect("operation should succeed").permissions();
-        fs::set_permissions(&meta_path, Permissions::from_mode(0o000)).await.expect("operation should succeed");
+        let original_permissions = fs::metadata(&meta_path)
+            .await
+            .expect("operation should succeed")
+            .permissions();
+        fs::set_permissions(&meta_path, Permissions::from_mode(0o000))
+            .await
+            .expect("operation should succeed");
         if fs::File::open(&meta_path).await.is_ok() {
-            fs::set_permissions(&meta_path, original_permissions).await.expect("operation should succeed");
+            fs::set_permissions(&meta_path, original_permissions)
+                .await
+                .expect("operation should succeed");
             return;
         }
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (_reader, mut writer) = tokio::io::duplex(4096);
@@ -4401,7 +4444,9 @@ mod test {
             .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await;
 
-        fs::set_permissions(&meta_path, original_permissions).await.expect("operation should succeed");
+        fs::set_permissions(&meta_path, original_permissions)
+            .await
+            .expect("operation should succeed");
 
         assert!(matches!(result, Err(DiskError::FileAccessDenied)));
     }
@@ -4437,31 +4482,48 @@ mod test {
 
         fs::create_dir_all(&multipart_base).await.expect("operation should succeed");
         for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
-            fs::create_dir_all(multipart_base.join(uuid)).await.expect("operation should succeed");
-            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.expect("operation should succeed");
+            fs::create_dir_all(multipart_base.join(uuid))
+                .await
+                .expect("operation should succeed");
+            fs::write(multipart_base.join(uuid).join("part.1"), b"part")
+                .await
+                .expect("operation should succeed");
         }
-        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.expect("operation should succeed");
-        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.expect("operation should succeed");
+        fs::create_dir_all(obj_base.join(UUID_OBJ))
+            .await
+            .expect("operation should succeed");
+        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part")
+            .await
+            .expect("operation should succeed");
 
-        fs::create_dir_all(&dir_in_multipart_base).await.expect("operation should succeed");
+        fs::create_dir_all(&dir_in_multipart_base)
+            .await
+            .expect("operation should succeed");
         fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
             .await
             .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).expect("operation should succeed");
-        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).expect("operation should succeed");
-        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().expect("operation should succeed"))
-            .await
+        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1))
             .expect("operation should succeed");
+        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2))
+            .expect("operation should succeed");
+        fs::write(
+            multipart_base.join(STORAGE_FORMAT_FILE),
+            fm.marshal_msg().expect("operation should succeed"),
+        )
+        .await
+        .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).expect("operation should succeed");
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ))
+            .expect("operation should succeed");
         fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().expect("operation should succeed"))
             .await
             .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4477,7 +4539,10 @@ mod test {
         )
         .await
         .expect("operation should succeed");
-        MetacacheWriter::new(&mut writer).close().await.expect("operation should succeed");
+        MetacacheWriter::new(&mut writer)
+            .close()
+            .await
+            .expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
         let entries = reader.read_all().await.expect("operation should succeed");
@@ -4570,7 +4635,9 @@ mod test {
 
         let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).expect("operation should succeed");
+        let tmpp = disk
+            .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
+            .expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
@@ -4598,7 +4665,9 @@ mod test {
 
         let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).expect("operation should succeed");
+        let tmpp = disk
+            .resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET))
+            .expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
@@ -4634,7 +4703,9 @@ mod test {
         assert!(bucket_path.to_string_lossy().contains("test-bucket"));
 
         // Test object path
-        let object_path = disk.get_object_path("test-bucket", "test-object").expect("operation should succeed");
+        let object_path = disk
+            .get_object_path("test-bucket", "test-object")
+            .expect("operation should succeed");
         assert!(object_path.to_string_lossy().contains("test-bucket"));
         assert!(object_path.to_string_lossy().contains("test-object"));
 
@@ -4695,7 +4766,10 @@ mod test {
             .await
             .expect("operation should succeed");
 
-        let read_data = disk.read_all("test-volume", "test-file.txt").await.expect("operation should succeed");
+        let read_data = disk
+            .read_all("test-volume", "test-file.txt")
+            .await
+            .expect("operation should succeed");
         assert_eq!(read_data, test_data);
 
         // Test file deletion
@@ -4705,7 +4779,9 @@ mod test {
             undo_write: false,
             old_data_dir: None,
         };
-        disk.delete("test-volume", "test-file.txt", delete_opts).await.expect("operation should succeed");
+        disk.delete("test-volume", "test-file.txt", delete_opts)
+            .await
+            .expect("operation should succeed");
 
         // Clean up
         disk.delete_volume("test-volume").await.expect("operation should succeed");
@@ -4781,7 +4857,8 @@ mod test {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("operation should succeed");
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         disk.make_volume("test-volume").await.expect("operation should succeed");
@@ -4798,7 +4875,8 @@ mod test {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("operation should succeed");
-        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         disk.make_volume("test-volume").await.expect("operation should succeed");

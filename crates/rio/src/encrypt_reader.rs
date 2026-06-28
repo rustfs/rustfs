@@ -636,7 +636,10 @@ mod tests {
         let reader = BufReader::new(Cursor::new(data.to_vec()));
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
         encrypted
     }
 
@@ -674,14 +677,20 @@ mod tests {
         // Encrypt
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         // Decrypt using DecryptReader
         let reader = Cursor::new(encrypted.clone());
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, data);
     }
@@ -700,7 +709,10 @@ mod tests {
         let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         // Now test DecryptReader
 
@@ -708,7 +720,10 @@ mod tests {
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, data);
     }
@@ -728,13 +743,19 @@ mod tests {
         let encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypt_reader = encrypt_reader;
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = std::io::Cursor::new(encrypted.clone());
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypt_reader = decrypt_reader;
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(&decrypted, &data);
     }
@@ -752,12 +773,18 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 3);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -775,12 +802,18 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = PendingChunkedCursor::new(encrypted, 3);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -798,7 +831,10 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 8192);
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
@@ -826,7 +862,10 @@ mod tests {
         let reader = Cursor::new(data.clone());
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let reader = ChunkedCursor::new(encrypted, 8192);
         let decrypt_reader = DecryptReader::new(reader, key, nonce);
@@ -857,7 +896,10 @@ mod tests {
             let reader = BufReader::new(Cursor::new(data.to_vec()));
             let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
             let mut encrypted = Vec::new();
-            encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+            encrypt_reader
+                .read_to_end(&mut encrypted)
+                .await
+                .expect("operation should succeed");
             encrypted
         }
 
@@ -871,7 +913,10 @@ mod tests {
         let reader = BufReader::new(Cursor::new(combined));
         let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
         expected.extend_from_slice(&part_one);
@@ -891,7 +936,10 @@ mod tests {
         let reader = Cursor::new(data);
         let mut encrypt_reader = EncryptReader::new(reader, key, nonce);
         let mut encrypted = Vec::new();
-        encrypt_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        encrypt_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         let payloads = extract_encrypted_payloads(&encrypted);
         assert!(payloads.len() >= 2);
@@ -920,7 +968,10 @@ mod tests {
         let reader = Cursor::new(encrypted);
         let mut decrypt_reader = DecryptReader::new(reader, key, nonce);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(decrypted, data);
     }
@@ -945,7 +996,10 @@ mod tests {
         let reader = BufReader::new(Cursor::new(combined));
         let mut decrypt_reader = DecryptReader::new_multipart(reader, key, base_nonce, vec![1, 2]);
         let mut decrypted = Vec::new();
-        decrypt_reader.read_to_end(&mut decrypted).await.expect("operation should succeed");
+        decrypt_reader
+            .read_to_end(&mut decrypted)
+            .await
+            .expect("operation should succeed");
 
         let mut expected = Vec::with_capacity(part_one.len() + part_two.len());
         expected.extend_from_slice(&part_one);

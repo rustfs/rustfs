@@ -38,6 +38,13 @@ pub const DISK_MIN_INODES: u64 = 1000;
 pub const DISK_FILL_FRACTION: f64 = 0.99;
 pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 
+// Global singletons for backward compatibility with MinIO port.
+// These should be migrated to AppContext over time.
+// See issue #730 for migration plan.
+//
+// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_IsErasure*, GLOBAL_LOCAL_DISK_*,
+//   GLOBAL_RootDiskThreshold, GLOBAL_LifecycleSys, GLOBAL_EventNotifier, etc.
+// Tier B (keep as static): GLOBAL_RUSTFS_PORT, GLOBAL_REGION, env var caches, etc.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
     static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
