@@ -730,7 +730,7 @@ async fn submit_read_repair_heal_with_submitter(
         bucket.to_string(),
         Some(object.to_string()),
         false,
-        Some(HealChannelPriority::Normal),
+        Some(HealChannelPriority::Low),
         Some(pool_index),
         Some(set_index),
     );
@@ -2472,10 +2472,13 @@ mod metadata_cache_tests {
     use super::*;
     use rustfs_common::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CAPTURED_READ_REPAIR_PRIORITY: Mutex<Option<HealChannelPriority>> = Mutex::new(None);
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2489,6 +2492,15 @@ mod metadata_cache_tests {
         DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+        })
+    }
+
+    fn capture_read_repair_submitter(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = Some(request.priority);
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted)
         })
     }
 
@@ -2673,6 +2685,41 @@ mod metadata_cache_tests {
 
         assert_eq!(DROPPED_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed), 1);
         release_read_repair_heal_reservation(&released_key).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_uses_low_priority() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = None;
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
+            capture_read_repair_submitter,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background read-repair submitter should be called");
+
+        assert_eq!(
+            *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned"),
+            Some(HealChannelPriority::Low)
+        );
     }
 
     #[test]
