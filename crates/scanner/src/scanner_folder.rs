@@ -608,6 +608,7 @@ async fn send_required_scanner_heal_request(
     }
 
     record_high_priority_heal_escalation(candidate_type, priority, result);
+    let admission_error = build_high_priority_heal_admission_error(candidate_type, bucket, object, priority, result);
     error!(
         target: "rustfs::scanner::folder",
         event = EVENT_SCANNER_HEAL_ADMISSION,
@@ -619,10 +620,11 @@ async fn send_required_scanner_heal_request(
         priority = heal_priority_label(priority),
         admission = result.result_label(),
         reason = result.reason_label(),
+        error = %admission_error,
         state = "high_priority_not_admitted",
         "Scanner high-priority heal admission failed"
     );
-    Err(build_high_priority_heal_admission_error(candidate_type, bucket, object, priority, result))
+    Ok(())
 }
 
 /// Scanner item representing a file during scanning
