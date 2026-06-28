@@ -17,7 +17,6 @@
 //! This module defines environment variables and default values for mmap-based
 //! read operations. Note: despite the "zero_copy" naming in env vars (kept for
 //! backward compatibility), the actual implementation performs mmap-then-copy,
-//! not true zero-copy. See https://github.com/rustfs/backlog/issues/733
 
 // =============================================================================
 // Mmap Read Configuration

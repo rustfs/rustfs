@@ -179,7 +179,6 @@ serde_urlencoded = "0.7.1"
 # NOTE: aes-gcm and chacha20poly1305 use RC versions because stable 0.11.0
 # has not been released yet. The previous stable versions (0.10.x) have
 # incompatible APIs. Monitor upstream for stable releases and upgrade promptly.
-# See https://github.com/rustfs/backlog/issues/732 for discussion.
 aes-gcm = { version = "0.11.0-rc.4", features = ["rand_core"] }
 argon2 = { version = "0.6.0-rc.8" }
 blake2 = "0.11.0-rc.6"
