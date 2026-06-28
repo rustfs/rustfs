@@ -3450,6 +3450,7 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             encryption_applied,
+            is_inline_fast_path: _,
         } = read_setup;
 
         let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);

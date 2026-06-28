@@ -1936,7 +1936,7 @@ impl SetDisks {
             object, offset, length, end_offset, part_index, last_part_index, last_part_relative_offset, "Multipart read bounds"
         );
 
-        let erasure = crate::erasure::coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -1987,12 +1987,11 @@ impl SetDisks {
             );
 
             let checksum_info = fi.erasure.get_checksum_info(part_number);
-            let checksum_algo =
-                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                } else {
-                    checksum_info.algorithm
-                };
+            let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+                HashAlgorithm::HighwayHash256SLegacy
+            } else {
+                checksum_info.algorithm
+            };
             let read_length = till_offset.saturating_sub(read_offset);
 
             // Read zero-copy configuration from environment variable
@@ -2278,7 +2277,7 @@ impl SetDisks {
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
-        let erasure = crate::erasure::coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -2362,7 +2361,7 @@ impl SetDisks {
         fi: &FileInfo,
         files: &[FileInfo],
         disks: &[Option<DiskStore>],
-        erasure: &crate::erasure::coding::Erasure,
+        erasure: &coding::Erasure,
         part_number: usize,
         part_offset: usize,
         part_length: usize,
@@ -2373,9 +2372,8 @@ impl SetDisks {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
         let checksum_info = fi.erasure.get_checksum_info(part_number);
-        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
-        {
-            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+            HashAlgorithm::HighwayHash256SLegacy
         } else {
             checksum_info.algorithm
         };
@@ -2427,24 +2425,19 @@ impl SetDisks {
         }
 
         let readers = reader_setup.readers;
-        let source =
-            crate::erasure::coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
-                readers,
-                erasure.clone(),
-                part_offset,
-                part_size,
-                Some(metrics_path),
-                read_costs,
-            );
+        let source = coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            part_offset,
+            part_size,
+            Some(metrics_path),
+            read_costs,
+        );
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
-        let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(
-            source,
-            engine,
-            part_length,
-            metrics_path,
-        )?;
+        let reader =
+            coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;
         Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(
-            crate::erasure::coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
+            coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
         )))
     }
 }
@@ -2627,7 +2620,7 @@ mod metadata_cache_tests {
             "read-repair submission should not wait for admission response"
         );
 
-        tokio::time::timeout(Duration::from_secs(1), async {
+        timeout(Duration::from_secs(1), async {
             while SLOW_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed) == 0 {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
@@ -2656,7 +2649,7 @@ mod metadata_cache_tests {
         )
         .await;
 
-        let released_key = tokio::time::timeout(Duration::from_secs(1), async {
+        let released_key = timeout(Duration::from_secs(1), async {
             loop {
                 if let Some(key) = reserve_read_repair_heal(&bucket, "object", None, 0, 0).await {
                     break key;
@@ -3707,7 +3700,7 @@ mod tests {
                 );
 
                 let mut remote_fi = fi;
-                remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
+                remote_fi.transition_status = TRANSITION_COMPLETE.to_string();
                 let remote = codec_streaming_test_object_info(&remote_fi);
                 assert_eq!(
                     codec_streaming_reader_gate_for_test(&None, &remote, &remote_fi, true).decision,
@@ -3831,7 +3824,7 @@ mod tests {
     #[test]
     fn codec_streaming_decode_engine_builder_selects_rustfs() {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
-            let erasure = crate::erasure::coding::Erasure::new(4, 2, 32);
+            let erasure = coding::Erasure::new(4, 2, 32);
             let engine = build_get_codec_streaming_decode_engine(erasure).expect("engine should be built");
 
             assert!(matches!(engine, CodecStreamingDecodeEngine::Rustfs(_)));
@@ -3841,17 +3834,11 @@ mod tests {
     #[test]
     fn codec_streaming_metrics_path_matches_selected_engine() {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, None::<&str>, || {
-            assert_eq!(
-                get_codec_streaming_metrics_path(),
-                crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE
-            );
+            assert_eq!(get_codec_streaming_metrics_path(), GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE);
         });
 
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
-            assert_eq!(
-                get_codec_streaming_metrics_path(),
-                crate::diagnostics::get::GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE
-            );
+            assert_eq!(get_codec_streaming_metrics_path(), GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE);
         });
     }
 
@@ -4067,7 +4054,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_read_multiple_results_fails_early_when_quorum_is_impossible() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let resp = ReadMultipleResp {
             bucket: "bucket".to_string(),
             prefix: "prefix".to_string(),
@@ -4085,14 +4072,14 @@ mod tests {
         ]
         .into_iter()
         .map(|(delay_ms, outcome)| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             outcome
         })
         .collect();
 
         let result = collect_read_multiple_results(tasks, 2).await;
         assert!(result.is_err(), "quorum should become impossible before slow tail completes");
-        assert!(started.elapsed() < std::time::Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_millis(120));
     }
 
     #[tokio::test]
@@ -4114,7 +4101,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(delay_ms, outcome)| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             outcome
         })
         .collect();
@@ -4142,7 +4129,7 @@ mod tests {
             .map(|(delay_ms, should_panic)| {
                 let resp = resp.clone();
                 async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     if should_panic {
                         panic!("simulated task panic");
                     }
@@ -4160,7 +4147,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_read_parts_results_fails_early_when_quorum_is_impossible() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let part = ObjectPartInfo {
             number: 1,
             etag: "etag".to_string(),
@@ -4174,14 +4161,14 @@ mod tests {
         ]
         .into_iter()
         .map(|(delay_ms, outcome)| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             outcome
         })
         .collect();
 
         let result = collect_read_parts_results(tasks, 2).await;
         assert!(result.is_err(), "quorum should become impossible before slow tail completes");
-        assert!(started.elapsed() < std::time::Duration::from_millis(120));
+        assert!(started.elapsed() < Duration::from_millis(120));
     }
 
     #[tokio::test]
@@ -4199,7 +4186,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(delay_ms, outcome)| async move {
-            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
             outcome
         })
         .collect();
@@ -4222,7 +4209,7 @@ mod tests {
             .map(|(delay_ms, should_panic)| {
                 let part = part.clone();
                 async move {
-                    tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
                     if should_panic {
                         panic!("simulated task panic");
                     }

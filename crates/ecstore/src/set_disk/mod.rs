@@ -1885,8 +1885,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<ObjectInfo> = async {
-            let erasure =
-                coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
@@ -4218,8 +4217,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
-        let erasure =
-            coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
         let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -5912,9 +5910,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
-            if runtime_state.should_probe_for_admin()
-                || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect
-            {
+            if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
                 match disk.disk_info(&DiskInfoOptions::default()).await {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);

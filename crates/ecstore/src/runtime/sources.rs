@@ -237,9 +237,9 @@ pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize>
 pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
     if let Some(sc) = get_global_storage_class() {
         let standard = sc
-            .get_parity_for_sc(crate::config::storageclass::CLASS_STANDARD)
+            .get_parity_for_sc(storageclass::CLASS_STANDARD)
             .or(Some(default_standard_parity));
-        let reduced_redundancy = sc.get_parity_for_sc(crate::config::storageclass::RRS);
+        let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
         (standard, reduced_redundancy)
     } else {
         (Some(default_standard_parity), None)
