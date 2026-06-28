@@ -609,7 +609,7 @@ impl ReplicationResyncer {
                 let mut bucket_status = BucketReplicationResyncStatus::new();
                 bucket_status.id = 0;
                 status_map.insert(opts.bucket.clone(), bucket_status);
-                status_map.get_mut(&opts.bucket).unwrap()
+                status_map.get_mut(&opts.bucket).expect("bucket should be in status map")
             };
 
             let state = if let Some(state) = bucket_status.targets_map.get_mut(&opts.arn) {
@@ -617,7 +617,7 @@ impl ReplicationResyncer {
             } else {
                 let state = TargetReplicationResyncStatus::new();
                 bucket_status.targets_map.insert(opts.arn.clone(), state);
-                bucket_status.targets_map.get_mut(&opts.arn).unwrap()
+                bucket_status.targets_map.get_mut(&opts.arn).expect("ARN should be in targets map")
             };
 
             if !resync_state_accepts_update(state, &opts) {
@@ -670,7 +670,7 @@ impl ReplicationResyncer {
             let mut bucket_status = BucketReplicationResyncStatus::new();
             bucket_status.id = 0;
             status_map.insert(opts.bucket.clone(), bucket_status);
-            status_map.get_mut(&opts.bucket).unwrap()
+            status_map.get_mut(&opts.bucket).expect("bucket should be in status map")
         };
 
         let state = if let Some(state) = bucket_status.targets_map.get_mut(&opts.arn) {
@@ -678,7 +678,7 @@ impl ReplicationResyncer {
         } else {
             let state = TargetReplicationResyncStatus::new();
             bucket_status.targets_map.insert(opts.arn.clone(), state);
-            bucket_status.targets_map.get_mut(&opts.arn).unwrap()
+            bucket_status.targets_map.get_mut(&opts.arn).expect("ARN should be in targets map")
         };
 
         if !resync_state_accepts_update(state, &opts) {
@@ -764,7 +764,7 @@ impl ReplicationResyncer {
                                     "Failed to persist resync status"
                                 );
                             } else {
-                                last_update_times.insert(bucket.clone(), status.last_update.unwrap());
+                                last_update_times.insert(bucket.clone(), status.last_update.expect("last_update should be set"));
                             }
                         }
                     }
@@ -2710,7 +2710,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         && !tgt_client.reset_id.is_empty()
         && dobj.op_type == ReplicationType::ExistingObject
     {
-        rinfo.resync_timestamp = format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap(), tgt_client.reset_id);
+        rinfo.resync_timestamp = format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "invalid-time".to_string()), tgt_client.reset_id);
     }
 
     rinfo
@@ -3474,7 +3474,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         && !tgt_client.reset_id.is_empty()
                     {
                         rinfo.resync_timestamp =
-                            format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap(), tgt_client.reset_id);
+                            format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "invalid-time".to_string()), tgt_client.reset_id);
                         rinfo.replication_resynced = true;
                     }
 

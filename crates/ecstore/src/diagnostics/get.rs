@@ -15,6 +15,7 @@
 use crate::disk::error::DiskError;
 use crate::error::StorageError;
 use std::io;
+use std::time::Instant;
 
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING: &str = "codec_streaming";
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE: &str = "codec_streaming_legacy_engine";
@@ -172,6 +173,18 @@ pub(crate) fn record_get_object_pipeline_failure_for_path(
     reason: GetObjectFailureReason,
 ) {
     rustfs_io_metrics::record_get_object_pipeline_failure_for_path(path, stage, reason.as_str());
+}
+
+#[inline(always)]
+pub(crate) fn get_stage_timer_if_enabled(stage_metrics_enabled: bool) -> Option<Instant> {
+    stage_metrics_enabled.then(Instant::now)
+}
+
+#[inline(always)]
+pub(crate) fn record_get_stage_duration_if_enabled(path: &'static str, stage: &'static str, started_at: Option<Instant>) {
+    if let Some(started_at) = started_at {
+        rustfs_io_metrics::record_get_object_stage_duration(path, stage, started_at.elapsed().as_secs_f64());
+    }
 }
 
 #[cfg(test)]

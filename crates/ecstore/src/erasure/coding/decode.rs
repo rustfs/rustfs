@@ -16,7 +16,8 @@ use crate::diagnostics::get::{
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_SHARD_READ_ERROR_MISSING, GET_SHARD_READ_ERROR_NONE, GET_SHARD_READ_OUTCOME_ERROR,
     GET_SHARD_READ_OUTCOME_MISSING, GET_SHARD_READ_OUTCOME_SUCCESS, GET_SHARD_ROLE_DATA, GET_SHARD_ROLE_PARITY, GET_STAGE_EMIT,
     GET_STAGE_RANGE, GET_STAGE_RECONSTRUCT, GET_STAGE_STRIPE_READ, GET_STAGE_STRIPE_READ_FIRST_SHARD,
-    GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error, record_get_object_pipeline_failure,
+    GET_STAGE_STRIPE_READ_QUORUM, GetObjectFailureReason, classify_io_error, get_stage_timer_if_enabled,
+    record_get_object_pipeline_failure, record_get_stage_duration_if_enabled,
 };
 use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::Error;
@@ -182,7 +183,7 @@ where
         Box::pin(async move {
             let mut buf = recycled_buf.unwrap_or_else(|| vec![0; shard_size]);
             debug_assert_eq!(buf.len(), shard_size);
-            let read_start = Instant::now();
+            let read_start = metrics_path.map(|_| Instant::now());
             let read_result = if read_timeout.is_zero() {
                 reader.read(&mut buf).await
             } else {
@@ -200,7 +201,7 @@ where
                                 GET_SHARD_READ_OUTCOME_ERROR,
                                 error_class,
                                 0,
-                                read_start.elapsed().as_secs_f64(),
+                                read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
                                 reader.last_verify_duration().as_secs_f64(),
                             );
                         }
@@ -221,7 +222,7 @@ where
                             GET_SHARD_READ_OUTCOME_SUCCESS,
                             GET_SHARD_READ_ERROR_NONE,
                             n,
-                            read_start.elapsed().as_secs_f64(),
+                            read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
                             reader.last_verify_duration().as_secs_f64(),
                         );
                     }
@@ -240,7 +241,7 @@ where
                             GET_SHARD_READ_OUTCOME_ERROR,
                             error_class,
                             0,
-                            read_start.elapsed().as_secs_f64(),
+                            read_start.map_or(0.0, |read_start| read_start.elapsed().as_secs_f64()),
                             verify_duration_secs,
                         );
                     }
@@ -450,6 +451,7 @@ where
         read_timeout: Duration,
         verify_reconstruction: bool,
     ) -> Self {
+        let metrics_path = metrics_path.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
         let shard_size = e.shard_size();
         let shard_file_size = e.shard_file_size(total_length as i64) as usize;
 
@@ -615,7 +617,7 @@ where
             let mut reader_iter = ReaderLaunchIter::new(&mut self.readers, read_costs, locality_preference_enabled);
             let mut sets = FuturesUnordered::new();
             let mut active_readers = vec![false; num_readers];
-            let stripe_read_start = Instant::now();
+            let stripe_read_start = self.metrics_path.map(|_| Instant::now());
             let mut scheduled = 0usize;
             for _ in 0..self.data_shards {
                 if let Some((i, reader)) = reader_iter.next() {
@@ -722,11 +724,7 @@ where
                 completed += 1;
                 if !first_shard_recorded {
                     if let Some(path) = self.metrics_path {
-                        rustfs_io_metrics::record_get_object_stage_duration(
-                            path,
-                            GET_STAGE_STRIPE_READ_FIRST_SHARD,
-                            stripe_read_start.elapsed().as_secs_f64(),
-                        );
+                        record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_FIRST_SHARD, stripe_read_start);
                     }
                     first_shard_recorded = true;
                 }
@@ -876,11 +874,7 @@ where
             }
 
             if let Some(path) = self.metrics_path {
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    path,
-                    GET_STAGE_STRIPE_READ_QUORUM,
-                    stripe_read_start.elapsed().as_secs_f64(),
-                );
+                record_get_stage_duration_if_enabled(path, GET_STAGE_STRIPE_READ_QUORUM, stripe_read_start);
                 rustfs_io_metrics::record_get_object_shard_read_fanout(path, scheduled, completed, success, failed);
                 if locality_preference_enabled {
                     let remote_avoided = remote_available.saturating_sub(remote_scheduled);
@@ -1038,9 +1032,11 @@ where
         offset = 0;
 
         let write_len = write_left.min(block_slice.len());
-        let write_stage_start = Instant::now();
+        let write_stage_start = get_stage_timer_if_enabled(rustfs_io_metrics::get_stage_metrics_enabled());
         if let Err(e) = writer.write_all(&block_slice[..write_len]).await {
-            rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+            if let Some(write_stage_start) = write_stage_start {
+                rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+            }
             let reason = classify_io_error(&e);
             record_get_object_pipeline_failure(GET_STAGE_EMIT, reason);
             error!(
@@ -1054,7 +1050,9 @@ where
             );
             return Err(e);
         }
-        rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+        if let Some(write_stage_start) = write_stage_start {
+            rustfs_io_metrics::record_get_object_duplex_backpressure_duration(write_stage_start.elapsed().as_secs_f64());
+        }
 
         total_written += write_len;
         write_left -= write_len;
@@ -1180,13 +1178,10 @@ impl Erasure {
                 break;
             }
 
-            let stripe_read_stage_start = Instant::now();
+            let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+            let stripe_read_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let (mut shards, errs) = reader.read().await;
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "legacy_duplex",
-                "stripe_read",
-                stripe_read_stage_start.elapsed().as_secs_f64(),
-            );
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_STRIPE_READ, stripe_read_stage_start);
 
             if ret_err.is_none()
                 && let (_, Some(err)) = reduce_errs(&errs, &[])
@@ -1216,12 +1211,12 @@ impl Erasure {
             // Decode the shards. If this stripe needed parity to reconstruct a
             // missing data shard and an extra source shard was available, verify
             // the reconstructed data against that source before streaming bytes.
-            let reconstruct_stage_start = Instant::now();
+            let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             if let Err(e) = self.decode_data_with_reconstruction_verification(&mut shards) {
-                rustfs_io_metrics::record_get_object_stage_duration(
-                    "legacy_duplex",
-                    "reconstruct",
-                    reconstruct_stage_start.elapsed().as_secs_f64(),
+                record_get_stage_duration_if_enabled(
+                    GET_OBJECT_PATH_LEGACY_DUPLEX,
+                    GET_STAGE_RECONSTRUCT,
+                    reconstruct_stage_start,
                 );
                 let reason = GetObjectFailureReason::DecodeError;
                 error!(
@@ -1238,28 +1233,16 @@ impl Erasure {
                 ret_err = Some(e);
                 break;
             }
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "legacy_duplex",
-                "reconstruct",
-                reconstruct_stage_start.elapsed().as_secs_f64(),
-            );
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
-            let emit_stage_start = Instant::now();
+            let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let n = match write_data_blocks(writer, &shards, self.data_shards, block_offset, block_length).await {
                 Ok(n) => {
-                    rustfs_io_metrics::record_get_object_stage_duration(
-                        "legacy_duplex",
-                        "emit",
-                        emit_stage_start.elapsed().as_secs_f64(),
-                    );
+                    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
                     n
                 }
                 Err(e) => {
-                    rustfs_io_metrics::record_get_object_stage_duration(
-                        "legacy_duplex",
-                        "emit",
-                        emit_stage_start.elapsed().as_secs_f64(),
-                    );
+                    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_EMIT, emit_stage_start);
                     error!(
                         block_offset,
                         block_length,
@@ -1622,6 +1605,24 @@ mod tests {
 
         assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2, 3, 4]);
         assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), true), vec![1, 3, 2, 0, 4]);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn parallel_reader_drops_metrics_path_when_stage_metrics_disabled() {
+        let erasure = Erasure::new(2, 1, 32);
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = vec![None, None, None];
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+        let reader = ParallelReader::new_with_metrics_path(readers, erasure.clone(), 0, 1, Some(GET_OBJECT_PATH_LEGACY_DUPLEX));
+        assert_eq!(reader.metrics_path, None);
+
+        let readers: Vec<Option<BitrotReader<Cursor<Vec<u8>>>>> = vec![None, None, None];
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let reader = ParallelReader::new_with_metrics_path(readers, erasure, 0, 1, Some(GET_OBJECT_PATH_LEGACY_DUPLEX));
+        assert_eq!(reader.metrics_path, Some(GET_OBJECT_PATH_LEGACY_DUPLEX));
+
+        rustfs_io_metrics::set_get_stage_metrics_enabled(false);
     }
 
     #[tokio::test]

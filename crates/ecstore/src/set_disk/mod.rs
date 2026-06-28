@@ -171,10 +171,10 @@ const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
-static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
-static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 
 use crate::io_support::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -355,6 +355,9 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: u32 = 100;
 const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 
+const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
+
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
@@ -472,13 +475,43 @@ fn is_get_codec_streaming_enabled() -> bool {
 /// When enabled, multipart objects use per-part codec streaming
 /// instead of falling back to the legacy duplex path.
 fn is_codec_streaming_multipart_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
             DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+            )
+        })
+    }
+}
+
+fn get_codec_streaming_multipart_max_parts() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+            )
+        })
+    }
 }
 
 /// Check if metadata early-stop is enabled (base flag).
@@ -506,10 +539,17 @@ fn is_version_early_stop_enabled() -> bool {
 // --- Rollout Percentage Functions ---
 
 fn get_codec_streaming_rollout_pct() -> u32 {
-    static CACHED: OnceLock<u32> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<u32> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_u32(ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT)
+        })
+    }
 }
 
 fn get_metadata_early_stop_rollout_pct() -> u32 {
@@ -545,7 +585,6 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
 
     (hash as u32) < rollout_pct
 }
-
 /// Should this specific request use codec streaming?
 pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
     let base = is_get_codec_streaming_enabled();
@@ -633,6 +672,7 @@ impl GetCodecStreamingRollout {
 enum GetCodecStreamingFallbackReason {
     Disabled,
     RolloutNotOptedIn,
+    RolloutPctNotSelected,
     BodyCompatibilityUnconfirmed,
     HeaderCompatibilityUnconfirmed,
     LockOptimizationDisabled,
@@ -644,6 +684,7 @@ enum GetCodecStreamingFallbackReason {
     Multipart,
     InvalidMinSize,
     ReadQuorumNotSafe,
+    MultipartPartLimit,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -651,6 +692,7 @@ impl GetCodecStreamingFallbackReason {
         match self {
             Self::Disabled => "disabled",
             Self::RolloutNotOptedIn => "rollout_not_opted_in",
+            Self::RolloutPctNotSelected => "rollout_pct_not_selected",
             Self::BodyCompatibilityUnconfirmed => "body_compatibility_unconfirmed",
             Self::HeaderCompatibilityUnconfirmed => "header_compatibility_unconfirmed",
             Self::LockOptimizationDisabled => "lock_optimization_disabled",
@@ -662,6 +704,7 @@ impl GetCodecStreamingFallbackReason {
             Self::Multipart => "multipart",
             Self::InvalidMinSize => "invalid_min_size",
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
+            Self::MultipartPartLimit => "multipart_part_limit",
         }
     }
 }
@@ -732,6 +775,8 @@ fn classify_get_codec_streaming_object_class(
 }
 
 fn get_codec_streaming_reader_gate(
+    bucket: &str,
+    object: &str,
     range: &Option<HTTPRangeSpec>,
     object_info: &ObjectInfo,
     fi: &FileInfo,
@@ -749,6 +794,12 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
+        };
+    }
+    if !should_use_codec_streaming(bucket, object) {
+        return GetCodecStreamingGate {
+            object_class,
+            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
         };
     }
     if !is_get_codec_streaming_body_compat_confirmed() {
@@ -807,10 +858,18 @@ fn get_codec_streaming_reader_gate(
         };
     }
     if object_class == GetCodecStreamingObjectClass::Multipart {
-        return GetCodecStreamingGate {
-            object_class,
-            decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
-        };
+        if !is_codec_streaming_multipart_enabled() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+            };
+        }
+        if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
+            };
+        }
     }
 
     GetCodecStreamingGate {
@@ -1615,7 +1674,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
-        let codec_streaming_gate = get_codec_streaming_reader_gate(&range, &object_info, &fi, lock_optimization_enabled);
+        let codec_streaming_gate =
+            get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
 
         if object_info.is_remote() {
             if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
@@ -1826,7 +1886,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         let result: Result<ObjectInfo> = async {
             let erasure =
-                crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+                coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
@@ -2411,10 +2471,10 @@ impl SetDisks {
                                 }
                             }
                             Ok((_client_idx, Err(err))) => {
-                                tracing::warn!("late distributed delete lock batch request failed: {}", err);
+                                warn!("late distributed delete lock batch request failed: {}", err);
                             }
                             Err(err) => {
-                                tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                                warn!("late distributed delete lock batch task join failed: {}", err);
                             }
                         }
                     }
@@ -2426,7 +2486,7 @@ impl SetDisks {
                         } else {
                             Some(async move {
                                 if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                                    tracing::warn!(
+                                    warn!(
                                         client_idx,
                                         lock_count = lock_ids.len(),
                                         "failed to cleanup late distributed delete locks in batch: {}",
@@ -2488,7 +2548,7 @@ impl SetDisks {
             } else {
                 Some(async move {
                     if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                        tracing::warn!(
+                        warn!(
                             client_idx,
                             lock_count = lock_ids.len(),
                             "failed to release distributed delete locks in batch: {}",
@@ -3588,7 +3648,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = dest_obj {
             return Err(to_object_err(err, vec![]));
         }
-        let dest_obj = dest_obj.unwrap();
+        let dest_obj = dest_obj?;
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         let mut transition_meta = (*oi.user_defined).clone();
@@ -3721,7 +3781,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
-        let (actual_fi, _, _) = fi.unwrap();
+        let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
@@ -3733,7 +3793,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
-            let gr = gr.unwrap();
+            let gr = gr?;
             let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
@@ -4159,7 +4219,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
         let erasure =
-            crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
         let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -5853,7 +5913,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
             if runtime_state.should_probe_for_admin()
-                || runtime_state == crate::disk::health_state::RuntimeDriveHealthState::Suspect
+                || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect
             {
                 match disk.disk_info(&DiskInfoOptions::default()).await {
                     Ok(res) => {
@@ -5946,7 +6006,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
 
 fn build_runtime_snapshot_disk(
     endpoint: &Endpoint,
-    runtime_state: crate::disk::health_state::RuntimeDriveHealthState,
+    runtime_state: disk::health_state::RuntimeDriveHealthState,
     offline_duration_seconds: Option<u64>,
     capacity_snapshot: Option<(u64, u64, u64, u64)>,
 ) -> rustfs_madmin::Disk {
@@ -6809,7 +6869,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.copy_object(
                 "bucket",
@@ -6881,7 +6941,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6919,7 +6979,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6952,7 +7012,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6987,7 +7047,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_millis(50),
             set_disks.delete_object(
                 "bucket",
@@ -7617,11 +7677,11 @@ mod tests {
             disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
         }
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
         let err = set_disks
             .list_path(
                 CancellationToken::new(),
-                crate::store::list_objects::ListPathOptions {
+                ListPathOptions {
                     bucket: "bucket".to_string(),
                     recursive: true,
                     ..Default::default()
@@ -7675,7 +7735,7 @@ mod tests {
 
         disk.make_volume(bucket).await.expect("bucket should be created");
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-xl-meta"))
+        disk.write_all(bucket, &metadata_path, Bytes::from_static(b"not-xl-meta"))
             .await
             .expect("corrupt metadata file should be written");
 
@@ -7730,7 +7790,7 @@ mod tests {
 
         disk.make_volume(bucket).await.expect("bucket should be created");
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+        disk.write_all(bucket, &metadata_path, Bytes::from_static(b"not-an-xl-meta"))
             .await
             .expect("metadata file should be created");
 
@@ -7768,7 +7828,7 @@ mod tests {
                 assert_eq!(walk_err, DiskError::Timeout);
                 assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                let (tx, mut rx) = mpsc::channel::<MetaCacheEntry>(4);
                 set_disks
                     .list_path(
                         CancellationToken::new(),
@@ -7819,7 +7879,7 @@ mod tests {
         let object = "config/iam/sts/test/identity.json";
 
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+        disk.write_all(RUSTFS_META_BUCKET, &metadata_path, Bytes::from_static(b"not-an-xl-meta"))
             .await
             .expect("system path metadata file should be created");
 
@@ -7858,7 +7918,7 @@ mod tests {
                 assert_eq!(walk_err, DiskError::Timeout);
                 assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                let (tx, mut rx) = mpsc::channel::<MetaCacheEntry>(4);
                 set_disks
                     .list_path(
                         CancellationToken::new(),
@@ -8302,7 +8362,7 @@ mod tests {
         fi.size = payload.len() as i64;
         fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
 
-        let erasure = crate::erasure::coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -8587,7 +8647,7 @@ mod tests {
                 .await
                 .expect("format should be saved");
 
-            std::mem::forget(dir);
+            mem::forget(dir);
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }
@@ -8637,7 +8697,7 @@ mod tests {
                     .expect("format should be saved");
             }
 
-            std::mem::forget(dir);
+            mem::forget(dir);
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }

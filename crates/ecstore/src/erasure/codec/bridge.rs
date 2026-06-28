@@ -16,9 +16,14 @@ use crate::erasure::codec::workspace::RustfsCodecDecodeWorkspace;
 use crate::erasure::coding::Erasure;
 use reed_solomon_erasure::galois_8::ReedSolomon;
 use std::io;
+use std::sync::{Arc, OnceLock};
 
 pub(crate) const GET_CODEC_STREAMING_ENGINE_LEGACY: &str = "legacy";
 pub(crate) const GET_CODEC_STREAMING_ENGINE_RUSTFS: &str = "rustfs";
+pub(crate) const GET_RECONSTRUCT_OUTCOME_LEGACY_CALLED: &str = "legacy_called";
+pub(crate) const GET_RECONSTRUCT_OUTCOME_RUSTFS_CALLED: &str = "rustfs_called";
+pub(crate) const GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE: &str = "skip_data_complete";
+pub(crate) const GET_RECONSTRUCT_OUTCOME_SKIP_EMPTY_PAYLOAD: &str = "skip_empty_payload";
 
 pub(crate) trait DecodeWorkspace: Send + Sync + 'static {
     fn shard_len(&self) -> usize;
@@ -30,13 +35,14 @@ pub(crate) trait ErasureDecodeEngine: Send + Sync + 'static {
     fn data_shards(&self) -> usize;
     fn parity_shards(&self) -> usize;
     fn block_size(&self) -> usize;
+    fn engine_name(&self) -> &'static str;
 
     fn supports_progressive_decode(&self) -> bool;
     fn supports_aligned_shards(&self) -> bool;
 
     fn prepare_workspace(&self, shard_len: usize) -> io::Result<Self::Workspace>;
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<()>;
+    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str>;
 }
 
 fn data_shards_complete(shards: &[Option<Vec<u8>>], data_shards: usize) -> bool {
@@ -126,6 +132,10 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
         self.erasure.block_size
     }
 
+    fn engine_name(&self) -> &'static str {
+        GET_CODEC_STREAMING_ENGINE_LEGACY
+    }
+
     fn supports_progressive_decode(&self) -> bool {
         false
     }
@@ -138,12 +148,13 @@ impl ErasureDecodeEngine for LegacyEcDecodeEngine {
         Ok(LegacyDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<()> {
+    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.erasure.data_shards) {
-            return Ok(());
+            return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
 
-        self.erasure.decode_data_with_reconstruction_verification(shards)
+        self.erasure.decode_data_with_reconstruction_verification(shards)?;
+        Ok(GET_RECONSTRUCT_OUTCOME_LEGACY_CALLED)
     }
 }
 
@@ -152,25 +163,73 @@ pub(crate) struct RustfsCodecDecodeEngine {
     data_shards: usize,
     parity_shards: usize,
     block_size: usize,
-    codec: Option<ReedSolomon>,
+    codec: OnceLock<Arc<ReedSolomon>>,
 }
 
 impl RustfsCodecDecodeEngine {
     pub(crate) fn new(erasure: &Erasure) -> io::Result<Self> {
-        let codec = if erasure.parity_shards > 0 {
-            ReedSolomon::new(erasure.data_shards, erasure.parity_shards)
-                .map_err(|err| io::Error::other(format!("Failed to create RustFS codec decode engine: {err:?}")))
-                .map(Some)?
-        } else {
-            None
-        };
-
         Ok(Self {
             data_shards: erasure.data_shards,
             parity_shards: erasure.parity_shards,
             block_size: erasure.block_size,
-            codec,
+            codec: OnceLock::new(),
         })
+    }
+
+    fn codec(&self) -> io::Result<Option<Arc<ReedSolomon>>> {
+        if self.parity_shards == 0 {
+            return Ok(None);
+        }
+
+        if let Some(codec) = self.codec.get() {
+            return Ok(Some(Arc::clone(codec)));
+        }
+
+        let codec = Arc::new(
+            ReedSolomon::new(self.data_shards, self.parity_shards)
+                .map_err(|err| io::Error::other(format!("Failed to create RustFS codec decode engine: {err:?}")))?,
+        );
+        if self.codec.set(Arc::clone(&codec)).is_err() {
+            return Ok(self.codec.get().map(Arc::clone).or(Some(codec)));
+        }
+        Ok(Some(codec))
+    }
+
+    fn needs_source_parity_verification(&self, shards: &[Option<Vec<u8>>]) -> bool {
+        let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
+        let available_shards = shards.iter().filter(|shard| shard.is_some()).count();
+        missing_data_source && available_shards > self.data_shards
+    }
+
+    fn verify_source_parity(&self, codec: &ReedSolomon, shards: &[Option<Vec<u8>>], needs_verification: bool) -> io::Result<()> {
+        if !needs_verification {
+            return Ok(());
+        }
+
+        let mut shard_refs = Vec::with_capacity(self.data_shards + self.parity_shards);
+        for (index, shard) in shards.iter().enumerate() {
+            let shard = shard.as_ref().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing shard {index} after RustFS codec reconstruction"),
+                )
+            })?;
+            shard_refs.push(shard.as_slice());
+        }
+
+        let valid = codec
+            .verify(&shard_refs)
+            .map_err(|err| io::Error::other(format!("RustFS codec verify failed: {err:?}")))?;
+        if !valid {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "inconsistent read source shards"));
+        }
+
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn codec_is_initialized(&self) -> bool {
+        self.codec.get().is_some()
     }
 }
 
@@ -189,6 +248,10 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
         self.block_size
     }
 
+    fn engine_name(&self) -> &'static str {
+        GET_CODEC_STREAMING_ENGINE_RUSTFS
+    }
+
     fn supports_progressive_decode(&self) -> bool {
         false
     }
@@ -201,21 +264,23 @@ impl ErasureDecodeEngine for RustfsCodecDecodeEngine {
         Ok(RustfsCodecDecodeWorkspace::new(shard_len))
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<()> {
+    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], _workspace: &mut Self::Workspace) -> io::Result<&'static str> {
         if data_shards_complete(shards, self.data_shards) {
-            return Ok(());
+            return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE);
         }
         if recover_empty_payload_data_shards(shards, self.data_shards, self.parity_shards)? {
-            return Ok(());
+            return Ok(GET_RECONSTRUCT_OUTCOME_SKIP_EMPTY_PAYLOAD);
         }
 
-        if let Some(codec) = &self.codec {
+        if let Some(codec) = self.codec()? {
+            let needs_source_parity_verification = self.needs_source_parity_verification(shards);
             codec
                 .reconstruct_data_opt(shards)
-                .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))
-        } else {
-            Ok(())
+                .map_err(|err| io::Error::other(format!("RustFS codec reconstruct failed: {err:?}")))?;
+            self.verify_source_parity(&codec, shards, needs_source_parity_verification)?;
         }
+
+        Ok(GET_RECONSTRUCT_OUTCOME_RUSTFS_CALLED)
     }
 }
 
@@ -273,6 +338,13 @@ impl ErasureDecodeEngine for CodecStreamingDecodeEngine {
         }
     }
 
+    fn engine_name(&self) -> &'static str {
+        match self {
+            Self::Legacy(engine) => engine.engine_name(),
+            Self::Rustfs(engine) => engine.engine_name(),
+        }
+    }
+
     fn supports_progressive_decode(&self) -> bool {
         match self {
             Self::Legacy(engine) => engine.supports_progressive_decode(),
@@ -294,7 +366,7 @@ impl ErasureDecodeEngine for CodecStreamingDecodeEngine {
         }
     }
 
-    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<()> {
+    fn reconstruct_into(&self, shards: &mut [Option<Vec<u8>>], workspace: &mut Self::Workspace) -> io::Result<&'static str> {
         match (self, workspace) {
             (Self::Legacy(engine), CodecStreamingDecodeWorkspace::Legacy(workspace)) => {
                 engine.reconstruct_into(shards, workspace)
@@ -325,7 +397,7 @@ mod tests {
         E: ErasureDecodeEngine,
     {
         let mut workspace = engine.prepare_workspace(4)?;
-        engine.reconstruct_into(shards, &mut workspace)
+        engine.reconstruct_into(shards, &mut workspace).map(|_| ())
     }
 
     #[test]
@@ -393,8 +465,10 @@ mod tests {
         let before = shards.clone();
 
         let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        assert!(!engine.codec_is_initialized());
         reconstruct_with(&engine, &mut shards).expect("complete data shards should not reconstruct");
 
+        assert!(!engine.codec_is_initialized());
         assert_eq!(shards, before);
     }
 
@@ -444,6 +518,46 @@ mod tests {
 
         assert!(reconstruct_with(&legacy, &mut legacy_shards).is_err());
         assert!(reconstruct_with(&rustfs, &mut rustfs_shards).is_err());
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_rejects_inconsistent_reconstruction_sources() {
+        let erasure = Erasure::new(2, 2, 32);
+        let encoded = erasure
+            .encode_data(&(0u8..64u8).collect::<Vec<_>>())
+            .expect("test stripe should encode");
+        let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        shards[0] = None;
+        let Some(corrupt_parity) = shards[erasure.data_shards].as_mut() else {
+            panic!("test parity shard should be present");
+        };
+        corrupt_parity[0] ^= 0x80;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let err = reconstruct_with(&engine, &mut shards).expect_err("rustfs codec should reject inconsistent sources");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
+    }
+
+    #[test]
+    fn rustfs_codec_decode_engine_rejects_stale_data_source() {
+        let erasure = Erasure::new(4, 2, 32);
+        let encoded = erasure
+            .encode_data(&(0u8..128u8).collect::<Vec<_>>())
+            .expect("test stripe should encode");
+        let mut shards = encoded.into_iter().map(|shard| Some(shard.to_vec())).collect::<Vec<_>>();
+        shards[0] = None;
+        let Some(stale_data) = shards[1].as_mut() else {
+            panic!("test data shard should be present");
+        };
+        stale_data[0] ^= 0x40;
+
+        let engine = RustfsCodecDecodeEngine::new(&erasure).expect("engine should be created");
+        let err = reconstruct_with(&engine, &mut shards).expect_err("rustfs codec should reject stale data sources");
+
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
     }
 
     #[test]
