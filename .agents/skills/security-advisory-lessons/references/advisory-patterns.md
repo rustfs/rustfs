@@ -68,6 +68,7 @@ Update this file only when an advisory adds or changes a reusable lesson, affect
 ### Browser, CORS, and console isolation
 
 - `GHSA-v9fg-3cr2-277j`: object preview rendered attacker-controlled HTML in a same-origin iframe, exposing console credentials stored in `localStorage`. Lesson: user content must be origin-isolated from the console and protected with `nosniff`, CSP, and strict content-type handling.
+- `GHSA-7gcx-wg4x-q9x6`: an incomplete preview fix reintroduced extension-based PDF detection and bypassed the sandboxed fallback for attacker-controlled content. Lesson: browser-surface fixes need regression tests for alternate viewers and file-type branches, and preview trust must come from validated content type plus sandboxing rather than object names.
 - `GHSA-x5xv-223c-8vm7`: default CORS reflected arbitrary origins with credentials. Lesson: never combine reflected origins with `Access-Control-Allow-Credentials: true`; default should be fail-closed.
 
 ### Trusted proxy and source IP conditions
