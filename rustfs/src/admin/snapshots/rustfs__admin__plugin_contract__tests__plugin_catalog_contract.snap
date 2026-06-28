@@ -1,0 +1,45 @@
+---
+source: rustfs/src/admin/plugin_contract.rs
+expression: value
+---
+{
+  "admin_discovery": {
+    "clusterSnapshot": "/rustfs/admin/v4/cluster/snapshot",
+    "extensionsCatalog": "/rustfs/admin/v4/extensions/catalog",
+    "runtimeCapabilities": "/rustfs/admin/v4/runtime/capabilities"
+  },
+  "plugins": [
+    {
+      "api_compatibility_version": "rustfs.target-plugin.v1",
+      "display_name": "Webhook",
+      "distribution": null,
+      "domain_configs": [
+        {
+          "domain": "notify",
+          "subsystem": "notify_webhook",
+          "valid_fields": [
+            "endpoint",
+            "auth_token"
+          ]
+        }
+      ],
+      "entrypoint_kind": "builtin",
+      "packaging": "builtin",
+      "plugin_id": "builtin:webhook",
+      "provider": "rustfs",
+      "runtime_contract": {
+        "protocol_version": "rustfs.target-runtime.v1",
+        "transport": "in_process"
+      },
+      "secret_fields": [
+        "auth_token"
+      ],
+      "supported_domains": [
+        "audit",
+        "notify"
+      ],
+      "target_type": "webhook",
+      "version": "1.0.0"
+    }
+  ]
+}

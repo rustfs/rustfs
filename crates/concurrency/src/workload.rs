@@ -181,7 +181,25 @@ pub trait WorkloadAdmissionSnapshotProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn workload_contract_covers_required_classes() {
@@ -211,6 +229,10 @@ mod tests {
         );
         let registry = WorkloadAdmissionRegistrySnapshot::new(vec![unknown.clone(), open.clone()]);
 
+        insta::assert_json_snapshot!(
+            "workload_admission_registry_snapshot",
+            sorted_json_value(serde_json::to_value(&registry).expect("workload admission registry should serialize"))
+        );
         assert_eq!(registry.entries(), &[unknown, open]);
         assert_eq!(
             registry.get(WorkloadClass::Scanner).map(|snapshot| snapshot.state),
@@ -262,8 +284,9 @@ mod tests {
         let snapshot = WorkloadAdmissionSnapshot::new(WorkloadClass::ForegroundWrite, AdmissionState::Disabled)
             .with_counts(Some(0), Some(0), Some(0))
             .with_reason("foreground write admission not exposed");
-        let encoded = serde_json::to_value(&snapshot).expect("serialize workload admission snapshot");
+        let encoded = sorted_json_value(serde_json::to_value(&snapshot).expect("serialize workload admission snapshot"));
 
+        insta::assert_json_snapshot!("workload_admission_snapshot", encoded);
         assert_eq!(encoded["class"], json!("foreground_write"));
         assert_eq!(encoded["state"], json!("disabled"));
 
