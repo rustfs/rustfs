@@ -237,10 +237,10 @@ impl PutObjectOptions {
             if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
             {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
-                    header.insert(header_name, HeaderValue::from_str(&v).unwrap());
+                    header.insert(header_name, HeaderValue::from_str(&v).expect("operation should succeed"));
                 }
             } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{}", k).as_bytes()) {
-                header.insert(header_name, HeaderValue::from_str(&v).unwrap());
+                header.insert(header_name, HeaderValue::from_str(&v).expect("operation should succeed"));
             }
         }
 
@@ -376,7 +376,7 @@ impl TransitionClient {
 
             let mut md5_base64: String = "".to_string();
             if opts.send_content_md5 {
-                if let Some(mut md5_hasher) = self.md5_hasher.lock().unwrap().as_mut() {
+                if let Some(mut md5_hasher) = self.md5_hasher.lock().expect("operation should succeed").as_mut() {
                     let hash = md5_hasher.hash_encode(&buf[..length]);
                     md5_base64 = base64_encode(hash.as_ref());
                 }

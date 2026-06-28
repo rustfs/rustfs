@@ -36,7 +36,7 @@ impl ECStore {
                 //     if disk.is_none() {
                 //         continue;
                 //     }
-                //     // let disk = disk.as_ref().unwrap().clone();
+                //     // let disk = disk.as_ref().expect("operation should succeed").clone();
                 //     // futures.push(disk.delete(
                 //     //     bucket,
                 //     //     prefix,
@@ -315,7 +315,7 @@ impl ECStore {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
             }
 
-            let err = pinfo.err.as_ref().unwrap();
+            let err = pinfo.err.as_ref().expect("operation should succeed");
 
             if err == &Error::ErasureReadQuorum && !opts.metadata_chg {
                 return Ok((pinfo.clone(), self.pools_with_object(&ress, opts).await));
@@ -460,7 +460,7 @@ impl ECStore {
 
         let mut pool_meta = self.pool_meta.write().await;
         *pool_meta = meta;
-        // *self.pool_meta.write().unwrap() = meta;
+        // *self.pool_meta.write().expect("operation should succeed") = meta;
         Ok(())
     }
 
@@ -638,7 +638,7 @@ mod tests {
 
     fn object_info_with_mod_time(unix_ts: i64, delete_marker: bool) -> ObjectInfo {
         ObjectInfo {
-            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).unwrap()),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(unix_ts).expect("operation should succeed")),
             delete_marker,
             ..Default::default()
         }
@@ -660,7 +660,7 @@ mod tests {
         ];
 
         let (info, idx) =
-            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).expect("operation should succeed");
 
         assert_eq!(idx, 1);
         assert!(info.delete_marker);
@@ -681,7 +681,7 @@ mod tests {
             },
         ];
 
-        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).unwrap();
+        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).expect("operation should succeed");
 
         assert_eq!(idx, 1);
     }

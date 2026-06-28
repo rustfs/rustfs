@@ -112,7 +112,7 @@ pub fn set_global_rustfs_port(value: u16) {
 /// * None
 ///
 pub fn set_global_deployment_id(id: Uuid) {
-    globalDeploymentIDPtr.set(id).unwrap();
+    globalDeploymentIDPtr.set(id).expect("operation should succeed");
 }
 
 /// Get the global deployment id
@@ -274,7 +274,7 @@ pub(crate) type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// # Returns
 /// * None
 pub fn set_global_region(region: s3s::region::Region) {
-    GLOBAL_REGION.set(region).unwrap();
+    GLOBAL_REGION.set(region).expect("operation should succeed");
 }
 
 /// Get the global region
