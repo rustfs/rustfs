@@ -398,6 +398,13 @@ rustfs/backlog#724
 rustfs/backlog#725
 rustfs/backlog#726
 rustfs/backlog#727
+rustfs/backlog#758
+rustfs/backlog#759
+rustfs/backlog#760
+rustfs/backlog#761
+rustfs/backlog#762
+rustfs/backlog#763
+rustfs/backlog#764
 EOF
 }
 
@@ -428,10 +435,17 @@ Relevant focused proof points:
 - set_disk::read::tests::codec_streaming_reader_gate_requires_explicit_rollout_and_compat_confirmation
 - set_disk::read::tests::codec_streaming_reader_gate_is_conservative
 - set_disk::read::tests::codec_streaming_reader_build_falls_back_when_read_quorum_is_not_safe
+- erasure::codec::bridge::tests::rustfs_codec_decode_engine_rejects_inconsistent_reconstruction_sources
+- erasure::codec::bridge::tests::rustfs_codec_decode_engine_rejects_stale_data_source
+- erasure::coding::decode_reader::tests::erasure_decode_reader_rustfs_engine_recovers_after_bitrot_source_mismatch
+- rustfs_io_get_object_reconstruct_outcome_total{path,engine,outcome}
 
 Conclusion:
 - range / encrypted / compressed / multipart / remote objects remain on legacy fallback paths
 - degraded reader setup remains opt-out via read_quorum_not_safe
+- codec-rustfs remains explicit opt-in through RUSTFS_GET_CODEC_STREAMING_ENGINE=rustfs
+- healthy codec-rustfs reads should report skip_data_complete instead of rustfs_called
+- rustfs_called is reserved for explicit reconstruction test/probe coverage and must not be required for healthy-read rollout
 - env kill switch remains available through RUSTFS_GET_CODEC_STREAMING_ENABLE=false
 EOF
 }
