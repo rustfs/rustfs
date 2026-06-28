@@ -1841,6 +1841,7 @@ mod tests {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::<u8>::new())),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             };
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
@@ -1879,6 +1880,7 @@ mod tests {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(vec![1, 2, 3])),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             };
 
             let mut reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));

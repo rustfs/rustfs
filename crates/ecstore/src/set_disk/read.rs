@@ -1876,6 +1876,9 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        metrics_path: &'static str,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
     ) -> Result<()>
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -2038,6 +2041,13 @@ impl SetDisks {
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                metrics_path,
+                GET_STAGE_READER_SETUP,
+                metrics_object_class,
+                metrics_size_bucket,
+                reader_setup_elapsed.as_secs_f64(),
+            );
             let setup_available_readers = reader_setup.available_shards();
             if reader_setup_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
                 warn!(
@@ -2172,6 +2182,13 @@ impl SetDisks {
                 .await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                metrics_path,
+                GET_STAGE_DECODE,
+                metrics_object_class,
+                metrics_size_bucket,
+                decode_elapsed.as_secs_f64(),
+            );
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
                 warn!(
                     event = EVENT_SET_DISK_READ,

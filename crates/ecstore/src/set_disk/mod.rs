@@ -27,10 +27,10 @@ use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
-    GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
-    GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error,
-    record_get_object_pipeline_failure,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
+    GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
+    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
 };
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
@@ -47,7 +47,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_writer};
+use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::runtime::sources as runtime_sources;
 use crate::services::batch_processor::AsyncBatchProcessor;
@@ -361,6 +361,11 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
 
+const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY";
+const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = false;
+const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD";
+const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD: usize = 128 * 1024;
+
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
@@ -618,6 +623,40 @@ fn get_codec_streaming_min_size() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
 }
 
+fn is_get_small_object_direct_memory_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY, DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY, DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY)
+        })
+    }
+}
+
+fn get_small_object_direct_memory_threshold() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD,
+            DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD,
+                DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD,
+            )
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum GetCodecStreamingEngine {
     Legacy,
@@ -753,7 +792,11 @@ struct GetCodecStreamingGate {
     decision: GetCodecStreamingDecision,
 }
 
-fn record_get_codec_streaming_gate_decision(object_class: GetCodecStreamingObjectClass, decision: GetCodecStreamingDecision) {
+fn record_get_codec_streaming_gate_decision(
+    object_class: GetCodecStreamingObjectClass,
+    decision: GetCodecStreamingDecision,
+    size_bucket: &'static str,
+) {
     let (outcome, reason) = match decision {
         GetCodecStreamingDecision::Use => (
             crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_USE,
@@ -763,7 +806,18 @@ fn record_get_codec_streaming_gate_decision(object_class: GetCodecStreamingObjec
             (crate::diagnostics::get::GET_CODEC_STREAMING_DECISION_FALLBACK, reason.as_str())
         }
     };
-    rustfs_io_metrics::record_get_object_codec_streaming_decision(outcome, object_class.as_str(), reason);
+    let object_class = object_class.as_str();
+    rustfs_io_metrics::record_get_object_codec_streaming_decision(outcome, object_class, reason);
+    rustfs_io_metrics::record_get_object_codec_streaming_decision_by_size(outcome, object_class, reason, size_bucket);
+}
+
+fn record_get_object_reader_path_observation(
+    path: &'static str,
+    object_class: GetCodecStreamingObjectClass,
+    size_bucket: &'static str,
+) {
+    rustfs_io_metrics::record_get_object_reader_path(path);
+    rustfs_io_metrics::record_get_object_reader_path_by_size(path, object_class.as_str(), size_bucket);
 }
 
 fn classify_get_codec_streaming_object_class(
@@ -787,6 +841,59 @@ fn classify_get_codec_streaming_object_class(
         return GetCodecStreamingObjectClass::Multipart;
     }
     GetCodecStreamingObjectClass::PlainSinglePart
+}
+
+fn is_get_small_object_direct_memory_eligible_with_threshold(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+    threshold: usize,
+) -> bool {
+    if threshold == 0
+        || range.is_some()
+        || opts.part_number.is_some()
+        || opts.version_id.is_some()
+        || opts.versioned
+        || opts.version_suspended
+        || opts.incl_free_versions
+        || opts.skip_free_version
+        || opts.data_movement
+        || opts.raw_data_movement_read
+        || object_info.delete_marker
+        || object_info.metadata_only
+        || object_info.version_only
+        || object_info.is_encrypted()
+        || object_info.is_compressed()
+        || object_info.is_remote()
+        || object_info.parts.len() != 1
+        || fi.parts.len() != 1
+        || fi.size <= 0
+    {
+        return false;
+    }
+
+    let Ok(object_size) = usize::try_from(fi.size) else {
+        return false;
+    };
+
+    object_size <= threshold
+}
+
+fn is_get_small_object_direct_memory_eligible(
+    range: &Option<HTTPRangeSpec>,
+    object_info: &ObjectInfo,
+    fi: &FileInfo,
+    opts: &ObjectOptions,
+) -> bool {
+    is_get_small_object_direct_memory_enabled()
+        && is_get_small_object_direct_memory_eligible_with_threshold(
+            range,
+            object_info,
+            fi,
+            opts,
+            get_small_object_direct_memory_threshold(),
+        )
 }
 
 fn get_codec_streaming_reader_gate(
@@ -1590,10 +1697,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         let metadata_stage_start = Instant::now();
         let (fi, files, disks) = match self.get_object_fileinfo(bucket, object, opts, true).await {
-            Ok(result) => {
-                rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
-                result
-            }
+            Ok(result) => result,
             Err(err) => {
                 rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_stage_start.elapsed().as_secs_f64());
                 record_get_object_pipeline_failure(GET_STAGE_METADATA, classify_storage_error(&err));
@@ -1601,6 +1705,17 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         };
         let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
+        let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
+        let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
+        let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
+        rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
+        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            GET_STAGE_METADATA,
+            object_class.as_str(),
+            size_bucket,
+            metadata_elapsed,
+        );
 
         if object_info.delete_marker {
             if opts.version_id.is_none() {
@@ -1619,7 +1734,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // }
 
         if object_info.size == 0 {
-            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_EMPTY);
+            record_get_object_reader_path_observation(GET_OBJECT_PATH_EMPTY, object_class, size_bucket);
             // if let Some(rs) = range {
             //     let _ = rs.get_offset_length(object_info.size)?;
             // }
@@ -1627,6 +1742,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             let reader = GetObjectReader {
                 stream: Box::new(Cursor::new(Vec::new())),
                 object_info,
+                buffered_body: Some(Bytes::new()),
             };
             return Ok(reader);
         }
@@ -1669,8 +1785,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
                     if let Some(data) = &file.data {
                         readers.push(
-                            create_bitrot_reader(
-                                Some(data),
+                            create_bitrot_reader_from_bytes(
+                                Some(data.clone()),
                                 None,
                                 bucket,
                                 object,
@@ -1702,10 +1818,12 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     ));
                 }
 
-                rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_INLINE_DIRECT);
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                let body = Bytes::from(output.into_inner());
                 let reader = GetObjectReader {
-                    stream: Box::new(Cursor::new(output.into_inner())),
+                    stream: Box::new(Cursor::new(body.clone())),
                     object_info,
+                    buffered_body: Some(body),
                 };
                 return Ok(reader);
             }
@@ -1716,10 +1834,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
         if object_info.is_remote() {
             if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
-                record_get_codec_streaming_gate_decision(codec_streaming_gate.object_class, codec_streaming_gate.decision);
+                record_get_codec_streaming_gate_decision(
+                    codec_streaming_gate.object_class,
+                    codec_streaming_gate.decision,
+                    size_bucket,
+                );
                 rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
             }
-            rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_REMOTE_TRANSITION);
+            record_get_object_reader_path_observation(GET_OBJECT_PATH_REMOTE_TRANSITION, object_class, size_bucket);
             let mut opts = opts.clone();
             if object_info.parts.len() == 1 {
                 opts.part_number = Some(1);
@@ -1747,6 +1869,45 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             read_lock_guard
         };
 
+        if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {
+            let object_size = usize::try_from(object_info.size)
+                .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
+            let mut output = Vec::with_capacity(object_size);
+            Self::get_object_with_fileinfo(
+                bucket,
+                object,
+                0,
+                object_info.size,
+                &mut output,
+                fi,
+                files,
+                &disks,
+                self.set_index,
+                self.pool_index,
+                opts.skip_verify_bitrot,
+                GET_OBJECT_PATH_DIRECT_MEMORY,
+                object_class.as_str(),
+                size_bucket,
+            )
+            .await?;
+
+            if output.len() != object_size {
+                return Err(to_object_err(
+                    Error::other("direct-memory GET decoded length mismatch"),
+                    vec![bucket, object],
+                ));
+            }
+
+            record_get_object_reader_path_observation(GET_OBJECT_PATH_DIRECT_MEMORY, object_class, size_bucket);
+            let body = Bytes::from(output);
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(body.clone())),
+                object_info,
+                buffered_body: Some(body),
+            };
+            return Ok(reader);
+        }
+
         match codec_streaming_gate.decision {
             GetCodecStreamingDecision::Use => {
                 match Self::get_object_decode_reader_with_fileinfo(
@@ -1765,8 +1926,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Use,
+                            size_bucket,
                         );
-                        rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_CODEC_STREAMING);
+                        record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
                         let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
                         return Ok(reader);
                     }
@@ -1774,18 +1936,23 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         record_get_codec_streaming_gate_decision(
                             codec_streaming_gate.object_class,
                             GetCodecStreamingDecision::Fallback(reason),
+                            size_bucket,
                         );
                         rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
                     }
                 }
             }
             GetCodecStreamingDecision::Fallback(reason) => {
-                record_get_codec_streaming_gate_decision(codec_streaming_gate.object_class, codec_streaming_gate.decision);
+                record_get_codec_streaming_gate_decision(
+                    codec_streaming_gate.object_class,
+                    codec_streaming_gate.decision,
+                    size_bucket,
+                );
                 rustfs_io_metrics::record_get_object_codec_streaming_fallback(reason.as_str());
             }
         }
 
-        rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        record_get_object_reader_path_observation(GET_OBJECT_PATH_LEGACY_DUPLEX, object_class, size_bucket);
 
         let duplex_buffer_size = adaptive_duplex_buffer_size(object_info.size);
         let (rd, wd) = tokio::io::duplex(duplex_buffer_size);
@@ -1821,6 +1988,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 set_index,
                 pool_index,
                 skip_verify,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                object_class.as_str(),
+                size_bucket,
             )
             .await
             {
@@ -3716,6 +3886,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let reader = ReaderImpl::ObjectBody(GetObjectReader {
             stream: Box::new(pr),
             object_info: oi,
+            buffered_body: None,
         });
 
         let cloned_bucket = bucket.to_string();
@@ -3724,6 +3895,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(cloned_fi.size);
         tokio::spawn(async move {
             if let Err(e) = Self::get_object_with_fileinfo(
                 &cloned_bucket,
@@ -3737,6 +3909,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 set_index,
                 pool_index,
                 skip_verify,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+                metrics_size_bucket,
             )
             .await
             {
@@ -8461,6 +8636,111 @@ mod tests {
         assert_eq!(complete_part_checksum(&part, full_object_crc32), Some(Some("AAAAAA==".to_string())));
     }
 
+    fn direct_memory_test_metadata(size: i64) -> (ObjectInfo, FileInfo, ObjectOptions) {
+        let part_size = usize::try_from(size).expect("test size should fit usize");
+        let part = ObjectPartInfo {
+            number: 1,
+            size: part_size,
+            actual_size: size,
+            ..Default::default()
+        };
+        let object_info = ObjectInfo {
+            size,
+            actual_size: size,
+            parts: Arc::new(vec![part]),
+            etag: Some("0123456789abcdef0123456789abcdef".to_string()),
+            ..Default::default()
+        };
+        let mut fi = FileInfo::new("bucket/object", 1, 0);
+        fi.size = size;
+        fi.add_object_part(1, String::new(), part_size, None, size, None, None);
+        (object_info, fi, ObjectOptions::default())
+    }
+
+    #[test]
+    fn small_object_direct_memory_eligibility_is_conservative() {
+        let (object_info, fi, opts) = direct_memory_test_metadata(1024);
+        assert!(is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &object_info,
+            &fi,
+            &opts,
+            128 * 1024
+        ));
+
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &Some(HTTPRangeSpec {
+                start: 0,
+                end: 10,
+                is_suffix_length: false,
+            }),
+            &object_info,
+            &fi,
+            &opts,
+            128 * 1024
+        ));
+
+        let mut part_opts = opts.clone();
+        part_opts.part_number = Some(1);
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &object_info,
+            &fi,
+            &part_opts,
+            128 * 1024
+        ));
+
+        let mut versioned_opts = opts.clone();
+        versioned_opts.versioned = true;
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &object_info,
+            &fi,
+            &versioned_opts,
+            128 * 1024
+        ));
+
+        let mut remote = object_info;
+        remote.transitioned_object.status = TRANSITION_COMPLETE.to_string();
+        remote.transitioned_object.tier = "remote-tier".to_string();
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &remote,
+            &fi,
+            &opts,
+            128 * 1024
+        ));
+    }
+
+    #[test]
+    fn small_object_direct_memory_eligibility_respects_threshold_and_shape() {
+        let (object_info, fi, opts) = direct_memory_test_metadata(128 * 1024);
+        assert!(is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &object_info,
+            &fi,
+            &opts,
+            128 * 1024
+        ));
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &object_info,
+            &fi,
+            &opts,
+            (128 * 1024) - 1
+        ));
+
+        let mut multipart = object_info;
+        multipart.parts = Arc::new(vec![ObjectPartInfo::default(), ObjectPartInfo::default()]);
+        assert!(!is_get_small_object_direct_memory_eligible_with_threshold(
+            &None,
+            &multipart,
+            &fi,
+            &opts,
+            128 * 1024
+        ));
+    }
+
     #[tokio::test]
     async fn range_reads_use_shard_span_length_for_non_zero_offsets() {
         use tokio::io::AsyncReadExt;
@@ -8526,6 +8806,7 @@ mod tests {
         let files = vec![fi.clone()];
         let disks = vec![Some(disk.clone())];
         let (mut reader, mut writer) = tokio::io::duplex(range_length * 2);
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
 
         let read_task = tokio::spawn(async move {
             SetDisks::get_object_with_fileinfo(
@@ -8540,6 +8821,9 @@ mod tests {
                 0,
                 0,
                 true,
+                GET_OBJECT_PATH_LEGACY_DUPLEX,
+                GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+                metrics_size_bucket,
             )
             .await
         });

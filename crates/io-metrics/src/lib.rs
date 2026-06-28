@@ -186,6 +186,25 @@ const SHARD_READ_COST_SAME_NODE: &str = "same_node";
 const SHARD_READ_COST_UNKNOWN: &str = "unknown";
 const LOW_COST_QUORUM_CANDIDATE_FALSE: &str = "false";
 const LOW_COST_QUORUM_CANDIDATE_TRUE: &str = "true";
+pub const GET_OBJECT_SIZE_BUCKET_LE_4_KIB: &str = "le_4kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_16_KIB: &str = "le_16kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_64_KIB: &str = "le_64kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_128_KIB: &str = "le_128kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_1_MIB: &str = "le_1mib";
+pub const GET_OBJECT_SIZE_BUCKET_GT_1_MIB: &str = "gt_1mib";
+
+/// Return the bounded size bucket used by small-object GET diagnostics.
+#[inline(always)]
+pub const fn get_object_size_bucket(size_bytes: i64) -> &'static str {
+    match size_bytes {
+        ..=4_096 => GET_OBJECT_SIZE_BUCKET_LE_4_KIB,
+        4_097..=16_384 => GET_OBJECT_SIZE_BUCKET_LE_16_KIB,
+        16_385..=65_536 => GET_OBJECT_SIZE_BUCKET_LE_64_KIB,
+        65_537..=131_072 => GET_OBJECT_SIZE_BUCKET_LE_128_KIB,
+        131_073..=1_048_576 => GET_OBJECT_SIZE_BUCKET_LE_1_MIB,
+        _ => GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
+    }
+}
 
 fn saturating_sub_atomic(counter: &AtomicU64, bytes: u64) -> u64 {
     let mut current = counter.load(Ordering::Relaxed);
@@ -446,6 +465,28 @@ pub fn record_get_object_stage_duration(path: &'static str, stage: &'static str,
     histogram!("rustfs_io_get_object_stage_duration_seconds", "path" => path, "stage" => stage).record(duration_secs);
 }
 
+/// Record GetObject stage duration with bounded object class and size labels.
+#[inline(always)]
+pub fn record_get_object_stage_duration_by_size(
+    path: &'static str,
+    stage: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    duration_secs: f64,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_stage_duration_seconds_by_size",
+        "path" => path,
+        "stage" => stage,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(duration_secs);
+}
+
 /// Record GetObject metadata fanout duration.
 #[inline(always)]
 pub fn record_get_object_metadata_fanout_duration(path: &'static str, duration_secs: f64) {
@@ -603,6 +644,21 @@ pub fn record_get_object_reader_path(path: &'static str) {
     counter!("rustfs_io_get_object_reader_path_total", "path" => path).increment(1);
 }
 
+/// Record the selected GetObject reader path with bounded object class and size labels.
+#[inline(always)]
+pub fn record_get_object_reader_path_by_size(path: &'static str, object_class: &'static str, size_bucket: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_reader_path_by_size_total",
+        "path" => path,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .increment(1);
+}
+
 /// Record why the codec streaming reader was not selected.
 #[inline(always)]
 pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {
@@ -623,6 +679,27 @@ pub fn record_get_object_codec_streaming_decision(outcome: &'static str, object_
         "outcome" => outcome,
         "object_class" => object_class,
         "reason" => reason
+    )
+    .increment(1);
+}
+
+/// Record the final codec-streaming rollout decision with bounded size attribution.
+#[inline(always)]
+pub fn record_get_object_codec_streaming_decision_by_size(
+    outcome: &'static str,
+    object_class: &'static str,
+    reason: &'static str,
+    size_bucket: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_codec_streaming_decision_by_size_total",
+        "outcome" => outcome,
+        "object_class" => object_class,
+        "reason" => reason,
+        "size_bucket" => size_bucket
     )
     .increment(1);
 }
@@ -1694,10 +1771,13 @@ mod tests {
     #[test]
     fn test_record_get_object_stage_metrics() {
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_stage_duration_by_size("legacy_duplex", "metadata", "plain_single_part", "le_4kib", 0.001);
         record_get_object_reader_path("codec_streaming");
+        record_get_object_reader_path_by_size("codec_streaming", "plain_single_part", "le_1mib");
         record_get_object_codec_streaming_fallback("range");
         record_get_object_codec_streaming_decision("fallback", "range", "range");
         record_get_object_codec_streaming_decision("use", "plain_single_part", "none");
+        record_get_object_codec_streaming_decision_by_size("fallback", "plain_single_part", "below_min_size", "le_128kib");
         record_get_object_reader_stripe("codec_streaming");
         record_get_object_reader_bytes("codec_streaming", 1024);
         record_get_object_reader_buffer("codec_streaming", "output", 1024);
@@ -1794,8 +1874,11 @@ mod tests {
         let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_get_stage_metrics_enabled(true);
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_stage_duration_by_size("legacy_duplex", "metadata", "plain_single_part", "le_4kib", 0.001);
         record_get_object_reader_path("codec_streaming");
+        record_get_object_reader_path_by_size("codec_streaming", "plain_single_part", "le_1mib");
         record_get_object_codec_streaming_fallback("range");
+        record_get_object_codec_streaming_decision_by_size("fallback", "plain_single_part", "below_min_size", "le_128kib");
         record_get_object_reader_stripe("codec_streaming");
         record_get_object_reader_bytes("codec_streaming", 1024);
         record_get_object_reader_buffer("codec_streaming", "output", 1024);
@@ -1838,8 +1921,11 @@ mod tests {
         let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         set_get_stage_metrics_enabled(false);
         record_get_object_stage_duration("s3_handler", "request_context", 0.001);
+        record_get_object_stage_duration_by_size("legacy_duplex", "metadata", "plain_single_part", "le_4kib", 0.001);
         record_get_object_reader_path("codec_streaming");
+        record_get_object_reader_path_by_size("codec_streaming", "plain_single_part", "le_1mib");
         record_get_object_codec_streaming_fallback("range");
+        record_get_object_codec_streaming_decision_by_size("fallback", "plain_single_part", "below_min_size", "le_128kib");
         record_get_object_reader_stripe("codec_streaming");
         record_get_object_reader_bytes("codec_streaming", 1024);
         record_get_object_reader_buffer("codec_streaming", "output", 1024);
@@ -1877,6 +1963,22 @@ mod tests {
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
         assert!(!get_stage_metrics_enabled());
+    }
+
+    #[test]
+    fn test_get_object_size_buckets_match_issue714_matrix() {
+        assert_eq!(get_object_size_bucket(0), GET_OBJECT_SIZE_BUCKET_LE_4_KIB);
+        assert_eq!(get_object_size_bucket(1024), GET_OBJECT_SIZE_BUCKET_LE_4_KIB);
+        assert_eq!(get_object_size_bucket(4096), GET_OBJECT_SIZE_BUCKET_LE_4_KIB);
+        assert_eq!(get_object_size_bucket(4097), GET_OBJECT_SIZE_BUCKET_LE_16_KIB);
+        assert_eq!(get_object_size_bucket(10 * 1024), GET_OBJECT_SIZE_BUCKET_LE_16_KIB);
+        assert_eq!(get_object_size_bucket(16 * 1024), GET_OBJECT_SIZE_BUCKET_LE_16_KIB);
+        assert_eq!(get_object_size_bucket((16 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_64_KIB);
+        assert_eq!(get_object_size_bucket(100 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
+        assert_eq!(get_object_size_bucket(128 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
+        assert_eq!(get_object_size_bucket((128 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
+        assert_eq!(get_object_size_bucket(1024 * 1024), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
+        assert_eq!(get_object_size_bucket((1024 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_GT_1_MIB);
     }
 
     #[test]

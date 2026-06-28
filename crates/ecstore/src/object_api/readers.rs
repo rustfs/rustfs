@@ -277,6 +277,7 @@ impl PutObjReader {
 pub struct GetObjectReader {
     pub stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     pub object_info: ObjectInfo,
+    pub buffered_body: Option<Bytes>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -529,6 +530,7 @@ impl ReadPlan {
                 GetObjectReader {
                     stream: reader,
                     object_info: oi.clone(),
+                    buffered_body: None,
                 },
                 self.storage_offset,
                 self.storage_length,
@@ -582,6 +584,7 @@ impl ReadPlan {
                     GetObjectReader {
                         stream: final_reader,
                         object_info,
+                        buffered_body: None,
                     },
                     self.storage_offset,
                     self.storage_length,
@@ -682,6 +685,7 @@ impl ReadPlan {
                     GetObjectReader {
                         stream: final_reader,
                         object_info,
+                        buffered_body: None,
                     },
                     self.storage_offset,
                     self.storage_length,

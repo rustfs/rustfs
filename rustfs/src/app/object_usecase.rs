@@ -273,6 +273,7 @@ struct GetObjectReadSetup {
     info: ObjectInfo,
     event_info: ObjectInfo,
     final_stream: DynReader,
+    buffered_body: Option<Bytes>,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -1970,13 +1971,16 @@ impl DefaultObjectUsecase {
         }
     }
 
-    fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
-        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(buf.len());
-        let bytes = Bytes::from(buf);
+    fn build_memory_bytes_blob(bytes: Bytes, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes.len());
         Some(StreamingBlob::wrap(bytes_stream(
             MemoryTrackedBytesStream::new(bytes, guard),
             response_content_length as usize,
         )))
+    }
+
+    fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob> {
+        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size)
     }
 
     fn select_stream_buffer_strategy(
@@ -2255,6 +2259,8 @@ impl DefaultObjectUsecase {
         }
 
         let info = reader.object_info;
+        let stream = reader.stream;
+        let buffered_body = reader.buffered_body;
 
         let read_duration = read_start.elapsed();
 
@@ -2342,6 +2348,7 @@ impl DefaultObjectUsecase {
             ssekms_key_id,
             encryption_applied,
             final_stream,
+            buffered_body,
         ) = match sse_decryption(decryption_request).await? {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
@@ -2353,10 +2360,11 @@ impl DefaultObjectUsecase {
                     sse_customer_key_md5,
                     material.kms_key_id,
                     true,
-                    wrap_reader(reader.stream),
+                    wrap_reader(stream),
+                    None,
                 )
             }
-            None => (None, None, None, None, false, wrap_reader(reader.stream)),
+            None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
         };
 
         // Detect inline fast path: data is in memory, no disk I/O semaphore needed.
@@ -2367,6 +2375,7 @@ impl DefaultObjectUsecase {
             info,
             event_info,
             final_stream,
+            buffered_body,
             rs,
             content_type,
             last_modified,
@@ -2536,6 +2545,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
+        buffered_body: Option<Bytes>,
         bucket: &str,
         key: &str,
     ) -> S3Result<Option<StreamingBlob>>
@@ -2575,6 +2585,18 @@ impl DefaultObjectUsecase {
                 bucket,
                 key,
             ));
+        }
+
+        if let Some(buffered_body) = buffered_body {
+            if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
+                warn!(
+                    expected = response_content_length,
+                    actual = buffered_body.len(),
+                    "Buffered GetObject body size mismatch"
+                );
+            }
+
+            return Ok(Self::build_memory_bytes_blob(buffered_body, response_content_length, optimal_buffer_size));
         }
 
         let should_provide_seek_support =
@@ -3297,6 +3319,7 @@ impl DefaultObjectUsecase {
         info: ObjectInfo,
         event_info: ObjectInfo,
         final_stream: DynReader,
+        buffered_body: Option<Bytes>,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -3342,6 +3365,7 @@ impl DefaultObjectUsecase {
             part_number,
             rs.is_some(),
             encryption_applied,
+            buffered_body,
             bucket,
             key,
         )
@@ -3477,6 +3501,7 @@ impl DefaultObjectUsecase {
             info,
             event_info,
             final_stream,
+            buffered_body,
             rs,
             content_type,
             last_modified,
@@ -3514,6 +3539,7 @@ impl DefaultObjectUsecase {
                 info,
                 event_info,
                 final_stream,
+                buffered_body,
                 rs,
                 content_type,
                 last_modified,
@@ -6194,6 +6220,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             "test-bucket",
             "large-object",
         )
@@ -6229,6 +6256,7 @@ mod tests {
             None,
             false,
             true,
+            None,
             "test-bucket",
             "large-encrypted-object",
         )
@@ -6240,6 +6268,42 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             0,
             "large encrypted object response construction should not pre-read object data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_uses_buffered_body_without_reader_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 4,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            4,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"test")),
+            "test-bucket",
+            "direct-memory-object",
+        )
+        .await
+        .expect("build_get_object_body should consume buffered body");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered GetObject body must not be read from the fallback reader"
         );
     }
 
@@ -6884,6 +6948,7 @@ mod tests {
                 info.clone(),
                 info,
                 wrap_reader(tokio::io::empty()),
+                None,
                 None,
                 None,
                 None,
