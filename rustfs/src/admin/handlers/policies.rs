@@ -169,7 +169,7 @@ impl Operation for ListCannedPolicies {
         let body = serde_json::to_vec(&kvs).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -294,8 +294,8 @@ impl Operation for AddCannedPolicy {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -360,7 +360,7 @@ impl Operation for InfoCannedPolicy {
         let body = serde_json::to_vec(&pd).map_err(|e| s3_error!(InternalError, "failed to serialize response: {:?}", e))?;
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
     }
@@ -440,8 +440,8 @@ impl Operation for RemoveCannedPolicy {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -597,8 +597,8 @@ impl Operation for SetPolicyForUserOrGroup {
         }
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }
@@ -932,8 +932,8 @@ async fn handle_builtin_policy_entities(req: S3Request<Body>) -> S3Result<S3Resp
     let (body, content_type) = encode_compatible_admin_payload(&req_path, &cred.secret_key, body)?;
 
     let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, content_type.parse().unwrap());
-    header.insert(CONTENT_LENGTH, body.len().to_string().parse().unwrap());
+    header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    header.insert(CONTENT_LENGTH, body.len().to_string().parse().expect("valid header value"));
     Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
 }
 
@@ -1095,8 +1095,8 @@ async fn handle_builtin_policy_association(req: S3Request<Body>, is_attach: bool
     let (body, content_type) = encode_compatible_admin_payload(&req_path, &cred.secret_key, body)?;
 
     let mut header = HeaderMap::new();
-    header.insert(CONTENT_TYPE, content_type.parse().unwrap());
-    header.insert(CONTENT_LENGTH, body.len().to_string().parse().unwrap());
+    header.insert(CONTENT_TYPE, content_type.parse().expect("valid header value"));
+    header.insert(CONTENT_LENGTH, body.len().to_string().parse().expect("valid header value"));
     Ok(S3Response::with_headers((StatusCode::OK, Body::from(body)), header))
 }
 
