@@ -22,6 +22,7 @@ mod hybrid;
 mod layer;
 mod module_switch;
 mod prefix;
+pub mod rate_limit;
 mod readiness;
 mod runtime;
 pub(crate) mod runtime_sources;
