@@ -1840,6 +1840,13 @@ struct StrongTableCatalogSnapshot {
 #[derive(Clone)]
 pub(crate) struct StrongTableCatalogStore<B> {
     object_backend: B,
+    // Single mutex protecting all catalog state (table_buckets, namespaces, tables, views, commits, idempotency).
+    // This is intentional: many operations require atomic read-modify-write across multiple fields.
+    // Splitting into per-field locks would introduce deadlock risk and complexity.
+    // If lock contention becomes a bottleneck (acquisition time > 10ms), consider:
+    // 1. Using RwLock for read-heavy paths (but most paths need write access)
+    // 2. Splitting into logical groups (e.g., metadata vs commits)
+    // 3. Using optimistic concurrency with version checks
     state: Arc<tokio::sync::Mutex<StrongTableCatalogState>>,
     // Serializes local snapshot mutations; object ETags fence independent store instances.
     write_lock: Arc<tokio::sync::Mutex<()>>,
