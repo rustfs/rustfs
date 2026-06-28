@@ -236,7 +236,8 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").expect("operation should succeed"));
+static ELLIPSES_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").expect("operation should succeed"));
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";

@@ -18,45 +18,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::{CapabilitySnapshotError, CapabilityStatus};
 
+/// Snapshot of observability capabilities and state.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservabilitySnapshot {
+    /// Runtime telemetry capabilities.
     pub runtime_telemetry: CapabilityStatus,
+    /// Userspace profiling capabilities.
     pub userspace_profiling: UserspaceProfilingCapability,
+    /// Memory sampling state.
     pub memory_sampling: MemorySamplingState,
+    /// Platform support information.
     pub platform: PlatformSupport,
 }
 
+/// Capabilities for userspace profiling.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct UserspaceProfilingCapability {
+    /// CPU profiling capability.
     pub cpu: CapabilityStatus,
+    /// Memory profiling capability.
     pub memory: CapabilityStatus,
+    /// Continuous CPU profiling capability.
     pub continuous_cpu: CapabilityStatus,
+    /// Periodic CPU profiling capability.
     pub periodic_cpu: CapabilityStatus,
 }
 
+/// State of memory sampling capabilities.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct MemorySamplingState {
+    /// Process-level memory sampling.
     pub process: CapabilityStatus,
+    /// System-level memory sampling.
     pub system: CapabilityStatus,
+    /// Cgroup-level memory sampling.
     pub cgroup: CapabilityStatus,
 }
 
+/// Platform support information.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlatformSupport {
+    /// Target triple (e.g., x86_64-unknown-linux-gnu).
     pub target_triple: Option<String>,
+    /// Operating system.
     pub os: Option<String>,
+    /// Architecture.
     pub arch: Option<String>,
+    /// Memory allocator capability.
     pub allocator: CapabilityStatus,
+    /// eBPF support.
     pub ebpf: CapabilityStatus,
+    /// NUMA support.
     pub numa: CapabilityStatus,
 }
 
+/// Provider for observability snapshots.
 #[async_trait::async_trait]
 pub trait ObservabilitySnapshotProvider: Send + Sync + Debug {
+    /// Get a snapshot of observability capabilities and state.
     async fn observability_snapshot(&self) -> Result<ObservabilitySnapshot, CapabilitySnapshotError>;
 }
 

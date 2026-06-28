@@ -17,44 +17,69 @@ use std::fmt::Debug;
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
 
+/// Options for creating a new bucket.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct MakeBucketOptions {
+    /// Enable object lock for the bucket.
     pub lock_enabled: bool,
+    /// Enable versioning for the bucket.
     pub versioning_enabled: bool,
+    /// Force creation even if bucket already exists.
     pub force_create: bool,
+    /// Optional creation timestamp.
     pub created_at: Option<OffsetDateTime>,
+    /// Skip acquiring namespace lock.
     pub no_lock: bool,
 }
 
+/// Operation to perform on a bucket during site replication delete.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub enum SRBucketDeleteOp {
+    /// No operation.
     #[default]
     NoOp,
+    /// Mark the bucket for deletion.
     MarkDelete,
+    /// Purge the bucket and all its contents.
     Purge,
 }
 
+/// Options for deleting a bucket.
 #[derive(Debug, Default, Clone)]
 pub struct DeleteBucketOptions {
+    /// Skip acquiring namespace lock.
     pub no_lock: bool,
+    /// Do not recreate bucket on failure.
     pub no_recreate: bool,
+    /// Force deletion even if bucket is not empty.
     pub force: bool,
+    /// Site replication delete operation.
     pub srdelete_op: SRBucketDeleteOp,
 }
 
+/// Options for querying bucket information.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct BucketOptions {
+    /// Include deleted buckets in results.
     pub deleted: bool,
+    /// Use cached bucket information.
     pub cached: bool,
+    /// Skip loading bucket metadata.
     pub no_metadata: bool,
 }
 
+/// Information about a bucket.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BucketInfo {
+    /// Bucket name.
     pub name: String,
+    /// Creation timestamp.
     pub created: Option<OffsetDateTime>,
+    /// Deletion timestamp (if deleted).
     pub deleted: Option<OffsetDateTime>,
+    /// Whether versioning is enabled.
     pub versioning: bool,
+    /// Whether object locking is enabled.
     pub object_locking: bool,
 }
 
