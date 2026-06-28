@@ -427,7 +427,9 @@ impl DataUsageCache {
                 if root.children.is_empty() {
                     return Some(root.clone());
                 }
-                let mut flat = self.flatten(root);
+                let mut visited = HashSet::new();
+                visited.insert(hash_path(path).key());
+                let mut flat = self.flatten_with_guard(root, &mut visited, 0);
                 if flat.replication_stats.as_ref().is_some_and(|stats| stats.empty()) {
                     flat.replication_stats = None;
                 }
@@ -1419,6 +1421,45 @@ mod tests {
         copied.delete_recursive(&root_hash);
         assert!(!copied.cache.contains_key(&root_hash.key()));
         assert!(!copied.cache.contains_key(&child_hash.key()));
+    }
+
+    #[test]
+    fn test_data_usage_cache_flatten_does_not_count_root_twice_in_cycle() {
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(
+            &root_hash,
+            &None,
+            &DataUsageEntry {
+                objects: 1,
+                size: 10,
+                ..Default::default()
+            },
+        );
+        cache.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.cache.entry(child_hash.key()).or_default().add_child(&root_hash);
+
+        let flat = cache.size_recursive("bucket").expect("cyclic cache should still flatten");
+
+        assert_eq!(flat.objects, 3);
+        assert_eq!(flat.size, 30);
+        assert!(flat.children.is_empty());
     }
 
     #[test]
