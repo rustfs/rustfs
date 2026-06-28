@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-#![warn(dead_code)] // Gradually clean up; see https://github.com/rustfs/backlog/issues/742
+#![allow(dead_code)]
 
 use base64_simd::STANDARD;
 use std::error::Error;

@@ -12,38 +12,37 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy I/O configuration constants.
+//! Mmap-based read I/O configuration constants.
 //!
-//! This module defines environment variables and default values for zero-copy
-//! read operations, which use memory mapping (mmap) to avoid data copying.
+//! This module defines environment variables and default values for mmap-based
+//! read operations. Note: despite the "zero_copy" naming in env vars (kept for
+//! backward compatibility), the actual implementation performs mmap-then-copy,
+//! not true zero-copy. See https://github.com/rustfs/backlog/issues/733
 
 // =============================================================================
-// Zero-Copy Configuration
+// Mmap Read Configuration
 // =============================================================================
 
-/// Environment variable for zero-copy read enable.
+/// Environment variable for mmap-based read enable.
 ///
-/// When enabled, uses mmap (Unix) or optimized reads for zero-copy data access.
-/// This reduces memory copies from 3-4 to 1, lowering CPU usage by 20-30%
-/// and improving P95 latency by 15-25%.
+/// When enabled, uses mmap (Unix) or optimized reads for file access.
+/// This reduces memory copies from 3-4 to 1, lowering CPU usage and
+/// improving latency for large object reads.
 ///
-/// - Purpose: Enable or disable zero-copy read operations
+/// - Purpose: Enable or disable mmap-based read operations
 /// - Acceptable values: `"true"` / `"false"` (case-insensitive) or a boolean typed config
 /// - Semantics: When enabled, uses mmap on Unix systems for memory-mapped file reads;
 ///   falls back to regular I/O on non-Unix platforms or when mmap fails
 /// - Example: `export RUSTFS_OBJECT_ZERO_COPY_ENABLE=true`
-/// - Note: Zero-copy is safe for all workloads and provides significant performance
-///   benefits with minimal risk. Disable only if mmap-related issues are encountered.
+/// - Note: The env var name is kept as ZERO_COPY for backward compatibility.
+///   The actual behavior is mmap-then-copy, not true zero-copy.
 pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
 
-/// Default: zero-copy reads are enabled.
+/// Default: mmap-based reads are enabled.
 ///
-/// Zero-copy uses memory mapping (mmap) on Unix systems to avoid data copying
-/// between kernel and user space. This provides:
-/// - Reduced memory copies: from 3-4 copies to 1 copy
-/// - Lower CPU usage: 20-30% reduction expected
-/// - Improved latency P95: 15-25% reduction expected
-/// - Increased throughput: 10-20% improvement expected
+/// Uses memory mapping (mmap) on Unix systems, then copies data into owned
+/// Bytes. This is faster than multiple read+copy passes but is NOT true
+/// zero-copy (the data is still copied once from the mmap region).
 ///
 /// On non-Unix platforms or when mmap fails, the system automatically falls back
 /// to regular I/O without errors.

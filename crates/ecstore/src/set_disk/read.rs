@@ -819,7 +819,7 @@ async fn create_bitrot_readers_until_quorum(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
     data_shards: usize,
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
@@ -850,7 +850,7 @@ async fn create_bitrot_readers_until_quorum(
                 shard_size,
                 checksum_algo,
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
             )
             .await;
             (idx, result)
@@ -902,7 +902,7 @@ async fn create_bitrot_readers_until_quorum(
                 shard_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
             ));
             setup.errors[idx] = None;
         }
@@ -1962,7 +1962,7 @@ impl SetDisks {
 
             // Read zero-copy configuration from environment variable
             // Default: enabled (true) for performance
-            let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+            let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
             let reader_setup_stage_start = Instant::now();
             let read_costs = disks
@@ -1980,7 +1980,7 @@ impl SetDisks {
                 erasure.shard_size(),
                 checksum_algo,
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
                 erasure.data_shards,
                 erasure.parity_shards,
                 BitrotReaderSetupMode::ReadQuorum,
@@ -2267,7 +2267,7 @@ impl SetDisks {
         } else {
             checksum_info.algorithm
         };
-        let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+        let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
         let till_offset = erasure.shard_file_offset(0, part_length, part_size);
 
         let reader_setup_stage_start = Instant::now();
@@ -2286,7 +2286,7 @@ impl SetDisks {
             erasure.shard_size(),
             checksum_algo,
             skip_verify_bitrot,
-            use_zero_copy,
+            use_mmap_read,
             erasure.data_shards,
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
