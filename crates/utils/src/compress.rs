@@ -224,12 +224,30 @@ mod tests {
 
     #[test]
     fn test_from_str() {
-        assert_eq!(CompressionAlgorithm::from_str("gzip").expect("operation should succeed"), CompressionAlgorithm::Gzip);
-        assert_eq!(CompressionAlgorithm::from_str("deflate").expect("operation should succeed"), CompressionAlgorithm::Deflate);
-        assert_eq!(CompressionAlgorithm::from_str("zstd").expect("operation should succeed"), CompressionAlgorithm::Zstd);
-        assert_eq!(CompressionAlgorithm::from_str("lz4").expect("operation should succeed"), CompressionAlgorithm::Lz4);
-        assert_eq!(CompressionAlgorithm::from_str("brotli").expect("operation should succeed"), CompressionAlgorithm::Brotli);
-        assert_eq!(CompressionAlgorithm::from_str("snappy").expect("operation should succeed"), CompressionAlgorithm::Snappy);
+        assert_eq!(
+            CompressionAlgorithm::from_str("gzip").expect("operation should succeed"),
+            CompressionAlgorithm::Gzip
+        );
+        assert_eq!(
+            CompressionAlgorithm::from_str("deflate").expect("operation should succeed"),
+            CompressionAlgorithm::Deflate
+        );
+        assert_eq!(
+            CompressionAlgorithm::from_str("zstd").expect("operation should succeed"),
+            CompressionAlgorithm::Zstd
+        );
+        assert_eq!(
+            CompressionAlgorithm::from_str("lz4").expect("operation should succeed"),
+            CompressionAlgorithm::Lz4
+        );
+        assert_eq!(
+            CompressionAlgorithm::from_str("brotli").expect("operation should succeed"),
+            CompressionAlgorithm::Brotli
+        );
+        assert_eq!(
+            CompressionAlgorithm::from_str("snappy").expect("operation should succeed"),
+            CompressionAlgorithm::Snappy
+        );
         assert!(CompressionAlgorithm::from_str("unknown").is_err());
     }
 
@@ -278,12 +296,27 @@ mod tests {
             println!("{name}: {size} bytes, {dur:?}");
         }
         // All should decompress to the original
-        assert_eq!(decompress_block(&gzip, CompressionAlgorithm::Gzip).expect("operation should succeed"), data);
-        assert_eq!(decompress_block(&deflate, CompressionAlgorithm::Deflate).expect("operation should succeed"), data);
-        assert_eq!(decompress_block(&zstd, CompressionAlgorithm::Zstd).expect("operation should succeed"), data);
+        assert_eq!(
+            decompress_block(&gzip, CompressionAlgorithm::Gzip).expect("operation should succeed"),
+            data
+        );
+        assert_eq!(
+            decompress_block(&deflate, CompressionAlgorithm::Deflate).expect("operation should succeed"),
+            data
+        );
+        assert_eq!(
+            decompress_block(&zstd, CompressionAlgorithm::Zstd).expect("operation should succeed"),
+            data
+        );
         assert_eq!(decompress_block(&lz4, CompressionAlgorithm::Lz4).expect("operation should succeed"), data);
-        assert_eq!(decompress_block(&brotli, CompressionAlgorithm::Brotli).expect("operation should succeed"), data);
-        assert_eq!(decompress_block(&snappy, CompressionAlgorithm::Snappy).expect("operation should succeed"), data);
+        assert_eq!(
+            decompress_block(&brotli, CompressionAlgorithm::Brotli).expect("operation should succeed"),
+            data
+        );
+        assert_eq!(
+            decompress_block(&snappy, CompressionAlgorithm::Snappy).expect("operation should succeed"),
+            data
+        );
         // All compressed results should not be empty
         assert!(
             !gzip.is_empty()

@@ -342,7 +342,10 @@ impl ExpirationWorker {
         metrics: &Arc<RwLock<ExpirationMetrics>>,
     ) -> SwiftResult<()> {
         let start_time = SystemTime::now();
-        let now = start_time.duration_since(UNIX_EPOCH).expect("operation should succeed").as_secs();
+        let now = start_time
+            .duration_since(UNIX_EPOCH)
+            .expect("operation should succeed")
+            .as_secs();
 
         debug!(
             event = EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY,
@@ -452,7 +455,9 @@ impl ExpirationWorker {
         }
 
         // Update metrics
-        let duration = SystemTime::now().duration_since(start_time).expect("operation should succeed");
+        let duration = SystemTime::now()
+            .duration_since(start_time)
+            .expect("operation should succeed");
         let mut m = metrics.write().await;
         m.objects_scanned += scanned_count;
         m.objects_deleted += deleted_count;

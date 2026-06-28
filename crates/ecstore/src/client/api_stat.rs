@@ -153,7 +153,10 @@ impl TransitionClient {
             headers.insert("X-Source-DeleteMarker", HeaderValue::from_str("true").expect("operation should succeed"));
         }
         if opts.internal.is_replication_ready_for_delete_marker {
-            headers.insert("X-Check-Replication-Ready", HeaderValue::from_str("true").expect("operation should succeed"));
+            headers.insert(
+                "X-Check-Replication-Ready",
+                HeaderValue::from_str("true").expect("operation should succeed"),
+            );
         }
 
         let resp = self
