@@ -549,7 +549,8 @@ impl SetDisks {
                                 } else {
                                     rename_successes += 1;
                                     if parts_metadata[index].is_remote() {
-                                        let rm_data_dir = parts_metadata[index].data_dir.expect("operation should succeed").to_string();
+                                        let rm_data_dir =
+                                            parts_metadata[index].data_dir.expect("operation should succeed").to_string();
 
                                         let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
 
