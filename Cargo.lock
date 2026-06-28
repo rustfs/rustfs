@@ -9049,6 +9049,7 @@ dependencies = [
  "chrono",
  "clap",
  "const-str",
+ "criterion",
  "datafusion",
  "flatbuffers",
  "futures",

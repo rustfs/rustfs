@@ -14,8 +14,13 @@
 
 //! Stable storage error contracts shared across storage consumers.
 
+/// Result type alias for storage operations.
 pub type StorageResult<T, E = StorageErrorCode> = core::result::Result<T, E>;
 
+/// Error codes for storage operations.
+///
+/// These codes provide a stable, cross-crate error classification
+/// that can be serialized and transmitted between nodes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum StorageErrorCode {
     Io,

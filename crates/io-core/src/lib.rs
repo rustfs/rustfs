@@ -17,7 +17,6 @@
 //! This crate provides buffered readers and writers for I/O operations.
 //! Note: despite "ZeroCopy" naming in type names (kept for backward compatibility),
 //! the actual implementations perform mmap-then-copy or aligned pread, not true
-//! zero-copy. See https://github.com/rustfs/backlog/issues/733
 //!
 //! # Features
 //!
