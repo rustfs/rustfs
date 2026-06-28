@@ -361,7 +361,7 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
-const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = true; // Enabled by default
+const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT";
 const DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ROLLOUT_PCT: u32 = 100;
@@ -585,7 +585,6 @@ fn is_optimization_enabled_for_request(base_enabled: bool, rollout_pct: u32, buc
 
     (hash as u32) < rollout_pct
 }
-
 /// Should this specific request use codec streaming?
 pub fn should_use_codec_streaming(bucket: &str, object: &str) -> bool {
     let base = is_get_codec_streaming_enabled();

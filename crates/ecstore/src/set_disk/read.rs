@@ -278,6 +278,7 @@ impl MetadataQuorumAccumulator {
 
         self.valid_responses = self.valid_responses.saturating_add(1);
 
+        // Track version match for versioned requests
         if !self.requested_version_id.is_empty()
             && let Some(ref vid) = file_info.version_id
             && vid.to_string() == self.requested_version_id
@@ -853,7 +854,7 @@ async fn create_bitrot_readers_until_quorum(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
     data_shards: usize,
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
@@ -884,7 +885,7 @@ async fn create_bitrot_readers_until_quorum(
                 shard_size,
                 checksum_algo,
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
             )
             .await;
             (idx, result)
@@ -936,7 +937,7 @@ async fn create_bitrot_readers_until_quorum(
                 shard_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
             ));
             setup.errors[idx] = None;
         }
@@ -2006,7 +2007,7 @@ impl SetDisks {
 
             // Read zero-copy configuration from environment variable
             // Default: enabled (true) for performance
-            let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+            let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
 
             let reader_setup_stage_start = Instant::now();
             let read_costs = disks
@@ -2024,7 +2025,7 @@ impl SetDisks {
                 erasure.shard_size(),
                 checksum_algo,
                 skip_verify_bitrot,
-                use_zero_copy,
+                use_mmap_read,
                 erasure.data_shards,
                 erasure.parity_shards,
                 BitrotReaderSetupMode::ReadQuorum,
@@ -2388,7 +2389,7 @@ impl SetDisks {
         } else {
             checksum_info.algorithm
         };
-        let use_zero_copy = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+        let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
         let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
         let read_length = till_offset.saturating_sub(read_offset);
@@ -2410,7 +2411,7 @@ impl SetDisks {
             erasure.shard_size(),
             checksum_algo,
             skip_verify_bitrot,
-            use_zero_copy,
+            use_mmap_read,
             erasure.data_shards,
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
@@ -3274,9 +3275,9 @@ mod tests {
     }
 
     #[test]
-    fn metadata_early_stop_gate_defaults_to_enabled() {
+    fn metadata_early_stop_gate_defaults_to_disabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
-            assert!(is_get_metadata_early_stop_enabled());
+            assert!(!is_get_metadata_early_stop_enabled());
         });
     }
 
