@@ -52,7 +52,8 @@ use crate::{
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
-pub(crate) const SCANNER_METADATA_HEAL_ERROR: &str = "scanner metadata heal required";
+pub(crate) const SCANNER_METADATA_CORRUPT_ERROR: &str = "scanner metadata corrupt";
+pub(crate) const SCANNER_METADATA_TRANSIENT_ERROR: &str = "scanner metadata transient";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_IO: &str = "io";
 const EVENT_SCANNER_DISK_BUCKET_STATE: &str = "scanner_disk_bucket_state";
@@ -71,13 +72,23 @@ const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucke
 
 pub type DirtyUsageBuckets = HashMap<String, u64>;
 
-pub(crate) fn is_scanner_metadata_heal_error(err: &StorageError) -> bool {
-    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_HEAL_ERROR))
+pub(crate) fn is_scanner_metadata_corrupt_error(err: &StorageError) -> bool {
+    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_CORRUPT_ERROR))
 }
 
-fn scanner_metadata_heal_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
+pub(crate) fn is_scanner_metadata_transient_error(err: &StorageError) -> bool {
+    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_TRANSIENT_ERROR))
+}
+
+fn scanner_metadata_corrupt_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
     StorageError::other(format!(
-        "{SCANNER_METADATA_HEAL_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
+        "{SCANNER_METADATA_CORRUPT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
+    ))
+}
+
+fn scanner_metadata_transient_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
+    StorageError::other(format!(
+        "{SCANNER_METADATA_TRANSIENT_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
     ))
 }
 
@@ -1384,7 +1395,7 @@ impl ScannerIODisk for Disk {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
             }
             Err(e) => {
-                return Err(scanner_metadata_heal_error(
+                return Err(scanner_metadata_transient_error(
                     format!("failed to read metadata: {e}"),
                     &item.bucket,
                     &item.object_path(),
@@ -1395,7 +1406,7 @@ impl ScannerIODisk for Disk {
         item.transform_meta_dir();
 
         let meta = FileMeta::load(&data).map_err(|e| {
-            scanner_metadata_heal_error(format!("failed to load metadata: {e}"), &item.bucket, &item.object_path())
+            scanner_metadata_corrupt_error(format!("failed to load metadata: {e}"), &item.bucket, &item.object_path())
         })?;
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
@@ -1411,7 +1422,7 @@ impl ScannerIODisk for Disk {
                     error = %e,
                     "Scanner disk bucket failed to resolve file info versions"
                 );
-                return Err(scanner_metadata_heal_error(
+                return Err(scanner_metadata_corrupt_error(
                     format!("failed to resolve file info versions: {e}"),
                     &item.bucket,
                     &item.object_path(),
@@ -1951,7 +1962,7 @@ mod tests {
             .get_size(item)
             .await
             .expect_err("corrupt metadata should be surfaced as scanner-heal work");
-        assert!(is_scanner_metadata_heal_error(&err));
+        assert!(is_scanner_metadata_corrupt_error(&err));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }

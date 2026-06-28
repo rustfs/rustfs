@@ -28,7 +28,9 @@ use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
-use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_heal_error};
+use crate::scanner_io::{
+    SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
+};
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
@@ -1168,10 +1170,14 @@ fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeF
         return GetSizeFailureAction::Skip;
     }
 
-    if is_scanner_metadata_heal_error(err) {
+    if is_scanner_metadata_corrupt_error(err) {
         return GetSizeFailureAction::HealMetadata {
             object: item.metadata_object_path(),
         };
+    }
+
+    if is_scanner_metadata_transient_error(err) {
+        return GetSizeFailureAction::RecordFailed;
     }
 
     GetSizeFailureAction::RecordFailed
@@ -2641,7 +2647,7 @@ mod tests {
             heal_bitrot: false,
             debug: false,
         };
-        let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_HEAL_ERROR));
+        let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_CORRUPT_ERROR));
 
         let action = classify_get_size_failure(&item, &err);
 
@@ -2651,6 +2657,31 @@ mod tests {
                 object: "dir/object".to_string()
             }
         );
+    }
+
+    #[test]
+    fn test_classify_get_size_failure_records_transient_metadata_error_without_heal() {
+        let temp_dir = std::env::temp_dir();
+        let file_type = std::fs::metadata(&temp_dir)
+            .expect("temp dir metadata should be readable")
+            .file_type();
+        let item = ScannerItem {
+            path: temp_dir.join("bucket/dir/object/xl.meta").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: "dir/object".to_string(),
+            object_name: "xl.meta".to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+        let err = StorageError::other(format!("{}: temporary read failure", crate::scanner_io::SCANNER_METADATA_TRANSIENT_ERROR));
+
+        let action = classify_get_size_failure(&item, &err);
+
+        assert_eq!(action, GetSizeFailureAction::RecordFailed);
     }
 
     #[test]
