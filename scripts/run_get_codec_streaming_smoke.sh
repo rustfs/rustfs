@@ -1326,6 +1326,19 @@ else:
                     ),
                     "proves runtime multipart GET selected codec streaming under explicit opt-in",
                 )
+                add(
+                    profile,
+                    "multipart_fallback_read_quorum_not_safe",
+                    'rustfs_io_get_object_codec_streaming_decision_total{outcome="fallback",object_class="multipart",reason="read_quorum_not_safe"} delta > 0',
+                    delta_for(
+                        profile,
+                        "rustfs_io_get_object_codec_streaming_decision_total",
+                        'outcome="fallback"',
+                        'object_class="multipart"',
+                        'reason="read_quorum_not_safe"',
+                    ),
+                    "proves unsafe multipart part setup falls back before returning a codec reader",
+                )
             else:
                 add(
                     profile,
@@ -1522,6 +1535,7 @@ profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_r
 ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
 ${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,$([[ "$CODEC_MULTIPART" == "on" ]] && printf none || printf multipart),dry-run only
+${profile},multipart_degraded_read,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
 ${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
 ${profile},read_quorum_not_safe,${COMPAT_OBJECT_KEY}.degraded-read,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
 EOF
@@ -1995,7 +2009,12 @@ else:
             else:
                 multipart_get, multipart_get_body = request("GET", multipart_path)
                 expected_multipart_len = len(multipart_part_one) + len(multipart_part_two)
-                multipart_ok = multipart_get["status"] == 200 and len(multipart_get_body) == expected_multipart_len
+                expected_multipart_body_hash = sha256_hex(multipart_part_one + multipart_part_two)
+                multipart_ok = (
+                    multipart_get["status"] == 200
+                    and len(multipart_get_body) == expected_multipart_len
+                    and sha256_hex(multipart_get_body) == expected_multipart_body_hash
+                )
                 fallback_rows.append(
                     {
                         "profile": profile,
@@ -2008,6 +2027,67 @@ else:
                         "note": multipart_note,
                     }
                 )
+                if codec_multipart_enabled and profile.startswith("codec-"):
+                    profile_dir = out_dir.parent
+                    data_root = profile_dir / "data"
+                    multipart_rel = pathlib.Path(*multipart_key.split("/"))
+                    part_candidates = []
+                    for disk_dir in sorted(data_root.glob("disk*")):
+                        object_dir = disk_dir / bucket / multipart_rel
+                        part_candidates.extend(sorted(object_dir.glob("*/part.1")))
+
+                    if not part_candidates:
+                        fallback_rows.append(
+                            {
+                                "profile": profile,
+                                "probe": "multipart_degraded_read",
+                                "object_key": multipart_key,
+                                "status": "part_file_missing",
+                                "status_code": "N/A",
+                                "body_len": 0,
+                                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                                "note": "multipart degraded-read probe could not find an on-disk part.1 shard to move",
+                            }
+                        )
+                    else:
+                        multipart_part = part_candidates[0]
+                        missing_dir = out_dir / "multipart-degraded-missing-shards"
+                        missing_dir.mkdir(parents=True, exist_ok=True)
+                        missing_part = missing_dir / f"{multipart_part.parent.name}-{multipart_part.name}"
+                        if missing_part.exists():
+                            missing_part.unlink()
+                        multipart_part.rename(missing_part)
+                        degraded_multipart_get, degraded_multipart_body = request("GET", multipart_path)
+                        degraded_multipart_ok = (
+                            degraded_multipart_get["status"] == 200
+                            and len(degraded_multipart_body) == expected_multipart_len
+                            and sha256_hex(degraded_multipart_body) == expected_multipart_body_hash
+                        )
+                        fallback_rows.append(
+                            {
+                                "profile": profile,
+                                "probe": "multipart_degraded_read",
+                                "object_key": multipart_key,
+                                "status": "ok" if degraded_multipart_ok else "unexpected_status_or_body",
+                                "status_code": degraded_multipart_get["status"],
+                                "body_len": len(degraded_multipart_body),
+                                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                                "note": f"Moved one multipart shard to {missing_part}; unsafe part setup should fall back before returning a codec reader",
+                            }
+                        )
+                else:
+                    fallback_rows.append(
+                        {
+                            "profile": profile,
+                            "probe": "multipart_degraded_read",
+                            "object_key": multipart_key,
+                            "status": "skipped",
+                            "status_code": "N/A",
+                            "body_len": "N/A",
+                            "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                            "note": "Enable --codec-multipart on for multipart degraded-read fallback proof",
+                        }
+                    )
 
 encrypted_key = object_key + ".encrypted"
 encrypted_path = bucket_path + "/" + urllib.parse.quote(encrypted_key, safe="/-_.~")
