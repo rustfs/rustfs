@@ -178,6 +178,44 @@ jobs:
       - name: Run rio-v2 clippy lints
         run: cargo clippy -p rustfs -p rustfs-ecstore --all-targets --features rio-v2 -- -D warnings
 
+  test-and-lint-protocols:
+    name: "Test and Lint (${{ matrix.features.name }})"
+    needs: skip-check
+    if: needs.skip-check.outputs.should_skip != 'true'
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        features:
+          - name: swift
+            flags: "--features swift"
+          - name: sftp
+            flags: "--features sftp"
+          - name: no-default
+            flags: "--no-default-features"
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-test-${{ matrix.features.name }}-${{ hashFiles('**/Cargo.lock') }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          cache-save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Run tests with ${{ matrix.features.name }}
+        run: |
+          cargo nextest run -p rustfs -p rustfs-protocols ${{ matrix.features.flags }}
+
+      - name: Run clippy with ${{ matrix.features.name }}
+        run: |
+          cargo clippy -p rustfs -p rustfs-protocols --all-targets ${{ matrix.features.flags }} -- -D warnings
+
   build-rustfs-debug-binary:
     name: Build RustFS Debug Binary
     needs: skip-check

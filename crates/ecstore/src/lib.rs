@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+#![warn(dead_code)] // Gradually clean up dead code; see https://github.com/rustfs/backlog/issues/742
 // Copyright 2024 RustFS Team
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
