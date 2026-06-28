@@ -17,6 +17,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::current_scanner_metrics_report;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::startup_background::{ENV_SCANNER_ENABLED, scanner_enabled_from_env};
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -31,8 +32,14 @@ const JSON_CONTENT_TYPE: &str = "application/json";
 
 #[derive(Debug, Serialize)]
 struct ScannerStatusResponse {
+    enabled: bool,
+    disabled_reason: Option<String>,
     metrics: ScannerMetricsReport,
     runtime_config: rustfs_scanner::runtime_config::ScannerRuntimeConfigStatus,
+}
+
+fn scanner_disabled_reason(enabled: bool) -> Option<String> {
+    (!enabled).then(|| format!("disabled by {ENV_SCANNER_ENABLED}"))
 }
 
 pub fn register_scanner_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -84,7 +91,10 @@ pub struct ScannerStatusHandler {}
 impl Operation for ScannerStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let _cred = validate_scanner_status_request(&req).await?;
+        let enabled = scanner_enabled_from_env();
         let response = ScannerStatusResponse {
+            enabled,
+            disabled_reason: scanner_disabled_reason(enabled),
             metrics: current_scanner_metrics_report().await,
             runtime_config: rustfs_scanner::scanner_runtime_config_status(),
         };
@@ -93,5 +103,16 @@ impl Operation for ScannerStatusHandler {
         })?;
 
         json_response(body)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scanner_disabled_reason_reports_startup_env_key() {
+        assert_eq!(scanner_disabled_reason(true), None);
+        assert_eq!(scanner_disabled_reason(false), Some(format!("disabled by {ENV_SCANNER_ENABLED}")));
     }
 }
