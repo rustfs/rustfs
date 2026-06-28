@@ -659,8 +659,8 @@ mod tests {
             },
         ];
 
-        let (info, idx) =
-            resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).expect("operation should succeed");
+        let (info, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("operation should succeed");
 
         assert_eq!(idx, 1);
         assert!(info.delete_marker);
@@ -681,7 +681,8 @@ mod tests {
             },
         ];
 
-        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default()).expect("operation should succeed");
+        let (_, idx) = resolve_latest_object_info_candidates(candidates, "bucket", "object", &ObjectOptions::default())
+            .expect("operation should succeed");
 
         assert_eq!(idx, 1);
     }

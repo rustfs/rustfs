@@ -181,7 +181,12 @@ mod tests {
 
         let result = db.execute(&query).await.expect("operation should succeed");
 
-        let results = result.result().chunk_result().await.expect("operation should succeed").to_vec();
+        let results = result
+            .result()
+            .chunk_result()
+            .await
+            .expect("operation should succeed")
+            .to_vec();
 
         let expected = [
             "+----------------+---------+-----+------------+--------+",
@@ -240,7 +245,12 @@ mod tests {
 
         let result = db.execute(&query).await.expect("operation should succeed");
 
-        let results = result.result().chunk_result().await.expect("operation should succeed").to_vec();
+        let results = result
+            .result()
+            .chunk_result()
+            .await
+            .expect("operation should succeed")
+            .to_vec();
         pretty::print_batches(&results).expect("operation should succeed");
     }
 }
