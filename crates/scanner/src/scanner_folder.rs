@@ -28,7 +28,7 @@ use crate::runtime_config::{
     scanner_alert_excess_folders, scanner_alert_excess_version_size, scanner_alert_excess_versions, scanner_yield_every_n_objects,
 };
 use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
-use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _};
+use crate::scanner_io::{SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_heal_error};
 use crate::sleeper::DynamicSleeper;
 use metrics::{counter, describe_counter};
 use rustfs_common::heal_channel::{
@@ -433,6 +433,13 @@ pub struct CachedFolder {
 /// Type alias for get size function
 pub type GetSizeFn = Box<dyn Fn(ScannerItem) -> Result<SizeSummary, StorageError> + Send + Sync>;
 
+#[derive(Debug, PartialEq, Eq)]
+enum GetSizeFailureAction {
+    Skip,
+    RecordFailed,
+    HealMetadata { object: String },
+}
+
 fn build_bucket_heal_request(bucket: String, priority: HealChannelPriority) -> HealChannelRequest {
     HealChannelRequest {
         bucket,
@@ -658,6 +665,12 @@ impl ScannerItem {
 
         // Object name is the last element
         self.object_name = split.last().unwrap_or(&"").to_string();
+    }
+
+    fn metadata_object_path(&self) -> String {
+        let mut item = self.clone();
+        item.transform_meta_dir();
+        item.object_path()
     }
 
     pub async fn apply_actions(
@@ -1146,6 +1159,20 @@ impl ScannerItem {
             );
         }
     }
+}
+
+fn classify_get_size_failure(item: &ScannerItem, err: &StorageError) -> GetSizeFailureAction {
+    if matches!(err, StorageError::Io(io) if io.to_string() == SCANNER_SKIP_FILE_ERROR) {
+        return GetSizeFailureAction::Skip;
+    }
+
+    if is_scanner_metadata_heal_error(err) {
+        return GetSizeFailureAction::HealMetadata {
+            object: item.metadata_object_path(),
+        };
+    }
+
+    GetSizeFailureAction::RecordFailed
 }
 
 /// Folder scanner for scanning directory structures
@@ -1677,9 +1704,9 @@ impl FolderScanner {
                 let sz = match self.local_disk.get_size(item.clone()).await {
                     Ok(sz) => sz,
                     Err(e) => {
-                        let is_skip_file = matches!(e, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR);
+                        let failure_action = classify_get_size_failure(&item, &e);
 
-                        if !is_skip_file {
+                        if failure_action != GetSizeFailureAction::Skip {
                             // Track failed objects to prevent infinite retry loops
                             into.failed_objects += 1;
                             self.record_failed(&item.path);
@@ -1697,6 +1724,22 @@ impl FolderScanner {
                                     "Scanner folder failed to get object size"
                                 );
                             }
+                        }
+
+                        if let GetSizeFailureAction::HealMetadata { object } = failure_action {
+                            send_required_scanner_heal_request(
+                                "object",
+                                &item.bucket,
+                                Some(&object),
+                                build_object_heal_request(
+                                    item.bucket.clone(),
+                                    object.clone(),
+                                    None,
+                                    self.scan_mode,
+                                    HealChannelPriority::High,
+                                ),
+                            )
+                            .await?;
                         }
 
                         timer.sleep().await;
@@ -2576,6 +2619,36 @@ mod tests {
         let now = FolderScanner::now_secs();
         scanner.new_cache.info.failed_objects.insert("path2".to_string(), now);
         assert!(!scanner.should_skip_failed("path2"));
+    }
+
+    #[test]
+    fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
+        let temp_dir = std::env::temp_dir();
+        let file_type = std::fs::metadata(&temp_dir)
+            .expect("temp dir metadata should be readable")
+            .file_type();
+        let item = ScannerItem {
+            path: temp_dir.join("bucket/dir/object/xl.meta").to_string_lossy().to_string(),
+            bucket: "bucket".to_string(),
+            prefix: "dir/object".to_string(),
+            object_name: "xl.meta".to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+        let err = StorageError::other(format!("{}: corrupt metadata", crate::scanner_io::SCANNER_METADATA_HEAL_ERROR));
+
+        let action = classify_get_size_failure(&item, &err);
+
+        assert_eq!(
+            action,
+            GetSizeFailureAction::HealMetadata {
+                object: "dir/object".to_string()
+            }
+        );
     }
 
     #[test]

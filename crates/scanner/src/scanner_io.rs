@@ -52,6 +52,7 @@ use crate::{
 };
 
 pub(crate) const SCANNER_SKIP_FILE_ERROR: &str = "skip file";
+pub(crate) const SCANNER_METADATA_HEAL_ERROR: &str = "scanner metadata heal required";
 const LOG_COMPONENT_SCANNER: &str = "scanner";
 const LOG_SUBSYSTEM_IO: &str = "io";
 const EVENT_SCANNER_DISK_BUCKET_STATE: &str = "scanner_disk_bucket_state";
@@ -69,6 +70,16 @@ const METRIC_SCANNER_DISK_BUCKET_SCANS_ACTIVE: &str = "rustfs_scanner_disk_bucke
 const METRIC_SCANNER_DISK_BUCKET_SCANS_QUEUED: &str = "rustfs_scanner_disk_bucket_scans_queued";
 
 pub type DirtyUsageBuckets = HashMap<String, u64>;
+
+pub(crate) fn is_scanner_metadata_heal_error(err: &StorageError) -> bool {
+    matches!(err, StorageError::Io(io) if io.to_string().starts_with(SCANNER_METADATA_HEAL_ERROR))
+}
+
+fn scanner_metadata_heal_error(reason: impl std::fmt::Display, bucket: &str, object_path: &str) -> StorageError {
+    StorageError::other(format!(
+        "{SCANNER_METADATA_HEAL_ERROR}: {reason}, bucket={bucket}, object_path={object_path}"
+    ))
+}
 
 #[derive(Clone)]
 pub struct ScannerBucketScanPlan {
@@ -1325,17 +1336,19 @@ impl ScannerIODisk for Disk {
                 return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
             }
             Err(e) => {
-                return Err(StorageError::other(format!(
-                    "failed to read metadata: {e}, bucket={}, object_path={}",
+                return Err(scanner_metadata_heal_error(
+                    format!("failed to read metadata: {e}"),
                     &item.bucket,
-                    &item.object_path()
-                )));
+                    &item.object_path(),
+                ));
             }
         };
 
         item.transform_meta_dir();
 
-        let meta = FileMeta::load(&data)?;
+        let meta = FileMeta::load(&data).map_err(|e| {
+            scanner_metadata_heal_error(format!("failed to load metadata: {e}"), &item.bucket, &item.object_path())
+        })?;
         let fivs = match meta.get_file_info_versions(item.bucket.as_str(), item.object_path().as_str(), false) {
             Ok(versions) => versions,
             Err(e) => {
@@ -1350,7 +1363,11 @@ impl ScannerIODisk for Disk {
                     error = %e,
                     "Scanner disk bucket failed to resolve file info versions"
                 );
-                return Err(StorageError::other(SCANNER_SKIP_FILE_ERROR.to_string()));
+                return Err(scanner_metadata_heal_error(
+                    format!("failed to resolve file info versions: {e}"),
+                    &item.bucket,
+                    &item.object_path(),
+                ));
             }
         };
 
@@ -1800,6 +1817,61 @@ mod tests {
             .await
             .expect_err("missing metadata should be skipped instead of reported as a scanner failure");
         assert!(matches!(err, StorageError::Io(ref io) if io.to_string() == SCANNER_SKIP_FILE_ERROR));
+
+        let _ = tokio::fs::remove_dir_all(&temp_dir).await;
+    }
+
+    #[tokio::test]
+    async fn get_size_marks_corrupt_metadata_for_heal() {
+        let temp_dir = std::env::temp_dir().join(format!("rustfs-scanner-corrupt-meta-{}", Uuid::new_v4()));
+        let bucket = "bucket";
+        let object = "object";
+        let object_dir = temp_dir.join(bucket).join(object);
+        let metadata_path = object_dir.join(STORAGE_FORMAT_FILE);
+
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("failed to create object directory");
+        tokio::fs::write(&metadata_path, b"not-valid-filemeta")
+            .await
+            .expect("failed to write corrupt metadata");
+
+        let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("failed to open local disk");
+
+        let relative_path = metadata_path.to_string_lossy().to_string();
+        let (_, scanner_path) = path2_bucket_object_with_base_path(temp_dir.to_string_lossy().as_ref(), relative_path.as_str());
+        let file_type = tokio::fs::metadata(&metadata_path)
+            .await
+            .expect("failed to stat metadata")
+            .file_type();
+
+        let item = ScannerItem {
+            path: scanner_path,
+            bucket: bucket.to_string(),
+            prefix: object.to_string(),
+            object_name: STORAGE_FORMAT_FILE.to_string(),
+            file_type,
+            lifecycle: None,
+            replication: None,
+            heal_enabled: false,
+            heal_bitrot: false,
+            debug: false,
+        };
+
+        let err = disk
+            .get_size(item)
+            .await
+            .expect_err("corrupt metadata should be surfaced as scanner-heal work");
+        assert!(is_scanner_metadata_heal_error(&err));
 
         let _ = tokio::fs::remove_dir_all(&temp_dir).await;
     }
