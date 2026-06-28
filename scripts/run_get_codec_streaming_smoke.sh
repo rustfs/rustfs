@@ -26,6 +26,7 @@ ROUND_COOLDOWN_SECS=20
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+CODEC_MULTIPART="off"
 METADATA_EARLY_STOP="off"
 SHARD_LOCALITY_PREFERENCE="off"
 OUTPUT_HANDOFF_ATTRIBUTION=false
@@ -76,6 +77,8 @@ Core options:
   --shard-locality-preference <on|off>
                                  Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
+  --codec-multipart <on|off>     Enable multipart codec streaming opt-in for codec profiles
+                                 (default: off)
   --handoff-attribution          Enable output handoff attribution metrics
   --diagnostic-metrics           Enable observability metrics export and capture server-side metrics
   --diagnostic-metrics-url <url> Prometheus scrape URL for diagnostic captures
@@ -204,6 +207,7 @@ parse_args() {
       --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
+      --codec-multipart) CODEC_MULTIPART="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
       --diagnostic-metrics) DIAGNOSTIC_METRICS=true; shift ;;
       --diagnostic-metrics-url) DIAGNOSTIC_METRICS_URL="$2"; shift 2 ;;
@@ -258,6 +262,11 @@ validate_args() {
   case "$SHARD_LOCALITY_PREFERENCE" in
     on|off) ;;
     *) die "--shard-locality-preference must be on or off" ;;
+  esac
+
+  case "$CODEC_MULTIPART" in
+    on|off) ;;
+    *) die "--codec-multipart must be on or off" ;;
   esac
 
   local raw engine
@@ -441,7 +450,8 @@ Relevant focused proof points:
 - rustfs_io_get_object_reconstruct_outcome_total{path,engine,outcome}
 
 Conclusion:
-- range / encrypted / compressed / multipart / remote objects remain on legacy fallback paths
+- range / encrypted / compressed / remote objects remain on legacy fallback paths
+- multipart remains a legacy fallback by default and can be separately enabled with RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=true
 - degraded reader setup remains opt-out via read_quorum_not_safe
 - codec-rustfs remains explicit opt-in through RUSTFS_GET_CODEC_STREAMING_ENGINE=rustfs
 - healthy codec-rustfs reads should report skip_data_complete instead of rustfs_called
@@ -471,6 +481,7 @@ codec_max_inflight=${CODEC_MAX_INFLIGHT}
 codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
+codec_multipart=${CODEC_MULTIPART}
 output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
 diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
 diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
@@ -630,6 +641,7 @@ RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=${header_compat_confirmed}
 RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
+RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
@@ -745,6 +757,7 @@ start_server() {
     export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
     export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
+    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
@@ -1109,7 +1122,7 @@ write_service_metrics_acceptance() {
   local service_csv="${OUT_DIR}/service_metrics_summary.csv"
 
   "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" \
-    "$COMPRESSED_FALLBACK_PROBE" "${OUT_DIR}/metrics_summary.csv" <<'PY'
+    "$COMPRESSED_FALLBACK_PROBE" "${OUT_DIR}/metrics_summary.csv" "$CODEC_MULTIPART" <<'PY'
 import csv
 import pathlib
 import sys
@@ -1121,6 +1134,7 @@ mode = sys.argv[4]
 codec_engines = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
 compressed_fallback_probe_enabled = sys.argv[6] == "true"
 metrics_path = pathlib.Path(sys.argv[7])
+codec_multipart_enabled = sys.argv[8] == "on"
 
 
 def expected_profiles():
@@ -1298,13 +1312,28 @@ else:
                 delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="range"'),
                 "proves runtime Range GET fallback reason delta",
             )
-            add(
-                profile,
-                "fallback_multipart",
-                'rustfs_io_get_object_codec_streaming_fallback_total{reason="multipart"} delta > 0',
-                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="multipart"'),
-                "proves runtime multipart object fallback reason delta",
-            )
+            if codec_multipart_enabled:
+                add(
+                    profile,
+                    "multipart_codec_decision_use",
+                    'rustfs_io_get_object_codec_streaming_decision_total{outcome="use",object_class="multipart",reason="none"} delta > 0',
+                    delta_for(
+                        profile,
+                        "rustfs_io_get_object_codec_streaming_decision_total",
+                        'outcome="use"',
+                        'object_class="multipart"',
+                        'reason="none"',
+                    ),
+                    "proves runtime multipart GET selected codec streaming under explicit opt-in",
+                )
+            else:
+                add(
+                    profile,
+                    "fallback_multipart",
+                    'rustfs_io_get_object_codec_streaming_fallback_total{reason="multipart"} delta > 0',
+                    delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="multipart"'),
+                    "proves runtime multipart object fallback reason delta",
+                )
             add(
                 profile,
                 "fallback_encrypted",
@@ -1492,7 +1521,7 @@ EOF
 profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
 ${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
 ${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
-${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,multipart,dry-run only
+${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,$([[ "$CODEC_MULTIPART" == "on" ]] && printf none || printf multipart),dry-run only
 ${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
 ${profile},read_quorum_not_safe,${COMPAT_OBJECT_KEY}.degraded-read,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
 EOF
@@ -1531,7 +1560,8 @@ EOF
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
     "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" \
-    "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" <<'PY'
+    "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" \
+    "$CODEC_MULTIPART" <<'PY'
 import base64
 import csv
 import datetime as dt
@@ -1560,10 +1590,12 @@ from xml.sax.saxutils import escape as xml_escape
     compressed_fallback_probe_raw,
     compressed_probe_extension,
     compressed_probe_mime_type,
+    codec_multipart_raw,
 ) = sys.argv[1:]
 object_size = int(object_size_raw)
 codec_min_size = int(codec_min_size_raw)
 compressed_fallback_probe = compressed_fallback_probe_raw == "true"
+codec_multipart_enabled = codec_multipart_raw == "on"
 out_dir = pathlib.Path(out_dir_raw)
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -1877,6 +1909,12 @@ multipart_key = object_key + ".multipart"
 multipart_path = bucket_path + "/" + urllib.parse.quote(multipart_key, safe="/-_.~")
 multipart_part_one = payload(5 * 1024 * 1024)
 multipart_part_two = payload(1)
+multipart_expected_reason = "none" if codec_multipart_enabled and profile.startswith("codec-") else "multipart"
+multipart_note = (
+    "Multipart object GET should use the codec streaming path for codec profiles"
+    if multipart_expected_reason == "none"
+    else "Multipart object GET should stay on the legacy fallback path for codec profiles"
+)
 initiate_multipart, initiate_multipart_body = request("POST", multipart_path + "?uploads")
 if initiate_multipart["status"] not in (200, 201):
     fallback_rows.append(
@@ -1887,7 +1925,7 @@ if initiate_multipart["status"] not in (200, 201):
             "status": "initiate_failed",
             "status_code": initiate_multipart["status"],
             "body_len": 0,
-            "expected_runtime_fallback_reason": "multipart",
+            "expected_runtime_fallback_reason": multipart_expected_reason,
             "note": "multipart initiate failed",
         }
     )
@@ -1902,7 +1940,7 @@ else:
                 "status": "upload_id_missing",
                 "status_code": initiate_multipart["status"],
                 "body_len": 0,
-                "expected_runtime_fallback_reason": "multipart",
+                "expected_runtime_fallback_reason": multipart_expected_reason,
                 "note": "multipart initiate response did not include UploadId",
             }
         )
@@ -1921,7 +1959,7 @@ else:
                     "status": "upload_part_failed",
                     "status_code": f"{part_one['status']};{part_two['status']}",
                     "body_len": 0,
-                    "expected_runtime_fallback_reason": "multipart",
+                    "expected_runtime_fallback_reason": multipart_expected_reason,
                     "note": "multipart part upload failed or ETag was missing",
                 }
             )
@@ -1949,7 +1987,7 @@ else:
                         "status": "complete_failed",
                         "status_code": complete_multipart["status"],
                         "body_len": 0,
-                        "expected_runtime_fallback_reason": "multipart",
+                        "expected_runtime_fallback_reason": multipart_expected_reason,
                         "note": "multipart complete failed",
                     }
                 )
@@ -1966,8 +2004,8 @@ else:
                         "status": "ok" if multipart_ok else "unexpected_status_or_length",
                         "status_code": multipart_get["status"],
                         "body_len": len(multipart_get_body),
-                        "expected_runtime_fallback_reason": "multipart",
-                        "note": "Multipart object GET should stay on the legacy fallback path for codec profiles",
+                        "expected_runtime_fallback_reason": multipart_expected_reason,
+                        "note": multipart_note,
                     }
                 )
 
@@ -2667,7 +2705,7 @@ PY
 
   if [[ -f "$fallback_coverage_path" ]] \
     && grep -q 'read_quorum_not_safe' "$fallback_coverage_path" \
-    && grep -q 'range / encrypted / compressed / multipart / remote' "$fallback_coverage_path"; then
+    && grep -q 'range / encrypted / compressed / remote' "$fallback_coverage_path"; then
     fallback_proven="pass"
   else
     fallback_proven="fail"
@@ -2713,7 +2751,7 @@ PY
     echo "| runtime server metrics prove path and fallback deltas | ${runtime_metrics_ok} | see service_metrics_acceptance.csv; skipped for observability-off performance runs |"
     echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
     echo "| response headers compatible | ${headers_compatible} | see compat_summary.csv |"
-    echo "| range / encrypted / compressed / multipart / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
+    echo "| range / encrypted / compressed / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
     echo "| kill switch verified | ${kill_switch_verified} | see fallback_coverage.txt |"
     echo
     echo "## Evidence Files"
