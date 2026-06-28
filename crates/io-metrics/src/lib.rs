@@ -423,6 +423,39 @@ pub fn record_get_object_reader_stream_poll(
     .record(duration_secs);
 }
 
+/// Record a poll of the single-chunk in-memory GetObject handoff stream.
+#[inline(always)]
+pub fn record_get_object_memory_body_stream_poll(source: &'static str, outcome: &'static str, bytes: usize, duration_secs: f64) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    let bytes_counter = u64::try_from(bytes).unwrap_or(u64::MAX);
+    counter!(
+        "rustfs_io_get_object_memory_body_stream_poll_total",
+        "source" => source,
+        "outcome" => outcome
+    )
+    .increment(1);
+    counter!(
+        "rustfs_io_get_object_memory_body_stream_poll_bytes_total",
+        "source" => source,
+        "outcome" => outcome
+    )
+    .increment(bytes_counter);
+    histogram!(
+        "rustfs_io_get_object_memory_body_stream_poll_bytes",
+        "source" => source,
+        "outcome" => outcome
+    )
+    .record(usize_to_f64(bytes));
+    histogram!(
+        "rustfs_io_get_object_memory_body_stream_poll_duration_seconds",
+        "source" => source,
+        "outcome" => outcome
+    )
+    .record(duration_secs);
+}
+
 /// Record I/O queue congestion observation.
 #[inline(always)]
 pub fn record_io_queue_congestion() {
@@ -1830,6 +1863,7 @@ mod tests {
         record_get_object_reader_prefetch_bytes("codec_streaming", "single_inflight", 4096);
         record_get_object_reader_stream_buffer_size("standard", "selected", 131072);
         record_get_object_reader_stream_poll("standard", "selected", "ready_data", 8192, 4096, 0.0002);
+        record_get_object_memory_body_stream_poll("buffered_body", "ready_data", 4096, 0.0001);
 
         assert!(0.0003_f64.is_sign_positive());
     }

@@ -341,6 +341,9 @@ const GET_READER_STREAM_POLL_PENDING: &str = "pending";
 const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
+const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
+const GET_MEMORY_BODY_SOURCE_SEEK_BUFFER: &str = "seek_buffer";
+const GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER: &str = "encrypted_buffer";
 
 fn get_reader_stream_buffer_size_override() -> Option<usize> {
     static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -438,6 +441,7 @@ pin_project! {
     struct MemoryTrackedBytesStream {
         bytes: Bytes,
         emitted: bool,
+        source: &'static str,
         _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     }
 }
@@ -484,10 +488,11 @@ pin_project! {
 }
 
 impl MemoryTrackedBytesStream {
-    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+    fn new(bytes: Bytes, source: &'static str, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
         Self {
             bytes,
             emitted: false,
+            source,
             _guard: guard,
         }
     }
@@ -517,11 +522,28 @@ impl futures::Stream for MemoryTrackedBytesStream {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
+        let poll_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
         if *this.emitted {
+            if let Some(poll_start) = poll_start {
+                rustfs_io_metrics::record_get_object_memory_body_stream_poll(
+                    this.source,
+                    GET_READER_STREAM_POLL_READY_EMPTY,
+                    0,
+                    poll_start.elapsed().as_secs_f64(),
+                );
+            }
             return Poll::Ready(None);
         }
 
         *this.emitted = true;
+        if let Some(poll_start) = poll_start {
+            rustfs_io_metrics::record_get_object_memory_body_stream_poll(
+                this.source,
+                GET_READER_STREAM_POLL_READY_DATA,
+                this.bytes.len(),
+                poll_start.elapsed().as_secs_f64(),
+            );
+        }
         Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
@@ -1971,16 +1993,36 @@ impl DefaultObjectUsecase {
         }
     }
 
-    fn build_memory_bytes_blob(bytes: Bytes, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
-        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes.len());
-        Some(StreamingBlob::wrap(bytes_stream(
-            MemoryTrackedBytesStream::new(bytes, guard),
-            response_content_length as usize,
-        )))
+    fn build_memory_bytes_blob(
+        bytes: Bytes,
+        response_content_length: i64,
+        _optimal_buffer_size: usize,
+        source: &'static str,
+    ) -> Option<StreamingBlob> {
+        let handoff_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
+        let bytes_len = bytes.len();
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
+        let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let blob = StreamingBlob::wrap(bytes_stream(MemoryTrackedBytesStream::new(bytes, source, guard), remaining));
+        if let Some(handoff_start) = handoff_start {
+            rustfs_io_metrics::record_get_object_response_handoff(
+                "single_chunk",
+                source,
+                bytes_len,
+                response_content_length,
+                handoff_start.elapsed().as_secs_f64(),
+            );
+        }
+        Some(blob)
     }
 
-    fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, optimal_buffer_size: usize) -> Option<StreamingBlob> {
-        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size)
+    fn build_memory_blob(
+        buf: Vec<u8>,
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        source: &'static str,
+    ) -> Option<StreamingBlob> {
+        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size, source)
     }
 
     fn select_stream_buffer_strategy(
@@ -2571,7 +2613,12 @@ impl DefaultObjectUsecase {
                     );
                 }
 
-                return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
+                return Ok(Self::build_memory_blob(
+                    buf,
+                    response_content_length,
+                    optimal_buffer_size,
+                    GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
+                ));
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
@@ -2596,7 +2643,12 @@ impl DefaultObjectUsecase {
                 );
             }
 
-            return Ok(Self::build_memory_bytes_blob(buffered_body, response_content_length, optimal_buffer_size));
+            return Ok(Self::build_memory_bytes_blob(
+                buffered_body,
+                response_content_length,
+                optimal_buffer_size,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            ));
         }
 
         let should_provide_seek_support =
@@ -2614,7 +2666,12 @@ impl DefaultObjectUsecase {
                         );
                     }
 
-                    return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
+                    return Ok(Self::build_memory_blob(
+                        buf,
+                        response_content_length,
+                        optimal_buffer_size,
+                        GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
+                    ));
                 }
                 Err(e) => {
                     error!(error = %e, "GetObject seek-support buffering failed");
