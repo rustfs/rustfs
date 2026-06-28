@@ -101,6 +101,7 @@ For the full pattern map, read [advisory-patterns.md](references/advisory-patter
 - Do not reflect arbitrary `Origin` while also allowing credentials. Default CORS should be no CORS unless explicitly configured.
 - Do not render user-controlled object content in a same-origin iframe with console credentials available to JavaScript.
 - Prefer origin separation for object preview/download, `nosniff`, CSP, strict content-type handling, and avoiding durable credentials in `localStorage`.
+- Preview safety must be based on trusted content type and sandboxing, not object names or extensions such as `.pdf`.
 - Console license/version-like metadata endpoints should expose only coarse public data unless authenticated, especially subject names and expiration timestamps.
 
 ### Profiling, debug, and health endpoints
@@ -129,4 +130,5 @@ Use these prompts while reviewing a diff:
 - Does this response contain stored replication, remote target, or service credentials that need redaction or stricter authorization?
 - Is an archive entry, object key, or policy resource normalized differently between authorization and storage?
 - Is the same operation implemented in multiple paths, such as `CopyObject` vs `UploadPartCopy`, and do all paths enforce the same security contract?
+- Does a preview or browser-surface fix preserve the original security invariant when adding alternate viewers or file-type detection?
 - Does the test prove the exploit form is denied, or only that the intended form still works?
