@@ -841,7 +841,10 @@ impl Operation for ExportIam {
             .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/zip".parse().expect("valid header value"));
-        header.insert(CONTENT_DISPOSITION, "attachment; filename=iam-assets.zip".parse().expect("valid header value"));
+        header.insert(
+            CONTENT_DISPOSITION,
+            "attachment; filename=iam-assets.zip".parse().expect("valid header value"),
+        );
         header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
     }
