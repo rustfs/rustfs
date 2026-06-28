@@ -184,8 +184,10 @@ mod tests {
 
     #[test]
     fn scanner_freshness_reports_stale_after_window() {
-        let mut metrics = ScannerMetricsReport::default();
-        metrics.last_cycle_end_unix_secs = Utc::now().timestamp().max(0) as u64 - 121;
+        let metrics = ScannerMetricsReport {
+            last_cycle_end_unix_secs: Utc::now().timestamp().max(0) as u64 - 121,
+            ..Default::default()
+        };
         let mut runtime_config = rustfs_scanner::scanner_runtime_config_status();
         runtime_config.cycle_interval_seconds.value = 60;
 
