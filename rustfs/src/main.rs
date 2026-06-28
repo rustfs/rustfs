@@ -21,7 +21,7 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // in high-concurrency workloads. Setting to 4 provides a good balance
 // between concurrency and memory efficiency.
 #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-#[export_name = "malloc_conf"]
+#[unsafe(export_name = "malloc_conf")]
 pub static MALLOC_CONF: &[u8] = b"narenas:4\0";
 
 #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
