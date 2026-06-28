@@ -559,6 +559,18 @@ fn background_heal_info_for_scan_complete(mut info: BackgroundHealInfo, scan_mod
     Some(info)
 }
 
+fn background_heal_info_for_scan_result(
+    info: BackgroundHealInfo,
+    scan_mode: HealScanMode,
+    success: bool,
+) -> Option<BackgroundHealInfo> {
+    if !success {
+        return None;
+    }
+
+    background_heal_info_for_scan_complete(info, scan_mode)
+}
+
 fn retain_recent_cycle_completions(cycle_completed: &mut Vec<DateTime<Utc>>) {
     let keep = data_usage_update_dir_cycles() as usize;
     if cycle_completed.len() > keep {
@@ -789,9 +801,10 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             "Scanner cycle failed"
         );
         emit_scan_cycle_complete(false, cycle_start.elapsed());
-        if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+        if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, false) {
             save_background_heal_info(storeapi.clone(), new_heal_info).await;
         }
+        mark_scan_cycle_idle(cycle_info).await;
         return;
     }
     if cycle_budget.budget_elapsed() && !ctx.is_cancelled() {
@@ -822,7 +835,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     done_cycle();
     global_metrics().finish_scan_cycle_work(cycle_work_start);
     emit_scan_cycle_complete(true, cycle_start.elapsed());
-    if let Some(new_heal_info) = background_heal_info_for_scan_complete(background_heal_info.clone(), scan_mode) {
+    if let Some(new_heal_info) = background_heal_info_for_scan_result(background_heal_info.clone(), scan_mode, true) {
         save_background_heal_info(storeapi.clone(), new_heal_info).await;
     }
 
@@ -1743,6 +1756,18 @@ mod tests {
         };
 
         assert!(background_heal_info_for_scan_complete(info, HealScanMode::Normal).is_none());
+    }
+
+    #[test]
+    #[serial]
+    fn test_background_heal_info_for_failed_scan_preserves_deep_mode() {
+        let info = BackgroundHealInfo {
+            bitrot_start_time: Some(Utc::now()),
+            bitrot_start_cycle: 7,
+            current_scan_mode: HealScanMode::Deep,
+        };
+
+        assert!(background_heal_info_for_scan_result(info, HealScanMode::Deep, false).is_none());
     }
 
     #[test]
