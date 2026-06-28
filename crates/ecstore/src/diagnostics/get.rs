@@ -21,6 +21,7 @@ pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING: &str = "codec_streaming";
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE: &str = "codec_streaming_legacy_engine";
 pub(crate) const GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE: &str = "codec_streaming_rustfs_engine";
 pub(crate) const GET_OBJECT_PATH_EMPTY: &str = "empty";
+pub(crate) const GET_OBJECT_PATH_INLINE_DIRECT: &str = "inline_direct";
 pub(crate) const GET_OBJECT_PATH_LEGACY_DUPLEX: &str = "legacy_duplex";
 pub(crate) const GET_OBJECT_PATH_REMOTE_TRANSITION: &str = "remote_transition";
 pub(crate) const GET_CODEC_STREAMING_DECISION_USE: &str = "use";
