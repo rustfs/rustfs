@@ -26,6 +26,14 @@ use super::utils::{HostAddrError, try_get_host_addr};
 use rustfs_utils::crypto::{hex, hmac_sha1};
 use s3s::Body;
 
+// NOTE: SHA-1 HMAC is used here for AWS S3 Signature V2 compatibility.
+// SHA-1 is considered weak, but it's only used for HMAC (not signature collision).
+// Migration plan (not yet implemented):
+// Phase 1: Support both SHA-1 and SHA-256 (configurable)
+// Phase 2: Deprecation warnings in response headers
+// Phase 3: Default to SHA-256, SHA-1 becomes optional
+// See https://github.com/rustfs/backlog/issues/747 for discussion.
+
 const _SIGN_V4_ALGORITHM: &str = "AWS4-HMAC-SHA256";
 const SIGN_V2_ALGORITHM: &str = "AWS";
 
