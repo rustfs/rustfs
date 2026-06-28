@@ -1448,4 +1448,34 @@ mod tests {
             assert_eq!(original_error, recovered_error);
         }
     }
+
+    #[test]
+    fn test_storage_error_display_snapshot() {
+        // Snapshot test to detect unexpected changes in error display format
+        let errors = vec![
+            StorageError::BucketNotFound("test-bucket".to_string()),
+            StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()),
+            StorageError::VersionNotFound("bucket".to_string(), "object".to_string(), "v1".to_string()),
+            StorageError::InvalidUploadID("bucket".to_string(), "object".to_string(), "upload123".to_string()),
+            StorageError::DiskFull,
+            StorageError::FaultyDisk,
+            StorageError::FileNotFound,
+            StorageError::VolumeNotFound,
+            StorageError::ErasureReadQuorum,
+            StorageError::ErasureWriteQuorum,
+            StorageError::DecommissionAlreadyRunning,
+            StorageError::RebalanceAlreadyRunning,
+            StorageError::OperationCanceled,
+            StorageError::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "bucket".into(),
+                object: "object".into(),
+                required: 3,
+                achieved: 2,
+            },
+        ];
+
+        let error_messages: Vec<String> = errors.iter().map(|e| e.to_string()).collect();
+        insta::assert_yaml_snapshot!("storage_error_display", error_messages);
+    }
 }

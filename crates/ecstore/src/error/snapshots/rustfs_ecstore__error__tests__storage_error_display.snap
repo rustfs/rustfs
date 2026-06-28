@@ -1,0 +1,18 @@
+---
+source: crates/ecstore/src/error/mod.rs
+expression: error_messages
+---
+- "Bucket not found: test-bucket"
+- "Object not found: bucket/object"
+- "Version not found: bucket/object-v1"
+- "Invalid upload id: bucket/object-upload123"
+- Disk full
+- Faulty disk
+- File not found
+- Volume not found
+- erasure read quorum
+- erasure write quorum
+- Decommission already running
+- Rebalance already running
+- Operation canceled
+- "Namespace lock quorum unavailable for write lock on bucket/object: required 3, achieved 2"
