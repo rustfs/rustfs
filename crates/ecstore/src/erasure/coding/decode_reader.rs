@@ -20,7 +20,7 @@ use crate::diagnostics::get::{
     GET_STAGE_STRIPE_READ, get_stage_timer_if_enabled, record_get_stage_duration_if_enabled,
 };
 use crate::disk::error::Error as DiskError;
-use crate::erasure::codec::bridge::ErasureDecodeEngine;
+use crate::erasure::codec::bridge::{ErasureDecodeEngine, GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE};
 use crate::set_disk::shard_source::{ShardStripeSource, StripeReadState};
 use std::collections::VecDeque;
 use std::io;
@@ -711,6 +711,11 @@ where
 
     let reconstruct_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     if state.data_shards_complete(engine.data_shards()) {
+        rustfs_io_metrics::record_get_object_reconstruct_outcome(
+            metrics_path,
+            engine.engine_name(),
+            GET_RECONSTRUCT_OUTCOME_SKIP_DATA_COMPLETE,
+        );
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
         let emit_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         emit_data_shards_into(&state, engine.data_shards(), engine.block_size(), remaining, output)?;
@@ -719,10 +724,14 @@ where
     }
 
     let (mut shards, _errs) = state.into_parts();
-    if let Err(err) = engine.reconstruct_into(&mut shards, workspace) {
-        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
-        return Err(err);
-    }
+    let reconstruct_outcome = match engine.reconstruct_into(&mut shards, workspace) {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
+            return Err(err);
+        }
+    };
+    rustfs_io_metrics::record_get_object_reconstruct_outcome(metrics_path, engine.engine_name(), reconstruct_outcome);
     record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_RECONSTRUCT, reconstruct_stage_start);
 
     if shards.len() < engine.data_shards() {
