@@ -78,8 +78,8 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
     let addr = format!(
         "{}://{}:{}",
         endpoint.url.scheme(),
-        endpoint.url.host_str().unwrap(),
-        endpoint.url.port().unwrap()
+        endpoint.url.host_str().expect("URL should have host"),
+        endpoint.url.port().expect("URL should have port")
     );
 
     let ping_task = async {
@@ -309,10 +309,10 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
         let ep = &disk.endpoint;
         let state = &disk.state;
         if *state != DriveState::Ok.to_string() && *state != DriveState::Unformatted.to_string() {
-            *offline_disks.get_mut(ep).unwrap() += 1;
+            *offline_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
             continue;
         }
-        *online_disks.get_mut(ep).unwrap() += 1;
+        *online_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
     }
 
     let mut root_disk_count = 0;
@@ -329,8 +329,8 @@ fn get_online_offline_disks_stats(disks_info: &[Disk]) -> (BackendDisks, Backend
     for disk in disks_info {
         let ep = &disk.endpoint;
         if disk.root_disk {
-            *offline_disks.get_mut(ep).unwrap() += 1;
-            *online_disks.get_mut(ep).unwrap() -= 1;
+            *offline_disks.get_mut(ep).expect("endpoint should be in disk map") += 1;
+            *online_disks.get_mut(ep).expect("endpoint should be in disk map") -= 1;
         }
     }
 

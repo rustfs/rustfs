@@ -555,6 +555,21 @@ pub fn record_get_object_reconstruct_duration(path: &'static str, duration_secs:
     record_get_object_stage_duration(path, "reconstruct", duration_secs);
 }
 
+/// Record the reconstruction outcome for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_reconstruct_outcome(path: &'static str, engine: &'static str, outcome: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_reconstruct_outcome_total",
+        "path" => path,
+        "engine" => engine,
+        "outcome" => outcome
+    )
+    .increment(1);
+}
+
 /// Record GetObject emit duration.
 #[inline(always)]
 pub fn record_get_object_emit_duration(path: &'static str, duration_secs: f64) {
@@ -713,6 +728,24 @@ pub fn record_get_object_fill_queued(path: &'static str, policy: &'static str, q
     counter!("rustfs_io_get_object_fill_queued_total", "path" => path, "policy" => policy)
         .increment(u64::try_from(queued).unwrap_or(u64::MAX));
     histogram!("rustfs_io_get_object_fill_queued", "path" => path, "policy" => policy).record(usize_to_f64(queued));
+}
+
+/// Record that a background fill task was started for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_fill_started(path: &'static str, policy: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_started_total", "path" => path, "policy" => policy).increment(1);
+}
+
+/// Record that a persistent fill worker was started for a GetObject reader path.
+#[inline(always)]
+pub fn record_get_object_fill_worker_started(path: &'static str, policy: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_fill_worker_started_total", "path" => path, "policy" => policy).increment(1);
 }
 
 /// Record that a fill completed while the current output buffer still had unread bytes.
@@ -1675,6 +1708,7 @@ mod tests {
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
         record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_reconstruct_outcome("codec_streaming", "legacy", "skip_data_complete");
         record_get_object_emit_duration("codec_streaming", 0.007);
         record_get_object_first_byte_latency("s3_handler", 0.008);
         record_get_object_full_body_latency("s3_handler", 0.009);
@@ -1696,6 +1730,8 @@ mod tests {
     #[test]
     fn test_record_get_object_fill_metrics() {
         record_get_object_fill_queued("codec_streaming", "single_inflight", 1);
+        record_get_object_fill_started("codec_streaming", "single_inflight");
+        record_get_object_fill_worker_started("codec_streaming", "single_inflight");
         record_get_object_fill_completed_before_output_drained("codec_streaming", "single_inflight");
         record_get_object_fill_waited_by_output("codec_streaming", "single_inflight", 0.0003);
         record_get_object_fill_cancelled_on_drop("codec_streaming", "single_inflight");
@@ -1770,6 +1806,7 @@ mod tests {
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
         record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_reconstruct_outcome("codec_streaming", "legacy", "legacy_called");
         record_get_object_emit_duration("codec_streaming", 0.007);
         record_get_object_first_byte_latency("s3_handler", 0.008);
         record_get_object_full_body_latency("s3_handler", 0.009);
@@ -1813,6 +1850,7 @@ mod tests {
         record_get_object_first_shard_read_duration("codec_streaming", 0.004);
         record_get_object_bitrot_verify_duration("codec_streaming", 0.005);
         record_get_object_reconstruct_duration("codec_streaming", 0.006);
+        record_get_object_reconstruct_outcome("codec_streaming", "rustfs", "rustfs_called");
         record_get_object_emit_duration("codec_streaming", 0.007);
         record_get_object_first_byte_latency("s3_handler", 0.008);
         record_get_object_full_body_latency("s3_handler", 0.009);

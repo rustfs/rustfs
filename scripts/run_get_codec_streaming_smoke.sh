@@ -26,9 +26,24 @@ ROUND_COOLDOWN_SECS=20
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+CODEC_MULTIPART="off"
+CODEC_MULTIPART_MAX_PARTS=256
 METADATA_EARLY_STOP="off"
 SHARD_LOCALITY_PREFERENCE="off"
 OUTPUT_HANDOFF_ATTRIBUTION=false
+DIAGNOSTIC_METRICS=false
+DIAGNOSTIC_METRICS_URL="http://127.0.0.1:8889/metrics"
+DIAGNOSTIC_PROMETHEUS_QUERY_URL=""
+DIAGNOSTIC_PROMETHEUS_QUERY='{__name__=~"rustfs_io_get_object_.*"}'
+DIAGNOSTIC_METRICS_SETTLE_SECS="${RUSTFS_DIAGNOSTIC_METRICS_SETTLE_SECS:-2}"
+DIAGNOSTIC_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
+DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
+DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
+DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-codec}"
+SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
+COMPRESSED_FALLBACK_PROBE=false
+COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
+COMPRESSED_PROBE_MIME_TYPE="text/plain"
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -63,7 +78,34 @@ Core options:
   --shard-locality-preference <on|off>
                                  Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
+  --codec-multipart <on|off>     Enable multipart codec streaming opt-in for codec profiles
+                                 (default: off)
+  --codec-multipart-max-parts <n>
+                                 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS
+                                 (default: 256)
   --handoff-attribution          Enable output handoff attribution metrics
+  --diagnostic-metrics           Enable observability metrics export and capture server-side metrics
+  --diagnostic-metrics-url <url> Prometheus scrape URL for diagnostic captures
+                                 (default: http://127.0.0.1:8889/metrics)
+  --diagnostic-prometheus-query-url <url>
+                                 Prometheus HTTP API query endpoint for OTLP-exported metrics,
+                                 e.g. http://localhost:9090/api/v1/query
+  --diagnostic-prometheus-query <promql>
+                                 PromQL used with --diagnostic-prometheus-query-url
+                                 (default: {__name__=~"rustfs_io_get_object_.*"})
+  --diagnostic-metrics-settle-secs <n>
+                                 Seconds to wait before the after snapshot so OTLP periodic
+                                 metrics can export probe counters (default: 2)
+  --diagnostic-obs-endpoint <url>
+                                 RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
+  --diagnostic-obs-metric-endpoint <url>
+                                 RUSTFS_OBS_METRIC_ENDPOINT passed to RustFS during diagnostic runs
+  --diagnostic-obs-meter-interval <secs>
+                                 RUSTFS_OBS_METER_INTERVAL passed during diagnostic runs (default: 1)
+  --diagnostic-obs-service-name-prefix <name>
+                                 Prefix used for unique per-profile RUSTFS_OBS_SERVICE_NAME
+                                 (default: RustFS-get-codec, or existing RUSTFS_OBS_SERVICE_NAME)
+  --compressed-fallback-probe    Enable disk compression only for the compressed fallback probe object
   --address <host:port>          RustFS listen address (default: 127.0.0.1:19030)
   --bucket <name>                Benchmark bucket (default: rustfs-get-codec-smoke)
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
@@ -104,6 +146,9 @@ Output:
   <out-dir>/engine_compare.csv                  when legacy and codec profiles both run
   <out-dir>/compat_summary.csv                  when legacy and codec profiles both run
   <out-dir>/metrics_summary.csv
+  <out-dir>/service_metrics_summary.csv         when --diagnostic-metrics is set
+  <out-dir>/service_metrics_acceptance.csv      when --diagnostic-metrics is set
+  <out-dir>/fallback_probe_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
   <out-dir>/body_sha256_codec_legacy.txt        when codec-legacy profile runs
   <out-dir>/body_sha256_codec_rustfs.txt        when codec-rustfs profile runs
@@ -112,7 +157,10 @@ Output:
   <out-dir>/response_headers_codec_rustfs.json  when codec-rustfs profile runs
   <out-dir>/<profile>/manifest.env
   <out-dir>/<profile>/metrics_summary.csv
+  <out-dir>/<profile>/service_metrics_summary.csv
+  <out-dir>/<profile>/service-metrics/*.prom     before/after snapshots when --diagnostic-metrics is set
   <out-dir>/<profile>/compat/compat_summary.csv
+  <out-dir>/<profile>/compat/fallback_probe_summary.csv
   <out-dir>/<profile>/compat/response_headers.json
   <out-dir>/<profile>/compat/body_sha256.txt
   <out-dir>/<profile>/rustfs.log
@@ -163,7 +211,19 @@ parse_args() {
       --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
+      --codec-multipart) CODEC_MULTIPART="$2"; shift 2 ;;
+      --codec-multipart-max-parts) CODEC_MULTIPART_MAX_PARTS="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
+      --diagnostic-metrics) DIAGNOSTIC_METRICS=true; shift ;;
+      --diagnostic-metrics-url) DIAGNOSTIC_METRICS_URL="$2"; shift 2 ;;
+      --diagnostic-prometheus-query-url) DIAGNOSTIC_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
+      --diagnostic-prometheus-query) DIAGNOSTIC_PROMETHEUS_QUERY="$2"; shift 2 ;;
+      --diagnostic-metrics-settle-secs) DIAGNOSTIC_METRICS_SETTLE_SECS="$2"; shift 2 ;;
+      --diagnostic-obs-endpoint) DIAGNOSTIC_OBS_ENDPOINT="$2"; shift 2 ;;
+      --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
+      --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
+      --diagnostic-obs-service-name-prefix) DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="$2"; shift 2 ;;
+      --compressed-fallback-probe) COMPRESSED_FALLBACK_PROBE=true; shift ;;
       --address) ADDRESS="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -209,6 +269,11 @@ validate_args() {
     *) die "--shard-locality-preference must be on or off" ;;
   esac
 
+  case "$CODEC_MULTIPART" in
+    on|off) ;;
+    *) die "--codec-multipart must be on or off" ;;
+  esac
+
   local raw engine
   IFS=',' read -r -a engines <<< "$CODEC_ENGINES"
   [[ "${#engines[@]}" -gt 0 ]] || die "--codec-engine must not be empty"
@@ -227,13 +292,18 @@ validate_args() {
   [[ -n "$SIZES" ]] || die "--sizes must not be empty"
   validate_positive_int "$CONCURRENCY" "--concurrency"
   validate_positive_int "$CODEC_MAX_INFLIGHT" "--codec-max-inflight"
+  validate_positive_int "$CODEC_MULTIPART_MAX_PARTS" "--codec-multipart-max-parts"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
+  validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
+  validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
+  [[ -n "$DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX" ]] || die "--diagnostic-obs-service-name-prefix must not be empty"
+  [[ -n "$DIAGNOSTIC_METRICS_URL" ]] || die "--diagnostic-metrics-url must not be empty"
 
   [[ -x "$ENHANCED_BENCH" ]] || die "enhanced benchmark script is not executable: $ENHANCED_BENCH"
   require_cmd curl
@@ -260,8 +330,29 @@ bool_from_on_off() {
   esac
 }
 
+dry_run_multipart_expected_reason() {
+  if [[ "$CODEC_MULTIPART" != "on" ]]; then
+    echo "multipart"
+  elif [[ "$CODEC_MULTIPART_MAX_PARTS" -lt 2 ]]; then
+    echo "multipart_part_limit"
+  else
+    echo "none"
+  fi
+}
+
 command_line_string() {
   printf '%q ' "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+}
+
+sanitize_metric_label_value() {
+  printf '%s' "$1" | tr -c '[:alnum:]_-' '-'
+}
+
+diagnostic_service_name() {
+  local profile="$1"
+  local run_id
+  run_id="$(sanitize_metric_label_value "$(basename "$OUT_DIR")")"
+  echo "${DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX}-${run_id}-${profile}"
 }
 
 detect_cpu_summary() {
@@ -332,6 +423,13 @@ rustfs/backlog#724
 rustfs/backlog#725
 rustfs/backlog#726
 rustfs/backlog#727
+rustfs/backlog#758
+rustfs/backlog#759
+rustfs/backlog#760
+rustfs/backlog#761
+rustfs/backlog#762
+rustfs/backlog#763
+rustfs/backlog#764
 EOF
 }
 
@@ -343,6 +441,7 @@ codec_streaming rollout fallback coverage proof
 Static gate reasons:
 - disabled
 - rollout_not_opted_in
+- rollout_pct_not_selected
 - body_compatibility_unconfirmed
 - header_compatibility_unconfirmed
 - lock_optimization_disabled
@@ -352,6 +451,7 @@ Static gate reasons:
 - compressed
 - remote
 - multipart
+- multipart_part_limit
 - invalid_min_size
 - read_quorum_not_safe
 
@@ -361,10 +461,19 @@ Relevant focused proof points:
 - set_disk::read::tests::codec_streaming_reader_gate_requires_explicit_rollout_and_compat_confirmation
 - set_disk::read::tests::codec_streaming_reader_gate_is_conservative
 - set_disk::read::tests::codec_streaming_reader_build_falls_back_when_read_quorum_is_not_safe
+- erasure::codec::bridge::tests::rustfs_codec_decode_engine_rejects_inconsistent_reconstruction_sources
+- erasure::codec::bridge::tests::rustfs_codec_decode_engine_rejects_stale_data_source
+- erasure::coding::decode_reader::tests::erasure_decode_reader_rustfs_engine_recovers_after_bitrot_source_mismatch
+- rustfs_io_get_object_reconstruct_outcome_total{path,engine,outcome}
 
 Conclusion:
-- range / encrypted / compressed / multipart / remote objects remain on legacy fallback paths
+- range / encrypted / compressed / remote objects remain on legacy fallback paths
+- multipart remains a legacy fallback by default and can be separately enabled with RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=true
+- multipart codec streaming is bounded by RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS
 - degraded reader setup remains opt-out via read_quorum_not_safe
+- codec-rustfs remains explicit opt-in through RUSTFS_GET_CODEC_STREAMING_ENGINE=rustfs
+- healthy codec-rustfs reads should report skip_data_complete instead of rustfs_called
+- rustfs_called is reserved for explicit reconstruction test/probe coverage and must not be required for healthy-read rollout
 - env kill switch remains available through RUSTFS_GET_CODEC_STREAMING_ENABLE=false
 EOF
 }
@@ -390,7 +499,22 @@ codec_max_inflight=${CODEC_MAX_INFLIGHT}
 codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
+codec_multipart=${CODEC_MULTIPART}
+codec_multipart_max_parts=${CODEC_MULTIPART_MAX_PARTS}
 output_handoff_attribution=${OUTPUT_HANDOFF_ATTRIBUTION}
+diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
+diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
+diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
+diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
+diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
+diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
+diagnostic_obs_service_name_prefix=${DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX}
+service_metric_prefix=${SERVICE_METRIC_PREFIX}
+compressed_fallback_probe=${COMPRESSED_FALLBACK_PROBE}
+compressed_probe_extension=${COMPRESSED_PROBE_EXTENSION}
+compressed_probe_mime_type=${COMPRESSED_PROBE_MIME_TYPE}
 address=${ADDRESS}
 bucket=${BUCKET}
 region=${REGION}
@@ -497,11 +621,12 @@ write_manifest() {
   local volumes="$4"
   local codec_engine="$5"
   local metrics_path="$6"
-  local rollout_target body_compat_confirmed header_compat_confirmed
+  local rollout_target body_compat_confirmed header_compat_confirmed obs_service_name
   local git_head git_dirty_count
   rollout_target="$(profile_rollout_target "$profile")"
   body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
   header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
+  obs_service_name="$(diagnostic_service_name "$profile")"
 
   git_head="$(git -C "$PROJECT_ROOT" rev-parse HEAD)"
   git_dirty_count="$(git -C "$PROJECT_ROOT" status --porcelain | awk 'END { print NR + 0 }')"
@@ -535,8 +660,24 @@ RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=${header_compat_confirmed}
 RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
+RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
+RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
+RUSTFS_OBS_ENDPOINT=${DIAGNOSTIC_OBS_ENDPOINT}
+RUSTFS_OBS_METRIC_ENDPOINT=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
+RUSTFS_OBS_METER_INTERVAL=${DIAGNOSTIC_OBS_METER_INTERVAL}
+RUSTFS_OBS_SERVICE_NAME=${obs_service_name}
+RUSTFS_COMPRESSION_ENABLED=${COMPRESSED_FALLBACK_PROBE}
+RUSTFS_COMPRESSION_EXTENSIONS=${COMPRESSED_PROBE_EXTENSION}
+RUSTFS_COMPRESSION_MIME_TYPES=${COMPRESSED_PROBE_MIME_TYPE}
+diagnostic_metrics_enabled=${DIAGNOSTIC_METRICS}
+diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
+diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
+diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
+diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+service_metric_prefix=${SERVICE_METRIC_PREFIX}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
 RUSTFS_SCANNER_START_DELAY_SECS=3600
@@ -597,6 +738,7 @@ start_server() {
   local rollout_target
   local body_compat_confirmed
   local header_compat_confirmed
+  local obs_service_name
   local rustfs_log
 
   data_root="$(profile_data_root "$profile")"
@@ -607,6 +749,7 @@ start_server() {
   rollout_target="$(profile_rollout_target "$profile")"
   body_compat_confirmed="$(profile_body_compat_confirmed "$profile")"
   header_compat_confirmed="$(profile_header_compat_confirmed "$profile")"
+  obs_service_name="$(diagnostic_service_name "$profile")"
   rustfs_log="${profile_dir}/rustfs.log"
 
   mkdir -p "${data_root}/disk1" "${data_root}/disk2" "${data_root}/disk3" "${data_root}/disk4"
@@ -634,8 +777,24 @@ start_server() {
     export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
     export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
+    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
+    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
+    if [[ "$DIAGNOSTIC_METRICS" == "true" ]]; then
+      export RUSTFS_OBS_METER_INTERVAL="$DIAGNOSTIC_OBS_METER_INTERVAL"
+      export RUSTFS_OBS_SERVICE_NAME="$obs_service_name"
+      if [[ -n "$DIAGNOSTIC_OBS_ENDPOINT" ]]; then
+        export RUSTFS_OBS_ENDPOINT="$DIAGNOSTIC_OBS_ENDPOINT"
+      fi
+      if [[ -n "$DIAGNOSTIC_OBS_METRIC_ENDPOINT" ]]; then
+        export RUSTFS_OBS_METRIC_ENDPOINT="$DIAGNOSTIC_OBS_METRIC_ENDPOINT"
+      fi
+    fi
+    export RUSTFS_COMPRESSION_ENABLED="$COMPRESSED_FALLBACK_PROBE"
+    export RUSTFS_COMPRESSION_EXTENSIONS="$COMPRESSED_PROBE_EXTENSION"
+    export RUSTFS_COMPRESSION_MIME_TYPES="$COMPRESSED_PROBE_MIME_TYPE"
     export RUSTFS_REGION="$REGION"
     export RUSTFS_RPC_SECRET="rustfs-get-codec-smoke-rpc-secret"
     export RUSTFS_SCANNER_ENABLED=false
@@ -694,6 +853,619 @@ write_metrics_summary() {
   if [[ -f "$median_csv" ]]; then
     cp "$median_csv" "${profile_dir}/metrics_summary.csv"
   fi
+}
+
+service_metrics_dir() {
+  local profile="$1"
+  echo "${OUT_DIR}/${profile}/service-metrics"
+}
+
+capture_prometheus_query_snapshot() {
+  local phase="$1"
+  local snapshot_file="$2"
+  local status_file="$3"
+  local service_name="$4"
+
+  "$PYTHON_BIN" - "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" "$DIAGNOSTIC_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$service_name" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+query_url, query, phase, snapshot_raw, status_raw, service_name = sys.argv[1:]
+snapshot_path = pathlib.Path(snapshot_raw)
+status_path = pathlib.Path(status_raw)
+
+
+def write_status(status):
+    status_path.write_text(
+        "\n".join(
+            [
+                f"phase={phase}",
+                f"status={status}",
+                f"url={query_url}",
+                f"query={query}",
+                f"service_name={service_name}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def escape_label(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def sample_to_line(sample):
+    metric = dict(sample.get("metric", {}))
+    name = metric.pop("__name__", "")
+    if not name:
+        return None
+    labels = ",".join(f'{key}="{escape_label(value)}"' for key, value in sorted(metric.items()))
+    value = sample.get("value", [None, None])[1]
+    if value is None:
+        return None
+    if labels:
+        return f"{name}{{{labels}}} {value}"
+    return f"{name} {value}"
+
+
+try:
+    separator = "&" if "?" in query_url else "?"
+    url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=5) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as err:  # noqa: BLE001 - shell harness reports the failure in status files.
+    snapshot_path.write_text(f"# prometheus_query_failed error={err}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+if payload.get("status") != "success":
+    snapshot_path.write_text(f"# prometheus_query_failed payload_status={payload.get('status')}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+samples = [
+    sample
+    for sample in payload.get("data", {}).get("result", [])
+    if not service_name or sample.get("metric", {}).get("service.name") == service_name
+]
+lines = [line for sample in samples if (line := sample_to_line(sample))]
+if not lines:
+    snapshot_path.write_text(f"# no_matching_metrics service_name={service_name}\n", encoding="utf-8")
+    write_status("no_matching_metrics")
+    raise SystemExit(0)
+
+snapshot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+write_status("ok")
+PY
+}
+
+capture_service_metrics_snapshot() {
+  local profile="$1"
+  local phase="$2"
+  local metrics_dir snapshot_file status_file
+  metrics_dir="$(service_metrics_dir "$profile")"
+  snapshot_file="${metrics_dir}/${phase}.prom"
+  status_file="${metrics_dir}/${phase}.status"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$metrics_dir"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=not_run_dry_run
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+    return 0
+  fi
+
+  if [[ -n "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    capture_prometheus_query_snapshot "$phase" "$snapshot_file" "$status_file" "$(diagnostic_service_name "$profile")"
+    return 0
+  fi
+
+  if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$snapshot_file"; then
+    if [[ ! -s "$snapshot_file" ]]; then
+      cat >"$status_file" <<EOF
+phase=${phase}
+status=empty_response
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+      log "WARN: captured empty service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
+      return 0
+    fi
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=ok
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+  else
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+phase=${phase}
+status=capture_failed
+url=${DIAGNOSTIC_METRICS_URL}
+EOF
+    log "WARN: failed to capture service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
+  fi
+}
+
+write_profile_service_metrics_summary() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local out_csv="${profile_dir}/service_metrics_summary.csv"
+  local before_file="${profile_dir}/service-metrics/before.prom"
+  local after_file="${profile_dir}/service-metrics/after.prom"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},disabled,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled
+EOF
+    return
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},not_run_dry_run,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_dry_run
+EOF
+    return
+  fi
+
+  if [[ ! -s "$before_file" || ! -s "$after_file" ]]; then
+    cat >"$out_csv" <<EOF
+profile,status,metric,labels,before,after,delta,classification
+${profile},snapshot_missing,N/A,N/A,N/A,N/A,N/A,service_metrics_snapshot_missing
+EOF
+    return
+  fi
+
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" <<'PY'
+import csv
+import pathlib
+import re
+import sys
+
+profile, metric_prefix, before_raw, after_raw, out_raw = sys.argv[1:]
+before_path = pathlib.Path(before_raw)
+after_path = pathlib.Path(after_raw)
+out_path = pathlib.Path(out_raw)
+
+LINE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$'
+)
+
+
+def classify(metric):
+    if metric == "rustfs_io_get_object_codec_streaming_decision_total":
+        return "codec_decision"
+    if metric == "rustfs_io_get_object_codec_streaming_fallback_total":
+        return "codec_fallback"
+    if metric == "rustfs_io_get_object_reader_path_total":
+        return "reader_path"
+    if metric.startswith("rustfs_io_get_object_stage_duration_seconds"):
+        return "stage_duration"
+    if metric.startswith("rustfs_io_get_object_reader_copy"):
+        return "reader_copy"
+    if metric.startswith("rustfs_io_get_object_reader_prefetch"):
+        return "reader_prefetch"
+    if metric.startswith("rustfs_io_get_object_fill_"):
+        return "fill_pipeline"
+    if metric.startswith("rustfs_io_get_object_shard_read"):
+        return "shard_read"
+    if metric.startswith("rustfs_io_get_object_metadata_"):
+        return "metadata"
+    if metric.startswith("rustfs_io_get_object_reader_"):
+        return "reader"
+    return "get_object"
+
+
+def read_metrics(path):
+    rows = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        match = LINE.match(raw)
+        if match is None:
+            continue
+        metric, labels, value = match.groups()
+        if not metric.startswith(metric_prefix):
+            continue
+        labels = labels or ""
+        rows[(metric, labels)] = float(value)
+    return rows
+
+
+before = read_metrics(before_path)
+after = read_metrics(after_path)
+keys = sorted(set(before) | set(after))
+
+with out_path.open("w", encoding="utf-8", newline="") as handle:
+    writer = csv.writer(handle)
+    writer.writerow(["profile", "status", "metric", "labels", "before", "after", "delta", "classification"])
+    if not keys:
+        writer.writerow([profile, "no_matching_metrics", "N/A", "N/A", "N/A", "N/A", "N/A", "service_metrics_empty"])
+    for metric, labels in keys:
+        before_value = before.get((metric, labels), 0.0)
+        after_value = after.get((metric, labels), 0.0)
+        writer.writerow(
+            [
+                profile,
+                "ok",
+                metric,
+                labels,
+                f"{before_value:.12g}",
+                f"{after_value:.12g}",
+                f"{after_value - before_value:.12g}",
+                classify(metric),
+            ]
+        )
+PY
+}
+
+write_root_service_metrics_summary() {
+  local out_csv="${OUT_DIR}/service_metrics_summary.csv"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/service_metrics_summary.csv"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,status,metric,labels,before,after,delta,classification
+N/A,missing,N/A,N/A,N/A,N/A,N/A,no_profile_service_metrics_summary
+EOF
+  fi
+}
+
+write_service_metrics_acceptance() {
+  local out_csv="${OUT_DIR}/service_metrics_acceptance.csv"
+  local service_csv="${OUT_DIR}/service_metrics_summary.csv"
+
+  "$PYTHON_BIN" - "$out_csv" "$service_csv" "$DIAGNOSTIC_METRICS" "$MODE" "$CODEC_ENGINES" \
+    "$COMPRESSED_FALLBACK_PROBE" "${OUT_DIR}/metrics_summary.csv" "$CODEC_MULTIPART" \
+    "$CODEC_MULTIPART_MAX_PARTS" <<'PY'
+import csv
+import pathlib
+import sys
+
+out_path = pathlib.Path(sys.argv[1])
+service_path = pathlib.Path(sys.argv[2])
+diagnostic_enabled = sys.argv[3] == "true"
+mode = sys.argv[4]
+codec_engines = [item.strip() for item in sys.argv[5].split(",") if item.strip()]
+compressed_fallback_probe_enabled = sys.argv[6] == "true"
+metrics_path = pathlib.Path(sys.argv[7])
+codec_multipart_enabled = sys.argv[8] == "on"
+codec_multipart_max_parts = int(sys.argv[9])
+
+
+def expected_profiles():
+    codec_profiles = [f"codec-{engine}" for engine in codec_engines]
+    if mode == "legacy":
+        return ["legacy"]
+    if mode == "codec":
+        return codec_profiles
+    return ["legacy", *codec_profiles]
+
+
+rows = []
+if service_path.exists():
+    with service_path.open(encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+
+metrics_rows = []
+if metrics_path.exists():
+    with metrics_path.open(encoding="utf-8", newline="") as handle:
+        metrics_rows = list(csv.DictReader(handle))
+
+
+def metric_matches(actual, expected):
+    return actual == expected or actual == f"{expected}_total"
+
+
+def delta_for(profile, metric, *label_fragments):
+    total = 0.0
+    for row in rows:
+        if row.get("profile") != profile or row.get("status") != "ok":
+            continue
+        if not metric_matches(row.get("metric", ""), metric):
+            continue
+        labels = row.get("labels", "")
+        if all(fragment in labels for fragment in label_fragments):
+            try:
+                total += float(row.get("delta", "0") or 0)
+            except ValueError:
+                pass
+    return total
+
+
+def delta_prefix(profile, metric_prefix, *label_fragments):
+    total = 0.0
+    for row in rows:
+        if row.get("profile") != profile or row.get("status") != "ok":
+            continue
+        if not row.get("metric", "").startswith(metric_prefix):
+            continue
+        labels = row.get("labels", "")
+        if all(fragment in labels for fragment in label_fragments):
+            try:
+                total += float(row.get("delta", "0") or 0)
+            except ValueError:
+                pass
+    return total
+
+
+def status_for(delta):
+    return "pass" if delta > 0 else "fail"
+
+
+def add(profile, check, expected, delta, note):
+    rows_out.append(
+        {
+            "profile": profile,
+            "check": check,
+            "expected": expected,
+            "status": status_for(delta),
+            "observed_delta": f"{delta:.12g}",
+            "note": note,
+        }
+    )
+
+
+def p99_available():
+    for row in metrics_rows:
+        value = row.get("median_req_p99_ms", "")
+        if value and value != "N/A":
+            return True
+    return False
+
+
+rows_out = []
+if not diagnostic_enabled:
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_enabled",
+            "expected": "true",
+            "status": "skipped",
+            "observed_delta": "N/A",
+            "note": "performance run: observability metrics export intentionally disabled",
+        }
+    )
+elif rows and all(row.get("status") == "not_run_dry_run" for row in rows):
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_enabled",
+            "expected": "non-dry-run service metrics snapshots",
+            "status": "skipped",
+            "observed_delta": "N/A",
+            "note": "dry-run only validates artifact wiring; runtime deltas require a real server run",
+        }
+    )
+elif rows and all(row.get("status") == "snapshot_missing" for row in rows):
+    rows_out.append(
+        {
+            "profile": "N/A",
+            "check": "diagnostic_metrics_capture",
+            "expected": "non-empty service metrics snapshots",
+            "status": "fail",
+            "observed_delta": "N/A",
+            "note": "metrics endpoint returned empty or missing snapshots; verify --diagnostic-metrics-url and exporter setup",
+        }
+    )
+else:
+    for profile in expected_profiles():
+        if profile == "legacy":
+            add(
+                profile,
+                "reader_path",
+                'rustfs_io_get_object_reader_path_total{path="legacy_duplex"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_path_total", 'path="legacy_duplex"'),
+                "proves legacy_duplex path was exercised",
+            )
+            add(
+                profile,
+                "fallback_disabled",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="disabled"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="disabled"'),
+                "proves kill-switch fallback reason at runtime",
+            )
+        else:
+            engine = profile[len("codec-") :] if profile.startswith("codec-") else profile
+            engine_path = "codec_streaming_rustfs_engine" if engine == "rustfs" else "codec_streaming_legacy_engine"
+            add(
+                profile,
+                "codec_decision_use",
+                'rustfs_io_get_object_codec_streaming_decision_total{outcome="use",reason="none"} delta > 0',
+                delta_for(
+                    profile,
+                    "rustfs_io_get_object_codec_streaming_decision_total",
+                    'outcome="use"',
+                    'reason="none"',
+                ),
+                "proves eligible GETs selected codec streaming",
+            )
+            add(
+                profile,
+                "reader_path",
+                'rustfs_io_get_object_reader_path_total{path="codec_streaming"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_path_total", 'path="codec_streaming"'),
+                "proves response reader used the codec streaming path",
+            )
+            add(
+                profile,
+                "engine_stage",
+                f'rustfs_io_get_object_stage_duration_seconds*{{path="{engine_path}"}} delta > 0',
+                delta_prefix(profile, "rustfs_io_get_object_stage_duration_seconds", f'path="{engine_path}"'),
+                "proves engine-specific codec path stage attribution",
+            )
+            add(
+                profile,
+                "reader_bytes",
+                f'rustfs_io_get_object_reader_bytes_total{{path="{engine_path}"}} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_reader_bytes_total", f'path="{engine_path}"'),
+                "proves emitted reader bytes were attributed to the selected engine",
+            )
+            add(
+                profile,
+                "fallback_range",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="range"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="range"'),
+                "proves runtime Range GET fallback reason delta",
+            )
+            if codec_multipart_enabled:
+                if codec_multipart_max_parts < 2:
+                    add(
+                        profile,
+                        "multipart_fallback_part_limit",
+                        'rustfs_io_get_object_codec_streaming_decision_total{outcome="fallback",object_class="multipart",reason="multipart_part_limit"} delta > 0',
+                        delta_for(
+                            profile,
+                            "rustfs_io_get_object_codec_streaming_decision_total",
+                            'outcome="fallback"',
+                            'object_class="multipart"',
+                            'reason="multipart_part_limit"',
+                        ),
+                        "proves multipart codec streaming falls back when part count exceeds the configured guard",
+                    )
+                else:
+                    add(
+                        profile,
+                        "multipart_codec_decision_use",
+                        'rustfs_io_get_object_codec_streaming_decision_total{outcome="use",object_class="multipart",reason="none"} delta > 0',
+                        delta_for(
+                            profile,
+                            "rustfs_io_get_object_codec_streaming_decision_total",
+                            'outcome="use"',
+                            'object_class="multipart"',
+                            'reason="none"',
+                        ),
+                        "proves runtime multipart GET selected codec streaming under explicit opt-in",
+                    )
+                    add(
+                        profile,
+                        "multipart_fallback_read_quorum_not_safe",
+                        'rustfs_io_get_object_codec_streaming_decision_total{outcome="fallback",object_class="multipart",reason="read_quorum_not_safe"} delta > 0',
+                        delta_for(
+                            profile,
+                            "rustfs_io_get_object_codec_streaming_decision_total",
+                            'outcome="fallback"',
+                            'object_class="multipart"',
+                            'reason="read_quorum_not_safe"',
+                        ),
+                        "proves unsafe multipart part setup falls back before returning a codec reader",
+                    )
+            else:
+                add(
+                    profile,
+                    "fallback_multipart",
+                    'rustfs_io_get_object_codec_streaming_fallback_total{reason="multipart"} delta > 0',
+                    delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="multipart"'),
+                    "proves runtime multipart object fallback reason delta",
+                )
+            add(
+                profile,
+                "fallback_encrypted",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="encrypted"} delta > 0',
+                delta_for(profile, "rustfs_io_get_object_codec_streaming_fallback_total", 'reason="encrypted"'),
+                "proves runtime encrypted object fallback reason delta",
+            )
+            add(
+                profile,
+                "fallback_read_quorum_not_safe",
+                'rustfs_io_get_object_codec_streaming_fallback_total{reason="read_quorum_not_safe"} delta > 0',
+                delta_for(
+                    profile,
+                    "rustfs_io_get_object_codec_streaming_fallback_total",
+                    'reason="read_quorum_not_safe"',
+                ),
+                "proves degraded-but-readable shard setup uses the legacy fallback path",
+            )
+            compressed_delta = delta_for(
+                profile,
+                "rustfs_io_get_object_codec_streaming_fallback_total",
+                'reason="compressed"',
+            )
+            rows_out.append(
+                {
+                    "profile": profile,
+                    "check": "fallback_compressed",
+                    "expected": 'rustfs_io_get_object_codec_streaming_fallback_total{reason="compressed"} delta > 0',
+                    "status": "pass"
+                    if compressed_delta > 0
+                    else ("fail" if compressed_fallback_probe_enabled else "unavailable"),
+                    "observed_delta": f"{compressed_delta:.12g}",
+                    "note": "Enable --compressed-fallback-probe to generate a runtime compressed fallback delta"
+                    if not compressed_fallback_probe_enabled
+                    else "proves runtime disk-compressed object fallback reason delta",
+                }
+            )
+            below_delta = delta_for(
+                profile,
+                "rustfs_io_get_object_codec_streaming_fallback_total",
+                'reason="below_min_size"',
+            )
+            rows_out.append(
+                {
+                    "profile": profile,
+                    "check": "fallback_below_min_size",
+                    "expected": 'rustfs_io_get_object_codec_streaming_fallback_total{reason="below_min_size"} delta > 0',
+                    "status": "pass" if below_delta > 0 else "unavailable",
+                    "observed_delta": f"{below_delta:.12g}",
+                    "note": "Set --codec-min-size greater than 1 to force this runtime fallback probe when unavailable",
+                }
+            )
+
+    rows_out.append(
+        {
+            "profile": "all",
+            "check": "diagnostic_vs_performance_separation",
+            "expected": "diagnostic artifacts are separate from performance conclusions",
+            "status": "pass",
+            "observed_delta": "N/A",
+            "note": "use --diagnostic-metrics for path proof; omit it for throughput acceptance runs",
+        }
+    )
+    p99_status = p99_available()
+    rows_out.append(
+        {
+            "profile": "all",
+            "check": "p95_p99",
+            "expected": "p99 available from warp request percentile output; p95 explicitly marked unavailable when warp does not emit it",
+            "status": "pass" if p99_status else "unavailable",
+            "observed_delta": "p99_available" if p99_status else "N/A",
+            "note": "median_req_p99_ms is aggregated in metrics_summary.csv; p95 remains unavailable because current warp text output emits 90% and 99%, not 95%",
+        }
+    )
+
+with out_path.open("w", encoding="utf-8", newline="") as handle:
+    fieldnames = ["profile", "check", "expected", "status", "observed_delta", "note"]
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(rows_out)
+PY
 }
 
 start_server_sampler() {
@@ -795,6 +1567,26 @@ ${COMPAT_OBJECT_SIZE},${profile},true,true,true,true,true,true,true,0,DRY_RUN,20
 EOF
     printf '%s\n' "DRY_RUN" >"${compat_dir}/body_sha256.txt"
     printf '{}\n' >"${compat_dir}/response_headers.json"
+    {
+      cat <<EOF
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+${profile},range,${COMPAT_OBJECT_KEY},not_run_dry_run,206,N/A,range,dry-run only
+${profile},below_min_size,${COMPAT_OBJECT_KEY}.below-min-size,not_run_dry_run,N/A,N/A,below_min_size,dry-run only
+${profile},multipart,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,$(dry_run_multipart_expected_reason),dry-run only
+${profile},multipart_degraded_read,${COMPAT_OBJECT_KEY}.multipart,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
+${profile},encrypted,${COMPAT_OBJECT_KEY}.encrypted,not_run_dry_run,200,N/A,encrypted,dry-run only
+${profile},read_quorum_not_safe,${COMPAT_OBJECT_KEY}.degraded-read,not_run_dry_run,200,N/A,read_quorum_not_safe,dry-run only
+EOF
+      if [[ "$COMPRESSED_FALLBACK_PROBE" == "true" ]]; then
+        printf '%s,%s,%s%s,%s,%s,%s,%s,%s\n' \
+          "$profile" "compressed" "$COMPAT_OBJECT_KEY" "$COMPRESSED_PROBE_EXTENSION" \
+          "not_run_dry_run" "200" "N/A" "compressed" "dry-run only"
+      else
+        printf '%s,%s,%s%s,%s,%s,%s,%s,%s\n' \
+          "$profile" "compressed" "$COMPAT_OBJECT_KEY" "$COMPRESSED_PROBE_EXTENSION" \
+          "skipped" "N/A" "N/A" "compressed" "use --compressed-fallback-probe"
+      fi
+    } >"${compat_dir}/fallback_probe_summary.csv"
     cat >"${compat_dir}/snapshot.json" <<EOF
 {
   "profile": "${profile}",
@@ -819,7 +1611,11 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$compat_dir" "$profile" <<'PY'
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" \
+    "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" \
+    "$CODEC_MULTIPART" "$CODEC_MULTIPART_MAX_PARTS" <<'PY'
+import base64
+import csv
 import datetime as dt
 import hashlib
 import hmac
@@ -829,9 +1625,31 @@ import pathlib
 import sys
 from typing import Dict, List, Optional, Tuple
 import urllib.parse
+import xml.etree.ElementTree as ET
+from xml.sax.saxutils import escape as xml_escape
 
-endpoint, access_key, secret_key, region, bucket, object_key, object_size_raw, out_dir_raw, profile = sys.argv[1:]
+(
+    endpoint,
+    access_key,
+    secret_key,
+    region,
+    bucket,
+    object_key,
+    object_size_raw,
+    codec_min_size_raw,
+    out_dir_raw,
+    profile,
+    compressed_fallback_probe_raw,
+    compressed_probe_extension,
+    compressed_probe_mime_type,
+    codec_multipart_raw,
+    codec_multipart_max_parts_raw,
+) = sys.argv[1:]
 object_size = int(object_size_raw)
+codec_min_size = int(codec_min_size_raw)
+compressed_fallback_probe = compressed_fallback_probe_raw == "true"
+codec_multipart_enabled = codec_multipart_raw == "on"
+codec_multipart_max_parts = int(codec_multipart_max_parts_raw)
 out_dir = pathlib.Path(out_dir_raw)
 out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -926,6 +1744,25 @@ def header_map(headers) -> Dict[str, List[str]]:
     return dict(sorted(result.items()))
 
 
+def first_header(snapshot, name: str) -> str:
+    name = name.lower()
+    for header_name, value in snapshot["headers"]:
+        if header_name.lower() == name:
+            return value
+    return ""
+
+
+def find_xml_text(body: bytes, name: str) -> Optional[str]:
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError:
+        return None
+    for elem in root.iter():
+        if elem.tag.rsplit("}", 1)[-1] == name:
+            return elem.text
+    return None
+
+
 bucket_path = "/" + urllib.parse.quote(bucket, safe="")
 object_path = bucket_path + "/" + urllib.parse.quote(object_key, safe="/-_.~")
 body = payload(object_size)
@@ -942,6 +1779,399 @@ head_object, _ = request("HEAD", object_path)
 get_object, get_body = request("GET", object_path)
 if get_object["status"] != 200:
     raise SystemExit(f"get object failed: {get_object['status']} {get_object['reason']}")
+
+range_object, range_body = request("GET", object_path, extra_headers=[("range", "bytes=0-0")])
+fallback_rows = [
+    {
+        "profile": profile,
+        "probe": "range",
+        "object_key": object_key,
+        "status": "ok" if range_object["status"] == 206 else "unexpected_status",
+        "status_code": range_object["status"],
+        "body_len": len(range_body),
+        "expected_runtime_fallback_reason": "range",
+        "note": "Range GET should stay on the legacy fallback path for codec profiles",
+    }
+]
+
+if codec_min_size > 1:
+    small_size = max(1, min(codec_min_size - 1, object_size))
+    small_key = object_key + ".below-min-size"
+    small_path = bucket_path + "/" + urllib.parse.quote(small_key, safe="/-_.~")
+    small_body = payload(small_size)
+    small_put, _ = request("PUT", small_path, small_body, [("content-type", "application/octet-stream")])
+    if small_put["status"] not in (200, 204):
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "below_min_size",
+                "object_key": small_key,
+                "status": "put_failed",
+                "status_code": small_put["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "below_min_size",
+                "note": "below-min-size probe upload failed",
+            }
+        )
+    else:
+        small_get, small_get_body = request("GET", small_path)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "below_min_size",
+                "object_key": small_key,
+                "status": "ok" if small_get["status"] == 200 else "unexpected_status",
+                "status_code": small_get["status"],
+                "body_len": len(small_get_body),
+                "expected_runtime_fallback_reason": "below_min_size",
+                "note": "Object smaller than codec-min-size should stay on the legacy fallback path for codec profiles",
+            }
+        )
+else:
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "below_min_size",
+            "object_key": object_key + ".below-min-size",
+            "status": "skipped",
+            "status_code": "N/A",
+            "body_len": "N/A",
+            "expected_runtime_fallback_reason": "below_min_size",
+            "note": "Set --codec-min-size greater than 1 to generate a runtime below_min_size fallback delta",
+        }
+    )
+
+compressed_key = object_key + compressed_probe_extension
+compressed_path = bucket_path + "/" + urllib.parse.quote(compressed_key, safe="/-_.~")
+if compressed_fallback_probe:
+    compressed_body = (b"RustFS compressed fallback probe\n" * 4096)[:128 * 1024]
+    compressed_put, _ = request(
+        "PUT",
+        compressed_path,
+        compressed_body,
+        [("content-type", compressed_probe_mime_type)],
+    )
+    if compressed_put["status"] not in (200, 204):
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "compressed",
+                "object_key": compressed_key,
+                "status": "put_failed",
+                "status_code": compressed_put["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "compressed",
+                "note": "compressed probe upload failed",
+            }
+        )
+    else:
+        compressed_get, compressed_get_body = request("GET", compressed_path)
+        compressed_ok = compressed_get["status"] == 200 and sha256_hex(compressed_get_body) == sha256_hex(compressed_body)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "compressed",
+                "object_key": compressed_key,
+                "status": "ok" if compressed_ok else "unexpected_status_or_body",
+                "status_code": compressed_get["status"],
+                "body_len": len(compressed_get_body),
+                "expected_runtime_fallback_reason": "compressed",
+                "note": "Disk-compressed object GET should stay on the legacy fallback path for codec profiles",
+            }
+        )
+else:
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "compressed",
+            "object_key": compressed_key,
+            "status": "skipped",
+            "status_code": "N/A",
+            "body_len": "N/A",
+            "expected_runtime_fallback_reason": "compressed",
+            "note": "Enable --compressed-fallback-probe to generate a runtime compressed fallback delta",
+        }
+    )
+
+degraded_key = object_key + ".degraded-read"
+degraded_path = bucket_path + "/" + urllib.parse.quote(degraded_key, safe="/-_.~")
+degraded_body = payload(max(object_size, 8 * 1024 * 1024))
+degraded_put, _ = request("PUT", degraded_path, degraded_body, [("content-type", "application/octet-stream")])
+if degraded_put["status"] not in (200, 204):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "read_quorum_not_safe",
+            "object_key": degraded_key,
+            "status": "put_failed",
+            "status_code": degraded_put["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": "read_quorum_not_safe",
+            "note": "degraded-read probe upload failed",
+        }
+    )
+else:
+    profile_dir = out_dir.parent
+    data_root = profile_dir / "data"
+    degraded_rel = pathlib.Path(*degraded_key.split("/"))
+    part_candidates = []
+    for disk_dir in sorted(data_root.glob("disk*")):
+        object_dir = disk_dir / bucket / degraded_rel
+        part_candidates.extend(sorted(object_dir.glob("*/part.1")))
+
+    if not part_candidates:
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "read_quorum_not_safe",
+                "object_key": degraded_key,
+                "status": "part_file_missing",
+                "status_code": "N/A",
+                "body_len": 0,
+                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                "note": "degraded-read probe could not find an on-disk part.1 shard to move",
+            }
+        )
+    else:
+        degraded_part = part_candidates[0]
+        missing_dir = out_dir / "degraded-missing-shards"
+        missing_dir.mkdir(parents=True, exist_ok=True)
+        missing_part = missing_dir / f"{degraded_part.parent.name}-{degraded_part.name}"
+        if missing_part.exists():
+            missing_part.unlink()
+        degraded_part.rename(missing_part)
+        try:
+            degraded_part.parent.rmdir()
+        except OSError:
+            pass
+        degraded_get, degraded_get_body = request("GET", degraded_path)
+        degraded_ok = degraded_get["status"] == 200 and sha256_hex(degraded_get_body) == sha256_hex(degraded_body)
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "read_quorum_not_safe",
+                "object_key": degraded_key,
+                "status": "ok" if degraded_ok else "unexpected_status_or_body",
+                "status_code": degraded_get["status"],
+                "body_len": len(degraded_get_body),
+                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                "note": f"Moved one shard to {missing_part}; degraded GET should stay on the legacy fallback path for codec profiles",
+            }
+        )
+
+multipart_key = object_key + ".multipart"
+multipart_path = bucket_path + "/" + urllib.parse.quote(multipart_key, safe="/-_.~")
+multipart_part_one = payload(5 * 1024 * 1024)
+multipart_part_two = payload(1)
+multipart_expected_reason = "multipart"
+if codec_multipart_enabled and profile.startswith("codec-"):
+    multipart_expected_reason = "multipart_part_limit" if codec_multipart_max_parts < 2 else "none"
+multipart_note = (
+    "Multipart object GET should use the codec streaming path for codec profiles"
+    if multipart_expected_reason == "none"
+    else "Multipart object GET should exceed the codec streaming part-count guard"
+    if multipart_expected_reason == "multipart_part_limit"
+    else "Multipart object GET should stay on the legacy fallback path for codec profiles"
+)
+initiate_multipart, initiate_multipart_body = request("POST", multipart_path + "?uploads")
+if initiate_multipart["status"] not in (200, 201):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "multipart",
+            "object_key": multipart_key,
+            "status": "initiate_failed",
+            "status_code": initiate_multipart["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": multipart_expected_reason,
+            "note": "multipart initiate failed",
+        }
+    )
+else:
+    upload_id = find_xml_text(initiate_multipart_body, "UploadId")
+    if not upload_id:
+        fallback_rows.append(
+            {
+                "profile": profile,
+                "probe": "multipart",
+                "object_key": multipart_key,
+                "status": "upload_id_missing",
+                "status_code": initiate_multipart["status"],
+                "body_len": 0,
+                "expected_runtime_fallback_reason": multipart_expected_reason,
+                "note": "multipart initiate response did not include UploadId",
+            }
+        )
+    else:
+        upload_id_query = urllib.parse.quote(upload_id, safe="")
+        part_one, _ = request("PUT", f"{multipart_path}?partNumber=1&uploadId={upload_id_query}", multipart_part_one)
+        part_two, _ = request("PUT", f"{multipart_path}?partNumber=2&uploadId={upload_id_query}", multipart_part_two)
+        etag_one = first_header(part_one, "etag")
+        etag_two = first_header(part_two, "etag")
+        if part_one["status"] not in (200, 201) or part_two["status"] not in (200, 201) or not etag_one or not etag_two:
+            fallback_rows.append(
+                {
+                    "profile": profile,
+                    "probe": "multipart",
+                    "object_key": multipart_key,
+                    "status": "upload_part_failed",
+                    "status_code": f"{part_one['status']};{part_two['status']}",
+                    "body_len": 0,
+                    "expected_runtime_fallback_reason": multipart_expected_reason,
+                    "note": "multipart part upload failed or ETag was missing",
+                }
+            )
+            request("DELETE", f"{multipart_path}?uploadId={upload_id_query}")
+        else:
+            complete_body = (
+                '<?xml version="1.0" encoding="UTF-8"?>'
+                "<CompleteMultipartUpload>"
+                f"<Part><PartNumber>1</PartNumber><ETag>{xml_escape(etag_one)}</ETag></Part>"
+                f"<Part><PartNumber>2</PartNumber><ETag>{xml_escape(etag_two)}</ETag></Part>"
+                "</CompleteMultipartUpload>"
+            ).encode()
+            complete_multipart, _ = request(
+                "POST",
+                f"{multipart_path}?uploadId={upload_id_query}",
+                complete_body,
+                [("content-type", "application/xml")],
+            )
+            if complete_multipart["status"] not in (200, 201):
+                fallback_rows.append(
+                    {
+                        "profile": profile,
+                        "probe": "multipart",
+                        "object_key": multipart_key,
+                        "status": "complete_failed",
+                        "status_code": complete_multipart["status"],
+                        "body_len": 0,
+                        "expected_runtime_fallback_reason": multipart_expected_reason,
+                        "note": "multipart complete failed",
+                    }
+                )
+                request("DELETE", f"{multipart_path}?uploadId={upload_id_query}")
+            else:
+                multipart_get, multipart_get_body = request("GET", multipart_path)
+                expected_multipart_len = len(multipart_part_one) + len(multipart_part_two)
+                expected_multipart_body_hash = sha256_hex(multipart_part_one + multipart_part_two)
+                multipart_ok = (
+                    multipart_get["status"] == 200
+                    and len(multipart_get_body) == expected_multipart_len
+                    and sha256_hex(multipart_get_body) == expected_multipart_body_hash
+                )
+                fallback_rows.append(
+                    {
+                        "profile": profile,
+                        "probe": "multipart",
+                        "object_key": multipart_key,
+                        "status": "ok" if multipart_ok else "unexpected_status_or_length",
+                        "status_code": multipart_get["status"],
+                        "body_len": len(multipart_get_body),
+                        "expected_runtime_fallback_reason": multipart_expected_reason,
+                        "note": multipart_note,
+                    }
+                )
+                if multipart_expected_reason == "none":
+                    profile_dir = out_dir.parent
+                    data_root = profile_dir / "data"
+                    multipart_rel = pathlib.Path(*multipart_key.split("/"))
+                    part_candidates = []
+                    for disk_dir in sorted(data_root.glob("disk*")):
+                        object_dir = disk_dir / bucket / multipart_rel
+                        part_candidates.extend(sorted(object_dir.glob("*/part.1")))
+
+                    if not part_candidates:
+                        fallback_rows.append(
+                            {
+                                "profile": profile,
+                                "probe": "multipart_degraded_read",
+                                "object_key": multipart_key,
+                                "status": "part_file_missing",
+                                "status_code": "N/A",
+                                "body_len": 0,
+                                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                                "note": "multipart degraded-read probe could not find an on-disk part.1 shard to move",
+                            }
+                        )
+                    else:
+                        multipart_part = part_candidates[0]
+                        missing_dir = out_dir / "multipart-degraded-missing-shards"
+                        missing_dir.mkdir(parents=True, exist_ok=True)
+                        missing_part = missing_dir / f"{multipart_part.parent.name}-{multipart_part.name}"
+                        if missing_part.exists():
+                            missing_part.unlink()
+                        multipart_part.rename(missing_part)
+                        degraded_multipart_get, degraded_multipart_body = request("GET", multipart_path)
+                        degraded_multipart_ok = (
+                            degraded_multipart_get["status"] == 200
+                            and len(degraded_multipart_body) == expected_multipart_len
+                            and sha256_hex(degraded_multipart_body) == expected_multipart_body_hash
+                        )
+                        fallback_rows.append(
+                            {
+                                "profile": profile,
+                                "probe": "multipart_degraded_read",
+                                "object_key": multipart_key,
+                                "status": "ok" if degraded_multipart_ok else "unexpected_status_or_body",
+                                "status_code": degraded_multipart_get["status"],
+                                "body_len": len(degraded_multipart_body),
+                                "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                                "note": f"Moved one multipart shard to {missing_part}; unsafe part setup should fall back before returning a codec reader",
+                            }
+                        )
+                else:
+                    fallback_rows.append(
+                        {
+                            "profile": profile,
+                            "probe": "multipart_degraded_read",
+                            "object_key": multipart_key,
+                            "status": "skipped",
+                            "status_code": "N/A",
+                            "body_len": "N/A",
+                            "expected_runtime_fallback_reason": "read_quorum_not_safe",
+                            "note": "Enable --codec-multipart on with a multipart max-parts value of at least 2 for degraded-read fallback proof",
+                        }
+                    )
+
+encrypted_key = object_key + ".encrypted"
+encrypted_path = bucket_path + "/" + urllib.parse.quote(encrypted_key, safe="/-_.~")
+ssec_key = b"0123456789abcdef0123456789abcdef"
+ssec_key_b64 = base64.b64encode(ssec_key).decode()
+ssec_key_md5_b64 = base64.b64encode(hashlib.md5(ssec_key).digest()).decode()
+ssec_headers = [
+    ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+    ("x-amz-server-side-encryption-customer-key", ssec_key_b64),
+    ("x-amz-server-side-encryption-customer-key-md5", ssec_key_md5_b64),
+]
+encrypted_put, _ = request("PUT", encrypted_path, body, [("content-type", "application/octet-stream"), *ssec_headers])
+if encrypted_put["status"] not in (200, 204):
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "encrypted",
+            "object_key": encrypted_key,
+            "status": "put_failed",
+            "status_code": encrypted_put["status"],
+            "body_len": 0,
+            "expected_runtime_fallback_reason": "encrypted",
+            "note": "SSE-C encrypted object upload failed",
+        }
+    )
+else:
+    encrypted_get, encrypted_body = request("GET", encrypted_path, extra_headers=ssec_headers)
+    encrypted_ok = encrypted_get["status"] == 200 and sha256_hex(encrypted_body) == sha256_hex(body)
+    fallback_rows.append(
+        {
+            "profile": profile,
+            "probe": "encrypted",
+            "object_key": encrypted_key,
+            "status": "ok" if encrypted_ok else "unexpected_status_or_body",
+            "status_code": encrypted_get["status"],
+            "body_len": len(encrypted_body),
+            "expected_runtime_fallback_reason": "encrypted",
+            "note": "SSE-C encrypted object GET should stay on the legacy fallback path for codec profiles",
+        }
+    )
 
 body_sha = sha256_hex(get_body)
 expected_sha = sha256_hex(body)
@@ -969,6 +2199,20 @@ snapshot = {
 (out_dir / "response_headers.json").write_text(json.dumps(headers_report, indent=2, sort_keys=True) + "\n")
 (out_dir / "snapshot.json").write_text(json.dumps(snapshot, indent=2, sort_keys=True) + "\n")
 (out_dir / "body_sha256.txt").write_text(body_sha + "\n")
+with (out_dir / "fallback_probe_summary.csv").open("w", encoding="utf-8", newline="") as handle:
+    fieldnames = [
+        "profile",
+        "probe",
+        "object_key",
+        "status",
+        "status_code",
+        "body_len",
+        "expected_runtime_fallback_reason",
+        "note",
+    ]
+    writer = csv.DictWriter(handle, fieldnames=fieldnames)
+    writer.writeheader()
+    writer.writerows(fallback_rows)
 
 get_headers = snapshot["get_headers"]
 content_length = ",".join(get_headers.get("content-length", []))
@@ -1093,6 +2337,30 @@ with open(out_csv, "w", encoding="utf-8", newline="") as handle:
 PY
 }
 
+write_root_fallback_probe_summary() {
+  local out_csv="${OUT_DIR}/fallback_probe_summary.csv"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/compat/fallback_probe_summary.csv"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+N/A,missing,N/A,missing,N/A,N/A,N/A,no_profile_fallback_probe_summary
+EOF
+  fi
+}
+
 write_root_metrics_summary() {
   local profile_dirs=()
   local profile
@@ -1150,6 +2418,10 @@ def performance_note(throughput_delta, latency_delta):
     return "at_or_better_than_legacy"
 
 
+def row_value(row, key):
+    return row.get(key, "")
+
+
 rows = []
 by_profile = {}
 for profile_dir in profile_dirs:
@@ -1179,6 +2451,8 @@ for profile_dir in profile_dirs:
                 "median_throughput_bps": row["median_throughput_bps"],
                 "median_reqps": row["median_reqps"],
                 "median_latency_ms": row["median_latency_ms"],
+                "median_req_p90_ms": row_value(row, "median_req_p90_ms"),
+                "median_req_p99_ms": row_value(row, "median_req_p99_ms"),
             }
         )
 
@@ -1195,10 +2469,14 @@ for row in rows:
     throughput_delta = delta_pct(parse_float(row["median_throughput_bps"]), parse_float(baseline["median_throughput_bps"]))
     reqps_delta = delta_pct(parse_float(row["median_reqps"]), parse_float(baseline["median_reqps"]))
     latency_delta = delta_pct(parse_float(row["median_latency_ms"]), parse_float(baseline["median_latency_ms"]))
+    p90_delta = delta_pct(parse_float(row.get("median_req_p90_ms", "")), parse_float(baseline.get("median_req_p90_ms", "")))
+    p99_delta = delta_pct(parse_float(row.get("median_req_p99_ms", "")), parse_float(baseline.get("median_req_p99_ms", "")))
     row["baseline_profile"] = "legacy"
     row["delta_throughput_pct_vs_legacy"] = throughput_delta
     row["delta_reqps_pct_vs_legacy"] = reqps_delta
     row["delta_latency_pct_vs_legacy"] = latency_delta
+    row["delta_req_p90_pct_vs_legacy"] = p90_delta
+    row["delta_req_p99_pct_vs_legacy"] = p99_delta
     row["performance_note"] = performance_note(throughput_delta, latency_delta)
 
 fieldnames = [
@@ -1220,10 +2498,14 @@ fieldnames = [
     "median_throughput_bps",
     "median_reqps",
     "median_latency_ms",
+    "median_req_p90_ms",
+    "median_req_p99_ms",
     "baseline_profile",
     "delta_throughput_pct_vs_legacy",
     "delta_reqps_pct_vs_legacy",
     "delta_latency_pct_vs_legacy",
+    "delta_req_p90_pct_vs_legacy",
+    "delta_req_p99_pct_vs_legacy",
     "performance_note",
 ]
 with open(metrics_csv, "w", encoding="utf-8", newline="") as handle:
@@ -1254,6 +2536,12 @@ baseline_fields = [
     "new_median_latency_ms",
     "baseline_median_latency_ms",
     "delta_latency_pct_vs_legacy",
+    "new_median_req_p90_ms",
+    "baseline_median_req_p90_ms",
+    "delta_req_p90_pct_vs_legacy",
+    "new_median_req_p99_ms",
+    "baseline_median_req_p99_ms",
+    "delta_req_p99_pct_vs_legacy",
     "new_median_throughput_bps",
     "baseline_median_throughput_bps",
     "delta_throughput_pct_vs_legacy",
@@ -1290,6 +2578,12 @@ for row in rows:
             "new_median_latency_ms": row["median_latency_ms"],
             "baseline_median_latency_ms": baseline.get("median_latency_ms", ""),
             "delta_latency_pct_vs_legacy": row["delta_latency_pct_vs_legacy"],
+            "new_median_req_p90_ms": row.get("median_req_p90_ms", ""),
+            "baseline_median_req_p90_ms": baseline.get("median_req_p90_ms", ""),
+            "delta_req_p90_pct_vs_legacy": row.get("delta_req_p90_pct_vs_legacy", ""),
+            "new_median_req_p99_ms": row.get("median_req_p99_ms", ""),
+            "baseline_median_req_p99_ms": baseline.get("median_req_p99_ms", ""),
+            "delta_req_p99_pct_vs_legacy": row.get("delta_req_p99_pct_vs_legacy", ""),
             "new_median_throughput_bps": row["median_throughput_bps"],
             "baseline_median_throughput_bps": baseline.get("median_throughput_bps", ""),
             "delta_throughput_pct_vs_legacy": row["delta_throughput_pct_vs_legacy"],
@@ -1318,12 +2612,24 @@ compare_fields = [
     "legacy_median_latency_ms",
     "codec_legacy_median_latency_ms",
     "codec_rustfs_median_latency_ms",
+    "legacy_median_req_p90_ms",
+    "codec_legacy_median_req_p90_ms",
+    "codec_rustfs_median_req_p90_ms",
+    "legacy_median_req_p99_ms",
+    "codec_legacy_median_req_p99_ms",
+    "codec_rustfs_median_req_p99_ms",
     "codec_legacy_delta_throughput_pct_vs_legacy",
     "codec_rustfs_delta_throughput_pct_vs_legacy",
     "codec_rustfs_delta_throughput_pct_vs_codec_legacy",
     "codec_legacy_delta_latency_pct_vs_legacy",
     "codec_rustfs_delta_latency_pct_vs_legacy",
     "codec_rustfs_delta_latency_pct_vs_codec_legacy",
+    "codec_legacy_delta_req_p90_pct_vs_legacy",
+    "codec_rustfs_delta_req_p90_pct_vs_legacy",
+    "codec_rustfs_delta_req_p90_pct_vs_codec_legacy",
+    "codec_legacy_delta_req_p99_pct_vs_legacy",
+    "codec_rustfs_delta_req_p99_pct_vs_legacy",
+    "codec_rustfs_delta_req_p99_pct_vs_codec_legacy",
 ]
 compare_rows = []
 for size, legacy in legacy_by_size.items():
@@ -1341,6 +2647,12 @@ for size, legacy in legacy_by_size.items():
             "legacy_median_latency_ms": legacy.get("median_latency_ms", ""),
             "codec_legacy_median_latency_ms": codec_legacy.get("median_latency_ms", ""),
             "codec_rustfs_median_latency_ms": codec_rustfs.get("median_latency_ms", ""),
+            "legacy_median_req_p90_ms": legacy.get("median_req_p90_ms", ""),
+            "codec_legacy_median_req_p90_ms": codec_legacy.get("median_req_p90_ms", ""),
+            "codec_rustfs_median_req_p90_ms": codec_rustfs.get("median_req_p90_ms", ""),
+            "legacy_median_req_p99_ms": legacy.get("median_req_p99_ms", ""),
+            "codec_legacy_median_req_p99_ms": codec_legacy.get("median_req_p99_ms", ""),
+            "codec_rustfs_median_req_p99_ms": codec_rustfs.get("median_req_p99_ms", ""),
             "codec_legacy_delta_throughput_pct_vs_legacy": delta_pct(
                 parse_float(codec_legacy.get("median_throughput_bps", "")),
                 parse_float(legacy.get("median_throughput_bps", "")),
@@ -1364,6 +2676,30 @@ for size, legacy in legacy_by_size.items():
             "codec_rustfs_delta_latency_pct_vs_codec_legacy": delta_pct(
                 parse_float(codec_rustfs.get("median_latency_ms", "")),
                 parse_float(codec_legacy.get("median_latency_ms", "")),
+            ),
+            "codec_legacy_delta_req_p90_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_req_p90_ms", "")),
+                parse_float(legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p90_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p90_ms", "")),
+                parse_float(legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p90_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p90_ms", "")),
+                parse_float(codec_legacy.get("median_req_p90_ms", "")),
+            ),
+            "codec_legacy_delta_req_p99_pct_vs_legacy": delta_pct(
+                parse_float(codec_legacy.get("median_req_p99_ms", "")),
+                parse_float(legacy.get("median_req_p99_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p99_pct_vs_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p99_ms", "")),
+                parse_float(legacy.get("median_req_p99_ms", "")),
+            ),
+            "codec_rustfs_delta_req_p99_pct_vs_codec_legacy": delta_pct(
+                parse_float(codec_rustfs.get("median_req_p99_ms", "")),
+                parse_float(codec_legacy.get("median_req_p99_ms", "")),
             ),
         }
     )
@@ -1407,10 +2743,11 @@ write_default_switch_readiness_report() {
   local compat_summary_path="${OUT_DIR}/compat_summary.csv"
   local cpu_rss_notes_path="${OUT_DIR}/cpu_rss_notes.txt"
   local fallback_coverage_path="${OUT_DIR}/fallback_coverage.txt"
+  local service_metrics_acceptance_path="${OUT_DIR}/service_metrics_acceptance.csv"
   local tracking_issues_path="${OUT_DIR}/tracking_issues.txt"
 
   local stable not_worse improved_over_five two_sizes_gt_five
-  local headers_compatible p95_p99_ok cpu_rss_ok fallback_proven kill_switch_verified correctness_matrix_ok
+  local headers_compatible p95_p99_ok cpu_rss_ok runtime_metrics_ok fallback_proven kill_switch_verified correctness_matrix_ok
   local all_pass decision
 
   if [[ -f "$baseline_compare_path" ]]; then
@@ -1431,7 +2768,7 @@ write_default_switch_readiness_report() {
           if ($19 == "" || $22 == "" || ($19 + 0.0) < 0.0 || ($22 + 0.0) > 0.0) {
             not_worse = 0
           }
-          if ($25 != "" && ($25 + 0.0) > 5.0) {
+          if ($31 != "" && ($31 + 0.0) > 5.0) {
             improved++
           }
         }
@@ -1464,6 +2801,25 @@ write_default_switch_readiness_report() {
 
   p95_p99_ok="fail"
   correctness_matrix_ok="fail"
+  runtime_metrics_ok="fail"
+
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && -f "$service_metrics_acceptance_path" ]] \
+     && "$PYTHON_BIN" - "$service_metrics_acceptance_path" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], encoding="utf-8", newline="") as handle:
+    rows = list(csv.DictReader(handle))
+
+statuses = [row.get("status") for row in rows]
+if not rows or "fail" in statuses or "pass" not in statuses:
+    raise SystemExit(1)
+PY
+  then
+    runtime_metrics_ok="pass"
+  elif [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    runtime_metrics_ok="skipped"
+  fi
 
   if [[ -f "$cpu_rss_notes_path" ]] && grep -q 'cpu_rss_acceptability=acceptable' "$cpu_rss_notes_path"; then
     cpu_rss_ok="pass"
@@ -1473,7 +2829,7 @@ write_default_switch_readiness_report() {
 
   if [[ -f "$fallback_coverage_path" ]] \
     && grep -q 'read_quorum_not_safe' "$fallback_coverage_path" \
-    && grep -q 'range / encrypted / compressed / multipart / remote' "$fallback_coverage_path"; then
+    && grep -q 'range / encrypted / compressed / remote' "$fallback_coverage_path"; then
     fallback_proven="pass"
   else
     fallback_proven="fail"
@@ -1490,6 +2846,7 @@ write_default_switch_readiness_report() {
      && "$two_sizes_gt_five" == "pass" \
      && "$p95_p99_ok" == "pass" \
      && "$cpu_rss_ok" == "pass" \
+     && "$runtime_metrics_ok" == "pass" \
      && "$correctness_matrix_ok" == "pass" \
      && "$headers_compatible" == "pass" \
      && "$fallback_proven" == "pass" \
@@ -1513,11 +2870,12 @@ write_default_switch_readiness_report() {
     echo "| multi-round cooled A/B stable | ${stable} | expected rounds per target size: ${ROUNDS} |"
     echo "| 1MiB / 4MiB / 10MiB not worse than legacy | ${not_worse} | derived from baseline_compare.csv |"
     echo "| at least two sizes improve by more than 5% | ${two_sizes_gt_five} | qualifying sizes: ${improved_over_five} |"
-    echo "| p95 / p99 do not regress | ${p95_p99_ok} | current harness retains raw output paths but does not aggregate p95/p99 yet |"
+    echo "| p95 / p99 do not regress | ${p95_p99_ok} | p99 is aggregated in metrics_summary.csv; p95 remains unavailable in current warp text output |"
     echo "| CPU and RSS acceptable | ${cpu_rss_ok} | see cpu_rss_notes.txt |"
+    echo "| runtime server metrics prove path and fallback deltas | ${runtime_metrics_ok} | see service_metrics_acceptance.csv; skipped for observability-off performance runs |"
     echo "| correctness matrix passes | ${correctness_matrix_ok} | compat smoke passes, but full correctness matrix is not fully evidenced by this harness alone |"
     echo "| response headers compatible | ${headers_compatible} | see compat_summary.csv |"
-    echo "| range / encrypted / compressed / multipart / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
+    echo "| range / encrypted / compressed / remote fallback proven | ${fallback_proven} | see fallback_coverage.txt |"
     echo "| kill switch verified | ${kill_switch_verified} | see fallback_coverage.txt |"
     echo
     echo "## Evidence Files"
@@ -1525,6 +2883,9 @@ write_default_switch_readiness_report() {
     echo "- \`baseline_compare.csv\`"
     echo "- \`compat_summary.csv\`"
     echo "- \`metrics_summary.csv\`"
+    echo "- \`service_metrics_summary.csv\`"
+    echo "- \`service_metrics_acceptance.csv\`"
+    echo "- \`fallback_probe_summary.csv\`"
     echo "- \`cpu_rss_notes.txt\`"
     echo "- \`fallback_coverage.txt\`"
     echo "- \`tracking_issues.txt\`"
@@ -1547,6 +2908,7 @@ run_profile() {
 
   stop_server
   start_server "$profile"
+  capture_service_metrics_snapshot "$profile" before
   if run_bench "$profile" "$baseline_csv"; then
     :
   else
@@ -1554,11 +2916,17 @@ run_profile() {
   fi
   write_metrics_summary "$profile"
   run_compat_probe "$profile"
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && "$DIAGNOSTIC_METRICS_SETTLE_SECS" -gt 0 ]]; then
+    sleep "$DIAGNOSTIC_METRICS_SETTLE_SECS"
+  fi
+  capture_service_metrics_snapshot "$profile" after
+  write_profile_service_metrics_summary "$profile"
   stop_server
   write_profile_cpu_rss_notes "$profile"
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
   log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
+  log "Service metrics summary: ${OUT_DIR}/${profile}/service_metrics_summary.csv"
   log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
@@ -1623,7 +2991,10 @@ main() {
   done
 
   write_root_metrics_summary "${profiles[@]}"
+  write_root_service_metrics_summary "${profiles[@]}"
+  write_service_metrics_acceptance
   write_root_compat_summary "${profiles[@]}"
+  write_root_fallback_probe_summary "${profiles[@]}"
   write_root_cpu_rss_notes
   write_fallback_coverage
   write_tracking_issues
@@ -1638,6 +3009,15 @@ main() {
   fi
   if [[ -f "${OUT_DIR}/metrics_summary.csv" ]]; then
     log "Metrics summary: ${OUT_DIR}/metrics_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/service_metrics_summary.csv" ]]; then
+    log "Service metrics summary: ${OUT_DIR}/service_metrics_summary.csv"
+  fi
+  if [[ -f "${OUT_DIR}/service_metrics_acceptance.csv" ]]; then
+    log "Service metrics acceptance: ${OUT_DIR}/service_metrics_acceptance.csv"
+  fi
+  if [[ -f "${OUT_DIR}/fallback_probe_summary.csv" ]]; then
+    log "Fallback probe summary: ${OUT_DIR}/fallback_probe_summary.csv"
   fi
   if [[ -f "${OUT_DIR}/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/baseline_compare.csv"

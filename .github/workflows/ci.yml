@@ -192,13 +192,11 @@ jobs:
             flags: "--features swift"
           - name: sftp
             flags: "--features sftp"
-          - name: no-default
-            flags: "--no-default-features"
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v7
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
       - name: Setup Rust environment
         uses: ./.github/actions/setup

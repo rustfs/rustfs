@@ -12,20 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy core reader and writer implementations for RustFS.
+//! Buffered I/O reader and writer implementations for RustFS.
 //!
-//! This crate provides zero-copy readers and writers that minimize memory
-//! allocations and data copying during I/O operations. It depends on
-//! `rustfs-io-metrics` for metrics reporting and is designed to avoid
-//! introducing cyclic dependencies in the RustFS crate graph.
+//! This crate provides buffered readers and writers for I/O operations.
+//! Note: despite "ZeroCopy" naming in type names (kept for backward compatibility),
+//! the actual implementations perform mmap-then-copy or aligned pread, not true
+//! zero-copy. See https://github.com/rustfs/backlog/issues/733
 //!
 //! # Features
 //!
-//! - Memory-mapped file reading (mmap) on Unix platforms
-//! - Bytes-based zero-copy wrapping
+//! - Memory-mapped file reading (mmap-then-copy) on Unix platforms
+//! - Bytes-based buffered wrapping
 //! - AsyncRead trait implementations
 //! - Tiered BytesPool for buffer management
-//! - Optional Direct I/O support (Linux only)
+//! - Aligned pread-based reader (NOT true Direct I/O / O_DIRECT)
 //!
 //! # Example
 //!

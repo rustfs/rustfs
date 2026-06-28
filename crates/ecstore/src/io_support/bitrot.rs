@@ -36,7 +36,7 @@ struct BitrotReaderSource {
     path: String,
     offset: usize,
     length: usize,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
 }
 
 impl BitrotReaderSource {
@@ -47,7 +47,7 @@ impl BitrotReaderSource {
             rd.set_position(offset);
             Ok(Some(Box::new(rd)))
         } else if let Some(disk) = self.disk {
-            open_disk_reader(&disk, &self.bucket, &self.path, self.offset, self.length, self.use_zero_copy)
+            open_disk_reader(&disk, &self.bucket, &self.path, self.offset, self.length, self.use_mmap_read)
                 .await
                 .map(Some)
         } else {
@@ -136,9 +136,9 @@ async fn open_disk_reader(
     path: &str,
     offset: usize,
     length: usize,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
 ) -> disk::error::Result<FileReader> {
-    if use_zero_copy && disk.is_local() {
+    if use_mmap_read && disk.is_local() {
         let start = Instant::now();
         match disk.read_file_zero_copy(bucket, path, offset, length).await {
             Ok(bytes) => {
@@ -192,7 +192,7 @@ fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksu
 /// * `shard_size` - Shard size for erasure coding
 /// * `checksum_algo` - Hash algorithm for bitrot verification
 /// * `skip_verify` - If true, skip checksum verification
-/// * `use_zero_copy` - If true, use zero-copy read (mmap on Unix)
+/// * `use_mmap_read` - If true, use zero-copy read (mmap on Unix)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_bitrot_reader(
     inline_data: Option<&[u8]>,
@@ -204,7 +204,7 @@ pub async fn create_bitrot_reader(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let source = BitrotReaderSource {
@@ -214,7 +214,7 @@ pub async fn create_bitrot_reader(
         path: path.to_string(),
         offset,
         length,
-        use_zero_copy,
+        use_mmap_read,
     };
 
     source
@@ -234,7 +234,7 @@ pub fn create_deferred_bitrot_reader(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify: bool,
-    use_zero_copy: bool,
+    use_mmap_read: bool,
 ) -> BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>> {
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let source = BitrotReaderSource {
@@ -244,7 +244,7 @@ pub fn create_deferred_bitrot_reader(
         path: path.to_string(),
         offset,
         length,
-        use_zero_copy,
+        use_mmap_read,
     };
 
     BitrotReader::new(Box::new(DeferredObjectReader::new(source)), shard_size, checksum_algo, skip_verify)

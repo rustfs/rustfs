@@ -379,9 +379,9 @@ impl Operation for ExportBucketMetadata {
             .finish()
             .map_err(|e| s3_error!(InternalError, "failed to finalize export archive: {e}"))?;
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/zip".parse().unwrap());
-        header.insert(CONTENT_DISPOSITION, "attachment; filename=bucket-meta.zip".parse().unwrap());
-        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/zip".parse().expect("valid header value"));
+        header.insert(CONTENT_DISPOSITION, "attachment; filename=bucket-meta.zip".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, zip_bytes.get_ref().len().to_string().parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(zip_bytes.into_inner())), header))
     }
 }
@@ -597,7 +597,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.policy_config_json = content;
                     metadata.policy_config_updated_at = update_at;
                 }
@@ -617,7 +617,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.notification_config_xml = content;
                     metadata.notification_config_updated_at = update_at;
                 }
@@ -638,7 +638,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.lifecycle_config_xml = content;
                     metadata.lifecycle_config_updated_at = update_at;
                 }
@@ -659,7 +659,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.encryption_config_xml = content;
                     metadata.encryption_config_updated_at = update_at;
                 }
@@ -680,7 +680,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.tagging_config_xml = content;
                     metadata.tagging_config_updated_at = update_at;
                 }
@@ -701,7 +701,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.quota_config_json = content;
                     metadata.quota_config_updated_at = update_at;
                 }
@@ -722,7 +722,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.object_lock_config_xml = content;
                     metadata.object_lock_config_updated_at = update_at;
                 }
@@ -743,7 +743,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.versioning_config_xml = content;
                     metadata.versioning_config_updated_at = update_at;
                 }
@@ -764,7 +764,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.replication_config_xml = content;
                     metadata.replication_config_updated_at = update_at;
                 }
@@ -785,7 +785,7 @@ impl Operation for ImportBucketMetadata {
                         continue;
                     }
 
-                    let metadata = bucket_metadatas.get_mut(bucket_name).unwrap();
+                    let metadata = match bucket_metadatas.get_mut(bucket_name) { Some(m) => m, None => continue, };
                     metadata.bucket_targets_config_json = content;
                     metadata.bucket_targets_config_updated_at = update_at;
                 }
@@ -797,8 +797,8 @@ impl Operation for ImportBucketMetadata {
         // TODO: site replication notify
 
         let mut header = HeaderMap::new();
-        header.insert(CONTENT_TYPE, "application/json".parse().unwrap());
-        header.insert(CONTENT_LENGTH, "0".parse().unwrap());
+        header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
+        header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
     }
 }

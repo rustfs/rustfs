@@ -1435,7 +1435,7 @@ where
                             .unwrap());
                     }
 
-                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).expect("valid response body");
                     let cors_layer = ConditionalCorsLayer {
                         cors_origins: (*cors_origins).clone(),
                     };
@@ -1464,7 +1464,7 @@ where
                         let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
                         let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
 
-                        let mut response = Response::builder().status(status).body(ResBody::default()).unwrap();
+                        let mut response = Response::builder().status(status).body(ResBody::default()).expect("valid response body");
                         if cors_allowed {
                             for (key, value) in cors_headers.iter() {
                                 response.headers_mut().insert(key, value.clone());
@@ -1474,7 +1474,7 @@ where
                     }
 
                     // No bucket-level CORS config: fall back to global/default CORS behavior.
-                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                    let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).expect("valid response body");
                     cors_layer.apply_cors_headers(&request_headers, response.headers_mut());
                     Ok(response)
                 });
@@ -1482,7 +1482,7 @@ where
 
             let request_headers_clone = request_headers.clone();
             return Box::pin(async move {
-                let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).unwrap();
+                let mut response = Response::builder().status(StatusCode::OK).body(ResBody::default()).expect("valid response body");
                 let cors_layer = ConditionalCorsLayer {
                     cors_origins: (*cors_origins).clone(),
                 };
