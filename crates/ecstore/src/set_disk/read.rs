@@ -22,7 +22,8 @@ use crate::diagnostics::get::{
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::create_deferred_bitrot_reader;
@@ -31,13 +32,14 @@ use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
 use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
-    collections::HashMap,
+    collections::{HashMap, VecDeque},
     future::Future,
     pin::Pin,
     sync::OnceLock,
+    task::{Context, Poll},
     time::{Duration, Instant},
 };
-use tokio::io::AsyncRead;
+use tokio::io::{AsyncRead, ReadBuf};
 use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
@@ -51,6 +53,39 @@ static READ_REPAIR_HEAL_CACHE: OnceLock<RwLock<HashMap<ReadRepairHealCacheKey, I
 pub(super) enum GetCodecStreamingReaderBuildOutcome {
     Reader(Box<dyn AsyncRead + Unpin + Send + Sync>),
     Fallback(GetCodecStreamingFallbackReason),
+}
+
+struct MultipartCodecStreamingReader {
+    readers: VecDeque<Box<dyn AsyncRead + Unpin + Send + Sync>>,
+}
+
+impl MultipartCodecStreamingReader {
+    fn new(readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>>) -> Self {
+        Self {
+            readers: VecDeque::from(readers),
+        }
+    }
+}
+
+impl AsyncRead for MultipartCodecStreamingReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+
+        loop {
+            let Some(reader) = self.readers.front_mut() else {
+                return Poll::Ready(Ok(()));
+            };
+            let filled_before = buf.filled().len();
+            match Pin::new(reader).poll_read(cx, buf) {
+                Poll::Ready(Ok(())) if buf.filled().len() == filled_before => {
+                    self.readers.pop_front();
+                }
+                result => return result,
+            }
+        }
+    }
 }
 
 pub(super) fn codec_streaming_reader_setup_fallback_reason(missing_shards: usize) -> Option<GetCodecStreamingFallbackReason> {
@@ -2252,9 +2287,6 @@ impl SetDisks {
         skip_verify_bitrot: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
-        if fi.parts.len() != 1 {
-            return Err(Error::other("codec streaming reader only supports single-part plain objects"));
-        }
 
         let erasure = crate::erasure::coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
@@ -2262,14 +2294,94 @@ impl SetDisks {
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
         );
-        let part = &fi.parts[0];
-        let part_number = part.number;
-        let part_size = part.size;
-        let part_length = usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
+
+        if fi.parts.len() == 1 {
+            let part = &fi.parts[0];
+            let part_length =
+                usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
+            return Self::build_codec_streaming_part_reader(
+                bucket,
+                object,
+                fi,
+                &files,
+                &disks,
+                &erasure,
+                part.number,
+                0,
+                part_length,
+                part.size,
+                skip_verify_bitrot,
+            )
+            .await;
+        }
+
+        if !is_codec_streaming_multipart_enabled() {
+            return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::Multipart));
+        }
+        if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
+            return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(
+                GetCodecStreamingFallbackReason::MultipartPartLimit,
+            ));
+        }
+
+        let object_length =
+            usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
+        let mut total_part_size = 0usize;
+        for part in &fi.parts {
+            total_part_size = total_part_size
+                .checked_add(part.size)
+                .ok_or_else(|| Error::other("codec streaming multipart part sizes overflow"))?;
+        }
+        if total_part_size != object_length {
+            return Err(Error::other("codec streaming multipart part sizes do not match object size"));
+        }
+
+        let mut readers = Vec::with_capacity(fi.parts.len());
+        for part in &fi.parts {
+            match Self::build_codec_streaming_part_reader(
+                bucket,
+                object,
+                fi,
+                &files,
+                &disks,
+                &erasure,
+                part.number,
+                0,
+                part.size,
+                part.size,
+                skip_verify_bitrot,
+            )
+            .await?
+            {
+                GetCodecStreamingReaderBuildOutcome::Reader(reader) => readers.push(reader),
+                GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
+                    return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(reason));
+                }
+            }
+        }
+
+        Ok(GetCodecStreamingReaderBuildOutcome::Reader(Box::new(MultipartCodecStreamingReader::new(
+            readers,
+        ))))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn build_codec_streaming_part_reader(
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        erasure: &crate::erasure::coding::Erasure,
+        part_number: usize,
+        part_offset: usize,
+        part_length: usize,
+        part_size: usize,
+        skip_verify_bitrot: bool,
+    ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
         }
-
         let checksum_info = fi.erasure.get_checksum_info(part_number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
         {
@@ -2278,21 +2390,24 @@ impl SetDisks {
             checksum_info.algorithm
         };
         let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
-        let till_offset = erasure.shard_file_offset(0, part_length, part_size);
+        let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
+        let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
+        let read_length = till_offset.saturating_sub(read_offset);
 
-        let reader_setup_stage_start = Instant::now();
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = disks
             .iter()
             .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
             .collect::<Vec<_>>();
         let reader_setup = create_bitrot_readers_until_quorum(
-            &files,
-            &disks,
+            files,
+            disks,
             bucket,
             object,
             part_number,
-            0,
-            till_offset,
+            read_offset,
+            read_length,
             erasure.shard_size(),
             checksum_algo,
             skip_verify_bitrot,
@@ -2303,11 +2418,7 @@ impl SetDisks {
         )
         .await;
         let metrics_path = get_codec_streaming_metrics_path();
-        rustfs_io_metrics::record_get_object_stage_duration(
-            metrics_path,
-            GET_STAGE_READER_SETUP,
-            reader_setup_stage_start.elapsed().as_secs_f64(),
-        );
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
         if available_shards < erasure.data_shards {
@@ -2330,12 +2441,12 @@ impl SetDisks {
             crate::erasure::coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
                 readers,
                 erasure.clone(),
-                0,
+                part_offset,
                 part_size,
                 Some(metrics_path),
                 read_costs,
             );
-        let engine = build_get_codec_streaming_decode_engine(erasure)?;
+        let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader = crate::erasure::coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(
             source,
             engine,
@@ -2706,6 +2817,15 @@ mod metadata_cache_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::AsyncReadExt;
+
+    const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
+    const CODEC_STREAMING_TEST_OBJECT: &str = "object";
 
     fn metadata_fanout_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);
@@ -3257,7 +3377,147 @@ mod tests {
     }
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {
-        ObjectInfo::from_file_info(fi, "bucket", "object", false)
+        ObjectInfo::from_file_info(fi, CODEC_STREAMING_TEST_BUCKET, CODEC_STREAMING_TEST_OBJECT, false)
+    }
+
+    fn codec_streaming_reader_gate_for_test(
+        range: &Option<HTTPRangeSpec>,
+        object_info: &ObjectInfo,
+        fi: &FileInfo,
+        lock_optimization_enabled: bool,
+    ) -> GetCodecStreamingGate {
+        get_codec_streaming_reader_gate(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            range,
+            object_info,
+            fi,
+            lock_optimization_enabled,
+        )
+    }
+
+    #[tokio::test]
+    async fn multipart_codec_streaming_reader_reads_parts_in_order() {
+        let readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>> = vec![
+            Box::new(Cursor::new(b"hello ".to_vec())),
+            Box::new(Cursor::new(b"multipart".to_vec())),
+        ];
+        let mut reader = MultipartCodecStreamingReader::new(readers);
+        let mut output = Vec::new();
+
+        reader
+            .read_to_end(&mut output)
+            .await
+            .expect("multipart codec reader should read all parts");
+
+        assert_eq!(output, b"hello multipart");
+    }
+
+    struct OneByteAsyncReader {
+        data: Vec<u8>,
+        position: usize,
+    }
+
+    impl OneByteAsyncReader {
+        fn new(data: &'static [u8]) -> Self {
+            Self {
+                data: data.to_vec(),
+                position: 0,
+            }
+        }
+    }
+
+    impl AsyncRead for OneByteAsyncReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.position >= self.data.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            buf.put_slice(&self.data[self.position..self.position + 1]);
+            self.position += 1;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_codec_streaming_reader_crosses_part_boundaries_with_short_reads() {
+        let readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>> = vec![
+            Box::new(OneByteAsyncReader::new(b"abc")),
+            Box::new(OneByteAsyncReader::new(b"def")),
+        ];
+        let mut reader = MultipartCodecStreamingReader::new(readers);
+        let mut first = [0u8; 5];
+        let mut second = Vec::new();
+
+        reader
+            .read_exact(&mut first)
+            .await
+            .expect("multipart codec reader should cross part boundaries");
+        reader
+            .read_to_end(&mut second)
+            .await
+            .expect("multipart codec reader should drain the final part");
+
+        assert_eq!(&first, b"abcde");
+        assert_eq!(second, b"f");
+    }
+
+    struct DropCountingReader {
+        data: Vec<u8>,
+        position: usize,
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl DropCountingReader {
+        fn new(data: &'static [u8], drops: Arc<AtomicUsize>) -> Self {
+            Self {
+                data: data.to_vec(),
+                position: 0,
+                drops,
+            }
+        }
+    }
+
+    impl AsyncRead for DropCountingReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if self.position >= self.data.len() || buf.remaining() == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let available = self.data.len() - self.position;
+            let count = available.min(buf.remaining());
+            let end = self.position + count;
+            buf.put_slice(&self.data[self.position..end]);
+            self.position = end;
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    impl Drop for DropCountingReader {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_codec_streaming_reader_drops_remaining_parts_on_abort() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        {
+            let readers: Vec<Box<dyn AsyncRead + Unpin + Send + Sync>> = vec![
+                Box::new(DropCountingReader::new(b"abc", Arc::clone(&drops))),
+                Box::new(DropCountingReader::new(b"def", Arc::clone(&drops))),
+            ];
+            let mut reader = MultipartCodecStreamingReader::new(readers);
+            let mut first = [0u8; 1];
+
+            reader
+                .read_exact(&mut first)
+                .await
+                .expect("multipart codec reader should support partial reads");
+            assert_eq!(&first, b"a");
+        }
+
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
     }
 
     fn inline_reader_setup_fileinfo(data: Option<&'static [u8]>) -> FileInfo {
@@ -3405,12 +3665,12 @@ mod tests {
                 let fi = codec_streaming_test_fileinfo(1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Use
                 );
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, false).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, false).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled)
                 );
 
@@ -3420,14 +3680,14 @@ mod tests {
                     end: 1,
                 });
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&range, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&range, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range)
                 );
 
                 let multipart_fi = codec_streaming_test_fileinfo(1024, 2);
                 let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &multipart_object_info, &multipart_fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &multipart_object_info, &multipart_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
                 );
 
@@ -3437,7 +3697,7 @@ mod tests {
                     .insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
                 let encrypted = codec_streaming_test_object_info(&encrypted_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &encrypted, &encrypted_fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &encrypted, &encrypted_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted)
                 );
 
@@ -3445,14 +3705,14 @@ mod tests {
                 insert_str(&mut compressed_fi.metadata, SUFFIX_COMPRESSION, "lz4".to_string());
                 let compressed = codec_streaming_test_object_info(&compressed_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &compressed, &compressed_fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &compressed, &compressed_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed)
                 );
 
                 let small_fi = codec_streaming_test_fileinfo(0, 1);
                 let small_object_info = codec_streaming_test_object_info(&small_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &small_object_info, &small_fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &small_object_info, &small_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize)
                 );
 
@@ -3460,7 +3720,7 @@ mod tests {
                 remote_fi.transition_status = crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE.to_string();
                 let remote = codec_streaming_test_object_info(&remote_fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &remote, &remote_fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &remote, &remote_fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote)
                 );
             },
@@ -3498,8 +3758,81 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_allows_multipart_when_explicitly_enabled() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.object_class, GetCodecStreamingObjectClass::Multipart);
+                assert_eq!(gate.decision, GetCodecStreamingDecision::Use);
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_keeps_multipart_default_off() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, None),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.object_class, GetCodecStreamingObjectClass::Multipart);
+                assert_eq!(
+                    gate.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_limits_multipart_part_count() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.object_class, GetCodecStreamingObjectClass::Multipart);
+                assert_eq!(
+                    gate.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit)
                 );
             },
         );
@@ -3537,6 +3870,10 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::Disabled.as_str(), "disabled");
         assert_eq!(GetCodecStreamingFallbackReason::RolloutNotOptedIn.as_str(), "rollout_not_opted_in");
         assert_eq!(
+            GetCodecStreamingFallbackReason::RolloutPctNotSelected.as_str(),
+            "rollout_pct_not_selected"
+        );
+        assert_eq!(
             GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed.as_str(),
             "body_compatibility_unconfirmed"
         );
@@ -3556,6 +3893,7 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
         assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
         assert_eq!(GetCodecStreamingFallbackReason::ReadQuorumNotSafe.as_str(), "read_quorum_not_safe");
+        assert_eq!(GetCodecStreamingFallbackReason::MultipartPartLimit.as_str(), "multipart_part_limit");
         assert_eq!(GetCodecStreamingObjectClass::PlainSinglePart.as_str(), "plain_single_part");
         assert_eq!(GetCodecStreamingObjectClass::Range.as_str(), "range");
         assert_eq!(GetCodecStreamingObjectClass::Encrypted.as_str(), "encrypted");
@@ -3579,7 +3917,7 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled)
                 );
             },
@@ -3601,7 +3939,7 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn)
                 );
             },
@@ -3620,7 +3958,7 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed)
                 );
             },
@@ -3639,8 +3977,51 @@ mod tests {
                 let object_info = codec_streaming_test_object_info(&fi);
 
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).decision,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed)
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_reader_gate_honors_rollout_percentage() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("0")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected)
+                );
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT, Some("100")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+
+                assert_eq!(
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
+                    GetCodecStreamingDecision::Use
                 );
             },
         );
@@ -3660,7 +4041,7 @@ mod tests {
                 let fi = codec_streaming_test_fileinfo(1024, 1);
                 let object_info = codec_streaming_test_object_info(&fi);
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&None, &object_info, &fi, true).object_class,
+                    codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).object_class,
                     GetCodecStreamingObjectClass::PlainSinglePart
                 );
 
@@ -3670,7 +4051,7 @@ mod tests {
                     end: 1,
                 });
                 assert_eq!(
-                    get_codec_streaming_reader_gate(&range, &object_info, &fi, true).object_class,
+                    codec_streaming_reader_gate_for_test(&range, &object_info, &fi, true).object_class,
                     GetCodecStreamingObjectClass::Range
                 );
             },
