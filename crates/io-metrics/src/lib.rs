@@ -1084,6 +1084,66 @@ pub fn record_get_object_shard_read_fanout(
     histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
 }
 
+/// Record the bitrot reader setup scheduling strategy selected for a GET read.
+#[inline(always)]
+pub fn record_get_object_reader_setup_strategy(strategy: &'static str, mode: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_reader_setup_strategy_total",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .increment(1);
+}
+
+/// Record the final bitrot reader setup fanout shape for a GET read.
+#[inline(always)]
+pub fn record_get_object_reader_setup_fanout(
+    strategy: &'static str,
+    mode: &'static str,
+    scheduled: usize,
+    attempted: usize,
+    ready: usize,
+    failed: usize,
+    deferred: usize,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_reader_setup_scheduled",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(scheduled));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_attempted",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(attempted));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_ready",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(ready));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_failed",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(failed));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_deferred",
+        "strategy" => strategy,
+        "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(deferred));
+}
+
 /// Record GetObject metadata resolution duration.
 #[inline(always)]
 pub fn record_get_object_metadata_phase_duration(duration_secs: f64) {
@@ -1848,6 +1908,8 @@ mod tests {
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
+        record_get_object_reader_setup_strategy("data_blocks_first", "read_quorum");
+        record_get_object_reader_setup_fanout("data_blocks_first", "read_quorum", 3, 2, 2, 0, 2);
 
         assert!(0.005_f64.is_sign_positive());
     }
