@@ -75,6 +75,8 @@ pub static DATA_USAGE_BLOOM_NAME_PATH: LazyLock<String> =
 pub static BACKGROUND_HEAL_INFO_PATH: LazyLock<String> =
     LazyLock::new(|| format!("{BUCKET_META_PREFIX}{SLASH_SEPARATOR}.background-heal.json"));
 
+const MAX_DATA_USAGE_CACHE_DEPTH: usize = 1024;
+
 #[derive(Clone, Copy, Default, Debug, Serialize, Deserialize, PartialEq)]
 pub struct TierStats {
     pub total_size: u64,
@@ -334,12 +336,25 @@ impl DataUsageCache {
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
+        let mut visited = HashSet::new();
+        self.flatten_with_guard(root, &mut visited, 0)
+    }
+
+    fn flatten_with_guard(&self, root: &DataUsageEntry, visited: &mut HashSet<String>, depth: usize) -> DataUsageEntry {
         let mut root = root.clone();
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            root.children.clear();
+            return root;
+        }
+
         for id in root.children.clone().iter() {
+            if !visited.insert(id.clone()) {
+                continue;
+            }
             if let Some(e) = self.cache.get(id) {
                 let mut e = e.clone();
                 if !e.children.is_empty() {
-                    e = self.flatten(&e);
+                    e = self.flatten_with_guard(&e, visited, depth + 1);
                 }
                 root.merge(&e);
             }
@@ -349,13 +364,31 @@ impl DataUsageCache {
     }
 
     pub fn copy_with_children(&mut self, src: &DataUsageCache, hash: &DataUsageHash, parent: &Option<DataUsageHash>) {
+        let mut visited = HashSet::new();
+        self.copy_with_children_guard(src, hash, parent, &mut visited, 0);
+    }
+
+    fn copy_with_children_guard(
+        &mut self,
+        src: &DataUsageCache,
+        hash: &DataUsageHash,
+        parent: &Option<DataUsageHash>,
+        visited: &mut HashSet<String>,
+        depth: usize,
+    ) {
+        if !visited.insert(hash.key()) {
+            return;
+        }
+
         if let Some(e) = src.cache.get(&hash.string()) {
             self.cache.insert(hash.key(), e.clone());
-            for ch in e.children.iter() {
-                if *ch == hash.key() {
-                    return;
+            if depth < MAX_DATA_USAGE_CACHE_DEPTH {
+                for ch in e.children.iter() {
+                    if *ch == hash.key() {
+                        continue;
+                    }
+                    self.copy_with_children_guard(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()), visited, depth + 1);
                 }
-                self.copy_with_children(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()));
             }
             if let Some(parent) = parent {
                 self.cache.entry(parent.key()).or_default().add_child(hash);
@@ -364,6 +397,15 @@ impl DataUsageCache {
     }
 
     pub fn delete_recursive(&mut self, hash: &DataUsageHash) {
+        let mut visited = HashSet::new();
+        self.delete_recursive_guard(hash, &mut visited, 0);
+    }
+
+    fn delete_recursive_guard(&mut self, hash: &DataUsageHash, visited: &mut HashSet<String>, depth: usize) {
+        if !visited.insert(hash.key()) {
+            return;
+        }
+
         let mut need_remove = Vec::new();
         if let Some(v) = self.cache.get(&hash.string()) {
             for child in v.children.iter() {
@@ -371,8 +413,11 @@ impl DataUsageCache {
             }
         }
         self.cache.remove(&hash.string());
+        if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+            return;
+        }
         for child in need_remove {
-            self.delete_recursive(&DataUsageHash(child));
+            self.delete_recursive_guard(&DataUsageHash(child), visited, depth + 1);
         }
     }
 
@@ -488,16 +533,24 @@ impl DataUsageCache {
     }
 
     pub fn total_children_rec(&self, path: &str) -> usize {
+        let mut visited = HashSet::new();
+        visited.insert(hash_path(path).key());
+        self.total_children_rec_guard(path, &mut visited, 0)
+    }
+
+    fn total_children_rec_guard(&self, path: &str, visited: &mut HashSet<String>, depth: usize) -> usize {
         let Some(root) = self.find(path) else {
             return 0;
         };
-        if root.children.is_empty() {
+        if root.children.is_empty() || depth >= MAX_DATA_USAGE_CACHE_DEPTH {
             return 0;
         }
 
-        let mut n = root.children.len();
+        let mut n = 0;
         for ch in root.children.iter() {
-            n += self.total_children_rec(ch);
+            if visited.insert(ch.clone()) {
+                n += 1 + self.total_children_rec_guard(ch, visited, depth + 1);
+            }
         }
         n
     }
@@ -938,13 +991,29 @@ struct Inner {
 }
 
 fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
+    let mut visited = HashSet::new();
+    visited.insert(path.key());
+    add_with_guard(data_usage_cache, path, candidates, &mut visited, 0)
+}
+
+fn add_with_guard(
+    data_usage_cache: &DataUsageCache,
+    path: &DataUsageHash,
+    candidates: &mut Vec<Inner>,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> usize {
     let e = match data_usage_cache.cache.get(&path.key()) {
         Some(e) => e,
         None => return 0,
     };
     let mut objects = e.objects;
-    for ch in e.children.iter() {
-        objects += add(data_usage_cache, &DataUsageHash(ch.clone()), candidates);
+    if depth < MAX_DATA_USAGE_CACHE_DEPTH {
+        for ch in e.children.iter() {
+            if visited.insert(ch.clone()) {
+                objects += add_with_guard(data_usage_cache, &DataUsageHash(ch.clone()), candidates, visited, depth + 1);
+            }
+        }
     }
     // Collect internal nodes (with children) as compaction candidates.
     // Leaf nodes have no children to remove, so compacting them is a no-op —
@@ -959,10 +1028,20 @@ fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut
 }
 
 fn mark(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>) {
+    mark_with_depth(duc, entry, found, 0);
+}
+
+fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut HashSet<String>, depth: usize) {
+    if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
+        return;
+    }
+
     for k in entry.children.iter() {
-        found.insert(k.to_string());
+        if !found.insert(k.to_string()) {
+            continue;
+        }
         if let Some(ch) = duc.cache.get(k) {
-            mark(duc, ch, found);
+            mark_with_depth(duc, ch, found, depth + 1);
         }
     }
 }
@@ -1296,6 +1375,50 @@ mod tests {
         assert!(!dst.cache.contains_key(&child_hash.key()));
         assert!(!dst.cache.contains_key(&grandchild_hash.key()));
         assert!(dst.cache.contains_key(&root_hash.key()));
+    }
+
+    #[test]
+    fn test_data_usage_cache_recursive_helpers_tolerate_cycles() {
+        let root_hash = hash_path("bucket");
+        let child_hash = hash_path("bucket/a");
+
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(&root_hash, &None, &DataUsageEntry::default());
+        cache.replace_hashed(
+            &child_hash,
+            &Some(root_hash.clone()),
+            &DataUsageEntry {
+                objects: 2,
+                size: 20,
+                ..Default::default()
+            },
+        );
+        cache.cache.entry(child_hash.key()).or_default().add_child(&root_hash);
+
+        assert_eq!(cache.total_children_rec("bucket"), 1);
+
+        let flat = cache.size_recursive("bucket").expect("cyclic cache should still flatten");
+        assert_eq!(flat.objects, 2);
+        assert_eq!(flat.size, 20);
+        assert!(flat.children.is_empty());
+
+        let mut copied = DataUsageCache {
+            info: cache.info.clone(),
+            ..Default::default()
+        };
+        copied.copy_with_children(&cache, &root_hash, &None);
+        assert!(copied.cache.contains_key(&root_hash.key()));
+        assert!(copied.cache.contains_key(&child_hash.key()));
+
+        copied.delete_recursive(&root_hash);
+        assert!(!copied.cache.contains_key(&root_hash.key()));
+        assert!(!copied.cache.contains_key(&child_hash.key()));
     }
 
     #[test]
