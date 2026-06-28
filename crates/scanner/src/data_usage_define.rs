@@ -191,7 +191,7 @@ impl SizeSummary {
         }
 
         if let Some(tier_stats) = self.tier_stats.get_mut(&tier) {
-            tier_stats.add(&TierStats::from_object_info(oi));
+            *tier_stats = tier_stats.add(&TierStats::from_object_info(oi));
         }
     }
 }
@@ -1080,6 +1080,37 @@ mod tests {
         assert_eq!(summary.delete_markers, 1);
         assert_eq!(summary.versions, 0);
         assert_eq!(summary.total_size, 0);
+    }
+
+    #[test]
+    fn size_summary_actions_accounting_accumulates_tier_stats() {
+        let mut summary = SizeSummary::new();
+        summary
+            .tier_stats
+            .insert(storageclass::STANDARD.to_string(), TierStats::default());
+
+        let object = ObjectInfo {
+            storage_class: Some(storageclass::STANDARD.to_string()),
+            size: 10,
+            is_latest: true,
+            ..Default::default()
+        };
+
+        summary.actions_accounting(&object, 10, 10);
+        summary.actions_accounting(&object, 10, 10);
+
+        let stats = summary
+            .tier_stats
+            .get(storageclass::STANDARD)
+            .expect("standard tier stats should remain present");
+        assert_eq!(
+            *stats,
+            TierStats {
+                total_size: 20,
+                num_versions: 2,
+                num_objects: 2,
+            }
+        );
     }
 
     #[test]
