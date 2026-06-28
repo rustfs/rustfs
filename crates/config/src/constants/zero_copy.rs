@@ -15,8 +15,9 @@
 //! Mmap-based read I/O configuration constants.
 //!
 //! This module defines environment variables and default values for mmap-based
-//! read operations. Note: despite the "zero_copy" naming in env vars (kept for
-//! backward compatibility), the actual implementation performs mmap-then-copy,
+//! read operations. Note: the legacy "zero_copy" env var is kept as a
+//! deprecated compatibility alias; the actual implementation performs
+//! mmap-then-copy, not true zero-copy.
 
 // =============================================================================
 // Mmap Read Configuration
@@ -32,9 +33,13 @@
 /// - Acceptable values: `"true"` / `"false"` (case-insensitive) or a boolean typed config
 /// - Semantics: When enabled, uses mmap on Unix systems for memory-mapped file reads;
 ///   falls back to regular I/O on non-Unix platforms or when mmap fails
-/// - Example: `export RUSTFS_OBJECT_ZERO_COPY_ENABLE=true`
-/// - Note: The env var name is kept as ZERO_COPY for backward compatibility.
-///   The actual behavior is mmap-then-copy, not true zero-copy.
+/// - Example: `export RUSTFS_OBJECT_MMAP_READ_ENABLE=true`
+pub const ENV_OBJECT_MMAP_READ_ENABLE: &str = "RUSTFS_OBJECT_MMAP_READ_ENABLE";
+
+/// Deprecated compatibility alias for mmap-based read enable.
+///
+/// Prefer [`ENV_OBJECT_MMAP_READ_ENABLE`]. When both variables are set, the
+/// canonical mmap-read variable takes precedence.
 pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
 
 /// Default: mmap-based reads are enabled.
@@ -45,7 +50,12 @@ pub const ENV_OBJECT_ZERO_COPY_ENABLE: &str = "RUSTFS_OBJECT_ZERO_COPY_ENABLE";
 ///
 /// On non-Unix platforms or when mmap fails, the system automatically falls back
 /// to regular I/O without errors.
-pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = true;
+pub const DEFAULT_OBJECT_MMAP_READ_ENABLE: bool = true;
+
+/// Deprecated compatibility alias for mmap-based read default.
+///
+/// Prefer [`DEFAULT_OBJECT_MMAP_READ_ENABLE`].
+pub const DEFAULT_OBJECT_ZERO_COPY_ENABLE: bool = DEFAULT_OBJECT_MMAP_READ_ENABLE;
 
 // =============================================================================
 // Direct I/O Configuration

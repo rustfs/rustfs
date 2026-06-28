@@ -26,11 +26,10 @@ use crate::diagnostics::get::{
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
-use crate::io_support::bitrot::create_deferred_bitrot_reader;
+use crate::io_support::bitrot::{create_deferred_bitrot_reader, object_mmap_read_enabled};
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
-use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use std::{
     collections::{HashMap, VecDeque},
     future::Future,
@@ -2004,9 +2003,7 @@ impl SetDisks {
             };
             let read_length = till_offset.saturating_sub(read_offset);
 
-            // Read zero-copy configuration from environment variable
-            // Default: enabled (true) for performance
-            let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+            let use_mmap_read = object_mmap_read_enabled();
 
             let reader_setup_stage_start = Instant::now();
             let read_costs = disks
@@ -2387,7 +2384,7 @@ impl SetDisks {
         } else {
             checksum_info.algorithm
         };
-        let use_mmap_read = rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+        let use_mmap_read = object_mmap_read_enabled();
         let till_offset = erasure.shard_file_offset(part_offset, part_length, part_size);
         let read_offset = (part_offset / erasure.block_size) * erasure.shard_size();
         let read_length = till_offset.saturating_sub(read_offset);
