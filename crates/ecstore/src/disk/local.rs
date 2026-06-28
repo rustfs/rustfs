@@ -1827,7 +1827,7 @@ impl LocalDisk {
             while let Some((last_name, _, _)) = dir_stack.last()
                 && *last_name < name
             {
-                let (pop, skip_object, dir_to_skip) = dir_stack.pop().unwrap();
+                let (pop, skip_object, dir_to_skip) = dir_stack.pop().expect("operation should succeed");
                 out.write_obj(&MetaCacheEntry {
                     name: pop.clone(),
                     ..Default::default()
@@ -1862,7 +1862,7 @@ impl LocalDisk {
             if let Some(_dir) = dir_objes.get(entry) {
                 is_dir_obj = true;
                 meta.name
-                    .truncate(meta.name.len() - meta.name.chars().last().unwrap().len_utf8());
+                    .truncate(meta.name.len() - meta.name.chars().last().expect("operation should succeed").len_utf8());
                 meta.name.push_str(GLOBAL_DIR_SUFFIX_WITH_SLASH);
             }
 
@@ -3758,7 +3758,7 @@ impl DiskAPI for LocalDisk {
         let mut info = Cache::get(self.disk_info_cache.clone()).await?;
         info.nr_requests = self.nrrequests;
         info.rotational = self.rotational;
-        info.mount_path = self.path().to_str().unwrap().to_string();
+        info.mount_path = self.path().to_str().expect("operation should succeed").to_string();
         info.endpoint = self.endpoint.to_string();
         info.scanning = self.scanning.load(Ordering::Acquire) == 1;
 
@@ -3851,7 +3851,7 @@ mod test {
         let paths: Vec<_> = vols.iter().map(|v| path_join(&[Path::new(v), Path::new("test")])).collect();
 
         for p in paths.iter() {
-            assert!(skip_access_checks(p.to_str().unwrap()));
+            assert!(skip_access_checks(p.to_str().expect("operation should succeed")));
         }
     }
 
@@ -3883,8 +3883,8 @@ mod test {
         use crate::disk::format::FormatV3;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let mut endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
         endpoint.set_pool_index(0);
         endpoint.set_set_index(0);
         endpoint.set_disk_index(0);
@@ -3927,15 +3927,15 @@ mod test {
     async fn cleanup_tmp_on_startup_moves_existing_tmp_and_recreates_trash() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let leftover = tmp.join("leftover").join("data");
-        fs::create_dir_all(leftover.parent().unwrap()).await.unwrap();
-        fs::write(&leftover, b"temporary").await.unwrap();
+        fs::create_dir_all(leftover.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::write(&leftover, b"temporary").await.expect("operation should succeed");
 
         LocalDisk::cleanup_tmp_on_startup(dir.path(), Arc::new(AtomicU32::new(0)), Arc::new(Notify::new()))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(!tmp.join("leftover").exists());
         assert!(LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET).exists());
@@ -3945,50 +3945,50 @@ mod test {
     async fn cleanup_stale_tmp_objects_moves_expired_tmp_dirs_to_trash() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let stale = tmp.join("stale").join("data");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
-        fs::create_dir_all(stale.parent().unwrap()).await.unwrap();
-        fs::create_dir_all(&trash).await.unwrap();
-        fs::write(&stale, b"temporary").await.unwrap();
+        fs::create_dir_all(stale.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::create_dir_all(&trash).await.expect("operation should succeed");
+        fs::write(&stale, b"temporary").await.expect("operation should succeed");
 
         tokio::time::sleep(Duration::from_millis(2)).await;
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::ZERO)
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(!tmp.join("stale").exists());
         assert!(trash.exists());
 
-        let mut entries = fs::read_dir(&trash).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_some());
+        let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
+        assert!(entries.next_entry().await.expect("operation should succeed").is_some());
     }
 
     #[tokio::test]
     async fn cleanup_stale_tmp_objects_keeps_fresh_dirs_and_regular_files() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let tmp = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_BUCKET);
         let fresh_dir = tmp.join("fresh").join("data");
         let regular_file = tmp.join("note.txt");
         let trash = LocalDisk::meta_path(dir.path(), RUSTFS_META_TMP_DELETED_BUCKET);
 
-        fs::create_dir_all(fresh_dir.parent().unwrap()).await.unwrap();
-        fs::create_dir_all(&trash).await.unwrap();
-        fs::write(&fresh_dir, b"temporary").await.unwrap();
-        fs::write(&regular_file, b"keep").await.unwrap();
+        fs::create_dir_all(fresh_dir.parent().expect("operation should succeed")).await.expect("operation should succeed");
+        fs::create_dir_all(&trash).await.expect("operation should succeed");
+        fs::write(&fresh_dir, b"temporary").await.expect("operation should succeed");
+        fs::write(&regular_file, b"keep").await.expect("operation should succeed");
 
         LocalDisk::cleanup_stale_tmp_objects_with_expiry(dir.path().to_path_buf(), Duration::from_secs(60))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(tmp.join("fresh").exists());
         assert!(regular_file.exists());
 
-        let mut entries = fs::read_dir(&trash).await.unwrap();
-        assert!(entries.next_entry().await.unwrap().is_none());
+        let mut entries = fs::read_dir(&trash).await.expect("operation should succeed");
+        assert!(entries.next_entry().await.expect("operation should succeed").is_none());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4019,7 +4019,7 @@ mod test {
         ready.store(1, Ordering::Release);
         notify.notify_waiters();
 
-        assert!(wait.await.unwrap());
+        assert!(wait.await.expect("operation should succeed"));
     }
 
     #[tokio::test(start_paused = true)]
@@ -4036,7 +4036,7 @@ mod test {
         tokio::task::yield_now().await;
         tokio::time::advance(Duration::from_secs(2)).await;
 
-        assert!(!wait.await.unwrap());
+        assert!(!wait.await.expect("operation should succeed"));
     }
 
     #[tokio::test]
@@ -4044,21 +4044,21 @@ mod test {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("quux/thud")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("asdf")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("foo/bar/xyzzy")).await.expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("quux/thud")).await.expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("asdf")).await.expect("operation should succeed");
 
-        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.unwrap();
-        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("foo/bar/xl.meta"), b"meta").await.expect("operation should succeed");
+        fs::write(bucket_dir.join("foo/bar/xyzzy/xl.meta"), b"meta").await.expect("operation should succeed");
+        fs::write(bucket_dir.join("quux/thud/xl.meta"), b"meta").await.expect("operation should succeed");
+        fs::write(bucket_dir.join("asdf/xl.meta"), b"meta").await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -4072,11 +4072,11 @@ mod test {
 
         disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries
             .into_iter()
             .filter(|entry| !entry.metadata.is_empty())
@@ -4094,26 +4094,26 @@ mod test {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
-        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.unwrap();
-        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.unwrap();
+        fs::create_dir_all(bucket_dir.join("marker/file.txt")).await.expect("operation should succeed");
+        fs::create_dir_all(bucket_dir.join("marker/subdir/file.txt")).await.expect("operation should succeed");
         fs::create_dir_all(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}")))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.unwrap();
+        fs::write(bucket_dir.join("marker/file.txt/xl.meta"), b"meta").await.expect("operation should succeed");
         fs::write(bucket_dir.join("marker/subdir/file.txt/xl.meta"), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
         fs::write(bucket_dir.join(format!("marker/subdir{GLOBAL_DIR_SUFFIX}/xl.meta")), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -4127,11 +4127,11 @@ mod test {
 
         disk.scan_dir("marker/".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries
             .into_iter()
             .filter(|entry| !entry.metadata.is_empty())
@@ -4148,7 +4148,7 @@ mod test {
         use rustfs_filemeta::MetacacheReader;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
@@ -4166,12 +4166,12 @@ mod test {
             "unrelated/engineering/repo-0000",
         ] {
             let object_dir = bucket_dir.join(name);
-            fs::create_dir_all(&object_dir).await.unwrap();
-            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.unwrap();
+            fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), b"meta").await.expect("operation should succeed");
         }
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         async fn scan_names(disk: &LocalDisk, bucket: &str, base_dir: &str, forward_to: &str) -> (Vec<String>, i32) {
             let (reader, mut writer) = tokio::io::duplex(4096);
@@ -4187,13 +4187,13 @@ mod test {
 
             disk.scan_dir(base_dir.to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
                 .await
-                .unwrap();
-            out.close().await.unwrap();
+                .expect("operation should succeed");
+            out.close().await.expect("operation should succeed");
             drop(out);
             drop(writer);
 
             let mut reader = MetacacheReader::new(reader);
-            let entries = reader.read_all().await.unwrap();
+            let entries = reader.read_all().await.expect("operation should succeed");
             let names: Vec<String> = entries
                 .into_iter()
                 .filter(|entry| !entry.metadata.is_empty())
@@ -4291,7 +4291,7 @@ mod test {
             fm.marshal_msg().expect("object metadata should encode")
         }
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
 
@@ -4301,14 +4301,14 @@ mod test {
             ("shard/aaa-trash-0002", "33333333-3333-3333-3333-333333333333"),
         ] {
             let object_dir = bucket_dir.join(name);
-            fs::create_dir_all(&object_dir).await.unwrap();
+            fs::create_dir_all(&object_dir).await.expect("operation should succeed");
             fs::write(object_dir.join(STORAGE_FORMAT_FILE), delete_marker_metadata(version_id))
                 .await
-                .unwrap();
+                .expect("operation should succeed");
         }
 
         let hidden_versioned_dir = bucket_dir.join("shard/aaa-trash-0003");
-        fs::create_dir_all(&hidden_versioned_dir).await.unwrap();
+        fs::create_dir_all(&hidden_versioned_dir).await.expect("operation should succeed");
         fs::write(
             hidden_versioned_dir.join(STORAGE_FORMAT_FILE),
             delete_marker_with_old_object_metadata(
@@ -4317,19 +4317,19 @@ mod test {
             ),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
         let visible_dir = bucket_dir.join("shard/bbb-visible-0000");
-        fs::create_dir_all(&visible_dir).await.unwrap();
+        fs::create_dir_all(&visible_dir).await.expect("operation should succeed");
         fs::write(
             visible_dir.join(STORAGE_FORMAT_FILE),
             object_metadata("66666666-6666-6666-6666-666666666666"),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -4344,8 +4344,8 @@ mod test {
 
         disk.scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await
-            .unwrap();
-        out.close().await.unwrap();
+            .expect("operation should succeed");
+        out.close().await.expect("operation should succeed");
         drop(out);
         drop(writer);
 
@@ -4353,7 +4353,7 @@ mod test {
         let has_visible_object = reader
             .read_all()
             .await
-            .unwrap()
+            .expect("operation should succeed")
             .into_iter()
             .any(|entry| !entry.metadata.is_empty() && entry.name == "shard/bbb-visible-0000");
 
@@ -4368,24 +4368,24 @@ mod test {
         use std::os::unix::fs::PermissionsExt;
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let bucket = "test-bucket";
         let bucket_dir = dir.path().join(bucket);
         let object_dir = bucket_dir.join("broken");
         let meta_path = object_dir.join(STORAGE_FORMAT_FILE);
 
-        fs::create_dir_all(&object_dir).await.unwrap();
-        fs::write(&meta_path, b"meta").await.unwrap();
+        fs::create_dir_all(&object_dir).await.expect("operation should succeed");
+        fs::write(&meta_path, b"meta").await.expect("operation should succeed");
 
-        let original_permissions = fs::metadata(&meta_path).await.unwrap().permissions();
-        fs::set_permissions(&meta_path, Permissions::from_mode(0o000)).await.unwrap();
+        let original_permissions = fs::metadata(&meta_path).await.expect("operation should succeed").permissions();
+        fs::set_permissions(&meta_path, Permissions::from_mode(0o000)).await.expect("operation should succeed");
         if fs::File::open(&meta_path).await.is_ok() {
-            fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+            fs::set_permissions(&meta_path, original_permissions).await.expect("operation should succeed");
             return;
         }
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (_reader, mut writer) = tokio::io::duplex(4096);
         let mut out = MetacacheWriter::new(&mut writer);
@@ -4401,7 +4401,7 @@ mod test {
             .scan_dir("".to_string(), "".to_string(), &opts, &mut out, &mut objs_returned, false, None)
             .await;
 
-        fs::set_permissions(&meta_path, original_permissions).await.unwrap();
+        fs::set_permissions(&meta_path, original_permissions).await.expect("operation should succeed");
 
         assert!(matches!(result, Err(DiskError::FileAccessDenied)));
     }
@@ -4422,7 +4422,7 @@ mod test {
         const DIR_IN_MULTIPART_DIR: &str = "dir-in-multipart";
         const EMPTY_STR: &str = "";
 
-        let parse_uuid = |s: &str| Uuid::parse_str(s).unwrap();
+        let parse_uuid = |s: &str| Uuid::parse_str(s).expect("operation should succeed");
         let create_file_info = |version_id: &str, data_dir: &str| FileInfo {
             version_id: Some(parse_uuid(version_id)),
             data_dir: Some(parse_uuid(data_dir)),
@@ -4430,39 +4430,39 @@ mod test {
             ..Default::default()
         };
 
-        let dir = tempdir().unwrap();
+        let dir = tempdir().expect("operation should succeed");
         let obj_base = dir.path().join("test-bucket").join(BASE_DIR);
         let multipart_base = obj_base.join(MULTIPART_DIR);
         let dir_in_multipart_base = multipart_base.join(DIR_IN_MULTIPART_DIR);
 
-        fs::create_dir_all(&multipart_base).await.unwrap();
+        fs::create_dir_all(&multipart_base).await.expect("operation should succeed");
         for uuid in &[UUID_MULTIPART_1, UUID_MULTIPART_2] {
-            fs::create_dir_all(multipart_base.join(uuid)).await.unwrap();
-            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.unwrap();
+            fs::create_dir_all(multipart_base.join(uuid)).await.expect("operation should succeed");
+            fs::write(multipart_base.join(uuid).join("part.1"), b"part").await.expect("operation should succeed");
         }
-        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.unwrap();
-        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.unwrap();
+        fs::create_dir_all(obj_base.join(UUID_OBJ)).await.expect("operation should succeed");
+        fs::write(obj_base.join(UUID_OBJ).join("part.1"), b"part").await.expect("operation should succeed");
 
-        fs::create_dir_all(&dir_in_multipart_base).await.unwrap();
+        fs::create_dir_all(&dir_in_multipart_base).await.expect("operation should succeed");
         fs::write(dir_in_multipart_base.join(STORAGE_FORMAT_FILE), b"meta")
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).unwrap();
-        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).unwrap();
-        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+        fm.add_version(create_file_info(VER_ID_1, UUID_MULTIPART_1)).expect("operation should succeed");
+        fm.add_version(create_file_info(VER_ID_2, UUID_MULTIPART_2)).expect("operation should succeed");
+        fs::write(multipart_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().expect("operation should succeed"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let mut fm = FileMeta::default();
-        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).unwrap();
-        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().unwrap())
+        fm.add_version(create_file_info(VER_ID_3, UUID_OBJ)).expect("operation should succeed");
+        fs::write(obj_base.join(STORAGE_FORMAT_FILE), fm.marshal_msg().expect("operation should succeed"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let (reader, mut writer) = tokio::io::duplex(4096);
         disk.walk_dir(
@@ -4476,11 +4476,11 @@ mod test {
             &mut writer,
         )
         .await
-        .unwrap();
-        MetacacheWriter::new(&mut writer).close().await.unwrap();
+        .expect("operation should succeed");
+        MetacacheWriter::new(&mut writer).close().await.expect("operation should succeed");
 
         let mut reader = MetacacheReader::new(reader);
-        let entries = reader.read_all().await.unwrap();
+        let entries = reader.read_all().await.expect("operation should succeed");
         let names: Vec<String> = entries.into_iter().map(|entry| entry.name).collect();
 
         assert_eq!(
@@ -4558,7 +4558,7 @@ mod test {
     #[tokio::test]
     async fn test_make_volume() {
         let p = "./testv0";
-        fs::create_dir_all(&p).await.unwrap();
+        fs::create_dir_all(&p).await.expect("operation should succeed");
 
         let ep = match Endpoint::try_from(p) {
             Ok(e) => e,
@@ -4568,17 +4568,17 @@ mod test {
             }
         };
 
-        let disk = LocalDisk::new(&ep, false).await.unwrap();
+        let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -4586,7 +4586,7 @@ mod test {
     #[tokio::test]
     async fn test_delete_volume() {
         let p = "./testv1";
-        fs::create_dir_all(&p).await.unwrap();
+        fs::create_dir_all(&p).await.expect("operation should succeed");
 
         let ep = match Endpoint::try_from(p) {
             Ok(e) => e,
@@ -4596,17 +4596,17 @@ mod test {
             }
         };
 
-        let disk = LocalDisk::new(&ep, false).await.unwrap();
+        let disk = LocalDisk::new(&ep, false).await.expect("operation should succeed");
 
-        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).unwrap();
+        let tmpp = disk.resolve_abs_path(Path::new(RUSTFS_META_TMP_DELETED_BUCKET)).expect("operation should succeed");
 
         println!("ppp :{:?}", &tmpp);
 
         let volumes = vec!["a123", "b123", "c123"];
 
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
-        disk.delete_volume("a").await.unwrap();
+        disk.delete_volume("a").await.expect("operation should succeed");
 
         let _ = fs::remove_dir_all(&p).await;
     }
@@ -4614,10 +4614,10 @@ mod test {
     #[tokio::test]
     async fn test_local_disk_basic_operations() {
         let test_dir = "./test_local_disk_basic";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Test basic properties
         assert!(disk.is_local());
@@ -4626,15 +4626,15 @@ mod test {
         assert!(!disk.to_string().is_empty());
 
         // Test path resolution
-        let abs_path = disk.resolve_abs_path("test/path").unwrap();
+        let abs_path = disk.resolve_abs_path("test/path").expect("operation should succeed");
         assert!(abs_path.is_absolute());
 
         // Test bucket path
-        let bucket_path = disk.get_bucket_path("test-bucket").unwrap();
+        let bucket_path = disk.get_bucket_path("test-bucket").expect("operation should succeed");
         assert!(bucket_path.to_string_lossy().contains("test-bucket"));
 
         // Test object path
-        let object_path = disk.get_object_path("test-bucket", "test-object").unwrap();
+        let object_path = disk.get_object_path("test-bucket", "test-object").expect("operation should succeed");
         assert!(object_path.to_string_lossy().contains("test-bucket"));
         assert!(object_path.to_string_lossy().contains("test-object"));
 
@@ -4648,13 +4648,13 @@ mod test {
         use std::os::unix::fs::symlink;
         use tempfile::tempdir;
 
-        let root_dir = tempdir().unwrap();
-        let outside_dir = tempdir().unwrap();
+        let root_dir = tempdir().expect("operation should succeed");
+        let outside_dir = tempdir().expect("operation should succeed");
         let link_path = root_dir.path().join("escape-bucket");
-        symlink(outside_dir.path(), &link_path).unwrap();
+        symlink(outside_dir.path(), &link_path).expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         assert!(matches!(disk.get_bucket_path("escape-bucket"), Err(DiskError::InvalidPath)));
     }
@@ -4665,15 +4665,15 @@ mod test {
         use std::os::unix::fs::symlink;
         use tempfile::tempdir;
 
-        let root_dir = tempdir().unwrap();
-        let outside_dir = tempdir().unwrap();
+        let root_dir = tempdir().expect("operation should succeed");
+        let outside_dir = tempdir().expect("operation should succeed");
         let bucket_dir = root_dir.path().join("bucket");
-        fs::create_dir_all(&bucket_dir).await.unwrap();
+        fs::create_dir_all(&bucket_dir).await.expect("operation should succeed");
         let link_path = bucket_dir.join("escape");
-        symlink(outside_dir.path(), &link_path).unwrap();
+        symlink(outside_dir.path(), &link_path).expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(root_dir.path().to_string_lossy().as_ref()).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         assert!(matches!(disk.get_object_path("bucket", "escape/object.txt"), Err(DiskError::InvalidPath)));
     }
@@ -4681,21 +4681,21 @@ mod test {
     #[tokio::test]
     async fn test_local_disk_file_operations() {
         let test_dir = "./test_local_disk_file_ops";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Create test volume
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
 
         // Test write and read operations
         let test_data: Vec<u8> = vec![1, 2, 3, 4, 5];
         disk.write_all("test-volume", "test-file.txt", test_data.clone().into())
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
-        let read_data = disk.read_all("test-volume", "test-file.txt").await.unwrap();
+        let read_data = disk.read_all("test-volume", "test-file.txt").await.expect("operation should succeed");
         assert_eq!(read_data, test_data);
 
         // Test file deletion
@@ -4705,38 +4705,38 @@ mod test {
             undo_write: false,
             old_data_dir: None,
         };
-        disk.delete("test-volume", "test-file.txt", delete_opts).await.unwrap();
+        disk.delete("test-volume", "test-file.txt", delete_opts).await.expect("operation should succeed");
 
         // Clean up
-        disk.delete_volume("test-volume").await.unwrap();
+        disk.delete_volume("test-volume").await.expect("operation should succeed");
         let _ = fs::remove_dir_all(&test_dir).await;
     }
 
     #[tokio::test]
     async fn test_local_disk_volume_operations() {
         let test_dir = "./test_local_disk_volumes";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         // Test creating multiple volumes
         let volumes = vec!["vol1", "vol2", "vol3"];
-        disk.make_volumes(volumes.clone()).await.unwrap();
+        disk.make_volumes(volumes.clone()).await.expect("operation should succeed");
 
         // Test listing volumes
-        let volume_list = disk.list_volumes().await.unwrap();
+        let volume_list = disk.list_volumes().await.expect("operation should succeed");
         assert!(!volume_list.is_empty());
 
         // Test volume stats
         for vol in &volumes {
-            let vol_info = disk.stat_volume(vol).await.unwrap();
+            let vol_info = disk.stat_volume(vol).await.expect("operation should succeed");
             assert_eq!(vol_info.name, *vol);
         }
 
         // Test deleting volumes
         for vol in &volumes {
-            disk.delete_volume(vol).await.unwrap();
+            disk.delete_volume(vol).await.expect("operation should succeed");
         }
 
         // Clean up the test directory
@@ -4746,10 +4746,10 @@ mod test {
     #[tokio::test]
     async fn test_local_disk_disk_info() {
         let test_dir = "./test_local_disk_info";
-        fs::create_dir_all(&test_dir).await.unwrap();
+        fs::create_dir_all(&test_dir).await.expect("operation should succeed");
 
-        let endpoint = Endpoint::try_from(test_dir).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let endpoint = Endpoint::try_from(test_dir).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
         let disk_info_opts = DiskInfoOptions {
             disk_id: "test-disk".to_string(),
@@ -4757,7 +4757,7 @@ mod test {
             noop: false,
         };
 
-        let disk_info = disk.disk_info(&disk_info_opts).await.unwrap();
+        let disk_info = disk.disk_info(&disk_info_opts).await.expect("operation should succeed");
 
         // Basic checks on disk info
         // Note: On macOS, Windows, and some other systems, fs_type may be empty
@@ -4780,14 +4780,14 @@ mod test {
     async fn test_read_file_stream_rejects_offset_length_overflow() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
         disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let result = disk.read_file_stream("test-volume", "test-file.txt", usize::MAX, 1).await;
         assert!(matches!(result, Err(DiskError::FileCorrupt)));
@@ -4797,14 +4797,14 @@ mod test {
     async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
         use tempfile::tempdir;
 
-        let dir = tempdir().unwrap();
-        let endpoint = Endpoint::try_from(dir.path().to_str().unwrap()).unwrap();
-        let disk = LocalDisk::new(&endpoint, false).await.unwrap();
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
 
-        disk.make_volume("test-volume").await.unwrap();
+        disk.make_volume("test-volume").await.expect("operation should succeed");
         disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         let result = disk.read_file_zero_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
         assert!(matches!(result, Err(DiskError::FileCorrupt)));
@@ -4857,15 +4857,15 @@ mod test {
         let test_file = "./test_read_exists.txt";
 
         // Test non-existent file
-        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
         assert!(data.is_empty());
         assert!(metadata.is_none());
 
         // Create test file
-        fs::write(test_file, b"test content").await.unwrap();
+        fs::write(test_file, b"test content").await.expect("operation should succeed");
 
         // Test existing file
-        let (data, metadata) = read_file_exists(test_file).await.unwrap();
+        let (data, metadata) = read_file_exists(test_file).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), b"test content");
         assert!(metadata.is_some());
 
@@ -4879,10 +4879,10 @@ mod test {
         let test_content = b"test content for read_all";
 
         // Create test file
-        fs::write(test_file, test_content).await.unwrap();
+        fs::write(test_file, test_content).await.expect("operation should succeed");
 
         // Test reading file
-        let (data, metadata) = read_file_all(test_file).await.unwrap();
+        let (data, metadata) = read_file_all(test_file).await.expect("operation should succeed");
         assert_eq!(data.as_ref(), test_content);
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), test_content.len() as u64);
@@ -4896,10 +4896,10 @@ mod test {
         let test_file = "./test_metadata.txt";
 
         // Create test file
-        fs::write(test_file, b"test").await.unwrap();
+        fs::write(test_file, b"test").await.expect("operation should succeed");
 
         // Test reading metadata
-        let metadata = read_file_metadata(test_file).await.unwrap();
+        let metadata = read_file_metadata(test_file).await.expect("operation should succeed");
         assert!(metadata.is_file());
         assert_eq!(metadata.len(), 4); // "test" is 4 bytes
 

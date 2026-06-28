@@ -150,10 +150,10 @@ impl TransitionClient {
     ) -> Result<ObjectInfo, std::io::Error> {
         let mut headers = opts.header();
         if opts.internal.replication_delete_marker {
-            headers.insert("X-Source-DeleteMarker", HeaderValue::from_str("true").unwrap());
+            headers.insert("X-Source-DeleteMarker", HeaderValue::from_str("true").expect("operation should succeed"));
         }
         if opts.internal.is_replication_ready_for_delete_marker {
-            headers.insert("X-Check-Replication-Ready", HeaderValue::from_str("true").unwrap());
+            headers.insert("X-Check-Replication-Ready", HeaderValue::from_str("true").expect("operation should succeed"));
         }
 
         let resp = self
@@ -183,12 +183,12 @@ impl TransitionClient {
             Ok(resp) => {
                 let h = resp.headers();
                 let delete_marker = if let Some(x_amz_delete_marker) = h.get(X_AMZ_DELETE_MARKER.as_str()) {
-                    x_amz_delete_marker.to_str().unwrap() == "true"
+                    x_amz_delete_marker.to_str().expect("operation should succeed") == "true"
                 } else {
                     false
                 };
                 let replication_ready = if let Some(x_amz_delete_marker) = h.get("X-Replication-Ready") {
-                    x_amz_delete_marker.to_str().unwrap() == "true"
+                    x_amz_delete_marker.to_str().expect("operation should succeed") == "true"
                 } else {
                     false
                 };
@@ -224,7 +224,7 @@ impl TransitionClient {
                     //http_resp_to_error_response(resp, bucket_name, object_name)
                 }
 
-                Ok(to_object_info(bucket_name, object_name, h).unwrap())
+                Ok(to_object_info(bucket_name, object_name, h).expect("operation should succeed"))
             }
             Err(err) => {
                 return Err(std::io::Error::other(err));

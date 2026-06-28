@@ -178,7 +178,7 @@ mod tests {
     fn test_compress_decompress_gzip() {
         let data = b"hello gzip compress";
         let compressed = compress_block(data, CompressionAlgorithm::Gzip);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Gzip).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Gzip).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
@@ -186,7 +186,7 @@ mod tests {
     fn test_compress_decompress_deflate() {
         let data = b"hello deflate compress";
         let compressed = compress_block(data, CompressionAlgorithm::Deflate);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Deflate).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Deflate).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
@@ -194,7 +194,7 @@ mod tests {
     fn test_compress_decompress_zstd() {
         let data = b"hello zstd compress";
         let compressed = compress_block(data, CompressionAlgorithm::Zstd);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Zstd).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Zstd).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
@@ -202,7 +202,7 @@ mod tests {
     fn test_compress_decompress_lz4() {
         let data = b"hello lz4 compress";
         let compressed = compress_block(data, CompressionAlgorithm::Lz4);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Lz4).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Lz4).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
@@ -210,7 +210,7 @@ mod tests {
     fn test_compress_decompress_brotli() {
         let data = b"hello brotli compress";
         let compressed = compress_block(data, CompressionAlgorithm::Brotli);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Brotli).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Brotli).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
@@ -218,18 +218,18 @@ mod tests {
     fn test_compress_decompress_snappy() {
         let data = b"hello snappy compress";
         let compressed = compress_block(data, CompressionAlgorithm::Snappy);
-        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Snappy).unwrap();
+        let decompressed = decompress_block(&compressed, CompressionAlgorithm::Snappy).expect("operation should succeed");
         assert_eq!(decompressed, data);
     }
 
     #[test]
     fn test_from_str() {
-        assert_eq!(CompressionAlgorithm::from_str("gzip").unwrap(), CompressionAlgorithm::Gzip);
-        assert_eq!(CompressionAlgorithm::from_str("deflate").unwrap(), CompressionAlgorithm::Deflate);
-        assert_eq!(CompressionAlgorithm::from_str("zstd").unwrap(), CompressionAlgorithm::Zstd);
-        assert_eq!(CompressionAlgorithm::from_str("lz4").unwrap(), CompressionAlgorithm::Lz4);
-        assert_eq!(CompressionAlgorithm::from_str("brotli").unwrap(), CompressionAlgorithm::Brotli);
-        assert_eq!(CompressionAlgorithm::from_str("snappy").unwrap(), CompressionAlgorithm::Snappy);
+        assert_eq!(CompressionAlgorithm::from_str("gzip").expect("operation should succeed"), CompressionAlgorithm::Gzip);
+        assert_eq!(CompressionAlgorithm::from_str("deflate").expect("operation should succeed"), CompressionAlgorithm::Deflate);
+        assert_eq!(CompressionAlgorithm::from_str("zstd").expect("operation should succeed"), CompressionAlgorithm::Zstd);
+        assert_eq!(CompressionAlgorithm::from_str("lz4").expect("operation should succeed"), CompressionAlgorithm::Lz4);
+        assert_eq!(CompressionAlgorithm::from_str("brotli").expect("operation should succeed"), CompressionAlgorithm::Brotli);
+        assert_eq!(CompressionAlgorithm::from_str("snappy").expect("operation should succeed"), CompressionAlgorithm::Snappy);
         assert!(CompressionAlgorithm::from_str("unknown").is_err());
     }
 
@@ -278,12 +278,12 @@ mod tests {
             println!("{name}: {size} bytes, {dur:?}");
         }
         // All should decompress to the original
-        assert_eq!(decompress_block(&gzip, CompressionAlgorithm::Gzip).unwrap(), data);
-        assert_eq!(decompress_block(&deflate, CompressionAlgorithm::Deflate).unwrap(), data);
-        assert_eq!(decompress_block(&zstd, CompressionAlgorithm::Zstd).unwrap(), data);
-        assert_eq!(decompress_block(&lz4, CompressionAlgorithm::Lz4).unwrap(), data);
-        assert_eq!(decompress_block(&brotli, CompressionAlgorithm::Brotli).unwrap(), data);
-        assert_eq!(decompress_block(&snappy, CompressionAlgorithm::Snappy).unwrap(), data);
+        assert_eq!(decompress_block(&gzip, CompressionAlgorithm::Gzip).expect("operation should succeed"), data);
+        assert_eq!(decompress_block(&deflate, CompressionAlgorithm::Deflate).expect("operation should succeed"), data);
+        assert_eq!(decompress_block(&zstd, CompressionAlgorithm::Zstd).expect("operation should succeed"), data);
+        assert_eq!(decompress_block(&lz4, CompressionAlgorithm::Lz4).expect("operation should succeed"), data);
+        assert_eq!(decompress_block(&brotli, CompressionAlgorithm::Brotli).expect("operation should succeed"), data);
+        assert_eq!(decompress_block(&snappy, CompressionAlgorithm::Snappy).expect("operation should succeed"), data);
         // All compressed results should not be empty
         assert!(
             !gzip.is_empty()
@@ -326,7 +326,7 @@ mod tests {
 
                 // Decompression test
                 let start = Instant::now();
-                let _decompressed = decompress_block(&compressed, algo).unwrap();
+                let _decompressed = decompress_block(&compressed, algo).expect("operation should succeed");
                 let _decompression_time = start.elapsed();
 
                 // Calculate compression ratio

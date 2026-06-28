@@ -352,8 +352,8 @@ impl SetDisks {
 
                         // We write at temporary location and then rename to final location.
                         let tmp_id = Uuid::new_v4().to_string();
-                        let src_data_dir = latest_meta.data_dir.unwrap().to_string();
-                        let dst_data_dir = latest_meta.data_dir.unwrap();
+                        let src_data_dir = latest_meta.data_dir.expect("operation should succeed").to_string();
+                        let dst_data_dir = latest_meta.data_dir.expect("operation should succeed");
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure.clone();
@@ -549,13 +549,13 @@ impl SetDisks {
                                 } else {
                                     rename_successes += 1;
                                     if parts_metadata[index].is_remote() {
-                                        let rm_data_dir = parts_metadata[index].data_dir.unwrap().to_string();
+                                        let rm_data_dir = parts_metadata[index].data_dir.expect("operation should succeed").to_string();
 
                                         let d_path = Path::new(&encode_dir_object(object)).join(rm_data_dir);
 
                                         disk.delete(
                                             bucket,
-                                            d_path.to_str().unwrap(),
+                                            d_path.to_str().expect("operation should succeed"),
                                             DeleteOptions {
                                                 immediate: true,
 
@@ -713,7 +713,7 @@ impl SetDisks {
         for (index, (err, disk)) in errs.iter().zip(disks.iter()).enumerate() {
             if let (Some(DiskError::VolumeNotFound | DiskError::FileNotFound), Some(disk)) = (err, disk) {
                 let vol_path = Path::new(bucket).join(object);
-                let drive_state = match disk.make_volume(vol_path.to_str().unwrap()).await {
+                let drive_state = match disk.make_volume(vol_path.to_str().expect("operation should succeed")).await {
                     Ok(_) => DriveState::Ok.to_string(),
                     Err(merr) => match merr {
                         DiskError::VolumeExists => DriveState::Ok.to_string(),
