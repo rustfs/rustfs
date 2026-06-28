@@ -355,6 +355,9 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ROLLOUT_PCT: u32 = 100;
 const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 
+const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
+
 // --- Metadata Early-Stop Configuration ---
 
 const ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE: &str = "RUSTFS_GET_METADATA_EARLY_STOP_ENABLE";
@@ -486,6 +489,26 @@ fn is_codec_streaming_multipart_enabled() -> bool {
             rustfs_utils::get_env_bool(
                 ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
                 DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE,
+            )
+        })
+    }
+}
+
+fn get_codec_streaming_multipart_max_parts() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS,
             )
         })
     }
@@ -662,6 +685,7 @@ enum GetCodecStreamingFallbackReason {
     Multipart,
     InvalidMinSize,
     ReadQuorumNotSafe,
+    MultipartPartLimit,
 }
 
 impl GetCodecStreamingFallbackReason {
@@ -681,6 +705,7 @@ impl GetCodecStreamingFallbackReason {
             Self::Multipart => "multipart",
             Self::InvalidMinSize => "invalid_min_size",
             Self::ReadQuorumNotSafe => "read_quorum_not_safe",
+            Self::MultipartPartLimit => "multipart_part_limit",
         }
     }
 }
@@ -838,6 +863,12 @@ fn get_codec_streaming_reader_gate(
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+            };
+        }
+        if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
+            return GetCodecStreamingGate {
+                object_class,
+                decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
             };
         }
     }

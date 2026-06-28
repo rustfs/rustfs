@@ -2319,6 +2319,11 @@ impl SetDisks {
         if !is_codec_streaming_multipart_enabled() {
             return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(GetCodecStreamingFallbackReason::Multipart));
         }
+        if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
+            return Ok(GetCodecStreamingReaderBuildOutcome::Fallback(
+                GetCodecStreamingFallbackReason::MultipartPartLimit,
+            ));
+        }
 
         let object_length =
             usize::try_from(fi.size).map_err(|_| Error::other("codec streaming reader object size is invalid"))?;
@@ -3809,6 +3814,32 @@ mod tests {
     }
 
     #[test]
+    fn codec_streaming_reader_gate_limits_multipart_part_count() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(1024, 2);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.object_class, GetCodecStreamingObjectClass::Multipart);
+                assert_eq!(
+                    gate.decision,
+                    GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit)
+                );
+            },
+        );
+    }
+
+    #[test]
     fn codec_streaming_decode_engine_builder_selects_rustfs() {
         temp_env::with_var(ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS), || {
             let erasure = crate::erasure::coding::Erasure::new(4, 2, 32);
@@ -3863,6 +3894,7 @@ mod tests {
         assert_eq!(GetCodecStreamingFallbackReason::Multipart.as_str(), "multipart");
         assert_eq!(GetCodecStreamingFallbackReason::InvalidMinSize.as_str(), "invalid_min_size");
         assert_eq!(GetCodecStreamingFallbackReason::ReadQuorumNotSafe.as_str(), "read_quorum_not_safe");
+        assert_eq!(GetCodecStreamingFallbackReason::MultipartPartLimit.as_str(), "multipart_part_limit");
         assert_eq!(GetCodecStreamingObjectClass::PlainSinglePart.as_str(), "plain_single_part");
         assert_eq!(GetCodecStreamingObjectClass::Range.as_str(), "range");
         assert_eq!(GetCodecStreamingObjectClass::Encrypted.as_str(), "encrypted");
