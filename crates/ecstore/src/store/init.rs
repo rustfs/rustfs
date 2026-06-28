@@ -286,8 +286,8 @@ impl ECStore {
             }
 
             for disk in disks.iter() {
-                if disk.is_some() && disk.as_ref().unwrap().is_local() {
-                    local_disks.push(disk.as_ref().unwrap().clone());
+                if disk.is_some() && disk.as_ref().expect("operation should succeed").is_local() {
+                    local_disks.push(disk.as_ref().expect("operation should succeed").clone());
                 }
             }
 

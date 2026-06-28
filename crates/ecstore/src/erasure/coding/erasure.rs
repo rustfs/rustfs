@@ -412,7 +412,7 @@ fn recover_empty_payload_data_shards(
 /// use rustfs_ecstore::api::erasure::Erasure;
 /// let erasure = Erasure::new(4, 2, 8);
 /// let data = b"hello world";
-/// let shards = erasure.encode_data(data).unwrap();
+/// let shards = erasure.encode_data(data).expect("operation should succeed");
 /// // Simulate loss and recovery...
 /// ```
 pub struct Erasure {
@@ -474,13 +474,13 @@ impl Erasure {
     /// for decode/reconstruct (for reading and healing old-version files).
     pub fn new_with_options(data_shards: usize, parity_shards: usize, block_size: usize, uses_legacy: bool) -> Self {
         let encoder = if !uses_legacy && parity_shards > 0 {
-            Some(ReedSolomonEncoder::new(data_shards, parity_shards).unwrap())
+            Some(ReedSolomonEncoder::new(data_shards, parity_shards).expect("operation should succeed"))
         } else {
             None
         };
 
         let legacy_encoder = if uses_legacy && parity_shards > 0 {
-            Some(LegacyReedSolomonEncoder::new(data_shards, parity_shards).unwrap())
+            Some(LegacyReedSolomonEncoder::new(data_shards, parity_shards).expect("operation should succeed"))
         } else {
             None
         };
@@ -1208,7 +1208,7 @@ mod tests {
         let test_data = b"SIMD mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization.".repeat(20); // ~3KB for SIMD
 
         let data = &test_data;
-        let encoded_shards = erasure.encode_data(data).unwrap();
+        let encoded_shards = erasure.encode_data(data).expect("operation should succeed");
         assert_eq!(encoded_shards.len(), data_shards + parity_shards);
 
         // Create decode input with some shards missing, convert to the format expected by decode_data
@@ -1217,12 +1217,12 @@ mod tests {
             decode_input[i] = Some(encoded_shards[i].to_vec());
         }
 
-        erasure.decode_data(&mut decode_input).unwrap();
+        erasure.decode_data(&mut decode_input).expect("operation should succeed");
 
         // Recover original data
         let mut recovered = Vec::new();
         for shard in decode_input.iter().take(data_shards) {
-            recovered.extend_from_slice(shard.as_ref().unwrap());
+            recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
         }
         recovered.truncate(data.len());
         assert_eq!(&recovered, data);
@@ -1238,7 +1238,7 @@ mod tests {
         // Generate 1MB test data
         let data: Vec<u8> = (0..1048576).map(|i| (i % 256) as u8).collect();
 
-        let encoded_shards = erasure.encode_data(&data).unwrap();
+        let encoded_shards = erasure.encode_data(&data).expect("operation should succeed");
         assert_eq!(encoded_shards.len(), data_shards + parity_shards);
 
         // Create decode input with some shards missing, convert to the format expected by decode_data
@@ -1247,12 +1247,12 @@ mod tests {
             decode_input[i] = Some(encoded_shards[i].to_vec());
         }
 
-        erasure.decode_data(&mut decode_input).unwrap();
+        erasure.decode_data(&mut decode_input).expect("operation should succeed");
 
         // Recover original data
         let mut recovered = Vec::new();
         for shard in decode_input.iter().take(data_shards) {
-            recovered.extend_from_slice(shard.as_ref().unwrap());
+            recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
         }
         recovered.truncate(data.len());
         assert_eq!(recovered, data);
@@ -1265,7 +1265,7 @@ mod tests {
         let block_size = 6;
         let erasure = Erasure::new(data_shards, parity_shards, block_size);
         let data = vec![0u8; block_size];
-        let shards = erasure.encode_data(&data).unwrap();
+        let shards = erasure.encode_data(&data).expect("operation should succeed");
         assert_eq!(shards.len(), data_shards + parity_shards);
         let total_len: usize = shards.iter().map(|b| b.len()).sum();
         assert_eq!(total_len, erasure.shard_size() * (data_shards + parity_shards));
@@ -1296,7 +1296,7 @@ mod tests {
         let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, true);
 
         let data = b"Legacy encode/decode roundtrip test data with sufficient length.".repeat(20);
-        let encoded_shards = erasure.encode_data(&data).unwrap();
+        let encoded_shards = erasure.encode_data(&data).expect("operation should succeed");
         assert_eq!(encoded_shards.len(), data_shards + parity_shards);
 
         let mut decode_input: Vec<Option<Vec<u8>>> = vec![None; data_shards + parity_shards];
@@ -1304,11 +1304,11 @@ mod tests {
             decode_input[i] = Some(encoded_shards[i].to_vec());
         }
 
-        erasure.decode_data(&mut decode_input).unwrap();
+        erasure.decode_data(&mut decode_input).expect("operation should succeed");
 
         let mut recovered = Vec::new();
         for shard in decode_input.iter().take(data_shards) {
-            recovered.extend_from_slice(shard.as_ref().unwrap());
+            recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
         }
         recovered.truncate(data.len());
         assert_eq!(&recovered, &data);
@@ -1322,17 +1322,17 @@ mod tests {
         let erasure = Erasure::new_with_options(data_shards, parity_shards, block_size, true);
 
         let data = b"Legacy decode with missing shards test.".repeat(10);
-        let encoded_shards = erasure.encode_data(&data).unwrap();
+        let encoded_shards = erasure.encode_data(&data).expect("operation should succeed");
 
         let mut shards_opt: Vec<Option<Vec<u8>>> = encoded_shards.iter().map(|s| Some(s.to_vec())).collect();
         shards_opt[1] = None;
         shards_opt[5] = None;
 
-        erasure.decode_data(&mut shards_opt).unwrap();
+        erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
         let mut recovered = Vec::new();
         for shard in shards_opt.iter().take(data_shards) {
-            recovered.extend_from_slice(shard.as_ref().unwrap());
+            recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
         }
         recovered.truncate(data.len());
         assert_eq!(&recovered, &data);
@@ -1373,17 +1373,17 @@ mod tests {
                 .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                     let tx = tx.clone();
                     async move {
-                        let shards = res.unwrap();
-                        tx.send(shards).await.unwrap();
+                        let shards = res.expect("operation should succeed");
+                        tx.send(shards).await.expect("operation should succeed");
                         Ok(())
                     }
                 })
                 .await
-                .unwrap();
+                .expect("operation should succeed");
         });
         let result = handle.await;
         assert!(result.is_ok());
-        let collected_shards = rx.recv().await.unwrap();
+        let collected_shards = rx.recv().await.expect("operation should succeed");
         assert_eq!(collected_shards.len(), data_shards + parity_shards);
     }
 
@@ -1412,17 +1412,17 @@ mod tests {
                 .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                     let tx = tx.clone();
                     async move {
-                        let shards = res.unwrap();
-                        tx.send(shards).await.unwrap();
+                        let shards = res.expect("operation should succeed");
+                        tx.send(shards).await.expect("operation should succeed");
                         Ok(())
                     }
                 })
                 .await
-                .unwrap();
+                .expect("operation should succeed");
         });
         let result = handle.await;
         assert!(result.is_ok());
-        let shards = rx.recv().await.unwrap();
+        let shards = rx.recv().await.expect("operation should succeed");
         assert_eq!(shards.len(), data_shards + parity_shards);
 
         // Test decode using the old API that operates in-place
@@ -1430,12 +1430,12 @@ mod tests {
         for i in 0..data_shards {
             decode_input[i] = Some(shards[i].to_vec());
         }
-        erasure.decode_data(&mut decode_input).unwrap();
+        erasure.decode_data(&mut decode_input).expect("operation should succeed");
 
         // Recover original data
         let mut recovered = Vec::new();
         for shard in decode_input.iter().take(data_shards) {
-            recovered.extend_from_slice(shard.as_ref().unwrap());
+            recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
         }
         recovered.truncate(data_clone.len());
         assert_eq!(&recovered, &data_clone);
@@ -1456,7 +1456,7 @@ mod tests {
                 let observed = observed_clone.clone();
                 async move {
                     let err = res.expect_err("zero block size should report an error");
-                    *observed.lock().unwrap() = Some((err.kind(), err.to_string()));
+                    *observed.lock().expect("operation should succeed") = Some((err.kind(), err.to_string()));
                     Ok(())
                 }
             })
@@ -1464,7 +1464,7 @@ mod tests {
             .expect("callback should handle the zero block size error");
 
         assert_eq!(total, 0);
-        let observed = observed.lock().unwrap();
+        let observed = observed.lock().expect("operation should succeed");
         let (kind, message) = observed.as_ref().expect("callback should be invoked once");
         assert_eq!(*kind, io::ErrorKind::InvalidInput);
         assert!(message.contains("block_size"));
@@ -1485,7 +1485,7 @@ mod tests {
             let test_data = b"SIMD mode test data for encoding and decoding roundtrip verification with sufficient length to ensure shard size requirements are met for proper SIMD optimization and validation.";
             let data = test_data.repeat(25); // Create much larger data: ~5KB total, ~1.25KB per shard
 
-            let encoded_shards = erasure.encode_data(&data).unwrap();
+            let encoded_shards = erasure.encode_data(&data).expect("operation should succeed");
             assert_eq!(encoded_shards.len(), data_shards + parity_shards);
 
             // Create decode input with some shards missing
@@ -1495,12 +1495,12 @@ mod tests {
             shards_opt[1] = None; // Lose second data shard
             shards_opt[5] = None; // Lose second parity shard
 
-            erasure.decode_data(&mut shards_opt).unwrap();
+            erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
             // Verify recovered data
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
-                recovered.extend_from_slice(shard.as_ref().unwrap());
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
             recovered.truncate(data.len());
             assert_eq!(&recovered, &data);
@@ -1516,7 +1516,7 @@ mod tests {
             // Create all-zero data that ensures adequate shard size for SIMD optimization
             let data = vec![0u8; 1024]; // 1KB of zeros, each shard will be 256 bytes
 
-            let encoded_shards = erasure.encode_data(&data).unwrap();
+            let encoded_shards = erasure.encode_data(&data).expect("operation should succeed");
             assert_eq!(encoded_shards.len(), data_shards + parity_shards);
 
             // Verify that all data shards are zeros
@@ -1531,12 +1531,12 @@ mod tests {
             shards_opt[0] = None; // Lose first data shard
             shards_opt[4] = None; // Lose first parity shard
 
-            erasure.decode_data(&mut shards_opt).unwrap();
+            erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
             // Verify recovered data is still all zeros
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
-                recovered.extend_from_slice(shard.as_ref().unwrap());
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
             recovered.truncate(data.len());
             assert!(recovered.iter().all(|&x| x == 0), "Recovered data should be all zeros");
@@ -1555,7 +1555,7 @@ mod tests {
                 data.push((i % 256) as u8);
             }
 
-            let shards = erasure.encode_data(&data).unwrap();
+            let shards = erasure.encode_data(&data).expect("operation should succeed");
             assert_eq!(shards.len(), data_shards + parity_shards);
 
             // Simulate the loss of multiple shards
@@ -1566,12 +1566,12 @@ mod tests {
             shards_opt[11] = None; // Parity shard
 
             // Decode
-            erasure.decode_data(&mut shards_opt).unwrap();
+            erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
             // Recover original data
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
-                recovered.extend_from_slice(shard.as_ref().unwrap());
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
             recovered.truncate(data.len());
             assert_eq!(&recovered, &data);
@@ -1603,7 +1603,7 @@ mod tests {
                         Ok(_) => {
                             let mut recovered = Vec::new();
                             for shard in shards_opt.iter().take(data_shards) {
-                                recovered.extend_from_slice(shard.as_ref().unwrap());
+                                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
                             }
                             recovered.truncate(data.len());
                             assert_eq!(&recovered, &data);
@@ -1630,7 +1630,7 @@ mod tests {
             let data =
                 b"Testing maximum erasure capacity with SIMD Reed-Solomon implementation for robustness verification!".repeat(3);
 
-            let shards = erasure.encode_data(&data).unwrap();
+            let shards = erasure.encode_data(&data).expect("operation should succeed");
 
             // Lose exactly the maximum number of shards (equal to parity_shards)
             let mut shards_opt: Vec<Option<Vec<u8>>> = shards.iter().map(|b| Some(b.to_vec())).collect();
@@ -1639,11 +1639,11 @@ mod tests {
             shards_opt[6] = None; // Parity shard
 
             // Should succeed with maximum erasures
-            erasure.decode_data(&mut shards_opt).unwrap();
+            erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
-                recovered.extend_from_slice(shard.as_ref().unwrap());
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
             recovered.truncate(data.len());
             assert_eq!(&recovered, &data);
@@ -1662,7 +1662,7 @@ mod tests {
         fn test_reed_solomon_compat() {
             let data = generate_compat_test_data(7557);
             let erasure = Erasure::new(4, 2, 7557);
-            let shards = erasure.encode_data(&data).unwrap();
+            let shards = erasure.encode_data(&data).expect("operation should succeed");
             assert_eq!(shards.len(), 6, "expected 6 shards (4 data + 2 parity)");
 
             // Per-shard HighwayHash
@@ -1732,7 +1732,7 @@ mod tests {
                             // Verify recovered data
                             let mut recovered = Vec::new();
                             for shard in shards_opt.iter().take(data_shards) {
-                                recovered.extend_from_slice(shard.as_ref().unwrap());
+                                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
                             }
                             recovered.truncate(small_data.len());
                             println!("recovered: {recovered:?}");
@@ -1776,7 +1776,7 @@ mod tests {
 
             // Encode the data
             let start = std::time::Instant::now();
-            let shards = erasure.encode_data(&data).unwrap();
+            let shards = erasure.encode_data(&data).expect("operation should succeed");
             let encode_duration = start.elapsed();
 
             println!("⏱️  Encoding completed in: {encode_duration:?}");
@@ -1800,7 +1800,7 @@ mod tests {
 
             // Decode and recover data
             let start = std::time::Instant::now();
-            erasure.decode_data(&mut shards_opt).unwrap();
+            erasure.decode_data(&mut shards_opt).expect("operation should succeed");
             let decode_duration = start.elapsed();
 
             println!("⏱️  Decoding completed in: {decode_duration:?}");
@@ -1808,7 +1808,7 @@ mod tests {
             // Verify recovered data integrity
             let mut recovered = Vec::new();
             for shard in shards_opt.iter().take(data_shards) {
-                recovered.extend_from_slice(shard.as_ref().unwrap());
+                recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
             }
             recovered.truncate(data.len());
 
@@ -1853,20 +1853,20 @@ mod tests {
                     .encode_stream_callback_async::<_, _, (), _>(&mut reader, move |res| {
                         let tx = tx.clone();
                         async move {
-                            let shards = res.unwrap();
-                            tx.send(shards).await.unwrap();
+                            let shards = res.expect("operation should succeed");
+                            tx.send(shards).await.expect("operation should succeed");
                             Ok(())
                         }
                     })
                     .await
-                    .unwrap();
+                    .expect("operation should succeed");
             });
 
             let mut all_blocks = Vec::new();
             while let Some(block) = rx.recv().await {
                 all_blocks.push(block);
             }
-            handle.await.unwrap();
+            handle.await.expect("operation should succeed");
 
             // Verify we got multiple blocks
             assert!(all_blocks.len() > 1, "Should have multiple blocks for stream test");
@@ -1879,10 +1879,10 @@ mod tests {
                 shards_opt[1] = None;
                 shards_opt[5] = None;
 
-                erasure.decode_data(&mut shards_opt).unwrap();
+                erasure.decode_data(&mut shards_opt).expect("operation should succeed");
 
                 for shard in shards_opt.iter().take(data_shards) {
-                    recovered.extend_from_slice(shard.as_ref().unwrap());
+                    recovered.extend_from_slice(shard.as_ref().expect("operation should succeed"));
                 }
             }
 

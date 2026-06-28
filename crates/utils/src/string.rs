@@ -32,10 +32,10 @@ use std::sync::LazyLock;
 /// let false_values = ["0", "f", "F", "false", "FALSE", "False", "off", "OFF", "Off", "disabled"];
 ///
 /// for val in true_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), true);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), true);
 /// }
 /// for val in false_values.iter() {
-///     assert_eq!(parse_bool(val).unwrap(), false);
+///     assert_eq!(parse_bool(val).expect("operation should succeed"), false);
 /// }
 /// ```
 ///
@@ -236,7 +236,7 @@ pub fn match_as_pattern_prefix(pattern: &str, text: &str) -> bool {
     text.len() <= pattern.len()
 }
 
-static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").unwrap());
+static ELLIPSES_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(.*)(\{[0-9A-Fa-f]*\.\.\.[0-9A-Fa-f]*\})(.*)").expect("operation should succeed"));
 
 /// Ellipses constants
 const OPEN_BRACES: &str = "{";
@@ -351,7 +351,7 @@ impl ArgPattern {
 /// use rustfs_utils::string::find_ellipses_patterns;
 ///
 /// let pattern = "http://rustfs{2...3}/export/set{1...64}";
-/// let arg_pattern = find_ellipses_patterns(pattern).unwrap();
+/// let arg_pattern = find_ellipses_patterns(pattern).expect("operation should succeed");
 /// assert_eq!(arg_pattern.total_sizes(), 128);
 /// ```
 pub fn find_ellipses_patterns(arg: &str) -> Result<ArgPattern> {
@@ -469,7 +469,7 @@ pub fn has_ellipses<T: AsRef<str>>(s: &[T]) -> bool {
 /// ```no_run
 /// use rustfs_utils::string::parse_ellipses_range;
 ///
-/// let range = parse_ellipses_range("{1...5}").unwrap();
+/// let range = parse_ellipses_range("{1...5}").expect("operation should succeed");
 /// assert_eq!(range, vec!["1", "2", "3", "4", "5"]);
 /// ```
 ///

@@ -383,7 +383,7 @@ impl PoolTier {
 
         // Use the pool's shared metrics for recording
         let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-        let _metrics = _metrics_lock.as_ref().unwrap();
+        let _metrics = _metrics_lock.as_ref().expect("operation should succeed");
 
         // Record acquisition
         pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
@@ -406,7 +406,7 @@ impl PoolTier {
 
         // Use the pool's shared metrics for recording
         let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-        let _metrics = _metrics_lock.as_ref().unwrap();
+        let _metrics = _metrics_lock.as_ref().expect("operation should succeed");
 
         // Record acquisition
         pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);

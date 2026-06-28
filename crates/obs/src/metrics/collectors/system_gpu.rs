@@ -25,7 +25,7 @@
 //! use rustfs_obs::metrics::collectors::{GpuCollector, collect_gpu_metrics};
 //! use sysinfo::Pid;
 //!
-//! let pid = sysinfo::get_current_pid().unwrap();
+//! let pid = sysinfo::get_current_pid().expect("operation should succeed");
 //! let collector = GpuCollector::new(pid)?;
 //! let stats = collector.collect()?;
 //! let metrics = collect_gpu_metrics(&stats, &labels);
@@ -105,7 +105,7 @@ impl GpuCollector {
     /// use rustfs_obs::metrics::collectors::GpuCollector;
     /// use sysinfo::Pid;
     ///
-    /// let pid = sysinfo::get_current_pid().unwrap();
+    /// let pid = sysinfo::get_current_pid().expect("operation should succeed");
     /// let collector = GpuCollector::new(pid)?;
     /// ```
     pub fn new(pid: Pid) -> Result<Self, GpuError> {

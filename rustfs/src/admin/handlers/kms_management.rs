@@ -208,7 +208,7 @@ impl Operation for KmsStatusHandler {
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
@@ -257,7 +257,7 @@ impl Operation for KmsConfigHandler {
         let data = serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
         let mut headers = HeaderMap::new();
-        headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+        headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
         Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
     }
@@ -302,7 +302,7 @@ impl Operation for KmsClearCacheHandler {
                     serde_json::to_vec(&response).map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
 
                 let mut headers = HeaderMap::new();
-                headers.insert(CONTENT_TYPE, "application/json".parse().unwrap());
+                headers.insert(CONTENT_TYPE, "application/json".parse().expect("operation should succeed"));
 
                 Ok(S3Response::with_headers((StatusCode::OK, Body::from(data)), headers))
             }

@@ -23,7 +23,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").unwrap());
+static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").expect("operation should succeed"));
 
 /// NetError represents errors that can occur in network operations.
 #[derive(Error, Debug)]
@@ -332,7 +332,7 @@ impl<'de> serde::Deserialize<'de> for ParsedURL {
     {
         let s: String = serde::Deserialize::deserialize(deserializer)?;
         if s.is_empty() {
-            Ok(ParsedURL(Url::parse("about:blank").unwrap()))
+            Ok(ParsedURL(Url::parse("about:blank").expect("operation should succeed")))
         } else {
             parse_url(&s).map_err(serde::de::Error::custom)
         }
@@ -363,7 +363,7 @@ pub fn parse_url(s: &str) -> Result<ParsedURL, NetError> {
         });
 
         if !port_str.is_empty() {
-            let host_port = format!("{}:{}", uu.host_str().unwrap(), port_str);
+            let host_port = format!("{}:{}", uu.host_str().expect("operation should succeed"), port_str);
             parse_host(&host_port)?;
         }
     }
@@ -485,7 +485,7 @@ mod tests {
     fn parse_host_with_valid_ipv4() {
         let result = parse_host("192.168.1.1:8080");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "192.168.1.1");
         assert_eq!(host.port, Some(8080));
     }
@@ -494,7 +494,7 @@ mod tests {
     fn parse_host_with_valid_hostname() {
         let result = parse_host("example.com:443");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "example.com");
         assert_eq!(host.port, Some(443));
     }
@@ -503,7 +503,7 @@ mod tests {
     fn parse_host_with_ipv6_brackets() {
         let result = parse_host("[::1]:8080");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, Some(8080));
     }
@@ -512,7 +512,7 @@ mod tests {
     fn parse_host_with_bare_ipv6_without_port() {
         let result = parse_host("::1");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, None);
     }
@@ -521,7 +521,7 @@ mod tests {
     fn parse_host_with_ipv6_zone_without_port() {
         let result = parse_host("fe80::1%eth0");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "fe80::1%eth0");
         assert_eq!(host.port, None);
     }
@@ -530,7 +530,7 @@ mod tests {
     fn parse_host_with_bracketed_ipv6_zone_and_port() {
         let result = parse_host("[fe80::1%eth0]:9000");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "fe80::1%eth0");
         assert_eq!(host.port, Some(9000));
     }
@@ -539,7 +539,7 @@ mod tests {
     fn parse_host_with_bracketed_ipv6_without_port() {
         let result = parse_host("[::1]");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "::1");
         assert_eq!(host.port, None);
     }
@@ -560,7 +560,7 @@ mod tests {
     fn parse_host_without_port() {
         let result = parse_host("example.com");
         assert!(result.is_ok());
-        let host = result.unwrap();
+        let host = result.expect("operation should succeed");
         assert_eq!(host.name, "example.com");
         assert_eq!(host.port, None);
     }
@@ -605,7 +605,7 @@ mod tests {
     fn parse_url_with_valid_http_url() {
         let result = parse_url("http://example.com/path");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.hostname(), "example.com");
         assert_eq!(parsed.port(), "80");
         assert_eq!(parsed.scheme(), "http");
@@ -616,7 +616,7 @@ mod tests {
     fn parse_url_with_explicit_default_https_port() {
         let result = parse_url("https://example.com:443/path");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.to_string(), "https://example.com/path");
     }
 
@@ -636,7 +636,7 @@ mod tests {
     fn parse_url_normalizes_path() {
         let result = parse_url("http://example.com//path/../path/");
         assert!(result.is_ok());
-        let parsed = result.unwrap();
+        let parsed = result.expect("operation should succeed");
         assert_eq!(parsed.to_string(), "http://example.com/path/");
     }
 }

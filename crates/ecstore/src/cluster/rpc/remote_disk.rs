@@ -142,9 +142,9 @@ impl RemoteDisk {
 
     pub(crate) async fn new(ep: &Endpoint, opt: &DiskOption, data_transport: Arc<dyn InternodeDataTransport>) -> Result<Self> {
         let addr = if let Some(port) = ep.url.port() {
-            format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().unwrap(), port)
+            format!("{}://{}:{}", ep.url.scheme(), ep.url.host_str().expect("operation should succeed"), port)
         } else {
-            format!("{}://{}", ep.url.scheme(), ep.url.host_str().unwrap())
+            format!("{}://{}", ep.url.scheme(), ep.url.host_str().expect("operation should succeed"))
         };
 
         let env_health_check =
@@ -363,7 +363,7 @@ impl RemoteDisk {
                     let elapsed = Duration::from_nanos(
                         (std::time::SystemTime::now()
                             .duration_since(std::time::UNIX_EPOCH)
-                            .unwrap()
+                            .expect("operation should succeed")
                             .as_nanos() as i64 - last_success_nanos) as u64
                     );
 
@@ -587,7 +587,7 @@ impl RemoteDisk {
         // Record operation start
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
+            .expect("operation should succeed")
             .as_nanos() as i64;
         self.health.last_started.store(now, std::sync::atomic::Ordering::Relaxed);
         self.health.increment_waiting();
@@ -2550,7 +2550,7 @@ mod tests {
 
     async fn new_remote_disk_with_transport(data_transport: Arc<dyn InternodeDataTransport>) -> RemoteDisk {
         let endpoint = Endpoint {
-            url: url::Url::parse("http://remote-node:9000/data/rustfs0").unwrap(),
+            url: url::Url::parse("http://remote-node:9000/data/rustfs0").expect("operation should succeed"),
             is_local: false,
             pool_idx: 0,
             set_idx: 0,
@@ -2561,7 +2561,7 @@ mod tests {
             health_check: false,
         };
 
-        RemoteDisk::new(&endpoint, &disk_option, data_transport).await.unwrap()
+        RemoteDisk::new(&endpoint, &disk_option, data_transport).await.expect("operation should succeed")
     }
 
     #[derive(Debug)]
@@ -2603,7 +2603,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_creation() {
-        let url = url::Url::parse("http://example.com:9000/path").unwrap();
+        let url = url::Url::parse("http://example.com:9000/path").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -2619,7 +2619,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         assert!(!remote_disk.is_local());
         assert_eq!(remote_disk.endpoint.url, url);
@@ -2631,7 +2631,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_basic_properties() {
-        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let url = url::Url::parse("http://remote-server:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -2647,7 +2647,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         // Test basic properties
         assert!(!remote_disk.is_local());
@@ -2665,7 +2665,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_path() {
-        let url = url::Url::parse("http://remote-server:9000/storage").unwrap();
+        let url = url::Url::parse("http://remote-server:9000/storage").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -2681,7 +2681,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
         let path = remote_disk.path();
 
         // Remote disk path should be based on the URL path
@@ -2697,7 +2697,7 @@ mod tests {
         };
         let addr = listener.local_addr().expect("listener local address should be available");
 
-        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).unwrap();
+        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -2713,7 +2713,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
         assert!(remote_disk.is_online().await);
 
         drop(listener);
@@ -2734,7 +2734,7 @@ mod tests {
 
         drop(listener);
 
-        let url = url::Url::parse(&format!("http://{ip}:{port}/data/rustfs0")).unwrap();
+        let url = url::Url::parse(&format!("http://{ip}:{port}/data/rustfs0")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -2756,7 +2756,7 @@ mod tests {
 
                 let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
                     .await
-                    .unwrap();
+                    .expect("operation should succeed");
                 remote_disk.enable_health_check();
 
                 // Wait out the initial success-grace window so the active probe loop
@@ -2796,7 +2796,7 @@ mod tests {
         });
 
         let base_addr = format!("http://{}:{}", addr.ip(), addr.port());
-        let url = url::Url::parse(&format!("{base_addr}/data/rustfs0")).unwrap();
+        let url = url::Url::parse(&format!("{base_addr}/data/rustfs0")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -2808,7 +2808,7 @@ mod tests {
         health.mark_failure(&endpoint, "test_failure");
         health.mark_failure(&endpoint, "test_failure");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
-        let channel = TonicEndpoint::from_shared(base_addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(base_addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
         assert!(runtime_sources::test_node_channel_is_cached(&base_addr).await);
 
@@ -2854,19 +2854,19 @@ mod tests {
 
         let copy_task = tokio::spawn(async move {
             let mut cursor = Cursor::new(payload);
-            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.unwrap();
+            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.expect("operation should succeed");
         });
 
         let mut copied = Vec::new();
-        read_half.read_to_end(&mut copied).await.unwrap();
-        copy_task.await.unwrap();
+        read_half.read_to_end(&mut copied).await.expect("operation should succeed");
+        copy_task.await.expect("operation should succeed");
 
         assert_eq!(copied, expected);
     }
 
     #[tokio::test]
     async fn test_remote_disk_disk_id() {
-        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let url = url::Url::parse("http://remote-server:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -2882,29 +2882,29 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         // Initially, disk ID should be None
-        let initial_id = remote_disk.get_disk_id().await.unwrap();
+        let initial_id = remote_disk.get_disk_id().await.expect("operation should succeed");
         assert!(initial_id.is_none());
 
         // Set a disk ID
         let test_id = Uuid::new_v4();
-        remote_disk.set_disk_id(Some(test_id)).await.unwrap();
+        remote_disk.set_disk_id(Some(test_id)).await.expect("operation should succeed");
 
         // Verify the disk ID was set
-        let retrieved_id = remote_disk.get_disk_id().await.unwrap();
+        let retrieved_id = remote_disk.get_disk_id().await.expect("operation should succeed");
         assert_eq!(retrieved_id, Some(test_id));
 
         // Clear the disk ID
-        remote_disk.set_disk_id(None).await.unwrap();
-        let cleared_id = remote_disk.get_disk_id().await.unwrap();
+        remote_disk.set_disk_id(None).await.expect("operation should succeed");
+        let cleared_id = remote_disk.get_disk_id().await.expect("operation should succeed");
         assert!(cleared_id.is_none());
     }
 
     #[tokio::test]
     async fn test_remote_disk_ref_prefers_disk_id() {
-        let url = url::Url::parse("http://remote-server:9000").unwrap();
+        let url = url::Url::parse("http://remote-server:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -2919,11 +2919,11 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
         assert_eq!(remote_disk.disk_ref().await, endpoint.to_string());
 
         let disk_id = Uuid::new_v4();
-        remote_disk.set_disk_id(Some(disk_id)).await.unwrap();
+        remote_disk.set_disk_id(Some(disk_id)).await.expect("operation should succeed");
 
         assert_eq!(remote_disk.disk_ref().await, disk_id.to_string());
     }
@@ -2935,7 +2935,7 @@ mod tests {
             let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
             let expected_disk = remote_disk.disk_ref().await;
 
-            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.expect("operation should succeed");
 
             let calls = transport.calls();
             assert_eq!(calls.len(), 1);
@@ -2961,7 +2961,7 @@ mod tests {
             let transport = RecordingInternodeDataTransport::default();
             let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
 
-            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.unwrap();
+            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.expect("operation should succeed");
 
             let calls = transport.calls();
             assert_eq!(calls.len(), 1);
@@ -2982,8 +2982,8 @@ mod tests {
         let _created = remote_disk
             .create_file("orig-bucket", "bucket", "object/part.1", 4096)
             .await
-            .unwrap();
-        let _appended = remote_disk.append_file("bucket", "object/part.2").await.unwrap();
+            .expect("operation should succeed");
+        let _appended = remote_disk.append_file("bucket", "object/part.2").await.expect("operation should succeed");
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);
@@ -3070,10 +3070,10 @@ mod tests {
             disk_id: String::new(),
             ..Default::default()
         };
-        let expected_body = serde_json::to_vec(&opts).unwrap();
+        let expected_body = serde_json::to_vec(&opts).expect("operation should succeed");
         let mut writer = Vec::new();
 
-        remote_disk.walk_dir(opts, &mut writer).await.unwrap();
+        remote_disk.walk_dir(opts, &mut writer).await.expect("operation should succeed");
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
@@ -3191,7 +3191,7 @@ mod tests {
         ];
 
         for (url_str, expected_hostname) in test_cases {
-            let url = url::Url::parse(url_str).unwrap();
+            let url = url::Url::parse(url_str).expect("operation should succeed");
             let endpoint = Endpoint {
                 url: url.clone(),
                 is_local: false,
@@ -3207,7 +3207,7 @@ mod tests {
 
             let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
                 .await
-                .unwrap();
+                .expect("operation should succeed");
 
             assert!(!remote_disk.is_local());
             assert_eq!(remote_disk.host_name(), expected_hostname);
@@ -3219,7 +3219,7 @@ mod tests {
     #[tokio::test]
     async fn test_remote_disk_location_validation() {
         // Test valid location
-        let url = url::Url::parse("http://server:9000").unwrap();
+        let url = url::Url::parse("http://server:9000").expect("operation should succeed");
         let valid_endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -3235,7 +3235,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&valid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
         let location = remote_disk.get_disk_location();
         assert!(location.valid());
         assert_eq!(location.pool_idx, Some(0));
@@ -3253,7 +3253,7 @@ mod tests {
 
         let remote_disk_invalid = RemoteDisk::new(&invalid_endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
         let invalid_location = remote_disk_invalid.get_disk_location();
         assert!(!invalid_location.valid());
         assert_eq!(invalid_location.pool_idx, None);
@@ -3263,7 +3263,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_remote_disk_close() {
-        let url = url::Url::parse("http://server:9000").unwrap();
+        let url = url::Url::parse("http://server:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,
@@ -3279,7 +3279,7 @@ mod tests {
 
         let remote_disk = RemoteDisk::new(&endpoint, &disk_option, Arc::new(TcpHttpInternodeDataTransport))
             .await
-            .unwrap();
+            .expect("operation should succeed");
 
         // Test close operation (should succeed)
         let result = remote_disk.close().await;
@@ -3288,7 +3288,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_timeout_marks_remote_disk_faulty() {
-        let url = url::Url::parse("http://remote-timeout:9000").unwrap();
+        let url = url::Url::parse("http://remote-timeout:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3306,7 +3306,7 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
         let err = remote_disk
             .execute_with_timeout(
@@ -3330,7 +3330,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_timeout_can_ignore_remote_timeout_failure() {
-        let url = url::Url::parse("http://remote-timeout-ignored:9000").unwrap();
+        let url = url::Url::parse("http://remote-timeout-ignored:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3348,7 +3348,7 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
         let err = remote_disk
             .execute_with_timeout_for_op_and_health_action(
@@ -3369,7 +3369,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_execute_with_timeout_zero_duration_waits_for_operation() {
-        let url = url::Url::parse("http://remote-no-timeout:9000").unwrap();
+        let url = url::Url::parse("http://remote-no-timeout:9000").expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3387,7 +3387,7 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
         remote_disk
             .execute_with_timeout(
@@ -3409,7 +3409,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_evicts_cached_connection() {
         let addr = "http://127.0.0.1:59991".to_string();
-        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let url = url::Url::parse(&format!("{addr}/data")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3427,9 +3427,9 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
         assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
@@ -3453,7 +3453,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_marks_faulty_on_timeout_like_error() {
         let addr = "http://127.0.0.1:59992".to_string();
-        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let url = url::Url::parse(&format!("{addr}/data")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3471,9 +3471,9 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3509,7 +3509,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_marks_faulty_on_network_like_error() {
         let addr = "http://127.0.0.1:59993".to_string();
-        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let url = url::Url::parse(&format!("{addr}/data")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3527,9 +3527,9 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3570,7 +3570,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_can_ignore_network_like_error() {
         let addr = "http://127.0.0.1:59995".to_string();
-        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let url = url::Url::parse(&format!("{addr}/data")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3588,9 +3588,9 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3623,7 +3623,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_with_timeout_keeps_remote_disk_online_for_business_error() {
         let addr = "http://127.0.0.1:59994".to_string();
-        let url = url::Url::parse(&format!("{addr}/data")).unwrap();
+        let url = url::Url::parse(&format!("{addr}/data")).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -3641,9 +3641,9 @@ mod tests {
             Arc::new(TcpHttpInternodeDataTransport),
         )
         .await
-        .unwrap();
+        .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).unwrap().connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3661,7 +3661,7 @@ mod tests {
 
     #[test]
     fn test_remote_disk_sync_properties() {
-        let url = url::Url::parse("https://secure-remote:9000/data").unwrap();
+        let url = url::Url::parse("https://secure-remote:9000/data").expect("operation should succeed");
         let endpoint = Endpoint {
             url: url.clone(),
             is_local: false,

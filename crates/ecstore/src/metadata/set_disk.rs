@@ -429,7 +429,7 @@ impl SetDisks {
                 "find_file_info_in_quorum: inspecting meta"
             );
 
-            let etag_only = mod_time.is_none() && etag.is_some() && meta.get_etag().is_some_and(|v| &v == etag.as_ref().unwrap());
+            let etag_only = mod_time.is_none() && etag.is_some() && meta.get_etag().is_some_and(|v| &v == etag.as_ref().expect("operation should succeed"));
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
@@ -509,7 +509,7 @@ impl SetDisks {
         }
 
         if found {
-            let mut fi = found_fi.unwrap();
+            let mut fi = found_fi.expect("operation should succeed");
 
             for (val, &count) in &valid_obj_map {
                 if count >= quorum {

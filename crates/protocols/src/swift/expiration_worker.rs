@@ -342,7 +342,7 @@ impl ExpirationWorker {
         metrics: &Arc<RwLock<ExpirationMetrics>>,
     ) -> SwiftResult<()> {
         let start_time = SystemTime::now();
-        let now = start_time.duration_since(UNIX_EPOCH).unwrap().as_secs();
+        let now = start_time.duration_since(UNIX_EPOCH).expect("operation should succeed").as_secs();
 
         debug!(
             event = EVENT_SWIFT_EXPIRATION_ITERATION_SUMMARY,
@@ -375,7 +375,7 @@ impl ExpirationWorker {
                 }
 
                 // Remove from queue and add to batch
-                let entry = queue.pop().unwrap().0;
+                let entry = queue.pop().expect("operation should succeed").0;
                 drop(queue); // Release lock
 
                 batch.push(entry);
@@ -452,7 +452,7 @@ impl ExpirationWorker {
         }
 
         // Update metrics
-        let duration = SystemTime::now().duration_since(start_time).unwrap();
+        let duration = SystemTime::now().duration_since(start_time).expect("operation should succeed");
         let mut m = metrics.write().await;
         m.objects_scanned += scanned_count;
         m.objects_deleted += deleted_count;
@@ -589,9 +589,9 @@ mod tests {
         }));
 
         // Should pop in order: 1000, 2000, 3000
-        assert_eq!(heap.pop().unwrap().0.expires_at, 1000);
-        assert_eq!(heap.pop().unwrap().0.expires_at, 2000);
-        assert_eq!(heap.pop().unwrap().0.expires_at, 3000);
+        assert_eq!(heap.pop().expect("operation should succeed").0.expires_at, 1000);
+        assert_eq!(heap.pop().expect("operation should succeed").0.expires_at, 2000);
+        assert_eq!(heap.pop().expect("operation should succeed").0.expires_at, 3000);
     }
 
     #[test]
