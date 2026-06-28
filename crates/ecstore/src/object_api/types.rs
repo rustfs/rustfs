@@ -277,6 +277,46 @@ impl ObjectInfo {
         })
     }
 
+    /// Maximum inline size for non-versioned objects (128 KiB).
+    /// Matches `DEFAULT_INLINE_BLOCK` in `storageclass.rs`.
+    pub const INLINE_MAX_SIZE: i64 = 128 * 1024;
+
+    /// Maximum inline size for versioned objects (16 KiB).
+    /// Matches `DEFAULT_INLINE_BLOCK / 8` in `storageclass.rs`.
+    pub const INLINE_MAX_SIZE_VERSIONED: i64 = 16 * 1024;
+
+    /// Returns `true` when this object qualifies for the inline data fast path.
+    ///
+    /// The inline fast path decodes erasure-coded data entirely in memory,
+    /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
+    ///
+    /// The `inlined` flag is the primary signal — it is set during PUT by
+    /// `storage_class_should_inline()` which already applies the correct
+    /// version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
+    /// The size check below is a safety net using the same thresholds.
+    ///
+    /// Additional conditions:
+    /// - Single part
+    /// - Not encrypted
+    /// - Not compressed
+    /// - Not transitioned to remote tier
+    pub fn is_inline_fast_path_eligible(&self) -> bool {
+        if !self.inlined {
+            return false;
+        }
+        // Apply the same version-aware threshold as PUT (storageclass.rs).
+        let max_size = if self.version_id.is_some() {
+            Self::INLINE_MAX_SIZE_VERSIONED
+        } else {
+            Self::INLINE_MAX_SIZE
+        };
+        self.parts.len() == 1
+            && self.size <= max_size
+            && !self.is_encrypted()
+            && !self.is_compressed()
+            && self.transitioned_object.tier.is_empty()
+    }
+
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
         let actual_size = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
         if let Some(size_str) = self

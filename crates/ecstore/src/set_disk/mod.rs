@@ -1616,17 +1616,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
-        // Inline data fast path: skip duplex pipe for small inline objects
-        const INLINE_FAST_PATH_MAX_SIZE: i64 = 128 * 1024; // 128KB
-        if fi.inline_data()
-            && fi.data.is_some()
-            && fi.parts.len() == 1
-            && object_info.size <= INLINE_FAST_PATH_MAX_SIZE
-            && !object_info.is_encrypted()
-            && !object_info.is_compressed()
-            && !object_info.is_remote()
-            && range.is_none()
-        {
+        // Inline data fast path: skip duplex pipe for small inline objects.
+        // Uses the shared predicate from ObjectInfo; additionally checks that
+        // inline data is actually present and no range request is in flight.
+        if object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() {
             let data_shards = fi.erasure.data_blocks;
 
             // Check if we have enough inline data shards
@@ -1663,6 +1656,12 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));
+                }
+                if written == 0 && fi.size > 0 {
+                    return Err(to_object_err(
+                        Error::other("inline fast path: erasure decode returned 0 bytes"),
+                        vec![bucket, object],
+                    ));
                 }
 
                 rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_INLINE_DIRECT);

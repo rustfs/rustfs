@@ -2329,14 +2329,8 @@ impl DefaultObjectUsecase {
         };
 
         // Detect inline fast path: data is in memory, no disk I/O semaphore needed.
-        // Conditions match the inline path in set_disk/mod.rs get_object_reader.
-        let is_inline_fast_path = info.inlined
-            && info.size <= 128 * 1024
-            && info.parts.len() <= 1
-            && !info.is_encrypted()
-            && !info.is_compressed()
-            && info.transitioned_object.tier.is_empty()
-            && rs.is_none();
+        // Uses the shared predicate from ObjectInfo; additionally checks no range request.
+        let is_inline_fast_path = info.is_inline_fast_path_eligible() && rs.is_none();
 
         Ok(GetObjectReadSetup {
             info,
@@ -3329,12 +3323,7 @@ impl DefaultObjectUsecase {
         });
 
         // x-amz-expiration: predict from lifecycle configuration
-        // Only resolve if the object has an expiration marker
-        let expiration = if info.user_defined.contains_key("x-amz-expiration") {
-            resolve_put_object_expiration(bucket, &info).await
-        } else {
-            None
-        };
+        let expiration = resolve_put_object_expiration(bucket, &info).await;
         let storage_class = response_storage_class(&info, &info.user_defined);
         let content_disposition = info.user_defined.get("content-disposition").cloned();
 
