@@ -190,6 +190,20 @@ fn dirty_usage_buckets_excluding_failed(snapshot: &DirtyUsageBuckets, failed_buc
         .collect()
 }
 
+fn should_clear_dirty_usage_snapshot(
+    result_ok: bool,
+    completed_all_sets: bool,
+    budget_elapsed: bool,
+    dirty_buckets: &DirtyUsageBuckets,
+    failed_buckets: &HashSet<String>,
+) -> Option<DirtyUsageBuckets> {
+    if result_ok && completed_all_sets && !budget_elapsed {
+        return Some(dirty_usage_buckets_excluding_failed(dirty_buckets, failed_buckets));
+    }
+
+    None
+}
+
 async fn record_failed_dirty_bucket(failed_buckets: &Arc<Mutex<HashSet<String>>>, bucket: &str) {
     failed_buckets.lock().await.insert(bucket.to_string());
 }
@@ -892,9 +906,14 @@ impl ScannerIO for ECStore {
         let results = results_mutex.lock().await.clone();
         let completed_all_sets = results.iter().all(|result| result.info.last_update.is_some());
         let result = finalize_nsscanner_result(&results, first_err);
-        if result.is_ok() && completed_all_sets && !budget.budget_elapsed() {
-            let failed_buckets = failed_dirty_buckets.lock().await.clone();
-            let clear_snapshot = dirty_usage_buckets_excluding_failed(&dirty_usage_buckets, &failed_buckets);
+        let failed_buckets = failed_dirty_buckets.lock().await.clone();
+        if let Some(clear_snapshot) = should_clear_dirty_usage_snapshot(
+            result.is_ok(),
+            completed_all_sets,
+            budget.budget_elapsed(),
+            &dirty_usage_buckets,
+            &failed_buckets,
+        ) {
             clear_dirty_usage_buckets(&clear_snapshot);
         }
         result
@@ -1286,6 +1305,7 @@ impl ScannerIOCache for SetDisks {
 
                     let done_save = Metrics::time(Metric::SaveUsage);
                     if let Err(e) = cache.save(store_clone_clone.clone(), &cache_name).await {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                         error!(
                             target: "rustfs::scanner::io",
                             event = EVENT_SCANNER_CACHE_PERSIST_STATE,
@@ -1657,6 +1677,18 @@ mod tests {
         assert!(dirty_buckets.contains_key("videos"));
         drop(dirty_buckets);
         clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    fn dirty_usage_clear_plan_excludes_cache_save_failures() {
+        let snapshot = DirtyUsageBuckets::from([("photos".to_string(), 1), ("videos".to_string(), 2)]);
+        let failed_buckets = HashSet::from(["videos".to_string()]);
+
+        let clear_snapshot = should_clear_dirty_usage_snapshot(true, true, false, &snapshot, &failed_buckets)
+            .expect("successful completed cycle should produce a clear snapshot");
+
+        assert!(clear_snapshot.contains_key("photos"));
+        assert!(!clear_snapshot.contains_key("videos"));
     }
 
     #[test]
