@@ -121,8 +121,8 @@ pub fn new_getobjectreader<'a>(
     let is_compressed = false; //oi.is_compressed_ok();
 
     let rs_;
-    if rs.is_none() && opts.part_number.is_some() && opts.part_number.unwrap() > 0 {
-        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.unwrap());
+    if rs.is_none() && opts.part_number.is_some() && opts.part_number.expect("operation should succeed") > 0 {
+        rs_ = part_number_to_rangespec(oi.clone(), opts.part_number.expect("operation should succeed"));
     } else {
         rs_ = rs.clone();
     }

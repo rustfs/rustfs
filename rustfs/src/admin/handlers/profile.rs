@@ -70,7 +70,7 @@ impl Operation for TriggerProfileCPU {
             match crate::profiling::dump_cpu_pprof_for(dur).await {
                 Ok(path) => {
                     let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
+                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
                     Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
                 }
                 Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
@@ -99,7 +99,7 @@ impl Operation for TriggerProfileMemory {
             match crate::profiling::dump_memory_pprof_now().await {
                 Ok(path) => {
                     let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().unwrap());
+                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
                     Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
                 }
                 Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
