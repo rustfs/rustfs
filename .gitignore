@@ -53,6 +53,7 @@ docs/*
 !docs/architecture/**
 docs/heal-scanner-logging-governance.md
 docs/benchmark/rustfs-target-bench/
+docs/benchmark/*.md
 .codegraph/*
 .docker/compat/data/*
 .docker/compat/kms/*

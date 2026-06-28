@@ -345,9 +345,7 @@ pub fn shutdown_background_services() {
 /// * `Ok(())` if successful
 /// * `Err(Arc<dyn LockClient>)` if setting fails (client already set)
 ///
-pub fn set_global_lock_client(
-    client: Arc<dyn rustfs_lock::client::LockClient>,
-) -> Result<(), Arc<dyn rustfs_lock::client::LockClient>> {
+pub fn set_global_lock_client(client: Arc<dyn LockClient>) -> Result<(), Arc<dyn LockClient>> {
     GLOBAL_LOCAL_LOCK_CLIENT.set(client)
 }
 
@@ -356,7 +354,7 @@ pub fn set_global_lock_client(
 /// # Returns
 /// * `Option<Arc<dyn LockClient>>` - The global lock client, if set
 ///
-pub fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
+pub fn get_global_lock_client() -> Option<Arc<dyn LockClient>> {
     GLOBAL_LOCAL_LOCK_CLIENT.get().cloned()
 }
 

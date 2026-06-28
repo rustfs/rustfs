@@ -131,7 +131,7 @@ impl SetDisks {
 
     fn reprobe_runtime_candidates_once(&self, disks: &[DiskStore]) {
         for disk in disks {
-            if disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Online {
+            if disk.runtime_state() != disk::health_state::RuntimeDriveHealthState::Online {
                 disk.reset_health_for_store_init_retry();
             }
         }
@@ -536,15 +536,15 @@ mod tests {
         all_disks[1]
             .as_ref()
             .expect("disk 1 should exist")
-            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Suspect);
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Suspect);
         all_disks[2]
             .as_ref()
             .expect("disk 2 should exist")
-            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Returning);
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Returning);
         all_disks[3]
             .as_ref()
             .expect("disk 3 should exist")
-            .force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Offline);
+            .force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Offline);
 
         let snapshot = set_disks.drive_membership_snapshot().await;
         assert_eq!(snapshot.online.len(), 1);
@@ -563,7 +563,7 @@ mod tests {
         assert!(
             online_disks
                 .iter()
-                .all(|disk| { disk.runtime_state() != crate::disk::health_state::RuntimeDriveHealthState::Offline }),
+                .all(|disk| { disk.runtime_state() != disk::health_state::RuntimeDriveHealthState::Offline }),
             "offline disks should be filtered by membership snapshot"
         );
 
@@ -601,7 +601,7 @@ mod tests {
 
         let all_disks = set_disks.get_disks_internal().await;
         for disk in all_disks.iter().flatten() {
-            disk.force_runtime_state_for_test(crate::disk::health_state::RuntimeDriveHealthState::Returning);
+            disk.force_runtime_state_for_test(disk::health_state::RuntimeDriveHealthState::Returning);
         }
 
         let (online_disks, infos, healing) = set_disks.get_online_disks_with_healing_and_info(false).await;

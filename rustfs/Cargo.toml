@@ -104,6 +104,7 @@ rustfs-object-capacity = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
+starshard = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
