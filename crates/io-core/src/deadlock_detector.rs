@@ -117,6 +117,12 @@ impl Default for DeadlockDetectorConfig {
 }
 
 /// Deadlock detector.
+/// Deadlock detector using wait-for graphs.
+///
+/// Uses `std::sync::Mutex` (not `tokio::sync::Mutex`) because:
+/// - Locks are never held across `.await` points
+/// - Critical sections are sub-microsecond (single HashMap operations)
+/// - `tokio::sync::Mutex` would add unnecessary overhead for these short operations
 pub struct DeadlockDetector {
     /// Configuration.
     config: DeadlockDetectorConfig,
