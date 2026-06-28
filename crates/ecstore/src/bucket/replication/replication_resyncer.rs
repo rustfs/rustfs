@@ -617,7 +617,10 @@ impl ReplicationResyncer {
             } else {
                 let state = TargetReplicationResyncStatus::new();
                 bucket_status.targets_map.insert(opts.arn.clone(), state);
-                bucket_status.targets_map.get_mut(&opts.arn).expect("ARN should be in targets map")
+                bucket_status
+                    .targets_map
+                    .get_mut(&opts.arn)
+                    .expect("ARN should be in targets map")
             };
 
             if !resync_state_accepts_update(state, &opts) {
@@ -678,7 +681,10 @@ impl ReplicationResyncer {
         } else {
             let state = TargetReplicationResyncStatus::new();
             bucket_status.targets_map.insert(opts.arn.clone(), state);
-            bucket_status.targets_map.get_mut(&opts.arn).expect("ARN should be in targets map")
+            bucket_status
+                .targets_map
+                .get_mut(&opts.arn)
+                .expect("ARN should be in targets map")
         };
 
         if !resync_state_accepts_update(state, &opts) {
@@ -2710,7 +2716,13 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         && !tgt_client.reset_id.is_empty()
         && dobj.op_type == ReplicationType::ExistingObject
     {
-        rinfo.resync_timestamp = format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "invalid-time".to_string()), tgt_client.reset_id);
+        rinfo.resync_timestamp = format!(
+            "{};{}",
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .unwrap_or_else(|_| "invalid-time".to_string()),
+            tgt_client.reset_id
+        );
     }
 
     rinfo
@@ -3473,8 +3485,13 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         && self.op_type == ReplicationType::ExistingObject
                         && !tgt_client.reset_id.is_empty()
                     {
-                        rinfo.resync_timestamp =
-                            format!("{};{}", OffsetDateTime::now_utc().format(&Rfc3339).unwrap_or_else(|_| "invalid-time".to_string()), tgt_client.reset_id);
+                        rinfo.resync_timestamp = format!(
+                            "{};{}",
+                            OffsetDateTime::now_utc()
+                                .format(&Rfc3339)
+                                .unwrap_or_else(|_| "invalid-time".to_string()),
+                            tgt_client.reset_id
+                        );
                         rinfo.replication_resynced = true;
                     }
 

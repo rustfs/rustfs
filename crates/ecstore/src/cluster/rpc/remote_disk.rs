@@ -2561,7 +2561,9 @@ mod tests {
             health_check: false,
         };
 
-        RemoteDisk::new(&endpoint, &disk_option, data_transport).await.expect("operation should succeed")
+        RemoteDisk::new(&endpoint, &disk_option, data_transport)
+            .await
+            .expect("operation should succeed")
     }
 
     #[derive(Debug)]
@@ -2697,7 +2699,8 @@ mod tests {
         };
         let addr = listener.local_addr().expect("listener local address should be available");
 
-        let url = url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).expect("operation should succeed");
+        let url =
+            url::Url::parse(&format!("http://{}:{}/data/rustfs0", addr.ip(), addr.port())).expect("operation should succeed");
         let endpoint = Endpoint {
             url,
             is_local: false,
@@ -2808,7 +2811,9 @@ mod tests {
         health.mark_failure(&endpoint, "test_failure");
         health.mark_failure(&endpoint, "test_failure");
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Offline);
-        let channel = TonicEndpoint::from_shared(base_addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(base_addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(base_addr.clone(), channel).await;
         assert!(runtime_sources::test_node_channel_is_cached(&base_addr).await);
 
@@ -2854,7 +2859,9 @@ mod tests {
 
         let copy_task = tokio::spawn(async move {
             let mut cursor = Cursor::new(payload);
-            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024).await.expect("operation should succeed");
+            copy_stream_with_buffer(&mut cursor, &mut write_half, 4 * 1024)
+                .await
+                .expect("operation should succeed");
         });
 
         let mut copied = Vec::new();
@@ -2890,7 +2897,10 @@ mod tests {
 
         // Set a disk ID
         let test_id = Uuid::new_v4();
-        remote_disk.set_disk_id(Some(test_id)).await.expect("operation should succeed");
+        remote_disk
+            .set_disk_id(Some(test_id))
+            .await
+            .expect("operation should succeed");
 
         // Verify the disk ID was set
         let retrieved_id = remote_disk.get_disk_id().await.expect("operation should succeed");
@@ -2923,7 +2933,10 @@ mod tests {
         assert_eq!(remote_disk.disk_ref().await, endpoint.to_string());
 
         let disk_id = Uuid::new_v4();
-        remote_disk.set_disk_id(Some(disk_id)).await.expect("operation should succeed");
+        remote_disk
+            .set_disk_id(Some(disk_id))
+            .await
+            .expect("operation should succeed");
 
         assert_eq!(remote_disk.disk_ref().await, disk_id.to_string());
     }
@@ -2935,7 +2948,10 @@ mod tests {
             let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
             let expected_disk = remote_disk.disk_ref().await;
 
-            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.expect("operation should succeed");
+            let _reader = remote_disk
+                .read_file_stream("bucket", "object/part.1", 7, 11)
+                .await
+                .expect("operation should succeed");
 
             let calls = transport.calls();
             assert_eq!(calls.len(), 1);
@@ -2961,7 +2977,10 @@ mod tests {
             let transport = RecordingInternodeDataTransport::default();
             let remote_disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
 
-            let _reader = remote_disk.read_file_stream("bucket", "object/part.1", 7, 11).await.expect("operation should succeed");
+            let _reader = remote_disk
+                .read_file_stream("bucket", "object/part.1", 7, 11)
+                .await
+                .expect("operation should succeed");
 
             let calls = transport.calls();
             assert_eq!(calls.len(), 1);
@@ -2983,7 +3002,10 @@ mod tests {
             .create_file("orig-bucket", "bucket", "object/part.1", 4096)
             .await
             .expect("operation should succeed");
-        let _appended = remote_disk.append_file("bucket", "object/part.2").await.expect("operation should succeed");
+        let _appended = remote_disk
+            .append_file("bucket", "object/part.2")
+            .await
+            .expect("operation should succeed");
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 2);
@@ -3073,7 +3095,10 @@ mod tests {
         let expected_body = serde_json::to_vec(&opts).expect("operation should succeed");
         let mut writer = Vec::new();
 
-        remote_disk.walk_dir(opts, &mut writer).await.expect("operation should succeed");
+        remote_disk
+            .walk_dir(opts, &mut writer)
+            .await
+            .expect("operation should succeed");
 
         let calls = transport.calls();
         assert_eq!(calls.len(), 1);
@@ -3429,7 +3454,9 @@ mod tests {
         .await
         .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
         assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
 
@@ -3473,7 +3500,9 @@ mod tests {
         .await
         .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3529,7 +3558,9 @@ mod tests {
         .await
         .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3590,7 +3621,9 @@ mod tests {
         .await
         .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
@@ -3643,7 +3676,9 @@ mod tests {
         .await
         .expect("operation should succeed");
 
-        let channel = TonicEndpoint::from_shared(addr.clone()).expect("operation should succeed").connect_lazy();
+        let channel = TonicEndpoint::from_shared(addr.clone())
+            .expect("operation should succeed")
+            .connect_lazy();
         runtime_sources::cache_test_node_channel(addr.clone(), channel).await;
 
         let err = remote_disk
