@@ -359,6 +359,14 @@ impl MetadataQuorumAccumulator {
         if self.requested_version_id.is_empty() {
             return None;
         }
+        if self.conflicting_metadata
+            || self.delete_marker_seen
+            || self.not_found_responses > 0
+            || self.version_not_found_responses > 0
+            || self.hard_errors > 0
+        {
+            return None;
+        }
         if self.matching_version_votes >= self.read_quorum_for_version() {
             return Some(MetadataEarlyStopDecision {
                 reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
@@ -3408,28 +3416,40 @@ mod tests {
     }
 
     #[test]
-    fn version_early_stop_tracks_matching_votes_independently_of_candidate() {
+    fn version_early_stop_falls_back_on_conflicting_metadata() {
         let requested_vid = Uuid::new_v4();
         let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
 
         // Two valid responses with matching version_id but different erasure.index
-        // (so they conflict on the candidate path but still count for version votes)
+        // (so they conflict on the candidate path and must keep the fanout open)
         let mut fi1 = version_early_stop_candidate("object", 1, requested_vid);
         fi1.size = 100;
         let mut fi2 = version_early_stop_candidate("object", 2, requested_vid);
-        fi2.size = 200; // different size → conflicting metadata on candidate path
+        fi2.size = 200;
 
         accumulator.observe_file_info(&fi1);
         accumulator.observe_file_info(&fi2);
 
-        // Candidate path sees conflict, but version path sees quorum
         assert!(accumulator.early_stop_decision().is_none());
-        assert_eq!(
-            accumulator.version_early_stop_decision(),
-            Some(MetadataEarlyStopDecision {
-                reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM
-            })
-        );
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+    }
+
+    #[test]
+    fn version_early_stop_falls_back_on_split_data_dir() {
+        let requested_vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
+        let mut first = version_early_stop_candidate("object", 1, requested_vid);
+        let mut second = version_early_stop_candidate("object", 2, requested_vid);
+        first.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+        second.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
     }
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {

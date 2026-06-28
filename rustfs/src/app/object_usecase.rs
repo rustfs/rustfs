@@ -440,6 +440,9 @@ pin_project! {
 }
 
 pin_project! {
+    // Keep the disk-read admission permit tied to the response body. This is
+    // intentionally conservative backpressure: a streaming GET should occupy a
+    // read slot until the client drains or drops the body.
     struct DiskReadPermitReader<R> {
         #[pin]
         inner: R,
