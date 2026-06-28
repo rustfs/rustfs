@@ -82,6 +82,9 @@ to explicit AppContext ownership.
 `ecstore-erasure` and `storage-cluster` remain proposal-only until dependency
 cycles and hot-path risks are proven safe. The Phase 7 evaluation is complete
 for now: neither split is ready for code movement in this migration round.
+The follow-up ECStore module split plan is recorded in
+[`ecstore-module-split-plan.md`](ecstore-module-split-plan.md), including the
+remaining `SetDisks`, lifecycle, replication, and facade-shrink boundaries.
 
 ### CRATE-001: `ecstore-erasure`
 
@@ -141,6 +144,44 @@ Required evidence before proposing the split:
   per-pool quorum reduction, lock behavior, and data-stream request paths;
 - rollback plan that preserves quorum, remote disk IO, lock, peer health, and
   data movement behavior.
+
+### CRATE-003: `bucket-lifecycle`
+
+Decision: do not split in code yet. Lifecycle remains coupled to ECStore object
+operations, bucket metadata, `SetDisks` stale multipart cleanup, tier config,
+runtime lifecycle state, scanner metrics, notification/audit side effects, and
+replication delete scheduling.
+
+Required evidence before proposing the split:
+
+- contract sketch for lifecycle object operations, metadata access, runtime
+  state, replication delete scheduling, and audit/notification sinks;
+- dependency graph showing the candidate crate can avoid importing ECStore
+  implementation modules;
+- focused tests for lifecycle evaluation, expiry, transition, stale multipart
+  cleanup, tier journal recovery, and lifecycle-originated replication deletes;
+- compatibility plan for `rustfs_ecstore::api::bucket::lifecycle` consumers;
+- rollback plan that preserves lifecycle queues, scanner repair accounting,
+  tier transitions, object deletion behavior, and notification/audit events.
+
+### CRATE-004: `bucket-replication`
+
+Decision: do not split in code yet. Replication remains coupled to ECStore
+object APIs, bucket target clients, metadata systems, file metadata replication
+state, runtime replication pool/stat handles, bucket monitor state, scanner
+repair classification, lifecycle-originated deletes, and notification events.
+
+Required evidence before proposing the split:
+
+- contract sketch for replication storage operations, metadata/target access,
+  runtime pool and stats, event sinks, and lifecycle/heal bridges;
+- dependency graph showing the candidate crate can avoid importing ECStore
+  implementation modules;
+- focused tests for object replication, delete replication, resync state, heal
+  repair queueing, target error handling, and queue admission;
+- compatibility plan for `rustfs_ecstore::api::bucket::replication` consumers;
+- rollback plan that preserves replication queues, MRF/resync state, target
+  client behavior, scanner repair, and event emission.
 
 ## Preservation Rules
 
