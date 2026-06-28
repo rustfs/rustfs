@@ -1995,7 +1995,7 @@ async fn put_replication_probe_object(
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
-                req.headers_mut().insert(key.unwrap(), value);
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
             Result::<_, std::io::Error>::Ok(req)
         })
@@ -2039,7 +2039,7 @@ async fn delete_replication_probe_object(
         .customize()
         .map_request(move |mut req| {
             for (key, value) in headers.clone() {
-                req.headers_mut().insert(key.unwrap(), value);
+                req.headers_mut().insert(key.expect("operation should succeed"), value);
             }
             Result::<_, std::io::Error>::Ok(req)
         })

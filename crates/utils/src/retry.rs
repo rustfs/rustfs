@@ -84,7 +84,7 @@ impl Stream for RetryTimer {
             self.timer = Some(timer);
         }
 
-        let mut timer = self.timer.as_mut().unwrap();
+        let mut timer = self.timer.as_mut().expect("operation should succeed");
         match Pin::new(&mut timer).poll_tick(cx) {
             Poll::Ready(_) => {
                 self.rem -= 1;
@@ -151,7 +151,7 @@ pub fn is_request_error_retryable(_err: std::io::Error) -> bool {
     }
     let uerr = err.(*url.Error);
     if uerr.is_ok() {
-        let e = uerr.unwrap();
+        let e = uerr.expect("operation should succeed");
         return match e.type {
             x509.UnknownAuthorityError => {
                 false

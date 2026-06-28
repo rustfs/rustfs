@@ -173,7 +173,7 @@ pub fn set_global_guard(guard: OtelGuard) -> Result<(), GlobalError> {
 ///
 /// # async fn trace_operation() -> Result<(), Box<dyn std::error::Error>> {
 /// #    let guard = get_global_guard()?;
-/// #    let _lock = guard.lock().unwrap();
+/// #    let _lock = guard.lock().expect("operation should succeed");
 /// #    // Perform traced operation
 /// #    Ok(())
 /// # }

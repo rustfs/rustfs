@@ -176,12 +176,12 @@ mod tests {
                 scan_range: None,
             },
         };
-        let db = get_global_db(input.clone(), true).await.unwrap();
+        let db = get_global_db(input.clone(), true).await.expect("operation should succeed");
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await.unwrap();
+        let result = db.execute(&query).await.expect("operation should succeed");
 
-        let results = result.result().chunk_result().await.unwrap().to_vec();
+        let results = result.result().chunk_result().await.expect("operation should succeed").to_vec();
 
         let expected = [
             "+----------------+---------+-----+------------+--------+",
@@ -201,7 +201,7 @@ mod tests {
         ];
 
         assert_batches_eq!(expected, &results);
-        pretty::print_batches(&results).unwrap();
+        pretty::print_batches(&results).expect("operation should succeed");
     }
 
     #[tokio::test]
@@ -235,12 +235,12 @@ mod tests {
                 scan_range: None,
             },
         };
-        let db = get_global_db(input.clone(), true).await.unwrap();
+        let db = get_global_db(input.clone(), true).await.expect("operation should succeed");
         let query = Query::new(Context { input: Arc::new(input) }, sql.to_string());
 
-        let result = db.execute(&query).await.unwrap();
+        let result = db.execute(&query).await.expect("operation should succeed");
 
-        let results = result.result().chunk_result().await.unwrap().to_vec();
-        pretty::print_batches(&results).unwrap();
+        let results = result.result().chunk_result().await.expect("operation should succeed").to_vec();
+        pretty::print_batches(&results).expect("operation should succeed");
     }
 }
