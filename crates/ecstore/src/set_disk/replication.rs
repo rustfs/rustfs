@@ -24,9 +24,7 @@ impl SetDisks {
     ) -> Result<()> {
         let mut oi = obj_info.clone();
         oi.metadata_only = true;
-
         Arc::make_mut(&mut oi.user_defined).remove(X_AMZ_RESTORE.as_str());
-
         let version_id = oi.version_id.map(|v| v.to_string());
         let _obj = self
             .copy_object(

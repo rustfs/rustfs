@@ -221,7 +221,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_list_parts_results_fails_early_when_quorum_is_impossible() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let tasks: Vec<_> = vec![
             (10_u64, Err(DiskError::DiskNotFound)),
             (15, Err(DiskError::DiskNotFound)),
@@ -285,7 +285,7 @@ mod tests {
 
     #[tokio::test]
     async fn collect_list_parts_results_fails_early_when_file_not_found_fallback_is_impossible() {
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let tasks: Vec<_> = vec![
             (5_u64, Err(DiskError::FileNotFound)),
             (10, Err(DiskError::FileCorrupt)),

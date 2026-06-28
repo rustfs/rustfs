@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use super::*;
 use crate::storage_api_contracts::{
     list::VersionMarker,
@@ -263,6 +277,46 @@ impl ObjectInfo {
         })
     }
 
+    /// Maximum inline size for non-versioned objects (128 KiB).
+    /// Matches `DEFAULT_INLINE_BLOCK` in `storageclass.rs`.
+    pub const INLINE_MAX_SIZE: i64 = 128 * 1024;
+
+    /// Maximum inline size for versioned objects (16 KiB).
+    /// Matches `DEFAULT_INLINE_BLOCK / 8` in `storageclass.rs`.
+    pub const INLINE_MAX_SIZE_VERSIONED: i64 = 16 * 1024;
+
+    /// Returns `true` when this object qualifies for the inline data fast path.
+    ///
+    /// The inline fast path decodes erasure-coded data entirely in memory,
+    /// bypassing disk I/O, duplex pipes, and the disk-read semaphore.
+    ///
+    /// The `inlined` flag is the primary signal — it is set during PUT by
+    /// `storage_class_should_inline()` which already applies the correct
+    /// version-aware threshold (128 KiB non-versioned, 16 KiB versioned).
+    /// The size check below is a safety net using the same thresholds.
+    ///
+    /// Additional conditions:
+    /// - Single part
+    /// - Not encrypted
+    /// - Not compressed
+    /// - Not transitioned to remote tier
+    pub fn is_inline_fast_path_eligible(&self) -> bool {
+        if !self.inlined {
+            return false;
+        }
+        // Apply the same version-aware threshold as PUT (storageclass.rs).
+        let max_size = if self.version_id.is_some() {
+            Self::INLINE_MAX_SIZE_VERSIONED
+        } else {
+            Self::INLINE_MAX_SIZE
+        };
+        self.parts.len() == 1
+            && self.size <= max_size
+            && !self.is_encrypted()
+            && !self.is_compressed()
+            && self.transitioned_object.tier.is_empty()
+    }
+
     pub fn encryption_original_size(&self) -> std::io::Result<Option<i64>> {
         let actual_size = rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE);
         if let Some(size_str) = self
@@ -354,14 +408,14 @@ impl ObjectInfo {
         // Parse expires from metadata (HTTP date format RFC 7231 or ISO 8601)
         let expires = fi.metadata.get("expires").and_then(|s| {
             // Try parsing as ISO 8601 first
-            time::OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
+            OffsetDateTime::parse(s, &time::format_description::well_known::Iso8601::DEFAULT)
                 .or_else(|_| {
                     // Try RFC 2822 format
-                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
+                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc2822)
                 })
                 .or_else(|_| {
                     // Try RFC 3339 format
-                    time::OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
+                    OffsetDateTime::parse(s, &time::format_description::well_known::Rfc3339)
                 })
                 .ok()
         });
@@ -775,7 +829,7 @@ mod tests {
     #[tokio::test]
     async fn versions_listing_applies_version_marker_only_to_first_entry() {
         let metadata = rustfs_filemeta::test_data::create_real_xlmeta().expect("test metadata should be valid");
-        let entries = rustfs_filemeta::MetaCacheEntriesSorted {
+        let entries = MetaCacheEntriesSorted {
             o: rustfs_filemeta::MetaCacheEntries(vec![
                 Some(rustfs_filemeta::MetaCacheEntry {
                     name: "obj-a".to_owned(),
@@ -878,7 +932,7 @@ mod tests {
 
     #[test]
     fn from_file_info_preserves_replication_decision() {
-        let fi = rustfs_filemeta::FileInfo {
+        let fi = FileInfo {
             replication_state_internal: Some(ReplicationState {
                 replicate_decision_str: "arn=true;false;arn:replication::1:dest;rule-id".to_string(),
                 ..Default::default()
@@ -904,11 +958,11 @@ mod tests {
             actual_size: 0,
             user_defined: Arc::new(user_defined),
             parts: Arc::new(vec![
-                rustfs_filemeta::ObjectPartInfo {
+                ObjectPartInfo {
                     actual_size: 4,
                     ..Default::default()
                 },
-                rustfs_filemeta::ObjectPartInfo {
+                ObjectPartInfo {
                     actual_size: 5,
                     ..Default::default()
                 },
@@ -1016,13 +1070,13 @@ mod tests {
             user_defined: Arc::new(ud),
             user_tags: Arc::new("env=prod&team=storage".to_string()),
             parts: Arc::new(vec![
-                rustfs_filemeta::ObjectPartInfo {
+                ObjectPartInfo {
                     number: 1,
                     size: 1024,
                     actual_size: 1024,
                     ..Default::default()
                 },
-                rustfs_filemeta::ObjectPartInfo {
+                ObjectPartInfo {
                     number: 2,
                     size: 512,
                     actual_size: 512,
