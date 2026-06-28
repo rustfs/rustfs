@@ -317,13 +317,6 @@ impl ECStore {
             decommission_cancelers,
             start_gate: tokio::sync::Mutex::new(()),
             pool_meta_save_gate: tokio::sync::Mutex::new(()),
-
-            local_disk_map: runtime_sources::local_disk_map_handle(),
-            local_disk_id_map: runtime_sources::local_disk_id_map_handle(),
-            local_disk_set_drives: runtime_sources::local_disk_set_drives_handle(),
-            tier_config_mgr: runtime_sources::tier_config_mgr_handle(),
-            event_notifier: runtime_sources::event_notifier_handle(),
-            bucket_monitor: OnceLock::new(),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -352,10 +345,6 @@ impl ECStore {
         }
 
         runtime_sources::publish_object_store(ec.clone()).await;
-
-        if let Some(monitor) = runtime_sources::bucket_monitor() {
-            let _ = ec.bucket_monitor.set(monitor);
-        }
 
         Ok(ec)
     }
