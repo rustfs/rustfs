@@ -38,6 +38,9 @@ hot-path behavior must not drift during this migration.
 - [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md): late
   global-state cleanup, runtime-source boundaries, fallback removal rules, and
   crate-split evaluation criteria.
+- [`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md):
+  observability-to-ECStore dependency inventory, classification, and extraction
+  guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
   current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
   migration risks, and do-not-change contract.
