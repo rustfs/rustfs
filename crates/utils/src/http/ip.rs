@@ -30,8 +30,10 @@ pub const X_REAL_IP: &str = "x-real-ip";
 /// e.g. Forwarded: for=192.0.2.60;proto=https;by=203.0.113.43
 const FORWARDED: &str = "forwarded";
 
-static FOR_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)(?:for=)([^(;|,| )]+)(.*)").expect("operation should succeed"));
-static PROTO_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").expect("operation should succeed"));
+static FOR_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)(?:for=)([^(;|,| )]+)(.*)").expect("operation should succeed"));
+static PROTO_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^(;|,| )+(?:proto=)(https|http)").expect("operation should succeed"));
 
 /// Used to disable all processing of the X-Forwarded-For header in source IP discovery.
 ///
