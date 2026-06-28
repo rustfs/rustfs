@@ -23,6 +23,7 @@ use std::{
 
 use http::HeaderMap;
 use metrics::{counter, describe_counter, describe_histogram, histogram};
+use rustfs_common::heal_channel::HealScanMode;
 #[cfg(test)]
 use rustfs_config::ENV_SCANNER_CACHE_SAVE_TIMEOUT_SECS;
 pub use rustfs_data_usage::{
@@ -261,6 +262,31 @@ pub struct DataUsageEntryInfo {
     pub entry: DataUsageEntry,
 }
 
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingScannerHealKind {
+    Bucket,
+    Object,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingScannerHeal {
+    pub kind: PendingScannerHealKind,
+    pub bucket: String,
+    #[serde(default)]
+    pub object: Option<String>,
+    #[serde(default)]
+    pub version_id: Option<String>,
+    pub scan_mode: HealScanMode,
+    pub first_seen: u64,
+    pub last_attempt: u64,
+    pub attempts: u32,
+    #[serde(default)]
+    pub last_admission_result: String,
+    #[serde(default)]
+    pub last_admission_reason: String,
+}
+
 /// Data usage cache info
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct DataUsageCacheInfo {
@@ -276,6 +302,8 @@ pub struct DataUsageCacheInfo {
     pub scan_resume_after: Option<String>,
     #[serde(default)]
     pub scan_checkpoint: Option<DataUsageScanCheckpoint>,
+    #[serde(default)]
+    pub pending_heals: Vec<PendingScannerHeal>,
 }
 
 /// Data usage cache
@@ -1244,6 +1272,7 @@ mod tests {
         assert_eq!(decoded.next_cycle, 7);
         assert!(decoded.scan_resume_after.is_none());
         assert!(decoded.scan_checkpoint.is_none());
+        assert!(decoded.pending_heals.is_empty());
     }
 
     #[test]
@@ -1281,6 +1310,7 @@ mod tests {
         assert_eq!(decoded.failed_objects.get("bad-object"), Some(&11));
         assert!(decoded.scan_resume_after.is_none());
         assert!(decoded.scan_checkpoint.is_none());
+        assert!(decoded.pending_heals.is_empty());
     }
 
     #[test]
