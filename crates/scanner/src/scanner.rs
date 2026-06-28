@@ -59,6 +59,7 @@ const EVENT_SCANNER_LOCK_STATE: &str = "scanner_lock_state";
 const EVENT_SCANNER_PERSIST_STATE: &str = "scanner_persist_state";
 const EVENT_SCANNER_RUNTIME_CONFIG: &str = "scanner_runtime_config";
 const EVENT_SCANNER_BACKGROUND_HEAL_STATE: &str = "scanner_background_heal_state";
+const METRIC_SCANNER_LEADER_LOCK_TOTAL: &str = "rustfs_scanner_leader_lock_total";
 #[cfg(test)]
 const ENV_SCANNER_START_DELAY_SECS_DEPRECATED: &str = "RUSTFS_DATA_SCANNER_START_DELAY_SECS";
 
@@ -75,6 +76,14 @@ fn cycle_interval() -> Duration {
 
 fn scanner_cycle_budget_config() -> ScannerCycleBudgetConfig {
     resolve_scanner_runtime_config().cycle_budget
+}
+
+fn record_scanner_leader_lock_state(state: &'static str) {
+    metrics::counter!(
+        METRIC_SCANNER_LEADER_LOCK_TOTAL,
+        "state" => state
+    )
+    .increment(1);
 }
 
 #[cfg(test)]
@@ -873,6 +882,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
     let _guard = match storeapi.new_ns_lock(RUSTFS_META_BUCKET, "leader.lock").await {
         Ok(ns_lock) => match ns_lock.get_write_lock_quiet(get_lock_acquire_timeout()).await {
             Ok(guard) => {
+                record_scanner_leader_lock_state("acquired");
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -885,6 +895,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
                 guard
             }
             Err(e) => {
+                record_scanner_leader_lock_state("contended");
                 debug!(
                     target: "rustfs::scanner",
                     event = EVENT_SCANNER_LOCK_STATE,
@@ -899,6 +910,7 @@ pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) ->
             }
         },
         Err(e) => {
+            record_scanner_leader_lock_state("create_failed");
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_LOCK_STATE,
