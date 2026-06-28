@@ -9063,6 +9063,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "insta",
  "jemalloc_pprof",
  "jiff",
  "libc",
@@ -9213,6 +9214,7 @@ dependencies = [
 name = "rustfs-concurrency"
 version = "1.0.0-beta.8"
 dependencies = [
+ "insta",
  "rustfs-io-core",
  "rustfs-io-metrics",
  "serde",
@@ -9612,6 +9614,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
+ "insta",
  "jiff",
  "md5",
  "moka",
@@ -10048,6 +10051,7 @@ name = "rustfs-storage-api"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "insta",
  "rustfs-filemeta",
  "serde",
  "serde_json",

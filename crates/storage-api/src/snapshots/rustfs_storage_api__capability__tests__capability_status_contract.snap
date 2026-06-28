@@ -1,0 +1,13 @@
+---
+source: crates/storage-api/src/capability.rs
+expression: "serde_json::to_value((&unknown,\n&unsupported)).expect(\"capability statuses should serialize\")"
+---
+[
+  {
+    "state": "unknown"
+  },
+  {
+    "reason": "target does not expose profiler",
+    "state": "unsupported"
+  }
+]

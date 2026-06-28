@@ -1,0 +1,14 @@
+---
+source: crates/kms/src/api_types.rs
+expression: "serde_json::to_value(ListKeysResponse\n{\n    success: true, message: \"keys listed\".to_string(), keys:\n    vec![\"key-a\".to_string(), \"key-b\".to_string()], truncated: true,\n    next_marker: Some(\"key-b\".to_string()),\n}).expect(\"list keys response should serialize\")"
+---
+{
+  "keys": [
+    "key-a",
+    "key-b"
+  ],
+  "message": "keys listed",
+  "next_marker": "key-b",
+  "success": true,
+  "truncated": true
+}

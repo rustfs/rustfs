@@ -210,6 +210,7 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
+insta = { workspace = true }
 proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = { workspace = true, features = ["async_closure"] }
