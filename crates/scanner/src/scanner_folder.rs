@@ -357,13 +357,7 @@ fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> Da
 }
 
 fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
-    !entry.children.is_empty()
-        || entry.size > 0
-        || entry.objects > 0
-        || entry.versions > 0
-        || entry.delete_markers > 0
-        || entry.failed_objects > 0
-        || entry.replication_stats.is_some()
+    data_usage_root_has_progress(entry)
 }
 
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
@@ -1476,6 +1470,11 @@ impl FolderScanner {
     }
 
     fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
+        if entry.compacted {
+            // Compacted entries store child totals directly; child links would be flattened twice.
+            return;
+        }
+
         let Some(old_entry) = self.old_cache.cache.get(&parent_hash.key()) else {
             return;
         };
@@ -4530,6 +4529,52 @@ mod tests {
         assert_eq!(root.objects, 5);
         assert!(result.info.scan_resume_after.is_none());
         assert!(result.info.scan_checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_partial_compacted_entry_does_not_carry_children() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir),
+        };
+
+        let child_hash = hash_path("bucket/child");
+        let old_leaf_hash = hash_path("bucket/child/old");
+        let mut old_child = DataUsageEntry::default();
+        old_child.add_child(&old_leaf_hash);
+
+        scanner
+            .old_cache
+            .replace_hashed(&child_hash, &Some(hash_path("bucket")), &old_child);
+        scanner.old_cache.replace_hashed(
+            &old_leaf_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 7,
+                size: 7,
+                ..Default::default()
+            },
+        );
+
+        let mut compacted_partial = DataUsageEntry {
+            objects: 2,
+            size: 2,
+            compacted: true,
+            ..Default::default()
+        };
+
+        scanner.carry_forward_old_children(&child_hash, &mut compacted_partial);
+
+        assert!(
+            compacted_partial.children.is_empty(),
+            "compacted entries already contain flattened totals and must not retain child entries"
+        );
+        assert_eq!(compacted_partial.objects, 2);
+        assert!(
+            scanner.new_cache.find(&old_leaf_hash.key()).is_none(),
+            "carried children would be flattened again by size_recursive"
+        );
     }
 
     #[tokio::test]
