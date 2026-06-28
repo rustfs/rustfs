@@ -664,7 +664,8 @@ mod tests {
 
         // Test 1: Simple creation
         let reader1 = BufReader::new(Cursor::new(&data[..]));
-        let hash_reader1 = HashReader::from_stream(reader1, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
+        let hash_reader1 =
+            HashReader::from_stream(reader1, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
         assert_eq!(hash_reader1.size(), size);
         assert_eq!(hash_reader1.actual_size(), actual_size);
 
@@ -673,7 +674,8 @@ mod tests {
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
                 .expect("operation should succeed");
         let hard_limit = HardLimitReader::new(reader2, size);
-        let hash_reader2 = HashReader::from_reader(hard_limit, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
+        let hash_reader2 =
+            HashReader::from_reader(hard_limit, size, actual_size, etag.clone(), None, false).expect("operation should succeed");
         assert_eq!(hash_reader2.size(), size);
         assert_eq!(hash_reader2.actual_size(), actual_size);
 
@@ -682,7 +684,8 @@ mod tests {
             HashReader::from_stream(BufReader::new(Cursor::new(&data[..])), size, actual_size, etag.clone(), None, false)
                 .expect("operation should succeed");
         let etag_reader = EtagReader::new(reader3, etag.clone());
-        let hash_reader3 = HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).expect("operation should succeed");
+        let hash_reader3 =
+            HashReader::from_reader(etag_reader, size, actual_size, etag, None, false).expect("operation should succeed");
         assert_eq!(hash_reader3.size(), size);
         assert_eq!(hash_reader3.actual_size(), actual_size);
     }
@@ -734,7 +737,10 @@ mod tests {
         )
         .expect("operation should succeed");
         let mut encrypted = Vec::new();
-        hash_reader.read_to_end(&mut encrypted).await.expect("operation should succeed");
+        hash_reader
+            .read_to_end(&mut encrypted)
+            .await
+            .expect("operation should succeed");
 
         assert!(!encrypted.is_empty());
         assert_ne!(encrypted, data);
@@ -745,7 +751,8 @@ mod tests {
     async fn test_hashreader_etag_basic() {
         let data = b"hello hashreader";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).expect("operation should succeed");
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
         let etag = hash_reader.try_resolve_etag();
@@ -757,7 +764,8 @@ mod tests {
     async fn test_hashreader_diskable_md5() {
         let data = b"no etag";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, true).expect("operation should succeed");
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, true)
+            .expect("operation should succeed");
         let mut buf = Vec::new();
         let _ = hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
         // Etag should be None when diskable_md5 is true
@@ -770,9 +778,12 @@ mod tests {
     async fn test_add_calculated_checksum_records_checksum() {
         let data = b"server-side copy checksum";
         let reader = BufReader::new(Cursor::new(&data[..]));
-        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).expect("operation should succeed");
+        let mut hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
 
-        hash_reader.add_calculated_checksum(ChecksumType::CRC64_NVME).expect("operation should succeed");
+        hash_reader
+            .add_calculated_checksum(ChecksumType::CRC64_NVME)
+            .expect("operation should succeed");
 
         let mut buf = Vec::new();
         hash_reader.read_to_end(&mut buf).await.expect("operation should succeed");
@@ -838,14 +849,18 @@ mod tests {
         let size = data.len() as i64;
         let actual_size = data.len() as i64;
 
-        let mut hr = HashReader::from_stream(reader, size, actual_size, Some(expected.clone()), None, false).expect("operation should succeed");
+        let mut hr = HashReader::from_stream(reader, size, actual_size, Some(expected.clone()), None, false)
+            .expect("operation should succeed");
 
         // If compression is enabled, compress data first
         let compressed_data = if is_compress {
             let mut compressed_buf = Vec::new();
             let compress_reader = CompressReader::new(hr, CompressionAlgorithm::Gzip);
             let mut compress_reader = compress_reader;
-            compress_reader.read_to_end(&mut compressed_buf).await.expect("operation should succeed");
+            compress_reader
+                .read_to_end(&mut compressed_buf)
+                .await
+                .expect("operation should succeed");
 
             println!("Original size: {}, Compressed size: {}", data.len(), compressed_buf.len());
 
@@ -869,7 +884,10 @@ mod tests {
             let encrypt_reader = encrypt_reader::EncryptReader::new(Cursor::new(compressed_data), key, nonce);
             let mut encrypted_data = Vec::new();
             let mut encrypt_reader = encrypt_reader;
-            encrypt_reader.read_to_end(&mut encrypted_data).await.expect("operation should succeed");
+            encrypt_reader
+                .read_to_end(&mut encrypted_data)
+                .await
+                .expect("operation should succeed");
 
             println!("Encrypted size: {}", encrypted_data.len());
 
@@ -877,14 +895,20 @@ mod tests {
             let decrypt_reader = DecryptReader::new(Cursor::new(encrypted_data), key, nonce);
             let mut decrypt_reader = decrypt_reader;
             let mut decrypted_data = Vec::new();
-            decrypt_reader.read_to_end(&mut decrypted_data).await.expect("operation should succeed");
+            decrypt_reader
+                .read_to_end(&mut decrypted_data)
+                .await
+                .expect("operation should succeed");
 
             if is_compress {
                 // If compression was used, decompress is needed
                 let decompress_reader = DecompressReader::new(Cursor::new(decrypted_data), CompressionAlgorithm::Gzip);
                 let mut decompress_reader = decompress_reader;
                 let mut final_data = Vec::new();
-                decompress_reader.read_to_end(&mut final_data).await.expect("operation should succeed");
+                decompress_reader
+                    .read_to_end(&mut final_data)
+                    .await
+                    .expect("operation should succeed");
 
                 println!("Final decompressed size: {}", final_data.len());
                 assert_eq!(final_data.len() as i64, actual_size);
@@ -902,7 +926,10 @@ mod tests {
             let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), CompressionAlgorithm::Gzip);
             let mut decompress_reader = decompress_reader;
             let mut decompressed = Vec::new();
-            decompress_reader.read_to_end(&mut decompressed).await.expect("operation should succeed");
+            decompress_reader
+                .read_to_end(&mut decompressed)
+                .await
+                .expect("operation should succeed");
 
             assert_eq!(decompressed.len() as i64, actual_size);
             assert_eq!(&decompressed, &data);
@@ -931,13 +958,17 @@ mod tests {
         println!("Original data size: {} bytes", data.len());
 
         let reader = BufReader::new(Cursor::new(data.clone()));
-        let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).expect("operation should succeed");
+        let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+            .expect("operation should succeed");
 
         // Test compression
         let compress_reader = CompressReader::new(hash_reader, CompressionAlgorithm::Gzip);
         let mut compressed_data = Vec::new();
         let mut compress_reader = compress_reader;
-        compress_reader.read_to_end(&mut compressed_data).await.expect("operation should succeed");
+        compress_reader
+            .read_to_end(&mut compressed_data)
+            .await
+            .expect("operation should succeed");
 
         println!("Compressed data size: {} bytes", compressed_data.len());
         println!("Compression ratio: {:.2}%", (compressed_data.len() as f64 / data.len() as f64) * 100.0);
@@ -949,7 +980,10 @@ mod tests {
         let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), CompressionAlgorithm::Gzip);
         let mut decompressed_data = Vec::new();
         let mut decompress_reader = decompress_reader;
-        decompress_reader.read_to_end(&mut decompressed_data).await.expect("operation should succeed");
+        decompress_reader
+            .read_to_end(&mut decompressed_data)
+            .await
+            .expect("operation should succeed");
 
         // Verify decompressed data matches original
         assert_eq!(decompressed_data.len(), data.len());
@@ -976,13 +1010,17 @@ mod tests {
             println!("\nTesting algorithm: {algorithm:?}");
 
             let reader = BufReader::new(Cursor::new(data.clone()));
-            let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false).expect("operation should succeed");
+            let hash_reader = HashReader::from_stream(reader, data.len() as i64, data.len() as i64, None, None, false)
+                .expect("operation should succeed");
 
             // Compress
             let compress_reader = CompressReader::new(hash_reader, algorithm);
             let mut compressed_data = Vec::new();
             let mut compress_reader = compress_reader;
-            compress_reader.read_to_end(&mut compressed_data).await.expect("operation should succeed");
+            compress_reader
+                .read_to_end(&mut compressed_data)
+                .await
+                .expect("operation should succeed");
 
             println!(
                 "  Compressed size: {} bytes (ratio: {:.2}%)",
@@ -994,7 +1032,10 @@ mod tests {
             let decompress_reader = DecompressReader::new(Cursor::new(compressed_data), algorithm);
             let mut decompressed_data = Vec::new();
             let mut decompress_reader = decompress_reader;
-            decompress_reader.read_to_end(&mut decompressed_data).await.expect("operation should succeed");
+            decompress_reader
+                .read_to_end(&mut decompressed_data)
+                .await
+                .expect("operation should succeed");
 
             // Verify
             assert_eq!(decompressed_data.len(), data.len());

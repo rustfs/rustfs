@@ -23,7 +23,8 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-static HOST_LABEL_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").expect("operation should succeed"));
+static HOST_LABEL_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?$").expect("operation should succeed"));
 
 /// NetError represents errors that can occur in network operations.
 #[derive(Error, Debug)]
