@@ -41,6 +41,8 @@ run_unit_checks() {
     list_path_gather_results_returns_after_limit_without_waiting_for_input_close
     list_path_gather_results_keeps_marker_entry_for_version_marker_listing
     list_path_gather_results_skips_marker_entry_by_default
+    list_path_forward_past_is_idempotent_for_same_marker
+    list_path_parse_marker_replay_still_stable
     normalize_list_quorum_falls_back_to_strict
     list_objects_quorum_from_env_defaults_to_optimal
   )
@@ -91,8 +93,12 @@ run_live_smoke() {
 run_metrics_context() {
   log_info "Collecting local metric symbol index for review"
   local metric_log="$OUT_DIR/issue-785-metrics-context.log"
-  rg -n "record_stage_duration\(\"store_list_objects_|record_stage_duration\(\"sets_list_objects_|record_stage_duration\(\"set_disks_list_objects_" "$PROJECT_ROOT/crates/ecstore/src/store/list_objects.rs" > "$metric_log"
-  log_info "Metric context saved: $metric_log"
+  if rg -n "record_stage_duration\(" "$PROJECT_ROOT/crates/ecstore/src/store/list_objects.rs" > "$metric_log"; then
+    log_info "Metric context saved: $metric_log"
+  else
+    log_error "No metric stage context found"
+    return 1
+  fi
 }
 
 parse_args() {

@@ -3313,6 +3313,59 @@ mod test {
     }
 
     #[test]
+    fn list_path_forward_past_is_idempotent_for_same_marker() {
+        let mut first_page = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
+        first_page.forward_past(Some("obj-0002".to_string()));
+
+        let first_page_names = first_page
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        let mut second_page = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
+        second_page.forward_past(Some("obj-0002".to_string()));
+
+        let second_page_names = second_page
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_page_names, second_page_names);
+        assert_eq!(first_page_names, vec!["obj-0003".to_string(), "obj-0004".to_string()]);
+    }
+
+    #[test]
+    fn list_path_parse_marker_replay_still_stable() {
+        let marker = "photos/2026/image.jpg[rustfs_cache:v1,id:list-cache-id,p:3,s:7]".to_string();
+
+        let mut parsed = ListPathOptions {
+            marker: Some(marker),
+            ..Default::default()
+        };
+        parsed.parse_marker();
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+
+        let base_marker = parsed.marker.clone().expect("marker should parse");
+        let replay_marker = parsed.encode_marker(base_marker.as_str());
+        let mut replay = ListPathOptions {
+            marker: Some(replay_marker),
+            ..Default::default()
+        };
+        replay.parse_marker();
+
+        assert_eq!(replay.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(replay.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(replay.pool_idx, Some(3));
+        assert_eq!(replay.set_idx, Some(7));
+        assert_eq!(replay.create, false);
+    }
+
+    #[test]
     fn test_max_keys_plus_one_caps_before_lookahead() {
         assert_eq!(max_keys_plus_one(999, true), 1000);
         assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST, true), MAX_OBJECT_LIST + 1);
