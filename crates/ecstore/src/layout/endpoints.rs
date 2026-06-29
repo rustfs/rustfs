@@ -17,7 +17,7 @@ use crate::{
         disks_layout::DisksLayout,
         endpoint::{Endpoint, EndpointType},
     },
-    runtime::global::global_rustfs_port,
+    runtime::sources as runtime_sources,
 };
 use rustfs_config::{DEFAULT_UNSAFE_BYPASS_DISK_CHECK, ENV_MINIO_CI, ENV_UNSAFE_BYPASS_DISK_CHECK};
 use rustfs_utils::{XHost, check_local_server_addr, get_host_ip, is_local_host};
@@ -811,7 +811,7 @@ impl EndpointServerPools {
                     continue;
                 }
                 let host = endpoint.host_port();
-                if endpoint.is_local && endpoint.url.port() == Some(global_rustfs_port()) && local.is_none() {
+                if endpoint.is_local && endpoint.url.port() == Some(runtime_sources::rustfs_port()) && local.is_none() {
                     local = Some(host.clone());
                 }
 
