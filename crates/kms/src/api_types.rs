@@ -487,6 +487,29 @@ impl ConfigureKmsRequest {
 mod tests {
     use super::*;
     use crate::config::REDACTED_SECRET;
+    use serde_json::Value;
+
+    fn stable_json_value(value: impl serde::Serialize) -> Value {
+        sorted_json_value(serde_json::to_value(value).expect("KMS snapshot value should serialize"))
+    }
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn test_deserialize_vault_kv2_configure_request_accepts_type_aliases() {
@@ -650,6 +673,7 @@ mod tests {
         };
 
         let summary = KmsConfigSummary::from(&config);
+        insta::assert_json_snapshot!("kms_vault_transit_config_summary", stable_json_value(&summary));
         assert_eq!(summary.backend_type, KmsBackend::VaultTransit);
         assert_eq!(summary.timeout_seconds, 30);
         assert_eq!(summary.retry_attempts, 3);
@@ -776,6 +800,102 @@ mod tests {
             assert!(!rendered.contains("summary-approle-secret-id"));
             assert!(rendered.contains("has_master_key") || rendered.contains("has_stored_credentials"));
         }
+    }
+
+    #[test]
+    fn kms_management_responses_have_stable_json_shapes() {
+        insta::assert_json_snapshot!(
+            "kms_configure_response",
+            stable_json_value(ConfigureKmsResponse {
+                success: true,
+                message: "kms configured".to_string(),
+                status: KmsServiceStatus::Configured,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_start_response",
+            stable_json_value(StartKmsResponse {
+                success: true,
+                message: "kms started".to_string(),
+                status: KmsServiceStatus::Running,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_stop_response",
+            stable_json_value(StopKmsResponse {
+                success: true,
+                message: "kms stopped".to_string(),
+                status: KmsServiceStatus::Configured,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_status_response",
+            stable_json_value(KmsStatusResponse {
+                status: KmsServiceStatus::Running,
+                backend_type: Some(KmsBackend::VaultTransit),
+                healthy: Some(true),
+                config_summary: None,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_delete_key_response",
+            stable_json_value(DeleteKeyResponse {
+                success: true,
+                message: "key scheduled for deletion".to_string(),
+                key_id: "key-a".to_string(),
+                deletion_date: Some("2026-07-01T00:00:00Z".to_string()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_list_keys_response",
+            stable_json_value(ListKeysResponse {
+                success: true,
+                message: "keys listed".to_string(),
+                keys: vec!["key-a".to_string(), "key-b".to_string()],
+                truncated: true,
+                next_marker: Some("key-b".to_string()),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_describe_key_response_missing",
+            stable_json_value(DescribeKeyResponse {
+                success: false,
+                message: "key not found".to_string(),
+                key_metadata: None,
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_cancel_key_deletion_response",
+            stable_json_value(CancelKeyDeletionResponse {
+                success: true,
+                message: "key deletion canceled".to_string(),
+                key_id: "key-a".to_string(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_update_key_description_response",
+            stable_json_value(UpdateKeyDescriptionResponse {
+                success: true,
+                message: "key description updated".to_string(),
+                key_id: "key-a".to_string(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_tag_key_response",
+            stable_json_value(TagKeyResponse {
+                success: true,
+                message: "key tags updated".to_string(),
+                key_id: "key-a".to_string(),
+            })
+        );
+        insta::assert_json_snapshot!(
+            "kms_untag_key_response",
+            stable_json_value(UntagKeyResponse {
+                success: true,
+                message: "key tags removed".to_string(),
+                key_id: "key-a".to_string(),
+            })
+        );
     }
 }
 

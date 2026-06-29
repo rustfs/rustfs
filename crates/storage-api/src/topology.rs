@@ -95,6 +95,25 @@ pub trait TopologySnapshotProvider: Send + Sync + Debug {
 mod tests {
     use super::*;
     use crate::CapabilityState;
+    use serde_json::Value;
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn topology_snapshot_allows_missing_and_extra_labels() {
@@ -141,6 +160,10 @@ mod tests {
         }"#;
 
         let snapshot: TopologySnapshot = serde_json::from_str(raw).expect("deserialize topology snapshot");
+        insta::assert_json_snapshot!(
+            "topology_snapshot_contract",
+            sorted_json_value(serde_json::to_value(&snapshot).expect("topology snapshot should serialize"))
+        );
         let disk = &snapshot.pools[0].sets[0].disks[0];
 
         assert_eq!(snapshot.pools[0].labels.zone, None);

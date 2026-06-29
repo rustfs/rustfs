@@ -67,6 +67,24 @@ require_source_contains "docs/architecture/global-state-crate-split-plan.md" "##
 require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Fallback Removal Plan" "global state plan fallback section"
 require_source_contains "docs/architecture/global-state-crate-split-plan.md" "## Crate Split Evaluation" "global state plan crate split section"
 require_source_contains "docs/architecture/global-state-crate-split-plan.md" "rustfs_ecstore::api::global" "global state plan facade boundary"
+require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Dependency Inventory" "observability ECStore dependency inventory section"
+require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Extraction Plan" "observability ECStore extraction plan section"
+require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "crates/obs/src/metrics/storage_api.rs" "observability ECStore storage_api boundary"
+require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inventory.md" "architecture overview ECStore facade inventory link"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Split Dependency Inventory" "ECStore split dependency inventory section"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Shrink Rules" "ECStore facade shrink rules section"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "rustfs/src/storage/storage_api.rs" "RustFS storage ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/scanner/src/storage_api.rs" "scanner ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/obs/src/metrics/storage_api.rs" "OBS ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/iam/src/storage_api.rs" "IAM ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/heal/src/heal/storage_api.rs" "heal ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/notify/src/storage_api.rs" "notify ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/protocols/src/swift/storage_api.rs" "Swift ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "crates/s3select-api/src/storage_api.rs" "S3 Select ECStore facade boundary inventory"
+require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "Do not add direct \`rustfs_ecstore::api\` imports outside the boundary files" "ECStore facade new-import shrink rule"
 
 TMP_DIR="$(mktemp -d)"
 trap 'rm -rf "$TMP_DIR"' EXIT
@@ -199,6 +217,7 @@ SCANNER_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_storage_api_sour
 SCANNER_STORAGE_API_TEST_BYPASS_HITS_FILE="${TMP_DIR}/scanner_storage_api_test_bypass_hits.txt"
 HEAL_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/heal_storage_api_source_bypass_hits.txt"
 HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE="${TMP_DIR}/heal_storage_api_test_bypass_hits.txt"
+OBS_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/obs_storage_api_source_bypass_hits.txt"
 NOTIFY_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/notify_storage_compat_module_hits.txt"
 OBS_STORAGE_COMPAT_PASSTHROUGH_HITS_FILE="${TMP_DIR}/obs_storage_compat_passthrough_hits.txt"
 E2E_STORAGE_COMPAT_RPC_PASSTHROUGH_HITS_FILE="${TMP_DIR}/e2e_storage_compat_rpc_passthrough_hits.txt"
@@ -2723,6 +2742,18 @@ fi
 
 if [[ -s "$HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE" ]]; then
   report_failure "heal tests must route ECStore and storage-api symbols through heal test storage_api: $(paste -sd '; ' "$HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::|^use rustfs_storage_api|rustfs_storage_api::' \
+    crates/obs/src \
+    --glob '*.rs' |
+    rg -v '^crates/obs/src/metrics/storage_api\.rs:' || true
+) >"$OBS_STORAGE_API_SOURCE_BYPASS_HITS_FILE"
+
+if [[ -s "$OBS_STORAGE_API_SOURCE_BYPASS_HITS_FILE" ]]; then
+  report_failure "obs source files must route ECStore and storage-api symbols through obs metrics storage_api boundary: $(paste -sd '; ' "$OBS_STORAGE_API_SOURCE_BYPASS_HITS_FILE")"
 fi
 
 (

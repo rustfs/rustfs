@@ -15,6 +15,7 @@
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
+use rustfs_config::{DEFAULT_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use rustfs_utils::HashAlgorithm;
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -27,6 +28,14 @@ use tracing::debug;
 
 type BoxedObjectReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type OpenObjectReaderFuture = Pin<Box<dyn Future<Output = disk::error::Result<Option<BoxedObjectReader>>> + Send>>;
+
+pub(crate) fn object_mmap_read_enabled() -> bool {
+    rustfs_utils::get_env_bool_with_aliases(
+        ENV_OBJECT_MMAP_READ_ENABLE,
+        &[ENV_OBJECT_ZERO_COPY_ENABLE],
+        DEFAULT_OBJECT_MMAP_READ_ENABLE,
+    )
+}
 
 #[derive(Clone)]
 struct BitrotReaderSource {
@@ -294,6 +303,32 @@ pub async fn create_bitrot_writer(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn object_mmap_read_enabled_accepts_legacy_zero_copy_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_OBJECT_MMAP_READ_ENABLE, None::<&str>),
+                (ENV_OBJECT_ZERO_COPY_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(!object_mmap_read_enabled());
+            },
+        );
+    }
+
+    #[test]
+    fn object_mmap_read_enabled_prefers_canonical_env() {
+        temp_env::with_vars(
+            [
+                (ENV_OBJECT_MMAP_READ_ENABLE, Some("true")),
+                (ENV_OBJECT_ZERO_COPY_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(object_mmap_read_enabled());
+            },
+        );
+    }
 
     #[tokio::test]
     async fn test_create_bitrot_reader_with_inline_data() {
