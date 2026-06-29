@@ -401,6 +401,11 @@ pub(crate) async fn local_disk_path_by_id(disk_id: &Uuid) -> Option<String> {
     GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(disk_id).cloned()
 }
 
+#[cfg(test)]
+pub(crate) async fn clear_local_disk_id_map_for_test() {
+    GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+}
+
 pub(crate) async fn record_local_disk_id(disk_id: Uuid, endpoint: String) {
     GLOBAL_LOCAL_DISK_ID_MAP.write().await.insert(disk_id, endpoint);
 }

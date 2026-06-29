@@ -755,7 +755,8 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 mod tests {
     use super::*;
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
-    use crate::runtime::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
+    use crate::runtime::global::reset_local_disk_test_state;
+    use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
     use crate::store::init_format::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;
@@ -832,7 +833,7 @@ mod tests {
             .await
             .expect("initialize format metadata");
 
-        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        clear_local_disk_id_map_for_test().await;
 
         let local_disks = all_local_disk().await;
         let first_disk = local_disks.first().expect("local disk exists");
@@ -844,10 +845,7 @@ mod tests {
 
         let found = find_local_disk_by_ref(&disk_id.to_string()).await;
         assert!(found.is_some(), "disk lookup by id should backfill cache");
-        assert_eq!(
-            GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned(),
-            Some(first_disk.endpoint().to_string())
-        );
+        assert_eq!(local_disk_path_by_id(&disk_id).await, Some(first_disk.endpoint().to_string()));
 
         reset_local_disk_test_state().await;
     }
