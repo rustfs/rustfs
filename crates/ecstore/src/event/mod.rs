@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: event target types are retained for notification owner migration.
+#![allow(dead_code)]
+
 pub mod name;
 pub mod targetid;
 pub mod targetlist;
