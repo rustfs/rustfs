@@ -379,11 +379,11 @@ pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     GLOBAL_TierConfigMgr.clone()
 }
 
-pub(crate) fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
+pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
     GLOBAL_ExpiryState.clone()
 }
 
-pub(crate) fn transition_state_handle() -> Arc<TransitionState> {
+pub fn transition_state_handle() -> Arc<TransitionState> {
     GLOBAL_TransitionState.clone()
 }
 

@@ -122,8 +122,8 @@ pub mod global {
 
 pub mod runtime {
     pub use crate::runtime::sources::{
-        bucket_monitor, first_cluster_node_is_local, global_tier_config_mgr, local_disk_map_read, object_store_handle,
-        setup_is_erasure, setup_is_erasure_sd,
+        bucket_monitor, expiry_state_handle, first_cluster_node_is_local, global_tier_config_mgr, local_disk_map_read,
+        object_store_handle, setup_is_erasure, setup_is_erasure_sd, transition_state_handle,
     };
 }
 
