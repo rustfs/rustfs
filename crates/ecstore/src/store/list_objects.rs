@@ -1678,6 +1678,7 @@ impl Sets {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -1708,7 +1709,9 @@ impl Sets {
         }
 
         let mut next_marker = if is_truncated {
-            get_objects.last().map(|last| last.name.clone())
+            get_objects
+                .last()
+                .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
         } else {
             None
         };
@@ -1741,8 +1744,11 @@ impl Sets {
                 is_truncated = true;
                 next_marker = objects
                     .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
+                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
+                    .or_else(|| prefixes
+                        .last()
+                        .cloned()
+                        .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
             }
         }
 
@@ -1796,6 +1802,7 @@ impl Sets {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -1833,7 +1840,10 @@ impl Sets {
         let mut next_marker: Option<String> = None;
         let mut next_version_idmarker: Option<String> = None;
         if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
+            next_marker = Some(append_list_cache_id_to_marker(
+                last.name.clone(),
+                next_cache_id.as_deref(),
+            ));
             next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
         }
 
@@ -1864,10 +1874,13 @@ impl Sets {
             if should_truncate {
                 is_truncated = true;
                 if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
+                    next_marker = Some(append_list_cache_id_to_marker(
+                        last.name.clone(),
+                        next_cache_id.as_deref(),
+                    ));
                     next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
                 } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
+                    next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
                     next_version_idmarker = None;
                 }
             }
@@ -2451,6 +2464,7 @@ impl SetDisks {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -2481,7 +2495,9 @@ impl SetDisks {
         }
 
         let mut next_marker = if is_truncated {
-            get_objects.last().map(|last| last.name.clone())
+            get_objects
+                .last()
+                .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
         } else {
             None
         };
@@ -2514,8 +2530,11 @@ impl SetDisks {
                 is_truncated = true;
                 next_marker = objects
                     .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
+                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
+                    .or_else(|| prefixes
+                        .last()
+                        .cloned()
+                        .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
             }
         }
 
@@ -2569,6 +2588,7 @@ impl SetDisks {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -2606,7 +2626,10 @@ impl SetDisks {
         let mut next_marker: Option<String> = None;
         let mut next_version_idmarker: Option<String> = None;
         if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
+            next_marker = Some(append_list_cache_id_to_marker(
+                last.name.clone(),
+                next_cache_id.as_deref(),
+            ));
             next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
         }
 
@@ -2637,10 +2660,13 @@ impl SetDisks {
             if should_truncate {
                 is_truncated = true;
                 if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
+                    next_marker = Some(append_list_cache_id_to_marker(
+                        last.name.clone(),
+                        next_cache_id.as_deref(),
+                    ));
                     next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
                 } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
+                    next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
                     next_version_idmarker = None;
                 }
             }
