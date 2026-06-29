@@ -178,7 +178,8 @@ pub struct ListPathOptions {
     pub set_idx: Option<usize>,
 }
 
-const MARKER_TAG_VERSION: &str = "v1";
+const MARKER_TAG_VERSION: &str = "v2";
+const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
 const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
@@ -207,6 +208,17 @@ fn list_quorum_from_env() -> String {
 fn list_objects_quorum_from_env() -> String {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_QUORUM, DEFAULT_API_LIST_OBJECTS_QUORUM);
     normalize_list_quorum(&value).to_owned()
+}
+
+fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
+    match cache_id {
+        Some(id) => ListPathOptions {
+            id: Some(id.to_owned()),
+            ..Default::default()
+        }
+        .encode_marker(&marker),
+        None => marker,
+    }
 }
 
 fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versioned: bool) -> MetadataResolutionParams {
@@ -285,7 +297,7 @@ impl ListPathOptions {
                 continue;
             };
             if key == "rustfs_cache" {
-                if value != MARKER_TAG_VERSION {
+                if !LEGACY_MARKER_TAG_VERSIONS.contains(&value) {
                     return;
                 }
                 supported_marker = true;
@@ -329,14 +341,16 @@ impl ListPathOptions {
     }
     pub fn encode_marker(&mut self, marker: &str) -> String {
         if let Some(id) = &self.id {
-            format!(
-                "{}[rustfs_cache:{},id:{},p:{},s:{}]",
-                marker,
-                MARKER_TAG_VERSION,
-                id.to_owned(),
-                self.pool_idx.unwrap_or_default(),
-                self.set_idx.unwrap_or_default(),
-            )
+            let mut marker_tag = format!("{}[rustfs_cache:{}", marker, MARKER_TAG_VERSION);
+            marker_tag.push_str(&format!(",id:{}", id));
+            if let Some(pool_idx) = self.pool_idx {
+                marker_tag.push_str(&format!(",p:{}", pool_idx));
+            }
+            if let Some(set_idx) = self.set_idx {
+                marker_tag.push_str(&format!(",s:{}", set_idx));
+            }
+            marker_tag.push(']');
+            marker_tag
         } else {
             format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
         }
@@ -437,6 +451,7 @@ impl ECStore {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         // err=None means gather_results filled its limit → disk has more data
         let disk_has_more = list_result.err.is_none();
@@ -474,7 +489,9 @@ impl ECStore {
 
         let mut next_marker = {
             if is_truncated {
-                get_objects.last().map(|last| last.name.clone())
+                get_objects
+                    .last()
+                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
             } else {
                 None
             }
@@ -515,8 +532,8 @@ impl ECStore {
                 // Prefer last object name; fall back to last prefix for marker.
                 next_marker = objects
                     .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
+                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
+                    .or_else(|| prefixes.last().cloned().map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
             }
         }
 
@@ -3542,6 +3559,22 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_path_marker_parser_accepts_legacy_v1_tag() {
+        let mut parsed = ListPathOptions {
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v1,id:legacy-cache-id,p:4,s:1]".to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("legacy-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(4));
+        assert_eq!(parsed.set_idx, Some(1));
+        assert!(!parsed.create);
     }
 
     #[test]
