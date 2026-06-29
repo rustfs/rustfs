@@ -42,7 +42,6 @@ use crate::{
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
-use rustfs_common::GLOBAL_LOCAL_NODE_NAME;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -164,11 +163,11 @@ pub(crate) async fn set_setup_type(setup_type: SetupType) {
 }
 
 pub(crate) async fn local_node_name() -> String {
-    GLOBAL_LOCAL_NODE_NAME.read().await.clone()
+    rustfs_common::get_global_local_node_name().await
 }
 
 pub(crate) async fn set_local_node_name(node_name: String) {
-    *GLOBAL_LOCAL_NODE_NAME.write().await = node_name;
+    rustfs_common::set_global_local_node_name(&node_name).await;
 }
 
 pub(crate) fn default_local_node_name() -> String {
@@ -510,7 +509,7 @@ pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::LockRegistry;
+    use super::{LockRegistry, local_node_name, set_local_node_name};
     use crate::disk::endpoint::Endpoint;
     use rustfs_lock::{LocalClient, LockClient};
     use std::{collections::HashMap, sync::Arc};
@@ -545,5 +544,18 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert!(Arc::ptr_eq(&clients[0], &client_a));
         assert!(Arc::ptr_eq(&clients[1], &client_b));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_node_name_round_trips_through_common_runtime_helper() {
+        let previous = local_node_name().await;
+        let next = "runtime-source-local-node-test".to_string();
+
+        set_local_node_name(next.clone()).await;
+        let observed = local_node_name().await;
+        set_local_node_name(previous).await;
+
+        assert_eq!(observed, next);
     }
 }
