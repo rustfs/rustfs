@@ -378,11 +378,15 @@ pub(crate) mod ecstore_global {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::global::new_object_layer_fn;
     pub(crate) use rustfs_ecstore::api::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
+        GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
         get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
         is_dist_erasure, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
         shutdown_background_services, update_erasure_type,
     };
+}
+
+pub(crate) mod ecstore_runtime {
+    pub(crate) use rustfs_ecstore::api::runtime::boot_time;
 }
 
 #[allow(unused_imports)]
@@ -568,7 +572,7 @@ pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
 }
 
 pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
-    ecstore_global::GLOBAL_BOOT_TIME.get().cloned()
+    ecstore_runtime::boot_time()
 }
 
 pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
