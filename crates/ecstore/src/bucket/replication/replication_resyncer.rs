@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
@@ -28,7 +29,6 @@ use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::runtime::sources as runtime_sources;
 use crate::services::event_notification::{EventArgs, send_event};
 use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{

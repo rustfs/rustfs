@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
@@ -28,7 +29,6 @@ use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::object_api::{ObjectInfo, ObjectOptions};
-use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::object::DeletedObject;
 use crate::storage_api_contracts::object::EcstoreObjectIO;
 use lazy_static::lazy_static;
