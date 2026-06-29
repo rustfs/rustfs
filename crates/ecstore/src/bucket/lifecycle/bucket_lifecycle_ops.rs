@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
+use crate::bucket::lifecycle::bucket_lifecycle_audit::{
+    LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
+    emit_transition_failed_event, emit_transitioned_expiration_event,
+};
 use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
@@ -34,7 +37,6 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::services::event_notification::{EventArgs, send_event};
 use crate::services::tier::warm_backend::WarmBackendGetOpts;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
@@ -63,7 +65,6 @@ use rustfs_filemeta::{
     FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
     VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
 };
-use rustfs_s3_types::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -1230,15 +1231,7 @@ impl TransitionState {
                                         "Lifecycle tier operation failed"
                                     );
                                 }
-                                // Send s3:ObjectTransition:Failed event
-                                send_event(EventArgs {
-                                event_name: EventName::ObjectTransitionFailed.to_string(),
-                                bucket_name: obj_info_for_event.bucket.clone(),
-                                object: obj_info_for_event,
-                                user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: runtime_sources::default_local_node_name(),
-                                ..Default::default()
-                            });
+                            emit_transition_failed_event(obj_info_for_event);
                         } else {
                             global_metrics().record_scanner_transition_completed(1);
                             let mut ts = TierStats {
@@ -1251,15 +1244,7 @@ impl TransitionState {
                             }
                             transition_state.add_lastday_stats(&task.event.storage_class, ts);
 
-                            // Send s3:ObjectTransition:Complete event
-                            send_event(EventArgs {
-                                event_name: EventName::ObjectTransitionComplete.to_string(),
-                                bucket_name: obj_info_for_event.bucket.clone(),
-                                object: obj_info_for_event,
-                                user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: runtime_sources::default_local_node_name(),
-                                ..Default::default()
-                            });
+                            emit_transition_complete_event(obj_info_for_event);
                         }
                         TransitionState::add_counter(&transition_state.active_tasks, -1);
                         transition_state.record_scanner_transition_state();
@@ -2199,39 +2184,7 @@ pub async fn expire_transitioned_object(
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
-    let event_name = if oi.delete_marker {
-        EventName::LifecycleExpirationDelete
-    } else if dobj.delete_marker {
-        EventName::LifecycleExpirationDeleteMarkerCreated
-    } else {
-        EventName::LifecycleExpirationDelete
-    };
-    let obj_info = ObjectInfo {
-        bucket: oi.bucket.clone(),
-        name: oi.name.clone(),
-        size: oi.size,
-        version_id: oi.version_id,
-        delete_marker: oi.delete_marker,
-        ..Default::default()
-    };
-    send_event(EventArgs {
-        event_name: event_name.to_string(),
-        bucket_name: obj_info.bucket.clone(),
-        object: obj_info,
-        user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: runtime_sources::default_local_node_name(),
-        ..Default::default()
-    });
-    /*let system = match notification_system() {
-        Some(sys) => sys,
-        None => {
-            let config = Config::new();
-            initialize(config).await?;
-            notification_system().expect("Failed to initialize notification system")
-        }
-    };
-    let event = Arc::new(Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut));
-    system.send_event(event).await;*/
+    emit_transitioned_expiration_event(oi, &dobj);
 
     Ok(dobj)
 }
@@ -2681,20 +2634,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    let event_name = match lc_event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => EventName::LifecycleExpirationDelete,
-        _ if oi.delete_marker => EventName::LifecycleExpirationDelete,
-        _ if dobj.delete_marker => EventName::LifecycleExpirationDeleteMarkerCreated,
-        _ => EventName::LifecycleExpirationDelete,
-    };
-    send_event(EventArgs {
-        event_name: event_name.to_string(),
-        bucket_name: dobj.bucket.clone(),
-        object: dobj,
-        user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: runtime_sources::default_local_node_name(),
-        ..Default::default()
-    });
+    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj);
 
     if lc_event.action != IlmAction::NoneAction {
         let mut num_versions = 1_u64;
