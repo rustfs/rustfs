@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, warn};
+use tracing::{debug, Instrument, error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -1217,7 +1217,12 @@ async fn gather_results(
 ) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
+    let gather_started = std::time::Instant::now();
+    let mut scanned_entries = 0usize;
+    let mut candidate_entries = 0usize;
+
     while let Some(mut entry) = recv.recv().await {
+        scanned_entries += 1;
         #[cfg(windows)]
         {
             // normalize windows path separator
@@ -1257,9 +1262,25 @@ async fn gather_results(
         // TODO: Lifecycle
 
         entries.push(Some(entry));
+        candidate_entries += 1;
 
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
             rx.cancel();
+            let filtered = scanned_entries.saturating_sub(candidate_entries);
+            debug!(
+                bucket = %opts.bucket,
+                prefix = %opts.prefix,
+                limit = opts.limit,
+                scanned_entries = scanned_entries,
+                returned_entries = candidate_entries,
+                filtered_entries = filtered,
+                marker = %opts.marker.as_deref().unwrap_or(""),
+                "list_objects gather_results reached page limit and cancelled upstream listing"
+            );
+            rustfs_io_metrics::record_stage_duration(
+                "store_list_objects_gather",
+                gather_started.elapsed().as_secs_f64() * 1000.0,
+            );
 
             results_tx
                 .send(MetaCacheEntriesSortedResult {
@@ -1276,6 +1297,21 @@ async fn gather_results(
     }
 
     // finish not full, return eof
+    let filtered = scanned_entries.saturating_sub(candidate_entries);
+    debug!(
+        bucket = %opts.bucket,
+        prefix = %opts.prefix,
+        scanned_entries = scanned_entries,
+        returned_entries = candidate_entries,
+        filtered_entries = filtered,
+        marker = %opts.marker.as_deref().unwrap_or(""),
+        "list_objects gather_results drained all candidates without hitting limit"
+    );
+    rustfs_io_metrics::record_stage_duration(
+        "store_list_objects_gather",
+        gather_started.elapsed().as_secs_f64() * 1000.0,
+    );
+
     results_tx
         .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
@@ -2841,6 +2877,18 @@ impl SetDisks {
         }
 
         let resolver = list_metadata_resolution_params(opts.bucket.clone(), listing_quorum, opts.versioned);
+
+        debug!(
+            bucket = %opts.bucket,
+            prefix = %opts.base_dir,
+            set_drive_count = self.set_drive_count,
+            asked_disks = ask_disks,
+            listing_quorum = listing_quorum,
+            fallback_disks = fallback_disks.len(),
+            limit = opts.limit,
+            stop_disk_at_limit = opts.stop_disk_at_limit,
+            "set_disks list_path selected listing quorum and fallback disks"
+        );
 
         let limit = {
             if opts.limit > 0 && opts.stop_disk_at_limit {
