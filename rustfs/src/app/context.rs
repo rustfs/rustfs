@@ -29,7 +29,7 @@ pub use interfaces::*;
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use super::storage_api::context::{ECStore, EndpointServerPools};
 use crate::config::RustFSBufferConfig;
@@ -248,6 +248,11 @@ pub fn resolve_expiry_state_handle() -> Option<Arc<RwLock<ExpiryState>>> {
     resolve_expiry_state_handle_with(get_global_app_context())
 }
 
+/// Resolve lifecycle transition state using AppContext-first precedence.
+pub fn resolve_transition_state_handle() -> Option<Arc<TransitionState>> {
+    resolve_transition_state_handle_with(get_global_app_context())
+}
+
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
     resolve_server_config_with(get_global_app_context())
@@ -444,6 +449,10 @@ fn resolve_expiry_state_handle_with(context: Option<Arc<AppContext>>) -> Option<
     context.map(|context| context.expiry_state().handle())
 }
 
+fn resolve_transition_state_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<TransitionState>> {
+    context.map(|context| context.transition_state().handle())
+}
+
 fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config> {
     context.and_then(|context| context.server_config().get())
 }
@@ -485,7 +494,7 @@ mod tests {
         EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
         LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
         RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface, TransitionStateInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -798,6 +807,16 @@ mod tests {
         }
     }
 
+    struct TestTransitionStateInterface {
+        transition_state: Arc<TransitionState>,
+    }
+
+    impl TransitionStateInterface for TestTransitionStateInterface {
+        fn handle(&self) -> Arc<TransitionState> {
+            self.transition_state.clone()
+        }
+    }
+
     struct TestServerConfigInterface {
         config: Option<Config>,
         published: Arc<AtomicUsize>,
@@ -937,6 +956,7 @@ mod tests {
         };
         let tier_config = TierConfigMgr::new();
         let context_expiry_state = ExpiryState::new();
+        let context_transition_state = TransitionState::new();
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let context_storage_class_published = Arc::new(AtomicUsize::new(0));
@@ -1046,6 +1066,9 @@ mod tests {
                 }),
                 expiry_state: Arc::new(TestExpiryStateInterface {
                     expiry_state: context_expiry_state.clone(),
+                }),
+                transition_state: Arc::new(TestTransitionStateInterface {
+                    transition_state: context_transition_state.clone(),
                 }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
@@ -1176,6 +1199,10 @@ mod tests {
             &resolve_expiry_state_handle_with(Some(context.clone())).expect("context expiry state"),
             &context_expiry_state
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_transition_state_handle_with(Some(context.clone())).expect("context transition state"),
+            &context_transition_state
+        ));
         assert_eq!(
             resolve_server_config_with(Some(context.clone())).expect("context server config"),
             server_config
@@ -1221,6 +1248,7 @@ mod tests {
         assert!(resolve_region_with(None).is_none());
         assert!(resolve_tier_config_handle_with(None).is_none());
         assert!(resolve_expiry_state_handle_with(None).is_none());
+        assert!(resolve_transition_state_handle_with(None).is_none());
         assert!(resolve_server_config_with(None).is_none());
         assert!(!publish_server_config_with(None, Config::new()));
         assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));
