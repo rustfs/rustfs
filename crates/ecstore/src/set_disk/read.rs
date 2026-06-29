@@ -21,9 +21,10 @@ use crate::diagnostics::get::{
     GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
+    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error,
+    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{create_deferred_bitrot_reader, object_mmap_read_enabled};
@@ -2121,14 +2122,26 @@ impl SetDisks {
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
         let vid = opts.version_id.clone().unwrap_or_default();
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
+        let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
         if use_metadata_cache
             && vid.is_empty()
             && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await
         {
+            record_get_stage_duration_if_enabled(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_STAGE_METADATA_CACHE_LOOKUP,
+                metadata_cache_lookup_start,
+            );
             return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
         }
+        record_get_stage_duration_if_enabled(
+            GET_OBJECT_PATH_SET_DISK,
+            GET_STAGE_METADATA_CACHE_LOOKUP,
+            metadata_cache_lookup_start,
+        );
 
         let disks = self.disks.read().await;
 
@@ -2154,12 +2167,18 @@ impl SetDisks {
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
+        let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
             .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
         {
             Ok(v) => v,
             Err(e) => {
                 // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
+                record_get_stage_duration_if_enabled(
+                    GET_OBJECT_PATH_SET_DISK,
+                    GET_STAGE_METADATA_RESOLVE,
+                    metadata_resolve_stage_start,
+                );
                 return Err(e);
             }
         };
@@ -2169,6 +2188,11 @@ impl SetDisks {
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
+            record_get_stage_duration_if_enabled(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_STAGE_METADATA_RESOLVE,
+                metadata_resolve_stage_start,
+            );
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
@@ -2191,6 +2215,7 @@ impl SetDisks {
             self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
                 .await;
         }
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();

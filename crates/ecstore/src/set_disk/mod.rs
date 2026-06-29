@@ -30,8 +30,9 @@ use crate::diagnostics::get::{
     GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
     GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
-    GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_METADATA, GET_STAGE_READER_SETUP, classify_storage_error,
-    record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE,
+    GET_STAGE_METADATA, GET_STAGE_OBJECT_INFO, GET_STAGE_PATH_DECISION, GET_STAGE_READER_SETUP, classify_storage_error,
+    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_stage_duration_if_enabled,
 };
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
@@ -1681,6 +1682,40 @@ async fn build_inline_bitrot_readers(
     Ok(readers)
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers_from_refs(
+    files: &[&FileInfo],
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    let mut readers = Vec::with_capacity(files.len());
+    for file in files {
+        let reader = if let Some(data) = &file.data {
+            create_bitrot_reader_from_bytes(
+                Some(data.clone()),
+                None,
+                bucket,
+                object,
+                0,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                false,
+            )
+            .await?
+        } else {
+            None
+        };
+        readers.push(reader);
+    }
+    Ok(readers)
+}
+
 async fn try_read_inline_data_shards_direct(
     readers: &mut [Option<InlineBitrotReader>],
     data_shards: usize,
@@ -1718,6 +1753,83 @@ fn can_try_inline_data_shards_direct(object_size: usize, block_size: usize) -> b
     object_size > 0 && object_size <= block_size
 }
 
+fn inline_erasure_shard_size(block_size: usize, data_shards: usize, uses_legacy: bool) -> usize {
+    if block_size == 0 || data_shards == 0 {
+        return 0;
+    }
+    if uses_legacy {
+        coding::calc_shard_size_legacy(block_size, data_shards)
+    } else {
+        coding::calc_shard_size(block_size, data_shards)
+    }
+}
+
+fn inline_erasure_shard_file_size(total_length: usize, block_size: usize, data_shards: usize, uses_legacy: bool) -> usize {
+    if total_length == 0 || block_size == 0 || data_shards == 0 {
+        return 0;
+    }
+
+    let shard_size = inline_erasure_shard_size(block_size, data_shards, uses_legacy);
+    let shard_size_fn = if uses_legacy {
+        coding::calc_shard_size_legacy
+    } else {
+        coding::calc_shard_size
+    };
+    let num_shards = total_length / block_size;
+    let last_block_size = total_length % block_size;
+    let last_shard_size = shard_size_fn(last_block_size, data_shards);
+    num_shards * shard_size + last_shard_size
+}
+
+fn inline_erasure_shard_file_offset(
+    start_offset: usize,
+    length: usize,
+    total_length: usize,
+    block_size: usize,
+    data_shards: usize,
+    uses_legacy: bool,
+) -> usize {
+    if block_size == 0 || data_shards == 0 {
+        return 0;
+    }
+
+    let shard_size = inline_erasure_shard_size(block_size, data_shards, uses_legacy);
+    let shard_file_size = inline_erasure_shard_file_size(total_length, block_size, data_shards, uses_legacy);
+    let end_shard = (start_offset + length) / block_size;
+    let till_offset = end_shard * shard_size + shard_size;
+    till_offset.min(shard_file_size)
+}
+
+fn collect_inline_data_shard_fileinfos_by_index<'a>(
+    parts_metadata: &'a [FileInfo],
+    fi: &FileInfo,
+    data_shards: usize,
+    mut disk_is_online: impl FnMut(usize) -> bool,
+) -> Option<Vec<&'a FileInfo>> {
+    let distribution = &fi.erasure.distribution;
+    let mut data_files = vec![None; data_shards];
+
+    for (disk_index, file_info) in parts_metadata.iter().enumerate() {
+        if !disk_is_online(disk_index) {
+            continue;
+        }
+        let block_index = *distribution.get(disk_index)?;
+        if block_index == 0 || block_index > data_shards {
+            continue;
+        }
+        if !file_info.is_valid() {
+            continue;
+        }
+        if file_info.data.as_ref().is_none_or(|data| data.is_empty()) {
+            continue;
+        }
+
+        data_files[block_index - 1] = Some(file_info);
+    }
+
+    data_files.into_iter().collect()
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -1737,6 +1849,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         h: HeaderMap,
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         // Check if lock optimization is enabled
         // When enabled, read locks are released after metadata read
         let lock_optimization_enabled = is_lock_optimization_enabled();
@@ -1744,6 +1857,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Acquire a shared read-lock early to protect read consistency
         let read_lock_guard = if !opts.no_lock {
             let acquire_start = Instant::now();
+            let lock_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
 
             // Record lock wait for deadlock detection
             if is_deadlock_detection_enabled() {
@@ -1763,6 +1877,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             // Record lock statistics
             metrics::counter!("rustfs.lock.acquire.total", "type" => "read").increment(1);
             metrics::histogram!("rustfs.lock.acquire.duration.seconds").record(acquire_start.elapsed().as_secs_f64());
+            record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_LOCK_ACQUIRE, lock_stage_start);
 
             Some(guard)
         } else {
@@ -1778,9 +1893,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 return Err(to_object_err(err, vec![bucket, object]));
             }
         };
+        let object_info_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let object_info = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         let object_class = classify_get_codec_streaming_object_class(&range, &object_info, &fi);
         let size_bucket = rustfs_io_metrics::get_object_size_bucket(object_info.size);
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_OBJECT_INFO, object_info_stage_start);
         let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
         rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -1825,7 +1942,96 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         // Uses the shared predicate from ObjectInfo; additionally checks that
         // inline data is actually present and no range request is in flight.
         if object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() {
+            let mut inline_prepare_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
             let data_shards = fi.erasure.data_blocks;
+
+            let object_size = usize::try_from(fi.size)
+                .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
+
+            let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
+            let checksum_algo =
+                if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                    rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                } else {
+                    checksum_info.algorithm
+                };
+
+            if can_try_inline_data_shards_direct(object_size, fi.erasure.block_size)
+                && let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, &fi, data_shards, |index| {
+                    disks.get(index).is_some_and(Option::is_some)
+                })
+            {
+                let read_length = inline_erasure_shard_file_offset(
+                    0,
+                    object_size,
+                    object_size,
+                    fi.erasure.block_size,
+                    data_shards,
+                    fi.uses_legacy_checksum,
+                );
+                let shard_size = inline_erasure_shard_size(fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_INLINE_PREPARE,
+                        object_class.as_str(),
+                        size_bucket,
+                        inline_prepare_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
+                let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                let mut readers = build_inline_bitrot_readers_from_refs(
+                    &data_files,
+                    bucket,
+                    object,
+                    read_length,
+                    shard_size,
+                    &checksum_algo,
+                    opts.skip_verify_bitrot,
+                )
+                .await?;
+                if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_READER_SETUP,
+                        object_class.as_str(),
+                        size_bucket,
+                        reader_setup_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
+
+                // Decode directly
+                let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
+                if let Some(body) = try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
+                {
+                    if let Some(decode_stage_start) = decode_stage_start {
+                        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                            GET_OBJECT_PATH_INLINE_DIRECT,
+                            GET_STAGE_DECODE,
+                            object_class.as_str(),
+                            size_bucket,
+                            decode_stage_start.elapsed().as_secs_f64(),
+                        );
+                    }
+
+                    record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
+                    let reader = GetObjectReader {
+                        stream: Box::new(Cursor::new(body.clone())),
+                        object_info,
+                        buffered_body: Some(body),
+                    };
+                    return Ok(reader);
+                }
+            }
+
+            let erasure = coding::Erasure::new_with_options(
+                fi.erasure.data_blocks,
+                fi.erasure.parity_blocks,
+                fi.erasure.block_size,
+                fi.uses_legacy_checksum,
+            );
+            let read_length = erasure.shard_file_offset(0, object_size, object_size);
+            let total_shards = data_shards + fi.erasure.parity_blocks;
             let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
 
             // Check if we have enough inline data shards
@@ -1836,34 +2042,19 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 .count();
 
             if inline_count >= data_shards {
-                // All data shards are inline - decode in memory
-                let erasure = coding::Erasure::new_with_options(
-                    fi.erasure.data_blocks,
-                    fi.erasure.parity_blocks,
-                    fi.erasure.block_size,
-                    fi.uses_legacy_checksum,
-                );
-                let object_size = usize::try_from(fi.size)
-                    .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
-
-                let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
-                let checksum_algo =
-                    if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
-                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
-                    } else {
-                        checksum_info.algorithm
-                    };
-                let read_length = erasure.shard_file_offset(0, object_size, object_size);
+                if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_INLINE_PREPARE,
+                        object_class.as_str(),
+                        size_bucket,
+                        inline_prepare_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
                 let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let total_shards = data_shards + fi.erasure.parity_blocks;
-                let initial_reader_shards = if can_try_inline_data_shards_direct(object_size, erasure.block_size) {
-                    data_shards
-                } else {
-                    total_shards
-                };
-                let mut readers = build_inline_bitrot_readers(
+                let readers = build_inline_bitrot_readers(
                     &files,
-                    initial_reader_shards,
+                    total_shards,
                     bucket,
                     object,
                     read_length,
@@ -1882,40 +2073,19 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
 
-                // Decode directly
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let direct_body = if can_try_inline_data_shards_direct(object_size, erasure.block_size) {
-                    try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
-                } else {
-                    None
-                };
-                let body = if let Some(body) = direct_body {
-                    body
-                } else {
-                    let readers = build_inline_bitrot_readers(
-                        &files,
-                        total_shards,
-                        bucket,
-                        object,
-                        read_length,
-                        erasure.shard_size(),
-                        &checksum_algo,
-                        opts.skip_verify_bitrot,
-                    )
-                    .await?;
-                    let mut output = Cursor::new(Vec::with_capacity(object_size));
-                    let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
-                    if let Some(e) = err {
-                        return Err(to_object_err(e.into(), vec![bucket, object]));
-                    }
-                    if written == 0 && fi.size > 0 {
-                        return Err(to_object_err(
-                            Error::other("inline fast path: erasure decode returned 0 bytes"),
-                            vec![bucket, object],
-                        ));
-                    }
-                    Bytes::from(output.into_inner())
-                };
+                let mut output = Cursor::new(Vec::with_capacity(object_size));
+                let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+                if let Some(e) = err {
+                    return Err(to_object_err(e.into(), vec![bucket, object]));
+                }
+                if written == 0 && fi.size > 0 {
+                    return Err(to_object_err(
+                        Error::other("inline fast path: erasure decode returned 0 bytes"),
+                        vec![bucket, object],
+                    ));
+                }
+                let body = Bytes::from(output.into_inner());
                 if let Some(decode_stage_start) = decode_stage_start {
                     rustfs_io_metrics::record_get_object_stage_duration_by_size(
                         GET_OBJECT_PATH_INLINE_DIRECT,
@@ -1936,8 +2106,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
         }
 
+        let path_decision_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let codec_streaming_gate =
             get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_PATH_DECISION, path_decision_stage_start);
 
         if object_info.is_remote() {
             if let GetCodecStreamingDecision::Fallback(reason) = codec_streaming_gate.decision {
@@ -8876,6 +9048,60 @@ mod tests {
         (erasure, files, read_length, checksum_algo)
     }
 
+    fn inline_data_shard_fileinfo(
+        name: &str,
+        data_blocks: usize,
+        parity_blocks: usize,
+        erasure_index: usize,
+        distribution: &[usize],
+        data: Option<&'static [u8]>,
+    ) -> FileInfo {
+        let mut fi = FileInfo::new(name, data_blocks, parity_blocks);
+        fi.name = name.to_string();
+        fi.erasure.index = erasure_index;
+        fi.erasure.distribution = distribution.to_vec();
+        fi.data = data.map(Bytes::from_static);
+        fi
+    }
+
+    #[test]
+    fn collect_inline_data_shards_by_index_uses_distribution_order() {
+        let distribution = vec![3, 1, 5, 2, 4, 6];
+        let mut fi = FileInfo::new("object", 4, 2);
+        fi.erasure.distribution = distribution.clone();
+        let files = vec![
+            inline_data_shard_fileinfo("block-3", 4, 2, 3, &distribution, Some(b"c")),
+            inline_data_shard_fileinfo("block-1", 4, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo("parity-5", 4, 2, 5, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo("block-2", 4, 2, 2, &distribution, Some(b"b")),
+            inline_data_shard_fileinfo("block-4", 4, 2, 4, &distribution, Some(b"d")),
+            inline_data_shard_fileinfo("parity-6", 4, 2, 6, &distribution, Some(b"q")),
+        ];
+
+        let data_files =
+            collect_inline_data_shard_fileinfos_by_index(&files, &fi, 4, |_| true).expect("all data shards should be collected");
+
+        assert_eq!(
+            data_files.iter().map(|file| file.name.as_str()).collect::<Vec<_>>(),
+            ["block-1", "block-2", "block-3", "block-4"]
+        );
+    }
+
+    #[test]
+    fn collect_inline_data_shards_by_index_rejects_missing_data_shard() {
+        let distribution = vec![1, 2, 3, 4];
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.erasure.distribution = distribution.clone();
+        let files = vec![
+            inline_data_shard_fileinfo("block-1", 2, 2, 1, &distribution, Some(b"a")),
+            inline_data_shard_fileinfo("block-2", 2, 2, 2, &distribution, None),
+            inline_data_shard_fileinfo("parity-3", 2, 2, 3, &distribution, Some(b"p")),
+            inline_data_shard_fileinfo("parity-4", 2, 2, 4, &distribution, Some(b"q")),
+        ];
+
+        assert!(collect_inline_data_shard_fileinfos_by_index(&files, &fi, 2, |_| true).is_none());
+    }
+
     #[tokio::test]
     async fn inline_data_shards_direct_read_reassembles_payload() {
         let payload = b"small inline object payload that spans data shards";
@@ -8934,6 +9160,30 @@ mod tests {
         assert!(can_try_inline_data_shards_direct(1024, 1024));
         assert!(!can_try_inline_data_shards_direct(0, 1024));
         assert!(!can_try_inline_data_shards_direct(1025, 1024));
+    }
+
+    #[test]
+    fn inline_erasure_offset_helpers_match_erasure_methods() {
+        for uses_legacy in [false, true] {
+            let erasure = coding::Erasure::new_with_options(4, 2, 1024 * 1024, uses_legacy);
+            for object_size in [1usize, 1024, 100 * 1024, 1024 * 1024] {
+                assert_eq!(
+                    inline_erasure_shard_size(erasure.block_size, erasure.data_shards, uses_legacy),
+                    erasure.shard_size()
+                );
+                assert_eq!(
+                    inline_erasure_shard_file_offset(
+                        0,
+                        object_size,
+                        object_size,
+                        erasure.block_size,
+                        erasure.data_shards,
+                        uses_legacy,
+                    ),
+                    erasure.shard_file_offset(0, object_size, object_size)
+                );
+            }
+        }
     }
 
     #[tokio::test]
