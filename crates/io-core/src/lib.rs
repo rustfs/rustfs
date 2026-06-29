@@ -17,6 +17,7 @@
 //! This crate provides buffered readers and writers for I/O operations.
 //! Note: despite "ZeroCopy" naming in type names (kept for backward compatibility),
 //! the actual implementations perform mmap-then-copy or aligned pread, not true
+//! zero-copy file I/O or true Direct I/O.
 //!
 //! # Features
 //!
@@ -36,7 +37,7 @@
 //! let data = Bytes::from("hello world");
 //! let reader = ZeroCopyObjectReader::from_bytes(data);
 //!
-//! // Create from file using mmap (Unix only)
+//! // Create from file using mmap-then-copy (Unix only)
 //! #[cfg(unix)]
 //! let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
 //!

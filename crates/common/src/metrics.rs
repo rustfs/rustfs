@@ -739,9 +739,14 @@ pub struct Metrics {
     scanner_set_scans_queued: AtomicU64,
     scanner_set_scans_active: AtomicU64,
     scanner_disk_bucket_scan_states: Mutex<HashMap<String, ScannerDiskBucketScanState>>,
+    scanner_leader_lock_state: RwLock<String>,
+    scanner_leader_lock_held: AtomicBool,
+    scanner_leader_lock_last_error: RwLock<String>,
+    scanner_leader_lock_last_update_unix_secs: AtomicU64,
     last_scan_cycle_result: AtomicU8,
     last_scan_cycle_partial_reason: AtomicU8,
     last_scan_cycle_partial_source: AtomicU8,
+    last_scan_cycle_end_unix_secs: AtomicU64,
     last_scan_cycle_duration_millis: AtomicU64,
     last_scan_cycle_objects_scanned: AtomicU64,
     last_scan_cycle_directories_scanned: AtomicU64,
@@ -1104,6 +1109,16 @@ pub struct ScannerMetricsReport {
     pub last_minute: ScannerLastMinute,
     pub active_paths: Vec<String>,
     pub current_scan_mode: String,
+    #[serde(default)]
+    pub leader_lock_state: String,
+    #[serde(default)]
+    pub leader_lock_held_by_this_process: bool,
+    #[serde(default)]
+    pub leader_lock_last_error: String,
+    #[serde(default)]
+    pub leader_lock_last_update_unix_secs: u64,
+    #[serde(default)]
+    pub last_cycle_end_unix_secs: u64,
     #[serde(default)]
     pub current_set_scan_concurrency_limit: u64,
     #[serde(default)]
@@ -1678,9 +1693,14 @@ impl Metrics {
             scanner_set_scans_queued: AtomicU64::new(0),
             scanner_set_scans_active: AtomicU64::new(0),
             scanner_disk_bucket_scan_states: Mutex::new(HashMap::new()),
+            scanner_leader_lock_state: RwLock::new("unknown".to_string()),
+            scanner_leader_lock_held: AtomicBool::new(false),
+            scanner_leader_lock_last_error: RwLock::new(String::new()),
+            scanner_leader_lock_last_update_unix_secs: AtomicU64::new(0),
             last_scan_cycle_result: AtomicU8::new(SCAN_CYCLE_RESULT_UNKNOWN),
             last_scan_cycle_partial_reason: AtomicU8::new(ScanCyclePartialReason::Unknown as u8),
             last_scan_cycle_partial_source: AtomicU8::new(0),
+            last_scan_cycle_end_unix_secs: AtomicU64::new(0),
             last_scan_cycle_duration_millis: AtomicU64::new(0),
             last_scan_cycle_objects_scanned: AtomicU64::new(0),
             last_scan_cycle_directories_scanned: AtomicU64::new(0),
@@ -2280,6 +2300,19 @@ impl Metrics {
         HealScanMode::from_u8(self.current_scan_mode.load(Ordering::Relaxed)).unwrap_or(HealScanMode::Unknown)
     }
 
+    pub async fn record_scanner_leader_liveness(&self, state: impl Into<String>, held: bool, error: impl Into<String>) {
+        *self.scanner_leader_lock_state.write().await = state.into();
+        *self.scanner_leader_lock_last_error.write().await = error.into();
+        self.scanner_leader_lock_held.store(held, Ordering::Relaxed);
+        self.scanner_leader_lock_last_update_unix_secs
+            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+    }
+
+    pub fn record_scanner_cycle_end_time(&self) {
+        self.last_scan_cycle_end_unix_secs
+            .store(Utc::now().timestamp().max(0) as u64, Ordering::Relaxed);
+    }
+
     pub fn record_scan_cycle_complete(&self, success: bool, duration: Duration) {
         let result = if success {
             SCAN_CYCLE_RESULT_SUCCESS
@@ -2287,6 +2320,7 @@ impl Metrics {
             self.failed_scan_cycles.fetch_add(1, Ordering::Relaxed);
             SCAN_CYCLE_RESULT_ERROR
         };
+        self.record_scanner_cycle_end_time();
         self.last_scan_cycle_result.store(result, Ordering::Relaxed);
         self.last_scan_cycle_partial_reason
             .store(ScanCyclePartialReason::Unknown as u8, Ordering::Relaxed);
@@ -2305,6 +2339,7 @@ impl Metrics {
         reason: ScanCyclePartialReason,
         source: Option<ScannerWorkSource>,
     ) {
+        self.record_scanner_cycle_end_time();
         self.partial_scan_cycles.fetch_add(1, Ordering::Relaxed);
         match reason {
             ScanCyclePartialReason::Unknown => &self.partial_scan_cycles_unknown,
@@ -2660,6 +2695,11 @@ impl Metrics {
             .map(|(disk, state)| format!("{disk}/{}", state.path))
             .collect();
         m.current_scan_mode = self.current_scan_mode().as_str().to_string();
+        m.leader_lock_state = self.scanner_leader_lock_state.read().await.clone();
+        m.leader_lock_held_by_this_process = self.scanner_leader_lock_held.load(Ordering::Relaxed);
+        m.leader_lock_last_error = self.scanner_leader_lock_last_error.read().await.clone();
+        m.leader_lock_last_update_unix_secs = self.scanner_leader_lock_last_update_unix_secs.load(Ordering::Relaxed);
+        m.last_cycle_end_unix_secs = self.last_scan_cycle_end_unix_secs.load(Ordering::Relaxed);
         m.current_set_scan_concurrency_limit = self.scanner_set_scan_concurrency_limit.load(Ordering::Relaxed);
         m.current_set_scans_queued = self.scanner_set_scans_queued.load(Ordering::Relaxed);
         m.current_set_scans_active = self.scanner_set_scans_active.load(Ordering::Relaxed);
@@ -3669,6 +3709,21 @@ mod tests {
         let report = metrics.report().await;
 
         assert_eq!(report.current_scan_mode, HealScanMode::Deep.as_str());
+    }
+
+    #[tokio::test]
+    async fn report_includes_scanner_leader_liveness() {
+        let metrics = Metrics::new();
+
+        metrics.record_scanner_leader_liveness("contended", false, "lock busy").await;
+        metrics.record_scanner_cycle_end_time();
+        let report = metrics.report().await;
+
+        assert_eq!(report.leader_lock_state, "contended");
+        assert!(!report.leader_lock_held_by_this_process);
+        assert_eq!(report.leader_lock_last_error, "lock busy");
+        assert!(report.leader_lock_last_update_unix_secs > 0);
+        assert!(report.last_cycle_end_unix_secs > 0);
     }
 
     #[tokio::test]
