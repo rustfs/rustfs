@@ -41,6 +41,10 @@ require_source_contains() {
   fi
 }
 
+if grep -Eq '^[[:space:]]*#!\[allow\([^]]*dead_code' "${ROOT_DIR}/crates/ecstore/src/lib.rs"; then
+  report_failure "ecstore crate root must not use allow(dead_code); scope temporary allowances to owning modules"
+fi
+
 require_source_contains "docs/architecture/overview.md" "## Baseline" "architecture overview baseline section"
 require_source_contains "docs/architecture/overview.md" "## Core Principle" "architecture overview core principle section"
 require_source_contains "docs/architecture/overview.md" "## Phase Order" "architecture overview phase order section"

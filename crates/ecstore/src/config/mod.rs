@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: configuration migration keeps legacy subsystem definitions available behind this module.
+#![allow(dead_code)]
+
 mod audit;
 pub mod com;
 #[allow(dead_code)]

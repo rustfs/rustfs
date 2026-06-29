@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: pool coordination helpers are being migrated behind runtime owners.
+#![allow(dead_code)]
+
 pub(crate) mod pools;
 pub(crate) mod sets;
 

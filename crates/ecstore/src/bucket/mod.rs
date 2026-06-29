@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: bucket subsystems still contain staged ECStore migration code.
+#![allow(dead_code)]
+
 pub mod bandwidth;
 pub mod bucket_target_sys;
 pub mod error;

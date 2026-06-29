@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: disk abstractions still carry staged health and direct-I/O migration paths.
+#![allow(dead_code)]
+
 pub mod disk_store;
 pub mod endpoint;
 pub mod error;
