@@ -182,11 +182,9 @@ impl BytesBufferedReader {
     /// let reader = BytesBufferedReader::from_file_read(&file, 0, 1024).await?;
     /// ```
     #[cfg(unix)]
-    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
-        // For mmap, we need the file path - fall back to regular read if not available
-        // This is a simplified implementation
         let mut cloned = file.try_clone().await?;
         cloned.seek(SeekFrom::Start(offset)).await?;
 
@@ -203,7 +201,7 @@ impl BytesBufferedReader {
     ///
     /// On platforms that don't support mmap, this falls back to regular file I/O.
     #[cfg(not(unix))]
-    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
         use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
 
         let mut cloned = file.try_clone().await?;
@@ -218,12 +216,13 @@ impl BytesBufferedReader {
         })
     }
 
-    /// Create a Bytes-backed reader from a file using normal buffered reads.
-    ///
-    /// This is the preferred name for new code. It is currently equivalent to
-    /// the historical `from_file_mmap` compatibility method.
-    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
-        Self::from_file_mmap(file, offset, size).await
+    /// Historical name for `from_file_read`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use from_file_read; this method performs normal reads into owned Bytes"
+    )]
+    pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+        Self::from_file_read(file, offset, size).await
     }
 
     /// Get the remaining data as Bytes (zero-copy).
@@ -286,7 +285,16 @@ impl std::fmt::Debug for BytesBufferedReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
     use tokio::io::AsyncReadExt;
+
+    fn temp_file_path(test_name: &str) -> PathBuf {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!("rustfs-io-core-{test_name}-{}-{nonce}", std::process::id()))
+    }
 
     #[tokio::test]
     async fn test_from_bytes() {
@@ -310,6 +318,49 @@ mod tests {
 
         assert_eq!(n, 5);
         assert_eq!(&buf[..n], b"hello");
+    }
+
+    #[tokio::test]
+    async fn test_from_file_read_reads_requested_range() {
+        let path = temp_file_path("from-file-read");
+        tokio::fs::write(&path, b"hello world")
+            .await
+            .expect("write temp file for reader test");
+
+        let file = tokio::fs::File::open(&path).await.expect("open temp file for reader test");
+        let mut reader = BytesBufferedReader::from_file_read(&file, 6, 5)
+            .await
+            .expect("read requested range into Bytes");
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.expect("drain reader output");
+
+        assert_eq!(output, b"world");
+
+        let _ = tokio::fs::remove_file(path).await;
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_from_file_mmap_legacy_alias_reads_requested_range() {
+        let path = temp_file_path("from-file-mmap");
+        tokio::fs::write(&path, b"hello world")
+            .await
+            .expect("write temp file for legacy reader test");
+
+        let file = tokio::fs::File::open(&path)
+            .await
+            .expect("open temp file for legacy reader test");
+        let mut reader = BytesBufferedReader::from_file_mmap(&file, 0, 5)
+            .await
+            .expect("read requested range through legacy alias");
+
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).await.expect("drain legacy reader output");
+
+        assert_eq!(output, b"hello");
+
+        let _ = tokio::fs::remove_file(path).await;
     }
 
     #[tokio::test]

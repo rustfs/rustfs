@@ -101,7 +101,7 @@ impl BytesMutWriter {
     ///
     /// # Arguments
     ///
-    /// * `data` - Data to write (as Bytes for zero-copy potential)
+    /// * `data` - Data to append to the internal buffer
     ///
     /// # Returns
     ///
@@ -112,9 +112,9 @@ impl BytesMutWriter {
     ///
     /// ```ignore
     /// let data = Bytes::from("hello world");
-    /// let written = writer.write_zero_copy(data).await?;
+    /// let written = writer.write_buffered(data).await?;
     /// ```
-    pub async fn write_zero_copy(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
+    pub async fn write_buffered(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
         if self.finalized {
             return Err(ZeroCopyWriteError::Finalized("Cannot write to finalized writer".to_string()));
         }
@@ -126,12 +126,13 @@ impl BytesMutWriter {
         Ok(len)
     }
 
-    /// Write data into the internal buffer.
-    ///
-    /// This is the preferred name for new code. It is currently equivalent to
-    /// the historical `write_zero_copy` compatibility method.
-    pub async fn write_buffered(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
-        self.write_zero_copy(data).await
+    /// Historical name for `write_buffered`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use write_buffered; this method appends bytes into an internal buffer"
+    )]
+    pub async fn write_zero_copy(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
+        self.write_buffered(data).await
     }
 
     /// Write a slice of data.
@@ -313,11 +314,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_write_zero_copy() {
+    async fn test_write_buffered() {
         let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello world");
 
-        let written = writer.write_zero_copy(data).await.unwrap();
+        let written = writer.write_buffered(data).await.unwrap();
         assert_eq!(written, 11);
         assert_eq!(writer.bytes_written(), 11);
         assert_eq!(writer.as_slice(), b"hello world");
@@ -351,7 +352,7 @@ mod tests {
         let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello world");
 
-        writer.write_zero_copy(data).await.unwrap();
+        writer.write_buffered(data).await.unwrap();
         let result = writer.into_bytes();
 
         assert_eq!(result.as_ref(), b"hello world");
@@ -362,17 +363,17 @@ mod tests {
         let mut writer = BytesMutWriter::new();
         let data = Bytes::from("hello");
 
-        writer.write_zero_copy(data).await.unwrap();
+        writer.write_buffered(data).await.unwrap();
         let _result = writer.into_bytes();
 
         // Create new writer and try to write after finalize
         let mut writer2 = BytesMutWriter::new();
-        writer2.write_zero_copy(Bytes::from("test")).await.unwrap();
+        writer2.write_buffered(Bytes::from("test")).await.unwrap();
         let _ = writer2.into_bytes();
 
         // Writing to a consumed writer should work via new writer
         let mut writer3 = BytesMutWriter::new();
-        let result = writer3.write_zero_copy(Bytes::from("final")).await;
+        let result = writer3.write_buffered(Bytes::from("final")).await;
         assert!(result.is_ok());
     }
 
@@ -403,7 +404,7 @@ mod tests {
     async fn test_multiple_writes() {
         let mut writer = BytesMutWriter::new();
 
-        writer.write_zero_copy(Bytes::from("hello ")).await.unwrap();
+        writer.write_buffered(Bytes::from("hello ")).await.unwrap();
         writer.write_slice(b"world").await.unwrap();
 
         assert_eq!(writer.as_slice(), b"hello world");
