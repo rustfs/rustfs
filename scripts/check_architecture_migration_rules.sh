@@ -206,6 +206,13 @@ GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_target_sys_b
 EVENT_DISPATCH_HOOK_BYPASS_HITS_FILE="${TMP_DIR}/event_dispatch_hook_bypass_hits.txt"
 DATA_USAGE_MEMORY_GLOBAL_BYPASS_HITS_FILE="${TMP_DIR}/data_usage_memory_global_bypass_hits.txt"
 WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE="${TMP_DIR}/workload_admission_provider_bypass_hits.txt"
+ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_read_repair_cache_bypass_hits.txt"
+ECSTORE_DISK_COMPRESSION_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_disk_compression_cache_bypass_hits.txt"
+ECSTORE_ERASURE_CODING_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_erasure_coding_cache_bypass_hits.txt"
+ECSTORE_SET_DISK_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_set_disk_cache_bypass_hits.txt"
+ECSTORE_DRIVE_TIMEOUT_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_drive_timeout_cache_bypass_hits.txt"
+ECSTORE_LIFECYCLE_RECOVERY_GUARD_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_lifecycle_recovery_guard_bypass_hits.txt"
+ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_remote_tier_delete_state_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
 GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
@@ -2583,6 +2590,90 @@ fi
 
 if [[ -s "$WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE" ]]; then
   report_failure "WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bREAD_REPAIR_HEAL_CACHE\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/set_disk/read\.rs:' || true
+) >"$ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE" ]]; then
+  report_failure "READ_REPAIR_HEAL_CACHE access must stay behind ECStore set-disk read owner helpers: $(paste -sd '; ' "$ECSTORE_READ_REPAIR_CACHE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bDISK_COMPRESSION_CONFIG\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/io_support/compress\.rs:' || true
+) >"$ECSTORE_DISK_COMPRESSION_CACHE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_DISK_COMPRESSION_CACHE_BYPASS_HITS_FILE" ]]; then
+  report_failure "DISK_COMPRESSION_CONFIG access must stay behind ECStore IO compression owner helpers: $(paste -sd '; ' "$ECSTORE_DISK_COMPRESSION_CACHE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bCACHED_(MAX_INFLIGHT_BYTES|BATCH_BLOCKS|BYTESMUT_INGEST)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/erasure/coding/encode\.rs:' || true
+) >"$ECSTORE_ERASURE_CODING_CACHE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_ERASURE_CODING_CACHE_BYPASS_HITS_FILE" ]]; then
+  report_failure "erasure coding cache access must stay behind ECStore erasure coding owner helpers: $(paste -sd '; ' "$ECSTORE_ERASURE_CODING_CACHE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(CACHED_(PUT_LARGE_BATCH_MIN_SIZE_BYTES|MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES)|OBJECT_LOCK_DIAG_ENABLED)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/set_disk/mod\.rs:' || true
+) >"$ECSTORE_SET_DISK_CACHE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_SET_DISK_CACHE_BYPASS_HITS_FILE" ]]; then
+  report_failure "set-disk cache access must stay behind ECStore set-disk owner helpers: $(paste -sd '; ' "$ECSTORE_SET_DISK_CACHE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bDRIVE_TIMEOUT_(PROFILE_CACHE|HEALTH_POLICY_CACHE)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/disk/disk_store\.rs:' || true
+) >"$ECSTORE_DRIVE_TIMEOUT_CACHE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_DRIVE_TIMEOUT_CACHE_BYPASS_HITS_FILE" ]]; then
+  report_failure "drive timeout cache access must stay behind ECStore disk-store owner helpers: $(paste -sd '; ' "$ECSTORE_DRIVE_TIMEOUT_CACHE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bTIER_(FREE_VERSION_RECOVERY_STARTED|DELETE_JOURNAL_RECOVERY_STARTED)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops\.rs:' || true
+) >"$ECSTORE_LIFECYCLE_RECOVERY_GUARD_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_LIFECYCLE_RECOVERY_GUARD_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle recovery guard access must stay behind ECStore lifecycle operation owner helpers: $(paste -sd '; ' "$ECSTORE_LIFECYCLE_RECOVERY_GUARD_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(REMOTE_DELETE_(INFLIGHT|LIMITER|BREAKER)|REMOTE_TIER_DELETE_TEST_HOOK)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/lifecycle/tier_sweeper\.rs:' || true
+) >"$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "remote tier delete state access must stay behind ECStore tier sweeper owner helpers: $(paste -sd '; ' "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE")"
 fi
 
 (
