@@ -190,6 +190,7 @@ REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
+REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_boundary_bypass_hits.txt"
 REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
@@ -2406,6 +2407,18 @@ fi
 
 if [[ -s "$REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication msgp helpers must stay behind replication msgp boundary: $(paste -sd '; ' "$REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::tagging::decode_tags_to_map|use crate::bucket::tagging' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_tagging_boundary\.rs:' || true
+) >"$REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication tag decoding must stay behind replication tagging boundary: $(paste -sd '; ' "$REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
