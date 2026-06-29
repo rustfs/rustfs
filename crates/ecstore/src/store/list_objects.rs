@@ -3437,7 +3437,7 @@ mod test {
         assert_eq!(replay.id.as_deref(), Some("list-cache-id"));
         assert_eq!(replay.pool_idx, Some(3));
         assert_eq!(replay.set_idx, Some(7));
-        assert_eq!(replay.create, false);
+        assert!(!replay.create);
     }
 
     #[test]
