@@ -630,6 +630,9 @@ impl ECStore {
         let read_lock_guard = self
             .acquire_object_read_lock_if_needed("get_object", bucket, &object, &mut opts)
             .await?;
+        if read_lock_guard.is_some() {
+            opts.metadata_cache_safe = true;
+        }
 
         let reader = if self.single_pool() {
             self.pools[0]

@@ -14,6 +14,13 @@
 
 use super::*;
 use crate::diagnostics::get::{
+    GET_METADATA_CACHE_DECISION_HIT, GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT,
+    GET_METADATA_CACHE_DECISION_SKIP, GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER,
+    GET_METADATA_CACHE_REASON_DIST_ERASURE, GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS,
+    GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM, GET_METADATA_CACHE_REASON_META_BUCKET,
+    GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED, GET_METADATA_CACHE_REASON_NOT_READ_DATA,
+    GET_METADATA_CACHE_REASON_PART_NUMBER, GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE,
+    GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
     GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
     GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
@@ -426,6 +433,13 @@ impl MetadataQuorumAccumulator {
             self.total_disks / 2
         }
     }
+}
+
+#[derive(Clone, Debug)]
+enum MetadataCacheLookup {
+    Hit(GetObjectMetadataCacheEntry),
+    Miss,
+    RejectedInsufficientQuorum,
 }
 
 fn metadata_early_stop_candidate_matches(left: &FileInfo, right: &FileInfo) -> bool {
@@ -1414,17 +1428,37 @@ where
 }
 
 impl SetDisks {
-    async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
+    async fn get_object_metadata_cache_bypass_reason(
+        bucket: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+    ) -> Option<&'static str> {
+        if let Some(reason) = get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data) {
+            return Some(reason);
+        }
+        runtime_sources::setup_is_dist_erasure()
+            .await
+            .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+        match self.lookup_cached_get_object_fileinfo(bucket, object).await {
+            MetadataCacheLookup::Hit(entry) => Some(entry),
+            MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
+        }
+    }
+
+    async fn lookup_cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> MetadataCacheLookup {
         let key = GetObjectMetadataCacheKey::new(bucket, object);
         // moka handles TTL expiry automatically; no is_fresh() check needed
-        self.get_object_metadata_cache
-            .get(&key)
-            .await
-            .filter(|entry| entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum)
+        let Some(entry) = self.get_object_metadata_cache.get(&key).await else {
+            return MetadataCacheLookup::Miss;
+        };
+        if entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum {
+            MetadataCacheLookup::Hit(entry)
+        } else {
+            MetadataCacheLookup::RejectedInsufficientQuorum
+        }
     }
 
     async fn cache_get_object_fileinfo(
@@ -2125,17 +2159,44 @@ impl SetDisks {
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
         let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
-        if use_metadata_cache
-            && vid.is_empty()
-            && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await
-        {
-            record_get_stage_duration_if_enabled(
+        let cache_bypass_reason = Self::get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
+        let use_metadata_cache = cache_bypass_reason.is_none();
+        if let Some(reason) = cache_bypass_reason {
+            rustfs_io_metrics::record_get_object_metadata_cache_decision(
                 GET_OBJECT_PATH_SET_DISK,
-                GET_STAGE_METADATA_CACHE_LOOKUP,
-                metadata_cache_lookup_start,
+                GET_METADATA_CACHE_DECISION_SKIP,
+                reason,
             );
-            return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+        } else if vid.is_empty() {
+            match self.lookup_cached_get_object_fileinfo(bucket, object).await {
+                MetadataCacheLookup::Hit(cached) => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_HIT,
+                        GET_METADATA_CACHE_REASON_USABLE,
+                    );
+                    record_get_stage_duration_if_enabled(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_STAGE_METADATA_CACHE_LOOKUP,
+                        metadata_cache_lookup_start,
+                    );
+                    return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+                }
+                MetadataCacheLookup::Miss => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_MISS,
+                        GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
+                    );
+                }
+                MetadataCacheLookup::RejectedInsufficientQuorum => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_REJECT,
+                        GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
+                    );
+                }
+            }
         }
         record_get_stage_duration_if_enabled(
             GET_OBJECT_PATH_SET_DISK,
@@ -2888,18 +2949,44 @@ fn should_allow_metadata_early_stop(read_data: bool, version_id: &str, healing: 
         || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
 }
 
+fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {
+    if !read_data {
+        return Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA);
+    }
+    if opts.no_lock && !opts.metadata_cache_safe {
+        return Some(GET_METADATA_CACHE_REASON_NO_LOCK);
+    }
+    if opts.version_id.is_some() {
+        return Some(GET_METADATA_CACHE_REASON_VERSION_ID);
+    }
+    if opts.versioned {
+        return Some(GET_METADATA_CACHE_REASON_VERSIONED);
+    }
+    if opts.version_suspended {
+        return Some(GET_METADATA_CACHE_REASON_VERSION_SUSPENDED);
+    }
+    if opts.incl_free_versions {
+        return Some(GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS);
+    }
+    if opts.delete_marker {
+        return Some(GET_METADATA_CACHE_REASON_DELETE_MARKER);
+    }
+    if opts.part_number.is_some() {
+        return Some(GET_METADATA_CACHE_REASON_PART_NUMBER);
+    }
+    if opts.data_movement {
+        return Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT);
+    }
+    if opts.raw_data_movement_read {
+        return Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ);
+    }
+    bucket
+        .starts_with(RUSTFS_META_BUCKET)
+        .then_some(GET_METADATA_CACHE_REASON_META_BUCKET)
+}
+
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-    read_data
-        && !opts.no_lock
-        && opts.version_id.is_none()
-        && !opts.versioned
-        && !opts.version_suspended
-        && !opts.incl_free_versions
-        && !opts.delete_marker
-        && opts.part_number.is_none()
-        && !opts.data_movement
-        && !opts.raw_data_movement_read
-        && !bucket.starts_with(RUSTFS_META_BUCKET)
+    get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
 }
 
 #[cfg(test)]
@@ -2968,62 +3055,110 @@ mod metadata_cache_tests {
     fn get_object_metadata_cache_request_eligibility_is_conservative() {
         let opts = ObjectOptions::default();
         assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(get_object_metadata_cache_request_bypass_reason("bucket", &opts, true), None);
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, false));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, false),
+            Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA)
+        );
         assert!(!is_get_object_metadata_cache_request_eligible(RUSTFS_META_BUCKET, &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason(RUSTFS_META_BUCKET, &opts, true),
+            Some(GET_METADATA_CACHE_REASON_META_BUCKET)
+        );
 
         let mut opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_NO_LOCK)
+        );
+        opts.metadata_cache_safe = true;
+        assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(get_object_metadata_cache_request_bypass_reason("bucket", &opts, true), None);
 
         opts = ObjectOptions {
             version_id: Some("version".to_string()),
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSION_ID)
+        );
 
         opts = ObjectOptions {
             versioned: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSIONED)
+        );
 
         opts = ObjectOptions {
             version_suspended: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSION_SUSPENDED)
+        );
 
         opts = ObjectOptions {
             incl_free_versions: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS)
+        );
 
         opts = ObjectOptions {
             delete_marker: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_DELETE_MARKER)
+        );
 
         opts = ObjectOptions {
             part_number: Some(1),
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_PART_NUMBER)
+        );
 
         opts = ObjectOptions {
             data_movement: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT)
+        );
 
         opts = ObjectOptions {
             raw_data_movement_read: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ)
+        );
     }
 
     #[tokio::test]

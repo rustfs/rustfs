@@ -559,6 +559,16 @@ pub fn record_get_object_metadata_response(path: &'static str, outcome: &'static
     counter!("rustfs_io_get_object_metadata_response_total", "path" => path, "outcome" => outcome).increment(1);
 }
 
+/// Record one bounded metadata cache decision.
+#[inline(always)]
+pub fn record_get_object_metadata_cache_decision(path: &'static str, decision: &'static str, reason: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_metadata_cache_total", "path" => path, "decision" => decision, "reason" => reason)
+        .increment(1);
+}
+
 /// Record aggregate metadata fanout shape for one GetObject metadata read.
 #[inline(always)]
 pub fn record_get_object_metadata_fanout_shape(path: &'static str, total: usize, valid: usize, ignored: usize, errors: usize) {
