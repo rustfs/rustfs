@@ -22,18 +22,22 @@ use rustfs_utils::get_env_bool_with_aliases;
 use std::{io::Result, sync::Arc};
 use tracing::{debug, info};
 
-const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
-const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
+pub(crate) const ENV_SCANNER_ENABLED: &str = "RUSTFS_SCANNER_ENABLED";
+pub(crate) const ENV_SCANNER_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_SCANNER";
 const ENV_HEAL_ENABLED: &str = "RUSTFS_HEAL_ENABLED";
 const ENV_HEAL_ENABLED_DEPRECATED: &str = "RUSTFS_ENABLE_HEAL";
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 
+pub(crate) fn scanner_enabled_from_env() -> bool {
+    get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true)
+}
+
 pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Result<bool> {
     let _ = create_ahm_services_cancel_token();
 
-    let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
+    let enable_scanner = scanner_enabled_from_env();
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
 
     info!(
