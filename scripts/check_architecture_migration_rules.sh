@@ -183,6 +183,7 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
+GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
 GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
 GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_dist_erasure_bypass_hits.txt"
@@ -195,6 +196,8 @@ GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_sys_bypass_hi
 GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE="${TMP_DIR}/global_event_notifier_bypass_hits.txt"
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
+GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
+GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -2323,6 +2326,18 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_BUCKET_MONITOR\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/global\.rs:' || true
+) >"$GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_BUCKET_MONITOR access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_Endpoints\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2463,6 +2478,30 @@ fi
 
 if [[ -s "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_LocalNodeName/Hex access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(REGION|RUSTFS_PORT)\b|\bglobalDeploymentIDPtr\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^(crates/common/src/globals|crates/ecstore/src/runtime/global)\.rs:' || true
+) >"$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE" ]]; then
+  report_failure "runtime scalar globals must stay behind owner helpers: $(paste -sd '; ' "$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(LOCAL_LOCK_CLIENT|LOCK_CLIENTS)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/global\.rs:' || true
+) >"$GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE" ]]; then
+  report_failure "ECStore lock client globals must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE")"
 fi
 
 (
