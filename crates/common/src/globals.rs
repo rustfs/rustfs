@@ -76,6 +76,16 @@ pub async fn set_global_addr(addr: &str) {
     *GLOBAL_RUSTFS_ADDR.write().await = addr.to_string();
 }
 
+/// Get the global RustFS host.
+pub async fn get_global_rustfs_host() -> String {
+    GLOBAL_RUSTFS_HOST.read().await.clone()
+}
+
+/// Get the global RustFS address used for gRPC connections.
+pub async fn get_global_addr() -> String {
+    GLOBAL_RUSTFS_ADDR.read().await.clone()
+}
+
 /// Set the global root CA certificate for outbound gRPC clients.
 /// This certificate is used to validate server TLS certificates.
 /// When set to None, clients use the system default root CAs.
