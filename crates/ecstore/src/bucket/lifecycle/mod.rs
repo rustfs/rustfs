@@ -14,6 +14,7 @@
 
 pub mod bucket_lifecycle_audit;
 pub mod bucket_lifecycle_ops;
+mod config_boundary;
 pub mod core;
 pub mod evaluator;
 pub use self::core as lifecycle;

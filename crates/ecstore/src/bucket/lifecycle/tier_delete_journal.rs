@@ -19,8 +19,8 @@ use sha2::{Digest, Sha256};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
 
+use crate::bucket::lifecycle::config_boundary;
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::config::com::{delete_config, read_config, save_config};
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -120,7 +120,7 @@ where
         >,
 {
     let data = encode_tier_delete_journal_entry(je).map_err(std::io::Error::other)?;
-    save_config(api, &tier_delete_journal_object_name(je), data)
+    config_boundary::save_config(api, &tier_delete_journal_object_name(je), data)
         .await
         .map_err(std::io::Error::other)
 }
@@ -136,7 +136,7 @@ where
             DeletedObject = DeletedObject,
         >,
 {
-    match delete_config(api, &tier_delete_journal_object_name(je)).await {
+    match config_boundary::delete_config(api, &tier_delete_journal_object_name(je)).await {
         Ok(()) | Err(Error::ConfigNotFound) => Ok(()),
         Err(err) => Err(std::io::Error::other(err)),
     }
@@ -180,7 +180,7 @@ pub async fn recover_tier_delete_journal_entries(
 
     for object in list.objects {
         stats.scanned += 1;
-        let data = match read_config(api.clone(), &object.name).await {
+        let data = match config_boundary::read_config(api.clone(), &object.name).await {
             Ok(data) => data,
             Err(Error::ConfigNotFound) => continue,
             Err(err) => {
