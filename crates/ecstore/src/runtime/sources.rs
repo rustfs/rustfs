@@ -226,7 +226,7 @@ pub(crate) async fn test_node_channel_is_cached(addr: &str) -> bool {
 
 #[cfg(test)]
 pub(crate) fn ensure_test_rpc_secret() {
-    let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set(TEST_RPC_SECRET.to_owned());
+    let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
 }
 
 pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
