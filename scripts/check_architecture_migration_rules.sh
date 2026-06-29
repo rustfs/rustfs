@@ -197,6 +197,7 @@ REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_bo
 REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
+GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_metadata_sys_bypass_hits.txt"
 GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_target_sys_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
@@ -210,6 +211,7 @@ GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE="${TMP_DIR}/global_root_disk_thresho
 GLOBAL_LIFECYCLE_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_state_bypass_hits.txt"
 GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_sys_bypass_hits.txt"
 GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE="${TMP_DIR}/global_event_notifier_bypass_hits.txt"
+GLOBAL_NOTIFICATION_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_notification_sys_bypass_hits.txt"
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
 GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
@@ -2518,6 +2520,18 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(BucketMetadataSys|BUCKET_METADATA_SYS)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/metadata/bucket_sys\.rs:' || true
+) >"$GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_BUCKET_METADATA_SYS access must stay behind ECStore bucket metadata owner helpers: $(paste -sd '; ' "$GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_BUCKET_TARGET_SYS\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2670,6 +2684,18 @@ fi
 
 if [[ -s "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_EVENT_NOTIFIER access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(NotificationSys|NOTIFICATION_SYS)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/services/notification_sys\.rs:' || true
+) >"$GLOBAL_NOTIFICATION_SYS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_NOTIFICATION_SYS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_NOTIFICATION_SYS access must stay behind ECStore notification owner helpers: $(paste -sd '; ' "$GLOBAL_NOTIFICATION_SYS_BYPASS_HITS_FILE")"
 fi
 
 (

@@ -947,7 +947,7 @@ pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Res
 
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
-    ecstore_bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some()
+    ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
 }
 
 #[cfg(test)]
