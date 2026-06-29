@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_config_store as config_store;
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
@@ -25,7 +26,6 @@ use crate::bucket::replication::replication_resyncer::{
     decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::config::com::{read_config, save_config};
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use crate::object_api::{ObjectInfo, ObjectOptions};
@@ -802,7 +802,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
-            let data = match read_config(storage.clone(), MRF_REPLICATION_FILE).await {
+            let data = match config_store::read(storage.clone(), MRF_REPLICATION_FILE).await {
                 Ok(d) => d,
                 Err(EcstoreError::ConfigNotFound) => return, // no file yet — normal on first start
                 Err(e) => {
@@ -826,7 +826,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         "Failed to decode MRF recovery file — discarding corrupt data"
                     );
                     // Overwrite the corrupt file so we don't fail again on next restart.
-                    let _ = save_config(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await;
+                    let _ = config_store::save(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await;
                     return;
                 }
             };
@@ -885,7 +885,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
             // delivery (idempotent) rather than entry loss.
-            if let Err(e) = save_config(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await {
+            if let Err(e) = config_store::save(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1257,7 +1257,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 async fn flush_mrf_to_disk<S: EcstoreObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
-            if let Err(e) = save_config(storage.clone(), MRF_REPLICATION_FILE, data).await {
+            if let Err(e) = config_store::save(storage.clone(), MRF_REPLICATION_FILE, data).await {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1292,7 +1292,7 @@ async fn load_bucket_resync_metadata<S: EcstoreObjectIO>(
     let resync_dir_path = format!("{BUCKET_META_PREFIX}/{bucket}/{REPLICATION_DIR}");
     let resync_file_path = format!("{resync_dir_path}/{RESYNC_FILE_NAME}");
 
-    let data = match read_config(obj_api, &resync_file_path).await {
+    let data = match config_store::read(obj_api, &resync_file_path).await {
         Ok(data) => data,
         Err(EcstoreError::ConfigNotFound) => return Ok(brs),
         Err(err) => return Err(err),
