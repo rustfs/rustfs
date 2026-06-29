@@ -2541,38 +2541,38 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_Endpoints\b' \
+  rg -n --with-filename '\bGLOBAL_(Endpoints|ENDPOINTS)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_Endpoints access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_ENDPOINTS access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_IsErasure\b' \
+  rg -n --with-filename '\bGLOBAL_(IsErasure|IS_ERASURE)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_IsErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_IS_ERASURE access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_IsDistErasure\b' \
+  rg -n --with-filename '\bGLOBAL_(IsDistErasure|IS_DIST_ERASURE)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_IsDistErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_IS_DIST_ERASURE access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2613,50 +2613,50 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_IsErasureSD\b' \
+  rg -n --with-filename '\bGLOBAL_(IsErasureSD|IS_ERASURE_SD)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_IsErasureSD access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_IS_ERASURE_SD access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_RootDiskThreshold\b' \
+  rg -n --with-filename '\bGLOBAL_(RootDiskThreshold|ROOT_DISK_THRESHOLD)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_RootDiskThreshold access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_ROOT_DISK_THRESHOLD access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_LifecycleSys\b' \
+  rg -n --with-filename '\bGLOBAL_(LifecycleSys|LIFECYCLE_SYS)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_LifecycleSys access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_LIFECYCLE_SYS access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE")"
 fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_EventNotifier\b' \
+  rg -n --with-filename '\bGLOBAL_(EventNotifier|EVENT_NOTIFIER)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_EventNotifier access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_EVENT_NOTIFIER access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2673,14 +2673,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_LocalNodeName(Hex)?\b' \
+  rg -n --with-filename '\bGLOBAL_(LocalNodeName(Hex)?|LOCAL_NODE_NAME(_HEX)?_FALLBACK)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_LocalNodeName/Hex access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE")"
+  report_failure "ECStore local node fallback globals must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2853,14 +2853,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_TierConfigMgr\b' \
+  rg -n --with-filename '\bGLOBAL_(TierConfigMgr|TIER_CONFIG_MGR)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
 ) >"$GLOBAL_TIER_CONFIG_MGR_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_TIER_CONFIG_MGR_BYPASS_HITS_FILE" ]]; then
-  report_failure "GLOBAL_TierConfigMgr access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_TIER_CONFIG_MGR_BYPASS_HITS_FILE")"
+  report_failure "GLOBAL_TIER_CONFIG_MGR access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_TIER_CONFIG_MGR_BYPASS_HITS_FILE")"
 fi
 
 (
