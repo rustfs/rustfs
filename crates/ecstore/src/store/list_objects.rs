@@ -181,6 +181,8 @@ pub struct ListPathOptions {
 const MARKER_TAG_VERSION: &str = "v1";
 const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
+const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
+const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
 
 fn normalize_list_quorum(value: &str) -> &'static str {
     let value = value.trim();
@@ -199,6 +201,11 @@ fn normalize_list_quorum(value: &str) -> &'static str {
 
 fn list_quorum_from_env() -> String {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_QUORUM, DEFAULT_API_LIST_QUORUM);
+    normalize_list_quorum(&value).to_owned()
+}
+
+fn list_objects_quorum_from_env() -> String {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_QUORUM, DEFAULT_API_LIST_OBJECTS_QUORUM);
     normalize_list_quorum(&value).to_owned()
 }
 
@@ -392,7 +399,7 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -551,7 +558,7 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -1542,7 +1549,7 @@ impl Sets {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -1684,7 +1691,7 @@ impl Sets {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -2293,7 +2300,7 @@ impl SetDisks {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -2435,7 +2442,7 @@ impl SetDisks {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -2959,9 +2966,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results,
-        list_metadata_resolution_params, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, version_marker_for_entries, walk_result_from_set_errors,
+        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker,
+        gather_results, list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, parse_version_marker, version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -3190,6 +3197,22 @@ mod test {
     fn list_quorum_from_env_rejects_unknown_value() {
         temp_env::with_var(ENV_API_LIST_QUORUM, Some("unsafe"), || {
             assert_eq!(list_quorum_from_env(), "strict");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_quorum_from_env_defaults_to_optimal() {
+        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_QUORUM, || {
+            assert_eq!(list_objects_quorum_from_env(), "optimal");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_quorum_from_env_honors_supported_value() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"), || {
+            assert_eq!(list_objects_quorum_from_env(), "strict");
         });
     }
 
