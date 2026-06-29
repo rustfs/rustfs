@@ -29,7 +29,7 @@ caches separate from runtime migration targets.
 | Owner-local compatibility | Existing compatibility adapters that are allowed to read globals while callers migrate to AppContext-first or owner-local runtime-source APIs. | `rustfs/src/*/runtime_sources.rs`, `rustfs/src/*/storage_api.rs`, `crates/*/storage_api.rs` |
 | Test or fixture state | Static setup used by tests to amortize expensive ECStore setup or isolate compatibility harness state. | `rustfs/src/app/*_test.rs`, `crates/scanner/tests/*`, `crates/ecstore/src/**/tests` |
 | Cache or constant | Regexes, metrics descriptors, defaults, KVS registrations, headers, path constants, and small process caches that are not runtime ownership handles. | `crates/config`, `crates/obs/src/metrics`, `crates/utils`, `rustfs/src/server/readiness.rs` |
-| Legacy naming or review-needed | Remaining mixed-case `GLOBAL_*`, old MinIO-port naming, stale comments, or names that need owner confirmation before code movement. | `GLOBAL_ExpiryState`, `GLOBAL_TransitionState`, `GLOBAL_OBJECT_API` |
+| Legacy naming or review-needed | Remaining mixed-case `GLOBAL_*`, old MinIO-port naming, stale comments, or names that need owner confirmation before code movement. | `GLOBAL_NotificationSys`, `GLOBAL_OBJECT_API` |
 
 ## Runtime Migration Inventory
 
@@ -42,7 +42,7 @@ migration PR removes or replaces each item.
 | `GLOBAL_OBJECT_API`, `GLOBAL_OBJECT_STORE_RESOLVER` | `crates/ecstore/src/runtime/global.rs` | Runtime migration target | Do not migrate first; it is tied to storage startup, IAM-after-storage AppContext publication, and data-plane resolver compatibility. |
 | `GLOBAL_ENDPOINTS`, `GLOBAL_IS_ERASURE`, `GLOBAL_IS_DIST_ERASURE`, `GLOBAL_IS_ERASURE_SD`, `GLOBAL_ROOT_DISK_THRESHOLD` | `crates/ecstore/src/runtime/global.rs` and `crates/ecstore/src/runtime/sources.rs` | Runtime migration target | Endpoint, setup-type, and root-disk-threshold access now stays behind ECStore runtime helpers; move endpoint ownership only after readiness and quorum behavior have explicit coverage. |
 | `GLOBAL_LOCAL_DISK_MAP`, `GLOBAL_LOCAL_DISK_ID_MAP`, `GLOBAL_LOCAL_DISK_SET_DRIVES` | `crates/ecstore/src/runtime/global.rs` and `crates/ecstore/src/runtime/sources.rs` | Runtime migration target | Local disk map, disk-id cache, and set-drive access now stay behind ECStore runtime-source helpers instead of direct global access; preserve disk lookup, remote/local classification, and test reset hooks in later ownership changes. |
-| `GLOBAL_ExpiryState`, `GLOBAL_TransitionState`, `GLOBAL_LIFECYCLE_SYS` | `crates/ecstore/src/bucket/lifecycle/*`, `crates/ecstore/src/runtime/global.rs`, and `crates/ecstore/src/runtime/sources.rs` | Runtime migration target | `GLOBAL_LIFECYCLE_SYS` access now stays behind ECStore runtime-source helpers; scanner expiry-state access now uses the ECStore runtime `expiry_state_handle` boundary; `GLOBAL_ExpiryState` remains the first code-bearing ownership candidate because AppContext already has an `ExpiryStateInterface`, resolver, and tests. |
+| `GLOBAL_EXPIRY_STATE`, `GLOBAL_TRANSITION_STATE`, `GLOBAL_LIFECYCLE_SYS` | `crates/ecstore/src/bucket/lifecycle/*`, `crates/ecstore/src/runtime/global.rs`, and `crates/ecstore/src/runtime/sources.rs` | Runtime migration target | Lifecycle state globals now stay behind ECStore lifecycle owner helpers and ECStore runtime-source helpers; scanner expiry-state access now uses the ECStore runtime `expiry_state_handle` boundary; `GLOBAL_EXPIRY_STATE` remains the first code-bearing ownership candidate because AppContext already has an `ExpiryStateInterface`, resolver, and tests. |
 | `GLOBAL_REPLICATION_POOL`, `GLOBAL_REPLICATION_STATS`, `GLOBAL_BUCKET_MONITOR` | `crates/ecstore/src/bucket/replication/*`, `crates/ecstore/src/runtime/global.rs` | Runtime migration target | Replication pool/stat access now stays behind replication owner and ECStore runtime-source helpers; bucket-monitor direct access now stays behind ECStore runtime helpers while AppContext/runtime-source resolvers remain the caller boundary. |
 | `GLOBAL_TIER_CONFIG_MGR`, `GLOBAL_STORAGE_CLASS`, `GLOBAL_CONFIG_SYS`, `GLOBAL_SERVER_CONFIG` | `crates/ecstore/src/config`, `crates/config`, `rustfs/src/app/context/runtime_sources.rs` | Runtime migration target | Tier config manager reads and reloads now use the ECStore runtime-source helper; move remaining config state through config/runtime-source owners only, without combining storage-class behavior or persistence changes. |
 | `GLOBAL_EVENT_NOTIFIER`, `GLOBAL_NotificationSys` | `crates/ecstore/src/runtime/global.rs`, `crates/ecstore/src/runtime/sources.rs`, and `crates/ecstore/src/services/*` | Runtime migration target | `GLOBAL_EVENT_NOTIFIER` access now stays behind ECStore runtime-source helpers; move remaining notification ownership only through notify/runtime-source boundaries. |
@@ -60,7 +60,7 @@ migration PR removes or replaces each item.
 
 ## First Code-Bearing Candidate
 
-`GLOBAL_ExpiryState` is the safest first runtime migration candidate:
+`GLOBAL_EXPIRY_STATE` is the safest first runtime migration candidate:
 
 - AppContext already exposes `ExpiryStateInterface` and resolver coverage in
   `rustfs/src/app/context.rs`.

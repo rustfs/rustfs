@@ -120,16 +120,16 @@ const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
 lazy_static! {
-    pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
-    pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
+    pub static ref GLOBAL_EXPIRY_STATE: Arc<RwLock<ExpiryState>> = ExpiryState::new();
+    pub static ref GLOBAL_TRANSITION_STATE: Arc<TransitionState> = TransitionState::new();
 }
 
 pub fn get_global_expiry_state() -> Arc<RwLock<ExpiryState>> {
-    GLOBAL_ExpiryState.clone()
+    GLOBAL_EXPIRY_STATE.clone()
 }
 
 pub fn get_global_transition_state() -> Arc<TransitionState> {
-    GLOBAL_TransitionState.clone()
+    GLOBAL_TRANSITION_STATE.clone()
 }
 
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
