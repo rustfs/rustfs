@@ -19,6 +19,7 @@ pub mod core;
 pub mod evaluator;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
+mod replication_sink;
 pub mod rule;
 mod runtime_boundary;
 mod tagging_boundary;

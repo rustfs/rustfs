@@ -20,7 +20,7 @@ use tracing::info;
 
 use super::object_lock_boundary;
 use crate::bucket::lifecycle::lifecycle::{Event, Lifecycle, ObjectOpts};
-use crate::bucket::replication::ReplicationConfig;
+use crate::bucket::lifecycle::replication_sink::{self, LifecycleReplicationConfig};
 use rustfs_common::metrics::IlmAction;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
@@ -32,7 +32,7 @@ const EVENT_LIFECYCLE_VERSION_SCAN_SKIPPED: &str = "lifecycle_version_scan_skipp
 pub struct Evaluator {
     policy: Arc<BucketLifecycleConfiguration>,
     lock_retention: Option<Arc<ObjectLockConfiguration>>,
-    repl_cfg: Option<Arc<ReplicationConfig>>,
+    repl_cfg: Option<Arc<LifecycleReplicationConfig>>,
 }
 
 impl Evaluator {
@@ -52,27 +52,16 @@ impl Evaluator {
     }
 
     /// WithReplicationConfig - sets the replication configuration for the evaluator
-    pub fn with_replication_config(mut self, rcfg: Option<Arc<ReplicationConfig>>) -> Self {
+    pub fn with_replication_config(mut self, rcfg: Option<Arc<LifecycleReplicationConfig>>) -> Self {
         self.repl_cfg = rcfg;
         self
     }
 
     /// IsPendingReplication checks if the object is pending replication.
     pub fn is_pending_replication(&self, obj: &ObjectOpts) -> bool {
-        use crate::bucket::replication::ReplicationConfigurationExt;
-        if self.repl_cfg.is_none() {
-            return false;
-        }
-        if let Some(rcfg) = &self.repl_cfg
-            && rcfg
-                .config
-                .as_ref()
-                .is_some_and(|config| config.has_active_rules(obj.name.as_str(), true))
-            && !obj.version_purge_status.is_empty()
-        {
-            return true;
-        }
-        false
+        self.repl_cfg
+            .as_ref()
+            .is_some_and(|rcfg| replication_sink::has_pending_version_purge(rcfg, obj))
     }
 
     /// IsObjectLocked checks if it is appropriate to remove an
