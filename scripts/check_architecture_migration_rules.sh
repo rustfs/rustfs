@@ -252,6 +252,7 @@ STANDALONE_CRATE_LOCAL_COMPAT_RELATIVE_CONSUMER_HITS_FILE="${TMP_DIR}/standalone
 SCANNER_BUCKET_STORAGE_COMPAT_MODULE_HITS_FILE="${TMP_DIR}/scanner_bucket_storage_compat_module_hits.txt"
 SCANNER_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_storage_api_source_bypass_hits.txt"
 SCANNER_STORAGE_API_TEST_BYPASS_HITS_FILE="${TMP_DIR}/scanner_storage_api_test_bypass_hits.txt"
+SCANNER_EXPIRY_STATE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_expiry_state_bypass_hits.txt"
 HEAL_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/heal_storage_api_source_bypass_hits.txt"
 HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE="${TMP_DIR}/heal_storage_api_test_bypass_hits.txt"
 OBS_STORAGE_API_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/obs_storage_api_source_bypass_hits.txt"
@@ -3139,6 +3140,18 @@ fi
 
 if [[ -s "$SCANNER_STORAGE_API_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "scanner source files must route ECStore and storage-api symbols through scanner::storage_api: $(paste -sd '; ' "$SCANNER_STORAGE_API_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(?:get_global_expiry_state|ecstore_get_global_expiry_state)\b' \
+    crates/scanner/src \
+    crates/scanner/tests \
+    --glob '*.rs' || true
+) >"$SCANNER_EXPIRY_STATE_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_EXPIRY_STATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner expiry-state access must use the ECStore runtime expiry_state_handle boundary: $(paste -sd '; ' "$SCANNER_EXPIRY_STATE_BYPASS_HITS_FILE")"
 fi
 
 (

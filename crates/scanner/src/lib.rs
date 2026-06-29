@@ -32,7 +32,7 @@ use storage_api::owner::{
     EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfig, EcstoreReplicationConfigurationExt,
     EcstoreReplicationHealQueueResult, EcstoreReplicationQueueAdmission, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks,
     EcstoreStorageError, EcstoreStore, EcstoreTierConfig, EcstoreVersioningApi, HTTPRangeSpec, ObjectIO, ObjectOperations,
-    ObjectToDelete, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_get_global_expiry_state,
+    ObjectToDelete, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
     ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
     ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket,
     ecstore_list_path_raw, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,
@@ -288,7 +288,7 @@ pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
-    ecstore_get_global_expiry_state().write().await.enqueue_free_version(oi).await;
+    ecstore_expiry_state_handle().write().await.enqueue_free_version(oi).await;
 }
 
 pub(crate) async fn enqueue_runtime_newer_noncurrent(
@@ -297,7 +297,7 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
     event: Event,
     src: &LcEventSrc,
 ) -> bool {
-    ecstore_get_global_expiry_state()
+    ecstore_expiry_state_handle()
         .write()
         .await
         .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
