@@ -70,7 +70,7 @@ require_source_contains "docs/architecture/global-state-crate-split-plan.md" "ru
 require_source_contains "docs/architecture/global-state-crate-split-plan.md" "global-state-inventory.md" "global state inventory plan link"
 require_source_contains "docs/architecture/global-state-inventory.md" "## Global State Classification" "global state inventory classification section"
 require_source_contains "docs/architecture/global-state-inventory.md" "## Runtime Migration Inventory" "global state inventory migration section"
-require_source_contains "docs/architecture/global-state-inventory.md" "GLOBAL_ExpiryState" "global state inventory first candidate"
+require_source_contains "docs/architecture/global-state-inventory.md" "GLOBAL_EXPIRY_STATE" "global state inventory first candidate"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Dependency Inventory" "observability ECStore dependency inventory section"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Extraction Plan" "observability ECStore extraction plan section"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "crates/obs/src/metrics/storage_api.rs" "observability ECStore storage_api boundary"
@@ -207,6 +207,7 @@ GLOBAL_LOCAL_DISK_ID_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_id_map_b
 GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_set_drives_bypass_hits.txt"
 GLOBAL_ERASURE_SD_BYPASS_HITS_FILE="${TMP_DIR}/global_erasure_sd_bypass_hits.txt"
 GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE="${TMP_DIR}/global_root_disk_threshold_bypass_hits.txt"
+GLOBAL_LIFECYCLE_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_state_bypass_hits.txt"
 GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_sys_bypass_hits.txt"
 GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE="${TMP_DIR}/global_event_notifier_bypass_hits.txt"
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
@@ -2633,6 +2634,18 @@ fi
 
 if [[ -s "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_ROOT_DISK_THRESHOLD access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(ExpiryState|EXPIRY_STATE|TransitionState|TRANSITION_STATE)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/(bucket/lifecycle/bucket_lifecycle_ops|runtime/sources)\.rs:' || true
+) >"$GLOBAL_LIFECYCLE_STATE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_LIFECYCLE_STATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle state globals must stay behind ECStore lifecycle owner and runtime-source helpers: $(paste -sd '; ' "$GLOBAL_LIFECYCLE_STATE_BYPASS_HITS_FILE")"
 fi
 
 (
