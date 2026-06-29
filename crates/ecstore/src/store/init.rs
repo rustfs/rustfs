@@ -70,9 +70,9 @@ fn should_auto_start_rebalance_after_recovered_meta(pool_meta: &PoolMeta, rebala
 }
 
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
-    tokio::select! {
+    select! {
         _ = rx.cancelled() => false,
-        _ = tokio::time::sleep(delay) => true,
+        _ = sleep(delay) => true,
     }
 }
 
@@ -140,9 +140,9 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                     error = %err,
                     "Retrying decommission resume after missing config"
                 );
-                tokio::select! {
+                select! {
                     _ = rx.cancelled() => return,
-                    _ = tokio::time::sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
+                    _ = sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
                 }
             }
             Err(err) => {
@@ -332,8 +332,8 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
-            start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -545,6 +545,7 @@ mod tests {
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(self.read_payload.clone())),
                 object_info: self.object_info(bucket, object, self.read_payload.len()),
+                buffered_body: None,
             })
         }
 
