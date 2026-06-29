@@ -378,15 +378,14 @@ pub(crate) mod ecstore_global {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::global::new_object_layer_fn;
     pub(crate) use rustfs_ecstore::api::global::{
-        GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
-        get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        is_dist_erasure, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
-        shutdown_background_services, update_erasure_type,
+        get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
+        get_global_lock_clients, get_global_region, global_rustfs_port, is_dist_erasure, set_global_endpoints, set_global_region,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
 }
 
 pub(crate) mod ecstore_runtime {
-    pub(crate) use rustfs_ecstore::api::runtime::boot_time;
+    pub(crate) use rustfs_ecstore::api::runtime::{boot_time, global_tier_config_mgr};
 }
 
 #[allow(unused_imports)]
@@ -1114,7 +1113,7 @@ pub(crate) fn global_rustfs_port() -> u16 {
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
-    ecstore_global::get_global_tier_config_mgr()
+    ecstore_runtime::global_tier_config_mgr()
 }
 
 pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
@@ -1201,7 +1200,7 @@ pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_global::GLOBAL_TierConfigMgr.write().await.reload(api).await
+    ecstore_runtime::global_tier_config_mgr().write().await.reload(api).await
 }
 
 pub(crate) async fn all_local_disk_path() -> Vec<String> {
