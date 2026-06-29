@@ -65,7 +65,6 @@ impl WarmBackendRustFS {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
             region: conf.region.clone(),
             ..Default::default()

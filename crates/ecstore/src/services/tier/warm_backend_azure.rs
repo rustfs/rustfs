@@ -68,7 +68,6 @@ impl WarmBackendAzure {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            //transport: GLOBAL_RemoteTargetTransport,
             trailing_headers: true,
             region: conf.region.clone(),
             bucket_lookup: BucketLookupType::BucketLookupDNS,
