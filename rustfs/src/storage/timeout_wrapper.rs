@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, warn};
@@ -116,6 +117,12 @@ impl GetObjectTimeoutPolicy {
             min_timeout: Duration::from_secs(min_timeout_secs),
             max_timeout: Duration::from_secs(max_timeout_secs),
         }
+    }
+
+    /// Load the process-wide GetObject timeout policy once for hot request paths.
+    pub fn cached_from_env() -> Self {
+        static POLICY: OnceLock<GetObjectTimeoutPolicy> = OnceLock::new();
+        POLICY.get_or_init(Self::from_env).clone()
     }
 
     /// Check if timeout is enabled (timeout > 0).
@@ -473,6 +480,18 @@ mod tests {
     fn test_timeout_config_default() {
         let config = GetObjectTimeoutPolicy::default();
         assert_eq!(config.get_object_timeout, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn test_cached_timeout_config_is_stable() {
+        let first = GetObjectTimeoutPolicy::cached_from_env();
+        let second = GetObjectTimeoutPolicy::cached_from_env();
+
+        assert_eq!(first.get_object_timeout, second.get_object_timeout);
+        assert_eq!(first.enable_dynamic_timeout, second.enable_dynamic_timeout);
+        assert_eq!(first.bytes_per_second, second.bytes_per_second);
+        assert_eq!(first.min_timeout, second.min_timeout);
+        assert_eq!(first.max_timeout, second.max_timeout);
     }
 
     #[test]

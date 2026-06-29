@@ -2116,7 +2116,7 @@ impl DefaultObjectUsecase {
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
-        let timeout_config = GetObjectTimeoutPolicy::from_env();
+        let timeout_config = GetObjectTimeoutPolicy::cached_from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
