@@ -18,6 +18,7 @@ mod replication_pool;
 mod replication_resyncer;
 mod replication_state;
 mod rule;
+mod runtime_boundary;
 
 pub use config::*;
 pub use datatypes::*;
