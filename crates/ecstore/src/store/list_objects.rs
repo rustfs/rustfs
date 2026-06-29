@@ -672,6 +672,8 @@ impl ECStore {
     pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
         // tracing::warn!("list_path opt {:?}", &o);
 
+        let list_path_started = std::time::Instant::now();
+
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
         //     return Err(Error::msg("eof"));
@@ -816,6 +818,21 @@ impl ECStore {
             }
         }
 
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            bucket = %o.bucket,
+            prefix = %o.base_dir,
+            limit = o.limit,
+            marker = %o.marker.as_deref().unwrap_or(""),
+            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
+            has_error = result.err.is_some(),
+            "store list_path finished"
+        );
+
         Ok(result)
     }
 
@@ -827,6 +844,15 @@ impl ECStore {
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
         // warn!("list_merged ops {:?}", &opts);
+        let merge_started = std::time::Instant::now();
+
+        debug!(
+            list_path_limit = opts.limit,
+            recursive = opts.recursive,
+            pool_count = self.pools.len(),
+            requested_marker = %opts.marker.as_deref().unwrap_or(""),
+            "store list_merged started"
+        );
 
         let mut futures = Vec::new();
 
@@ -900,6 +926,19 @@ impl ECStore {
         }
 
         // check all_at_eof
+
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_list_merged",
+            merge_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            set_pair_count = self.pools.len(),
+            all_at_eof = all_at_eof,
+            error_count = errs.iter().filter(|err| err.is_some()).count(),
+            "store list_merged finished"
+        );
+
         _ = all_at_eof;
 
         Ok(Vec::new())
@@ -1957,6 +1996,16 @@ impl Sets {
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
+        let merge_started = std::time::Instant::now();
+
+        debug!(
+            list_path_limit = opts.limit,
+            recursive = opts.recursive,
+            set_count = self.disk_set.len(),
+            requested_marker = %opts.marker.as_deref().unwrap_or(""),
+            "sets list_merged started"
+        );
+
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -2004,6 +2053,18 @@ impl Sets {
                 all_at_eof = false;
             }
         }
+
+        rustfs_io_metrics::record_stage_duration(
+            "sets_list_objects_list_merged",
+            merge_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            set_count = self.disk_set.len(),
+            all_at_eof = all_at_eof,
+            error_count = errs.iter().filter(|err| err.is_some()).count(),
+            "sets list_merged finished"
+        );
 
         _ = all_at_eof;
         Ok(Vec::new())
@@ -2724,6 +2785,8 @@ impl SetDisks {
     pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
 
+        let list_path_started = std::time::Instant::now();
+
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
@@ -2843,10 +2906,27 @@ impl SetDisks {
             }
         }
 
+        rustfs_io_metrics::record_stage_duration(
+            "sets_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            bucket = %o.bucket,
+            prefix = %o.base_dir,
+            limit = o.limit,
+            marker = %o.marker.as_deref().unwrap_or(""),
+            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
+            has_error = result.err.is_some(),
+            "sets list_path finished"
+        );
+
         Ok(result)
     }
 
     pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+        let list_path_started = std::time::Instant::now();
+
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
@@ -2903,7 +2983,7 @@ impl SetDisks {
         let cancel_for_send1 = rx.clone();
         let cancel_for_send2 = rx.clone();
 
-        list_path_raw(
+        let result = list_path_raw(
             rx,
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
@@ -2947,8 +3027,39 @@ impl SetDisks {
                 ..Default::default()
             },
         )
-        .await
-        .map_err(Error::from)
+        .await;
+
+        rustfs_io_metrics::record_stage_duration(
+            "set_disks_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        if let Err(ref err) = result {
+            debug!(
+                bucket = %opts.bucket,
+                path = %opts.base_dir,
+                disk_count = disks.len(),
+                fallback_disks = fallback_disks.len(),
+                asked_disks = ask_disks,
+                listing_quorum = listing_quorum,
+                stop_disk_at_limit = opts.stop_disk_at_limit,
+                list_error = %err,
+                "set_disks list_path finished with error"
+            );
+        } else {
+            debug!(
+                bucket = %opts.bucket,
+                path = %opts.base_dir,
+                disk_count = disks.len(),
+                fallback_disks = fallback_disks.len(),
+                asked_disks = ask_disks,
+                listing_quorum = listing_quorum,
+                stop_disk_at_limit = opts.stop_disk_at_limit,
+                "set_disks list_path finished"
+            );
+        }
+
+        result.map_err(Error::from)
     }
 }
 
