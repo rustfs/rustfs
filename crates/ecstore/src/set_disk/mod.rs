@@ -1181,7 +1181,7 @@ pub struct SetDisks {
     pub pool_index: usize,
     pub format: FormatV3,
     disk_health_cache: Arc<RwLock<Vec<Option<DiskHealthEntry>>>>,
-    get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, GetObjectMetadataCacheEntry>,
+    get_object_metadata_cache: moka::future::Cache<GetObjectMetadataCacheKey, Arc<GetObjectMetadataCacheEntry>>,
     pub lockers: Vec<Arc<dyn LockClient>>,
     local_lock_manager: Arc<rustfs_lock::GlobalLockManager>,
 }
@@ -2174,6 +2174,34 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {
             let object_size = usize::try_from(object_info.size)
                 .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
+            if let Some(body) = Self::try_get_object_direct_data_shards_with_fileinfo(
+                bucket,
+                object,
+                &fi,
+                &files,
+                &disks,
+                opts.skip_verify_bitrot,
+                object_class.as_str(),
+                size_bucket,
+            )
+            .await?
+            {
+                if body.len() != object_size {
+                    return Err(to_object_err(
+                        Error::other("direct-memory GET decoded length mismatch"),
+                        vec![bucket, object],
+                    ));
+                }
+
+                record_get_object_reader_path_observation(GET_OBJECT_PATH_DIRECT_MEMORY, object_class, size_bucket);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(body.clone())),
+                    object_info,
+                    buffered_body: Some(body),
+                };
+                return Ok(reader);
+            }
+
             let mut output = Vec::with_capacity(object_size);
             Self::get_object_with_fileinfo(
                 bucket,
@@ -9207,6 +9235,86 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn direct_memory_data_shards_direct_read_reassembles_single_block_payload() {
+        use uuid::Uuid;
+
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "object";
+        let payload = vec![b'd'; 192 * 1024];
+
+        disk.make_volume(bucket).await.expect("bucket should be created");
+
+        let mut fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 0);
+        let data_dir = Uuid::new_v4();
+        fi.data_dir = Some(data_dir);
+        fi.size = payload.len() as i64;
+        fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
+
+        let erasure = coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        let shard_path = format!("{object}/{data_dir}/part.1");
+        let checksum_info = fi.erasure.get_checksum_info(1);
+
+        let mut bitrot_writer = create_bitrot_writer(
+            true,
+            None,
+            bucket,
+            &shard_path,
+            payload.len() as i64,
+            erasure.shard_size(),
+            checksum_info.algorithm.clone(),
+        )
+        .await
+        .expect("bitrot writer should be created");
+
+        for chunk in payload.chunks(erasure.shard_size()) {
+            bitrot_writer.write(chunk).await.expect("payload chunk should be written");
+        }
+
+        let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
+        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+            .await
+            .expect("encoded shard should be stored");
+
+        let files = vec![fi.clone()];
+        let disks = vec![Some(disk)];
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            bucket,
+            object,
+            &fi,
+            &files,
+            &disks,
+            true,
+            GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+            metrics_size_bucket,
+        )
+        .await
+        .expect("direct-memory data shard read should not fail")
+        .expect("single-block data shard path should be used");
+
+        assert_eq!(body.as_ref(), payload);
     }
 
     #[tokio::test]

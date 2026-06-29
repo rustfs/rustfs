@@ -28,10 +28,10 @@ use crate::diagnostics::get::{
     GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_METADATA_CACHE_LOOKUP,
-    GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason, classify_disk_error,
-    get_stage_timer_if_enabled, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
-    record_get_stage_duration_if_enabled,
+    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
+    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
+    record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::{create_deferred_bitrot_reader, object_mmap_read_enabled};
@@ -437,7 +437,7 @@ impl MetadataQuorumAccumulator {
 
 #[derive(Clone, Debug)]
 enum MetadataCacheLookup {
-    Hit(GetObjectMetadataCacheEntry),
+    Hit(Arc<GetObjectMetadataCacheEntry>),
     Miss,
     RejectedInsufficientQuorum,
 }
@@ -839,6 +839,7 @@ enum BitrotReaderSetupMode {
 enum BitrotReaderSetupStrategy {
     AllShards,
     DataBlocksFirst,
+    DataBlocksOnly,
 }
 
 impl BitrotReaderSetupMode {
@@ -855,6 +856,7 @@ impl BitrotReaderSetupStrategy {
         match self {
             BitrotReaderSetupStrategy::AllShards => "all_shards",
             BitrotReaderSetupStrategy::DataBlocksFirst => "data_blocks_first",
+            BitrotReaderSetupStrategy::DataBlocksOnly => "data_blocks_only",
         }
     }
 }
@@ -1347,6 +1349,60 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     setup
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn create_data_block_bitrot_readers(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+) -> BitrotReaderSetup {
+    let strategy = BitrotReaderSetupStrategy::DataBlocksOnly;
+    let total_shards = disks.len().min(files.len());
+    let mut setup = BitrotReaderSetup::new(total_shards);
+    let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
+
+    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), BitrotReaderSetupMode::ReadQuorum.as_str());
+
+    for idx in 0..data_shards.min(total_shards) {
+        schedule_bitrot_reader_task(
+            &mut reader_tasks,
+            &mut setup,
+            idx,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+        );
+    }
+
+    while let Some((idx, result)) = reader_tasks.next().await {
+        setup.apply_reader_result(idx, result);
+        if setup.available_data_shards(data_shards) >= data_shards {
+            break;
+        }
+    }
+
+    drop(reader_tasks);
+    record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup);
+
+    setup
+}
+
 async fn collect_read_multiple_results<F>(
     tasks: Vec<F>,
     read_quorum: usize,
@@ -1443,7 +1499,7 @@ impl SetDisks {
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
         match self.lookup_cached_get_object_fileinfo(bucket, object).await {
-            MetadataCacheLookup::Hit(entry) => Some(entry),
+            MetadataCacheLookup::Hit(entry) => Some((*entry).clone()),
             MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
         }
     }
@@ -1479,13 +1535,13 @@ impl SetDisks {
         self.get_object_metadata_cache
             .insert(
                 key,
-                GetObjectMetadataCacheEntry {
+                Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
                     fi: fi.clone(),
                     parts_metadata: parts_metadata.to_vec(),
                     online_disks: online_disks.to_vec(),
                     read_quorum,
-                },
+                }),
             )
             .await;
     }
@@ -2180,7 +2236,7 @@ impl SetDisks {
                         GET_STAGE_METADATA_CACHE_LOOKUP,
                         metadata_cache_lookup_start,
                     );
-                    return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+                    return Ok((cached.fi.clone(), cached.parts_metadata.clone(), cached.online_disks.clone()));
                 }
                 MetadataCacheLookup::Miss => {
                     rustfs_io_metrics::record_get_object_metadata_cache_decision(
@@ -2323,6 +2379,97 @@ impl SetDisks {
         }
 
         (oi, write_quorum, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_get_object_direct_data_shards_with_fileinfo(
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<Option<Bytes>> {
+        if fi.parts.len() != 1 || !should_use_single_block_non_inline_fast_path(fi.data.is_some(), fi.size, fi.erasure.block_size)
+        {
+            return Ok(None);
+        }
+
+        let object_size = usize::try_from(fi.size)
+            .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
+        let Some(part) = fi.parts.first() else {
+            return Ok(None);
+        };
+        if part.size < object_size {
+            return Ok(None);
+        }
+
+        let erasure = coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        if erasure.data_shards == 0 {
+            return Ok(None);
+        }
+
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+        let checksum_info = fi.erasure.get_checksum_info(part.number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
+        let read_length = erasure.shard_file_offset(0, object_size, object_size);
+        let use_mmap_read = object_mmap_read_enabled();
+
+        let reader_setup_stage_start = Instant::now();
+        let mut reader_setup = create_data_block_bitrot_readers(
+            &files,
+            &disks,
+            bucket,
+            object,
+            part.number,
+            0,
+            read_length,
+            erasure.shard_size(),
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            erasure.data_shards,
+        )
+        .await;
+        let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+        rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+            GET_OBJECT_PATH_DIRECT_MEMORY,
+            GET_STAGE_READER_SETUP,
+            metrics_object_class,
+            metrics_size_bucket,
+            reader_setup_elapsed.as_secs_f64(),
+        );
+
+        if reader_setup.available_data_shards(erasure.data_shards) < erasure.data_shards {
+            return Ok(None);
+        }
+
+        let decode_stage_start = Instant::now();
+        let body =
+            try_read_inline_data_shards_direct(&mut reader_setup.readers, erasure.data_shards, read_length, object_size).await;
+        let decode_elapsed = decode_stage_start.elapsed();
+        rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+            GET_OBJECT_PATH_DIRECT_MEMORY,
+            GET_STAGE_DECODE,
+            metrics_object_class,
+            metrics_size_bucket,
+            decode_elapsed.as_secs_f64(),
+        );
+
+        Ok(body)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3375,13 +3522,13 @@ mod metadata_cache_tests {
         set.get_object_metadata_cache
             .insert(
                 GetObjectMetadataCacheKey::new("bucket", "object"),
-                GetObjectMetadataCacheEntry {
+                Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
                     read_quorum: 1,
-                },
+                }),
             )
             .await;
 
