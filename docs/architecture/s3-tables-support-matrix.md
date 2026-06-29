@@ -100,9 +100,30 @@ catalog extension.
 | Post-CAS finalization recovery | Supported | Diagnostics and recovery can repair stale or missing idempotency indexes without changing the current table pointer. |
 | Catalog export | Supported | Exposes table state, commit recovery state, and backing migration information for operator inspection. |
 | Strong backing migration contract | Supported as a contract | Diagnostics publish object-backed manifest state, recoverable commit-log WAL state, target backing type, replay requirements, and blockers. |
-| Strong KV/WAL backing cutover | Not claimed | The contract and diagnostics exist, but this matrix does not claim a completed backing-store migration. |
+| Durable backing migration dry-run | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, commit recovery blockers, idempotency indexes, warehouse prefix index readiness, recommended actions, and rollback configuration without mutating catalog state. |
+| Strong KV/WAL backing cutover | Preview / controlled | Operators can explicitly select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`. Run the migration dry-run first and keep the object-backed catalog available for rollback. Object-only advanced operations fail closed in durable strong mode. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple active regions. |
+
+## Durable Backing Cutover Runbook
+
+Use the migration dry-run before changing the table catalog backing for a
+warehouse:
+
+1. Run `GET /iceberg/v1/{warehouse}/catalog/migration` with a principal that has
+   `GetTableCatalogAction` on the table bucket.
+2. Treat any `blockers` entry as fail-closed. Run catalog recovery first when
+   commit recovery or idempotency repair is required, and backfill the warehouse
+   prefix index before switching backing modes.
+3. Take an object-backed catalog snapshot or backup before setting
+   `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`.
+4. Restart with durable strong backing enabled, then verify catalog config,
+   table load, commit recovery diagnostics, and table data-plane policy
+   resolution for representative tables.
+5. To roll back, restore `RUSTFS_TABLE_CATALOG_BACKING=object-backed` and restart
+   while preserving the object-backed catalog objects. Do not delete object-backed
+   catalog state until durable strong backing has passed the operator's retention
+   window.
 
 ## Production Failure Coverage
 
