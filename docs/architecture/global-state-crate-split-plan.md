@@ -9,6 +9,9 @@ the root facade and into explicit owner-local boundaries. Future work should
 therefore treat broad fallback removal as complete and use this document for the
 remaining ECStore-owned bootstrap state and crate-split decisions.
 
+The issue #730 global-state baseline and runtime migration target inventory are
+recorded in [`global-state-inventory.md`](global-state-inventory.md).
+
 ## Remaining Global Owners
 
 | Owner | Current role | Migration stance |

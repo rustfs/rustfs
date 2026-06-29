@@ -12,21 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy object writer for optimized write operations.
+//! BytesMut-backed object writer for optimized write operations.
 //!
-//! This module provides a zero-copy writer that minimizes memory allocations
-//! and data copying during write operations.
+//! This module keeps the historical `ZeroCopyObjectWriter` name for public API
+//! compatibility. It uses `BytesMut` for efficient buffering; writes into that
+//! buffer may still copy input bytes.
 
 use bytes::{BufMut, Bytes, BytesMut};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::AsyncWrite;
 
-/// Zero-copy object writer for optimized write operations.
+/// BytesMut-backed object writer for optimized write operations.
 ///
 /// This writer minimizes memory allocations by:
 /// - Using BytesMut for efficient buffer growth
-/// - Supporting zero-copy data transfer via Bytes
+/// - Accepting `Bytes` inputs for efficient buffer handling
 /// - Optional integration with BytesPool for buffer reuse
 ///
 /// # Example
@@ -89,11 +90,10 @@ impl ZeroCopyObjectWriter {
         }
     }
 
-    /// Write data with zero-copy if possible.
+    /// Write data into the internal buffer.
     ///
-    /// This method attempts to write data without copying:
-    /// - If `data` is a Bytes slice, it may be appended without copying
-    /// - If `data` shares the same underlying buffer, no copy occurs
+    /// This method accepts `Bytes` for API compatibility, then appends the
+    /// bytes into the internal `BytesMut` buffer.
     ///
     /// # Arguments
     ///
@@ -116,8 +116,6 @@ impl ZeroCopyObjectWriter {
         }
 
         let len = data.len();
-        // Zero-copy: put Bytes into BytesMut
-        // If data shares the same underlying buffer, no copy occurs
         self.buffer.put(data);
 
         self.bytes_written += len;

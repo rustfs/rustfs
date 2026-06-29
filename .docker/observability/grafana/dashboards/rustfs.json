@@ -5211,10 +5211,11 @@
             "uid": "${datasource}"
           },
           "expr": "rate(rustfs_s3_put_object_total{job=~\"$job\"}[5m])",
-          "legendFormat": "PutObject - {{zero_copy_enabled}}",
+          "legendFormat": "PutObject - legacy mmap flag {{zero_copy_enabled}}",
           "refId": "B"
         }
       ],
+      "description": "The zero_copy_enabled label is a legacy mmap-read compatibility flag retained until the metric rename transition.",
       "title": "S3 Operations Rate",
       "type": "timeseries"
     },
@@ -5480,11 +5481,12 @@
             "uid": "${datasource}"
           },
           "expr": "sum(increase(rustfs_zero_copy_memory_saved_bytes_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_bytes_saved_total{job=~\"$job\"}[$__rate_interval])) or vector(0)",
-          "legendFormat": "Memory Saved",
+          "legendFormat": "Legacy mmap metric",
           "refId": "A"
         }
       ],
-      "title": "Zero-Copy Memory Savings",
+      "description": "Legacy zero_copy metric names are retained for dashboard compatibility until the Phase 3 metric rename can dual-write replacement metrics.",
+      "title": "Mmap Read Memory Savings",
       "type": "timeseries"
     },
     {
