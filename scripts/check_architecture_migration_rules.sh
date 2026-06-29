@@ -182,12 +182,19 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
+GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
+GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
+GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
+GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_dist_erasure_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_ID_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_id_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_set_drives_bypass_hits.txt"
 GLOBAL_ERASURE_SD_BYPASS_HITS_FILE="${TMP_DIR}/global_erasure_sd_bypass_hits.txt"
 GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE="${TMP_DIR}/global_root_disk_threshold_bypass_hits.txt"
+GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_lifecycle_sys_bypass_hits.txt"
+GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE="${TMP_DIR}/global_event_notifier_bypass_hits.txt"
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
+GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -2304,6 +2311,54 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_REPLICATION_(POOL|STATS)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/(bucket/replication/replication_pool|runtime/sources)\.rs:' || true
+) >"$GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_REPLICATION_POOL/STATS access must stay behind replication owner or ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_Endpoints\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_Endpoints access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_IsErasure\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_IsErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_IsDistErasure\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_IsDistErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_LOCAL_DISK_MAP\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2364,6 +2419,30 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_LifecycleSys\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_LifecycleSys access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_LIFECYCLE_SYS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_EventNotifier\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_EventNotifier access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_BOOT_TIME\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2372,6 +2451,18 @@ fi
 
 if [[ -s "$GLOBAL_BOOT_TIME_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_BOOT_TIME access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_BOOT_TIME_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_LocalNodeName(Hex)?\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_LocalNodeName/Hex access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE")"
 fi
 
 (

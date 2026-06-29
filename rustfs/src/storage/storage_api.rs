@@ -567,7 +567,7 @@ pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
 }
 
 pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
-    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().cloned()
+    ecstore_bucket::replication::get_global_replication_stats()
 }
 
 pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
@@ -619,7 +619,7 @@ pub(crate) async fn prewarm_local_disk_id_map() {
 }
 
 pub(crate) fn replication_queue_current_count() -> Option<i64> {
-    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
+    get_global_replication_stats().and_then(|stats| {
         stats
             .q_cache
             .try_lock()
@@ -1046,7 +1046,7 @@ pub(crate) fn check_retention_for_modification(
 }
 
 pub(crate) async fn record_replication_proxy(bucket: &str, api: &str, is_err: bool) {
-    if let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() {
+    if let Some(stats) = get_global_replication_stats() {
         stats.inc_proxy(bucket, api, is_err).await;
     }
 }
