@@ -21,13 +21,11 @@ use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::bucket::replication::{
-    DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
-};
 use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -61,8 +59,8 @@ use rustfs_config::{
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
-    VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, ReplicateDecision, ReplicationState, RestoreStatusOps, VersionPurgeStatusType,
+    get_file_info, is_restored_object_on_disk,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
@@ -1948,7 +1946,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         Err(_) => None,
     };
     let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
-        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(ReplicationConfig::new(Some(cfg), None))),
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(replication_sink::new_replication_config(cfg))),
         _ => None,
     };
 
@@ -2703,13 +2701,7 @@ async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: 
 
     delete_object.replication_state = replication_state;
 
-    schedule_replication_delete(DeletedObjectReplicationInfo {
-        delete_object,
-        bucket: oi.bucket.clone(),
-        event_type: REPLICATE_INCOMING_DELETE.to_string(),
-        ..Default::default()
-    })
-    .await;
+    replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
 }
 
 fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
@@ -2752,9 +2744,9 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
         return Some(state);
     }
 
-    let dsc = check_replicate_delete(
+    let dsc = replication_sink::check_delete_replication(
         &oi.bucket,
-        &ObjectToDelete {
+        ObjectToDelete {
             object_name: oi.name.clone(),
             version_id,
             ..Default::default()
@@ -2765,7 +2757,6 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
             versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
             ..Default::default()
         },
-        None,
     )
     .await;
     if !dsc.replicate_any() {

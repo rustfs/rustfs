@@ -126,6 +126,7 @@ LIFECYCLE_AUDIT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_audit_sink_bypass_hi
 LIFECYCLE_CONFIG_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_config_boundary_bypass_hits.txt"
 LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_boundary_bypass_hits.txt"
 LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_lock_boundary_bypass_hits.txt"
+LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -196,6 +197,7 @@ REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_bo
 REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
+GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_target_sys_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
 GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
@@ -211,9 +213,12 @@ GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
 GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
 GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_bypass_hits.txt"
+AUDIT_SYSTEM_BYPASS_HITS_FILE="${TMP_DIR}/audit_system_bypass_hits.txt"
+HEAL_OWNER_GLOBAL_BYPASS_HITS_FILE="${TMP_DIR}/heal_owner_global_bypass_hits.txt"
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE="${TMP_DIR}/global_batch_processors_bypass_hits.txt"
 INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE="${TMP_DIR}/internode_data_transport_bypass_hits.txt"
+GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE="${TMP_DIR}/global_capacity_manager_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -841,6 +846,18 @@ fi
 
 if [[ -s "$LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle object-lock checks must stay behind lifecycle object_lock_boundary: $(paste -sd '; ' "$LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::replication' \
+    crates/ecstore/src/bucket/lifecycle \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/lifecycle/replication_sink\.rs:' || true
+) >"$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE"
+
+if [[ -s "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle replication scheduling must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2500,6 +2517,18 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_BUCKET_TARGET_SYS\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/bucket_target_sys\.rs:' || true
+) >"$GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_BUCKET_TARGET_SYS access must stay behind ECStore bucket target owner helpers: $(paste -sd '; ' "$GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_BUCKET_MONITOR\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2680,6 +2709,30 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename '\bAUDIT_SYSTEM\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/audit/src/global\.rs:' || true
+) >"$AUDIT_SYSTEM_BYPASS_HITS_FILE"
+
+if [[ -s "$AUDIT_SYSTEM_BYPASS_HITS_FILE" ]]; then
+  report_failure "AUDIT_SYSTEM access must stay behind audit owner helpers: $(paste -sd '; ' "$AUDIT_SYSTEM_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(HEAL_MANAGER|HEAL_CHANNEL_PROCESSOR|AHM_SERVICES_CANCEL_TOKEN)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/heal/src/lib\.rs:' || true
+) >"$HEAL_OWNER_GLOBAL_BYPASS_HITS_FILE"
+
+if [[ -s "$HEAL_OWNER_GLOBAL_BYPASS_HITS_FILE" ]]; then
+  report_failure "heal owner globals must stay behind heal owner helpers: $(paste -sd '; ' "$HEAL_OWNER_GLOBAL_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename '\bGLOBAL_(LOCAL_LOCK_CLIENT|LOCK_CLIENTS)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
@@ -2712,6 +2765,18 @@ fi
 
 if [[ -s "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE" ]]; then
   report_failure "internode data transport static must stay behind ECStore internode transport helpers: $(paste -sd '; ' "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_CAPACITY_MANAGER\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/object-capacity/src/capacity_manager\.rs:' || true
+) >"$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_CAPACITY_MANAGER access must stay behind rustfs_object_capacity helpers: $(paste -sd '; ' "$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE")"
 fi
 
 (
