@@ -14,8 +14,8 @@
 
 use crate::disk::{
     CheckPartsResp, DeleteOptions, DiskAPI, DiskError, DiskInfo, DiskInfoOptions, DiskLocation, Endpoint, Error,
-    FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result, UpdateMetadataOpts, VolumeInfo,
-    WalkDirOptions,
+    FileInfoVersions, MmapCopyStageMetrics, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, Result,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
     health_state::{
         RuntimeDriveHealthState, classify_drive_recovery, get_drive_returning_probe_interval,
         get_drive_returning_success_threshold, get_drive_suspect_failure_threshold, record_drive_offline_duration,
@@ -1364,6 +1364,25 @@ impl DiskAPI for LocalDiskWrapper {
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
         self.track_disk_health(
             || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<bytes::Bytes> {
+        self.track_disk_health(
+            || async {
+                self.disk
+                    .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
+                    .await
+            },
             get_max_timeout_duration(),
         )
         .await

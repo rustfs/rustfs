@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use crate::diagnostics::get::{
+    GET_STAGE_READER_MMAP_COPY_BUFFER, GET_STAGE_READER_MMAP_FILE_OPEN, GET_STAGE_READER_MMAP_MAP,
     GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS, GET_STAGE_READER_OPEN_STREAM,
     GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
 };
-use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
+use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, MmapCopyStageMetrics, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
 use rustfs_config::{DEFAULT_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
@@ -218,7 +219,16 @@ async fn open_disk_reader(
     if use_mmap_read && disk.is_local() {
         let start = stage_metrics_enabled.then(Instant::now);
         let zero_copy_start = Instant::now();
-        match disk.read_file_mmap_copy(bucket, path, offset, length).await {
+        let mmap_metrics = metrics_path.map(|metrics_path| MmapCopyStageMetrics {
+            path: metrics_path,
+            file_open_stage: GET_STAGE_READER_MMAP_FILE_OPEN,
+            mmap_map_stage: GET_STAGE_READER_MMAP_MAP,
+            mmap_copy_stage: GET_STAGE_READER_MMAP_COPY_BUFFER,
+        });
+        match disk
+            .read_file_mmap_copy_with_metrics(bucket, path, offset, length, mmap_metrics)
+            .await
+        {
             Ok(bytes) => {
                 let duration_ms = zero_copy_start.elapsed().as_secs_f64() * 1000.0;
 

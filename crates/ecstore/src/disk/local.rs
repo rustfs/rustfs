@@ -18,9 +18,9 @@ use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::{
     BUCKET_META_PREFIX, CHECK_PART_FILE_CORRUPT, CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS, CHECK_PART_UNKNOWN,
     CHECK_PART_VOLUME_NOT_FOUND, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskMetrics,
-    FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_DELETED_BUCKET,
-    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP,
-    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
+    FileInfoVersions, FileReader, FileWriter, MmapCopyStageMetrics, RUSTFS_META_BUCKET, RUSTFS_META_TMP_BUCKET,
+    RUSTFS_META_TMP_DELETED_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE,
+    STORAGE_FORMAT_FILE_BACKUP, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, conv_part_err_to_int,
     endpoint::Endpoint,
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
@@ -2784,6 +2784,23 @@ impl DiskAPI for LocalDisk {
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        self.read_file_mmap_copy_with_metrics(volume, path, offset, length, None)
+            .await
+    }
+
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
+    // SAFETY: Unix unsafe calls in this function only query page size and mmap
+    // a read-only file region after bounds and alignment are validated.
+    #[allow(unsafe_code)]
+    #[tracing::instrument(level = "debug", skip(self))]
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -2822,14 +2839,24 @@ impl DiskAPI for LocalDisk {
         #[cfg(unix)]
         {
             use memmap2::MmapOptions;
-            use std::time::Instant;
+            use std::time::{Duration as StdDuration, Instant as StdInstant};
 
-            let start = Instant::now();
+            struct MmapCopyReadResult {
+                bytes: Bytes,
+                file_open_duration: StdDuration,
+                mmap_map_duration: StdDuration,
+                mmap_copy_duration: StdDuration,
+            }
+
+            let metrics_enabled = metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+            let start = StdInstant::now();
             let file_path_clone = file_path.clone();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
-            let bytes = tokio::task::spawn_blocking(move || {
+            let read_result = tokio::task::spawn_blocking(move || {
+                let file_open_start = metrics_enabled.then(StdInstant::now);
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 #[cfg(target_os = "macos")]
                 if should_reclaim_after_read {
@@ -2856,8 +2883,10 @@ impl DiskAPI for LocalDisk {
                 // SAFETY: The file is opened as read-only, and we're mapping a region
                 // that we've already verified exists and is within file bounds. The
                 // file offset passed to mmap is page-size aligned as required on Unix.
+                let mmap_map_start = metrics_enabled.then(StdInstant::now);
                 let mmap =
                     unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+                let mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 // Copy only the requested logical range into a Bytes buffer. This
                 // avoids undefined behavior from treating OS-managed mmap memory as
@@ -2865,7 +2894,9 @@ impl DiskAPI for LocalDisk {
                 let end = logical_offset
                     .checked_add(length)
                     .ok_or_else(|| DiskError::other("mmap slice length overflow"))?;
+                let mmap_copy_start = metrics_enabled.then(StdInstant::now);
                 let bytes = Bytes::copy_from_slice(&mmap[logical_offset..end]);
+                let mmap_copy_duration = mmap_copy_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 #[cfg(target_os = "linux")]
                 if should_reclaim_after_read {
@@ -2879,10 +2910,33 @@ impl DiskAPI for LocalDisk {
                         .map_err(DiskError::from)?;
                 }
 
-                Ok::<Bytes, DiskError>(bytes)
+                Ok::<MmapCopyReadResult, DiskError>(MmapCopyReadResult {
+                    bytes,
+                    file_open_duration,
+                    mmap_map_duration,
+                    mmap_copy_duration,
+                })
             })
             .await
             .map_err(DiskError::from)??;
+            if metrics_enabled && let Some(metrics) = metrics {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.file_open_stage,
+                    read_result.file_open_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.mmap_map_stage,
+                    read_result.mmap_map_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.mmap_copy_stage,
+                    read_result.mmap_copy_duration.as_secs_f64(),
+                );
+            }
+            let bytes = read_result.bytes;
 
             // Log successful mmap read metrics
             let duration_ms = start.elapsed().as_secs_f64() * 1000.0;

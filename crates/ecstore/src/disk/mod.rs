@@ -59,6 +59,14 @@ pub type DiskStore = Arc<Disk>;
 pub type FileReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 
+#[derive(Clone, Copy, Debug)]
+pub struct MmapCopyStageMetrics {
+    pub(crate) path: &'static str,
+    pub(crate) file_open_stage: &'static str,
+    pub(crate) mmap_map_stage: &'static str,
+    pub(crate) mmap_copy_stage: &'static str,
+}
+
 #[derive(Debug)]
 pub enum Disk {
     Local(Box<LocalDiskWrapper>),
@@ -297,6 +305,24 @@ impl DiskAPI for Disk {
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         match self {
             Disk::Local(local_disk) => local_disk.read_file_mmap_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
+        }
+    }
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        match self {
+            Disk::Local(local_disk) => {
+                local_disk
+                    .read_file_mmap_copy_with_metrics(volume, path, offset, length, metrics)
+                    .await
+            }
             Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
         }
     }
@@ -563,6 +589,17 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
 
     /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
     async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
+    async fn read_file_mmap_copy_with_metrics(
+        &self,
+        volume: &str,
+        path: &str,
+        offset: usize,
+        length: usize,
+        _metrics: Option<MmapCopyStageMetrics>,
+    ) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
 
     /// Historical name for `read_file_mmap_copy`.
     #[deprecated(
