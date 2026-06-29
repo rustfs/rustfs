@@ -2402,7 +2402,7 @@ impl SetDisks {
         let Some(part) = fi.parts.first() else {
             return Ok(None);
         };
-        if part.size < object_size {
+        if part.size != object_size {
             return Ok(None);
         }
 
