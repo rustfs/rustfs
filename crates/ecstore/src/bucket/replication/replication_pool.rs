@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
@@ -1491,7 +1491,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         return;
     }
 
-    let rcfg = match metadata_sys::get_replication_config(bucket).await {
+    let rcfg = match metadata_boundary::replication_config(bucket).await {
         Ok((config, _)) => config,
         Err(err) => {
             debug!(

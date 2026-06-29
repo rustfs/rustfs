@@ -184,6 +184,7 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
+REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
@@ -2362,6 +2363,18 @@ fi
 
 if [[ -s "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication bucket-target access must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::metadata_sys|metadata_sys::get_replication_config' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_metadata_boundary\.rs:' || true
+) >"$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication metadata access must stay behind replication metadata boundary: $(paste -sd '; ' "$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
