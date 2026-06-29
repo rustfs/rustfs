@@ -158,6 +158,7 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&FileInfo) -> bool>;
+type InlineBitrotReader = coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>;
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_SET_DISK: &str = "set_disk";
@@ -1645,6 +1646,78 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn build_inline_bitrot_readers(
+    files: &[FileInfo],
+    total_shards: usize,
+    bucket: &str,
+    object: &str,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: &HashAlgorithm,
+    skip_verify_bitrot: bool,
+) -> disk::error::Result<Vec<Option<InlineBitrotReader>>> {
+    let mut readers = Vec::with_capacity(total_shards);
+    for file in files.iter().take(total_shards) {
+        let reader = if let Some(data) = &file.data {
+            create_bitrot_reader_from_bytes(
+                Some(data.clone()),
+                None,
+                bucket,
+                object,
+                0,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                false,
+            )
+            .await?
+        } else {
+            None
+        };
+        readers.push(reader);
+    }
+    Ok(readers)
+}
+
+async fn try_read_inline_data_shards_direct(
+    readers: &mut [Option<InlineBitrotReader>],
+    data_shards: usize,
+    read_length: usize,
+    object_size: usize,
+) -> Option<Bytes> {
+    if object_size == 0 || read_length == 0 || readers.len() < data_shards {
+        return None;
+    }
+
+    let mut body = Vec::with_capacity(object_size);
+    let mut remaining = object_size;
+    for reader in readers.iter_mut().take(data_shards) {
+        let reader = reader.as_mut()?;
+        let mut shard = vec![0u8; read_length];
+        let Ok(read) = reader.read(&mut shard).await else {
+            return None;
+        };
+        if read != read_length {
+            return None;
+        }
+
+        let take = remaining.min(shard.len());
+        body.extend_from_slice(&shard[..take]);
+        remaining -= take;
+        if remaining == 0 {
+            return Some(Bytes::from(body));
+        }
+    }
+
+    None
+}
+
+fn can_try_inline_data_shards_direct(object_size: usize, block_size: usize) -> bool {
+    object_size > 0 && object_size <= block_size
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
     type Error = Error;
@@ -1782,29 +1855,18 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     };
                 let read_length = erasure.shard_file_offset(0, object_size, object_size);
                 let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> =
-                    Vec::new();
-                for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
-                    if let Some(data) = &file.data {
-                        readers.push(
-                            create_bitrot_reader_from_bytes(
-                                Some(data.clone()),
-                                None,
-                                bucket,
-                                object,
-                                0,
-                                read_length,
-                                erasure.shard_size(),
-                                checksum_algo.clone(),
-                                opts.skip_verify_bitrot,
-                                false,
-                            )
-                            .await?,
-                        );
-                    } else {
-                        readers.push(None);
-                    }
-                }
+                let total_shards = data_shards + fi.erasure.parity_blocks;
+                let mut readers = build_inline_bitrot_readers(
+                    &files,
+                    total_shards,
+                    bucket,
+                    object,
+                    read_length,
+                    erasure.shard_size(),
+                    &checksum_algo,
+                    opts.skip_verify_bitrot,
+                )
+                .await?;
                 if let Some(reader_setup_stage_start) = reader_setup_stage_start {
                     rustfs_io_metrics::record_get_object_stage_duration_by_size(
                         GET_OBJECT_PATH_INLINE_DIRECT,
@@ -1817,8 +1879,38 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
 
                 // Decode directly
                 let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let mut output = Cursor::new(Vec::with_capacity(object_size));
-                let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+                let direct_body = if can_try_inline_data_shards_direct(object_size, erasure.block_size) {
+                    try_read_inline_data_shards_direct(&mut readers, data_shards, read_length, object_size).await
+                } else {
+                    None
+                };
+                let body = if let Some(body) = direct_body {
+                    body
+                } else {
+                    let readers = build_inline_bitrot_readers(
+                        &files,
+                        total_shards,
+                        bucket,
+                        object,
+                        read_length,
+                        erasure.shard_size(),
+                        &checksum_algo,
+                        opts.skip_verify_bitrot,
+                    )
+                    .await?;
+                    let mut output = Cursor::new(Vec::with_capacity(object_size));
+                    let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+                    if let Some(e) = err {
+                        return Err(to_object_err(e.into(), vec![bucket, object]));
+                    }
+                    if written == 0 && fi.size > 0 {
+                        return Err(to_object_err(
+                            Error::other("inline fast path: erasure decode returned 0 bytes"),
+                            vec![bucket, object],
+                        ));
+                    }
+                    Bytes::from(output.into_inner())
+                };
                 if let Some(decode_stage_start) = decode_stage_start {
                     rustfs_io_metrics::record_get_object_stage_duration_by_size(
                         GET_OBJECT_PATH_INLINE_DIRECT,
@@ -1829,18 +1921,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
 
-                if let Some(e) = err {
-                    return Err(to_object_err(e.into(), vec![bucket, object]));
-                }
-                if written == 0 && fi.size > 0 {
-                    return Err(to_object_err(
-                        Error::other("inline fast path: erasure decode returned 0 bytes"),
-                        vec![bucket, object],
-                    ));
-                }
-
                 record_get_object_reader_path_observation(GET_OBJECT_PATH_INLINE_DIRECT, object_class, size_bucket);
-                let body = Bytes::from(output.into_inner());
                 let reader = GetObjectReader {
                     stream: Box::new(Cursor::new(body.clone())),
                     object_info,
@@ -8760,6 +8841,90 @@ mod tests {
             &opts,
             128 * 1024
         ));
+    }
+
+    async fn inline_bitrot_files_for_payload(payload: &[u8]) -> (coding::Erasure, Vec<FileInfo>, usize, HashAlgorithm) {
+        let erasure = coding::Erasure::new(4, 2, 1024 * 1024);
+        let read_length = erasure.shard_file_offset(0, payload.len(), payload.len());
+        let checksum_algo = HashAlgorithm::HighwayHash256S;
+        let shards = erasure.encode_data(payload).expect("payload should encode");
+        let mut files = Vec::with_capacity(shards.len());
+
+        for shard in shards {
+            let mut writer = coding::BitrotWriterWrapper::new(
+                coding::CustomWriter::new_inline_buffer(),
+                erasure.shard_size(),
+                checksum_algo.clone(),
+            );
+            writer.write(&shard).await.expect("inline shard should write");
+            writer.shutdown().await.expect("inline writer should shutdown");
+            let data = writer.into_inline_data().expect("inline data should be retained");
+            files.push(FileInfo {
+                data: Some(Bytes::from(data)),
+                ..Default::default()
+            });
+        }
+
+        (erasure, files, read_length, checksum_algo)
+    }
+
+    #[tokio::test]
+    async fn inline_data_shards_direct_read_reassembles_payload() {
+        let payload = b"small inline object payload that spans data shards";
+        let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
+        let mut readers = build_inline_bitrot_readers(
+            &files,
+            erasure.total_shard_count(),
+            "bucket",
+            "object",
+            read_length,
+            erasure.shard_size(),
+            &checksum_algo,
+            false,
+        )
+        .await
+        .expect("inline bitrot readers should build");
+
+        let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len())
+            .await
+            .expect("data shard direct read should succeed");
+
+        assert_eq!(body.as_ref(), payload);
+    }
+
+    #[tokio::test]
+    async fn inline_data_shards_direct_read_rejects_corrupt_shard() {
+        let payload = b"small inline object payload that will be corrupted";
+        let (erasure, mut files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
+        let first = files[0].data.as_mut().expect("first shard should exist");
+        let mut corrupted = first.to_vec();
+        let last = corrupted.last_mut().expect("encoded shard should not be empty");
+        *last ^= 0xff;
+        *first = Bytes::from(corrupted);
+
+        let mut readers = build_inline_bitrot_readers(
+            &files,
+            erasure.total_shard_count(),
+            "bucket",
+            "object",
+            read_length,
+            erasure.shard_size(),
+            &checksum_algo,
+            false,
+        )
+        .await
+        .expect("inline bitrot readers should build");
+
+        let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len()).await;
+
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn inline_data_shards_direct_read_requires_single_block() {
+        assert!(can_try_inline_data_shards_direct(1024, 1024));
+        assert!(!can_try_inline_data_shards_direct(0, 1024));
+        assert!(!can_try_inline_data_shards_direct(1025, 1024));
     }
 
     #[tokio::test]
