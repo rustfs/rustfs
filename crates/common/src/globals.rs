@@ -143,6 +143,16 @@ pub async fn evict_connection_with_log_level(addr: &str, log_level: ConnectionEv
     }
 }
 
+/// Get a cached gRPC connection for the given address.
+pub async fn cached_connection(addr: &str) -> Option<Channel> {
+    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+}
+
+/// Cache a gRPC connection for the given address.
+pub async fn cache_connection(addr: String, channel: Channel) {
+    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+}
+
 /// Check if a connection exists in the cache for the given address.
 ///
 /// # Arguments
