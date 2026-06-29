@@ -2956,11 +2956,13 @@ impl SetDisks {
             fallback_disks = disks.split_off(ask_disks as usize);
         }
 
-        let resolver = list_metadata_resolution_params(opts.bucket.clone(), listing_quorum, opts.versioned);
+        let bucket = opts.bucket.clone();
+        let base_dir = opts.base_dir.clone();
+        let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, opts.versioned);
 
         debug!(
-            bucket = %opts.bucket,
-            prefix = %opts.base_dir,
+            bucket = %bucket,
+            prefix = %base_dir,
             set_drive_count = self.set_drive_count,
             asked_disks = ask_disks,
             listing_quorum = listing_quorum,
@@ -3036,8 +3038,8 @@ impl SetDisks {
 
         if let Err(ref err) = result {
             debug!(
-                bucket = %opts.bucket,
-                path = %opts.base_dir,
+                bucket = %bucket,
+                path = %base_dir,
                 disk_count = disks.len(),
                 fallback_disks = fallback_disks.len(),
                 asked_disks = ask_disks,
@@ -3048,8 +3050,8 @@ impl SetDisks {
             );
         } else {
             debug!(
-                bucket = %opts.bucket,
-                path = %opts.base_dir,
+                bucket = %bucket,
+                path = %base_dir,
                 disk_count = disks.len(),
                 fallback_disks = fallback_disks.len(),
                 asked_disks = ask_disks,

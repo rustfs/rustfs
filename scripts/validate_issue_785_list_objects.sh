@@ -35,13 +35,21 @@ run_unit_checks() {
   mkdir -p "$OUT_DIR"
 
   local test_log="$OUT_DIR/issue-785-ecstore-tests.log"
-  (cd "$PROJECT_ROOT" && cargo test -p rustfs-ecstore \
-    list_path_gather_results_returns_after_limit_without_waiting_for_input_close \
-    list_path_gather_results_keeps_marker_entry_for_version_marker_listing \
-    list_path_gather_results_skips_marker_entry_by_default \
-    normalize_list_quorum_falls_back_to_strict \
-    list_objects_quorum_from_env_defaults_to_optimal \
-    -- --nocapture | tee "$test_log")
+  : > "$test_log"
+
+  local tests=(
+    list_path_gather_results_returns_after_limit_without_waiting_for_input_close
+    list_path_gather_results_keeps_marker_entry_for_version_marker_listing
+    list_path_gather_results_skips_marker_entry_by_default
+    normalize_list_quorum_falls_back_to_strict
+    list_objects_quorum_from_env_defaults_to_optimal
+  )
+
+  local test
+  for test in "${tests[@]}"; do
+    echo "[TEST] $test" | tee -a "$test_log"
+    (cd "$PROJECT_ROOT" && cargo test -p rustfs-ecstore "$test" -- --nocapture | tee -a "$test_log")
+  done
 
   log_info "Unit test log: $test_log"
 }
