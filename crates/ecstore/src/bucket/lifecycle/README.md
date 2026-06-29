@@ -12,7 +12,7 @@ and tier services.
 | `core.rs` | Lifecycle rule model, action evaluation, object options, and transition/expiry decisions. | Uses ECStore object metadata types and compatibility DTO re-exports. |
 | `bucket_lifecycle_ops.rs` | Worker orchestration, expiry, transition, stale multipart cleanup, audit, replication delete scheduling, and queue state. | Depends on `ECStore`, `SetDisks`, runtime globals, bucket metadata/versioning/replication, disk internals, event notification, and tier services. |
 | `evaluator.rs` | Bucket lifecycle evaluation wrapper. | Reads object-lock and replication config from ECStore bucket modules. |
-| `rule.rs` | Lifecycle rule filter helpers. | Uses ECStore bucket tagging helpers. |
+| `rule.rs` | Lifecycle rule filter helpers. | Uses lifecycle-local tagging boundary. |
 | `tier_delete_journal.rs` | Remote tier delete journal persistence and recovery. | Uses lifecycle-local config persistence boundary, object IO contracts, metadata bucket paths, and `ECStore`. |
 | `tier_free_version_recovery.rs` | Free-version recovery queue and object restoration path. | Depends on `ECStore`, object metadata, storage-api contracts, and lifecycle queue callbacks. |
 | `tier_last_day_stats.rs` | Tier statistics helpers. | Pure data/stat logic, but still part of lifecycle worker reporting. |
@@ -27,6 +27,7 @@ and tier services.
 | `LifecycleMetadataStore` | Lifecycle, object-lock, replication, bucket versioning, and stale multipart metadata reads. | Direct bucket metadata, object-lock, versioning, and replication module imports. |
 | `LifecycleRuntime` | Expiry state, transition state, tier config, deployment ID, local node name, queue metrics, cancellation, and worker sizing. | Direct runtime source/global access and process environment reads inside worker code. |
 | `LifecycleConfigStore` | Persist, read, and remove lifecycle-owned journal/config objects. | Direct ECStore config persistence helper imports from worker paths. |
+| `LifecycleTagFilter` | Decode object tag strings for lifecycle rule matching. | Direct bucket tagging helper imports from lifecycle rule paths. |
 | `LifecycleReplicationSink` | Lifecycle-originated delete and version-purge replication scheduling. | Direct imports from bucket replication modules. |
 | `LifecycleAuditSink` | Lifecycle audit and notification event emission. | Direct event notification service calls and audit-side effects from worker code. |
 

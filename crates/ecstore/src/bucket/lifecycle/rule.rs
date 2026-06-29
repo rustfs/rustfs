@@ -11,7 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-use crate::bucket::tagging::decode_tags_to_map;
+use super::tagging_boundary;
 use s3s::dto::{LifecycleRuleAndOperator, LifecycleRuleFilter, Tag, Transition};
 
 const _ERR_TRANSITION_INVALID_DAYS: &str = "Days must be 0 or greater when used with Transition";
@@ -31,7 +31,7 @@ impl Filter for LifecycleRuleFilter {
             return true;
         }
 
-        let user_tags = decode_tags_to_map(user_tags);
+        let user_tags = tagging_boundary::decode_tags_to_map(user_tags);
 
         self.tag.as_ref().is_none_or(|tag| tag_matches(tag, &user_tags))
             && self.and.as_ref().is_none_or(|and| and_tags_match(and, &user_tags))
