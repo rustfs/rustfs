@@ -211,6 +211,7 @@ GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local
 GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
 GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_bypass_hits.txt"
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
+GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE="${TMP_DIR}/global_batch_processors_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -2672,6 +2673,18 @@ fi
 
 if [[ -s "$GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE" ]]; then
   report_failure "ECStore lock client globals must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_PROCESSORS\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/services/batch_processor\.rs:' || true
+) >"$GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_PROCESSORS access must stay behind ECStore batch processor owner helpers: $(paste -sd '; ' "$GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE")"
 fi
 
 (
