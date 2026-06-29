@@ -47,3 +47,7 @@ and lifecycle/heal scheduling paths.
 Start with `ReplicationRuntime` or `ReplicationEventSink`. Both can be added as
 narrow internal contracts while keeping current queue, MRF, resync, and target
 behavior unchanged. Do not start with a crate move.
+
+Current compatibility guard: `crates/ecstore/tests/replication_facade_compat_test.rs`
+keeps the ECStore replication facade types covered while architecture rules
+keep direct imports behind local `storage_api` boundaries.
