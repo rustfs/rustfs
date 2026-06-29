@@ -1053,6 +1053,11 @@ pub fn record_zero_copy_read(size_bytes: usize, duration_ms: f64) {
     counter!("rustfs_zero_copy_reads_total").increment(1);
     histogram!("rustfs_zero_copy_read_size_bytes").record(size_bytes as f64);
     histogram!("rustfs_zero_copy_read_duration_ms").record(duration_ms);
+
+    counter!(mmap_copy::READS_TOTAL).increment(1);
+    histogram!(mmap_copy::READ_SIZE_BYTES).record(size_bytes as f64);
+    histogram!(mmap_copy::READ_DURATION_MS).record(duration_ms);
+    counter!(mmap_copy::BYTES_COPIED_TOTAL).increment(size_bytes as u64);
 }
 
 /// Record memory copies avoided by using zero-copy.
@@ -1076,6 +1081,7 @@ pub fn record_memory_copy_saved(bytes_saved: usize) {
 #[inline(always)]
 pub fn record_zero_copy_fallback(reason: &str) {
     counter!("rustfs_zero_copy_fallback_total", "reason" => reason.to_string()).increment(1);
+    counter!(mmap_copy::FALLBACK_TOTAL, "reason" => reason.to_string()).increment(1);
 }
 
 // ============================================================================
@@ -1172,6 +1178,11 @@ pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
     counter!("rustfs_zero_copy_write_total").increment(1);
     histogram!("rustfs_zero_copy_write_size_bytes").record(size_bytes as f64);
     histogram!("rustfs_zero_copy_write_duration_ms").record(duration_ms);
+
+    counter!(buffered_write::WRITES_TOTAL).increment(1);
+    histogram!(buffered_write::WRITE_SIZE_BYTES).record(size_bytes as f64);
+    histogram!(buffered_write::WRITE_DURATION_MS).record(duration_ms);
+    counter!(buffered_write::BYTES_COPIED_TOTAL).increment(size_bytes as u64);
 }
 
 /// Record zero-copy write fallback.
@@ -1184,6 +1195,7 @@ pub fn record_zero_copy_write(size_bytes: usize, duration_ms: f64) {
 #[inline(always)]
 pub fn record_zero_copy_write_fallback(reason: &str) {
     counter!("rustfs_zero_copy_write_fallback_total", "reason" => reason.to_string()).increment(1);
+    counter!(buffered_write::FALLBACK_TOTAL, "reason" => reason.to_string()).increment(1);
 }
 
 /// Record bytes saved from zero-copy.
@@ -2016,7 +2028,7 @@ pub mod bandwidth;
 pub mod global_metrics;
 pub mod metric_names;
 
-pub use metric_names::zero_copy;
+pub use metric_names::{aligned_pread, buffered_write, mmap_copy, zero_copy};
 
 /// Record a zero-copy buffer operation.
 ///
@@ -2095,6 +2107,20 @@ pub fn record_direct_io_operation(operation: &str, size: usize, success: bool) {
         "status" => status.to_string()
     )
     .increment(size as u64);
+
+    counter!(
+        aligned_pread::OPERATIONS_TOTAL,
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(1);
+
+    counter!(
+        aligned_pread::BYTES_TOTAL,
+        "operation" => operation.to_string(),
+        "status" => status.to_string()
+    )
+    .increment(size as u64);
 }
 
 /// Update zero-copy performance metrics.
@@ -2160,5 +2186,8 @@ mod zero_copy_tests {
         assert!(!zero_copy::BUFFER_OPERATIONS_TOTAL.is_empty());
         assert!(!zero_copy::MEMORY_COPY_TOTAL.is_empty());
         assert!(!zero_copy::THROUGHPUT_MBPS.is_empty());
+        assert!(!mmap_copy::READS_TOTAL.is_empty());
+        assert!(!buffered_write::WRITES_TOTAL.is_empty());
+        assert!(!aligned_pread::OPERATIONS_TOTAL.is_empty());
     }
 }

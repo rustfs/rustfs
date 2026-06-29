@@ -15,6 +15,8 @@
 //! Object application use-case contracts.
 
 // Performance metrics recording (with zero-copy-metrics integration)
+use rustfs_io_metrics::buffered_write;
+
 use super::storage_api::object_usecase::ECStore;
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
@@ -2707,6 +2709,10 @@ impl DefaultObjectUsecase {
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let use_zero_copy_eager_put_path =
             should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        if use_zero_copy_eager_put_path {
+            counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
+            histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
+        }
         let put_path = if should_compress {
             "stream_compressed"
         } else if use_zero_copy_eager_put_path {
