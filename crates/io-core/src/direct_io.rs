@@ -155,10 +155,10 @@ impl DirectIoReader {
         })
     }
 
-    /// Read a chunk of data using Direct I/O.
+    /// Read a chunk of data using aligned pread.
     ///
-    /// This method performs aligned reads and handles the buffering
-    /// required for Direct I/O operations.
+    /// This method performs aligned reads and handles the buffering required
+    /// by this aligned pread implementation. It does not use `O_DIRECT`.
     fn read_chunk(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         // If buffer is exhausted, read more data
         if self.buffer_pos >= self.buffer_len {

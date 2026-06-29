@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Zero-copy object reader implementation.
+//! Bytes-backed object reader implementation.
 
 use bytes::Bytes;
 use std::io;
@@ -20,7 +20,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use tokio::io::{AsyncRead, ReadBuf};
 
-/// Errors that can occur during zero-copy read operations.
+/// Errors that can occur during Bytes-backed read operations.
 #[derive(Debug, Clone)]
 pub enum ZeroCopyReadError {
     /// I/O error occurred.
@@ -49,12 +49,11 @@ impl From<io::Error> for ZeroCopyReadError {
     }
 }
 
-/// Zero-copy object reader.
+/// Bytes-backed object reader.
 ///
-/// This reader provides zero-copy access to object data by using:
-/// - Memory-mapped files for on-disk data
-/// - Bytes wrapping for in-memory data
-/// - Reference counting to avoid copies
+/// This reader keeps the historical `ZeroCopyObjectReader` name for public API
+/// compatibility. `from_bytes` wraps existing `Bytes` without copying, but file
+/// constructors copy file data into owned `Bytes` after mmap or normal reads.
 ///
 /// # Example
 ///
@@ -94,10 +93,10 @@ impl ZeroCopyObjectReader {
         Self { data, pos: 0 }
     }
 
-    /// Create a zero-copy reader from a file using mmap.
+    /// Create a Bytes-backed reader from a file using mmap-then-copy.
     ///
-    /// This uses memory mapping to avoid loading the entire file into memory.
-    /// Only the accessed pages are loaded on demand.
+    /// This maps the requested file range and copies it into owned `Bytes`
+    /// before returning. It does not expose the mmap as a zero-copy buffer.
     ///
     /// # Arguments
     ///
@@ -107,7 +106,7 @@ impl ZeroCopyObjectReader {
     ///
     /// # Returns
     ///
-    /// A reader that provides zero-copy access to the file data.
+    /// A reader backed by copied file data.
     ///
     /// # Errors
     ///
@@ -148,10 +147,10 @@ impl ZeroCopyObjectReader {
         .map_err(|e| ZeroCopyReadError::Io(e.to_string()))?
     }
 
-    /// Create a zero-copy reader from a file using mmap.
+    /// Create a Bytes-backed reader from a file using normal reads.
     ///
-    /// This uses memory mapping to avoid loading the entire file into memory.
-    /// Only the accessed pages are loaded on demand.
+    /// This path reads the requested range into an owned buffer and wraps it in
+    /// `Bytes`. It does not perform mmap or zero-copy file I/O.
     ///
     /// # Arguments
     ///
@@ -161,7 +160,7 @@ impl ZeroCopyObjectReader {
     ///
     /// # Returns
     ///
-    /// A reader that provides zero-copy access to the file data.
+    /// A reader backed by copied file data.
     ///
     /// # Errors
     ///
@@ -191,7 +190,7 @@ impl ZeroCopyObjectReader {
         })
     }
 
-    /// Create a zero-copy reader from a file (non-Unix fallback).
+    /// Create a Bytes-backed reader from a file (non-Unix fallback).
     ///
     /// On platforms that don't support mmap, this falls back to regular file I/O.
     #[cfg(not(unix))]
