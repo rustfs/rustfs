@@ -183,6 +183,7 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
+REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
@@ -2352,6 +2353,18 @@ fi
 
 if [[ -s "$REPLICATION_EVENT_SINK_BYPASS_HITS_FILE" ]]; then
   report_failure "replication event notification access must stay behind replication event sink: $(paste -sd '; ' "$REPLICATION_EVENT_SINK_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::config::com::\{[^}]*\b(read_config|save_config)\b|crate::config::com::(read_config|save_config)|\b(read_config|save_config)\(' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_config_store\.rs:' || true
+) >"$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication config persistence must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
 fi
 
 (

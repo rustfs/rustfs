@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_config_store as config_store;
 use super::replication_event_sink::{EventArgs, send_event};
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
@@ -27,7 +28,6 @@ use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
-use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -1312,7 +1312,7 @@ pub(crate) async fn save_resync_status<S: EcstoreObjectIO>(
     let data = encode_resync_file(status)?;
 
     let config_file = path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR, RESYNC_FILE_NAME]);
-    save_config(api, &config_file, data).await?;
+    config_store::save(api, &config_file, data).await?;
 
     Ok(())
 }
