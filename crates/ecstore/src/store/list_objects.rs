@@ -195,16 +195,24 @@ struct ListContinuationV2 {
 
 impl ListContinuationV2 {
     fn encode_marker(&self, marker: &str) -> String {
-        let mut marker_tag = format!("{}[rustfs_cache:{}", marker, self.version);
+        let mut marker_tag = String::with_capacity(marker.len() + 64);
+        marker_tag.push_str(marker);
+        marker_tag.push_str("[rustfs_cache:");
+        marker_tag.push_str(self.version);
         match &self.id {
-            Some(id) => marker_tag.push_str(&format!(",id:{}", id)),
+            Some(id) => {
+                marker_tag.push_str(",id:");
+                marker_tag.push_str(id);
+            }
             None => marker_tag.push_str(",return:"),
         }
         if let Some(pool_idx) = self.pool_idx {
-            marker_tag.push_str(&format!(",p:{}", pool_idx));
+            marker_tag.push_str(",p:");
+            marker_tag.push_str(&pool_idx.to_string());
         }
         if let Some(set_idx) = self.set_idx {
-            marker_tag.push_str(&format!(",s:{}", set_idx));
+            marker_tag.push_str(",s:");
+            marker_tag.push_str(&set_idx.to_string());
         }
         marker_tag.push(']');
         marker_tag
@@ -293,14 +301,111 @@ fn list_objects_quorum_from_env() -> String {
 }
 
 fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
-    match cache_id {
-        Some(id) => ListPathOptions {
-            id: Some(id.to_owned()),
-            ..Default::default()
-        }
-        .encode_marker(&marker),
-        None => marker,
+    let Some(id) = cache_id else {
+        return marker;
+    };
+
+    let mut marker_tag = String::with_capacity(marker.len() + 24 + id.len());
+    marker_tag.push_str(&marker);
+    marker_tag.push_str("[rustfs_cache:");
+    marker_tag.push_str(MARKER_TAG_VERSION);
+    marker_tag.push_str(",id:");
+    marker_tag.push_str(id);
+    marker_tag.push(']');
+
+    marker_tag
+}
+
+fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
+    if let Some(last) = objects.last() {
+        Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
+    } else {
+        prefixes
+            .last()
+            .map(|marker| append_list_cache_id_to_marker(marker.clone(), cache_id))
     }
+}
+
+fn build_list_versions_next_marker(
+    objects: &[ObjectInfo],
+    prefixes: &[String],
+    cache_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(last) = objects.last() {
+        (
+            Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)),
+            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+        )
+    } else if let Some(last_prefix) = prefixes.last() {
+        (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
+    } else {
+        (None, None)
+    }
+}
+
+fn list_objects_paginate(
+    get_objects: Vec<ObjectInfo>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    disk_has_more: bool,
+    cache_id: Option<&str>,
+    include_version_id: bool,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
+    let mut get_objects = get_objects;
+    let mut is_truncated = false;
+    let mut next_marker = None;
+    let mut next_version_idmarker = None;
+
+    if max_keys <= 0 {
+        get_objects.clear();
+    } else if get_objects.len() > max_keys as usize {
+        is_truncated = true;
+        get_objects.truncate(max_keys as usize);
+    }
+
+    if is_truncated {
+        if include_version_id {
+            (next_marker, next_version_idmarker) = build_list_versions_next_marker(&get_objects, &[], cache_id);
+        } else {
+            next_marker = build_list_next_marker(&get_objects, &[], cache_id);
+        }
+    }
+
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut prefix_set: HashSet<String> = HashSet::new();
+    let mut objects = Vec::with_capacity(get_objects.len());
+    for obj in get_objects {
+        if delimiter.is_some() {
+            if obj.is_dir && obj.mod_time.is_none() {
+                if prefix_set.insert(obj.name.clone()) {
+                    prefixes.push(obj.name);
+                }
+            } else {
+                objects.push(obj);
+            }
+        } else {
+            objects.push(obj);
+        }
+    }
+
+    if !is_truncated && disk_has_more {
+        let visible_count = objects.len() + prefixes.len();
+        let should_truncate = if delimiter.is_none() {
+            visible_count > 0
+        } else {
+            visible_count >= max_keys as usize
+        };
+        if should_truncate {
+            is_truncated = true;
+            if include_version_id {
+                (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes, cache_id);
+            } else {
+                next_marker = build_list_next_marker(&objects, &prefixes, cache_id);
+            }
+        }
+    }
+
+    (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
 fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versioned: bool) -> MetadataResolutionParams {
@@ -508,7 +613,7 @@ impl ECStore {
 
         // contextCanceled
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -516,71 +621,9 @@ impl ECStore {
         )
         .await;
 
-        // Determine if there are more results: we requested max_keys + 1, so if we got more
-        // than max_keys, there are more results available
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            // Truncate to max_keys if we have more results
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = {
-            if is_truncated {
-                get_objects
-                    .last()
-                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-            } else {
-                None
-            }
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects.into_iter() {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    // Check if prefix already exists to avoid duplicates
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // No delimiter: reduction is from skipped entries → disk_has_more && non-empty.
-        // With delimiter: reduction may be from collapse → only when visible >= max_keys.
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                // Compute next_marker from visible results since get_objects was consumed.
-                // Prefer last object name; fall back to last prefix for marker.
-                next_marker = objects
-                    .last()
-                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| {
-                        prefixes
-                            .last()
-                            .cloned()
-                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
-                    });
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -633,6 +676,7 @@ impl ECStore {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         // err=None means gather_results filled its limit → disk has more data
         let disk_has_more = list_result.err.is_none();
@@ -651,7 +695,7 @@ impl ECStore {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -660,67 +704,8 @@ impl ECStore {
         )
         .await;
 
-        // Determine if there are more results: we requested max_keys + 1, so if we got more
-        // than max_keys, there are more results available
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            // Truncate to max_keys if we have more results
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
-            // AWS S3 API returns "null" for non-versioned objects
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects.into_iter() {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    // Check if prefix already exists to avoid duplicates
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // Two distinct scenarios (see list_objects_generic for detailed rationale):
-        // 1. No delimiter: reduction from skipped entries → disk_has_more && non-empty
-        // 2. With delimiter: reduction from collapse → only when visible >= max_keys
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                // Compute markers from visible results since get_objects was consumed.
-                if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -1734,7 +1719,7 @@ impl Sets {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -1742,59 +1727,9 @@ impl Sets {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = if is_truncated {
-            get_objects
-                .last()
-                .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-        } else {
-            None
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                next_marker = objects
-                    .last()
-                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| {
-                        prefixes
-                            .last()
-                            .cloned()
-                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
-                    });
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -1864,7 +1799,7 @@ impl Sets {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -1873,56 +1808,8 @@ impl Sets {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                if let Some(last) = objects.last() {
-                    next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -2513,7 +2400,7 @@ impl SetDisks {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -2521,59 +2408,8 @@ impl SetDisks {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = if is_truncated {
-            get_objects
-                .last()
-                .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-        } else {
-            None
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                next_marker = objects
-                    .last()
-                    .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| {
-                        prefixes
-                            .last()
-                            .cloned()
-                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
-                    });
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -2643,7 +2479,7 @@ impl SetDisks {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -2652,56 +2488,8 @@ impl SetDisks {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                if let Some(last) = objects.last() {
-                    next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
