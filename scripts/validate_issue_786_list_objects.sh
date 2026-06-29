@@ -162,19 +162,14 @@ run_live_smoke() {
     return 1
   fi
 
-  local -A seen
   local duplicate
   local dkeys=()
   duplicate=0
   local key
 
-  for key in "${keys1[@]}"; do
-    seen["$key"]=1
-  done
-
   while IFS= read -r key; do
     keys2+=("$key")
-    if [[ -n "${seen[$key]-}" ]]; then
+    if printf '%s\n' "${keys1[@]}" | grep -Fx -- "$key" >/dev/null 2>&1; then
       duplicate=1
       dkeys+=("$key")
     fi
