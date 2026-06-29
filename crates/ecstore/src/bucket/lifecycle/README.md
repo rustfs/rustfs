@@ -49,3 +49,6 @@ and tier services.
 Start with `LifecycleRuntime` or `LifecycleAuditSink`. Both can be introduced
 as narrow internal contracts while keeping the current ECStore worker behavior
 unchanged. Do not start with a crate move.
+
+Current first boundary: `runtime_boundary.rs` centralizes lifecycle access to
+runtime state while preserving the existing ECStore-backed implementations.

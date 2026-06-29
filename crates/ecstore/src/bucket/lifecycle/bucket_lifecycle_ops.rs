@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
 use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
@@ -33,7 +34,6 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::runtime::sources as runtime_sources;
 use crate::services::event_notification::{EventArgs, send_event};
 use crate::services::tier::warm_backend::WarmBackendGetOpts;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
@@ -2884,6 +2884,7 @@ mod tests {
         transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2892,7 +2893,6 @@ mod tests {
     use crate::error::is_err_invalid_upload_id;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
-    use crate::runtime::sources as runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, MakeBucketOptions},

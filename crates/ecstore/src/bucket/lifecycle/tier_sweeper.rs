@@ -18,11 +18,11 @@
 #![allow(unused_must_use)]
 #![allow(clippy::all)]
 
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::ExpiryOp;
 use crate::bucket::lifecycle::lifecycle::{self, ObjectOpts};
 use crate::bucket::lifecycle::tier_delete_journal::persist_tier_delete_journal_entry;
 use crate::client::signer_error::error_chain_contains_signer_header_marker;
-use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::lifecycle::TransitionedObject;
 use crate::store::ECStore;
 use rustfs_utils::get_env_usize;
