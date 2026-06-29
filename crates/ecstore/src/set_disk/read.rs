@@ -3041,6 +3041,22 @@ mod metadata_cache_tests {
         .await
     }
 
+    #[test]
+    #[serial]
+    fn get_object_metadata_cache_capacity_uses_default_and_env_override() {
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, None::<&str>, || {
+            assert_eq!(get_object_metadata_cache_max_entries(), DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, Some("16384"), || {
+            assert_eq!(get_object_metadata_cache_max_entries(), 16_384);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, Some("0"), || {
+            assert_eq!(get_object_metadata_cache_max_entries(), 1);
+        });
+    }
+
     fn valid_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);
         fi.volume = "bucket".to_string();
@@ -3410,7 +3426,7 @@ mod metadata_cache_tests {
 
     #[tokio::test]
     async fn get_object_metadata_cache_prunes_when_capacity_is_reached() {
-        // moka handles capacity eviction automatically via max_capacity(1024).
+        // moka handles capacity eviction automatically via the configured max_capacity.
         // This test verifies that the cache can hold entries and that insertion works.
         let set = new_metadata_cache_test_set().await;
         let fresh_fi = valid_test_fileinfo("fresh-object");

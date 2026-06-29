@@ -24,6 +24,9 @@ ROUNDS=3
 RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=20
 WARP_OBJECTS=""
+GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
+GET_SMALL_OBJECT_DIRECT_MEMORY=""
+GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
@@ -114,6 +117,11 @@ Core options:
   --duration <duration>          warp duration per round (default: 30s)
   --warp-objects <n>             Number of objects prepared by warp for each size
                                  (default: warp default)
+  --metadata-cache-max-entries <n>
+                                 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES for RustFS
+  --direct-memory <on|off>       RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY for RustFS
+  --direct-memory-threshold <bytes>
+                                 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD for RustFS
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
   --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 20)
@@ -233,6 +241,9 @@ parse_args() {
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
       --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
+      --metadata-cache-max-entries) GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$2"; shift 2 ;;
+      --direct-memory) GET_SMALL_OBJECT_DIRECT_MEMORY="$2"; shift 2 ;;
+      --direct-memory-threshold) GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$2"; shift 2 ;;
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
@@ -302,6 +313,18 @@ validate_args() {
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
   if [[ -n "$WARP_OBJECTS" ]]; then
     validate_positive_int "$WARP_OBJECTS" "--warp-objects"
+  fi
+  if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
+    validate_positive_int "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" "--metadata-cache-max-entries"
+  fi
+  if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY" ]]; then
+    case "$GET_SMALL_OBJECT_DIRECT_MEMORY" in
+      on|off) ;;
+      *) die "--direct-memory must be on or off" ;;
+    esac
+  fi
+  if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
+    validate_positive_int "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" "--direct-memory-threshold"
   fi
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
@@ -532,6 +555,9 @@ rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 warp_objects=${WARP_OBJECTS}
+RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
 skip_build=${SKIP_BUILD}
 dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
@@ -673,6 +699,9 @@ RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
 RUSTFS_OBS_ENDPOINT=${DIAGNOSTIC_OBS_ENDPOINT}
 RUSTFS_OBS_METRIC_ENDPOINT=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
@@ -790,6 +819,15 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
+      export RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES"
+    fi
+    if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY" ]]; then
+      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY="$(bool_from_on_off "$GET_SMALL_OBJECT_DIRECT_MEMORY")"
+    fi
+    if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
+      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD"
+    fi
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
     if [[ "$DIAGNOSTIC_METRICS" == "true" ]]; then
       export RUSTFS_OBS_METER_INTERVAL="$DIAGNOSTIC_OBS_METER_INTERVAL"

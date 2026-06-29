@@ -336,7 +336,8 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
 const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
-const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
+const DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
+const ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: &str = "RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES";
 
 // --- Codec Streaming Configuration ---
 
@@ -624,6 +625,28 @@ pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
 
 fn get_codec_streaming_min_size() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+}
+
+fn get_object_metadata_cache_max_entries() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES,
+            DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES,
+        )
+        .max(1)
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES,
+                DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES,
+            )
+            .max(1)
+        })
+    }
 }
 
 fn is_get_small_object_direct_memory_enabled() -> bool {
@@ -1317,7 +1340,7 @@ impl SetDisks {
             set_endpoints,
             disk_health_cache: Arc::new(RwLock::new(Vec::new())),
             get_object_metadata_cache: moka::future::Cache::builder()
-                .max_capacity(GET_OBJECT_METADATA_CACHE_MAX_ENTRIES as u64)
+                .max_capacity(get_object_metadata_cache_max_entries() as u64)
                 .time_to_live(GET_OBJECT_METADATA_CACHE_TTL)
                 .build(),
             lockers,
