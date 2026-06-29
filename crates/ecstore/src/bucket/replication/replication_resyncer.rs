@@ -16,6 +16,7 @@ use super::replication_config_store as config_store;
 use super::replication_event_sink::{EventArgs, send_event};
 use super::replication_lock_boundary as lock_boundary;
 use super::replication_metadata_boundary as metadata_boundary;
+use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use super::replication_target_boundary as target_boundary;
 use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
@@ -23,7 +24,6 @@ use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, Moni
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
-use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
@@ -4201,7 +4201,6 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::msgp_decode::write_msgp_time;
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;

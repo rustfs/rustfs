@@ -187,6 +187,7 @@ REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_b
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
+REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
@@ -2378,6 +2379,18 @@ fi
 
 if [[ -s "$REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication lock timeout access must stay behind replication lock boundary: $(paste -sd '; ' "$REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::msgp_decode' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_msgp_boundary\.rs:' || true
+) >"$REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication msgp helpers must stay behind replication msgp boundary: $(paste -sd '; ' "$REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
