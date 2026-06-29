@@ -60,18 +60,18 @@ impl PeerAdminCache {
 }
 
 lazy_static! {
-    pub static ref GLOBAL_NotificationSys: OnceLock<NotificationSys> = OnceLock::new();
+    pub static ref GLOBAL_NOTIFICATION_SYS: OnceLock<NotificationSys> = OnceLock::new();
 }
 
 pub async fn new_global_notification_sys(eps: EndpointServerPools) -> Result<()> {
-    let _ = GLOBAL_NotificationSys
+    let _ = GLOBAL_NOTIFICATION_SYS
         .set(NotificationSys::new(eps).await)
         .map_err(|_| Error::other("init notification_sys fail"));
     Ok(())
 }
 
 pub fn get_global_notification_sys() -> Option<&'static NotificationSys> {
-    GLOBAL_NotificationSys.get()
+    GLOBAL_NOTIFICATION_SYS.get()
 }
 
 pub struct NotificationSys {
