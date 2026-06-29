@@ -23,6 +23,7 @@ DURATION="30s"
 ROUNDS=3
 RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=20
+WARP_OBJECTS=""
 MODE="both"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
@@ -111,6 +112,8 @@ Core options:
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
   --concurrency <n>              warp concurrency (default: 16)
   --duration <duration>          warp duration per round (default: 30s)
+  --warp-objects <n>             Number of objects prepared by warp for each size
+                                 (default: warp default)
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
   --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 20)
@@ -229,6 +232,7 @@ parse_args() {
       --sizes) SIZES="$2"; shift 2 ;;
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
+      --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
@@ -296,6 +300,9 @@ validate_args() {
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
+  if [[ -n "$WARP_OBJECTS" ]]; then
+    validate_positive_int "$WARP_OBJECTS" "--warp-objects"
+  fi
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
@@ -524,6 +531,7 @@ duration=${DURATION}
 rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
+warp_objects=${WARP_OBJECTS}
 skip_build=${SKIP_BUILD}
 dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
@@ -645,6 +653,7 @@ duration=${DURATION}
 rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
+warp_objects=${WARP_OBJECTS}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 python_bin=${PYTHON_BIN}
@@ -836,6 +845,9 @@ run_bench() {
 
   if [[ -n "$baseline_csv" ]]; then
     cmd+=(--baseline-csv "$baseline_csv")
+  fi
+  if [[ -n "$WARP_OBJECTS" ]]; then
+    cmd+=(--extra-args "--objects ${WARP_OBJECTS}")
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
     cmd+=(--dry-run)

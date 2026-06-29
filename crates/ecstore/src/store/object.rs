@@ -428,6 +428,7 @@ impl ECStore {
             diag_enabled,
         );
         opts.no_lock = true;
+        opts.metadata_cache_safe = true;
 
         Ok(Some(ObjectLockDiagGuard::new(
             guard,
@@ -630,9 +631,6 @@ impl ECStore {
         let read_lock_guard = self
             .acquire_object_read_lock_if_needed("get_object", bucket, &object, &mut opts)
             .await?;
-        if read_lock_guard.is_some() {
-            opts.metadata_cache_safe = true;
-        }
 
         let reader = if self.single_pool() {
             self.pools[0]
@@ -1304,6 +1302,10 @@ impl ECStore {
 mod tests {
     use super::*;
     use crate::bucket::lifecycle::core::TRANSITION_COMPLETE;
+    use crate::layout::{
+        endpoints::{Endpoints, PoolEndpoints},
+        format::FormatV3,
+    };
     use bytes::Bytes;
     use std::io::Cursor;
     use std::sync::Arc;
@@ -1819,6 +1821,76 @@ mod tests {
 
         assert!(lookup_opts.skip_decommissioned);
         assert!(lookup_opts.no_lock);
+    }
+
+    async fn new_read_lock_test_store() -> ECStore {
+        let format = FormatV3::new(1, 2);
+        let endpoints = vec![
+            Endpoint::try_from("http://127.0.0.1:9000/data0").expect("first endpoint should parse"),
+            Endpoint::try_from("http://127.0.0.1:9001/data1").expect("second endpoint should parse"),
+        ];
+        let pool_endpoints = PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: 2,
+            endpoints: Endpoints::from(endpoints),
+            cmd_line: "read-lock-metadata-cache-safe-test".to_string(),
+            platform: "test".to_string(),
+        };
+        let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints.clone()]);
+        let sets = Sets::new(vec![None, None], &pool_endpoints, &format, 0, 1)
+            .await
+            .expect("test sets should be created with empty disks");
+
+        ECStore {
+            id: Uuid::new_v4(),
+            disk_map: HashMap::new(),
+            pools: vec![sets],
+            peer_sys: S3PeerSys::new(&endpoint_pools),
+            pool_meta: RwLock::new(PoolMeta::default()),
+            rebalance_meta: RwLock::new(None),
+            decommission_cancelers: RwLock::new(Vec::new()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
+        }
+    }
+
+    #[tokio::test]
+    async fn acquired_read_lock_marks_metadata_cache_safe_for_set_layer() {
+        let store = new_read_lock_test_store().await;
+        let mut opts = ObjectOptions::default();
+
+        let guard = store
+            .acquire_object_read_lock_if_needed("get_object", "bucket", "object", &mut opts)
+            .await
+            .expect("read lock should be acquired");
+
+        assert!(guard.is_some(), "read lock should be held by the outer store layer");
+        assert!(opts.no_lock, "set layer should not reacquire the object lock");
+        assert!(
+            opts.metadata_cache_safe,
+            "metadata cache is safe only because the outer store layer acquired the read lock"
+        );
+    }
+
+    #[tokio::test]
+    async fn prelocked_read_request_does_not_mark_metadata_cache_safe() {
+        let store = new_read_lock_test_store().await;
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+
+        let guard = store
+            .acquire_object_read_lock_if_needed("get_object", "bucket", "object", &mut opts)
+            .await
+            .expect("prelocked read should not acquire another lock");
+
+        assert!(guard.is_none(), "prelocked caller should keep lock ownership outside ECStore");
+        assert!(
+            !opts.metadata_cache_safe,
+            "generic no_lock callers must stay ineligible for metadata cache unless explicitly marked safe"
+        );
     }
 
     #[tokio::test]
