@@ -184,6 +184,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
+GLOBAL_OUTBOUND_TLS_BYPASS_HITS_FILE="${TMP_DIR}/global_outbound_tls_bypass_hits.txt"
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
 ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
 ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_support_module_hits.txt"
@@ -2314,6 +2315,18 @@ fi
 
 if [[ -s "$GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_RUSTFS_HOST/ADDR access must stay behind rustfs_common runtime helpers: $(paste -sd '; ' "$GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_(ROOT_CERT|MTLS_IDENTITY|OUTBOUND_TLS_GENERATION)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/common/src/globals\.rs:' || true
+) >"$GLOBAL_OUTBOUND_TLS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_OUTBOUND_TLS_BYPASS_HITS_FILE" ]]; then
+  report_failure "outbound TLS globals must stay behind rustfs_common runtime helpers: $(paste -sd '; ' "$GLOBAL_OUTBOUND_TLS_BYPASS_HITS_FILE")"
 fi
 
 (

@@ -96,6 +96,16 @@ pub async fn set_global_root_cert(cert: Vec<u8>) {
     *GLOBAL_ROOT_CERT.write().await = Some(cert);
 }
 
+/// Clear the global root CA certificate for outbound gRPC clients.
+pub async fn clear_global_root_cert() {
+    *GLOBAL_ROOT_CERT.write().await = None;
+}
+
+/// Get the global root CA certificate for outbound gRPC clients.
+pub async fn get_global_root_cert() -> Option<Vec<u8>> {
+    GLOBAL_ROOT_CERT.read().await.clone()
+}
+
 /// Set the global mTLS identity (cert+key PEM) for outbound gRPC clients.
 /// When set, clients will present this identity to servers requesting/requiring mTLS.
 /// When None, clients proceed with standard server-authenticated TLS.
@@ -104,6 +114,11 @@ pub async fn set_global_root_cert(cert: Vec<u8>) {
 /// * `identity` - An optional MtlsIdentityPem struct containing the cert and key PEM.
 pub async fn set_global_mtls_identity(identity: Option<MtlsIdentityPem>) {
     *GLOBAL_MTLS_IDENTITY.write().await = identity;
+}
+
+/// Get the global mTLS identity for outbound gRPC clients.
+pub async fn get_global_mtls_identity() -> Option<MtlsIdentityPem> {
+    GLOBAL_MTLS_IDENTITY.read().await.clone()
 }
 
 /// Set the global outbound TLS generation.
