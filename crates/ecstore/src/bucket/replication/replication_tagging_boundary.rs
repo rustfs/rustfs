@@ -12,25 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod config;
-pub mod datatypes;
-mod replication_config_store;
-mod replication_event_sink;
-mod replication_lock_boundary;
-mod replication_metadata_boundary;
-mod replication_msgp_boundary;
-mod replication_pool;
-mod replication_resyncer;
-mod replication_state;
-mod replication_tagging_boundary;
-mod replication_target_boundary;
-mod replication_versioning_boundary;
-mod rule;
-mod runtime_boundary;
+use std::collections::HashMap;
 
-pub use config::*;
-pub use datatypes::*;
-pub use replication_pool::*;
-pub use replication_resyncer::*;
-pub use replication_state::{BucketStats, ReplicationStats};
-pub use rule::*;
+pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
+    crate::bucket::tagging::decode_tags_to_map(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_tags_to_map;
+
+    #[test]
+    fn decode_tags_to_map_preserves_bucket_tagging_parser_behavior() {
+        let tags = decode_tags_to_map("env=prod&encoded=a%2Fb&=ignored");
+
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("encoded").map(String::as_str), Some("a/b"));
+        assert!(!tags.contains_key(""));
+    }
+}

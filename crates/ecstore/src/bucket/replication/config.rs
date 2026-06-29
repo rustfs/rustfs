@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_tagging_boundary as tagging_boundary;
 use crate::bucket::replication::ReplicationRuleExt as _;
-use crate::bucket::tagging::decode_tags_to_map;
 use rustfs_filemeta::ReplicationType;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
@@ -98,7 +98,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
 
             if let Some(filter) = &rule.filter {
-                let object_tags = decode_tags_to_map(&obj.user_tags);
+                let object_tags = tagging_boundary::decode_tags_to_map(&obj.user_tags);
                 if filter.test_tags(&object_tags) {
                     rules.push(rule.clone());
                 }
