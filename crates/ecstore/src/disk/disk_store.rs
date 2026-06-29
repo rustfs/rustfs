@@ -1361,9 +1361,9 @@ impl DiskAPI for LocalDiskWrapper {
         .await
     }
 
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<bytes::Bytes> {
         self.track_disk_health(
-            || async { self.disk.read_file_zero_copy(volume, path, offset, length).await },
+            || async { self.disk.read_file_mmap_copy(volume, path, offset, length).await },
             get_max_timeout_duration(),
         )
         .await
