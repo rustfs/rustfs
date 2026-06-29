@@ -52,3 +52,54 @@ pub mod zero_copy {
     /// Current memory saved estimate by zero-copy in bytes
     pub const MEMORY_SAVED_BYTES: &str = "rustfs_zero_copy_memory_saved_bytes_current";
 }
+
+/// Mmap-then-copy read metric names.
+pub mod mmap_copy {
+    /// Total number of mmap-copy reads.
+    pub const READS_TOTAL: &str = "rustfs_mmap_copy_reads_total";
+
+    /// Mmap-copy read size distribution.
+    pub const READ_SIZE_BYTES: &str = "rustfs_mmap_copy_read_size_bytes";
+
+    /// Mmap-copy read duration distribution.
+    pub const READ_DURATION_MS: &str = "rustfs_mmap_copy_read_duration_ms";
+
+    /// Total bytes copied from mmap regions into owned buffers.
+    pub const BYTES_COPIED_TOTAL: &str = "rustfs_mmap_copy_bytes_copied_total";
+
+    /// Total number of mmap-copy read fallbacks.
+    pub const FALLBACK_TOTAL: &str = "rustfs_mmap_copy_fallback_total";
+}
+
+/// Buffered eager PUT write metric names.
+pub mod buffered_write {
+    /// Total number of buffered eager PUT attempts.
+    pub const ATTEMPTS_TOTAL: &str = "rustfs_buffered_write_attempts_total";
+
+    /// Buffered eager PUT attempt size distribution.
+    pub const ATTEMPT_SIZE_BYTES: &str = "rustfs_buffered_write_attempt_size_bytes";
+
+    /// Total number of buffered eager PUT writes.
+    pub const WRITES_TOTAL: &str = "rustfs_buffered_write_total";
+
+    /// Buffered eager PUT write size distribution.
+    pub const WRITE_SIZE_BYTES: &str = "rustfs_buffered_write_size_bytes";
+
+    /// Buffered eager PUT write duration distribution.
+    pub const WRITE_DURATION_MS: &str = "rustfs_buffered_write_duration_ms";
+
+    /// Total bytes copied into buffered eager PUT bodies.
+    pub const BYTES_COPIED_TOTAL: &str = "rustfs_buffered_write_bytes_copied_total";
+
+    /// Total number of buffered eager PUT fallbacks.
+    pub const FALLBACK_TOTAL: &str = "rustfs_buffered_write_fallback_total";
+}
+
+/// Aligned pread metric names.
+pub mod aligned_pread {
+    /// Total number of aligned pread operations.
+    pub const OPERATIONS_TOTAL: &str = "rustfs_aligned_pread_operations_total";
+
+    /// Total bytes processed by aligned pread operations.
+    pub const BYTES_TOTAL: &str = "rustfs_aligned_pread_bytes_total";
+}
