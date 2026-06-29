@@ -575,10 +575,6 @@ pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
     ecstore_runtime::boot_time()
 }
 
-pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state().get_daily_all_tier_stats()
-}
-
 pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
 }
