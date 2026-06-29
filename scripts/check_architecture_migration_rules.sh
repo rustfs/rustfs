@@ -210,6 +210,7 @@ GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
 GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
 GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_bypass_hits.txt"
+AUDIT_SYSTEM_BYPASS_HITS_FILE="${TMP_DIR}/audit_system_bypass_hits.txt"
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE="${TMP_DIR}/global_batch_processors_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
@@ -2661,6 +2662,18 @@ fi
 
 if [[ -s "$GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE" ]]; then
   report_failure "background service cancellation must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bAUDIT_SYSTEM\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/audit/src/global\.rs:' || true
+) >"$AUDIT_SYSTEM_BYPASS_HITS_FILE"
+
+if [[ -s "$AUDIT_SYSTEM_BYPASS_HITS_FILE" ]]; then
+  report_failure "AUDIT_SYSTEM access must stay behind audit owner helpers: $(paste -sd '; ' "$AUDIT_SYSTEM_BYPASS_HITS_FILE")"
 fi
 
 (
