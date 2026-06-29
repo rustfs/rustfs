@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -573,7 +573,12 @@ impl ECStore {
                 next_marker = objects
                     .last()
                     .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| prefixes.last().cloned().map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
+                    .or_else(|| {
+                        prefixes
+                            .last()
+                            .cloned()
+                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
+                    });
             }
         }
 
@@ -1403,10 +1408,7 @@ async fn gather_results(
         marker = %opts.marker.as_deref().unwrap_or(""),
         "list_objects gather_results drained all candidates without hitting limit"
     );
-    rustfs_io_metrics::record_stage_duration(
-        "store_list_objects_gather",
-        gather_started.elapsed().as_secs_f64() * 1000.0,
-    );
+    rustfs_io_metrics::record_stage_duration("store_list_objects_gather", gather_started.elapsed().as_secs_f64() * 1000.0);
 
     results_tx
         .send(MetaCacheEntriesSortedResult {
@@ -1785,10 +1787,12 @@ impl Sets {
                 next_marker = objects
                     .last()
                     .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| prefixes
-                        .last()
-                        .cloned()
-                        .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
+                    .or_else(|| {
+                        prefixes
+                            .last()
+                            .cloned()
+                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
+                    });
             }
         }
 
@@ -1880,10 +1884,7 @@ impl Sets {
         let mut next_marker: Option<String> = None;
         let mut next_version_idmarker: Option<String> = None;
         if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(append_list_cache_id_to_marker(
-                last.name.clone(),
-                next_cache_id.as_deref(),
-            ));
+            next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
             next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
         }
 
@@ -1914,10 +1915,7 @@ impl Sets {
             if should_truncate {
                 is_truncated = true;
                 if let Some(last) = objects.last() {
-                    next_marker = Some(append_list_cache_id_to_marker(
-                        last.name.clone(),
-                        next_cache_id.as_deref(),
-                    ));
+                    next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
                     next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
                 } else if let Some(last_prefix) = prefixes.last().cloned() {
                     next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
@@ -2124,10 +2122,7 @@ impl Sets {
             }
         }
 
-        rustfs_io_metrics::record_stage_duration(
-            "sets_list_objects_list_merged",
-            merge_started.elapsed().as_secs_f64() * 1000.0,
-        );
+        rustfs_io_metrics::record_stage_duration("sets_list_objects_list_merged", merge_started.elapsed().as_secs_f64() * 1000.0);
 
         debug!(
             set_count = self.disk_set.len(),
@@ -2571,10 +2566,12 @@ impl SetDisks {
                 next_marker = objects
                     .last()
                     .map(|last| append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()))
-                    .or_else(|| prefixes
-                        .last()
-                        .cloned()
-                        .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref())));
+                    .or_else(|| {
+                        prefixes
+                            .last()
+                            .cloned()
+                            .map(|marker| append_list_cache_id_to_marker(marker, next_cache_id.as_deref()))
+                    });
             }
         }
 
@@ -2666,10 +2663,7 @@ impl SetDisks {
         let mut next_marker: Option<String> = None;
         let mut next_version_idmarker: Option<String> = None;
         if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(append_list_cache_id_to_marker(
-                last.name.clone(),
-                next_cache_id.as_deref(),
-            ));
+            next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
             next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
         }
 
@@ -2700,10 +2694,7 @@ impl SetDisks {
             if should_truncate {
                 is_truncated = true;
                 if let Some(last) = objects.last() {
-                    next_marker = Some(append_list_cache_id_to_marker(
-                        last.name.clone(),
-                        next_cache_id.as_deref(),
-                    ));
+                    next_marker = Some(append_list_cache_id_to_marker(last.name.clone(), next_cache_id.as_deref()));
                     next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
                 } else if let Some(last_prefix) = prefixes.last().cloned() {
                     next_marker = Some(append_list_cache_id_to_marker(last_prefix, next_cache_id.as_deref()));
@@ -3212,7 +3203,8 @@ mod test {
     use super::{
         ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker,
         gather_results, list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, parse_version_marker, version_marker_for_entries, walk_result_from_set_errors,
+        merge_entry_channels, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
+        walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -3630,10 +3622,7 @@ mod test {
     #[test]
     fn list_path_marker_parser_return_tag_forces_cache_refresh() {
         let mut parsed = ListPathOptions {
-            marker: Some(
-                "photos/2026/image.jpg[rustfs_cache:v2,return:,p:3,s:7]"
-                    .to_string(),
-            ),
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v2,return:,p:3,s:7]".to_string()),
             ..Default::default()
         };
 
