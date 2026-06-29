@@ -2153,7 +2153,6 @@ pub async fn expire_transitioned_object(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
 ) -> Result<ObjectInfo, std::io::Error> {
-    //let traceFn = GLOBAL_LifecycleSys.trace(oi);
     let mut opts = ObjectOptions {
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
