@@ -12,21 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod config;
-pub mod datatypes;
-mod replication_event_sink;
-mod replication_metadata_boundary;
-mod replication_pool;
-mod replication_resyncer;
-mod replication_state;
-mod replication_target_boundary;
-mod replication_versioning_boundary;
-mod rule;
-mod runtime_boundary;
+use crate::bucket::versioning_sys::BucketVersioningSys;
 
-pub use config::*;
-pub use datatypes::*;
-pub use replication_pool::*;
-pub use replication_resyncer::*;
-pub use replication_state::{BucketStats, ReplicationStats};
-pub use rule::*;
+pub(crate) async fn prefix_enabled(bucket: &str, prefix: &str) -> bool {
+    BucketVersioningSys::prefix_enabled(bucket, prefix).await
+}
+
+pub(crate) async fn prefix_suspended(bucket: &str, prefix: &str) -> bool {
+    BucketVersioningSys::prefix_suspended(bucket, prefix).await
+}

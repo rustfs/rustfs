@@ -15,6 +15,7 @@
 use super::replication_event_sink::{EventArgs, send_event};
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
+use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
@@ -25,7 +26,6 @@ use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
-use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -1247,8 +1247,8 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
             },
             &oi,
             &ObjectOptions {
-                versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
+                versioned: versioning_boundary::prefix_enabled(&oi.bucket, &oi.name).await,
+                version_suspended: versioning_boundary::prefix_suspended(&oi.bucket, &oi.name).await,
                 ..Default::default()
             },
             None,
@@ -1756,7 +1756,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
         return ReplicateDecision::default();
     }
 
-    if !BucketVersioningSys::prefix_enabled(bucket, object).await {
+    if !versioning_boundary::prefix_enabled(bucket, object).await {
         return ReplicateDecision::default();
     }
 
@@ -1892,8 +1892,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 &dobj.delete_object.object_name,
                 &ObjectOptions {
                     version_id: Some(delete_marker_version_id.to_string()),
-                    versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                    version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                    versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                     ..Default::default()
                 },
             )
@@ -2214,8 +2214,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 version_id: version_id.map(|v| v.to_string()),
                 mod_time: dobj.delete_object.delete_marker_mtime,
                 delete_replication: Some(drs),
-                versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                 ..Default::default()
             },
         )
@@ -2269,8 +2269,8 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
             object_name,
             &ObjectOptions {
                 version_id: Some(delete_marker_version_id.to_string()),
-                versioned: BucketVersioningSys::prefix_enabled(bucket, object_name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(bucket, object_name).await,
+                versioned: versioning_boundary::prefix_enabled(bucket, object_name).await,
+                version_suspended: versioning_boundary::prefix_suspended(bucket, object_name).await,
                 ..Default::default()
             },
         )
@@ -3010,8 +3010,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
+        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),
@@ -3297,8 +3297,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
+        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),

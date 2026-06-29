@@ -186,6 +186,7 @@ REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.t
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
+REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_source_bypass_hits.txt"
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
@@ -2375,6 +2376,18 @@ fi
 
 if [[ -s "$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication metadata access must stay behind replication metadata boundary: $(paste -sd '; ' "$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::versioning_sys|BucketVersioningSys::prefix_(enabled|suspended)' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_versioning_boundary\.rs:' || true
+) >"$REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication versioning access must stay behind replication versioning boundary: $(paste -sd '; ' "$REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
