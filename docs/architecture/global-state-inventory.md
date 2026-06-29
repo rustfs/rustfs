@@ -62,6 +62,23 @@ migration PR removes or replaces each item.
 | `GLOBAL_BUCKET_TARGET_SYS` | `crates/ecstore/src/bucket/bucket_target_sys.rs`, admin/app/scanner/replication target paths | Runtime migration target / owner helper | Direct static access now stays inside the ECStore bucket target owner; callers still use `BucketTargetSys::get()` until bucket target ownership moves behind a runtime-source or replication target boundary. |
 | `USAGE_MEMORY_CACHE`, `USAGE_CACHE_UPDATING` | `crates/ecstore/src/data_usage/mod.rs` | Runtime migration target / owner-local cache | Data-usage memory overlay and singleflight state stay private to the ECStore data-usage owner; callers use data-usage functions until scanner/data-usage ownership moves behind an injected runtime context. |
 
+## Owner-Local Cache Inventory
+
+These owner-local caches and static guards are part of the broad issue #730
+`OnceLock` audit, but they are not runtime ownership handles. They stay private
+to the defining owner module; callers must use the existing owner APIs instead
+of reaching across module boundaries.
+
+| State | Owner boundary | Category | Migration stance |
+|---|---|---|---|
+| `READ_REPAIR_HEAL_CACHE` | `crates/ecstore/src/set_disk/read.rs` | Cache or constant / owner-local cache | Read-repair heal suppression stays local to set-disk read handling. |
+| `DISK_COMPRESSION_CONFIG` | `crates/ecstore/src/io_support/compress.rs` | Cache or constant / owner-local cache | Disk compression environment parsing stays local to IO support compression helpers. |
+| `CACHED_MAX_INFLIGHT_BYTES`, `CACHED_BATCH_BLOCKS`, `CACHED_BYTESMUT_INGEST` | `crates/ecstore/src/erasure/coding/encode.rs` | Cache or constant / owner-local cache | Erasure encode tuning caches stay local to the coding owner. |
+| `CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES`, `CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES`, `OBJECT_LOCK_DIAG_ENABLED` | `crates/ecstore/src/set_disk/mod.rs` | Cache or constant / owner-local cache | Set-disk batching and diagnostics caches stay local to the set-disk owner. |
+| `DRIVE_TIMEOUT_PROFILE_CACHE`, `DRIVE_TIMEOUT_HEALTH_POLICY_CACHE` | `crates/ecstore/src/disk/disk_store.rs` | Cache or constant / owner-local cache | Drive timeout environment caches stay local to the disk-store owner. |
+| `TIER_FREE_VERSION_RECOVERY_STARTED`, `TIER_DELETE_JOURNAL_RECOVERY_STARTED` | `crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs` | Cache or constant / owner-local static guard | Lifecycle recovery single-run guards stay local to lifecycle operations. |
+| `REMOTE_DELETE_INFLIGHT`, `REMOTE_DELETE_LIMITER`, `REMOTE_DELETE_BREAKER`, `REMOTE_TIER_DELETE_TEST_HOOK` | `crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs` | Cache or constant / owner-local static guard | Remote tier delete concurrency, breaker, and test hook state stay local to the tier sweeper owner. |
+
 ## First Code-Bearing Candidate
 
 `GLOBAL_EXPIRY_STATE` is the safest first runtime migration candidate:
