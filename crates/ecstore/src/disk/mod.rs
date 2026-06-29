@@ -291,10 +291,10 @@ impl DiskAPI for Disk {
     }
 
     #[tracing::instrument(skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         match self {
-            Disk::Local(local_disk) => local_disk.read_file_zero_copy(volume, path, offset, length).await,
-            Disk::Remote(remote_disk) => remote_disk.read_file_zero_copy(volume, path, offset, length).await,
+            Disk::Local(local_disk) => local_disk.read_file_mmap_copy(volume, path, offset, length).await,
+            Disk::Remote(remote_disk) => remote_disk.read_file_mmap_copy(volume, path, offset, length).await,
         }
     }
 
@@ -558,11 +558,17 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_file(&self, volume: &str, path: &str) -> Result<FileReader>;
     async fn read_file_stream(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<FileReader>;
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
-    /// Returns Bytes that can be shared without copying.
-    /// On Unix, this uses mmap for true zero-copy access.
-    /// On other platforms, falls back to efficient read operations.
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+    /// File read using mmap-then-copy on Unix or an efficient read on non-Unix.
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes>;
+
+    /// Historical name for `read_file_mmap_copy`.
+    #[deprecated(
+        since = "1.0.0-beta.8",
+        note = "use read_file_mmap_copy; this path copies mmap data into owned Bytes"
+    )]
+    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+        self.read_file_mmap_copy(volume, path, offset, length).await
+    }
 
     async fn append_file(&self, volume: &str, path: &str) -> Result<FileWriter>;
     async fn create_file(&self, origvolume: &str, volume: &str, path: &str, file_size: i64) -> Result<FileWriter>;
