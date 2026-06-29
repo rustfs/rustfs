@@ -61,10 +61,10 @@ pub mod timeout_wrapper;
 pub mod writer;
 
 #[cfg(target_os = "linux")]
-#[allow(deprecated)]
-pub use direct_io::DirectIoReader;
+pub use direct_io::{AlignedPreadError, AlignedPreadReader};
 #[cfg(target_os = "linux")]
-pub use direct_io::{AlignedPreadError, AlignedPreadReader, DirectIoError};
+#[allow(deprecated)]
+pub use direct_io::{DirectIoError, DirectIoReader};
 pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
 #[allow(deprecated)]
 pub use reader::ZeroCopyObjectReader;

@@ -36,7 +36,7 @@ use tokio::io::{AsyncRead, ReadBuf};
 
 /// Errors that can occur during aligned pread operations.
 #[derive(Debug, Clone)]
-pub enum DirectIoError {
+pub enum AlignedPreadError {
     /// Platform doesn't support `read_at`-based I/O
     UnsupportedPlatform,
     /// File descriptor doesn't support this reader
@@ -47,7 +47,7 @@ pub enum DirectIoError {
     AlignmentError { offset: u64, size: usize },
 }
 
-impl std::fmt::Display for DirectIoError {
+impl std::fmt::Display for AlignedPreadError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::UnsupportedPlatform => write!(f, "Aligned pread not supported on this platform"),
@@ -60,9 +60,9 @@ impl std::fmt::Display for DirectIoError {
     }
 }
 
-impl std::error::Error for DirectIoError {}
+impl std::error::Error for AlignedPreadError {}
 
-impl From<io::Error> for DirectIoError {
+impl From<io::Error> for AlignedPreadError {
     fn from(err: io::Error) -> Self {
         Self::Io(err.to_string())
     }
@@ -136,13 +136,13 @@ impl AlignedPreadReader {
     /// # Errors
     ///
     /// Returns an error if offset or size are not 512-byte aligned.
-    pub fn new(file: std::fs::File, offset: u64, size: usize) -> Result<Self, DirectIoError> {
+    pub fn new(file: std::fs::File, offset: u64, size: usize) -> Result<Self, AlignedPreadError> {
         // Check alignment
         if !offset.is_multiple_of(Self::ALIGNMENT as u64) {
-            return Err(DirectIoError::AlignmentError { offset, size });
+            return Err(AlignedPreadError::AlignmentError { offset, size });
         }
         if !size.is_multiple_of(Self::ALIGNMENT) {
-            return Err(DirectIoError::AlignmentError { offset, size });
+            return Err(AlignedPreadError::AlignmentError { offset, size });
         }
 
         Ok(Self {
@@ -231,8 +231,8 @@ impl AlignedPreadReader {
     /// Create a new aligned pread reader (not supported on this platform).
     ///
     /// Always returns an error on non-Linux platforms.
-    pub fn new(_file: std::fs::File, _offset: u64, _size: usize) -> Result<Self, DirectIoError> {
-        Err(DirectIoError::UnsupportedPlatform)
+    pub fn new(_file: std::fs::File, _offset: u64, _size: usize) -> Result<Self, AlignedPreadError> {
+        Err(AlignedPreadError::UnsupportedPlatform)
     }
 }
 
@@ -265,8 +265,9 @@ impl std::fmt::Debug for AlignedPreadReader {
     }
 }
 
-/// Preferred name for aligned pread errors.
-pub type AlignedPreadError = DirectIoError;
+/// Historical name for aligned pread errors.
+#[deprecated(since = "1.0.0-beta.8", note = "use AlignedPreadError; this reader does not set O_DIRECT")]
+pub type DirectIoError = AlignedPreadError;
 
 /// Historical name for the aligned pread-based reader.
 #[deprecated(since = "1.0.0-beta.8", note = "use AlignedPreadReader; this reader does not set O_DIRECT")]
@@ -306,7 +307,10 @@ mod tests {
         {
             // Non-Linux should return UnsupportedPlatform
             let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            assert!(matches!(AlignedPreadReader::new(file, 0, 512), Err(DirectIoError::UnsupportedPlatform)));
+            assert!(matches!(
+                AlignedPreadReader::new(file, 0, 512),
+                Err(AlignedPreadError::UnsupportedPlatform)
+            ));
         }
     }
 
@@ -322,7 +326,7 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         {
             let file = std::fs::File::open(std::env::current_exe().unwrap()).unwrap();
-            assert!(matches!(DirectIoReader::new(file, 0, 512), Err(DirectIoError::UnsupportedPlatform)));
+            assert!(matches!(DirectIoReader::new(file, 0, 512), Err(AlignedPreadError::UnsupportedPlatform)));
         }
     }
 }
