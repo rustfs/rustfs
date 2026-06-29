@@ -1538,10 +1538,8 @@ impl SetDisks {
         observe: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
-        let early_stop_enabled = observe && is_get_metadata_early_stop_enabled();
-        let allow_early_stop = observe
-            && ((is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
-                || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing));
+        let early_stop_enabled = observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
+        let allow_early_stop = observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions);
         if allow_early_stop {
             return Self::read_all_fileinfo_early_stop(
                 disks,
@@ -1742,6 +1740,7 @@ impl SetDisks {
                     GET_OBJECT_PATH_LEGACY_DUPLEX,
                     saved_responses,
                 );
+                while join_set.join_next().await.is_some() {}
                 let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
                 return Ok((ress, errors, diagnostics));
             }
@@ -2111,6 +2110,7 @@ impl SetDisks {
         )
         .await?;
         metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
@@ -2149,7 +2149,7 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
-        } else if use_metadata_cache {
+        } else if use_metadata_cache && metadata_fanout_complete {
             self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
                 .await;
         }
@@ -2812,6 +2812,15 @@ impl SetDisks {
             coding::decode_reader::SyncErasureDecodeReader::new_with_metrics_path(reader, metrics_path),
         )))
     }
+}
+
+fn should_allow_metadata_early_stop(read_data: bool, version_id: &str, healing: bool, incl_free_versions: bool) -> bool {
+    if read_data {
+        return false;
+    }
+
+    (is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
+        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
 }
 
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
@@ -3696,6 +3705,22 @@ mod tests {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, None::<&str>, || {
             assert!(!is_get_metadata_early_stop_enabled());
         });
+    }
+
+    #[test]
+    fn metadata_early_stop_rejects_data_reads() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
+                assert!(should_allow_metadata_early_stop(false, "", false, false));
+                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
     }
 
     #[test]
