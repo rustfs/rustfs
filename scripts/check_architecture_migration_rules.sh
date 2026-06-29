@@ -185,6 +185,8 @@ REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.t
 GLOBAL_LOCAL_DISK_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_ID_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_id_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_set_drives_bypass_hits.txt"
+GLOBAL_ERASURE_SD_BYPASS_HITS_FILE="${TMP_DIR}/global_erasure_sd_bypass_hits.txt"
+GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE="${TMP_DIR}/global_root_disk_threshold_bypass_hits.txt"
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
@@ -2334,6 +2336,30 @@ fi
 
 if [[ -s "$GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_LOCAL_DISK_SET_DRIVES access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_IsErasureSD\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_IsErasureSD access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ERASURE_SD_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_RootDiskThreshold\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_RootDiskThreshold access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_ROOT_DISK_THRESHOLD_BYPASS_HITS_FILE")"
 fi
 
 (
