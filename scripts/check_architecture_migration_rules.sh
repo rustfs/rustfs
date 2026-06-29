@@ -185,6 +185,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
+REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_VERSIONING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_versioning_boundary_bypass_hits.txt"
@@ -2365,6 +2366,18 @@ fi
 
 if [[ -s "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication config persistence must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::set_disk::get_lock_acquire_timeout|\bget_lock_acquire_timeout\(' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_lock_boundary\.rs:' || true
+) >"$REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication lock timeout access must stay behind replication lock boundary: $(paste -sd '; ' "$REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

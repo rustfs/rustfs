@@ -14,6 +14,7 @@
 
 use super::replication_config_store as config_store;
 use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_lock_boundary as lock_boundary;
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::replication_versioning_boundary as versioning_boundary;
@@ -31,7 +32,6 @@ use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{
     list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     namespace::NamespaceLocking as StorageNamespaceLocking,
@@ -840,7 +840,7 @@ impl ReplicationResyncer {
                 return;
             }
         };
-        let _resync_leader_guard = match resync_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        let _resync_leader_guard = match resync_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
             Ok(g) => g,
             Err(_) => {
                 debug!(
@@ -2015,7 +2015,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(lock_guard) => lock_guard,
         Err(e) => {
             debug!(
@@ -2403,7 +2403,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
@@ -2802,7 +2802,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             return;
         }
     };
-    let _obj_lock_guard = match obj_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _obj_lock_guard = match obj_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(g) => g,
         Err(e) => {
             debug!(
