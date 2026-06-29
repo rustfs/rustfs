@@ -45,7 +45,7 @@ use crate::storage_api_contracts::{
     bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
     heal::HealOperations as _,
     namespace::NamespaceLocking as _,
-    object::{ObjectIO as _, ObjectOperations as _},
+    object::{EcstoreObjectIO, ObjectIO as _, ObjectOperations as _},
 };
 use crate::{core::sets::Sets, store::ECStore};
 use byteorder::{ByteOrder, LittleEndian, WriteBytesExt};
@@ -1464,7 +1464,18 @@ impl PoolMeta {
         self.load_from_config_data(data)
     }
 
-    async fn load_no_lock(&mut self, pool: Arc<Sets>) -> Result<()> {
+    /// Startup loads pool metadata before the full namespace-lock RPC surface is ready.
+    pub(crate) async fn load_for_startup<S>(&mut self, pool: Arc<S>) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        self.load_no_lock(pool).await
+    }
+
+    async fn load_no_lock<S>(&mut self, pool: Arc<S>) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
         let data = match read_config_no_lock(pool, POOL_META_NAME).await {
             Ok(data) => data,
             Err(err) => {
@@ -1502,7 +1513,18 @@ impl PoolMeta {
         Ok(())
     }
 
-    async fn save_no_lock(&self, pools: Vec<Arc<Sets>>) -> Result<()> {
+    /// Startup has a single elected local writer, so it must not depend on namespace locks here.
+    pub(crate) async fn save_for_startup<S>(&self, pools: Vec<Arc<S>>) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        self.save_no_lock(pools).await
+    }
+
+    async fn save_no_lock<S>(&self, pools: Vec<Arc<S>>) -> Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
         let data = self.encode_config_data()?;
         if data.is_empty() {
             return Ok(());
