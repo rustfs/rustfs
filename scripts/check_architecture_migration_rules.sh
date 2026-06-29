@@ -337,6 +337,7 @@ RUSTFS_STORAGE_OWNER_HELPER_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_o
 RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_rpc_root_consumer_hits.txt"
 RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_wildcard_import_hits.txt"
 RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_export_glob_hits.txt"
+RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_runtime_root_export_hits.txt"
 RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_facade_direct_owner_bypass_hits.txt"
 RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_sse_root_export_hits.txt"
 RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
@@ -2170,6 +2171,30 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE" ]]; then
   report_failure "RustFS storage owner root must explicitly list storage_api re-exports instead of using a wildcard: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  perl -0ne '
+    my $source = $_;
+    $source =~ s{//[^\n]*}{ }g;
+    $source =~ s{/\*.*?\*/}{
+      my $comment = $&;
+      $comment =~ s/[^\n]/ /g;
+      $comment;
+    }egs;
+    while ($source =~ /^[[:space:]]*pub\(crate\)\s+use\s+storage_api::([^;]+);/mg) {
+      my $body = $1;
+      next unless $body =~ /\b(ObjectStoreResolver|set_object_store_resolver|ecstore_global)\b/;
+      my $prefix = substr($source, 0, $-[0]);
+      my $line = ($prefix =~ tr/\n//) + 1;
+      print "$ARGV:$line:storage_api root re-export includes object-store resolver or raw ECStore global facade\n";
+    }
+  ' rustfs/src/storage/mod.rs || true
+) >"$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage owner root must not re-export object-store resolver or raw ECStore global facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE")"
 fi
 
 (
