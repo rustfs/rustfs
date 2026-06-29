@@ -186,10 +186,13 @@ pub(crate) async fn rustfs_addr() -> String {
     rustfs_common::get_global_addr().await
 }
 
+pub fn boot_time() -> Option<SystemTime> {
+    GLOBAL_BOOT_TIME.get().cloned()
+}
+
 pub(crate) fn boot_uptime_secs() -> u64 {
-    GLOBAL_BOOT_TIME
-        .get()
-        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+    boot_time()
+        .and_then(|boot_time| SystemTime::now().duration_since(boot_time).ok())
         .unwrap_or_default()
         .as_secs()
 }
