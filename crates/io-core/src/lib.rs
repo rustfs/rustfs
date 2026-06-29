@@ -15,9 +15,9 @@
 //! Buffered I/O reader and writer implementations for RustFS.
 //!
 //! This crate provides buffered readers and writers for I/O operations.
-//! Note: despite "ZeroCopy" naming in type names (kept for backward compatibility),
-//! the actual implementations perform mmap-then-copy or aligned pread, not true
-//! zero-copy file I/O or true Direct I/O.
+//! Prefer `BytesBufferedReader`, `BytesMutWriter`, and `AlignedPreadReader`
+//! for new code. Historical `ZeroCopy*` and `DirectIo*` names remain exported
+//! for backward compatibility.
 //!
 //! # Features
 //!
@@ -30,16 +30,15 @@
 //! # Example
 //!
 //! ```ignore
-//! use rustfs_io_core::{ZeroCopyObjectReader, BytesPool};
+//! use rustfs_io_core::{BytesBufferedReader, BytesPool};
 //! use bytes::Bytes;
 //!
 //! // Create from existing bytes (zero-copy)
 //! let data = Bytes::from("hello world");
-//! let reader = ZeroCopyObjectReader::from_bytes(data);
+//! let reader = BytesBufferedReader::from_bytes(data);
 //!
-//! // Create from file using mmap-then-copy (Unix only)
-//! #[cfg(unix)]
-//! let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
+//! // Create from file using buffered reads
+//! let reader = BytesBufferedReader::from_file_read(&file, 0, 1024).await?;
 //!
 //! // Use BytesPool
 //! let pool = BytesPool::new_tiered();
@@ -62,10 +61,10 @@ pub mod timeout_wrapper;
 pub mod writer;
 
 #[cfg(target_os = "linux")]
-pub use direct_io::{DirectIoError, DirectIoReader};
+pub use direct_io::{AlignedPreadError, AlignedPreadReader, DirectIoError, DirectIoReader};
 pub use pool::{BytesPool, BytesPoolConfig, BytesPoolMetrics, PooledBuffer};
-pub use reader::{ZeroCopyObjectReader, ZeroCopyReadError};
-pub use writer::{ZeroCopyObjectWriter, ZeroCopyWriteError};
+pub use reader::{BytesBufferedReader, ZeroCopyObjectReader, ZeroCopyReadError};
+pub use writer::{BytesMutWriter, ZeroCopyObjectWriter, ZeroCopyWriteError};
 
 // BufReader optimizer exports
 pub use bufreader_optimizer::{BufReaderConfig, BufReaderOptimizer, BufReaderStats, BufferedSource};

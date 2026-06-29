@@ -33,16 +33,16 @@ use tokio::io::AsyncWrite;
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_io_core::ZeroCopyObjectWriter;
+/// use rustfs_io_core::BytesMutWriter;
 /// use bytes::Bytes;
 ///
 /// #[tokio::main]
 /// async fn main() -> Result<(), Box<dyn std::error::Error>> {
-///     let mut writer = ZeroCopyObjectWriter::new();
+///     let mut writer = BytesMutWriter::new();
 ///
-///     // Write with zero-copy
+///     // Write into the internal BytesMut buffer
 ///     let data = Bytes::from("hello world");
-///     writer.write_zero_copy(data).await?;
+///     writer.write_buffered(data).await?;
 ///
 ///     // Get the result as Bytes (zero-copy conversion)
 ///     let result = writer.into_bytes();
@@ -59,19 +59,22 @@ pub struct ZeroCopyObjectWriter {
     finalized: bool,
 }
 
+/// Preferred name for the BytesMut-backed object writer.
+pub type BytesMutWriter = ZeroCopyObjectWriter;
+
 impl ZeroCopyObjectWriter {
-    /// Create a new zero-copy object writer with default capacity (8KB).
+    /// Create a new bytes-backed object writer with default capacity (8KB).
     ///
     /// # Example
     ///
     /// ```ignore
-    /// let writer = ZeroCopyObjectWriter::new();
+    /// let writer = BytesMutWriter::new();
     /// ```
     pub fn new() -> Self {
         Self::with_capacity(8 * 1024)
     }
 
-    /// Create a new zero-copy object writer with specified capacity.
+    /// Create a new bytes-backed object writer with specified capacity.
     ///
     /// # Arguments
     ///
@@ -80,7 +83,7 @@ impl ZeroCopyObjectWriter {
     /// # Example
     ///
     /// ```ignore
-    /// let writer = ZeroCopyObjectWriter::with_capacity(64 * 1024);
+    /// let writer = BytesMutWriter::with_capacity(64 * 1024);
     /// ```
     pub fn with_capacity(capacity: usize) -> Self {
         Self {
@@ -120,6 +123,14 @@ impl ZeroCopyObjectWriter {
 
         self.bytes_written += len;
         Ok(len)
+    }
+
+    /// Write data into the internal buffer.
+    ///
+    /// This is the preferred name for new code. It is currently equivalent to
+    /// the historical `write_zero_copy` compatibility method.
+    pub async fn write_buffered(&mut self, data: Bytes) -> Result<usize, ZeroCopyWriteError> {
+        self.write_zero_copy(data).await
     }
 
     /// Write a slice of data.
@@ -308,6 +319,18 @@ mod tests {
         let written = writer.write_zero_copy(data).await.unwrap();
         assert_eq!(written, 11);
         assert_eq!(writer.bytes_written(), 11);
+        assert_eq!(writer.as_slice(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_preferred_writer_alias() {
+        let mut writer = BytesMutWriter::new();
+        let written = writer
+            .write_buffered(Bytes::from("hello world"))
+            .await
+            .expect("write bytes through alias");
+
+        assert_eq!(written, 11);
         assert_eq!(writer.as_slice(), b"hello world");
     }
 

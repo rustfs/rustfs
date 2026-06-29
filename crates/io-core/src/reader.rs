@@ -58,9 +58,12 @@ impl From<io::Error> for ZeroCopyReadError {
 /// # Example
 ///
 /// ```ignore
-/// // Create from bytes (zero-copy)
+/// use bytes::Bytes;
+/// use rustfs_io_core::BytesBufferedReader;
+///
+/// // Create from bytes without copying the `Bytes` buffer
 /// let data = Bytes::from("hello world");
-/// let reader = ZeroCopyObjectReader::from_bytes(data);
+/// let reader = BytesBufferedReader::from_bytes(data);
 ///
 /// // Read using AsyncRead trait
 /// let mut buf = vec![0u8; 1024];
@@ -73,8 +76,11 @@ pub struct ZeroCopyObjectReader {
     pos: usize,
 }
 
+/// Preferred name for the bytes-backed object reader.
+pub type BytesBufferedReader = ZeroCopyObjectReader;
+
 impl ZeroCopyObjectReader {
-    /// Create a zero-copy reader from existing bytes.
+    /// Create a reader from existing bytes.
     ///
     /// This is a true zero-copy operation - the Bytes are wrapped
     /// without any allocation or copying.
@@ -87,7 +93,7 @@ impl ZeroCopyObjectReader {
     ///
     /// ```ignore
     /// let data = Bytes::from("hello world");
-    /// let reader = ZeroCopyObjectReader::from_bytes(data);
+    /// let reader = BytesBufferedReader::from_bytes(data);
     /// ```
     pub fn from_bytes(data: Bytes) -> Self {
         Self { data, pos: 0 }
@@ -102,7 +108,7 @@ impl ZeroCopyObjectReader {
     ///
     /// * `path` - Path to the file to memory map
     /// * `offset` - Offset within the file to start reading
-    /// * `size` - Number of bytes to map
+    /// * `size` - Number of bytes to read
     ///
     /// # Returns
     ///
@@ -115,7 +121,7 @@ impl ZeroCopyObjectReader {
     /// # Example
     ///
     /// ```ignore
-    /// let reader = ZeroCopyObjectReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
+    /// let reader = BytesBufferedReader::from_file_mmap_path("large_file.bin", 0, 1024).await?;
     /// ```
     #[cfg(unix)]
     // SAFETY: The mmap is created from a read-only file handle for the
@@ -154,7 +160,7 @@ impl ZeroCopyObjectReader {
     ///
     /// # Arguments
     ///
-    /// * `file` - File to memory map
+    /// * `file` - File to read from
     /// * `offset` - Offset within the file to start reading
     /// * `size` - Number of bytes to map
     ///
@@ -164,13 +170,13 @@ impl ZeroCopyObjectReader {
     ///
     /// # Errors
     ///
-    /// Returns an error if the file cannot be memory mapped.
+    /// Returns an error if the file cannot be read.
     ///
     /// # Example
     ///
     /// ```ignore
     /// let file = tokio::fs::File::open("large_file.bin").await?;
-    /// let reader = ZeroCopyObjectReader::from_file_mmap(&file, 0, 1024).await?;
+    /// let reader = BytesBufferedReader::from_file_read(&file, 0, 1024).await?;
     /// ```
     #[cfg(unix)]
     pub async fn from_file_mmap(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
@@ -207,6 +213,14 @@ impl ZeroCopyObjectReader {
             data: Bytes::from(buffer),
             pos: 0,
         })
+    }
+
+    /// Create a Bytes-backed reader from a file using normal buffered reads.
+    ///
+    /// This is the preferred name for new code. It is currently equivalent to
+    /// the historical `from_file_mmap` compatibility method.
+    pub async fn from_file_read(file: &tokio::fs::File, offset: u64, size: usize) -> Result<Self, ZeroCopyReadError> {
+        Self::from_file_mmap(file, offset, size).await
     }
 
     /// Get the remaining data as Bytes (zero-copy).
@@ -281,6 +295,18 @@ mod tests {
 
         assert_eq!(n, 11);
         assert_eq!(&buf[..n], b"hello world");
+    }
+
+    #[tokio::test]
+    async fn test_preferred_reader_alias() {
+        let data = Bytes::from("hello world");
+        let mut reader = BytesBufferedReader::from_bytes(data);
+
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf[..]).await.expect("read bytes from alias");
+
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"hello");
     }
 
     #[tokio::test]
