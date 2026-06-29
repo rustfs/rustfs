@@ -194,6 +194,11 @@ const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
 const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
 const GET_OBJECT_STAGE_BODY_BUILD: &str = "body_build";
+const GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ: &str = "body_encrypted_buffer_read";
+const GET_OBJECT_STAGE_BODY_MEMORY_BLOB: &str = "body_memory_blob";
+const GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ: &str = "body_seek_buffer_read";
+const GET_OBJECT_STAGE_BODY_STREAM_STRATEGY: &str = "body_stream_strategy";
+const GET_OBJECT_STAGE_BODY_STREAMING_BLOB: &str = "body_streaming_blob";
 const GET_OBJECT_STAGE_CHECKSUM_HEADERS: &str = "checksum_headers";
 const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
 const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
@@ -2015,6 +2020,7 @@ impl DefaultObjectUsecase {
         _optimal_buffer_size: usize,
         source: &'static str,
     ) -> Option<StreamingBlob> {
+        let memory_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let handoff_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
@@ -2029,6 +2035,7 @@ impl DefaultObjectUsecase {
                 handoff_start.elapsed().as_secs_f64(),
             );
         }
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_MEMORY_BLOB, memory_blob_start);
         Some(blob)
     }
 
@@ -2069,6 +2076,7 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        let streaming_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let tuned_stream_buffer_size =
             tune_reader_stream_buffer_size(stream_buffer_size, response_content_length, stream_strategy);
@@ -2095,6 +2103,7 @@ impl DefaultObjectUsecase {
                 handoff_start.elapsed().as_secs_f64(),
             );
         }
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAMING_BLOB, streaming_blob_start);
         Some(blob)
     }
 
@@ -2616,7 +2625,10 @@ impl DefaultObjectUsecase {
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
-                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+                let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+                record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ, buffer_read_start);
+                if let Err(e) = read_result {
                     error!(error = %e, "GetObject decrypted object buffering failed");
                     return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
                 }
@@ -2638,8 +2650,10 @@ impl DefaultObjectUsecase {
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
+            let stream_strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             let (stream_buffer_size, stream_strategy) =
                 Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
             return Ok(Self::build_reader_blob(
                 final_stream,
                 response_content_length,
@@ -2672,7 +2686,10 @@ impl DefaultObjectUsecase {
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
-            match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ, buffer_read_start);
+            match read_result {
                 Ok(_) => {
                     if buf.len() != response_content_length as usize {
                         warn!(
@@ -2695,8 +2712,10 @@ impl DefaultObjectUsecase {
             }
         }
 
+        let stream_strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let (stream_buffer_size, stream_strategy) =
             Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
         Ok(Self::build_reader_blob(
             final_stream,
             response_content_length,
