@@ -12,18 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod config;
-pub mod datatypes;
-mod replication_event_sink;
-mod replication_pool;
-mod replication_resyncer;
-mod replication_state;
-mod rule;
-mod runtime_boundary;
+pub(crate) use crate::services::event_notification::EventArgs;
 
-pub use config::*;
-pub use datatypes::*;
-pub use replication_pool::*;
-pub use replication_resyncer::*;
-pub use replication_state::{BucketStats, ReplicationStats};
-pub use rule::*;
+pub(crate) fn send_event(args: EventArgs) {
+    crate::services::event_notification::send_event(args);
+}
