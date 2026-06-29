@@ -214,6 +214,7 @@ GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_b
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE="${TMP_DIR}/global_batch_processors_bypass_hits.txt"
 INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE="${TMP_DIR}/internode_data_transport_bypass_hits.txt"
+GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE="${TMP_DIR}/global_capacity_manager_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -2711,6 +2712,18 @@ fi
 
 if [[ -s "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE" ]]; then
   report_failure "internode data transport static must stay behind ECStore internode transport helpers: $(paste -sd '; ' "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_CAPACITY_MANAGER\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/object-capacity/src/capacity_manager\.rs:' || true
+) >"$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_CAPACITY_MANAGER access must stay behind rustfs_object_capacity helpers: $(paste -sd '; ' "$GLOBAL_CAPACITY_MANAGER_BYPASS_HITS_FILE")"
 fi
 
 (
