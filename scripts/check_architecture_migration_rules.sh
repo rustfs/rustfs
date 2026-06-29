@@ -219,6 +219,7 @@ GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypas
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
 GLOBAL_OUTBOUND_TLS_BYPASS_HITS_FILE="${TMP_DIR}/global_outbound_tls_bypass_hits.txt"
 GLOBAL_RPC_SECRET_BYPASS_HITS_FILE="${TMP_DIR}/global_rpc_secret_bypass_hits.txt"
+GLOBAL_KMS_SERVICE_MANAGER_BYPASS_HITS_FILE="${TMP_DIR}/global_kms_service_manager_bypass_hits.txt"
 GLOBAL_TIER_CONFIG_MGR_BYPASS_HITS_FILE="${TMP_DIR}/global_tier_config_mgr_bypass_hits.txt"
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
 ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
@@ -2771,6 +2772,18 @@ fi
 
 if [[ -s "$GLOBAL_RPC_SECRET_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_RUSTFS_RPC_SECRET access must stay behind rustfs_credentials helpers: $(paste -sd '; ' "$GLOBAL_RPC_SECRET_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_KMS_SERVICE_MANAGER\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/kms/src/service_manager\.rs:' || true
+) >"$GLOBAL_KMS_SERVICE_MANAGER_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_KMS_SERVICE_MANAGER_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_KMS_SERVICE_MANAGER access must stay behind rustfs_kms service manager helpers: $(paste -sd '; ' "$GLOBAL_KMS_SERVICE_MANAGER_BYPASS_HITS_FILE")"
 fi
 
 (
