@@ -185,6 +185,88 @@ const DEFAULT_API_LIST_QUORUM: &str = "strict";
 const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
 const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListContinuationV2 {
+    version: &'static str,
+    id: Option<String>,
+    pool_idx: Option<usize>,
+    set_idx: Option<usize>,
+}
+
+impl ListContinuationV2 {
+    fn encode_marker(&self, marker: &str) -> String {
+        let mut marker_tag = format!("{}[rustfs_cache:{}", marker, self.version);
+        match &self.id {
+            Some(id) => marker_tag.push_str(&format!(",id:{}", id)),
+            None => marker_tag.push_str(",return:"),
+        }
+        if let Some(pool_idx) = self.pool_idx {
+            marker_tag.push_str(&format!(",p:{}", pool_idx));
+        }
+        if let Some(set_idx) = self.set_idx {
+            marker_tag.push_str(&format!(",s:{}", set_idx));
+        }
+        marker_tag.push(']');
+        marker_tag
+    }
+
+    fn parse(marker_tag: &str) -> Option<(Self, bool)> {
+        let mut parsed = Self {
+            version: MARKER_TAG_VERSION,
+            id: None,
+            pool_idx: None,
+            set_idx: None,
+        };
+        let mut has_list_cache = false;
+        let mut should_create = false;
+
+        for tag in marker_tag.split(',') {
+            let Some((key, value)) = tag.split_once(':') else {
+                continue;
+            };
+
+            match key {
+                "rustfs_cache" => {
+                    match value {
+                        "v1" => parsed.version = "v1",
+                        MARKER_TAG_VERSION => parsed.version = MARKER_TAG_VERSION,
+                        _ => return None,
+                    }
+                    has_list_cache = true;
+                }
+                "id" => {
+                    parsed.id = Some(value.to_owned());
+                }
+                "return" => {
+                    parsed.id = Some(Uuid::new_v4().to_string());
+                    should_create = true;
+                }
+                "p" => match value.parse::<usize>() {
+                    Ok(res) => parsed.pool_idx = Some(res),
+                    Err(_) => {
+                        parsed.id = Some(Uuid::new_v4().to_string());
+                        should_create = true;
+                    }
+                },
+                "s" => match value.parse::<usize>() {
+                    Ok(res) => parsed.set_idx = Some(res),
+                    Err(_) => {
+                        parsed.id = Some(Uuid::new_v4().to_string());
+                        should_create = true;
+                    }
+                },
+                _ => (),
+            }
+        }
+
+        if has_list_cache && LEGACY_MARKER_TAG_VERSIONS.contains(&parsed.version) {
+            Some((parsed, should_create))
+        } else {
+            None
+        }
+    }
+}
+
 fn normalize_list_quorum(value: &str) -> &'static str {
     let value = value.trim();
     if value.eq_ignore_ascii_case("disk") {
@@ -289,71 +371,29 @@ impl ListPathOptions {
         };
 
         let end_idx = start_idx + end_offset;
-        let tag_body = marker[start_idx + 1..end_idx].to_owned();
-        let mut supported_marker = false;
+        let tag_body = &marker[start_idx + 1..end_idx];
 
-        for tag in tag_body.split(',') {
-            let Some((key, value)) = tag.split_once(':') else {
-                continue;
-            };
-            if key == "rustfs_cache" {
-                if !LEGACY_MARKER_TAG_VERSIONS.contains(&value) {
-                    return;
-                }
-                supported_marker = true;
-            }
-        }
-
-        if !supported_marker {
+        let Some((continuation, should_create)) = ListContinuationV2::parse(tag_body) else {
             return;
-        }
+        };
 
         self.marker = Some(marker[..start_idx].to_owned());
-        for tag in tag_body.split(',') {
-            let Some((key, value)) = tag.split_once(':') else {
-                continue;
-            };
-
-            match key {
-                "rustfs_cache" => {}
-                "id" => self.id = Some(value.to_owned()),
-                "return" => {
-                    self.id = Some(Uuid::new_v4().to_string());
-                    self.create = true;
-                }
-                "p" => match value.parse::<usize>() {
-                    Ok(res) => self.pool_idx = Some(res),
-                    Err(_) => {
-                        self.id = Some(Uuid::new_v4().to_string());
-                        self.create = true;
-                    }
-                },
-                "s" => match value.parse::<usize>() {
-                    Ok(res) => self.set_idx = Some(res),
-                    Err(_) => {
-                        self.id = Some(Uuid::new_v4().to_string());
-                        self.create = true;
-                    }
-                },
-                _ => (),
-            }
+        self.id = continuation.id;
+        self.pool_idx = continuation.pool_idx;
+        self.set_idx = continuation.set_idx;
+        if should_create {
+            self.create = true;
         }
     }
+
     pub fn encode_marker(&mut self, marker: &str) -> String {
-        if let Some(id) = &self.id {
-            let mut marker_tag = format!("{}[rustfs_cache:{}", marker, MARKER_TAG_VERSION);
-            marker_tag.push_str(&format!(",id:{}", id));
-            if let Some(pool_idx) = self.pool_idx {
-                marker_tag.push_str(&format!(",p:{}", pool_idx));
-            }
-            if let Some(set_idx) = self.set_idx {
-                marker_tag.push_str(&format!(",s:{}", set_idx));
-            }
-            marker_tag.push(']');
-            marker_tag
-        } else {
-            format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
+        ListContinuationV2 {
+            version: MARKER_TAG_VERSION,
+            id: self.id.clone(),
+            pool_idx: self.pool_idx,
+            set_idx: self.set_idx,
         }
+        .encode_marker(marker)
     }
 }
 
@@ -3585,6 +3625,42 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_path_marker_parser_return_tag_forces_cache_refresh() {
+        let mut parsed = ListPathOptions {
+            marker: Some(
+                "photos/2026/image.jpg[rustfs_cache:v2,return:,p:3,s:7]"
+                    .to_string(),
+            ),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert!(parsed.id.is_some());
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert!(parsed.create);
+    }
+
+    #[test]
+    fn list_path_marker_parser_recovers_from_corrupt_set_index() {
+        let mut parsed = ListPathOptions {
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,p:3,s:not-a-number]".to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert!(parsed.id.is_some());
+        assert_ne!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert!(parsed.create);
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert!(parsed.set_idx.is_none());
     }
 
     #[test]
