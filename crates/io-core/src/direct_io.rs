@@ -82,7 +82,7 @@ impl From<io::Error> for DirectIoError {
 /// # Platform Support
 ///
 /// Only available on Linux (uses `FileExt::read_at`). On other platforms,
-/// use `ZeroCopyObjectReader` with memory mapping instead.
+/// use `BytesBufferedReader` instead.
 ///
 /// # Alignment Requirements
 ///
@@ -94,11 +94,11 @@ impl From<io::Error> for DirectIoError {
 /// # Example
 ///
 /// ```ignore
-/// use rustfs_io_core::DirectIoReader;
+/// use rustfs_io_core::AlignedPreadReader;
 ///
 /// // Linux only
 /// #[cfg(target_os = "linux")]
-/// let reader = DirectIoReader::new(file, offset, size)?;
+/// let reader = AlignedPreadReader::new(file, offset, size)?;
 /// ```
 #[cfg(target_os = "linux")]
 pub struct DirectIoReader {
@@ -263,6 +263,12 @@ impl std::fmt::Debug for DirectIoReader {
     }
 }
 
+/// Preferred name for aligned pread errors.
+pub type AlignedPreadError = DirectIoError;
+
+/// Preferred name for the aligned pread-based reader.
+pub type AlignedPreadReader = DirectIoReader;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,6 +280,12 @@ mod tests {
             // Valid alignment
             let file = std::fs::File::open("/dev/zero").unwrap();
             assert!(DirectIoReader::new(file, 0, 512).is_ok(), "Should succeed with aligned offset and size");
+
+            let file = std::fs::File::open("/dev/zero").expect("open /dev/zero for alias");
+            assert!(
+                AlignedPreadReader::new(file, 0, 512).is_ok(),
+                "Should succeed through aligned pread alias"
+            );
 
             // Invalid offset
             let file = std::fs::File::open("/dev/zero").unwrap();
