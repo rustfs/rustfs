@@ -1140,7 +1140,6 @@ impl TransitionState {
             "Lifecycle worker configuration resolved"
         );
 
-        //let mut transition_state = GLOBAL_TransitionState.write().await;
         //self.objAPI = objAPI
         Self::update_workers(api, n).await;
     }
@@ -1364,7 +1363,6 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
         workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
     }
 
-    //let expiry_state = GLOBAL_ExpiryStSate.write().await;
     ExpiryState::resize_workers(workers, api.clone()).await;
     spawn_tier_free_version_recovery_once(api.clone());
     spawn_tier_delete_journal_recovery_once(api);
