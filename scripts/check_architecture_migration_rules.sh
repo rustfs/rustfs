@@ -205,6 +205,7 @@ GLOBAL_EVENT_NOTIFIER_BYPASS_HITS_FILE="${TMP_DIR}/global_event_notifier_bypass_
 GLOBAL_BOOT_TIME_BYPASS_HITS_FILE="${TMP_DIR}/global_boot_time_bypass_hits.txt"
 GLOBAL_ECSTORE_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_ecstore_local_node_name_bypass_hits.txt"
 GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_hits.txt"
+GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_bypass_hits.txt"
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
@@ -2594,6 +2595,18 @@ fi
 
 if [[ -s "$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE" ]]; then
   report_failure "runtime scalar globals must stay behind owner helpers: $(paste -sd '; ' "$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN\b|\bget_background_services_cancel_token\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE" ]]; then
+  report_failure "background service cancellation must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE")"
 fi
 
 (

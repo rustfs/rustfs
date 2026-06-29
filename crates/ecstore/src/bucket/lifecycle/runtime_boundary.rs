@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use s3s::dto::BucketLifecycleConfiguration;
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, TransitionState};
 use crate::runtime::sources;
@@ -32,6 +33,10 @@ pub(crate) fn transition_state_handle() -> Arc<TransitionState> {
 
 pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     sources::tier_config_mgr_handle()
+}
+
+pub(crate) fn background_services_cancel_token() -> Option<&'static CancellationToken> {
+    sources::background_services_cancel_token()
 }
 
 pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {

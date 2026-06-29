@@ -623,7 +623,7 @@ impl ExpiryState {
     }
 
     async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>, stats: Arc<ExpiryStats>) {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token().unwrap_or_else(|| {
+        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new)
         });
@@ -1359,7 +1359,7 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
+        let cancel_token = runtime_sources::background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         let mut interval = tokio::time::interval(StdDuration::from_secs(60));
@@ -1434,7 +1434,7 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
+        let cancel_token = runtime_sources::background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;

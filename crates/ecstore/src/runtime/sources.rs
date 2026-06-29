@@ -31,10 +31,11 @@ use crate::{
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
-        TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle,
-        set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
+        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
+        get_global_endpoints, get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
+        global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local,
+        resolve_object_store_handle, set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
+        update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -50,6 +51,7 @@ use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
 use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -176,6 +178,10 @@ pub(crate) fn default_local_node_name() -> String {
 
 pub(crate) fn rustfs_port() -> u16 {
     global_rustfs_port()
+}
+
+pub(crate) fn background_services_cancel_token() -> Option<&'static CancellationToken> {
+    get_background_services_cancel_token()
 }
 
 pub(crate) async fn rustfs_host() -> String {
