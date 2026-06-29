@@ -356,6 +356,10 @@ fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> Da
     }
 }
 
+fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
+    data_usage_root_has_progress(entry)
+}
+
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
     let resume_after = cache.info.scan_resume_after.clone().or_else(|| {
         cache
@@ -1453,6 +1457,60 @@ impl FolderScanner {
         self.update_cache.info.scan_checkpoint = Some(checkpoint);
     }
 
+    fn record_scan_resume_hint_if_not_ancestor(&mut self, folder: &str) {
+        let keep_existing = self
+            .new_cache
+            .info
+            .scan_resume_after
+            .as_deref()
+            .is_some_and(|existing| matches!(folder_resume_match(folder, existing), Some(FolderResumeMatch::Descendant)));
+        if !keep_existing {
+            self.record_scan_resume_hint(folder);
+        }
+    }
+
+    fn carry_forward_old_children(&mut self, parent_hash: &DataUsageHash, entry: &mut DataUsageEntry) {
+        if entry.compacted {
+            // Compacted entries store child totals directly; child links would be flattened twice.
+            return;
+        }
+
+        let Some(old_entry) = self.old_cache.cache.get(&parent_hash.key()) else {
+            return;
+        };
+
+        let old_children = old_entry.children.iter().cloned().collect::<Vec<_>>();
+        for child in old_children {
+            if entry.children.contains(&child) {
+                continue;
+            }
+
+            let child_hash = DataUsageHash(child.clone());
+            self.new_cache
+                .copy_with_children(&self.old_cache, &child_hash, &Some(parent_hash.clone()));
+            entry.children.insert(child);
+        }
+    }
+
+    async fn preserve_partial_child_progress(
+        &mut self,
+        parent: &Option<DataUsageHash>,
+        child_hash: &DataUsageHash,
+        parent_entry: &mut DataUsageEntry,
+        child_entry: &DataUsageEntry,
+    ) {
+        if data_usage_entry_has_progress(child_entry) {
+            let mut child_entry = child_entry.clone();
+            self.carry_forward_old_children(child_hash, &mut child_entry);
+            self.record_scan_resume_hint_if_not_ancestor(&child_hash.key());
+            parent_entry.add_child(child_hash);
+            self.new_cache.replace_hashed(child_hash, parent, &child_entry);
+            self.update_cache.delete_recursive(child_hash);
+            self.update_cache.copy_with_children(&self.new_cache, child_hash, parent);
+            self.send_update().await;
+        }
+    }
+
     fn alert_excessive_folders(&self, folder: &str, total_folders: usize) {
         let threshold = scanner_excess_folders_threshold();
         if u64::try_from(total_folders).unwrap_or(u64::MAX) <= threshold {
@@ -2190,6 +2248,8 @@ impl FolderScanner {
                     let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                     if let Err(e) = fut.await {
                         if ctx.is_cancelled() {
+                            self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
+                                .await;
                             return Err(e);
                         }
                         warn!(
@@ -2531,11 +2591,14 @@ impl FolderScanner {
                         tokio::task::yield_now().await;
                     } else {
                         let mut dst = DataUsageEntry::default();
+                        let h = DataUsageHash(folder_item.name.clone());
 
                         // Use Box::pin for recursive async call
                         let fut = Box::pin(self.scan_folder(ctx.clone(), folder_item.clone(), &mut dst));
                         if let Err(e) = fut.await {
                             if ctx.is_cancelled() {
+                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
+                                    .await;
                                 return Err(e);
                             }
                             warn!(
@@ -2553,7 +2616,6 @@ impl FolderScanner {
                         }
                         tokio::task::yield_now().await;
 
-                        let h = DataUsageHash(folder_item.name.clone());
                         into.add_child(&h);
                         // We scanned a folder, optionally send update.
                         self.update_cache.delete_recursive(&h);
@@ -2737,11 +2799,15 @@ pub async fn scan_data_folder(
         }
         Err(e) => {
             if ctx.is_cancelled() {
+                let root_hash = hash_path(&cache.info.name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
+                if root_has_progress {
+                    scanner.carry_forward_old_children(&root_hash, &mut root);
+                }
                 let new_cache = scanner.as_mut_new_cache();
                 if root_has_progress {
-                    new_cache.replace_hashed(&hash_path(&cache.info.name), &None, &root);
+                    new_cache.replace_hashed(&root_hash, &None, &root);
                 }
                 if partial_cache_is_useful(&root, pending_heals_changed) {
                     if new_cache.root().is_some() {
@@ -3693,6 +3759,16 @@ mod tests {
         meta.marshal_msg().expect("test metadata should marshal")
     }
 
+    async fn write_test_object_metadata(root: &std::path::Path, bucket: &str, object: &str) {
+        let object_dir = root.join(bucket).join(object);
+        tokio::fs::create_dir_all(&object_dir)
+            .await
+            .expect("failed to create test object directory");
+        tokio::fs::write(object_dir.join("xl.meta"), metadata_for_object(bucket, object))
+            .await
+            .expect("failed to write test object metadata");
+    }
+
     fn test_metadata_resolver(bucket: &str) -> MetadataResolutionParams {
         MetadataResolutionParams {
             bucket: bucket.to_string(),
@@ -4371,6 +4447,134 @@ mod tests {
                 .is_some_and(|root| root.children.contains(&hash_path("bucket/child-c").key()))
         );
         assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_scan_data_folder_partial_object_budget_accumulates_progress() {
+        let (scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir.clone()),
+        };
+
+        for index in 0..5 {
+            write_test_object_metadata(&temp_dir, "bucket", &format!("obj/{index:04}")).await;
+        }
+
+        let mut cache = DataUsageCache {
+            info: crate::data_usage_define::DataUsageCacheInfo {
+                name: "bucket".to_string(),
+                next_cycle: 9,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        for expected_min_objects in [2, 4] {
+            let parent = CancellationToken::new();
+            let budget = ScannerCycleBudget::new(
+                &parent,
+                crate::scanner_budget::ScannerCycleBudgetConfig {
+                    max_objects: Some(2),
+                    ..Default::default()
+                },
+            );
+
+            let result = scan_data_folder(
+                budget.token(),
+                budget.clone(),
+                vec![scanner.local_disk.clone()],
+                scanner.local_disk.clone(),
+                cache,
+                None,
+                HealScanMode::Normal,
+                SCANNER_SLEEPER.clone(),
+            )
+            .await;
+
+            cache = match result {
+                Err(ScannerError::PartialCache(partial_cache)) => *partial_cache,
+                other => panic!("expected partial cache after object budget cancellation, got {other:?}"),
+            };
+
+            let root = cache
+                .size_recursive("bucket")
+                .expect("partial cache should retain bucket progress");
+            assert!(
+                root.objects >= expected_min_objects,
+                "partial scan progress should accumulate across cycles; expected at least {expected_min_objects}, got {}",
+                root.objects
+            );
+            assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Objects));
+        }
+
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new(&parent, Default::default());
+        let result = scan_data_folder(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            scanner.local_disk.clone(),
+            cache,
+            None,
+            HealScanMode::Normal,
+            SCANNER_SLEEPER.clone(),
+        )
+        .await
+        .expect("unbounded scan should finish after partial progress");
+
+        let root = result
+            .size_recursive("bucket")
+            .expect("completed cache should retain bucket usage");
+        assert_eq!(root.objects, 5);
+        assert!(result.info.scan_resume_after.is_none());
+        assert!(result.info.scan_checkpoint.is_none());
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_partial_compacted_entry_does_not_carry_children() {
+        let (mut scanner, temp_dir) = build_test_scanner().await;
+        let _guard = TestGuard {
+            temp_dir: Some(temp_dir),
+        };
+
+        let child_hash = hash_path("bucket/child");
+        let old_leaf_hash = hash_path("bucket/child/old");
+        let mut old_child = DataUsageEntry::default();
+        old_child.add_child(&old_leaf_hash);
+
+        scanner
+            .old_cache
+            .replace_hashed(&child_hash, &Some(hash_path("bucket")), &old_child);
+        scanner.old_cache.replace_hashed(
+            &old_leaf_hash,
+            &Some(child_hash.clone()),
+            &DataUsageEntry {
+                objects: 7,
+                size: 7,
+                ..Default::default()
+            },
+        );
+
+        let mut compacted_partial = DataUsageEntry {
+            objects: 2,
+            size: 2,
+            compacted: true,
+            ..Default::default()
+        };
+
+        scanner.carry_forward_old_children(&child_hash, &mut compacted_partial);
+
+        assert!(
+            compacted_partial.children.is_empty(),
+            "compacted entries already contain flattened totals and must not retain child entries"
+        );
+        assert_eq!(compacted_partial.objects, 2);
+        assert!(
+            scanner.new_cache.find(&old_leaf_hash.key()).is_none(),
+            "carried children would be flattened again by size_recursive"
+        );
     }
 
     #[tokio::test]
