@@ -1856,9 +1856,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 let read_length = erasure.shard_file_offset(0, object_size, object_size);
                 let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                 let total_shards = data_shards + fi.erasure.parity_blocks;
+                let initial_reader_shards = if can_try_inline_data_shards_direct(object_size, erasure.block_size) {
+                    data_shards
+                } else {
+                    total_shards
+                };
                 let mut readers = build_inline_bitrot_readers(
                     &files,
-                    total_shards,
+                    initial_reader_shards,
                     bucket,
                     object,
                     read_length,
@@ -1987,6 +1992,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 self.set_index,
                 self.pool_index,
                 opts.skip_verify_bitrot,
+                true,
                 GET_OBJECT_PATH_DIRECT_MEMORY,
                 object_class.as_str(),
                 size_bucket,
@@ -2090,6 +2096,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 set_index,
                 pool_index,
                 skip_verify,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 object_class.as_str(),
                 size_bucket,
@@ -4011,6 +4018,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 set_index,
                 pool_index,
                 skip_verify,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,
@@ -8874,7 +8882,7 @@ mod tests {
         let (erasure, files, read_length, checksum_algo) = inline_bitrot_files_for_payload(payload).await;
         let mut readers = build_inline_bitrot_readers(
             &files,
-            erasure.total_shard_count(),
+            erasure.data_shards,
             "bucket",
             "object",
             read_length,
@@ -8884,8 +8892,9 @@ mod tests {
         )
         .await
         .expect("inline bitrot readers should build");
+        assert_eq!(readers.len(), erasure.data_shards);
 
-        let body = try_read_inline_data_shards_direct(&mut readers, 4, read_length, payload.len())
+        let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, payload.len())
             .await
             .expect("data shard direct read should succeed");
 
@@ -9007,6 +9016,7 @@ mod tests {
                 0,
                 0,
                 true,
+                false,
                 GET_OBJECT_PATH_LEGACY_DUPLEX,
                 GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
                 metrics_size_bucket,

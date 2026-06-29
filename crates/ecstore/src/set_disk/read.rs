@@ -844,9 +844,9 @@ impl BitrotReaderSetupStrategy {
     }
 }
 
-fn get_bitrot_reader_setup_strategy(mode: BitrotReaderSetupMode) -> BitrotReaderSetupStrategy {
+fn get_bitrot_reader_setup_strategy(mode: BitrotReaderSetupMode, prefer_data_blocks_first: bool) -> BitrotReaderSetupStrategy {
     if matches!(mode, BitrotReaderSetupMode::ReadQuorum)
-        && rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false)
+        && (prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false))
     {
         BitrotReaderSetupStrategy::DataBlocksFirst
     } else {
@@ -1175,7 +1175,45 @@ async fn create_bitrot_readers_until_quorum(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
 ) -> BitrotReaderSetup {
-    let strategy = get_bitrot_reader_setup_strategy(mode);
+    create_bitrot_readers_until_quorum_with_preference(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        false,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_bitrot_readers_until_quorum_with_preference(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    prefer_data_blocks_first: bool,
+) -> BitrotReaderSetup {
+    let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
     if strategy == BitrotReaderSetupStrategy::AllShards {
         return create_bitrot_readers_until_quorum_all_shards(
             files,
@@ -2215,6 +2253,7 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        prefer_data_blocks_first_reader_setup: bool,
         metrics_path: &'static str,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
@@ -2361,7 +2400,7 @@ impl SetDisks {
                 .iter()
                 .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
                 .collect::<Vec<_>>();
-            let reader_setup = create_bitrot_readers_until_quorum(
+            let reader_setup = create_bitrot_readers_until_quorum_with_preference(
                 &files,
                 &disks,
                 bucket,
@@ -2376,6 +2415,7 @@ impl SetDisks {
                 erasure.data_shards,
                 erasure.parity_shards,
                 BitrotReaderSetupMode::ReadQuorum,
+                prefer_data_blocks_first_reader_setup,
             )
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
@@ -4027,6 +4067,36 @@ mod tests {
         .await
     }
 
+    async fn setup_inline_bitrot_readers_with_preference(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        prefer_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
+        let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
+        let disks = vec![None; files.len()];
+
+        create_bitrot_readers_until_quorum_with_preference(
+            &files,
+            &disks,
+            "bucket",
+            "object",
+            1,
+            0,
+            4,
+            4,
+            HashAlgorithm::None,
+            false,
+            false,
+            data_shards,
+            parity_shards,
+            mode,
+            prefer_data_blocks_first,
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn bitrot_reader_setup_stops_at_read_quorum() {
         let setup = setup_inline_bitrot_readers(
@@ -4107,6 +4177,23 @@ mod tests {
 
         assert_eq!(n, 4);
         assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_preference_uses_data_blocks_first_without_env() {
+        let setup = setup_inline_bitrot_readers_with_preference(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(setup.available_shards(), 2);
+        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.deferred_shards(), 2);
     }
 
     #[tokio::test]
