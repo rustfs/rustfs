@@ -9090,10 +9090,10 @@ mod tests {
             writer.write(&shard).await.expect("inline shard should write");
             writer.shutdown().await.expect("inline writer should shutdown");
             let data = writer.into_inline_data().expect("inline data should be retained");
-            files.push(FileInfo {
-                data: Some(Bytes::from(data)),
-                ..Default::default()
-            });
+            let mut file = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
+            file.erasure.index = files.len() + 1;
+            file.data = Some(Bytes::from(data));
+            files.push(file);
         }
 
         (erasure, files, read_length, checksum_algo)
@@ -9235,6 +9235,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    async fn direct_memory_inline_data_shards_direct_read_reassembles_single_block_payload() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let payload = vec![b'i'; 192 * 1024];
+        let (erasure, files, _read_length, _checksum_algo) = inline_bitrot_files_for_payload(&payload).await;
+        let mut fi = FileInfo::new("bucket/object", erasure.data_shards, erasure.parity_shards);
+        fi.size = payload.len() as i64;
+        fi.data = files[0].data.clone();
+        fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
+
+        let disks = vec![Some(disk); erasure.total_shard_count()];
+        let metrics_size_bucket = rustfs_io_metrics::get_object_size_bucket(fi.size);
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            "bucket",
+            "object",
+            &fi,
+            &files,
+            &disks,
+            true,
+            GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART,
+            metrics_size_bucket,
+        )
+        .await
+        .expect("direct-memory inline data shard read should not fail")
+        .expect("inline data shard path should be used");
+
+        assert_eq!(body.as_ref(), payload);
     }
 
     #[tokio::test]

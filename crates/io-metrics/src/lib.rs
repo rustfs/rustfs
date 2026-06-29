@@ -702,6 +702,22 @@ pub fn record_get_object_reader_path_by_size(path: &'static str, object_class: &
     .increment(1);
 }
 
+/// Record the concrete subpath used by the direct-memory GetObject reader.
+#[inline(always)]
+pub fn record_get_object_direct_memory_subpath(subpath: &'static str, object_class: &'static str, size_bucket: &'static str) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!("rustfs_io_get_object_direct_memory_subpath_total", "subpath" => subpath).increment(1);
+    counter!(
+        "rustfs_io_get_object_direct_memory_subpath_by_size_total",
+        "subpath" => subpath,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .increment(1);
+}
+
 /// Record why the codec streaming reader was not selected.
 #[inline(always)]
 pub fn record_get_object_codec_streaming_fallback(reason: &'static str) {

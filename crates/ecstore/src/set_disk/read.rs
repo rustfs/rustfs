@@ -14,13 +14,14 @@
 
 use super::*;
 use crate::diagnostics::get::{
-    GET_METADATA_CACHE_DECISION_HIT, GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT,
-    GET_METADATA_CACHE_DECISION_SKIP, GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER,
-    GET_METADATA_CACHE_REASON_DIST_ERASURE, GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS,
-    GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM, GET_METADATA_CACHE_REASON_META_BUCKET,
-    GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED, GET_METADATA_CACHE_REASON_NOT_READ_DATA,
-    GET_METADATA_CACHE_REASON_PART_NUMBER, GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE,
-    GET_METADATA_CACHE_REASON_VERSION_ID, GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
+    GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
+    GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
+    GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
+    GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
+    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
+    GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID,
+    GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
     GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
     GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
@@ -2392,8 +2393,7 @@ impl SetDisks {
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
     ) -> Result<Option<Bytes>> {
-        if fi.parts.len() != 1 || !should_use_single_block_non_inline_fast_path(fi.data.is_some(), fi.size, fi.erasure.block_size)
-        {
+        if fi.parts.len() != 1 || !object_fits_single_block(fi.size, fi.erasure.block_size) {
             return Ok(None);
         }
 
@@ -2424,6 +2424,58 @@ impl SetDisks {
             checksum_info.algorithm
         };
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
+
+        if fi.data.is_some() {
+            let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, fi, erasure.data_shards, |index| {
+                disks.get(index).is_some_and(Option::is_some)
+            }) else {
+                return Ok(None);
+            };
+
+            let reader_setup_stage_start = Instant::now();
+            let mut readers = build_inline_bitrot_readers_from_refs(
+                &data_files,
+                bucket,
+                object,
+                read_length,
+                erasure.shard_size(),
+                &checksum_algo,
+                skip_verify_bitrot,
+            )
+            .await?;
+            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_DIRECT_MEMORY,
+                GET_STAGE_READER_SETUP,
+                metrics_object_class,
+                metrics_size_bucket,
+                reader_setup_elapsed.as_secs_f64(),
+            );
+
+            let decode_stage_start = Instant::now();
+            let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await;
+            let decode_elapsed = decode_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_DIRECT_MEMORY,
+                GET_STAGE_DECODE,
+                metrics_object_class,
+                metrics_size_bucket,
+                decode_elapsed.as_secs_f64(),
+            );
+
+            if body.is_some() {
+                rustfs_io_metrics::record_get_object_direct_memory_subpath(
+                    GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                );
+            }
+
+            return Ok(body);
+        }
+
         let use_mmap_read = object_mmap_read_enabled();
 
         let reader_setup_stage_start = Instant::now();
@@ -2468,6 +2520,14 @@ impl SetDisks {
             metrics_size_bucket,
             decode_elapsed.as_secs_f64(),
         );
+
+        if body.is_some() {
+            rustfs_io_metrics::record_get_object_direct_memory_subpath(
+                GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS,
+                metrics_object_class,
+                metrics_size_bucket,
+            );
+        }
 
         Ok(body)
     }
