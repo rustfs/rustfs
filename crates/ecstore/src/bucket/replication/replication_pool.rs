@@ -1407,6 +1407,10 @@ pub fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
     runtime_sources::replication_pool()
 }
 
+pub fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
+    runtime_sources::replication_stats()
+}
+
 pub async fn schedule_replication<S: ReplicationStorage>(
     oi: ObjectInfo,
     o: Arc<S>,
