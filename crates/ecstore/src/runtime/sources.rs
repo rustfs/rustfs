@@ -42,7 +42,7 @@ use crate::{
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
-use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
+use rustfs_common::GLOBAL_LOCAL_NODE_NAME;
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -180,11 +180,11 @@ pub(crate) fn rustfs_port() -> u16 {
 }
 
 pub(crate) async fn rustfs_host() -> String {
-    GLOBAL_RUSTFS_HOST.read().await.clone()
+    rustfs_common::get_global_rustfs_host().await
 }
 
 pub(crate) async fn rustfs_addr() -> String {
-    GLOBAL_RUSTFS_ADDR.read().await.clone()
+    rustfs_common::get_global_addr().await
 }
 
 pub(crate) fn boot_uptime_secs() -> u64 {
