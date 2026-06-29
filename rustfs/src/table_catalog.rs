@@ -982,6 +982,24 @@ pub(crate) struct TableCatalogBackingMigrationPlan {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingMigrationDryRunReport {
+    pub table_bucket: String,
+    pub source_kind: TableCatalogBackingKind,
+    pub target_kind: TableCatalogBackingKind,
+    pub status: TableCatalogBackingMigrationStatus,
+    pub namespace_count: usize,
+    pub table_count: usize,
+    pub view_count: usize,
+    pub commit_log_count: usize,
+    pub idempotency_index_count: usize,
+    pub warehouse_prefix_count: usize,
+    pub warehouse_index_ready: bool,
+    pub blockers: Vec<TableCatalogBackingMigrationBlocker>,
+    pub recommended_actions: Vec<TableCatalogBackingMigrationAction>,
+    pub rollback: TableCatalogBackingRollbackPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCatalogBackingMigrationStatus {
     ReadyToSnapshot,
@@ -1004,6 +1022,29 @@ pub(crate) enum TableCatalogBackingMigrationStep {
 pub(crate) enum TableCatalogBackingMigrationBlocker {
     CommitRecoveryRequired,
     CommitManualReviewRequired,
+    WarehouseIndexBackfillRequired,
+    DuplicateWarehousePrefix,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackingMigrationAction {
+    RunCatalogRecovery,
+    BackfillWarehouseIndex,
+    ReviewDuplicateWarehousePrefixes,
+    SnapshotObjectBackedCatalog,
+    EnableDurableStrongBacking,
+    VerifyDurableStrongSnapshot,
+    KeepObjectBackedRollbackConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackingRollbackPlan {
+    pub backing_config_key: &'static str,
+    pub current_backing_value: &'static str,
+    pub rollback_backing_value: &'static str,
+    pub preserves_object_backed_catalog: bool,
+    pub requires_operator_restart: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4331,6 +4372,120 @@ where
             namespace: namespace_entry,
             table: table_entry,
             backing_manifest,
+        })
+    }
+
+    pub(crate) async fn plan_durable_strong_backing_migration(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogBackingMigrationDryRunReport> {
+        if self.get_table_bucket(table_bucket).await?.is_none() {
+            return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
+        }
+
+        let namespaces = self.list_namespaces(table_bucket).await?;
+        let mut table_count: usize = 0;
+        let mut view_count: usize = 0;
+        let mut commit_log_count: usize = 0;
+        let mut idempotency_index_count: usize = 0;
+        let mut recovery_required_count: usize = 0;
+        let mut manual_review_count: usize = 0;
+        let mut warehouse_prefix_owners = BTreeMap::<String, usize>::new();
+
+        for namespace in &namespaces {
+            let tables = self.list_tables(table_bucket, &namespace.namespace).await?;
+            for table in tables {
+                table_count += 1;
+                if table.state == TableCatalogEntryState::Active {
+                    let warehouse_prefix = table_warehouse_object_prefix(&table)?;
+                    warehouse_prefix_owners
+                        .entry(warehouse_prefix)
+                        .and_modify(|count| *count = count.saturating_add(1))
+                        .or_insert(1);
+                }
+
+                let recovery = self.table_commit_recovery_report_for_entry(&table, 0).await?;
+                commit_log_count = commit_log_count.saturating_add(recovery.commits.len());
+                idempotency_index_count = idempotency_index_count.saturating_add(
+                    self.backend
+                        .list_objects(
+                            self.catalog_bucket(),
+                            &self.paths.commit_idempotency_entries_prefix(table_bucket, &table.table_id),
+                        )
+                        .await?
+                        .into_iter()
+                        .filter(|object| object.ends_with(".json"))
+                        .count(),
+                );
+                recovery_required_count = recovery_required_count
+                    .saturating_add(recovery.staged_before_table_update_count)
+                    .saturating_add(recovery.finalization_required_count)
+                    .saturating_add(recovery.idempotency_repair_required_count);
+                manual_review_count = manual_review_count.saturating_add(recovery.manual_review_count);
+            }
+            view_count = view_count.saturating_add(self.list_views(table_bucket, &namespace.namespace).await?.len());
+        }
+
+        let warehouse_index_ready = self.warehouse_index_ready(table_bucket).await?;
+        let duplicate_warehouse_prefix_count = warehouse_prefix_owners.values().filter(|count| **count > 1).count();
+        let mut blockers = Vec::new();
+        let mut recommended_actions = Vec::new();
+        if recovery_required_count > 0 {
+            blockers.push(TableCatalogBackingMigrationBlocker::CommitRecoveryRequired);
+        }
+        if manual_review_count > 0 {
+            blockers.push(TableCatalogBackingMigrationBlocker::CommitManualReviewRequired);
+        }
+        if recovery_required_count > 0 || manual_review_count > 0 {
+            recommended_actions.push(TableCatalogBackingMigrationAction::RunCatalogRecovery);
+        }
+        if !warehouse_index_ready {
+            blockers.push(TableCatalogBackingMigrationBlocker::WarehouseIndexBackfillRequired);
+            recommended_actions.push(TableCatalogBackingMigrationAction::BackfillWarehouseIndex);
+        }
+        if duplicate_warehouse_prefix_count > 0 {
+            blockers.push(TableCatalogBackingMigrationBlocker::DuplicateWarehousePrefix);
+            recommended_actions.push(TableCatalogBackingMigrationAction::ReviewDuplicateWarehousePrefixes);
+        }
+
+        let status = if manual_review_count > 0 || duplicate_warehouse_prefix_count > 0 {
+            TableCatalogBackingMigrationStatus::ManualReviewRequired
+        } else if recovery_required_count > 0 || !warehouse_index_ready {
+            TableCatalogBackingMigrationStatus::RecoveryRequired
+        } else {
+            TableCatalogBackingMigrationStatus::ReadyToSnapshot
+        };
+
+        if status == TableCatalogBackingMigrationStatus::ReadyToSnapshot {
+            recommended_actions.extend([
+                TableCatalogBackingMigrationAction::SnapshotObjectBackedCatalog,
+                TableCatalogBackingMigrationAction::EnableDurableStrongBacking,
+                TableCatalogBackingMigrationAction::VerifyDurableStrongSnapshot,
+                TableCatalogBackingMigrationAction::KeepObjectBackedRollbackConfig,
+            ]);
+        }
+
+        Ok(TableCatalogBackingMigrationDryRunReport {
+            table_bucket: table_bucket.to_string(),
+            source_kind: TableCatalogBackingKind::ObjectBacked,
+            target_kind: TableCatalogBackingKind::StrongKvWal,
+            status,
+            namespace_count: namespaces.len(),
+            table_count,
+            view_count,
+            commit_log_count,
+            idempotency_index_count,
+            warehouse_prefix_count: warehouse_prefix_owners.len(),
+            warehouse_index_ready,
+            blockers,
+            recommended_actions,
+            rollback: TableCatalogBackingRollbackPlan {
+                backing_config_key: ENV_TABLE_CATALOG_BACKING,
+                current_backing_value: TABLE_CATALOG_BACKING_DURABLE_STRONG,
+                rollback_backing_value: TABLE_CATALOG_BACKING_OBJECT,
+                preserves_object_backed_catalog: true,
+                requires_operator_restart: true,
+            },
         })
     }
 
@@ -13655,6 +13810,177 @@ mod tests {
             TableCatalogHaWriterModel::SingleActiveWriterRegion
         );
         assert!(!export.backing_manifest.ha.active_active_supported);
+    }
+
+    #[tokio::test]
+    async fn durable_strong_migration_dry_run_reports_ready_catalog_inventory() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let view = IdentifierSegment::parse("recent_orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let view_metadata = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current_metadata.clone()).await;
+        store
+            .create_view(test_view_entry(bucket, &namespace, &view, view_metadata))
+            .await
+            .unwrap();
+        backend.seed_object(bucket, &next_metadata, b"{}".to_vec()).await;
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("client-request".to_string()),
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: next_metadata,
+                requirements: Vec::new(),
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap();
+
+        let report = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
+
+        assert_eq!(report.table_bucket, bucket);
+        assert_eq!(report.source_kind, TableCatalogBackingKind::ObjectBacked);
+        assert_eq!(report.target_kind, TableCatalogBackingKind::StrongKvWal);
+        assert_eq!(report.status, TableCatalogBackingMigrationStatus::ReadyToSnapshot);
+        assert_eq!(report.namespace_count, 1);
+        assert_eq!(report.table_count, 1);
+        assert_eq!(report.view_count, 1);
+        assert_eq!(report.commit_log_count, 1);
+        assert_eq!(report.idempotency_index_count, 1);
+        assert_eq!(report.warehouse_prefix_count, 1);
+        assert!(report.blockers.is_empty());
+        assert!(
+            report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::SnapshotObjectBackedCatalog)
+        );
+        assert!(
+            report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::EnableDurableStrongBacking)
+        );
+        assert_eq!(report.rollback.backing_config_key, ENV_TABLE_CATALOG_BACKING);
+        assert_eq!(report.rollback.rollback_backing_value, TABLE_CATALOG_BACKING_OBJECT);
+    }
+
+    #[tokio::test]
+    async fn durable_strong_migration_dry_run_reports_recovery_blockers() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let next_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current_metadata.clone()).await;
+        backend.seed_object(bucket, &next_metadata, b"{}".to_vec()).await;
+        store
+            .commit_table(TableCommitRequest {
+                table_bucket: bucket.to_string(),
+                namespace: namespace.public_name(),
+                table: table.as_str().to_string(),
+                commit_id: "commit-1".to_string(),
+                idempotency_key: Some("client-request".to_string()),
+                operation: "append".to_string(),
+                expected_version_token: "token-v1".to_string(),
+                expected_metadata_location: current_metadata,
+                new_metadata_location: next_metadata,
+                requirements: Vec::new(),
+                writer: Some("pyiceberg/test".to_string()),
+            })
+            .await
+            .unwrap();
+        let idempotency_path = store
+            .paths
+            .commit_idempotency_entry_path(bucket, "table-id", "client-request");
+        backend.delete_object(RUSTFS_META_BUCKET, &idempotency_path).await.unwrap();
+
+        let report = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
+
+        assert_eq!(report.status, TableCatalogBackingMigrationStatus::RecoveryRequired);
+        assert_eq!(report.commit_log_count, 1);
+        assert_eq!(report.idempotency_index_count, 0);
+        assert!(
+            report
+                .blockers
+                .contains(&TableCatalogBackingMigrationBlocker::CommitRecoveryRequired)
+        );
+        assert!(
+            report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::RunCatalogRecovery)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::SnapshotObjectBackedCatalog)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::EnableDurableStrongBacking)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::VerifyDurableStrongSnapshot)
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_strong_migration_dry_run_requires_ready_warehouse_index() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let current_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current_metadata).await;
+        let state_path = store.paths.warehouse_index_state_path(bucket);
+        backend.delete_object(RUSTFS_META_BUCKET, &state_path).await.unwrap();
+
+        let report = store.plan_durable_strong_backing_migration(bucket).await.unwrap();
+
+        assert_eq!(report.status, TableCatalogBackingMigrationStatus::RecoveryRequired);
+        assert!(!report.warehouse_index_ready);
+        assert!(
+            report
+                .blockers
+                .contains(&TableCatalogBackingMigrationBlocker::WarehouseIndexBackfillRequired)
+        );
+        assert!(
+            report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::BackfillWarehouseIndex)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::SnapshotObjectBackedCatalog)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::EnableDurableStrongBacking)
+        );
+        assert!(
+            !report
+                .recommended_actions
+                .contains(&TableCatalogBackingMigrationAction::VerifyDurableStrongSnapshot)
+        );
     }
 
     #[tokio::test]
