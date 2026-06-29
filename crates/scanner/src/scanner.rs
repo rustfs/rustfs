@@ -1215,6 +1215,7 @@ mod tests {
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(data)),
                 object_info: ObjectInfo::default(),
+                buffered_body: None,
             })
         }
 

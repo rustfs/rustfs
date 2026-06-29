@@ -256,6 +256,23 @@ impl DeadlockRequestGuard {
             request_id,
         }
     }
+
+    fn register_if_enabled<F>(
+        deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
+        request_id: &str,
+        description: F,
+    ) -> Option<Self>
+    where
+        F: FnOnce() -> String,
+    {
+        if !deadlock_detector.is_enabled() {
+            return None;
+        }
+
+        let request_id = request_id.to_string();
+        deadlock_detector.register_request(&request_id, description());
+        Some(Self::new(deadlock_detector, request_id))
+    }
 }
 
 impl Drop for DeadlockRequestGuard {
@@ -269,7 +286,7 @@ struct GetObjectBootstrap {
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
     request_guard: GetObjectGuard,
-    _deadlock_request_guard: DeadlockRequestGuard,
+    _deadlock_request_guard: Option<DeadlockRequestGuard>,
     concurrent_requests: usize,
 }
 
@@ -1240,6 +1257,8 @@ fn should_buffer_get_object_in_memory_with_threshold(
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
     use crate::app::storage_api::object_usecase::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     #[test]
@@ -1259,6 +1278,24 @@ mod deadlock_request_guard_tests {
         }
 
         assert_eq!(detector.tracked_count(), 0);
+    }
+
+    #[test]
+    fn deadlock_request_guard_skips_disabled_detector() {
+        let detector = Arc::new(DeadlockDetector::new(RequestHangDetectionPolicy {
+            enabled: false,
+            ..RequestHangDetectionPolicy::default()
+        }));
+        let description_built = Rc::new(Cell::new(false));
+        let description_built_for_closure = Rc::clone(&description_built);
+
+        let guard = DeadlockRequestGuard::register_if_enabled(detector, "test-request-id", || {
+            description_built_for_closure.set(true);
+            "test request".to_string()
+        });
+
+        assert!(guard.is_none());
+        assert!(!description_built.get());
     }
 }
 
@@ -2123,9 +2160,9 @@ impl DefaultObjectUsecase {
         let concurrent_requests = GetObjectGuard::concurrent_requests();
 
         let deadlock_detector = deadlock_detector::get_deadlock_detector();
-        let request_id = wrapper.request_id().to_string();
-        deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
-        let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+        let deadlock_request_guard = DeadlockRequestGuard::register_if_enabled(deadlock_detector, wrapper.request_id(), || {
+            format!("GetObject {bucket}/{key}")
+        });
 
         Self::ensure_get_object_not_timed_out(&wrapper, &timeout_config, bucket, key, GetObjectTimeoutStage::BeforeProcessing)?;
 
