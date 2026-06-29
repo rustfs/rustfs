@@ -30,12 +30,16 @@ use crate::diagnostics::get::{
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
-    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
+    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
-use crate::io_support::bitrot::{create_deferred_bitrot_reader, object_mmap_read_enabled};
+use crate::io_support::bitrot::{
+    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+};
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
@@ -817,6 +821,13 @@ type ObjectBitrotReader = BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>
 type BitrotReaderTask<'a> =
     Pin<Box<dyn Future<Output = (usize, std::result::Result<Option<ObjectBitrotReader>, DiskError>)> + Send + 'a>>;
 
+const DIRECT_MEMORY_BITROT_READER_STAGE_METRICS: BitrotReaderStageMetrics = BitrotReaderStageMetrics {
+    path: GET_OBJECT_PATH_DIRECT_MEMORY,
+    reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+    bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+};
+
 struct BitrotReaderSetup {
     readers: Vec<Option<ObjectBitrotReader>>,
     errors: Vec<Option<DiskError>>,
@@ -997,6 +1008,7 @@ fn schedule_bitrot_reader_task<'a>(
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 ) {
     if idx >= disks.len() || !setup.mark_scheduled(idx) {
         return;
@@ -1008,7 +1020,7 @@ fn schedule_bitrot_reader_task<'a>(
     let path = format!("{object}/{data_dir}/part.{part_number}");
 
     reader_tasks.push(Box::pin(async move {
-        let result = create_bitrot_reader(
+        let result = create_bitrot_reader_with_stage_metrics(
             inline_data,
             disk,
             bucket,
@@ -1019,6 +1031,7 @@ fn schedule_bitrot_reader_task<'a>(
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
+            stage_metrics,
         )
         .await;
         (idx, result)
@@ -1274,6 +1287,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
+            None,
         );
     }
 
@@ -1293,6 +1307,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
+            None,
         );
     }
 
@@ -1323,6 +1338,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
+                None,
             );
         }
     }
@@ -1369,9 +1385,11 @@ async fn create_data_block_bitrot_readers(
     let total_shards = disks.len().min(files.len());
     let mut setup = BitrotReaderSetup::new(total_shards);
     let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
+    let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
     rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), BitrotReaderSetupMode::ReadQuorum.as_str());
 
+    let schedule_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     for idx in 0..data_shards.min(total_shards) {
         schedule_bitrot_reader_task(
             &mut reader_tasks,
@@ -1388,17 +1406,31 @@ async fn create_data_block_bitrot_readers(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
+            Some(DIRECT_MEMORY_BITROT_READER_STAGE_METRICS),
         );
     }
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_DIRECT_MEMORY, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
 
+    let wait_quorum_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     while let Some((idx, result)) = reader_tasks.next().await {
         setup.apply_reader_result(idx, result);
         if setup.available_data_shards(data_shards) >= data_shards {
             break;
         }
     }
+    record_get_stage_duration_if_enabled(
+        GET_OBJECT_PATH_DIRECT_MEMORY,
+        GET_STAGE_READER_SETUP_WAIT_QUORUM,
+        wait_quorum_stage_start,
+    );
 
+    let drop_pending_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     drop(reader_tasks);
+    record_get_stage_duration_if_enabled(
+        GET_OBJECT_PATH_DIRECT_MEMORY,
+        GET_STAGE_READER_SETUP_DROP_PENDING,
+        drop_pending_stage_start,
+    );
     record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup);
 
     setup

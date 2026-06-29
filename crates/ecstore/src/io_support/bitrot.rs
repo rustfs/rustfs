@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::diagnostics::get::record_get_stage_duration_if_enabled;
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
@@ -28,6 +29,14 @@ use tracing::debug;
 
 type BoxedObjectReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type OpenObjectReaderFuture = Pin<Box<dyn Future<Output = disk::error::Result<Option<BoxedObjectReader>>> + Send>>;
+
+#[derive(Clone, Copy)]
+pub(crate) struct BitrotReaderStageMetrics {
+    pub(crate) path: &'static str,
+    pub(crate) reader_construction_stage: &'static str,
+    pub(crate) file_open_stage: &'static str,
+    pub(crate) bitrot_reader_init_stage: &'static str,
+}
 
 pub(crate) fn object_mmap_read_enabled() -> bool {
     rustfs_utils::get_env_bool_with_aliases(
@@ -215,7 +224,37 @@ pub async fn create_bitrot_reader(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
-    create_bitrot_reader_from_bytes(
+    create_bitrot_reader_with_stage_metrics(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn create_bitrot_reader_with_stage_metrics(
+    inline_data: Option<&[u8]>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+    create_bitrot_reader_from_bytes_with_stage_metrics(
         inline_data.map(Bytes::copy_from_slice),
         disk,
         bucket,
@@ -226,6 +265,7 @@ pub async fn create_bitrot_reader(
         checksum_algo,
         skip_verify,
         use_mmap_read,
+        stage_metrics,
     )
     .await
 }
@@ -247,6 +287,39 @@ pub async fn create_bitrot_reader_from_bytes(
     skip_verify: bool,
     use_mmap_read: bool,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+    create_bitrot_reader_from_bytes_with_stage_metrics(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        offset,
+        length,
+        shard_size,
+        checksum_algo,
+        skip_verify,
+        use_mmap_read,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_bitrot_reader_from_bytes_with_stage_metrics(
+    inline_data: Option<Bytes>,
+    disk: Option<&DiskStore>,
+    bucket: &str,
+    path: &str,
+    offset: usize,
+    length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
+    let stage_metrics_enabled = stage_metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+
+    let reader_construction_start = stage_metrics_enabled.then(Instant::now);
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
     let source = BitrotReaderSource {
         inline_data,
@@ -257,11 +330,23 @@ pub async fn create_bitrot_reader_from_bytes(
         length,
         use_mmap_read,
     };
+    if let Some(metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
+    }
 
-    source
-        .open()
-        .await
-        .map(|reader| reader.map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify)))
+    let file_open_start = stage_metrics_enabled.then(Instant::now);
+    let reader = source.open().await?;
+    if let Some(metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(metrics.path, metrics.file_open_stage, file_open_start);
+    }
+
+    let bitrot_reader_init_start = stage_metrics_enabled.then(Instant::now);
+    let reader = reader.map(|reader| BitrotReader::new(reader, shard_size, checksum_algo, skip_verify));
+    if let Some(metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(metrics.path, metrics.bitrot_reader_init_stage, bitrot_reader_init_start);
+    }
+
+    Ok(reader)
 }
 
 #[allow(clippy::too_many_arguments)]
