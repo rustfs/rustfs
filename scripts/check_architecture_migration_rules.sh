@@ -203,6 +203,9 @@ REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_sour
 GLOBAL_REPLICATION_STATE_BYPASS_HITS_FILE="${TMP_DIR}/global_replication_state_bypass_hits.txt"
 GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_metadata_sys_bypass_hits.txt"
 GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_target_sys_bypass_hits.txt"
+EVENT_DISPATCH_HOOK_BYPASS_HITS_FILE="${TMP_DIR}/event_dispatch_hook_bypass_hits.txt"
+DATA_USAGE_MEMORY_GLOBAL_BYPASS_HITS_FILE="${TMP_DIR}/data_usage_memory_global_bypass_hits.txt"
+WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE="${TMP_DIR}/workload_admission_provider_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
 GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
@@ -2544,6 +2547,42 @@ fi
 
 if [[ -s "$GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_BUCKET_TARGET_SYS access must stay behind ECStore bucket target owner helpers: $(paste -sd '; ' "$GLOBAL_BUCKET_TARGET_SYS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bEVENT_DISPATCH_HOOK\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/services/event_notification\.rs:' || true
+) >"$EVENT_DISPATCH_HOOK_BYPASS_HITS_FILE"
+
+if [[ -s "$EVENT_DISPATCH_HOOK_BYPASS_HITS_FILE" ]]; then
+  report_failure "EVENT_DISPATCH_HOOK access must stay behind ECStore event-notification owner helpers: $(paste -sd '; ' "$EVENT_DISPATCH_HOOK_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bUSAGE_(MEMORY_CACHE|CACHE_UPDATING)\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/data_usage/mod\.rs:' || true
+) >"$DATA_USAGE_MEMORY_GLOBAL_BYPASS_HITS_FILE"
+
+if [[ -s "$DATA_USAGE_MEMORY_GLOBAL_BYPASS_HITS_FILE" ]]; then
+  report_failure "data-usage memory globals must stay behind ECStore data-usage owner helpers: $(paste -sd '; ' "$DATA_USAGE_MEMORY_GLOBAL_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bWORKLOAD_ADMISSION_SNAPSHOT_PROVIDER\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/sources\.rs:' || true
+) >"$WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE"
+
+if [[ -s "$WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE" ]]; then
+  report_failure "WORKLOAD_ADMISSION_SNAPSHOT_PROVIDER access must stay behind ECStore runtime-source helpers: $(paste -sd '; ' "$WORKLOAD_ADMISSION_PROVIDER_BYPASS_HITS_FILE")"
 fi
 
 (
