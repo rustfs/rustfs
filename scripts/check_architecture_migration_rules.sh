@@ -2482,10 +2482,10 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_(REGION|RUSTFS_PORT)\b|\bglobalDeploymentIDPtr\b' \
+  rg -n --with-filename '\bGLOBAL_(REGION|RUSTFS_PORT)\b|\bglobalDeploymentIDPtr\b|\bruntime::global::global_rustfs_port\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^(crates/common/src/globals|crates/ecstore/src/runtime/global)\.rs:' || true
+    rg -v '^(crates/common/src/globals|crates/ecstore/src/runtime/(global|sources))\.rs:' || true
 ) >"$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE" ]]; then
