@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata_sys;
 use crate::bucket::replication::ResyncOpts;
 use crate::bucket::replication::ResyncStatusType;
@@ -1508,7 +1508,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         }
     };
 
-    let tgts = match BucketTargetSys::get().list_bucket_targets(bucket).await {
+    let tgts = match target_boundary::list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
         Err(err) => {
             debug!(
