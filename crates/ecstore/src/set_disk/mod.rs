@@ -30,7 +30,8 @@ use crate::diagnostics::get::{
     GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
     GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
-    GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error, record_get_object_pipeline_failure,
+    GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_METADATA, GET_STAGE_READER_SETUP, classify_storage_error,
+    record_get_object_pipeline_failure,
 };
 use crate::disk::error_reduce::{
     BUCKET_OP_IGNORED_ERRS, OBJECT_OP_IGNORED_ERRS, build_write_quorum_failure_summary, count_errs, reduce_read_quorum_errs,
@@ -1780,6 +1781,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         checksum_info.algorithm
                     };
                 let read_length = erasure.shard_file_offset(0, object_size, object_size);
+                let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                 let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> =
                     Vec::new();
                 for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
@@ -1803,10 +1805,29 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         readers.push(None);
                     }
                 }
+                if let Some(reader_setup_stage_start) = reader_setup_stage_start {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_READER_SETUP,
+                        object_class.as_str(),
+                        size_bucket,
+                        reader_setup_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
 
                 // Decode directly
+                let decode_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
                 let mut output = Cursor::new(Vec::with_capacity(object_size));
                 let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+                if let Some(decode_stage_start) = decode_stage_start {
+                    rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                        GET_OBJECT_PATH_INLINE_DIRECT,
+                        GET_STAGE_DECODE,
+                        object_class.as_str(),
+                        size_bucket,
+                        decode_stage_start.elapsed().as_secs_f64(),
+                    );
+                }
 
                 if let Some(e) = err {
                     return Err(to_object_err(e.into(), vec![bucket, object]));
