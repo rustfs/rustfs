@@ -13,11 +13,11 @@ caches separate from runtime migration targets.
 
 | Scope | Count | Command |
 |---|---:|---|
-| Rust source files | 1,237 | `rg --files -g '*.rs'` |
+| Rust source files | 1,252 | `rg --files -g '*.rs'` |
 | `OnceLock` references | 221 lines | `rg -n --glob '*.rs' 'OnceLock'` |
-| `GLOBAL_*` references | 302 lines | `rg -n --glob '*.rs' '\bGLOBAL_[A-Za-z0-9_]*\b'` |
+| `GLOBAL_*` references | 265 lines | `rg -n --glob '*.rs' '\bGLOBAL_[A-Za-z0-9_]*\b'` |
 | `static NAME:` definitions | 621 lines | `rg -n --glob '*.rs' '^\s*(pub(\([^)]*\))?\s+)?static(\s+mut)?\s+[A-Za-z_][A-Za-z0-9_]*\s*:'` |
-| `lazy_static!` `static ref` definitions | 59 lines | `rg -n --glob '*.rs' '^\s*(pub\s+)?static\s+ref\s+[A-Za-z_][A-Za-z0-9_]*\s*:'` |
+| `lazy_static!` `static ref` definitions | 58 lines | `rg -n --glob '*.rs' '^\s*(pub\s+)?static\s+ref\s+[A-Za-z_][A-Za-z0-9_]*\s*:'` |
 | `static mut` definitions | 0 lines | `rg -n --glob '*.rs' '^\s*(pub(\([^)]*\))?\s+)?static\s+mut\s+'` |
 
 ## Global State Classification
