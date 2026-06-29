@@ -191,9 +191,25 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
+const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
+const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
+const GET_OBJECT_STAGE_BODY_BUILD: &str = "body_build";
+const GET_OBJECT_STAGE_CHECKSUM_HEADERS: &str = "checksum_headers";
+const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
+const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn record_get_object_s3_handler_stage_duration(stage: &'static str, start: Option<std::time::Instant>) {
+    if let Some(start) = start {
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_STAGE_PATH_S3_HANDLER,
+            stage,
+            start.elapsed().as_secs_f64(),
+        );
+    }
+}
 
 fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
     let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
@@ -3394,6 +3410,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         versioned: bool,
     ) -> S3Result<GetObjectOutputContext> {
+        let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
             bucket,
@@ -3406,12 +3423,14 @@ impl DefaultObjectUsecase {
             queue_status,
             concurrent_requests,
         );
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_OUTPUT_STRATEGY, strategy_start);
         let GetObjectStrategyContext {
             io_strategy: _,
             optimal_buffer_size,
             enable_readahead,
         } = strategy;
 
+        let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let body = Self::build_get_object_body(
             final_stream,
             &info,
@@ -3427,8 +3446,11 @@ impl DefaultObjectUsecase {
             key,
         )
         .await?;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUILD, body_build_start);
 
+        let checksum_headers_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
         let output_version_id = if versioned {
             info.version_id.map(|vid| {
@@ -3449,9 +3471,15 @@ impl DefaultObjectUsecase {
         });
 
         // x-amz-expiration: predict from lifecycle configuration
+        let lifecycle_expiration_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expiration = resolve_put_object_expiration(bucket, &info).await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
         let storage_class = response_storage_class(&info, &info.user_defined);
         let content_disposition = info.user_defined.get("content-disposition").cloned();
+
+        let metadata_filter_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let metadata = filter_object_metadata(&info.user_defined);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
 
         let output = GetObjectOutput {
             body,
@@ -3463,7 +3491,7 @@ impl DefaultObjectUsecase {
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&info.user_defined),
+            metadata,
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
