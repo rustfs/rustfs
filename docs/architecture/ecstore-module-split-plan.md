@@ -82,6 +82,9 @@ First safe PR:
   each dependency;
 - add no code movement and no behavior changes.
 
+The module-level inventory lives in
+`crates/ecstore/src/bucket/lifecycle/README.md`.
+
 Focused verification for the first code-bearing lifecycle PR:
 
 - `cargo test -p rustfs-ecstore lifecycle --lib`
@@ -127,6 +130,9 @@ First safe PR:
   each dependency;
 - keep global pool/stat initialization and queue behavior unchanged.
 
+The module-level inventory lives in
+`crates/ecstore/src/bucket/replication/README.md`.
+
 Focused verification for the first code-bearing replication PR:
 
 - `cargo test -p rustfs-ecstore replication --lib`
@@ -137,7 +143,10 @@ Focused verification for the first code-bearing replication PR:
 ## Facade Shrink Plan
 
 The broad `rustfs_ecstore::api` facade remains a compatibility boundary, not a
-new architecture target. Shrinking it must be monotonic:
+new architecture target. The current facade groups and external consumers are
+recorded in
+[`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md).
+Shrinking it must be monotonic:
 
 1. Inventory every public facade group and consumer.
 2. Add compile-time coverage before removing or narrowing a facade item.

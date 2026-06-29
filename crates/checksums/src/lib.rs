@@ -338,8 +338,7 @@ mod tests {
 
     use crate::ChecksumAlgorithm;
     use crate::http::HttpChecksum;
-
-    use crate::base64;
+    use base64_simd::STANDARD;
     use http::HeaderValue;
     use pretty_assertions::assert_eq;
     use std::fmt::Write;
@@ -347,7 +346,9 @@ mod tests {
     const TEST_DATA: &str = r#"test data"#;
 
     fn base64_encoded_checksum_to_hex_string(header_value: &HeaderValue) -> String {
-        let decoded_checksum = base64::decode(header_value.to_str().unwrap()).unwrap();
+        let decoded_checksum = STANDARD
+            .decode_to_vec(header_value.to_str().expect("checksum header value should be ASCII"))
+            .expect("checksum header value should be valid base64");
         let decoded_checksum = decoded_checksum.into_iter().fold(String::new(), |mut acc, byte| {
             write!(acc, "{byte:02X?}").expect("string will always be writable");
             acc

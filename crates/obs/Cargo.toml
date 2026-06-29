@@ -41,7 +41,8 @@ rustfs-config = { workspace = true, features = ["constants", "observability"] }
 # The obs crate imports types from ecstore for metrics collection.
 # Breaking this dependency would require defining traits in obs and
 # implementing them in ecstore, which is a significant refactoring.
-# See https://github.com/rustfs/backlog/issues/735 for discussion.
+# See docs/architecture/obs-ecstore-dependency-inventory.md and
+# https://github.com/rustfs/backlog/issues/735 for discussion.
 rustfs-ecstore = { workspace = true }
 rustfs-iam = { workspace = true }
 rustfs-io-metrics = { workspace = true }

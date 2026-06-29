@@ -787,7 +787,8 @@ fn table_catalog_store_for_data_plane() -> S3Result<crate::table_catalog::EcStor
     let store =
         runtime_sources::current_object_store_handle().ok_or_else(|| s3_error!(InternalError, "object store not initialized"))?;
     let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(store);
-    Ok(crate::table_catalog::ObjectTableCatalogStore::new(backend))
+    crate::table_catalog::ConfiguredTableCatalogStore::from_env(backend)
+        .map_err(|err| s3_error!(InternalError, "failed to configure table catalog backing: {}", err))
 }
 
 async fn table_data_plane_resource_for_request(

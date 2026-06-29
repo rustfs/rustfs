@@ -38,6 +38,7 @@ time.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+insta = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 
