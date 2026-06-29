@@ -18,8 +18,8 @@ use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration, ObjectLock
 use time::OffsetDateTime;
 use tracing::info;
 
+use super::object_lock_boundary;
 use crate::bucket::lifecycle::lifecycle::{Event, Lifecycle, ObjectOpts};
-use crate::bucket::object_lock::objectlock_sys::is_object_locked_by_metadata;
 use crate::bucket::replication::ReplicationConfig;
 use rustfs_common::metrics::IlmAction;
 
@@ -89,7 +89,7 @@ impl Evaluator {
         }
 
         // Use the common function to check if the object is locked
-        is_object_locked_by_metadata(&obj.user_defined, obj.delete_marker)
+        object_lock_boundary::is_object_locked_by_metadata(&obj.user_defined, obj.delete_marker)
     }
 
     /// eval will return a lifecycle event for each object in objs for a given time.

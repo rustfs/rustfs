@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::runtime_boundary as runtime_sources;
+use super::{object_lock_boundary, runtime_boundary as runtime_sources};
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{
     LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
     emit_transition_failed_event, emit_transitioned_expiration_event,
@@ -25,7 +25,6 @@ use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
 use crate::bucket::replication::{
     DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
 };
@@ -2522,7 +2521,11 @@ pub async fn eval_action_from_lifecycle(
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
+            if lock_enabled
+                && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
+                    .await
+                    .is_some()
+            {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     debug!(
