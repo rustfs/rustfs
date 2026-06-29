@@ -3632,15 +3632,6 @@ impl DefaultObjectUsecase {
             final_stream
         };
 
-        let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        if let Some(versioning_start) = versioning_start {
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "s3_handler",
-                "versioning_lookup",
-                versioning_start.elapsed().as_secs_f64(),
-            );
-        }
         let output_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output_context = self
             .build_get_object_output_context(
@@ -3667,7 +3658,7 @@ impl DefaultObjectUsecase {
                 &queue_status,
                 concurrent_requests,
                 part_number,
-                versioned,
+                opts.versioned,
             )
             .await?;
         if let Some(output_build_start) = output_build_start {
