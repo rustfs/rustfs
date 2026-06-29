@@ -45,7 +45,7 @@ use std::sync::Arc;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
-use tracing::{Instrument, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
@@ -178,9 +178,102 @@ pub struct ListPathOptions {
     pub set_idx: Option<usize>,
 }
 
-const MARKER_TAG_VERSION: &str = "v1";
+const MARKER_TAG_VERSION: &str = "v2";
+const LEGACY_MARKER_TAG_VERSIONS: &[&str] = &["v1", MARKER_TAG_VERSION];
 const ENV_API_LIST_QUORUM: &str = "RUSTFS_API_LIST_QUORUM";
 const DEFAULT_API_LIST_QUORUM: &str = "strict";
+const ENV_API_LIST_OBJECTS_QUORUM: &str = "RUSTFS_LIST_OBJECTS_QUORUM";
+const DEFAULT_API_LIST_OBJECTS_QUORUM: &str = "optimal";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ListContinuationV2 {
+    version: &'static str,
+    id: Option<String>,
+    pool_idx: Option<usize>,
+    set_idx: Option<usize>,
+}
+
+impl ListContinuationV2 {
+    fn encode_marker(&self, marker: &str) -> String {
+        let mut marker_tag = String::with_capacity(marker.len() + 64);
+        marker_tag.push_str(marker);
+        marker_tag.push_str("[rustfs_cache:");
+        marker_tag.push_str(self.version);
+        match &self.id {
+            Some(id) => {
+                marker_tag.push_str(",id:");
+                marker_tag.push_str(id);
+            }
+            None => marker_tag.push_str(",return:"),
+        }
+        if let Some(pool_idx) = self.pool_idx {
+            marker_tag.push_str(",p:");
+            marker_tag.push_str(&pool_idx.to_string());
+        }
+        if let Some(set_idx) = self.set_idx {
+            marker_tag.push_str(",s:");
+            marker_tag.push_str(&set_idx.to_string());
+        }
+        marker_tag.push(']');
+        marker_tag
+    }
+
+    fn parse(marker_tag: &str) -> Option<(Self, bool)> {
+        let mut parsed = Self {
+            version: MARKER_TAG_VERSION,
+            id: None,
+            pool_idx: None,
+            set_idx: None,
+        };
+        let mut has_list_cache = false;
+        let mut should_create = false;
+
+        for tag in marker_tag.split(',') {
+            let Some((key, value)) = tag.split_once(':') else {
+                continue;
+            };
+
+            match key {
+                "rustfs_cache" => {
+                    match value {
+                        "v1" => parsed.version = "v1",
+                        MARKER_TAG_VERSION => parsed.version = MARKER_TAG_VERSION,
+                        _ => return None,
+                    }
+                    has_list_cache = true;
+                }
+                "id" => {
+                    parsed.id = Some(value.to_owned());
+                }
+                "return" => {
+                    parsed.id = Some(Uuid::new_v4().to_string());
+                    should_create = true;
+                }
+                "p" => match value.parse::<usize>() {
+                    Ok(res) => parsed.pool_idx = Some(res),
+                    Err(_) => {
+                        parsed.id = Some(Uuid::new_v4().to_string());
+                        should_create = true;
+                    }
+                },
+                "s" => match value.parse::<usize>() {
+                    Ok(res) => parsed.set_idx = Some(res),
+                    Err(_) => {
+                        parsed.id = Some(Uuid::new_v4().to_string());
+                        should_create = true;
+                    }
+                },
+                _ => (),
+            }
+        }
+
+        if has_list_cache && LEGACY_MARKER_TAG_VERSIONS.contains(&parsed.version) {
+            Some((parsed, should_create))
+        } else {
+            None
+        }
+    }
+}
 
 fn normalize_list_quorum(value: &str) -> &'static str {
     let value = value.trim();
@@ -200,6 +293,119 @@ fn normalize_list_quorum(value: &str) -> &'static str {
 fn list_quorum_from_env() -> String {
     let value = rustfs_utils::get_env_str(ENV_API_LIST_QUORUM, DEFAULT_API_LIST_QUORUM);
     normalize_list_quorum(&value).to_owned()
+}
+
+fn list_objects_quorum_from_env() -> String {
+    let value = rustfs_utils::get_env_str(ENV_API_LIST_OBJECTS_QUORUM, DEFAULT_API_LIST_OBJECTS_QUORUM);
+    normalize_list_quorum(&value).to_owned()
+}
+
+fn append_list_cache_id_to_marker(marker: String, cache_id: Option<&str>) -> String {
+    let Some(id) = cache_id else {
+        return marker;
+    };
+
+    let mut marker_tag = String::with_capacity(marker.len() + 24 + id.len());
+    marker_tag.push_str(&marker);
+    marker_tag.push_str("[rustfs_cache:");
+    marker_tag.push_str(MARKER_TAG_VERSION);
+    marker_tag.push_str(",id:");
+    marker_tag.push_str(id);
+    marker_tag.push(']');
+
+    marker_tag
+}
+
+fn build_list_next_marker(objects: &[ObjectInfo], prefixes: &[String], cache_id: Option<&str>) -> Option<String> {
+    if let Some(last) = objects.last() {
+        Some(append_list_cache_id_to_marker(last.name.clone(), cache_id))
+    } else {
+        prefixes
+            .last()
+            .map(|marker| append_list_cache_id_to_marker(marker.clone(), cache_id))
+    }
+}
+
+fn build_list_versions_next_marker(
+    objects: &[ObjectInfo],
+    prefixes: &[String],
+    cache_id: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    if let Some(last) = objects.last() {
+        (
+            Some(append_list_cache_id_to_marker(last.name.clone(), cache_id)),
+            Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string())),
+        )
+    } else if let Some(last_prefix) = prefixes.last() {
+        (Some(append_list_cache_id_to_marker(last_prefix.clone(), cache_id)), None)
+    } else {
+        (None, None)
+    }
+}
+
+fn list_objects_paginate(
+    get_objects: Vec<ObjectInfo>,
+    delimiter: &Option<String>,
+    max_keys: i32,
+    disk_has_more: bool,
+    cache_id: Option<&str>,
+    include_version_id: bool,
+) -> (Vec<ObjectInfo>, Vec<String>, bool, Option<String>, Option<String>) {
+    let mut get_objects = get_objects;
+    let mut is_truncated = false;
+    let mut next_marker = None;
+    let mut next_version_idmarker = None;
+
+    if max_keys <= 0 {
+        get_objects.clear();
+    } else if get_objects.len() > max_keys as usize {
+        is_truncated = true;
+        get_objects.truncate(max_keys as usize);
+    }
+
+    if is_truncated {
+        if include_version_id {
+            (next_marker, next_version_idmarker) = build_list_versions_next_marker(&get_objects, &[], cache_id);
+        } else {
+            next_marker = build_list_next_marker(&get_objects, &[], cache_id);
+        }
+    }
+
+    let mut prefixes: Vec<String> = Vec::new();
+    let mut prefix_set: HashSet<String> = HashSet::new();
+    let mut objects = Vec::with_capacity(get_objects.len());
+    for obj in get_objects {
+        if delimiter.is_some() {
+            if obj.is_dir && obj.mod_time.is_none() {
+                if prefix_set.insert(obj.name.clone()) {
+                    prefixes.push(obj.name);
+                }
+            } else {
+                objects.push(obj);
+            }
+        } else {
+            objects.push(obj);
+        }
+    }
+
+    if !is_truncated && disk_has_more {
+        let visible_count = objects.len() + prefixes.len();
+        let should_truncate = if delimiter.is_none() {
+            visible_count > 0
+        } else {
+            visible_count >= max_keys as usize
+        };
+        if should_truncate {
+            is_truncated = true;
+            if include_version_id {
+                (next_marker, next_version_idmarker) = build_list_versions_next_marker(&objects, &prefixes, cache_id);
+            } else {
+                next_marker = build_list_next_marker(&objects, &prefixes, cache_id);
+            }
+        }
+    }
+
+    (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
 fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versioned: bool) -> MetadataResolutionParams {
@@ -270,69 +476,29 @@ impl ListPathOptions {
         };
 
         let end_idx = start_idx + end_offset;
-        let tag_body = marker[start_idx + 1..end_idx].to_owned();
-        let mut supported_marker = false;
+        let tag_body = &marker[start_idx + 1..end_idx];
 
-        for tag in tag_body.split(',') {
-            let Some((key, value)) = tag.split_once(':') else {
-                continue;
-            };
-            if key == "rustfs_cache" {
-                if value != MARKER_TAG_VERSION {
-                    return;
-                }
-                supported_marker = true;
-            }
-        }
-
-        if !supported_marker {
+        let Some((continuation, should_create)) = ListContinuationV2::parse(tag_body) else {
             return;
-        }
+        };
 
         self.marker = Some(marker[..start_idx].to_owned());
-        for tag in tag_body.split(',') {
-            let Some((key, value)) = tag.split_once(':') else {
-                continue;
-            };
-
-            match key {
-                "rustfs_cache" => {}
-                "id" => self.id = Some(value.to_owned()),
-                "return" => {
-                    self.id = Some(Uuid::new_v4().to_string());
-                    self.create = true;
-                }
-                "p" => match value.parse::<usize>() {
-                    Ok(res) => self.pool_idx = Some(res),
-                    Err(_) => {
-                        self.id = Some(Uuid::new_v4().to_string());
-                        self.create = true;
-                    }
-                },
-                "s" => match value.parse::<usize>() {
-                    Ok(res) => self.set_idx = Some(res),
-                    Err(_) => {
-                        self.id = Some(Uuid::new_v4().to_string());
-                        self.create = true;
-                    }
-                },
-                _ => (),
-            }
+        self.id = continuation.id;
+        self.pool_idx = continuation.pool_idx;
+        self.set_idx = continuation.set_idx;
+        if should_create {
+            self.create = true;
         }
     }
+
     pub fn encode_marker(&mut self, marker: &str) -> String {
-        if let Some(id) = &self.id {
-            format!(
-                "{}[rustfs_cache:{},id:{},p:{},s:{}]",
-                marker,
-                MARKER_TAG_VERSION,
-                id.to_owned(),
-                self.pool_idx.unwrap_or_default(),
-                self.set_idx.unwrap_or_default(),
-            )
-        } else {
-            format!("{marker}[rustfs_cache:{MARKER_TAG_VERSION},return:]")
+        ListContinuationV2 {
+            version: MARKER_TAG_VERSION,
+            id: self.id.clone(),
+            pool_idx: self.pool_idx,
+            set_idx: self.set_idx,
         }
+        .encode_marker(marker)
     }
 }
 
@@ -392,7 +558,7 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -430,6 +596,7 @@ impl ECStore {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         // err=None means gather_results filled its limit → disk has more data
         let disk_has_more = list_result.err.is_none();
@@ -446,7 +613,7 @@ impl ECStore {
 
         // contextCanceled
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -454,64 +621,9 @@ impl ECStore {
         )
         .await;
 
-        // Determine if there are more results: we requested max_keys + 1, so if we got more
-        // than max_keys, there are more results available
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            // Truncate to max_keys if we have more results
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = {
-            if is_truncated {
-                get_objects.last().map(|last| last.name.clone())
-            } else {
-                None
-            }
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects.into_iter() {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    // Check if prefix already exists to avoid duplicates
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // No delimiter: reduction is from skipped entries → disk_has_more && non-empty.
-        // With delimiter: reduction may be from collapse → only when visible >= max_keys.
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                // Compute next_marker from visible results since get_objects was consumed.
-                // Prefer last object name; fall back to last prefix for marker.
-                next_marker = objects
-                    .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -551,7 +663,7 @@ impl ECStore {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -564,6 +676,7 @@ impl ECStore {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         // err=None means gather_results filled its limit → disk has more data
         let disk_has_more = list_result.err.is_none();
@@ -582,7 +695,7 @@ impl ECStore {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -591,67 +704,8 @@ impl ECStore {
         )
         .await;
 
-        // Determine if there are more results: we requested max_keys + 1, so if we got more
-        // than max_keys, there are more results available
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            // Truncate to max_keys if we have more results
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
-            // AWS S3 API returns "null" for non-versioned objects
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects.into_iter() {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    // Check if prefix already exists to avoid duplicates
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        // After delimiter collapse, re-evaluate is_truncated based on visible results.
-        // Two distinct scenarios (see list_objects_generic for detailed rationale):
-        // 1. No delimiter: reduction from skipped entries → disk_has_more && non-empty
-        // 2. With delimiter: reduction from collapse → only when visible >= max_keys
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                // Compute markers from visible results since get_objects was consumed.
-                if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -664,6 +718,8 @@ impl ECStore {
 
     pub async fn list_path(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
         // tracing::warn!("list_path opt {:?}", &o);
+
+        let list_path_started = std::time::Instant::now();
 
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
         // if opts.prefix.ends_with(SLASH_SEPARATOR) {
@@ -809,6 +865,21 @@ impl ECStore {
             }
         }
 
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            bucket = %o.bucket,
+            prefix = %o.base_dir,
+            limit = o.limit,
+            marker = %o.marker.as_deref().unwrap_or(""),
+            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
+            has_error = result.err.is_some(),
+            "store list_path finished"
+        );
+
         Ok(result)
     }
 
@@ -820,6 +891,15 @@ impl ECStore {
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
         // warn!("list_merged ops {:?}", &opts);
+        let merge_started = std::time::Instant::now();
+
+        debug!(
+            list_path_limit = opts.limit,
+            recursive = opts.recursive,
+            pool_count = self.pools.len(),
+            requested_marker = %opts.marker.as_deref().unwrap_or(""),
+            "store list_merged started"
+        );
 
         let mut futures = Vec::new();
 
@@ -893,6 +973,19 @@ impl ECStore {
         }
 
         // check all_at_eof
+
+        rustfs_io_metrics::record_stage_duration(
+            "store_list_objects_list_merged",
+            merge_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            set_pair_count = self.pools.len(),
+            all_at_eof = all_at_eof,
+            error_count = errs.iter().filter(|err| err.is_some()).count(),
+            "store list_merged finished"
+        );
+
         _ = all_at_eof;
 
         Ok(Vec::new())
@@ -1210,7 +1303,12 @@ async fn gather_results(
 ) -> Result<GatherResultsState> {
     let mut recv = recv;
     let mut entries = Vec::new();
+    let gather_started = std::time::Instant::now();
+    let mut scanned_entries = 0usize;
+    let mut candidate_entries = 0usize;
+
     while let Some(mut entry) = recv.recv().await {
+        scanned_entries += 1;
         #[cfg(windows)]
         {
             // normalize windows path separator
@@ -1250,9 +1348,25 @@ async fn gather_results(
         // TODO: Lifecycle
 
         entries.push(Some(entry));
+        candidate_entries += 1;
 
         if opts.limit > 0 && entries.len() >= opts.limit as usize {
             rx.cancel();
+            let filtered = scanned_entries.saturating_sub(candidate_entries);
+            debug!(
+                bucket = %opts.bucket,
+                prefix = %opts.prefix,
+                limit = opts.limit,
+                scanned_entries = scanned_entries,
+                returned_entries = candidate_entries,
+                filtered_entries = filtered,
+                marker = %opts.marker.as_deref().unwrap_or(""),
+                "list_objects gather_results reached page limit and cancelled upstream listing"
+            );
+            rustfs_io_metrics::record_stage_duration(
+                "store_list_objects_gather",
+                gather_started.elapsed().as_secs_f64() * 1000.0,
+            );
 
             results_tx
                 .send(MetaCacheEntriesSortedResult {
@@ -1269,6 +1383,18 @@ async fn gather_results(
     }
 
     // finish not full, return eof
+    let filtered = scanned_entries.saturating_sub(candidate_entries);
+    debug!(
+        bucket = %opts.bucket,
+        prefix = %opts.prefix,
+        scanned_entries = scanned_entries,
+        returned_entries = candidate_entries,
+        filtered_entries = filtered,
+        marker = %opts.marker.as_deref().unwrap_or(""),
+        "list_objects gather_results drained all candidates without hitting limit"
+    );
+    rustfs_io_metrics::record_stage_duration("store_list_objects_gather", gather_started.elapsed().as_secs_f64() * 1000.0);
+
     results_tx
         .send(MetaCacheEntriesSortedResult {
             entries: Some(MetaCacheEntriesSorted {
@@ -1542,7 +1668,7 @@ impl Sets {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -1579,6 +1705,7 @@ impl Sets {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -1592,7 +1719,7 @@ impl Sets {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -1600,52 +1727,9 @@ impl Sets {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = if is_truncated {
-            get_objects.last().map(|last| last.name.clone())
-        } else {
-            None
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                next_marker = objects
-                    .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
+        let _ = next_version_idmarker;
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -1684,7 +1768,7 @@ impl Sets {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -1697,6 +1781,7 @@ impl Sets {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -1714,7 +1799,7 @@ impl Sets {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -1723,56 +1808,8 @@ impl Sets {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -1914,6 +1951,16 @@ impl Sets {
         opts: ListPathOptions,
         sender: Sender<MetaCacheEntry>,
     ) -> Result<Vec<ObjectInfo>> {
+        let merge_started = std::time::Instant::now();
+
+        debug!(
+            list_path_limit = opts.limit,
+            recursive = opts.recursive,
+            set_count = self.disk_set.len(),
+            requested_marker = %opts.marker.as_deref().unwrap_or(""),
+            "sets list_merged started"
+        );
+
         let mut futures = Vec::new();
         let mut inputs = Vec::new();
 
@@ -1961,6 +2008,15 @@ impl Sets {
                 all_at_eof = false;
             }
         }
+
+        rustfs_io_metrics::record_stage_duration("sets_list_objects_list_merged", merge_started.elapsed().as_secs_f64() * 1000.0);
+
+        debug!(
+            set_count = self.disk_set.len(),
+            all_at_eof = all_at_eof,
+            error_count = errs.iter().filter(|err| err.is_some()).count(),
+            "sets list_merged finished"
+        );
 
         _ = all_at_eof;
         Ok(Vec::new())
@@ -2293,7 +2349,7 @@ impl SetDisks {
             limit: effective_max_keys,
             marker,
             incl_deleted,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             ..Default::default()
         };
 
@@ -2330,6 +2386,7 @@ impl SetDisks {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -2343,7 +2400,7 @@ impl SetDisks {
             result.forward_past(opts.marker);
         }
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_infos(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -2351,52 +2408,8 @@ impl SetDisks {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker = if is_truncated {
-            get_objects.last().map(|last| last.name.clone())
-        } else {
-            None
-        };
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                next_marker = objects
-                    .last()
-                    .map(|last| last.name.clone())
-                    .or_else(|| prefixes.last().cloned());
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, _next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), false);
 
         Ok(ListObjectsInfo {
             is_truncated,
@@ -2435,7 +2448,7 @@ impl SetDisks {
             limit: effective_max_keys,
             marker,
             incl_deleted: true,
-            ask_disks: list_quorum_from_env(),
+            ask_disks: list_objects_quorum_from_env(),
             versioned: true,
             include_marker: has_version_marker,
             ..Default::default()
@@ -2448,6 +2461,7 @@ impl SetDisks {
                 err: Some(err.into()),
                 ..Default::default()
             });
+        let next_cache_id = list_result.entries.as_ref().and_then(|entries| entries.list_id.clone());
 
         let disk_has_more = list_result.err.is_none();
 
@@ -2465,7 +2479,7 @@ impl SetDisks {
 
         let version_marker = version_marker_for_entries(list_result.entries.as_ref(), opts.marker.as_deref(), version_marker);
 
-        let mut get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
+        let get_objects = ObjectInfo::from_meta_cache_entries_sorted_versions(
             &list_result.entries.unwrap_or_default(),
             bucket,
             prefix,
@@ -2474,56 +2488,8 @@ impl SetDisks {
         )
         .await;
 
-        let mut is_truncated = false;
-        if max_keys <= 0 {
-            get_objects.clear();
-        } else if get_objects.len() > max_keys as usize {
-            is_truncated = true;
-            get_objects.truncate(max_keys as usize);
-        }
-
-        let mut next_marker: Option<String> = None;
-        let mut next_version_idmarker: Option<String> = None;
-        if is_truncated && let Some(last) = get_objects.last() {
-            next_marker = Some(last.name.clone());
-            next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-        }
-
-        let mut prefixes: Vec<String> = Vec::new();
-        let mut prefix_set: HashSet<String> = HashSet::new();
-        let mut objects = Vec::with_capacity(get_objects.len());
-        for obj in get_objects {
-            if delimiter.is_some() {
-                if obj.is_dir && obj.mod_time.is_none() {
-                    if prefix_set.insert(obj.name.clone()) {
-                        prefixes.push(obj.name);
-                    }
-                } else {
-                    objects.push(obj);
-                }
-            } else {
-                objects.push(obj);
-            }
-        }
-
-        if !is_truncated && disk_has_more {
-            let visible_count = objects.len() + prefixes.len();
-            let should_truncate = if delimiter.is_none() {
-                visible_count > 0
-            } else {
-                visible_count >= max_keys as usize
-            };
-            if should_truncate {
-                is_truncated = true;
-                if let Some(last) = objects.last() {
-                    next_marker = Some(last.name.clone());
-                    next_version_idmarker = Some(last.version_id.map(|v| v.to_string()).unwrap_or_else(|| "null".to_string()));
-                } else if let Some(last_prefix) = prefixes.last().cloned() {
-                    next_marker = Some(last_prefix);
-                    next_version_idmarker = None;
-                }
-            }
-        }
+        let (objects, prefixes, is_truncated, next_marker, next_version_idmarker) =
+            list_objects_paginate(get_objects, &delimiter, max_keys, disk_has_more, next_cache_id.as_deref(), true);
 
         Ok(ListObjectVersionsInfo {
             is_truncated,
@@ -2681,6 +2647,8 @@ impl SetDisks {
     pub async fn list_path_result(self: Arc<Self>, o: &ListPathOptions) -> Result<MetaCacheEntriesSortedResult> {
         check_list_objs_args(&o.bucket, &o.prefix, &o.marker)?;
 
+        let list_path_started = std::time::Instant::now();
+
         let mut o = o.clone();
         o.marker = o.marker.filter(|v| v >= &o.prefix);
 
@@ -2800,10 +2768,27 @@ impl SetDisks {
             }
         }
 
+        rustfs_io_metrics::record_stage_duration(
+            "sets_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        debug!(
+            bucket = %o.bucket,
+            prefix = %o.base_dir,
+            limit = o.limit,
+            marker = %o.marker.as_deref().unwrap_or(""),
+            candidate_count = result.entries.as_ref().map(|entries| entries.entries().len()).unwrap_or_default(),
+            has_error = result.err.is_some(),
+            "sets list_path finished"
+        );
+
         Ok(result)
     }
 
     pub async fn list_path(&self, rx: CancellationToken, opts: ListPathOptions, sender: Sender<MetaCacheEntry>) -> Result<()> {
+        let list_path_started = std::time::Instant::now();
+
         let (mut disks, infos, _) = self.get_online_disks_with_healing_and_info(true).await;
 
         let mut ask_disks = get_list_quorum(&opts.ask_disks, self.set_drive_count as i32);
@@ -2833,7 +2818,21 @@ impl SetDisks {
             fallback_disks = disks.split_off(ask_disks as usize);
         }
 
-        let resolver = list_metadata_resolution_params(opts.bucket.clone(), listing_quorum, opts.versioned);
+        let bucket = opts.bucket.clone();
+        let base_dir = opts.base_dir.clone();
+        let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, opts.versioned);
+
+        debug!(
+            bucket = %bucket,
+            prefix = %base_dir,
+            set_drive_count = self.set_drive_count,
+            asked_disks = ask_disks,
+            listing_quorum = listing_quorum,
+            fallback_disks = fallback_disks.len(),
+            limit = opts.limit,
+            stop_disk_at_limit = opts.stop_disk_at_limit,
+            "set_disks list_path selected listing quorum and fallback disks"
+        );
 
         let limit = {
             if opts.limit > 0 && opts.stop_disk_at_limit {
@@ -2848,7 +2847,7 @@ impl SetDisks {
         let cancel_for_send1 = rx.clone();
         let cancel_for_send2 = rx.clone();
 
-        list_path_raw(
+        let result = list_path_raw(
             rx,
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
@@ -2892,8 +2891,39 @@ impl SetDisks {
                 ..Default::default()
             },
         )
-        .await
-        .map_err(Error::from)
+        .await;
+
+        rustfs_io_metrics::record_stage_duration(
+            "set_disks_list_objects_list_path",
+            list_path_started.elapsed().as_secs_f64() * 1000.0,
+        );
+
+        if let Err(ref err) = result {
+            debug!(
+                bucket = %bucket,
+                path = %base_dir,
+                disk_count = disks.len(),
+                fallback_disks = fallback_disks.len(),
+                asked_disks = ask_disks,
+                listing_quorum = listing_quorum,
+                stop_disk_at_limit = opts.stop_disk_at_limit,
+                list_error = %err,
+                "set_disks list_path finished with error"
+            );
+        } else {
+            debug!(
+                bucket = %bucket,
+                path = %base_dir,
+                disk_count = disks.len(),
+                fallback_disks = fallback_disks.len(),
+                asked_disks = ask_disks,
+                listing_quorum = listing_quorum,
+                stop_disk_at_limit = opts.stop_disk_at_limit,
+                "set_disks list_path finished"
+            );
+        }
+
+        result.map_err(Error::from)
     }
 }
 
@@ -2959,9 +2989,10 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker, gather_results,
-        list_metadata_resolution_params, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
-        parse_version_marker, version_marker_for_entries, walk_result_from_set_errors,
+        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker,
+        gather_results, list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
+        merge_entry_channels, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
+        walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -3145,6 +3176,59 @@ mod test {
     }
 
     #[test]
+    fn list_path_forward_past_is_idempotent_for_same_marker() {
+        let mut first_page = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
+        first_page.forward_past(Some("obj-0002".to_string()));
+
+        let first_page_names = first_page
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        let mut second_page = sorted_entries(&["obj-0001", "obj-0002", "obj-0003", "obj-0004"]);
+        second_page.forward_past(Some("obj-0002".to_string()));
+
+        let second_page_names = second_page
+            .entries()
+            .into_iter()
+            .map(|entry| entry.name.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(first_page_names, second_page_names);
+        assert_eq!(first_page_names, vec!["obj-0003".to_string(), "obj-0004".to_string()]);
+    }
+
+    #[test]
+    fn list_path_parse_marker_replay_still_stable() {
+        let marker = "photos/2026/image.jpg[rustfs_cache:v1,id:list-cache-id,p:3,s:7]".to_string();
+
+        let mut parsed = ListPathOptions {
+            marker: Some(marker),
+            ..Default::default()
+        };
+        parsed.parse_marker();
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+
+        let base_marker = parsed.marker.clone().expect("marker should parse");
+        let replay_marker = parsed.encode_marker(base_marker.as_str());
+        let mut replay = ListPathOptions {
+            marker: Some(replay_marker),
+            ..Default::default()
+        };
+        replay.parse_marker();
+
+        assert_eq!(replay.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(replay.id.as_deref(), Some("list-cache-id"));
+        assert_eq!(replay.pool_idx, Some(3));
+        assert_eq!(replay.set_idx, Some(7));
+        assert!(!replay.create);
+    }
+
+    #[test]
     fn test_max_keys_plus_one_caps_before_lookahead() {
         assert_eq!(max_keys_plus_one(999, true), 1000);
         assert_eq!(max_keys_plus_one(MAX_OBJECT_LIST, true), MAX_OBJECT_LIST + 1);
@@ -3190,6 +3274,22 @@ mod test {
     fn list_quorum_from_env_rejects_unknown_value() {
         temp_env::with_var(ENV_API_LIST_QUORUM, Some("unsafe"), || {
             assert_eq!(list_quorum_from_env(), "strict");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_quorum_from_env_defaults_to_optimal() {
+        temp_env::with_var_unset(ENV_API_LIST_OBJECTS_QUORUM, || {
+            assert_eq!(list_objects_quorum_from_env(), "optimal");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn list_objects_quorum_from_env_honors_supported_value() {
+        temp_env::with_var(ENV_API_LIST_OBJECTS_QUORUM, Some("strict"), || {
+            assert_eq!(list_objects_quorum_from_env(), "strict");
         });
     }
 
@@ -3305,6 +3405,55 @@ mod test {
         assert_eq!(parsed.id.as_deref(), Some("list-cache-id"));
         assert_eq!(parsed.pool_idx, Some(3));
         assert_eq!(parsed.set_idx, Some(7));
+    }
+
+    #[test]
+    fn list_path_marker_parser_return_tag_forces_cache_refresh() {
+        let mut parsed = ListPathOptions {
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v2,return:,p:3,s:7]".to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert!(parsed.id.is_some());
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert_eq!(parsed.set_idx, Some(7));
+        assert!(parsed.create);
+    }
+
+    #[test]
+    fn list_path_marker_parser_recovers_from_corrupt_set_index() {
+        let mut parsed = ListPathOptions {
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v2,id:list-cache-id,p:3,s:not-a-number]".to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert!(parsed.id.is_some());
+        assert_ne!(parsed.id.as_deref(), Some("list-cache-id"));
+        assert!(parsed.create);
+        assert_eq!(parsed.pool_idx, Some(3));
+        assert!(parsed.set_idx.is_none());
+    }
+
+    #[test]
+    fn list_path_marker_parser_accepts_legacy_v1_tag() {
+        let mut parsed = ListPathOptions {
+            marker: Some("photos/2026/image.jpg[rustfs_cache:v1,id:legacy-cache-id,p:4,s:1]".to_string()),
+            ..Default::default()
+        };
+
+        parsed.parse_marker();
+
+        assert_eq!(parsed.marker.as_deref(), Some("photos/2026/image.jpg"));
+        assert_eq!(parsed.id.as_deref(), Some("legacy-cache-id"));
+        assert_eq!(parsed.pool_idx, Some(4));
+        assert_eq!(parsed.set_idx, Some(1));
+        assert!(!parsed.create);
     }
 
     #[test]
