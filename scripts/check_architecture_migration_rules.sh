@@ -125,6 +125,7 @@ STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycl
 LIFECYCLE_AUDIT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_audit_sink_bypass_hits.txt"
 LIFECYCLE_CONFIG_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_config_boundary_bypass_hits.txt"
 LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_boundary_bypass_hits.txt"
+LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -826,6 +827,18 @@ fi
 
 if [[ -s "$LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle tag decoding must stay behind lifecycle tagging_boundary: $(paste -sd '; ' "$LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'crate::bucket::replication' \
+    crates/ecstore/src/bucket/lifecycle \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/lifecycle/replication_sink\.rs:' || true
+) >"$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE"
+
+if [[ -s "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle replication scheduling must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE")"
 fi
 
 (

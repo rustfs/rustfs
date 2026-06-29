@@ -10,8 +10,8 @@ and tier services.
 | Module | Current role | Split blocker |
 |---|---|---|
 | `core.rs` | Lifecycle rule model, action evaluation, object options, and transition/expiry decisions. | Uses ECStore object metadata types and compatibility DTO re-exports. |
-| `bucket_lifecycle_ops.rs` | Worker orchestration, expiry, transition, stale multipart cleanup, audit, replication delete scheduling, and queue state. | Depends on `ECStore`, `SetDisks`, runtime globals, bucket metadata/versioning/replication, disk internals, event notification, and tier services. |
-| `evaluator.rs` | Bucket lifecycle evaluation wrapper. | Reads object-lock and replication config from ECStore bucket modules. |
+| `bucket_lifecycle_ops.rs` | Worker orchestration, expiry, transition, stale multipart cleanup, audit, replication delete scheduling, and queue state. | Depends on `ECStore`, `SetDisks`, runtime globals, bucket metadata/versioning, disk internals, event notification, tier services, and lifecycle-local replication sink. |
+| `evaluator.rs` | Bucket lifecycle evaluation wrapper. | Reads object-lock config from ECStore bucket modules and replication state through lifecycle-local replication sink. |
 | `rule.rs` | Lifecycle rule filter helpers. | Uses lifecycle-local tagging boundary. |
 | `tier_delete_journal.rs` | Remote tier delete journal persistence and recovery. | Uses lifecycle-local config persistence boundary, object IO contracts, metadata bucket paths, and `ECStore`. |
 | `tier_free_version_recovery.rs` | Free-version recovery queue and object restoration path. | Depends on `ECStore`, object metadata, storage-api contracts, and lifecycle queue callbacks. |
@@ -28,7 +28,7 @@ and tier services.
 | `LifecycleRuntime` | Expiry state, transition state, tier config, deployment ID, local node name, queue metrics, cancellation, and worker sizing. | Direct runtime source/global access and process environment reads inside worker code. |
 | `LifecycleConfigStore` | Persist, read, and remove lifecycle-owned journal/config objects. | Direct ECStore config persistence helper imports from worker paths. |
 | `LifecycleTagFilter` | Decode object tag strings for lifecycle rule matching. | Direct bucket tagging helper imports from lifecycle rule paths. |
-| `LifecycleReplicationSink` | Lifecycle-originated delete and version-purge replication scheduling. | Direct imports from bucket replication modules. |
+| `LifecycleReplicationSink` | Lifecycle-originated delete and version-purge replication scheduling. | Boundary is local, but still backed by ECStore bucket replication internals. |
 | `LifecycleAuditSink` | Lifecycle audit and notification event emission. | Direct event notification service calls and audit-side effects from worker code. |
 
 ## Migration Rules
@@ -56,3 +56,6 @@ Current first boundary: `runtime_boundary.rs` centralizes lifecycle access to
 runtime state while preserving the existing ECStore-backed implementations.
 `config_boundary.rs` centralizes lifecycle-owned config object persistence for
 tier delete journal recovery while preserving the existing ECStore config store.
+`replication_sink.rs` centralizes lifecycle-originated replication config checks
+and delete scheduling while preserving the existing ECStore replication worker
+path.
