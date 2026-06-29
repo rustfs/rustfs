@@ -182,6 +182,9 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
+GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
+GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
+GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_dist_erasure_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_ID_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_id_map_bypass_hits.txt"
 GLOBAL_LOCAL_DISK_SET_DRIVES_BYPASS_HITS_FILE="${TMP_DIR}/global_local_disk_set_drives_bypass_hits.txt"
@@ -2302,6 +2305,42 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication facade imports must stay in local storage_api boundaries: $(paste -sd '; ' "$REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_Endpoints\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_Endpoints access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_ENDPOINTS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_IsErasure\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_IsErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_ERASURE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bGLOBAL_IsDistErasure\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/runtime/(global|sources)\.rs:' || true
+) >"$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE"
+
+if [[ -s "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE" ]]; then
+  report_failure "GLOBAL_IsDistErasure access must stay behind ECStore runtime helpers: $(paste -sd '; ' "$GLOBAL_IS_DIST_ERASURE_BYPASS_HITS_FILE")"
 fi
 
 (

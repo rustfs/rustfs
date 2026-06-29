@@ -265,7 +265,7 @@ impl BucketMetadataSys {
     async fn init_internal(&self, buckets: Vec<String>) -> Result<()> {
         let count = runtime_sources::endpoint_erasure_set_count()
             .map(|count| count * 10)
-            .ok_or_else(|| Error::other("GLOBAL_Endpoints not init"))?;
+            .ok_or_else(|| Error::other("endpoint pools not initialized"))?;
 
         let mut failed_buckets: HashSet<String> = HashSet::new();
         let mut buckets = buckets.as_slice();
