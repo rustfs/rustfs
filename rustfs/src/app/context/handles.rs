@@ -24,7 +24,7 @@ use super::interfaces::{
     KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
     NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface, TransitionStateInterface,
+    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use super::runtime_sources;
 use crate::config::RustFSBufferConfig;
@@ -233,16 +233,6 @@ impl BootTimeInterface for BootTimeHandle {
     }
 }
 
-/// Default tier transition statistics interface adapter.
-#[derive(Default)]
-pub struct TierStatsHandle;
-
-impl TierStatsInterface for TierStatsHandle {
-    fn daily_all(&self) -> DailyAllTierStats {
-        runtime_sources::daily_tier_stats()
-    }
-}
-
 /// Default scanner metrics report interface adapter.
 #[derive(Default)]
 pub struct ScannerMetricsHandle;
@@ -398,6 +388,10 @@ impl TransitionStateInterface for TransitionStateHandle {
     fn handle(&self) -> Arc<TransitionState> {
         runtime_sources::transition_state()
     }
+
+    fn daily_tier_stats(&self) -> DailyAllTierStats {
+        runtime_sources::daily_tier_stats()
+    }
 }
 
 /// Default server config interface adapter.
@@ -468,10 +462,6 @@ pub fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterfac
 
 pub fn default_boot_time_interface() -> Arc<dyn BootTimeInterface> {
     Arc::new(BootTimeHandle)
-}
-
-pub fn default_tier_stats_interface() -> Arc<dyn TierStatsInterface> {
-    Arc::new(TierStatsHandle)
 }
 
 pub fn default_scanner_metrics_interface() -> Arc<dyn ScannerMetricsInterface> {

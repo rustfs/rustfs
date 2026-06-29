@@ -115,11 +115,6 @@ pub trait BootTimeInterface: Send + Sync {
     fn get(&self) -> Option<SystemTime>;
 }
 
-/// Tier transition statistics interface for admin metric integration.
-pub trait TierStatsInterface: Send + Sync {
-    fn daily_all(&self) -> DailyAllTierStats;
-}
-
 /// Scanner metrics report interface for admin status integration.
 #[async_trait]
 pub trait ScannerMetricsInterface: Send + Sync {
@@ -200,6 +195,7 @@ pub trait ExpiryStateInterface: Send + Sync {
 /// Lifecycle transition state interface for transition queues and tier stats.
 pub trait TransitionStateInterface: Send + Sync {
     fn handle(&self) -> Arc<TransitionState>;
+    fn daily_tier_stats(&self) -> DailyAllTierStats;
 }
 
 /// Server config interface for application-layer and server modules.

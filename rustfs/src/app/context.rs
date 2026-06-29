@@ -356,7 +356,7 @@ fn resolve_boot_time_with(context: Option<Arc<AppContext>>) -> Option<SystemTime
 }
 
 fn resolve_daily_tier_stats_with(context: Option<Arc<AppContext>>) -> Option<DailyAllTierStats> {
-    context.map(|context| context.tier_stats().daily_all())
+    context.map(|context| context.transition_state().daily_tier_stats())
 }
 
 async fn resolve_scanner_metrics_report_with(context: Option<Arc<AppContext>>) -> Option<ScannerMetricsReport> {
@@ -494,7 +494,7 @@ mod tests {
         EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
         LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
         RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface, TransitionStateInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -622,16 +622,6 @@ mod tests {
     impl BootTimeInterface for TestBootTimeInterface {
         fn get(&self) -> Option<SystemTime> {
             self.boot_time
-        }
-    }
-
-    struct TestTierStatsInterface {
-        daily_stats: DailyAllTierStats,
-    }
-
-    impl TierStatsInterface for TestTierStatsInterface {
-        fn daily_all(&self) -> DailyAllTierStats {
-            self.daily_stats.clone()
         }
     }
 
@@ -809,11 +799,16 @@ mod tests {
 
     struct TestTransitionStateInterface {
         transition_state: Arc<TransitionState>,
+        daily_stats: DailyAllTierStats,
     }
 
     impl TransitionStateInterface for TestTransitionStateInterface {
         fn handle(&self) -> Arc<TransitionState> {
             self.transition_state.clone()
+        }
+
+        fn daily_tier_stats(&self) -> DailyAllTierStats {
+            self.daily_stats.clone()
         }
     }
 
@@ -948,8 +943,6 @@ mod tests {
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
         let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let mut context_daily_tier_stats = DailyAllTierStats::new();
-        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let context_scanner_metrics = ScannerMetricsReport {
             current_cycle: 7,
             ..Default::default()
@@ -957,6 +950,8 @@ mod tests {
         let tier_config = TierConfigMgr::new();
         let context_expiry_state = ExpiryState::new();
         let context_transition_state = TransitionState::new();
+        let mut context_daily_tier_stats = DailyAllTierStats::new();
+        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let context_storage_class_published = Arc::new(AtomicUsize::new(0));
@@ -1022,9 +1017,6 @@ mod tests {
                 boot_time: Arc::new(TestBootTimeInterface {
                     boot_time: Some(context_boot_time),
                 }),
-                tier_stats: Arc::new(TestTierStatsInterface {
-                    daily_stats: context_daily_tier_stats.clone(),
-                }),
                 scanner_metrics: Arc::new(TestScannerMetricsInterface {
                     report: context_scanner_metrics.clone(),
                 }),
@@ -1069,6 +1061,7 @@ mod tests {
                 }),
                 transition_state: Arc::new(TestTransitionStateInterface {
                     transition_state: context_transition_state.clone(),
+                    daily_stats: context_daily_tier_stats.clone(),
                 }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),

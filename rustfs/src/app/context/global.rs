@@ -23,8 +23,7 @@ use super::handles::{
     default_outbound_tls_runtime_interface, default_performance_metrics_interface, default_region_interface,
     default_replication_pool_interface, default_replication_stats_interface, default_runtime_port_interface,
     default_s3select_db_interface, default_scanner_metrics_interface, default_server_config_interface,
-    default_storage_class_interface, default_tier_config_interface, default_tier_stats_interface,
-    default_transition_state_interface, oidc_interface,
+    default_storage_class_interface, default_tier_config_interface, default_transition_state_interface, oidc_interface,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
@@ -32,7 +31,7 @@ use super::interfaces::{
     KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
     NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface, TransitionStateInterface,
+    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
@@ -55,7 +54,6 @@ pub struct AppContext {
     replication_pool: Arc<dyn ReplicationPoolInterface>,
     replication_stats: Arc<dyn ReplicationStatsInterface>,
     boot_time: Arc<dyn BootTimeInterface>,
-    tier_stats: Arc<dyn TierStatsInterface>,
     scanner_metrics: Arc<dyn ScannerMetricsInterface>,
     endpoints: Arc<dyn EndpointsInterface>,
     deployment_id: Arc<dyn DeploymentIdInterface>,
@@ -92,7 +90,6 @@ impl AppContext {
             replication_pool: default_replication_pool_interface(),
             replication_stats: default_replication_stats_interface(),
             boot_time: default_boot_time_interface(),
-            tier_stats: default_tier_stats_interface(),
             scanner_metrics: default_scanner_metrics_interface(),
             endpoints: default_endpoints_interface(),
             deployment_id: default_deployment_id_interface(),
@@ -179,10 +176,6 @@ impl AppContext {
 
     pub fn boot_time(&self) -> Arc<dyn BootTimeInterface> {
         self.boot_time.clone()
-    }
-
-    pub fn tier_stats(&self) -> Arc<dyn TierStatsInterface> {
-        self.tier_stats.clone()
     }
 
     pub fn scanner_metrics(&self) -> Arc<dyn ScannerMetricsInterface> {
@@ -272,7 +265,6 @@ pub(super) struct AppContextTestInterfaces {
     pub(super) replication_pool: Arc<dyn ReplicationPoolInterface>,
     pub(super) replication_stats: Arc<dyn ReplicationStatsInterface>,
     pub(super) boot_time: Arc<dyn BootTimeInterface>,
-    pub(super) tier_stats: Arc<dyn TierStatsInterface>,
     pub(super) scanner_metrics: Arc<dyn ScannerMetricsInterface>,
     pub(super) endpoints: Arc<dyn EndpointsInterface>,
     pub(super) deployment_id: Arc<dyn DeploymentIdInterface>,
@@ -310,7 +302,6 @@ impl AppContext {
             replication_pool: interfaces.replication_pool,
             replication_stats: interfaces.replication_stats,
             boot_time: interfaces.boot_time,
-            tier_stats: interfaces.tier_stats,
             scanner_metrics: interfaces.scanner_metrics,
             endpoints: interfaces.endpoints,
             deployment_id: interfaces.deployment_id,

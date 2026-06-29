@@ -205,10 +205,6 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_boot_time()
     }
 
-    pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-        crate::storage::storage_api::get_daily_all_tier_stats()
-    }
-
     pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {
         rustfs_common::metrics::global_metrics().report().await
     }
