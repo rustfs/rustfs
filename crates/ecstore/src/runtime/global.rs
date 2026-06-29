@@ -63,7 +63,6 @@ lazy_static! {
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
     pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
     pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
-    pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
     pub static ref GLOBAL_REGION: OnceLock<s3s::region::Region> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
