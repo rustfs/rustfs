@@ -42,7 +42,7 @@ use crate::{
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
+use rustfs_common::{GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -212,17 +212,17 @@ pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
 }
 
 pub(crate) async fn cached_node_channel(addr: &str) -> Option<Channel> {
-    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+    rustfs_common::cached_connection(addr).await
 }
 
 #[cfg(test)]
 pub(crate) async fn cache_test_node_channel(addr: String, channel: Channel) {
-    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+    rustfs_common::cache_connection(addr, channel).await;
 }
 
 #[cfg(test)]
 pub(crate) async fn test_node_channel_is_cached(addr: &str) -> bool {
-    GLOBAL_CONN_MAP.read().await.contains_key(addr)
+    rustfs_common::has_cached_connection(addr).await
 }
 
 #[cfg(test)]
