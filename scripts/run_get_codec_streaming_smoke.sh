@@ -1022,7 +1022,7 @@ EOF
     return
   fi
 
-  if [[ ! -s "$before_file" || ! -s "$after_file" ]]; then
+  if [[ ! -s "$after_file" ]]; then
     cat >"$out_csv" <<EOF
 profile,status,metric,labels,before,after,delta,classification
 ${profile},snapshot_missing,N/A,N/A,N/A,N/A,N/A,service_metrics_snapshot_missing
@@ -1030,20 +1030,21 @@ EOF
     return
   fi
 
-  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" <<'PY'
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" "$(diagnostic_service_name "$profile")" <<'PY'
 import csv
 import pathlib
 import re
 import sys
 
-profile, metric_prefix, before_raw, after_raw, out_raw = sys.argv[1:]
+profile, metric_prefix, before_raw, after_raw, out_raw, service_name = sys.argv[1:]
 before_path = pathlib.Path(before_raw)
 after_path = pathlib.Path(after_raw)
 out_path = pathlib.Path(out_raw)
 
 LINE = re.compile(
     r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
-    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'(?:\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)?\s*$'
 )
 
 
@@ -1083,6 +1084,9 @@ def read_metrics(path):
         if not metric.startswith(metric_prefix):
             continue
         labels = labels or ""
+        if service_name and f'service_name="{service_name}"' not in labels \
+                and f'service.name="{service_name}"' not in labels:
+            continue
         rows[(metric, labels)] = float(value)
     return rows
 
