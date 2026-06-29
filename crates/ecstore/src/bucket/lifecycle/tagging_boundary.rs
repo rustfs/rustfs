@@ -12,16 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub mod bucket_lifecycle_audit;
-pub mod bucket_lifecycle_ops;
-mod config_boundary;
-pub mod core;
-pub mod evaluator;
-pub use self::core as lifecycle;
-pub mod rule;
-mod runtime_boundary;
-mod tagging_boundary;
-pub mod tier_delete_journal;
-pub mod tier_free_version_recovery;
-pub mod tier_last_day_stats;
-pub mod tier_sweeper;
+use std::collections::HashMap;
+
+pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
+    crate::bucket::tagging::decode_tags_to_map(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_tags_to_map;
+
+    #[test]
+    fn decode_tags_to_map_preserves_bucket_tagging_parser_behavior() {
+        let tags = decode_tags_to_map("env=prod&encoded=a%2Fb&=ignored");
+
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("encoded").map(String::as_str), Some("a/b"));
+        assert!(!tags.contains_key(""));
+    }
+}
