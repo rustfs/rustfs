@@ -3498,6 +3498,34 @@ require_source_contains \
   "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
   "fn ecstore_implements_storage_heal_operations_contract()" \
   "ECStore storage-api HealOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_namespace_locking_contract()" \
+  "SetDisks storage-api NamespaceLocking compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_object_io_contract()" \
+  "SetDisks storage-api ObjectIO compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_bucket_operations_contract()" \
+  "SetDisks storage-api BucketOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_object_operations_contract()" \
+  "SetDisks storage-api ObjectOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_list_operations_contract()" \
+  "SetDisks storage-api ListOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_multipart_operations_contract()" \
+  "SetDisks storage-api MultipartOperations compile-time coverage test"
+require_source_contains \
+  "crates/ecstore/tests/ecstore_contract_compat_test.rs" \
+  "fn set_disks_implements_storage_heal_operations_contract()" \
+  "SetDisks storage-api HealOperations compile-time coverage test"
 
 if (( FAILURES > 0 )); then
   exit 1
