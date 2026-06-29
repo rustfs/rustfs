@@ -515,6 +515,7 @@ pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
 pub(crate) type Result<T> = ecstore_error::Result<T>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
@@ -580,6 +581,10 @@ pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
 
 pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
+}
+
+pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {

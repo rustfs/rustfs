@@ -18,10 +18,11 @@ use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, collect_scanner_metrics_report, get_daily_all_tier_stats,
-    get_global_boot_time, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_expiry_state,
-    get_global_lock_client, get_global_lock_clients, get_global_notification_sys, get_global_region, get_global_replication_pool,
-    get_global_replication_stats, get_global_tier_config_mgr, global_rustfs_port, set_global_storage_class,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState, collect_scanner_metrics_report,
+    get_daily_all_tier_stats, get_global_boot_time, get_global_bucket_monitor, get_global_deployment_id,
+    get_global_endpoints_opt, get_global_expiry_state, get_global_lock_client, get_global_lock_clients,
+    get_global_notification_sys, get_global_region, get_global_replication_pool, get_global_replication_stats,
+    get_global_tier_config_mgr, get_global_transition_state, global_rustfs_port, set_global_storage_class,
 };
 use crate::config::{RustFSBufferConfig, get_global_buffer_config};
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
@@ -178,6 +179,10 @@ pub fn tier_config() -> Arc<RwLock<TierConfigMgr>> {
 
 pub fn expiry_state() -> Arc<RwLock<ExpiryState>> {
     get_global_expiry_state()
+}
+
+pub fn transition_state() -> Arc<TransitionState> {
+    get_global_transition_state()
 }
 
 #[cfg(test)]

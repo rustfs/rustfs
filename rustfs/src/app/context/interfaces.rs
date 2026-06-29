@@ -16,7 +16,7 @@ use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use crate::config::RustFSBufferConfig;
 use async_trait::async_trait;
@@ -195,6 +195,11 @@ pub trait TierConfigInterface: Send + Sync {
 /// Lifecycle expiry state interface for transition cleanup queues.
 pub trait ExpiryStateInterface: Send + Sync {
     fn handle(&self) -> Arc<RwLock<ExpiryState>>;
+}
+
+/// Lifecycle transition state interface for transition queues and tier stats.
+pub trait TransitionStateInterface: Send + Sync {
+    fn handle(&self) -> Arc<TransitionState>;
 }
 
 /// Server config interface for application-layer and server modules.
