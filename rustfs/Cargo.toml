@@ -40,6 +40,10 @@ name = "manual-test-dial9"
 path = "tests/manual/test_dial9.rs"
 test = false
 bench = false
+
+[[bench]]
+name = "s3_operations"
+harness = false
 required-features = ["manual-test-runners"]
 
 [features]
@@ -100,6 +104,7 @@ rustfs-object-capacity = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }
+starshard = { workspace = true }
 
 # Async Runtime and Networking
 async-trait = { workspace = true }
@@ -205,6 +210,7 @@ serial_test = { workspace = true }
 tempfile = { workspace = true }
 aws-config = { workspace = true }
 anyhow = { workspace = true }
+insta = { workspace = true }
 proptest = "1"
 tokio = { workspace = true, features = ["test-util"] }
 temp-env = { workspace = true, features = ["async_closure"] }
@@ -212,6 +218,7 @@ tracing-subscriber = { workspace = true }
 opentelemetry_sdk = { workspace = true }
 rsa = { workspace = true }
 rcgen = { workspace = true }
+criterion = { workspace = true, features = ["html_reports"] }
 
 [build-dependencies]
 http.workspace = true

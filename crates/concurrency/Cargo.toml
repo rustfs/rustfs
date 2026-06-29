@@ -27,6 +27,7 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+insta = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true, features = ["test-util","macros","rt-multi-thread"] }
 

@@ -25,8 +25,8 @@ use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::diagnostics::get::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
-    GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_LEGACY_DUPLEX,
-    GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error,
+    GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT,
+    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION, GET_STAGE_EMIT, GET_STAGE_METADATA, classify_storage_error,
     record_get_object_pipeline_failure,
 };
 use crate::disk::error_reduce::{
@@ -171,10 +171,10 @@ const EVENT_SET_DISK_PUT_OBJECT_STAGE_SUMMARY: &str = "set_disk_put_object_stage
 const SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS: u128 = 5_000;
 const ENV_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 64 * 1024 * 1024;
-static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CACHED_PUT_LARGE_BATCH_MIN_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 const ENV_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: &str = "RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES";
 const DEFAULT_RUSTFS_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: usize = 128 * 1024 * 1024;
-static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+static CACHED_MULTIPART_PUT_LARGE_BATCH_MIN_SIZE_BYTES: OnceLock<usize> = OnceLock::new();
 
 use crate::io_support::rio::{EtagResolvable, HashReader, HashReaderMut, TryGetIndex as _};
 
@@ -329,8 +329,8 @@ fn adaptive_duplex_buffer_size(object_size: i64) -> usize {
 
 const DISK_ONLINE_TIMEOUT: Duration = Duration::from_secs(1);
 const DISK_HEALTH_CACHE_TTL: Duration = Duration::from_millis(750);
-const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_millis(250);
-const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 1024;
+const GET_OBJECT_METADATA_CACHE_TTL: Duration = Duration::from_secs(2); // Increased from 250ms to 2s
+const GET_OBJECT_METADATA_CACHE_MAX_ENTRIES: usize = 4096; // Increased from 1024 to 4096
 
 // --- Codec Streaming Configuration ---
 
@@ -420,15 +420,27 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 /// When enabled, read locks are released after metadata read instead of
 /// being held for the entire data transfer duration.
 ///
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
+/// **Note**: Cached via `OnceLock` in production — env var changes require
+/// process restart. In test builds the env var is read directly so that
+/// `temp_env` overrides take effect.
 pub fn is_lock_optimization_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
             rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+                rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+            )
+        })
+    }
 }
 
 /// Check if deadlock detection is enabled.
@@ -1616,6 +1628,86 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             return Ok(reader);
         }
 
+        // Inline data fast path: skip duplex pipe for small inline objects.
+        // Uses the shared predicate from ObjectInfo; additionally checks that
+        // inline data is actually present and no range request is in flight.
+        if object_info.is_inline_fast_path_eligible() && fi.data.is_some() && range.is_none() {
+            let data_shards = fi.erasure.data_blocks;
+            let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(&disks, &files, &fi);
+
+            // Check if we have enough inline data shards
+            let inline_count = files
+                .iter()
+                .take(data_shards)
+                .filter(|f| f.data.as_ref().is_some_and(|d| !d.is_empty()))
+                .count();
+
+            if inline_count >= data_shards {
+                // All data shards are inline - decode in memory
+                let erasure = coding::Erasure::new_with_options(
+                    fi.erasure.data_blocks,
+                    fi.erasure.parity_blocks,
+                    fi.erasure.block_size,
+                    fi.uses_legacy_checksum,
+                );
+                let object_size = usize::try_from(fi.size)
+                    .map_err(|_| to_object_err(Error::other("inline fast path object size is invalid"), vec![bucket, object]))?;
+
+                let checksum_info = fi.erasure.get_checksum_info(fi.parts[0].number);
+                let checksum_algo =
+                    if fi.uses_legacy_checksum && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S {
+                        rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                    } else {
+                        checksum_info.algorithm
+                    };
+                let read_length = erasure.shard_file_offset(0, object_size, object_size);
+                let mut readers: Vec<Option<coding::BitrotReader<Box<dyn tokio::io::AsyncRead + Send + Sync + Unpin>>>> =
+                    Vec::new();
+                for file in files.iter().take(data_shards + fi.erasure.parity_blocks) {
+                    if let Some(data) = &file.data {
+                        readers.push(
+                            create_bitrot_reader(
+                                Some(data),
+                                None,
+                                bucket,
+                                object,
+                                0,
+                                read_length,
+                                erasure.shard_size(),
+                                checksum_algo.clone(),
+                                opts.skip_verify_bitrot,
+                                false,
+                            )
+                            .await?,
+                        );
+                    } else {
+                        readers.push(None);
+                    }
+                }
+
+                // Decode directly
+                let mut output = Cursor::new(Vec::with_capacity(object_size));
+                let (written, err) = erasure.decode(&mut output, readers, 0, object_size, object_size).await;
+
+                if let Some(e) = err {
+                    return Err(to_object_err(e.into(), vec![bucket, object]));
+                }
+                if written == 0 && fi.size > 0 {
+                    return Err(to_object_err(
+                        Error::other("inline fast path: erasure decode returned 0 bytes"),
+                        vec![bucket, object],
+                    ));
+                }
+
+                rustfs_io_metrics::record_get_object_reader_path(GET_OBJECT_PATH_INLINE_DIRECT);
+                let reader = GetObjectReader {
+                    stream: Box::new(Cursor::new(output.into_inner())),
+                    object_info,
+                };
+                return Ok(reader);
+            }
+        }
+
         let codec_streaming_gate =
             get_codec_streaming_reader_gate(bucket, object, &range, &object_info, &fi, lock_optimization_enabled);
 
@@ -1827,8 +1919,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let tmp_object = format!("{}/{}/part.1", tmp_dir, fi.data_dir.unwrap());
 
         let result: Result<ObjectInfo> = async {
-            let erasure =
-                crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+            let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
@@ -2413,10 +2504,10 @@ impl SetDisks {
                                 }
                             }
                             Ok((_client_idx, Err(err))) => {
-                                tracing::warn!("late distributed delete lock batch request failed: {}", err);
+                                warn!("late distributed delete lock batch request failed: {}", err);
                             }
                             Err(err) => {
-                                tracing::warn!("late distributed delete lock batch task join failed: {}", err);
+                                warn!("late distributed delete lock batch task join failed: {}", err);
                             }
                         }
                     }
@@ -2428,7 +2519,7 @@ impl SetDisks {
                         } else {
                             Some(async move {
                                 if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                                    tracing::warn!(
+                                    warn!(
                                         client_idx,
                                         lock_count = lock_ids.len(),
                                         "failed to cleanup late distributed delete locks in batch: {}",
@@ -2490,7 +2581,7 @@ impl SetDisks {
             } else {
                 Some(async move {
                     if let Err(err) = client.release_locks_batch(&lock_ids).await {
-                        tracing::warn!(
+                        warn!(
                             client_idx,
                             lock_count = lock_ids.len(),
                             "failed to release distributed delete locks in batch: {}",
@@ -3590,7 +3681,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = dest_obj {
             return Err(to_object_err(err, vec![]));
         }
-        let dest_obj = dest_obj.unwrap();
+        let dest_obj = dest_obj?;
 
         let oi = ObjectInfo::from_file_info(&fi, bucket, object, opts.versioned || opts.version_suspended);
         let mut transition_meta = (*oi.user_defined).clone();
@@ -3723,7 +3814,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Err(err) = fi {
             return set_restore_header_fn(&mut oi, Some(to_object_err(err, vec![bucket, object]))).await;
         }
-        let (actual_fi, _, _) = fi.unwrap();
+        let (actual_fi, _, _) = fi?;
 
         oi = ObjectInfo::from_file_info(&actual_fi, bucket, object, opts.versioned || opts.version_suspended);
         let ropts = put_restore_opts(bucket, object, &opts.transition.restore_request, &oi).await?;
@@ -3735,7 +3826,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Err(err) = gr {
                 return set_restore_header_fn(&mut oi, Some(to_object_err(err.into(), vec![bucket, object]))).await;
             }
-            let gr = gr.unwrap();
+            let gr = gr?;
             let reader = BufReader::new(gr.stream);
             let hash_reader = HashReader::from_stream(reader, gr.object_info.size, gr.object_info.size, None, None, false)?;
             let mut p_reader = PutObjReader::new(hash_reader);
@@ -4160,8 +4251,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let tmp_part = format!("{}x{}", Uuid::new_v4(), OffsetDateTime::now_utc().unix_timestamp());
         let tmp_part_path = Arc::new(format!("{tmp_part}/{part_suffix}"));
 
-        let erasure =
-            crate::erasure::coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
+        let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
         let writer_setup_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(Instant::now);
 
         let mut writers = Vec::with_capacity(shuffle_disks.len());
@@ -5854,9 +5944,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
             let runtime_state = disk.runtime_state();
             let offline_duration_seconds = disk.offline_duration_secs();
             let capacity_snapshot = disk.last_capacity_snapshot();
-            if runtime_state.should_probe_for_admin()
-                || runtime_state == crate::disk::health_state::RuntimeDriveHealthState::Suspect
-            {
+            if runtime_state.should_probe_for_admin() || runtime_state == disk::health_state::RuntimeDriveHealthState::Suspect {
                 match disk.disk_info(&DiskInfoOptions::default()).await {
                     Ok(res) => {
                         disk.record_capacity_probe(res.total, res.used, res.free);
@@ -5948,7 +6036,7 @@ async fn get_disks_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> Vec<ru
 
 fn build_runtime_snapshot_disk(
     endpoint: &Endpoint,
-    runtime_state: crate::disk::health_state::RuntimeDriveHealthState,
+    runtime_state: disk::health_state::RuntimeDriveHealthState,
     offline_duration_seconds: Option<u64>,
     capacity_snapshot: Option<(u64, u64, u64, u64)>,
 ) -> rustfs_madmin::Disk {
@@ -6811,7 +6899,7 @@ mod tests {
             ..Default::default()
         };
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.copy_object(
                 "bucket",
@@ -6883,7 +6971,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6921,7 +7009,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6954,7 +7042,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        tokio::time::timeout(
+        timeout(
             Duration::from_secs(1),
             set_disks.delete_object(
                 "bucket",
@@ -6989,7 +7077,7 @@ mod tests {
             .await
             .expect("outer write lock should be acquired");
 
-        let result = tokio::time::timeout(
+        let result = timeout(
             Duration::from_millis(50),
             set_disks.delete_object(
                 "bucket",
@@ -7619,11 +7707,11 @@ mod tests {
             disk.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
         }
 
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let (tx, _rx) = mpsc::channel(1);
         let err = set_disks
             .list_path(
                 CancellationToken::new(),
-                crate::store::list_objects::ListPathOptions {
+                ListPathOptions {
                     bucket: "bucket".to_string(),
                     recursive: true,
                     ..Default::default()
@@ -7677,7 +7765,7 @@ mod tests {
 
         disk.make_volume(bucket).await.expect("bucket should be created");
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-xl-meta"))
+        disk.write_all(bucket, &metadata_path, Bytes::from_static(b"not-xl-meta"))
             .await
             .expect("corrupt metadata file should be written");
 
@@ -7732,7 +7820,7 @@ mod tests {
 
         disk.make_volume(bucket).await.expect("bucket should be created");
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(bucket, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+        disk.write_all(bucket, &metadata_path, Bytes::from_static(b"not-an-xl-meta"))
             .await
             .expect("metadata file should be created");
 
@@ -7770,7 +7858,7 @@ mod tests {
                 assert_eq!(walk_err, DiskError::Timeout);
                 assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                let (tx, mut rx) = mpsc::channel::<MetaCacheEntry>(4);
                 set_disks
                     .list_path(
                         CancellationToken::new(),
@@ -7821,7 +7909,7 @@ mod tests {
         let object = "config/iam/sts/test/identity.json";
 
         let metadata_path = format!("{object}/{STORAGE_FORMAT_FILE}");
-        disk.write_all(RUSTFS_META_BUCKET, &metadata_path, bytes::Bytes::from_static(b"not-an-xl-meta"))
+        disk.write_all(RUSTFS_META_BUCKET, &metadata_path, Bytes::from_static(b"not-an-xl-meta"))
             .await
             .expect("system path metadata file should be created");
 
@@ -7860,7 +7948,7 @@ mod tests {
                 assert_eq!(walk_err, DiskError::Timeout);
                 assert_eq!(disk.runtime_state(), RuntimeDriveHealthState::Online);
 
-                let (tx, mut rx) = tokio::sync::mpsc::channel::<MetaCacheEntry>(4);
+                let (tx, mut rx) = mpsc::channel::<MetaCacheEntry>(4);
                 set_disks
                     .list_path(
                         CancellationToken::new(),
@@ -8304,7 +8392,7 @@ mod tests {
         fi.size = payload.len() as i64;
         fi.add_object_part(1, String::new(), payload.len(), None, payload.len() as i64, None, None);
 
-        let erasure = crate::erasure::coding::Erasure::new_with_options(
+        let erasure = coding::Erasure::new_with_options(
             fi.erasure.data_blocks,
             fi.erasure.parity_blocks,
             fi.erasure.block_size,
@@ -8589,7 +8677,7 @@ mod tests {
                 .await
                 .expect("format should be saved");
 
-            std::mem::forget(dir);
+            mem::forget(dir);
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }
@@ -8639,7 +8727,7 @@ mod tests {
                     .expect("format should be saved");
             }
 
-            std::mem::forget(dir);
+            mem::forget(dir);
             endpoints.push(endpoint);
             disks.push(Some(disk));
         }

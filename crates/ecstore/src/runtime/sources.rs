@@ -31,10 +31,11 @@ use crate::{
     runtime::global::{
         GLOBAL_BOOT_TIME, GLOBAL_EventNotifier, GLOBAL_IsErasureSD, GLOBAL_LOCAL_DISK_ID_MAP, GLOBAL_LOCAL_DISK_MAP,
         GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LifecycleSys, GLOBAL_LocalNodeName, GLOBAL_RootDiskThreshold, GLOBAL_TierConfigMgr,
-        TypeLocalDiskSetDrives, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints,
-        get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle,
-        set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
+        TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor, get_global_deployment_id,
+        get_global_endpoints, get_global_endpoints_opt, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
+        global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure, is_first_cluster_node_local,
+        resolve_object_store_handle, set_global_deployment_id, set_global_lock_client, set_global_lock_clients, set_object_layer,
+        update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -42,7 +43,6 @@ use crate::{
     services::tier::tier::TierConfigMgr,
     store::ECStore,
 };
-use rustfs_common::{GLOBAL_CONN_MAP, GLOBAL_LOCAL_NODE_NAME, GLOBAL_RUSTFS_ADDR, GLOBAL_RUSTFS_HOST};
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_config::server_config::{Config, get_global_server_config, set_global_server_config};
 use rustfs_io_metrics::internode_metrics::global_internode_metrics;
@@ -51,6 +51,7 @@ use rustfs_lock::client::LockClient;
 use s3s::dto::BucketLifecycleConfiguration;
 use s3s::region::Region;
 use tokio::sync::{RwLock, RwLockReadGuard};
+use tokio_util::sync::CancellationToken;
 use tonic::transport::Channel;
 use uuid::Uuid;
 
@@ -164,11 +165,11 @@ pub(crate) async fn set_setup_type(setup_type: SetupType) {
 }
 
 pub(crate) async fn local_node_name() -> String {
-    GLOBAL_LOCAL_NODE_NAME.read().await.clone()
+    rustfs_common::get_global_local_node_name().await
 }
 
 pub(crate) async fn set_local_node_name(node_name: String) {
-    *GLOBAL_LOCAL_NODE_NAME.write().await = node_name;
+    rustfs_common::set_global_local_node_name(&node_name).await;
 }
 
 pub(crate) fn default_local_node_name() -> String {
@@ -179,18 +180,25 @@ pub(crate) fn rustfs_port() -> u16 {
     global_rustfs_port()
 }
 
+pub(crate) fn background_services_cancel_token() -> Option<&'static CancellationToken> {
+    get_background_services_cancel_token()
+}
+
 pub(crate) async fn rustfs_host() -> String {
-    GLOBAL_RUSTFS_HOST.read().await.clone()
+    rustfs_common::get_global_rustfs_host().await
 }
 
 pub(crate) async fn rustfs_addr() -> String {
-    GLOBAL_RUSTFS_ADDR.read().await.clone()
+    rustfs_common::get_global_addr().await
+}
+
+pub fn boot_time() -> Option<SystemTime> {
+    GLOBAL_BOOT_TIME.get().cloned()
 }
 
 pub(crate) fn boot_uptime_secs() -> u64 {
-    GLOBAL_BOOT_TIME
-        .get()
-        .and_then(|boot_time| SystemTime::now().duration_since(*boot_time).ok())
+    boot_time()
+        .and_then(|boot_time| SystemTime::now().duration_since(boot_time).ok())
         .unwrap_or_default()
         .as_secs()
 }
@@ -212,22 +220,22 @@ pub(crate) async fn root_disk_threshold_for_erasure_disk() -> Option<u64> {
 }
 
 pub(crate) async fn cached_node_channel(addr: &str) -> Option<Channel> {
-    GLOBAL_CONN_MAP.read().await.get(addr).cloned()
+    rustfs_common::cached_connection(addr).await
 }
 
 #[cfg(test)]
 pub(crate) async fn cache_test_node_channel(addr: String, channel: Channel) {
-    GLOBAL_CONN_MAP.write().await.insert(addr, channel);
+    rustfs_common::cache_connection(addr, channel).await;
 }
 
 #[cfg(test)]
 pub(crate) async fn test_node_channel_is_cached(addr: &str) -> bool {
-    GLOBAL_CONN_MAP.read().await.contains_key(addr)
+    rustfs_common::has_cached_connection(addr).await
 }
 
 #[cfg(test)]
 pub(crate) fn ensure_test_rpc_secret() {
-    let _ = rustfs_credentials::GLOBAL_RUSTFS_RPC_SECRET.set(TEST_RPC_SECRET.to_owned());
+    let _ = rustfs_credentials::set_global_rpc_secret(TEST_RPC_SECRET.to_owned());
 }
 
 pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize> {
@@ -237,9 +245,9 @@ pub(crate) fn storage_class_parity(storage_class: Option<&str>) -> Option<usize>
 pub(crate) fn backend_storage_class_parities(default_standard_parity: usize) -> (Option<usize>, Option<usize>) {
     if let Some(sc) = get_global_storage_class() {
         let standard = sc
-            .get_parity_for_sc(crate::config::storageclass::CLASS_STANDARD)
+            .get_parity_for_sc(storageclass::CLASS_STANDARD)
             .or(Some(default_standard_parity));
-        let reduced_redundancy = sc.get_parity_for_sc(crate::config::storageclass::RRS);
+        let reduced_redundancy = sc.get_parity_for_sc(storageclass::RRS);
         (standard, reduced_redundancy)
     } else {
         (Some(default_standard_parity), None)
@@ -379,11 +387,11 @@ pub(crate) fn tier_config_mgr_handle() -> Arc<RwLock<TierConfigMgr>> {
     GLOBAL_TierConfigMgr.clone()
 }
 
-pub(crate) fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
+pub fn expiry_state_handle() -> Arc<RwLock<ExpiryState>> {
     GLOBAL_ExpiryState.clone()
 }
 
-pub(crate) fn transition_state_handle() -> Arc<TransitionState> {
+pub fn transition_state_handle() -> Arc<TransitionState> {
     GLOBAL_TransitionState.clone()
 }
 
@@ -397,6 +405,11 @@ pub(crate) async fn local_disk_by_path(path: &str) -> Option<DiskStore> {
 
 pub(crate) async fn local_disk_path_by_id(disk_id: &Uuid) -> Option<String> {
     GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(disk_id).cloned()
+}
+
+#[cfg(test)]
+pub(crate) async fn clear_local_disk_id_map_for_test() {
+    GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
 }
 
 pub(crate) async fn record_local_disk_id(disk_id: Uuid, endpoint: String) {
@@ -510,7 +523,7 @@ pub(crate) async fn init_tier_config_mgr(store: Arc<ECStore>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::LockRegistry;
+    use super::{LockRegistry, local_node_name, set_local_node_name};
     use crate::disk::endpoint::Endpoint;
     use rustfs_lock::{LocalClient, LockClient};
     use std::{collections::HashMap, sync::Arc};
@@ -545,5 +558,18 @@ mod tests {
         assert_eq!(clients.len(), 2);
         assert!(Arc::ptr_eq(&clients[0], &client_a));
         assert!(Arc::ptr_eq(&clients[1], &client_b));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_node_name_round_trips_through_common_runtime_helper() {
+        let previous = local_node_name().await;
+        let next = "runtime-source-local-node-test".to_string();
+
+        set_local_node_name(next.clone()).await;
+        let observed = local_node_name().await;
+        set_local_node_name(previous).await;
+
+        assert_eq!(observed, next);
     }
 }

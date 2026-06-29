@@ -53,8 +53,8 @@ members = [
     "crates/trusted-proxies", # Trusted proxies management
     "crates/tls-runtime", # Project-wide TLS runtime foundation
     "crates/utils", # Utility functions and helpers
-    "crates/io-metrics", # Zero-copy metrics collection for performance analysis
-    "crates/io-core", # Zero-copy core reader and writer implementations
+    "crates/io-metrics", # I/O metrics collection for performance analysis
+    "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
 ]
 resolver = "3"
@@ -176,16 +176,20 @@ serde_json = { version = "1.0.150", features = ["raw_value"] }
 serde_urlencoded = "0.7.1"
 
 # Cryptography and Security
-aes-gcm = { version = "0.11.0-rc.4", features = ["rand_core"] }
-argon2 = { version = "0.6.0-rc.8" }
-blake2 = "0.11.0-rc.6"
-chacha20poly1305 = { version = "0.11.0-rc.3" }
+# NOTE: These direct cryptography dependencies use RC versions because the
+# matching stable releases are not available yet, while previous stable lines
+# have incompatible APIs. Keep them exact-pinned and monitor upstream for stable
+# releases.
+aes-gcm = { version = "=0.11.0", features = ["rand_core"] }
+argon2 = { version = "=0.6.0-rc.8" }
+blake2 = "=0.11.0-rc.6"
+chacha20poly1305 = { version = "=0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }
 openidconnect = { version = "4.0", default-features = false }
 pbkdf2 = "0.13.0"
-rsa = { version = "0.10.0-rc.18" }
+rsa = { version = "=0.10.0-rc.18" }
 rustls = { version = "0.23.41", default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-native-certs = "0.8"
 rustls-pki-types = "1.14.1"
@@ -333,6 +337,8 @@ mimalloc = "0.1"
 tikv-jemallocator = { version = "0.6", features = ["profiling", "stats", "unprefixed_malloc_on_supported_platforms", "background_threads"] }
 # Used to control and obtain statistics for jemalloc at runtime
 tikv-jemalloc-ctl = { version = "0.6", features = ["use_std", "stats", "profiling"] }
+# Snapshot testing for output format regression detection
+insta = { version = "1.41", features = ["yaml", "json"] }
 # Used to generate pprof-compatible memory profiling data and support symbolization and flame graphs
 jemalloc_pprof = { version = "0.8.2", features = ["symbolize", "flamegraph"] }
 # Used to generate CPU performance analysis data and flame diagrams

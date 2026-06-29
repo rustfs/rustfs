@@ -20,10 +20,10 @@ use rustfs_lock::NamespaceLockWrapper;
 use rustfs_madmin::heal_commands::HealResultItem;
 use storage_api::contract_compat::{
     CompletePart, DeletedObject, DiskStore, ECStore, Error, GetObjectReader, HTTPRangeSpec, ListMultipartsInfo, ListPartsInfo,
-    MultipartInfo, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, StorageAdminApi,
-    StorageHealOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageListOperations,
-    StorageMultipartOperations, StorageNamespaceLocking, StorageObjectIO, StorageObjectInfoOrErr, StorageObjectOperations,
-    StorageWalkOptions,
+    MultipartInfo, MultipartUploadResult, ObjectInfo, ObjectOptions, ObjectToDelete, PartInfo, PutObjReader, SetDisks,
+    StorageAdminApi, StorageBucketOperations, StorageHealOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info,
+    StorageListOperations, StorageMultipartOperations, StorageNamespaceLocking, StorageObjectIO, StorageObjectInfoOrErr,
+    StorageObjectOperations, StorageWalkOptions,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -62,6 +62,13 @@ where
             GetObjectReader = GetObjectReader,
             PutObjectReader = PutObjReader,
         >,
+{
+    std::any::type_name::<T>()
+}
+
+fn storage_bucket_operations_type_name<T>() -> &'static str
+where
+    T: StorageBucketOperations<Error = Error>,
 {
     std::any::type_name::<T>()
 }
@@ -136,6 +143,11 @@ fn ecstore_implements_storage_object_io_contract() {
 }
 
 #[test]
+fn ecstore_implements_storage_bucket_operations_contract() {
+    assert!(storage_bucket_operations_type_name::<ECStore>().ends_with("::ECStore"));
+}
+
+#[test]
 fn ecstore_implements_storage_object_operations_contract() {
     assert!(storage_object_operations_type_name::<ECStore>().ends_with("::ECStore"));
 }
@@ -153,4 +165,39 @@ fn ecstore_implements_storage_multipart_operations_contract() {
 #[test]
 fn ecstore_implements_storage_heal_operations_contract() {
     assert!(storage_heal_operations_type_name::<ECStore>().ends_with("::ECStore"));
+}
+
+#[test]
+fn set_disks_implements_storage_namespace_locking_contract() {
+    assert!(storage_namespace_locking_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_object_io_contract() {
+    assert!(storage_object_io_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_bucket_operations_contract() {
+    assert!(storage_bucket_operations_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_object_operations_contract() {
+    assert!(storage_object_operations_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_list_operations_contract() {
+    assert!(storage_list_operations_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_multipart_operations_contract() {
+    assert!(storage_multipart_operations_type_name::<SetDisks>().ends_with("::SetDisks"));
+}
+
+#[test]
+fn set_disks_implements_storage_heal_operations_contract() {
+    assert!(storage_heal_operations_type_name::<SetDisks>().ends_with("::SetDisks"));
 }

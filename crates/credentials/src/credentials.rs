@@ -30,7 +30,7 @@ use time::OffsetDateTime;
 static GLOBAL_ACTIVE_CRED: OnceLock<Credentials> = OnceLock::new();
 
 /// Global RPC authentication token
-pub static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
+static GLOBAL_RUSTFS_RPC_SECRET: OnceLock<String> = OnceLock::new();
 
 /// Public error returned when RPC authentication is not safely configured.
 pub const RPC_SECRET_REQUIRED_MESSAGE: &str = "RPC authentication secret is not configured";
@@ -262,6 +262,10 @@ fn resolve_rpc_secret(env_secret: Option<&str>, global_access: Option<&str>, glo
         (Some(access_key), Some(secret_key)) => derive_rpc_secret(access_key, secret_key),
         _ => None,
     }
+}
+
+pub fn set_global_rpc_secret(secret: String) -> Result<(), String> {
+    GLOBAL_RUSTFS_RPC_SECRET.set(secret)
 }
 
 pub fn try_get_rpc_token() -> std::io::Result<String> {

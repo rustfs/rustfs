@@ -14,10 +14,12 @@
 
 pub mod bucket_lifecycle_audit;
 pub mod bucket_lifecycle_ops;
+mod config_boundary;
 pub mod core;
 pub mod evaluator;
 pub use self::core as lifecycle;
 pub mod rule;
+mod runtime_boundary;
 pub mod tier_delete_journal;
 pub mod tier_free_version_recovery;
 pub mod tier_last_day_stats;

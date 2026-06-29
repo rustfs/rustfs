@@ -42,7 +42,8 @@ use s3s::{S3Error, S3ErrorCode, S3Response, S3Result};
 use serde_urlencoded::from_bytes;
 use std::collections::HashMap;
 use std::ops::Add;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use time::{format_description::FormatItem, macros::format_description};
@@ -745,17 +746,117 @@ pub(crate) async fn has_replication_rules(bucket: &str, objects: &[ObjectToDelet
     false
 }
 
-/// Helper function to get store and validate bucket exists
+/// Bucket validation cache to avoid repeated stat_volume() calls on every GET.
+///
+/// **Adaptive strategy** (selected once at startup via env var):
+///
+/// | Backend | Env var | Best for |
+/// |---------|---------|----------|
+/// | `RwLock<HashMap>` | default | < 100 buckets — lower per-op overhead |
+/// | `starshard::ShardedHashMap` | `RUSTFS_BUCKET_CACHE_STARSHARD=1` | >= 100 buckets — sharded locks reduce contention |
+///
+/// Entries expire after `BUCKET_VALIDATION_TTL` (checked on read).
+/// Write operations (delete/make bucket) invalidate the cache explicitly.
+const BUCKET_VALIDATION_TTL: Duration = Duration::from_secs(5);
+
+/// Tracks which backend is active: `false` = HashMap, `true` = starshard.
+static USE_STARSHARD_CACHE: OnceLock<bool> = OnceLock::new();
+
+fn use_starshard() -> bool {
+    *USE_STARSHARD_CACHE.get_or_init(|| {
+        std::env::var("RUSTFS_BUCKET_CACHE_STARSHARD")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(false)
+    })
+}
+
+/// --- HashMap backend (default) ---
+static BUCKET_CACHE_SMALL: OnceLock<RwLock<HashMap<String, Instant>>> = OnceLock::new();
+
+fn small_cache() -> &'static RwLock<HashMap<String, Instant>> {
+    BUCKET_CACHE_SMALL.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// --- starshard backend (opt-in) ---
+static BUCKET_CACHE_LARGE: OnceLock<starshard::ShardedHashMap<String, Instant>> = OnceLock::new();
+
+fn large_cache() -> &'static starshard::ShardedHashMap<String, Instant> {
+    BUCKET_CACHE_LARGE.get_or_init(|| starshard::ShardedHashMap::new(128))
+}
+
+/// Get a value from the active cache backend.
+fn cache_get(bucket: &str) -> Option<Instant> {
+    if use_starshard() {
+        large_cache().get(&bucket.to_string())
+    } else {
+        small_cache().read().ok()?.get(bucket).copied()
+    }
+}
+
+/// Insert a value into the active cache backend.
+fn cache_insert(bucket: String, ts: Instant) {
+    if use_starshard() {
+        large_cache().insert(bucket, ts);
+    } else if let Ok(mut map) = small_cache().write() {
+        map.insert(bucket, ts);
+    }
+}
+
+/// Remove a value from the active cache backend.
+fn cache_remove(bucket: &str) {
+    if use_starshard() {
+        large_cache().remove(&bucket.to_string());
+    } else if let Ok(mut map) = small_cache().write() {
+        map.remove(bucket);
+    }
+}
+
+/// Clear all entries in the active cache backend.
+#[allow(dead_code)]
+fn cache_clear() {
+    if use_starshard() {
+        large_cache().clear();
+    } else if let Ok(mut map) = small_cache().write() {
+        map.clear();
+    }
+}
+
+/// Invalidate the validation cache for a specific bucket.
+pub fn invalidate_bucket_validation_cache(bucket: &str) {
+    cache_remove(bucket);
+}
+
+/// Invalidate all bucket validation cache entries.
+#[allow(dead_code)]
+pub fn invalidate_all_bucket_validation_cache() {
+    cache_clear();
+}
+
+/// Helper function to get store and validate bucket exists.
+///
+/// Uses adaptive cache with 5s TTL to avoid repeated stat_volume() calls.
+/// Returns store directly on cache hit without calling get_bucket_info().
 pub(crate) async fn get_validated_store(bucket: &str) -> S3Result<Arc<super::ECStore>> {
     let Some(store) = runtime_sources::current_object_store_handle() else {
         return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
     };
 
-    // Validate bucket exists
+    // Check cache — TTL is checked manually.
+    if let Some(inserted_at) = cache_get(bucket)
+        && inserted_at.elapsed() < BUCKET_VALIDATION_TTL
+    {
+        return Ok(store); // Cache hit, skip validation
+    }
+
+    // Cache miss or expired, perform validation
     store
         .get_bucket_info(bucket, &BucketOptions::default())
         .await
         .map_err(ApiError::from)?;
+
+    // Update cache
+    cache_insert(bucket.to_string(), Instant::now());
 
     Ok(store)
 }

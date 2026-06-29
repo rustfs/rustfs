@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::*;
+use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
-use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
@@ -129,14 +129,14 @@ impl SetDisks {
 
                         let erasure = if !latest_meta.deleted && !latest_meta.is_remote() {
                             // Initialize erasure coding; use legacy mode for old-version files
-                            crate::erasure::coding::Erasure::new_with_options(
+                            coding::Erasure::new_with_options(
                                 latest_meta.erasure.data_blocks,
                                 latest_meta.erasure.parity_blocks,
                                 latest_meta.erasure.block_size,
                                 latest_meta.uses_legacy_checksum,
                             )
                         } else {
-                            crate::erasure::coding::Erasure::default()
+                            coding::Erasure::default()
                         };
 
                         result.object_size =
@@ -360,10 +360,7 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                // Read zero-copy configuration from environment variable
-                                // Default: enabled (true) for performance
-                                let use_mmap_read =
-                                    rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+                                let use_mmap_read = object_mmap_read_enabled();
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());
@@ -385,9 +382,9 @@ impl SetDisks {
                                     if let (Some(disk), Some(metadata)) = (disk, &copy_parts_metadata[index]) {
                                         let checksum_info = metadata.erasure.get_checksum_info(part.number);
                                         let checksum_algo = if metadata.uses_legacy_checksum
-                                            && checksum_info.algorithm == rustfs_utils::HashAlgorithm::HighwayHash256S
+                                            && checksum_info.algorithm == HashAlgorithm::HighwayHash256S
                                         {
-                                            rustfs_utils::HashAlgorithm::HighwayHash256SLegacy
+                                            HashAlgorithm::HighwayHash256SLegacy
                                         } else {
                                             checksum_info.algorithm
                                         };
@@ -498,7 +495,7 @@ impl SetDisks {
                                             //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                             // }
                                             parts_metadata[index].data =
-                                                Some(writer.into_inline_data().map(bytes::Bytes::from).unwrap_or_default());
+                                                Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
                                         }
                                         parts_metadata[index].set_inline_data();
                                     } else {

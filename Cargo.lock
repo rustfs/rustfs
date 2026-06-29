@@ -68,9 +68,9 @@ dependencies = [
 
 [[package]]
 name = "aes-gcm"
-version = "0.11.0-rc.4"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "da8c919c118108f144adecad74b425b804ad075580d605d9b33c2d6d1c62a2f8"
+checksum = "fdf011db2e21ce0d575593d749db5554b47fed37aff429e4dc50bc91ac93a028"
 dependencies = [
  "aead",
  "aes 0.9.1",
@@ -299,9 +299,9 @@ dependencies = [
 
 [[package]]
 name = "arc-swap"
-version = "1.9.1"
+version = "1.9.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6a3a1fd6f75306b68087b831f025c712524bcb19aad54e557b1129cfa0a2b207"
+checksum = "c049c0be4daef0b145cb3555416b3b8ef5b7888a38aea1a3a155801fe7b0810b"
 dependencies = [
  "rustversion",
 ]
@@ -1809,9 +1809,9 @@ dependencies = [
 
 [[package]]
 name = "chacha20poly1305"
-version = "0.11.0-rc.3"
+version = "0.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1c9ed179664f12fd6f155f6dd632edf5f3806d48c228c67ff78366f2a0eb6b5e"
+checksum = "9b89e1c441e926b9c82a8d023f6e1b7ae0adcfaa7d621814e4d60789bac751cb"
 dependencies = [
  "aead",
  "chacha20",
@@ -2029,6 +2029,17 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4ca0197aee26d1ae37445ee532fefce43251d24cc7c166799f4d46817f1d3973"
 dependencies = [
  "crossbeam-utils",
+]
+
+[[package]]
+name = "console"
+version = "0.16.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d64e8af5551369d19cf50138de61f1c42074ab970f74e99be916646777f8fc87"
+dependencies = [
+ "encode_unicode",
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3836,6 +3847,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "encode_unicode"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34aa73646ffb006b8f5147f3dc182bd4bcb190227ce861fc4a4844bf8e3cb2c0"
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.35"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5286,6 +5303,19 @@ checksum = "4250ce6452e92010fdf7268ccc5d14faa80bb12fc741938534c58f16804e03c7"
 dependencies = [
  "block-padding 0.4.2",
  "hybrid-array",
+]
+
+[[package]]
+name = "insta"
+version = "1.48.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "86f0f8fee8c926415c58d6ae43a08523a26faccb2323f5e6b644fe7dd4ef6b82"
+dependencies = [
+ "console",
+ "once_cell",
+ "serde",
+ "similar",
+ "tempfile",
 ]
 
 [[package]]
@@ -9019,6 +9049,7 @@ dependencies = [
  "chrono",
  "clap",
  "const-str",
+ "criterion",
  "datafusion",
  "flatbuffers",
  "futures",
@@ -9032,6 +9063,7 @@ dependencies = [
  "http-body-util",
  "hyper",
  "hyper-util",
+ "insta",
  "jemalloc_pprof",
  "jiff",
  "libc",
@@ -9102,6 +9134,7 @@ dependencies = [
  "sha2 0.11.0",
  "shadow-rs",
  "socket2",
+ "starshard",
  "subtle",
  "sysinfo",
  "temp-env",
@@ -9181,6 +9214,7 @@ dependencies = [
 name = "rustfs-concurrency"
 version = "1.0.0-beta.8"
 dependencies = [
+ "insta",
  "rustfs-io-core",
  "rustfs-io-metrics",
  "serde",
@@ -9282,6 +9316,7 @@ dependencies = [
  "hyper",
  "hyper-rustls",
  "hyper-util",
+ "insta",
  "lazy_static",
  "libc",
  "md-5 0.11.0",
@@ -9579,6 +9614,7 @@ dependencies = [
  "async-trait",
  "base64 0.22.1",
  "chacha20poly1305",
+ "insta",
  "jiff",
  "md5",
  "moka",
@@ -10015,6 +10051,7 @@ name = "rustfs-storage-api"
 version = "1.0.0-beta.8"
 dependencies = [
  "async-trait",
+ "insta",
  "rustfs-filemeta",
  "serde",
  "serde_json",
@@ -10909,6 +10946,12 @@ name = "simdutf8"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
+
+[[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
 
 [[package]]
 name = "simple_asn1"

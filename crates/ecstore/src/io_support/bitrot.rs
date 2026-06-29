@@ -15,6 +15,7 @@
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
+use rustfs_config::{DEFAULT_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_MMAP_READ_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 use rustfs_utils::HashAlgorithm;
 use std::future::Future;
 use std::io::{self, Cursor};
@@ -27,6 +28,14 @@ use tracing::debug;
 
 type BoxedObjectReader = Box<dyn AsyncRead + Send + Sync + Unpin>;
 type OpenObjectReaderFuture = Pin<Box<dyn Future<Output = disk::error::Result<Option<BoxedObjectReader>>> + Send>>;
+
+pub(crate) fn object_mmap_read_enabled() -> bool {
+    rustfs_utils::get_env_bool_with_aliases(
+        ENV_OBJECT_MMAP_READ_ENABLE,
+        &[ENV_OBJECT_ZERO_COPY_ENABLE],
+        DEFAULT_OBJECT_MMAP_READ_ENABLE,
+    )
+}
 
 #[derive(Clone)]
 struct BitrotReaderSource {
@@ -140,7 +149,7 @@ async fn open_disk_reader(
 ) -> disk::error::Result<FileReader> {
     if use_mmap_read && disk.is_local() {
         let start = Instant::now();
-        match disk.read_file_zero_copy(bucket, path, offset, length).await {
+        match disk.read_file_mmap_copy(bucket, path, offset, length).await {
             Ok(bytes) => {
                 let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
 
@@ -192,7 +201,7 @@ fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksu
 /// * `shard_size` - Shard size for erasure coding
 /// * `checksum_algo` - Hash algorithm for bitrot verification
 /// * `skip_verify` - If true, skip checksum verification
-/// * `use_mmap_read` - If true, use zero-copy read (mmap on Unix)
+/// * `use_mmap_read` - If true, use mmap-copy read (mmap on Unix)
 #[allow(clippy::too_many_arguments)]
 pub async fn create_bitrot_reader(
     inline_data: Option<&[u8]>,
@@ -295,6 +304,32 @@ pub async fn create_bitrot_writer(
 mod tests {
     use super::*;
 
+    #[test]
+    fn object_mmap_read_enabled_accepts_legacy_zero_copy_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_OBJECT_MMAP_READ_ENABLE, None::<&str>),
+                (ENV_OBJECT_ZERO_COPY_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(!object_mmap_read_enabled());
+            },
+        );
+    }
+
+    #[test]
+    fn object_mmap_read_enabled_prefers_canonical_env() {
+        temp_env::with_vars(
+            [
+                (ENV_OBJECT_MMAP_READ_ENABLE, Some("true")),
+                (ENV_OBJECT_ZERO_COPY_ENABLE, Some("false")),
+            ],
+            || {
+                assert!(object_mmap_read_enabled());
+            },
+        );
+    }
+
     #[tokio::test]
     async fn test_create_bitrot_reader_with_inline_data() {
         let test_data = b"hello world test data";
@@ -325,7 +360,7 @@ mod tests {
         let shard_size = 16;
         let checksum_algo = HashAlgorithm::HighwayHash256S;
 
-        // Test with zero-copy enabled (should work the same for inline data)
+        // Test with mmap-copy enabled (should work the same for inline data)
         let result = create_bitrot_reader(
             Some(test_data),
             None,

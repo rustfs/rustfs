@@ -1,3 +1,17 @@
+// Copyright 2024 RustFS Team
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 use super::*;
 #[cfg(feature = "rio-v2")]
 use aes_gcm::aead::Payload;
@@ -122,7 +136,7 @@ fn restore_request_active(opts: &ObjectOptions) -> bool {
     restore.type_.is_some() || restore.days.is_some() || restore.output_location.is_some() || restore.select_parameters.is_some()
 }
 
-fn decode_compression_index(index: Option<&bytes::Bytes>) -> Option<Index> {
+fn decode_compression_index(index: Option<&Bytes>) -> Option<Index> {
     crate::io_support::rio::decode_compression_index_bytes(index?)
 }
 
@@ -833,11 +847,7 @@ impl<R: AsyncRead + Unpin + Send + Sync + 'static> RangedDecompressReader<R> {
 }
 
 impl<R: AsyncRead + Unpin + Send + Sync + 'static> AsyncRead for RangedDecompressReader<R> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         use std::pin::Pin;
         use std::task::Poll;
         use tokio::io::ReadBuf;
@@ -985,11 +995,7 @@ impl<R: AsyncRead + Unpin + Send + 'static> StreamConsumer<R> {
 }
 
 impl<R: AsyncRead + Unpin + Send + 'static> AsyncRead for StreamConsumer<R> {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
         use std::pin::Pin;
         use std::task::Poll;
 
@@ -1032,7 +1038,7 @@ fn encrypted_plaintext_size(oi: &ObjectInfo, is_multipart: bool, is_compressed: 
     oi.decrypted_size().map_err(Into::into)
 }
 
-fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag: Option<&str>) -> bool {
+fn is_multipart_encrypted_object(parts: &[ObjectPartInfo], etag: Option<&str>) -> bool {
     if parts.len() > 1 {
         return true;
     }
@@ -1040,13 +1046,13 @@ fn is_multipart_encrypted_object(parts: &[rustfs_filemeta::ObjectPartInfo], etag
     etag.map(|etag| etag.trim_matches('"').len() != 32).unwrap_or(false)
 }
 
-fn multipart_plaintext_size(parts: &[rustfs_filemeta::ObjectPartInfo], fallback: i64) -> i64 {
+fn multipart_plaintext_size(parts: &[ObjectPartInfo], fallback: i64) -> i64 {
     let total: i64 = parts.iter().map(part_plaintext_size).sum();
 
     if total > 0 { total } else { fallback }
 }
 
-fn multipart_part_numbers(parts: &[rustfs_filemeta::ObjectPartInfo]) -> Vec<usize> {
+fn multipart_part_numbers(parts: &[ObjectPartInfo]) -> Vec<usize> {
     parts.iter().map(|part| part.number).collect()
 }
 
@@ -1605,13 +1611,13 @@ mod tests {
 
     fn ssec_headers_from_key(key_bytes: [u8; 32]) -> HeaderMap<HeaderValue> {
         let mut headers = HeaderMap::new();
-        headers.insert(rustfs_utils::http::SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
+        headers.insert(SSEC_ALGORITHM_HEADER, HeaderValue::from_static("AES256"));
         headers.insert(
-            rustfs_utils::http::SSEC_KEY_HEADER,
+            SSEC_KEY_HEADER,
             HeaderValue::from_str(&BASE64_STANDARD.encode(key_bytes)).expect("valid base64 header"),
         );
         headers.insert(
-            rustfs_utils::http::SSEC_KEY_MD5_HEADER,
+            SSEC_KEY_MD5_HEADER,
             HeaderValue::from_str(&BASE64_STANDARD.encode(md5_bytes(key_bytes))).expect("valid md5 header"),
         );
         headers
@@ -2616,7 +2622,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_object_reader_compressed_range_returns_physical_offset_from_index() {
-        let mut index = crate::io_support::rio::Index::new();
+        let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
 
@@ -2670,7 +2676,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_read_plan_compressed_range_tracks_storage_and_visible_offsets() {
-        let mut index = crate::io_support::rio::Index::new();
+        let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
 
@@ -2746,7 +2752,7 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[tokio::test]
     async fn test_read_plan_accepts_minio_headerless_compression_index() {
-        let mut index = crate::io_support::rio::Index::new();
+        let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(1_048_576, 2_097_152).unwrap();
         let headerless_index = crate::io_support::rio::compression_index_storage_bytes(&index);
@@ -2800,7 +2806,7 @@ mod tests {
     #[cfg(feature = "rio-v2")]
     #[test]
     fn test_get_compressed_offsets_aligns_encrypted_ranges_to_dare_packages() {
-        let mut index = crate::io_support::rio::Index::new();
+        let mut index = Index::new();
         index.add(0, 0).unwrap();
         index.add(200_000, 2_097_152).unwrap();
         let stored_index = crate::io_support::rio::compression_index_storage_bytes(&index);

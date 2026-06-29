@@ -36,7 +36,8 @@ rustfs-io-metrics = { workspace = true }
 
 # Enable tokio's io_uring-based runtime backend on Linux.
 # Note: this is a tokio runtime feature, not application-level io_uring usage.
-# See https://github.com/rustfs/backlog/issues/733
+# See the Tokio 1.52.0 release notes and tokio-rs/tokio#7907 for the upstream
+# runtime feature context.
 [target.'cfg(target_os = "linux")'.dependencies]
 tokio = { workspace = true, features = ["io-uring"] }
 

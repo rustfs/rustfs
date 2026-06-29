@@ -817,7 +817,11 @@ impl DefaultBucketUsecase {
             .await;
 
         match make_result {
-            Ok(()) => {}
+            Ok(()) => {
+                // Invalidate the bucket validation cache so subsequent GETs
+                // see the newly created bucket immediately.
+                crate::storage::invalidate_bucket_validation_cache(&bucket);
+            }
             Err(StorageError::BucketExists(_)) => {
                 // Per S3 spec: bucket namespace is global. Owner recreating returns 200 OK;
                 // non-owner gets 409 BucketAlreadyExists.
@@ -869,6 +873,10 @@ impl DefaultBucketUsecase {
             )
             .await
             .map_err(ApiError::from)?;
+
+        // Invalidate bucket validation cache
+        crate::storage::invalidate_bucket_validation_cache(&input.bucket);
+
         rustfs_scanner::clear_dirty_usage_bucket(&input.bucket);
         if let Err(err) = remove_bucket_usage_from_backend(store.clone(), &input.bucket).await {
             warn!(bucket = %input.bucket, error = ?err, "failed to remove deleted bucket from data usage");

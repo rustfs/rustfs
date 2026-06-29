@@ -14,7 +14,6 @@
 
 #![allow(clippy::map_entry)]
 
-use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
 use crate::bucket::lifecycle::bucket_lifecycle_ops::{
     enqueue_immediate_expiry, enqueue_transition_immediate, init_background_expiry,
@@ -42,11 +41,9 @@ use crate::error::{
     StorageError, is_err_bucket_exists, is_err_bucket_not_found, is_err_invalid_upload_id, is_err_object_not_found,
     is_err_read_quorum, is_err_version_not_found, to_object_err,
 };
-use crate::runtime::global::{DISK_RESERVE_FRACTION, TypeLocalDiskSetDrives};
+use crate::runtime::global::DISK_RESERVE_FRACTION;
 use crate::runtime::sources as runtime_sources;
-use crate::services::event_notification::EventNotifier;
 use crate::services::rebalance::RebalanceMeta;
-use crate::services::tier::tier::TierConfigMgr;
 use crate::storage_api_contracts::{
     bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions},
     list::{StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
@@ -75,11 +72,7 @@ use rustfs_utils::path::{decode_dir_object, encode_dir_object, path_join_buf};
 use s3s::dto::{BucketVersioningStatus, ObjectLockConfiguration, ObjectLockEnabled, VersioningConfiguration};
 use std::net::SocketAddr;
 use std::process::exit;
-use std::{
-    collections::HashMap,
-    sync::{Arc, OnceLock},
-    time::Duration,
-};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 use time::OffsetDateTime;
 use tokio::select;
 use tokio::sync::{Mutex, RwLock};
@@ -192,18 +185,6 @@ pub struct ECStore {
     /// The saver then clones the latest `pool_meta` under a short read lock and
     /// releases it before awaiting disk writes.
     pub(crate) pool_meta_save_gate: Mutex<()>,
-
-    // Phase 2 migration pending - do not use directly.
-    /// Local disk maps (migrated from GLOBAL_LOCAL_DISK_MAP/ID_MAP/SET_DRIVES)
-    pub(crate) local_disk_map: Arc<RwLock<HashMap<String, Option<DiskStore>>>>,
-    pub(crate) local_disk_id_map: Arc<RwLock<HashMap<Uuid, String>>>,
-    pub(crate) local_disk_set_drives: Arc<RwLock<TypeLocalDiskSetDrives>>,
-    /// Tier config manager (migrated from GLOBAL_TierConfigMgr)
-    pub(crate) tier_config_mgr: Arc<RwLock<TierConfigMgr>>,
-    /// Event notifier (migrated from GLOBAL_EventNotifier)
-    pub(crate) event_notifier: Arc<RwLock<EventNotifier>>,
-    /// Bucket monitor (migrated from GLOBAL_BUCKET_MONITOR)
-    pub(crate) bucket_monitor: OnceLock<Arc<Monitor>>,
 }
 
 impl std::fmt::Debug for ECStore {
@@ -774,7 +755,8 @@ impl crate::storage_api_contracts::admin::StorageAdminApi for ECStore {
 mod tests {
     use super::*;
     use crate::layout::endpoints::{Endpoints, PoolEndpoints};
-    use crate::runtime::global::{GLOBAL_LOCAL_DISK_ID_MAP, reset_local_disk_test_state};
+    use crate::runtime::global::reset_local_disk_test_state;
+    use crate::runtime::sources::{clear_local_disk_id_map_for_test, local_disk_path_by_id};
     use crate::store::init_format::{connect_load_init_formats, init_disks};
     use serial_test::serial;
     use tempfile::TempDir;
@@ -851,7 +833,7 @@ mod tests {
             .await
             .expect("initialize format metadata");
 
-        GLOBAL_LOCAL_DISK_ID_MAP.write().await.clear();
+        clear_local_disk_id_map_for_test().await;
 
         let local_disks = all_local_disk().await;
         let first_disk = local_disks.first().expect("local disk exists");
@@ -863,10 +845,7 @@ mod tests {
 
         let found = find_local_disk_by_ref(&disk_id.to_string()).await;
         assert!(found.is_some(), "disk lookup by id should backfill cache");
-        assert_eq!(
-            GLOBAL_LOCAL_DISK_ID_MAP.read().await.get(&disk_id).cloned(),
-            Some(first_disk.endpoint().to_string())
-        );
+        assert_eq!(local_disk_path_by_id(&disk_id).await, Some(first_disk.endpoint().to_string()));
 
         reset_local_disk_test_state().await;
     }

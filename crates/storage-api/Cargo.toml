@@ -29,12 +29,16 @@ doctest = false
 
 [dependencies]
 async-trait.workspace = true
+# NOTE: This dependency on rustfs-filemeta is a known architectural limitation.
+# The replication types (ReplicationStatusType, VersionPurgeStatusType, ReplicationState)
+# are shared between storage-api and filemeta. Moving them would require changes in 300+ files.
 rustfs-filemeta.workspace = true
 serde.workspace = true
 time.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+insta = { workspace = true }
 serde_json.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 

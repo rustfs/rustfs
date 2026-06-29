@@ -112,18 +112,17 @@ pub mod event {
 
 pub mod global {
     pub use crate::runtime::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_LOCAL_DISK_MAP, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id,
-        get_global_endpoints_opt, get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr,
-        global_rustfs_port, is_dist_erasure, is_erasure, is_erasure_sd, is_first_cluster_node_local, new_object_layer_fn,
-        resolve_object_store_handle, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
-        shutdown_background_services, update_erasure_type,
+        get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
+        get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port, is_dist_erasure, is_erasure,
+        is_erasure_sd, is_first_cluster_node_local, new_object_layer_fn, resolve_object_store_handle, set_global_endpoints,
+        set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
 }
 
 pub mod runtime {
     pub use crate::runtime::sources::{
-        bucket_monitor, first_cluster_node_is_local, global_tier_config_mgr, local_disk_map_read, object_store_handle,
-        setup_is_erasure, setup_is_erasure_sd,
+        boot_time, bucket_monitor, expiry_state_handle, first_cluster_node_is_local, global_tier_config_mgr, local_disk_map_read,
+        object_store_handle, setup_is_erasure, setup_is_erasure_sd, transition_state_handle,
     };
 }
 

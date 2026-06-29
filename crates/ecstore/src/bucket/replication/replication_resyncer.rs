@@ -12,25 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_config_store as config_store;
+use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_lock_boundary as lock_boundary;
+use super::replication_metadata_boundary as metadata_boundary;
+use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
+use super::replication_target_boundary as target_boundary;
+use super::replication_versioning_boundary as versioning_boundary;
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
-    AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
-use crate::bucket::metadata_sys;
-use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
-use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
-use crate::config::com::save_config;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::runtime::sources as runtime_sources;
-use crate::services::event_notification::{EventArgs, send_event};
-use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::{
     list::{ListOperations, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions},
     namespace::NamespaceLocking as StorageNamespaceLocking,
@@ -839,7 +840,7 @@ impl ReplicationResyncer {
                 return;
             }
         };
-        let _resync_leader_guard = match resync_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+        let _resync_leader_guard = match resync_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
             Ok(g) => g,
             Err(_) => {
                 debug!(
@@ -874,7 +875,7 @@ impl ReplicationResyncer {
             }
         };
 
-        let targets = match BucketTargetSys::get().list_bucket_targets(&opts.bucket).await {
+        let targets = match target_boundary::list_bucket_targets(&opts.bucket).await {
             Ok(targets) => targets,
             Err(err) => {
                 debug!(
@@ -919,10 +920,7 @@ impl ReplicationResyncer {
             return;
         }
 
-        let Some(target_client) = BucketTargetSys::get()
-            .get_remote_target_client(&opts.bucket, &target_arns[0])
-            .await
-        else {
+        let Some(target_client) = target_boundary::remote_target_client(&opts.bucket, &target_arns[0]).await else {
             error!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1249,8 +1247,8 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
             },
             &oi,
             &ObjectOptions {
-                versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
+                versioned: versioning_boundary::prefix_enabled(&oi.bucket, &oi.name).await,
+                version_suspended: versioning_boundary::prefix_suspended(&oi.bucket, &oi.name).await,
                 ..Default::default()
             },
             None,
@@ -1314,22 +1312,13 @@ pub(crate) async fn save_resync_status<S: EcstoreObjectIO>(
     let data = encode_resync_file(status)?;
 
     let config_file = path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR, RESYNC_FILE_NAME]);
-    save_config(api, &config_file, data).await?;
+    config_store::save(api, &config_file, data).await?;
 
     Ok(())
 }
 
 async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
-    let config = match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => Some(config),
-        Err(err) => {
-            if err != Error::ConfigNotFound {
-                return Err(err);
-            }
-            None
-        }
-    };
-    Ok(config)
+    metadata_boundary::optional_replication_config(bucket).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1686,7 +1675,7 @@ pub async fn check_replicate_delete(
             continue;
         }
 
-        let tgt = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_arn).await;
+        let tgt = target_boundary::remote_target_client(bucket, &tgt_arn).await;
         // The target online status should not be used here while deciding
         // whether to replicate deletes as the target could be temporarily down
         let tgt_dsc = if let Some(tgt) = tgt {
@@ -1767,7 +1756,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
         return ReplicateDecision::default();
     }
 
-    if !BucketVersioningSys::prefix_enabled(bucket, object).await {
+    if !versioning_boundary::prefix_enabled(bucket, object).await {
         return ReplicateDecision::default();
     }
 
@@ -1811,7 +1800,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     let mut dsc = ReplicateDecision::default();
 
     for arn in arns {
-        let cli = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await;
+        let cli = target_boundary::remote_target_client(bucket, &arn).await;
 
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
@@ -1903,8 +1892,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 &dobj.delete_object.object_name,
                 &ObjectOptions {
                     version_id: Some(delete_marker_version_id.to_string()),
-                    versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                    version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                    versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                     ..Default::default()
                 },
             )
@@ -2026,7 +2015,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(lock_guard) => lock_guard,
         Err(e) => {
             debug!(
@@ -2078,7 +2067,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // Get the remote target client
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &tgt_entry.arn).await else {
             debug!(
                 event = EVENT_REPLICATION_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2225,8 +2214,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 version_id: version_id.map(|v| v.to_string()),
                 mod_time: dobj.delete_object.delete_marker_mtime,
                 delete_replication: Some(drs),
-                versioned: BucketVersioningSys::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                 ..Default::default()
             },
         )
@@ -2280,8 +2269,8 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
             object_name,
             &ObjectOptions {
                 version_id: Some(delete_marker_version_id.to_string()),
-                versioned: BucketVersioningSys::prefix_enabled(bucket, object_name).await,
-                version_suspended: BucketVersioningSys::prefix_suspended(bucket, object_name).await,
+                versioned: versioning_boundary::prefix_enabled(bucket, object_name).await,
+                version_suspended: versioning_boundary::prefix_suspended(bucket, object_name).await,
                 ..Default::default()
             },
         )
@@ -2304,7 +2293,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
             continue;
         }
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &tgt_entry.arn).await else {
             continue;
         };
 
@@ -2414,7 +2403,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
@@ -2455,7 +2444,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &arn).await else {
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2484,7 +2473,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         let object_name = object_name.clone();
 
         join_set.spawn(async move {
-            if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+            if target_boundary::target_is_offline(&tgt_client).await {
                 error!(
                     event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2612,7 +2601,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+    if target_boundary::target_is_offline(&tgt_client).await {
         if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
@@ -2813,7 +2802,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             return;
         }
     };
-    let _obj_lock_guard = match obj_ns_lock.get_write_lock(get_lock_acquire_timeout()).await {
+    let _obj_lock_guard = match obj_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
         Ok(g) => g,
         Err(e) => {
             debug!(
@@ -2841,7 +2830,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &arn).await else {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2999,7 +2988,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+        if target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3021,8 +3010,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
+        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),
@@ -3286,7 +3275,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+        if target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3308,8 +3297,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &object).await;
-        let version_suspended = BucketVersioningSys::prefix_suspended(&bucket, &object).await;
+        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
+        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),
@@ -4212,7 +4201,6 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bucket::msgp_decode::write_msgp_time;
     use std::collections::HashMap;
     use time::OffsetDateTime;
     use uuid::Uuid;

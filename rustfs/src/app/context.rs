@@ -193,12 +193,12 @@ pub fn resolve_runtime_port() -> Option<u16> {
 
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
-    resolve_lock_client_with(get_global_app_context())
+    resolve_lock_client_with_startup_fallback(get_global_app_context(), runtime_sources::lock_client)
 }
 
 /// Resolve lock clients using AppContext-first precedence.
 pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    resolve_lock_clients_handle_with(get_global_app_context())
+    resolve_lock_clients_handle_with_startup_fallback(get_global_app_context(), runtime_sources::lock_clients)
 }
 
 /// Resolve performance metrics using AppContext-first precedence.
@@ -383,8 +383,25 @@ fn resolve_lock_client_with(context: Option<Arc<AppContext>>) -> Option<Arc<dyn 
     context.and_then(|context| context.lock_client().handle())
 }
 
+fn resolve_lock_client_with_startup_fallback<F>(context: Option<Arc<AppContext>>, fallback: F) -> Option<Arc<dyn LockClient>>
+where
+    F: FnOnce() -> Option<Arc<dyn LockClient>>,
+{
+    resolve_lock_client_with(context).or_else(fallback)
+}
+
 fn resolve_lock_clients_handle_with(context: Option<Arc<AppContext>>) -> Option<HashMap<String, Arc<dyn LockClient>>> {
     context.and_then(|context| context.lock_clients().handle())
+}
+
+fn resolve_lock_clients_handle_with_startup_fallback<F>(
+    context: Option<Arc<AppContext>>,
+    fallback: F,
+) -> Option<HashMap<String, Arc<dyn LockClient>>>
+where
+    F: FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
+{
+    resolve_lock_clients_handle_with(context).or_else(fallback)
 }
 
 fn resolve_performance_metrics_with(context: Option<Arc<AppContext>>) -> Option<Arc<PerformanceMetrics>> {
@@ -845,6 +862,10 @@ mod tests {
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
+        if let Some(store) = runtime_sources::object_store() {
+            return (temp_dir, store, endpoint_pools);
+        }
+
         init_local_disks(endpoint_pools.clone()).await.expect("test local disks");
         let store = ECStore::new(
             "127.0.0.1:0".parse().expect("test addr"),
@@ -874,6 +895,31 @@ mod tests {
                 scan_range: None,
             },
         }
+    }
+
+    #[test]
+    fn lock_client_resolver_uses_startup_fallback_before_app_context() {
+        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+
+        let resolved = resolve_lock_client_with_startup_fallback(None, || Some(fallback_lock_client.clone()))
+            .expect("startup fallback lock client");
+
+        assert!(Arc::ptr_eq(&resolved, &fallback_lock_client));
+    }
+
+    #[test]
+    fn lock_clients_resolver_uses_startup_fallback_before_app_context() {
+        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let mut fallback_lock_clients = HashMap::new();
+        fallback_lock_clients.insert("startup-node:9000".to_string(), fallback_lock_client.clone());
+
+        let resolved = resolve_lock_clients_handle_with_startup_fallback(None, || Some(fallback_lock_clients.clone()))
+            .expect("startup fallback lock clients");
+
+        assert!(Arc::ptr_eq(
+            resolved.get("startup-node:9000").expect("startup fallback lock client entry"),
+            &fallback_lock_client
+        ));
     }
 
     #[tokio::test]

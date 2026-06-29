@@ -34,7 +34,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 
-use super::{DiskError, EcstoreError, GLOBAL_LOCAL_DISK_MAP, HealDiskExt as _};
+use super::{DiskError, EcstoreError, HealDiskExt as _, local_disk_map_read};
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 const LOG_COMPONENT_HEAL: &str = "heal";
@@ -2101,7 +2101,8 @@ impl HealManager {
                         // Build list of endpoints that need healing
                         let mut endpoints = Vec::new();
                         let mut seen_returning_sets = HashSet::new();
-                        for (_, disk_opt) in GLOBAL_LOCAL_DISK_MAP.read().await.iter() {
+                        let local_disk_map = local_disk_map_read().await;
+                        for (_, disk_opt) in local_disk_map.iter() {
                             if let Some(disk) = disk_opt {
                                 let endpoint = disk.endpoint();
                                 let runtime_state = disk.runtime_state();

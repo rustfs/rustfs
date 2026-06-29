@@ -15,6 +15,8 @@
 //! Object application use-case contracts.
 
 // Performance metrics recording (with zero-copy-metrics integration)
+use rustfs_io_metrics::buffered_write;
+
 use super::storage_api::object_usecase::ECStore;
 use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
@@ -251,7 +253,8 @@ struct GetObjectBootstrap {
 }
 
 struct GetObjectIoPlanning<'a> {
-    _disk_permit: tokio::sync::SemaphorePermit<'a>,
+    /// `None` when inline fast path skips disk I/O semaphore.
+    _disk_permit: Option<tokio::sync::SemaphorePermit<'a>>,
     permit_wait_duration: Duration,
     queue_status: concurrency::IoQueueStatus,
     queue_utilization: f64,
@@ -280,6 +283,8 @@ struct GetObjectReadSetup {
     sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     ssekms_key_id: Option<SSEKMSKeyId>,
     encryption_applied: bool,
+    /// `true` when the object was read via the inline data fast path (no disk I/O).
+    is_inline_fast_path: bool,
 }
 
 struct GetObjectPreparedRead<'a> {
@@ -2078,7 +2083,7 @@ impl DefaultObjectUsecase {
         Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
 
         Ok(GetObjectIoPlanning {
-            _disk_permit: disk_permit,
+            _disk_permit: Some(disk_permit),
             permit_wait_duration,
             queue_status,
             queue_utilization,
@@ -2148,7 +2153,8 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
     ) -> S3Result<GetObjectPreparedRead<'a>> {
         let h = req.headers.clone();
-        let io_planning = Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?;
+
+        // SF05: Store lookup first (cached via SF01 moka cache).
         let store_lookup_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let store = get_validated_store(bucket).await?;
         if let Some(store_lookup_start) = store_lookup_start {
@@ -2159,6 +2165,8 @@ impl DefaultObjectUsecase {
             );
         }
 
+        // SF05: Read object metadata/data BEFORE acquiring disk I/O semaphore.
+        // ECStore's get_object_reader acquires its own RwLock — safe without the semaphore.
         let read_start = std::time::Instant::now();
         let read_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then_some(read_start);
         let read_setup = Self::prepare_get_object_read(
@@ -2175,6 +2183,18 @@ impl DefaultObjectUsecase {
             read_stage_start,
         )
         .await?;
+
+        // SF05: Skip disk I/O semaphore for inline fast path — data is already in memory.
+        let io_planning = if read_setup.is_inline_fast_path {
+            GetObjectIoPlanning {
+                _disk_permit: None,
+                permit_wait_duration: Duration::ZERO,
+                queue_status: concurrency::IoQueueStatus::default(),
+                queue_utilization: 0.0,
+            }
+        } else {
+            Self::acquire_get_object_io_planning(manager, wrapper, timeout_config, bucket, key).await?
+        };
 
         Ok(GetObjectPreparedRead { io_planning, read_setup })
     }
@@ -2207,11 +2227,14 @@ impl DefaultObjectUsecase {
 
         let info = reader.object_info;
 
-        use rustfs_io_metrics::record_zero_copy_read;
         let read_duration = read_start.elapsed();
-        record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
 
-        manager.record_disk_operation(info.size as u64, read_duration, true).await;
+        // Conditional metrics recording to reduce overhead
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            use rustfs_io_metrics::record_zero_copy_read;
+            record_zero_copy_read(info.size as usize, read_duration.as_secs_f64() * 1000.0);
+            manager.record_disk_operation(info.size as u64, read_duration, true).await;
+        }
 
         check_preconditions(&req.headers, &info)?;
 
@@ -2307,6 +2330,10 @@ impl DefaultObjectUsecase {
             None => (None, None, None, None, false, wrap_reader(reader.stream)),
         };
 
+        // Detect inline fast path: data is in memory, no disk I/O semaphore needed.
+        // Uses the shared predicate from ObjectInfo; additionally checks no range request.
+        let is_inline_fast_path = info.is_inline_fast_path_eligible() && rs.is_none();
+
         Ok(GetObjectReadSetup {
             info,
             event_info,
@@ -2321,6 +2348,7 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             encryption_applied,
+            is_inline_fast_path,
         })
     }
     #[allow(clippy::too_many_arguments)]
@@ -2351,14 +2379,17 @@ impl DefaultObjectUsecase {
             false
         };
 
-        if let Some(range_spec) = rs
-            && range_spec.start >= 0
-        {
-            manager.record_access(range_spec.start as u64, response_content_length as u64);
-        }
+        // Conditional metrics recording to reduce overhead
+        if rustfs_io_metrics::get_stage_metrics_enabled() {
+            if let Some(range_spec) = rs
+                && range_spec.start >= 0
+            {
+                manager.record_access(range_spec.start as u64, response_content_length as u64);
+            }
 
-        if response_content_length > 0 {
-            manager.record_transfer(response_content_length as u64, permit_wait_duration);
+            if response_content_length > 0 {
+                manager.record_transfer(response_content_length as u64, permit_wait_duration);
+            }
         }
 
         let io_strategy =
@@ -2678,6 +2709,10 @@ impl DefaultObjectUsecase {
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
         let use_zero_copy_eager_put_path =
             should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        if use_zero_copy_eager_put_path {
+            counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
+            histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
+        }
         let put_path = if should_compress {
             "stream_compressed"
         } else if use_zero_copy_eager_put_path {
@@ -3410,6 +3445,7 @@ impl DefaultObjectUsecase {
             sse_customer_key_md5,
             ssekms_key_id,
             encryption_applied,
+            is_inline_fast_path: _,
         } = read_setup;
 
         let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);

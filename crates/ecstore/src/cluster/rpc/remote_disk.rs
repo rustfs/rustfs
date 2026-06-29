@@ -1708,11 +1708,10 @@ impl DiskAPI for RemoteDisk {
             .await
     }
 
-    /// Zero-copy read for remote disks falls back to efficient network read.
-    /// Note: True zero-copy is not possible over network, but we avoid extra copies
-    /// by reading directly into Bytes.
+    /// Buffered read for remote disks.
+    /// The transport stream is collected into owned Bytes for caller sharing.
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         // For remote disks, use the regular reader and read into Bytes
         let reader = self.read_file_stream(volume, path, offset, length).await?;
 
