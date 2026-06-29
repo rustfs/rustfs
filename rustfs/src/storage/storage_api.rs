@@ -375,11 +375,13 @@ pub(crate) mod ecstore_event {
 }
 
 pub(crate) mod ecstore_global {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::global::new_object_layer_fn;
     pub(crate) use rustfs_ecstore::api::global::{
         GLOBAL_BOOT_TIME, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
         get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        is_dist_erasure, new_object_layer_fn, set_global_endpoints, set_global_region, set_global_rustfs_port,
-        set_object_store_resolver, shutdown_background_services, update_erasure_type,
+        is_dist_erasure, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
+        shutdown_background_services, update_erasure_type,
     };
 }
 
