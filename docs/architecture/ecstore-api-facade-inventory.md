@@ -42,6 +42,10 @@ local boundary or storage-api contract first, then route consumers through it.
 | Replication | Bucket target and metadata systems, bucket target client config, disk, object API, runtime sources, notification, and SetDisks lock timing. | `ReplicationStorage`, `ReplicationMetadataStore`, `ReplicationRuntime`, `ReplicationEventSink`, and `ReplicationLifecycleBridge`. |
 | SetDisks | Shared disks, endpoints, format state, namespace locks, cache, and implementations for object IO, namespace locking, bucket, object, list, multipart, and heal operations. | Pure shard source, disk error, bitrot IO, namespace lock, metrics label, and file metadata contracts before any operation family moves. |
 
+`crates/ecstore/tests/ecstore_contract_compat_test.rs` keeps compile-time
+coverage for `ECStore` and `SetDisks` storage-api trait compatibility before
+any facade shrink or operation-family movement.
+
 ## Shrink Rules
 
 1. Do not remove a facade item until its downstream boundary has compile-time
