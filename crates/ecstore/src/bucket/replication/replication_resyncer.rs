@@ -13,13 +13,13 @@
 // limitations under the License.
 
 use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
-use crate::bucket::metadata_sys;
 use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
@@ -1318,16 +1318,7 @@ pub(crate) async fn save_resync_status<S: EcstoreObjectIO>(
 }
 
 async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
-    let config = match metadata_sys::get_replication_config(bucket).await {
-        Ok((config, _)) => Some(config),
-        Err(err) => {
-            if err != Error::ConfigNotFound {
-                return Err(err);
-            }
-            None
-        }
-    };
-    Ok(config)
+    metadata_boundary::optional_replication_config(bucket).await
 }
 
 #[derive(Debug, Clone, Default)]

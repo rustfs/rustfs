@@ -15,6 +15,7 @@
 mod config;
 pub mod datatypes;
 mod replication_event_sink;
+mod replication_metadata_boundary;
 mod replication_pool;
 mod replication_resyncer;
 mod replication_state;
