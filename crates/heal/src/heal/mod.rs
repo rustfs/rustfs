@@ -49,14 +49,8 @@ pub(crate) type Endpoint = EcstoreEndpoint;
 pub(crate) type StorageError = EcstoreStorageError;
 pub(crate) type LocalDiskMap = std::collections::HashMap<String, Option<DiskStore>>;
 
-pub(crate) struct GlobalLocalDiskMap;
-
-pub(crate) static GLOBAL_LOCAL_DISK_MAP: GlobalLocalDiskMap = GlobalLocalDiskMap;
-
-impl GlobalLocalDiskMap {
-    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
-        ecstore_local_disk_map_read().await
-    }
+pub(crate) async fn local_disk_map_read() -> tokio::sync::RwLockReadGuard<'static, LocalDiskMap> {
+    ecstore_local_disk_map_read().await
 }
 
 #[cfg(test)]
