@@ -12,7 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::diagnostics::get::record_get_stage_duration_if_enabled;
+use crate::diagnostics::get::{
+    GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS, GET_STAGE_READER_OPEN_STREAM,
+    GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
+};
 use crate::disk::{self, DiskAPI as _, DiskStore, FileReader, error::DiskError};
 use crate::erasure::coding::{BitrotReader, BitrotWriterWrapper, CustomWriter};
 use bytes::Bytes;
@@ -55,6 +58,7 @@ struct BitrotReaderSource {
     offset: usize,
     length: usize,
     use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 }
 
 impl BitrotReaderSource {
@@ -65,11 +69,63 @@ impl BitrotReaderSource {
             rd.set_position(offset);
             Ok(Some(Box::new(rd)))
         } else if let Some(disk) = self.disk {
-            open_disk_reader(&disk, &self.bucket, &self.path, self.offset, self.length, self.use_mmap_read)
-                .await
-                .map(Some)
+            open_disk_reader(
+                &disk,
+                &self.bucket,
+                &self.path,
+                self.offset,
+                self.length,
+                self.use_mmap_read,
+                self.stage_metrics.map(|metrics| metrics.path),
+            )
+            .await
+            .map(Some)
         } else {
             Ok(None)
+        }
+    }
+}
+
+struct FirstReadMetricsReader {
+    inner: FileReader,
+    metrics_path: &'static str,
+    stage: &'static str,
+    started_at: Option<Instant>,
+    recorded: bool,
+}
+
+impl FirstReadMetricsReader {
+    fn new(inner: FileReader, metrics_path: &'static str, stage: &'static str) -> Self {
+        Self {
+            inner,
+            metrics_path,
+            stage,
+            started_at: None,
+            recorded: false,
+        }
+    }
+}
+
+impl AsyncRead for FirstReadMetricsReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+        if self.recorded {
+            return Pin::new(&mut self.inner).poll_read(cx, buf);
+        }
+
+        let filled_before = buf.filled().len();
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+
+        match Pin::new(&mut self.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) => {
+                if buf.filled().len() > filled_before {
+                    self.recorded = true;
+                    record_get_stage_duration_if_enabled(self.metrics_path, self.stage, self.started_at.take());
+                }
+                Poll::Ready(Ok(()))
+            }
+            other => other,
         }
     }
 }
@@ -155,14 +211,21 @@ async fn open_disk_reader(
     offset: usize,
     length: usize,
     use_mmap_read: bool,
+    metrics_path: Option<&'static str>,
 ) -> disk::error::Result<FileReader> {
+    let stage_metrics_enabled = metrics_path.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+
     if use_mmap_read && disk.is_local() {
-        let start = Instant::now();
+        let start = stage_metrics_enabled.then(Instant::now);
+        let zero_copy_start = Instant::now();
         match disk.read_file_mmap_copy(bucket, path, offset, length).await {
             Ok(bytes) => {
-                let duration_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let duration_ms = zero_copy_start.elapsed().as_secs_f64() * 1000.0;
 
                 rustfs_io_metrics::record_zero_copy_read(bytes.len(), duration_ms);
+                if let Some(metrics_path) = metrics_path {
+                    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS, start);
+                }
                 debug!(
                     size = bytes.len(),
                     path = %path,
@@ -172,6 +235,9 @@ async fn open_disk_reader(
                 return Ok(Box::new(Cursor::new(bytes)));
             }
             Err(err) => {
+                if let Some(metrics_path) = metrics_path {
+                    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, start);
+                }
                 let reason = format!("{err:?}");
                 rustfs_io_metrics::record_zero_copy_fallback(&reason);
                 debug!(
@@ -180,15 +246,36 @@ async fn open_disk_reader(
                     "zero_copy_fallback"
                 );
 
-                return match disk.read_file_stream(bucket, path, offset, length).await {
-                    Ok(reader) => Ok(reader),
+                let stream_start = stage_metrics_enabled.then(Instant::now);
+                let stream_result = disk.read_file_stream(bucket, path, offset, length).await;
+                if let Some(metrics_path) = metrics_path {
+                    record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_STREAM, stream_start);
+                }
+
+                return match stream_result {
+                    Ok(reader) => Ok(wrap_first_read_metrics(reader, metrics_path)),
                     Err(_) => Err(err),
                 };
             }
         }
     }
 
-    disk.read_file_stream(bucket, path, offset, length).await
+    let stream_start = stage_metrics_enabled.then(Instant::now);
+    let reader = disk.read_file_stream(bucket, path, offset, length).await?;
+    if let Some(metrics_path) = metrics_path {
+        record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_OPEN_STREAM, stream_start);
+    }
+    Ok(wrap_first_read_metrics(reader, metrics_path))
+}
+
+fn wrap_first_read_metrics(reader: FileReader, metrics_path: Option<&'static str>) -> FileReader {
+    if let Some(metrics_path) = metrics_path
+        && rustfs_io_metrics::get_stage_metrics_enabled()
+    {
+        return Box::new(FirstReadMetricsReader::new(reader, metrics_path, GET_STAGE_READER_STREAM_FIRST_READ));
+    }
+
+    reader
 }
 
 fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksum_algo: HashAlgorithm) -> (usize, usize) {
@@ -329,6 +416,7 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
         offset,
         length,
         use_mmap_read,
+        stage_metrics,
     };
     if let Some(metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(metrics.path, metrics.reader_construction_stage, reader_construction_start);
@@ -371,6 +459,7 @@ pub fn create_deferred_bitrot_reader(
         offset,
         length,
         use_mmap_read,
+        stage_metrics: None,
     };
 
     BitrotReader::new(Box::new(DeferredObjectReader::new(source)), shard_size, checksum_algo, skip_verify)
