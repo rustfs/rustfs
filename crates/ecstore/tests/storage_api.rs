@@ -20,6 +20,13 @@ pub(crate) mod contract_compat {
     pub(crate) use super::{DiskStore, ECStore, Error, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, SetDisks};
 }
 
+pub(crate) mod replication_compat {
+    pub(crate) use rustfs_ecstore::api::bucket::replication::{
+        BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, ReplicationConfigurationExt, ReplicationStats,
+        ResyncStatusType,
+    };
+}
+
 pub(crate) mod legacy_bitrot_read {
     pub(crate) use super::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, create_bitrot_reader, new_disk};
 }

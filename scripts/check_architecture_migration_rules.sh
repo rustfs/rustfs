@@ -181,6 +181,7 @@ RUSTFS_APP_ADMIN_STORAGE_HELPER_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_app_a
 EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_compat_bypass_hits.txt"
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
+REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 LEGACY_ECSTORE_CONFIG_MODEL_HITS_FILE="${TMP_DIR}/legacy_ecstore_config_model_hits.txt"
 ECSTORE_ROOT_STORE_SET_DISK_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_set_disk_module_hits.txt"
 ECSTORE_ROOT_STORE_SUPPORT_MODULE_HITS_FILE="${TMP_DIR}/ecstore_root_store_support_module_hits.txt"
@@ -2275,6 +2276,18 @@ fi
 
 if [[ -s "$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE" ]]; then
   report_failure "external ECStore API facade imports must stay in local storage_api boundary files: $(paste -sd '; ' "$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_ecstore::api::bucket::replication' \
+    rustfs/src crates/*/src crates/*/tests crates/ecstore/tests fuzz/fuzz_targets \
+    --glob '*.rs' |
+    rg -v '^(rustfs/src/(admin/storage_api|app/storage_api|storage/storage_api)\.rs|crates/ecstore/tests/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
+) >"$REPLICATION_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication facade imports must stay in local storage_api boundaries: $(paste -sd '; ' "$REPLICATION_FACADE_BYPASS_HITS_FILE")"
 fi
 
 (
