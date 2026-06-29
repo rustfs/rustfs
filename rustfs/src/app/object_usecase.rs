@@ -354,6 +354,7 @@ const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
 const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
+const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
@@ -379,6 +380,11 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_seek_buffer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE, false))
 }
 
 fn resolve_reader_stream_buffer_size(selected_size: usize, override_size: Option<usize>) -> (usize, &'static str) {
@@ -1193,6 +1199,7 @@ fn should_buffer_get_object_in_memory(
         has_range,
         configured_threshold,
         concurrent_requests,
+        is_get_seek_buffer_enabled(),
     )
 }
 
@@ -1203,8 +1210,9 @@ fn should_buffer_get_object_in_memory_with_threshold(
     has_range: bool,
     configured_threshold: i64,
     concurrent_requests: usize,
+    seek_buffer_enabled: bool,
 ) -> bool {
-    if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
+    if !seek_buffer_enabled || part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
         return false;
     }
 
@@ -6137,7 +6145,7 @@ mod tests {
         let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
         let response_len = 80_i64 * 1024 * 1024;
         let should_buffer =
-            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold, 1);
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold, 1, true);
 
         assert!(
             !should_buffer,
@@ -6156,7 +6164,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6164,7 +6173,8 @@ mod tests {
             Some(1),
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6172,7 +6182,24 @@ mod tests {
             None,
             true,
             configured_threshold,
-            1
+            1,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_requires_seek_buffer_opt_in() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024,
+            None,
+            false,
+            configured_threshold,
+            1,
+            false
         ));
     }
 
@@ -6187,7 +6214,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6195,7 +6223,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
     }
 
@@ -6210,7 +6239,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6218,9 +6248,10 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
-        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0, 1));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0, 1, true));
     }
 
     #[test]
@@ -6234,7 +6265,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6242,7 +6274,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            32
+            32,
+            true
         ));
         assert!(should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6250,7 +6283,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            true
         ));
     }
 
@@ -6408,6 +6442,42 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             0,
             "buffered GetObject body must not be read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_small_plain_objects_on_streaming_path_by_default() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 4,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            4,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "small-plain-object",
+        )
+        .await
+        .expect("build_get_object_body should keep small plain object on streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "default GetObject response construction should not pre-read small plain object data"
         );
     }
 
