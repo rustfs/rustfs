@@ -2685,7 +2685,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename '\bGLOBAL_(REGION|RUSTFS_PORT)\b|\bglobalDeploymentIDPtr\b|\bruntime::global::global_rustfs_port\b' \
+  rg -n --with-filename '\bGLOBAL_(DEPLOYMENT_ID|REGION|RUSTFS_PORT)\b|\bglobalDeploymentIDPtr\b|\bruntime::global::global_rustfs_port\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
     rg -v '^(crates/common/src/globals|crates/ecstore/src/runtime/(global|sources))\.rs:' || true

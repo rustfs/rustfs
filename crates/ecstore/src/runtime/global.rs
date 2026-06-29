@@ -47,7 +47,7 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, GLOBAL_REGION, env var caches, etc.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
-    static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
+    static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
     pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
@@ -82,6 +82,9 @@ pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
     GLOBAL_BUCKET_MONITOR.get().cloned()
 }
 
+// Startup-owned process globals intentionally fail fast on duplicate writes.
+// A second write means startup published conflicting runtime scalar state.
+
 /// Global cancellation token for background services (data scanner and auto heal)
 static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
 
@@ -106,7 +109,9 @@ pub fn global_rustfs_port() -> u16 {
 /// # Returns
 /// * None
 pub fn set_global_rustfs_port(value: u16) {
-    GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
+    GLOBAL_RUSTFS_PORT
+        .set(value)
+        .expect("GLOBAL_RUSTFS_PORT should be initialized once during startup");
 }
 
 /// Set the global deployment id
@@ -118,7 +123,9 @@ pub fn set_global_rustfs_port(value: u16) {
 /// * None
 ///
 pub fn set_global_deployment_id(id: Uuid) {
-    globalDeploymentIDPtr.set(id).expect("operation should succeed");
+    GLOBAL_DEPLOYMENT_ID
+        .set(id)
+        .expect("GLOBAL_DEPLOYMENT_ID should be initialized once during startup");
 }
 
 /// Get the global deployment id
@@ -127,7 +134,7 @@ pub fn set_global_deployment_id(id: Uuid) {
 /// * `Option<String>` - The global deployment id as a string, if set
 ///
 pub fn get_global_deployment_id() -> Option<String> {
-    globalDeploymentIDPtr.get().map(|v| v.to_string())
+    GLOBAL_DEPLOYMENT_ID.get().map(|v| v.to_string())
 }
 /// Set the global endpoints
 ///
@@ -140,7 +147,7 @@ pub fn get_global_deployment_id() -> Option<String> {
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
     GLOBAL_Endpoints
         .set(EndpointServerPools::from(eps))
-        .expect("GLOBAL_Endpoints set failed")
+        .expect("GLOBAL_Endpoints should be initialized once during storage startup")
 }
 
 /// Get the global endpoints
@@ -282,7 +289,9 @@ pub(crate) type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// # Returns
 /// * None
 pub fn set_global_region(region: s3s::region::Region) {
-    GLOBAL_REGION.set(region).expect("operation should succeed");
+    GLOBAL_REGION
+        .set(region)
+        .expect("GLOBAL_REGION should be initialized once during startup");
 }
 
 /// Get the global region
@@ -323,7 +332,8 @@ pub fn get_background_services_cancel_token() -> Option<&'static CancellationTok
 ///
 pub fn create_background_services_cancel_token() -> CancellationToken {
     let cancel_token = CancellationToken::new();
-    init_background_services_cancel_token(cancel_token.clone()).expect("Background services cancel token already initialized");
+    init_background_services_cancel_token(cancel_token.clone())
+        .expect("background services cancel token should be initialized once during startup");
     cancel_token
 }
 
