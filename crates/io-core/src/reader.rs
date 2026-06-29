@@ -51,9 +51,8 @@ impl From<io::Error> for ZeroCopyReadError {
 
 /// Bytes-backed object reader.
 ///
-/// This reader keeps the historical `ZeroCopyObjectReader` name for public API
-/// compatibility. `from_bytes` wraps existing `Bytes` without copying, but file
-/// constructors copy file data into owned `Bytes` after mmap or normal reads.
+/// `from_bytes` wraps existing `Bytes` without copying, but file constructors
+/// copy file data into owned `Bytes` after mmap or normal reads.
 ///
 /// # Example
 ///
@@ -69,17 +68,21 @@ impl From<io::Error> for ZeroCopyReadError {
 /// let mut buf = vec![0u8; 1024];
 /// let n = reader.read(&mut buf[..]).await?;
 /// ```
-pub struct ZeroCopyObjectReader {
+pub struct BytesBufferedReader {
     /// Internal data source (could be mmap or owned bytes)
     data: Bytes,
     /// Current read position
     pos: usize,
 }
 
-/// Preferred name for the bytes-backed object reader.
-pub type BytesBufferedReader = ZeroCopyObjectReader;
+/// Historical name for the bytes-backed object reader.
+#[deprecated(
+    since = "1.0.0-beta.8",
+    note = "use BytesBufferedReader; file constructors copy into owned Bytes"
+)]
+pub type ZeroCopyObjectReader = BytesBufferedReader;
 
-impl ZeroCopyObjectReader {
+impl BytesBufferedReader {
     /// Create a reader from existing bytes.
     ///
     /// This is a true zero-copy operation - the Bytes are wrapped
@@ -254,7 +257,7 @@ impl ZeroCopyObjectReader {
     }
 }
 
-impl AsyncRead for ZeroCopyObjectReader {
+impl AsyncRead for BytesBufferedReader {
     fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
         let remaining = self.data.len() - self.pos;
         if remaining == 0 {
@@ -270,9 +273,9 @@ impl AsyncRead for ZeroCopyObjectReader {
     }
 }
 
-impl std::fmt::Debug for ZeroCopyObjectReader {
+impl std::fmt::Debug for BytesBufferedReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("ZeroCopyObjectReader")
+        f.debug_struct("BytesBufferedReader")
             .field("data_len", &self.data.len())
             .field("pos", &self.pos)
             .field("remaining", &(self.data.len() - self.pos))
@@ -288,7 +291,7 @@ mod tests {
     #[tokio::test]
     async fn test_from_bytes() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from_bytes(data.clone());
+        let mut reader = BytesBufferedReader::from_bytes(data.clone());
 
         let mut buf = [0u8; 11];
         let n = reader.read(&mut buf[..]).await.unwrap();
@@ -312,7 +315,7 @@ mod tests {
     #[tokio::test]
     async fn test_remaining_bytes() {
         let data = Bytes::from("hello world");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
 
         let remaining = reader.remaining_bytes();
         assert_eq!(remaining.len(), 11);
@@ -322,7 +325,7 @@ mod tests {
     #[tokio::test]
     async fn test_position() {
         let data = Bytes::from("hello world");
-        let mut reader = ZeroCopyObjectReader::from_bytes(data);
+        let mut reader = BytesBufferedReader::from_bytes(data);
 
         assert_eq!(reader.position(), 0);
 
@@ -335,11 +338,24 @@ mod tests {
     #[tokio::test]
     async fn test_is_empty() {
         let data = Bytes::from("");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
         assert!(reader.is_empty());
 
         let data = Bytes::from("hello");
-        let reader = ZeroCopyObjectReader::from_bytes(data);
+        let reader = BytesBufferedReader::from_bytes(data);
         assert!(!reader.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_legacy_reader_alias() {
+        let data = Bytes::from("hello world");
+        let mut reader = ZeroCopyObjectReader::from_bytes(data);
+
+        let mut buf = [0u8; 5];
+        let n = reader.read(&mut buf[..]).await.expect("read bytes through legacy alias");
+
+        assert_eq!(n, 5);
+        assert_eq!(&buf[..n], b"hello");
     }
 }
