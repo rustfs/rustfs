@@ -18,6 +18,7 @@ mod replication_event_sink;
 mod replication_pool;
 mod replication_resyncer;
 mod replication_state;
+mod replication_target_boundary;
 mod rule;
 mod runtime_boundary;
 

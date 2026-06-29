@@ -13,10 +13,11 @@
 // limitations under the License.
 
 use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
-    AdvancedPutOptions, BucketTargetSys, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
 use crate::bucket::metadata_sys;
 use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
@@ -874,7 +875,7 @@ impl ReplicationResyncer {
             }
         };
 
-        let targets = match BucketTargetSys::get().list_bucket_targets(&opts.bucket).await {
+        let targets = match target_boundary::list_bucket_targets(&opts.bucket).await {
             Ok(targets) => targets,
             Err(err) => {
                 debug!(
@@ -919,10 +920,7 @@ impl ReplicationResyncer {
             return;
         }
 
-        let Some(target_client) = BucketTargetSys::get()
-            .get_remote_target_client(&opts.bucket, &target_arns[0])
-            .await
-        else {
+        let Some(target_client) = target_boundary::remote_target_client(&opts.bucket, &target_arns[0]).await else {
             error!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1686,7 +1684,7 @@ pub async fn check_replicate_delete(
             continue;
         }
 
-        let tgt = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_arn).await;
+        let tgt = target_boundary::remote_target_client(bucket, &tgt_arn).await;
         // The target online status should not be used here while deciding
         // whether to replicate deletes as the target could be temporarily down
         let tgt_dsc = if let Some(tgt) = tgt {
@@ -1811,7 +1809,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     let mut dsc = ReplicateDecision::default();
 
     for arn in arns {
-        let cli = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await;
+        let cli = target_boundary::remote_target_client(bucket, &arn).await;
 
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
@@ -2078,7 +2076,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // Get the remote target client
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &tgt_entry.arn).await else {
             debug!(
                 event = EVENT_REPLICATION_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2304,7 +2302,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
             continue;
         }
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &tgt_entry.arn).await else {
             continue;
         };
 
@@ -2455,7 +2453,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(bucket, &arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &arn).await else {
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2484,7 +2482,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         let object_name = object_name.clone();
 
         join_set.spawn(async move {
-            if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+            if target_boundary::target_is_offline(&tgt_client).await {
                 error!(
                     event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2612,7 +2610,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+    if target_boundary::target_is_offline(&tgt_client).await {
         if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
@@ -2841,7 +2839,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = BucketTargetSys::get().get_remote_target_client(&bucket, &arn).await else {
+        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &arn).await else {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2999,7 +2997,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+        if target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3286,7 +3284,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        if BucketTargetSys::get().is_offline(&tgt_client.to_url()).await {
+        if target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
