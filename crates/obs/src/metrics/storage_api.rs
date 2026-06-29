@@ -15,7 +15,7 @@
 pub(crate) use rustfs_ecstore::api::bucket::bandwidth::monitor::Monitor as ObsBucketBandwidthMonitor;
 pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::get_quota_config as obs_get_quota_config;
 pub(crate) use rustfs_ecstore::api::bucket::replication::{
-    GLOBAL_REPLICATION_STATS as OBS_GLOBAL_REPLICATION_STATS, ReplicationStats as ObsReplicationStats,
+    ReplicationStats as ObsReplicationStats, get_global_replication_stats as obs_get_global_replication_stats,
 };
 pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
@@ -34,8 +34,8 @@ pub(crate) mod metrics {
     pub(crate) use super::storage_contracts::{BucketOperations, BucketOptions, StorageAdminApi};
 
     pub(crate) use super::{
-        OBS_GLOBAL_REPLICATION_STATS, ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsReplicationStats, ObsStore,
-        obs_expiry_state_handle, obs_get_global_bucket_monitor, obs_get_quota_config, obs_get_total_usable_capacity,
+        ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsReplicationStats, ObsStore, obs_expiry_state_handle,
+        obs_get_global_bucket_monitor, obs_get_global_replication_stats, obs_get_quota_config, obs_get_total_usable_capacity,
         obs_get_total_usable_capacity_free, obs_load_data_usage_from_backend, obs_resolve_object_store_handle,
         obs_transition_state_handle,
     };
