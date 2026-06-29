@@ -213,6 +213,7 @@ GLOBAL_RUNTIME_SCALAR_BYPASS_HITS_FILE="${TMP_DIR}/global_runtime_scalar_bypass_
 GLOBAL_BACKGROUND_CANCEL_BYPASS_HITS_FILE="${TMP_DIR}/global_background_cancel_bypass_hits.txt"
 GLOBAL_LOCK_CLIENTS_BYPASS_HITS_FILE="${TMP_DIR}/global_lock_clients_bypass_hits.txt"
 GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE="${TMP_DIR}/global_batch_processors_bypass_hits.txt"
+INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE="${TMP_DIR}/internode_data_transport_bypass_hits.txt"
 GLOBAL_CONN_MAP_BYPASS_HITS_FILE="${TMP_DIR}/global_conn_map_bypass_hits.txt"
 GLOBAL_LOCAL_NODE_NAME_BYPASS_HITS_FILE="${TMP_DIR}/global_local_node_name_bypass_hits.txt"
 GLOBAL_RUSTFS_ADDR_BYPASS_HITS_FILE="${TMP_DIR}/global_rustfs_addr_bypass_hits.txt"
@@ -2698,6 +2699,18 @@ fi
 
 if [[ -s "$GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE" ]]; then
   report_failure "GLOBAL_PROCESSORS access must stay behind ECStore batch processor owner helpers: $(paste -sd '; ' "$GLOBAL_BATCH_PROCESSORS_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bINTERNODE_DATA_TRANSPORT\b' \
+    crates rustfs fuzz \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/cluster/rpc/internode_data_transport\.rs:' || true
+) >"$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE"
+
+if [[ -s "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE" ]]; then
+  report_failure "internode data transport static must stay behind ECStore internode transport helpers: $(paste -sd '; ' "$INTERNODE_DATA_TRANSPORT_BYPASS_HITS_FILE")"
 fi
 
 (
