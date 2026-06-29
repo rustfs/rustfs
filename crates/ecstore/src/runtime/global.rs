@@ -208,7 +208,9 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
 /// # Returns
 /// * None
 pub async fn set_object_layer(o: Arc<ECStore>) {
-    GLOBAL_OBJECT_API.set(o).expect("set_object_layer fail ")
+    if GLOBAL_OBJECT_API.set(o).is_err() {
+        warn!("global object layer already initialized, ignoring re-initialization");
+    }
 }
 
 /// Check if the setup type is distributed erasure coding
