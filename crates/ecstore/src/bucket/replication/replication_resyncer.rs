@@ -25,14 +25,12 @@ use super::replication_storage_boundary::{
 use super::replication_tagging_boundary as tagging_boundary;
 use super::replication_target_boundary;
 use super::replication_target_boundary::{
-    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, BucketTargets, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
 use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
-use crate::bucket::target::BucketTargets;
-use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -68,7 +66,6 @@ use rustfs_utils::http::{
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
     has_internal_suffix, insert_header_map, insert_str, internal_key_strip_suffix_prefix, is_internal_key,
 };
-use rustfs_utils::path::path_join_buf;
 use rustfs_utils::string::strings_has_prefix_fold;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
@@ -101,14 +98,8 @@ const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 
-pub(crate) const REPLICATION_DIR: &str = ".replication";
-pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";
 pub(crate) const RESYNC_META_FORMAT: u16 = 1;
 pub(crate) const RESYNC_META_VERSION: u16 = 1;
-
-// MRF (Most Recent Failures) persistence file — stored at
-// `{RUSTFS_META_BUCKET}/config/replication/mrf.bin`, cross-bucket.
-pub(crate) const MRF_REPLICATION_FILE: &str = "config/replication/mrf.bin";
 const MRF_META_FORMAT: u16 = 1;
 const MRF_META_VERSION: u16 = 1;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
@@ -746,8 +737,11 @@ impl ReplicationResyncer {
         // Acquire a cluster-wide leader lock for this (bucket, ARN) pair so that only
         // one node runs the resync scan at a time. Without this, every cluster node would
         // scan and replicate every object independently, causing N-fold duplicate traffic.
-        let resync_lock_key = format!("{}/{}/{}", REPLICATION_DIR, opts.bucket, opts.arn);
-        let resync_ns_lock = match storage.new_ns_lock(RUSTFS_META_BUCKET, &resync_lock_key).await {
+        let resync_lock_key = metadata_boundary::resync_lock_key(&opts.bucket, &opts.arn);
+        let resync_ns_lock = match storage
+            .new_ns_lock(metadata_boundary::rustfs_meta_bucket(), &resync_lock_key)
+            .await
+        {
             Ok(l) => l,
             Err(e) => {
                 warn!(
@@ -1234,7 +1228,7 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
 ) -> Result<()> {
     let data = encode_resync_file(status)?;
 
-    let config_file = path_join_buf(&[BUCKET_META_PREFIX, bucket, REPLICATION_DIR, RESYNC_FILE_NAME]);
+    let config_file = metadata_boundary::bucket_resync_file_path(bucket);
     config_store::save(api, &config_file, data).await?;
 
     Ok(())

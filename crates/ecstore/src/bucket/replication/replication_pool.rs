@@ -22,12 +22,11 @@ use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MRF_REPLICATION_FILE, REPLICATION_DIR, RESYNC_FILE_NAME,
-    ReplicationConfig, ReplicationResyncer, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file,
-    get_heal_replicate_object_info, save_resync_status,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
+    TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
+    save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
@@ -800,7 +799,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
-            let data = match config_store::read(storage.clone(), MRF_REPLICATION_FILE).await {
+            let data = match config_store::read(storage.clone(), metadata_boundary::MRF_REPLICATION_FILE).await {
                 Ok(d) => d,
                 Err(EcstoreError::ConfigNotFound) => return, // no file yet — normal on first start
                 Err(e) => {
@@ -824,7 +823,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         "Failed to decode MRF recovery file — discarding corrupt data"
                     );
                     // Overwrite the corrupt file so we don't fail again on next restart.
-                    let _ = config_store::save(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await;
+                    let _ = config_store::save(
+                        storage,
+                        metadata_boundary::MRF_REPLICATION_FILE,
+                        encode_mrf_file(&[]).unwrap_or_default(),
+                    )
+                    .await;
                     return;
                 }
             };
@@ -883,7 +887,10 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
             // delivery (idempotent) rather than entry loss.
-            if let Err(e) = config_store::save(storage, MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default()).await {
+            if let Err(e) =
+                config_store::save(storage, metadata_boundary::MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default())
+                    .await
+            {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1255,7 +1262,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
-            if let Err(e) = config_store::save(storage.clone(), MRF_REPLICATION_FILE, data).await {
+            if let Err(e) = config_store::save(storage.clone(), metadata_boundary::MRF_REPLICATION_FILE, data).await {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1287,8 +1294,7 @@ async fn load_bucket_resync_metadata<S: ReplicationObjectIO>(
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
     let mut brs = BucketReplicationResyncStatus::new();
 
-    let resync_dir_path = format!("{BUCKET_META_PREFIX}/{bucket}/{REPLICATION_DIR}");
-    let resync_file_path = format!("{resync_dir_path}/{RESYNC_FILE_NAME}");
+    let resync_file_path = metadata_boundary::bucket_resync_file_path(bucket);
 
     let data = match config_store::read(obj_api, &resync_file_path).await {
         Ok(data) => data,
