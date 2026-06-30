@@ -93,6 +93,11 @@ def table_path(warehouse: str, namespace: str, table: str, suffix: str = "", res
     return f"{base}{suffix}"
 
 
+def warehouse_path(warehouse: str, suffix: str = "", rest_path: str = "/iceberg") -> str:
+    base = f"{catalog_prefix(rest_path)}/{warehouse}"
+    return f"{base}{suffix}"
+
+
 def probe_step(
     name: str,
     method: str,
@@ -196,14 +201,175 @@ def failure_probe_plan(warehouse: str, namespace: str, table: str, rest_path: st
     ]
 
 
+def rehearsal_phase(name: str, objective: str, steps: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "name": name,
+        "objective": objective,
+        "steps": steps,
+    }
+
+
+def disaster_recovery_rehearsal_plan(
+    *,
+    warehouse: str,
+    namespace: str,
+    table: str,
+    rest_path: str = "/iceberg",
+    table_warehouse_location: str | None = None,
+) -> dict[str, Any]:
+    table_endpoint = table_path(warehouse, namespace, table, rest_path=rest_path)
+    table_warehouse_location = table_warehouse_location or f"s3://{warehouse}/tables/table-id"
+    return {
+        "mode": "manual-or-ci-optional",
+        "ci_gate": "RUSTFS_TABLE_CATALOG_DR_REHEARSAL=1",
+        "preconditions": [
+            "record the RustFS build and catalog backing mode before starting",
+            "run against a disposable table or a backed-up table warehouse",
+            "capture the current metadata location and version token from loadTable",
+            "keep object-backed catalog state available until durable backing cutover is accepted",
+        ],
+        "expected_invariants": [
+            "current metadata pointer remains recoverable or deliberately rolled back",
+            "recovery repair does not move the table pointer",
+            "rollback/import actions require explicit operator-selected metadata locations",
+            "durable backing cutover remains blocked while migration blockers are present",
+            "post-recovery loadTable and table data-plane policy checks still succeed",
+        ],
+        "phases": [
+            rehearsal_phase(
+                "capture-baseline",
+                "Capture table and catalog state before injecting or repairing a failure.",
+                [
+                    probe_step(
+                        "export-catalog-state",
+                        "GET",
+                        table_path(warehouse, namespace, table, "/catalog/export", rest_path),
+                        "200",
+                        "export includes table entry, current metadata location, commit recovery state, and backing manifest",
+                    ),
+                    probe_step(
+                        "load-table-before-recovery",
+                        "GET",
+                        table_endpoint,
+                        "200",
+                        "baseline loadTable returns the current metadata location and version token",
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "diagnose-and-repair",
+                "Inspect recovery state and run only safe repair actions.",
+                [
+                    probe_step(
+                        "read-recovery-diagnostics",
+                        "GET",
+                        table_path(warehouse, namespace, table, "/catalog/diagnostics", rest_path),
+                        "200",
+                        "diagnostics expose commit recovery state, idempotency index state, recommended actions, and manual-review blockers",
+                    ),
+                    probe_step(
+                        "safe-recovery-repair",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/recovery", rest_path),
+                        "200",
+                        "safe repair can finalize recoverable commit records or repair idempotency indexes without pointer movement",
+                        {
+                            "mode": "safe-repair",
+                        },
+                    ),
+                    probe_step(
+                        "diagnostics-after-repair",
+                        "GET",
+                        table_path(warehouse, namespace, table, "/catalog/diagnostics", rest_path),
+                        "200",
+                        "recovery state is clean or still reports manual-review blockers without advancing table state",
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "rollback-or-import",
+                "Exercise explicit operator-selected rollback/import paths.",
+                [
+                    probe_step(
+                        "rollback-to-known-metadata",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/rollback", rest_path),
+                        "200-or-409",
+                        "rollback commits only a validated operator-selected metadata location, or conflicts without pointer movement",
+                        {
+                            "metadata-location": "metadata-location-from-catalog-export-or-backup",
+                            "version-token": "current-version-token-from-load-table",
+                        },
+                    ),
+                    probe_step(
+                        "import-known-metadata",
+                        "POST",
+                        table_path(warehouse, namespace, table, "/catalog/import", rest_path),
+                        "200-or-409",
+                        "import/register validates metadata identity and conflicts without pointer/token/generation advancement when stale",
+                        {
+                            "metadata-location": "metadata-location-from-catalog-export-or-backup",
+                            "properties": {
+                                "recovery-source": "catalog-export-or-backup",
+                            },
+                        },
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "migration-preflight",
+                "Verify durable backing cutover remains explainable and fail-closed.",
+                [
+                    probe_step(
+                        "durable-backing-migration-dry-run",
+                        "GET",
+                        warehouse_path(warehouse, "/catalog/migration", rest_path),
+                        "200",
+                        "migration blockers must be empty before cutover",
+                    ),
+                ],
+            ),
+            rehearsal_phase(
+                "post-recovery-validation",
+                "Check the recovered table can still be loaded and data-plane policy still resolves to the table.",
+                [
+                    probe_step(
+                        "load-table-after-recovery",
+                        "GET",
+                        table_endpoint,
+                        "200",
+                        "loadTable returns the intended current metadata location after repair, rollback, or import",
+                    ),
+                    probe_step(
+                        "table-data-plane-policy-probe",
+                        "S3-PROBE",
+                        table_warehouse_location,
+                        "inside-allowed-outside-denied",
+                        "ordinary S3 object access still maps table warehouse objects to the table policy boundary",
+                    ),
+                    probe_step(
+                        "diagnostics-after-recovery",
+                        "GET",
+                        table_path(warehouse, namespace, table, "/catalog/diagnostics", rest_path),
+                        "200",
+                        "diagnostics no longer report unexpected recovery blockers after the rehearsal",
+                    ),
+                ],
+            ),
+        ],
+    }
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Print RustFS S3 Tables production failure coverage helpers.")
     parser.add_argument("--warehouse", default="rustfs-s3table-smoke")
     parser.add_argument("--namespace", default="smoke")
     parser.add_argument("--table", default="events")
     parser.add_argument("--rest-path", default="/iceberg")
+    parser.add_argument("--table-warehouse-location")
     parser.add_argument("--print-failure-matrix", action="store_true")
     parser.add_argument("--print-failure-probes", action="store_true")
+    parser.add_argument("--print-disaster-recovery-rehearsal", action="store_true")
     return parser.parse_args(argv)
 
 
@@ -234,6 +400,20 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
                     namespace=args.namespace,
                     table=args.table,
                     rest_path=args.rest_path,
+                )
+            },
+            output,
+        )
+        printed = True
+    if args.print_disaster_recovery_rehearsal:
+        print_json(
+            {
+                "disaster_recovery_rehearsal": disaster_recovery_rehearsal_plan(
+                    warehouse=args.warehouse,
+                    namespace=args.namespace,
+                    table=args.table,
+                    rest_path=args.rest_path,
+                    table_warehouse_location=args.table_warehouse_location,
                 )
             },
             output,

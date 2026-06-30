@@ -102,6 +102,7 @@ catalog extension.
 | Catalog export | Supported | Exposes table state, commit recovery state, and backing migration information for operator inspection. |
 | Strong backing migration contract | Supported as a contract | Diagnostics publish object-backed manifest state, recoverable commit-log WAL state, target backing type, replay requirements, and blockers. |
 | Durable backing migration dry-run | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` and the `/_iceberg/v1` alias inspect object-backed catalog inventory, commit recovery blockers, idempotency indexes, warehouse prefix index readiness, recommended actions, and rollback configuration without mutating catalog state. |
+| Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal` generates an operator runbook covering catalog export, diagnostics, safe recovery repair, rollback/import, durable backing migration dry-run, post-recovery loadTable, and table data-plane policy probes. |
 | Strong KV/WAL backing cutover | Preview / controlled | Operators can explicitly select durable strong backing with `RUSTFS_TABLE_CATALOG_BACKING=durable-strong`. Run the migration dry-run first and keep the object-backed catalog available for rollback. Object-only advanced operations fail closed in durable strong mode. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple active regions. |
@@ -194,6 +195,12 @@ python3 scripts/table-catalog/failure_coverage.py \
   --namespace smoke \
   --table events \
   --print-failure-probes
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --print-disaster-recovery-rehearsal
 ```
 
 ## Release Claim Guidance
@@ -205,7 +212,8 @@ Acceptable wording:
 > RustFS includes a core Iceberg REST Catalog-based S3 Tables implementation
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
 > controlled maintenance, catalog recovery diagnostics, Spark manual/live
-> conformance input, and production-failure probe harnesses.
+> conformance input, production-failure probe harnesses, and disaster-recovery
+> rehearsal probes.
 
 Do not claim:
 
