@@ -1532,15 +1532,19 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         }
     })?;
 
-    let action = match ext_req.route {
-        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 | ReplicationExtRoute::Check => {
+    authorize_request(req, replication_extension_policy_action(ext_req.route)).await
+}
+
+fn replication_extension_policy_action(route: ReplicationExtRoute) -> Action {
+    match route {
+        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             Action::S3Action(S3Action::GetReplicationConfigurationAction)
         }
+        ReplicationExtRoute::Check => Action::S3Action(S3Action::PutReplicationConfigurationAction),
         ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Action::S3Action(S3Action::ResetBucketReplicationStateAction)
         }
-    };
-    authorize_request(req, action).await
+    }
 }
 
 fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
@@ -2615,6 +2619,22 @@ mod tests {
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method_status).is_none());
+    }
+
+    #[test]
+    fn replication_extension_policy_action_uses_write_permission_for_active_check() {
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::MetricsV1),
+            Action::S3Action(S3Action::GetReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::Check),
+            Action::S3Action(S3Action::PutReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::ResetStart),
+            Action::S3Action(S3Action::ResetBucketReplicationStateAction)
+        );
     }
 
     #[test]
