@@ -3018,8 +3018,12 @@ impl DiskAPI for LocalDisk {
             let read_result = tokio::task::spawn_blocking(move || {
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
 
+                let file_open_start = metrics_enabled.then(StdInstant::now);
+                let mut file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
                 let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
-                let meta = std::fs::metadata(&file_path_clone).map_err(DiskError::from)?;
+                let meta = file.metadata().map_err(DiskError::from)?;
                 let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 let metadata_validate_start = metrics_enabled.then(StdInstant::now);
@@ -3028,10 +3032,6 @@ impl DiskAPI for LocalDisk {
                 }
                 let metadata_validate_duration =
                     metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
-
-                let file_open_start = metrics_enabled.then(StdInstant::now);
-                let mut file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
-                let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 #[cfg(target_os = "macos")]
                 if should_reclaim_after_read {
