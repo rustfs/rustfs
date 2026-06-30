@@ -111,6 +111,7 @@ const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_MAX_SECONDS: u64 = 24 * 60 * 60;
+const TABLE_MAINTENANCE_SCHEDULER_AUDIT_LIMIT: usize = 10;
 const TABLE_MAINTENANCE_DELETE_DISABLED_REASON: &str = "metadata delete is disabled by maintenance config";
 const TABLE_COMMIT_SLOW_LOG_THRESHOLD: StdDuration = StdDuration::from_secs(2);
 const ICEBERG_MAIN_REF: &str = "main";
@@ -511,6 +512,61 @@ pub(crate) struct TableMaintenanceEffectiveConfig {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceSchedulerStatus {
+    Ready,
+    Disabled,
+    Paused,
+    Backpressured,
+    RetryDeferred,
+    Quarantined,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceSchedulerReport {
+    pub table_bucket: String,
+    pub namespace: String,
+    pub table: String,
+    pub table_id: String,
+    pub status: TableMaintenanceSchedulerStatus,
+    pub config_source: TableMaintenanceConfigSource,
+    pub background_enabled: bool,
+    pub worker_paused: bool,
+    pub delete_enabled: bool,
+    pub worker_lease_timeout_seconds: u64,
+    pub max_retry_attempts: u16,
+    pub retry_initial_backoff_seconds: u64,
+    pub retry_max_backoff_seconds: u64,
+    pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
+    pub current_job: Option<TableMaintenanceSchedulerJobSummary>,
+    pub quarantine: TableMaintenanceSchedulerQuarantineBoundary,
+    pub audit_timeline: Vec<TableMaintenanceSchedulerJobSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceSchedulerQuarantineBoundary {
+    pub enabled: bool,
+    pub active: bool,
+    pub retention_seconds: u64,
+    pub quarantined_object_count: usize,
+    pub source_job_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceSchedulerJobSummary {
+    pub job_id: String,
+    pub operation: TableMetadataMaintenanceOperation,
+    pub status: TableMetadataMaintenanceJobStatus,
+    pub worker_id: Option<String>,
+    pub attempt: u16,
+    pub started_at: Option<String>,
+    pub finished_at: Option<String>,
+    pub heartbeat_at: Option<String>,
+    pub next_retry_after: Option<String>,
+    pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMetadataMaintenanceJob {
     pub job_id: String,
     pub table_bucket: String,
@@ -795,6 +851,7 @@ pub(crate) enum TableMetadataMaintenanceJobStatus {
 pub(crate) enum TableMaintenanceRecommendedAction {
     NoActionRequired,
     ReviewAndRunDelete,
+    ReviewQuarantine,
     EnableDelete,
     EnableBackgroundMaintenance,
     ResumeMaintenanceWorker,
@@ -1688,6 +1745,21 @@ impl TableCatalogObjectPaths {
             table.as_str(),
             table_catalog_path_hash(table_id),
             table_catalog_path_hash(job_id)
+        )
+    }
+
+    pub fn table_maintenance_jobs_prefix(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> String {
+        format!(
+            "{}{}/{MAINTENANCE_ROOT}/{}/{MAINTENANCE_JOB_ROOT}/",
+            self.table_entries_prefix(table_bucket, namespace),
+            table.as_str(),
+            table_catalog_path_hash(table_id)
         )
     }
 
@@ -3823,6 +3895,132 @@ where
             .map(|entry| entry.map(|(report, _)| table_maintenance_report_with_recommended_actions(report)))
     }
 
+    pub(crate) async fn get_table_maintenance_scheduler_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        self.get_table_maintenance_scheduler_report_at(table_bucket, namespace, table, OffsetDateTime::now_utc())
+            .await
+    }
+
+    async fn get_table_maintenance_scheduler_report_at(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        now: OffsetDateTime,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &table_path).await? else {
+            return Err(TableCatalogStoreError::NotFound(format!(
+                "table {}/{}/{}",
+                table_bucket,
+                namespace.public_name(),
+                table.as_str()
+            )));
+        };
+        let effective = self
+            .get_effective_table_maintenance_config(table_bucket, &namespace.public_name(), table.as_str())
+            .await?;
+        let current = self
+            .get_table_metadata_maintenance_report(
+                table_bucket,
+                &namespace.public_name(),
+                table.as_str(),
+                MAINTENANCE_JOB_ALIAS_CURRENT,
+            )
+            .await?;
+        let reports = self
+            .list_table_metadata_maintenance_audit_reports(table_bucket, &namespace, &table, &entry.table_id)
+            .await?;
+        let quarantine = table_maintenance_scheduler_quarantine_boundary(&effective.config, &reports);
+        let mut recommended_actions = Vec::new();
+
+        let status = if !effective.config.background_enabled {
+            push_unique_maintenance_action(
+                &mut recommended_actions,
+                TableMaintenanceRecommendedAction::EnableBackgroundMaintenance,
+            );
+            TableMaintenanceSchedulerStatus::Disabled
+        } else if effective.config.worker_paused {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::ResumeMaintenanceWorker);
+            TableMaintenanceSchedulerStatus::Paused
+        } else if let Some(current) = current.as_ref()
+            && matches!(current.job.status, TableMetadataMaintenanceJobStatus::Running)
+            && table_maintenance_job_lease_is_active(&current.job, effective.config.worker_lease_timeout_seconds, now)
+        {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::WaitForActiveWorker);
+            TableMaintenanceSchedulerStatus::Backpressured
+        } else if let Some(current) = current.as_ref()
+            && table_maintenance_job_retry_is_pending(&current.job, now)
+        {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::WaitForRetryBackoff);
+            TableMaintenanceSchedulerStatus::RetryDeferred
+        } else if quarantine.active {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::ReviewQuarantine);
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::InvestigateFailure);
+            TableMaintenanceSchedulerStatus::Quarantined
+        } else {
+            push_unique_maintenance_action(&mut recommended_actions, TableMaintenanceRecommendedAction::NoActionRequired);
+            TableMaintenanceSchedulerStatus::Ready
+        };
+
+        Ok(TableMaintenanceSchedulerReport {
+            table_bucket: table_bucket.to_string(),
+            namespace: namespace.public_name(),
+            table: table.as_str().to_string(),
+            table_id: entry.table_id,
+            status,
+            config_source: effective.source,
+            background_enabled: effective.config.background_enabled,
+            worker_paused: effective.config.worker_paused,
+            delete_enabled: effective.config.delete_enabled,
+            worker_lease_timeout_seconds: effective.config.worker_lease_timeout_seconds,
+            max_retry_attempts: effective.config.max_retry_attempts,
+            retry_initial_backoff_seconds: effective.config.retry_initial_backoff_seconds,
+            retry_max_backoff_seconds: effective.config.retry_max_backoff_seconds,
+            recommended_actions,
+            current_job: current.as_ref().map(table_maintenance_scheduler_job_summary),
+            quarantine,
+            audit_timeline: reports.iter().map(table_maintenance_scheduler_job_summary).collect(),
+        })
+    }
+
+    async fn list_table_metadata_maintenance_audit_reports(
+        &self,
+        table_bucket: &str,
+        namespace: &Namespace,
+        table: &IdentifierSegment,
+        table_id: &str,
+    ) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReport>> {
+        let jobs_prefix = self
+            .paths
+            .table_maintenance_jobs_prefix(table_bucket, namespace, table, table_id);
+        let mut reports = Vec::new();
+        for object in self.backend.list_objects(self.catalog_bucket(), &jobs_prefix).await? {
+            if !object.ends_with(".json") {
+                continue;
+            }
+            if let Some((report, _)) = self
+                .read_entry::<TableMetadataMaintenanceReport>(self.catalog_bucket(), &object)
+                .await?
+            {
+                reports.push(table_maintenance_report_with_recommended_actions(report));
+            }
+        }
+        reports.sort_by(|left, right| {
+            table_maintenance_report_order_timestamp(right)
+                .cmp(&table_maintenance_report_order_timestamp(left))
+                .then_with(|| left.job.job_id.cmp(&right.job.job_id))
+        });
+        reports.truncate(TABLE_MAINTENANCE_SCHEDULER_AUDIT_LIMIT);
+        Ok(reports)
+    }
+
     pub(crate) async fn run_table_metadata_maintenance_worker_once(
         &self,
         table_bucket: &str,
@@ -5930,6 +6128,22 @@ where
                     .await
             }
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance report")),
+        }
+    }
+
+    pub(crate) async fn get_table_maintenance_scheduler_report(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+    ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance scheduler")),
         }
     }
 
@@ -8479,6 +8693,9 @@ fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> V
             {
                 actions.push(TableMaintenanceRecommendedAction::EnableDelete);
             }
+            if job.quarantine_enabled && job.quarantined_object_count > 0 {
+                actions.push(TableMaintenanceRecommendedAction::ReviewQuarantine);
+            }
             if job.next_retry_after.is_some() {
                 actions.push(TableMaintenanceRecommendedAction::WaitForRetryBackoff);
             }
@@ -8494,6 +8711,56 @@ fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> V
         }
     }
     actions
+}
+
+fn push_unique_maintenance_action(
+    actions: &mut Vec<TableMaintenanceRecommendedAction>,
+    action: TableMaintenanceRecommendedAction,
+) {
+    if !actions.contains(&action) {
+        actions.push(action);
+    }
+}
+
+fn table_maintenance_report_order_timestamp(report: &TableMetadataMaintenanceReport) -> String {
+    report
+        .job
+        .finished_at
+        .clone()
+        .or_else(|| report.job.heartbeat_at.clone())
+        .or_else(|| report.job.started_at.clone())
+        .unwrap_or_default()
+}
+
+fn table_maintenance_scheduler_job_summary(report: &TableMetadataMaintenanceReport) -> TableMaintenanceSchedulerJobSummary {
+    TableMaintenanceSchedulerJobSummary {
+        job_id: report.job.job_id.clone(),
+        operation: report.job.operation.clone(),
+        status: report.job.status.clone(),
+        worker_id: report.job.worker_id.clone(),
+        attempt: report.job.attempt,
+        started_at: report.job.started_at.clone(),
+        finished_at: report.job.finished_at.clone(),
+        heartbeat_at: report.job.heartbeat_at.clone(),
+        next_retry_after: report.job.next_retry_after.clone(),
+        recommended_actions: report.job.recommended_actions.clone(),
+    }
+}
+
+fn table_maintenance_scheduler_quarantine_boundary(
+    config: &TableMaintenanceConfig,
+    reports: &[TableMetadataMaintenanceReport],
+) -> TableMaintenanceSchedulerQuarantineBoundary {
+    let source = reports
+        .iter()
+        .find(|report| report.job.quarantine_enabled && report.job.quarantined_object_count > 0);
+    TableMaintenanceSchedulerQuarantineBoundary {
+        enabled: config.quarantine_enabled,
+        active: source.is_some(),
+        retention_seconds: source.map_or(config.quarantine_retention_seconds, |report| report.job.quarantine_retention_seconds),
+        quarantined_object_count: source.map_or(0, |report| report.job.quarantined_object_count),
+        source_job_id: source.map(|report| report.job.job_id.clone()),
+    }
 }
 
 fn refresh_table_maintenance_report_recommended_actions(report: &mut TableMetadataMaintenanceReport) {
@@ -10492,8 +10759,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
         seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
@@ -10518,8 +10785,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
         seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
@@ -10565,8 +10832,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
         seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
@@ -10667,8 +10934,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend);
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let prefix = "tables/shared-table/";
         let index_path = store.paths.warehouse_index_entry_path(bucket, prefix);
@@ -10713,8 +10980,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let bucket_entry = test_bucket_entry(bucket);
         let namespace_entry = test_namespace_entry(bucket, &namespace);
@@ -10773,8 +11040,8 @@ mod tests {
         let backend = TestCatalogObjectBackend::default();
         let store = ObjectTableCatalogStore::new(backend.clone());
         let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
         let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
         let bucket_entry = test_bucket_entry(bucket);
         let namespace_entry = test_namespace_entry(bucket, &namespace);
@@ -11829,6 +12096,165 @@ mod tests {
         );
         assert_eq!(report.job.deleted_metadata_file_count, 0);
         assert!(backend.object_exists(bucket, &old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_report_marks_disabled_default() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+
+        let report = store
+            .get_table_maintenance_scheduler_report_at(
+                bucket,
+                "sales",
+                "orders",
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(100),
+            )
+            .await
+            .expect("scheduler report should load");
+
+        assert_eq!(report.status, TableMaintenanceSchedulerStatus::Disabled);
+        assert_eq!(report.config_source, TableMaintenanceConfigSource::Default);
+        assert!(!report.background_enabled);
+        assert_eq!(
+            report.recommended_actions,
+            vec![TableMaintenanceRecommendedAction::EnableBackgroundMaintenance]
+        );
+        assert!(report.current_job.is_none());
+        assert!(report.audit_timeline.is_empty());
+        assert!(!report.quarantine.active);
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_report_surfaces_active_backpressure_and_audit_timeline() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    worker_lease_timeout_seconds: 300,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let mut running = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        running.job.status = TableMetadataMaintenanceJobStatus::Running;
+        running.job.worker_id = Some("worker-a".to_string());
+        running.job.lease_id = "lease-a".to_string();
+        running.job.heartbeat_at = Some(maintenance_timestamp(now - Duration::seconds(10)));
+        store
+            .put_table_metadata_maintenance_report(&running)
+            .await
+            .expect("running maintenance report should be seeded");
+
+        let report = store
+            .get_table_maintenance_scheduler_report_at(bucket, "sales", "orders", now)
+            .await
+            .expect("scheduler report should load");
+
+        assert_eq!(report.status, TableMaintenanceSchedulerStatus::Backpressured);
+        assert_eq!(
+            report.current_job.as_ref().map(|job| job.job_id.as_str()),
+            Some(running.job.job_id.as_str())
+        );
+        assert_eq!(report.recommended_actions, vec![TableMaintenanceRecommendedAction::WaitForActiveWorker]);
+        assert_eq!(report.audit_timeline.len(), 1);
+        assert_eq!(report.audit_timeline[0].job_id, running.job.job_id);
+        assert_eq!(report.audit_timeline[0].status, TableMetadataMaintenanceJobStatus::Running);
+        assert_eq!(report.audit_timeline[0].worker_id.as_deref(), Some("worker-a"));
+    }
+
+    #[tokio::test]
+    async fn maintenance_scheduler_report_surfaces_quarantine_boundary() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    quarantine_enabled: true,
+                    quarantine_retention_seconds: 86_400,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let mut failed = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
+        failed.job.failure_reason = Some("quarantine retained failed cleanup candidates".to_string());
+        failed.job.quarantine_enabled = true;
+        failed.job.quarantine_retention_seconds = 86_400;
+        failed.job.quarantined_object_count = 2;
+        failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::UNIX_EPOCH + Duration::seconds(90)));
+        store
+            .put_table_metadata_maintenance_report(&failed)
+            .await
+            .expect("failed maintenance report should be seeded");
+
+        let report = store
+            .get_table_maintenance_scheduler_report_at(
+                bucket,
+                "sales",
+                "orders",
+                OffsetDateTime::UNIX_EPOCH + Duration::seconds(100),
+            )
+            .await
+            .expect("scheduler report should load");
+
+        assert_eq!(report.status, TableMaintenanceSchedulerStatus::Quarantined);
+        assert!(report.quarantine.active);
+        assert_eq!(report.quarantine.retention_seconds, 86_400);
+        assert_eq!(report.quarantine.quarantined_object_count, 2);
+        assert_eq!(report.quarantine.source_job_id.as_deref(), Some(failed.job.job_id.as_str()));
+        assert!(
+            report
+                .recommended_actions
+                .contains(&TableMaintenanceRecommendedAction::ReviewQuarantine)
+        );
     }
 
     #[tokio::test]

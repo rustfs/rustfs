@@ -182,8 +182,8 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "background-maintenance-worker",
         "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
-        "catalog_endpoint": "POST /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
-        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint with current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
+        "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
+        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint and inspected through the scheduler status endpoint with disabled/paused state, current-job backpressure, retry deferral, quarantine boundary, audit timeline, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
@@ -1049,6 +1049,7 @@ def run_view_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
 
 def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     config_path = table_endpoint_path(args, "/maintenance/config")
+    scheduler_path = table_endpoint_path(args, "/maintenance/scheduler")
     signed_rest_request(args, deps, "PUT", config_path, default_maintenance_config())
     config = signed_rest_request(args, deps, "GET", config_path)
     if config.get("version") != TABLE_MAINTENANCE_CONFIG_VERSION:
@@ -1065,6 +1066,12 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     if not isinstance(job, dict) or not job.get("job-id"):
         raise RuntimeError("maintenance metadata endpoint did not return a job id")
     signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
+    expected_scheduler_statuses = {"READY", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
+    if scheduler.get("status") not in expected_scheduler_statuses:
+        raise RuntimeError("maintenance scheduler endpoint did not return a stable scheduler status")
+    if "audit_timeline" not in scheduler:
+        raise RuntimeError("maintenance scheduler endpoint did not return an audit timeline")
 
     worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
     worker_job = worker.get("job")
