@@ -2055,15 +2055,19 @@ async fn apply_existing_object_expiry(api: Arc<ECStore>, object: &ObjectInfo, ev
     }
 }
 
-async fn enqueue_expiry_for_existing_object_group(
+struct ExistingObjectExpiryContext<'a> {
     api: Arc<ECStore>,
-    bucket: &str,
+    bucket: &'a str,
     lc: Arc<BucketLifecycleConfiguration>,
     lock_config: Option<Arc<ObjectLockConfiguration>>,
     replication: Option<Arc<replication_sink::LifecycleReplicationConfig>>,
-    object_infos: &[ObjectInfo],
-    src: &LcEventSrc,
+    src: &'a LcEventSrc,
     defer_date_expiry_once: bool,
+}
+
+async fn enqueue_expiry_for_existing_object_group(
+    context: &ExistingObjectExpiryContext<'_>,
+    object_infos: &[ObjectInfo],
     date_expiry_deferred_once: &mut bool,
 ) {
     if object_infos.is_empty() {
@@ -2074,16 +2078,16 @@ async fn enqueue_expiry_for_existing_object_group(
         .iter()
         .map(ObjectOpts::from_object_info)
         .collect::<Vec<ObjectOpts>>();
-    let events = match Evaluator::new(lc.clone())
-        .with_lock_retention(lock_config)
-        .with_replication_config(replication)
+    let events = match Evaluator::new(context.lc.clone())
+        .with_lock_retention(context.lock_config.clone())
+        .with_replication_config(context.replication.clone())
         .eval(&object_opts)
         .await
     {
         Ok(events) => events,
         Err(err) => {
             warn!(
-                bucket,
+                bucket = context.bucket,
                 object = %object_infos[0].name,
                 error = %err,
                 "failed to evaluate lifecycle events for existing object versions"
@@ -2105,9 +2109,9 @@ async fn enqueue_expiry_for_existing_object_group(
             | IlmAction::DelMarkerDeleteAllVersionsAction => {
                 let now = OffsetDateTime::now_utc();
                 if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
-                    if defer_date_expiry_once
+                    if context.defer_date_expiry_once
                         && !*date_expiry_deferred_once
-                        && lifecycle_rule_has_date_expiration(&lc, &event.rule_id)
+                        && lifecycle_rule_has_date_expiration(&context.lc, &event.rule_id)
                     {
                         tokio::time::sleep(StdDuration::from_secs(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS as u64)).await;
                         *date_expiry_deferred_once = true;
@@ -2123,10 +2127,10 @@ async fn enqueue_expiry_for_existing_object_group(
                             noncurrent_event = Some(event.clone());
                         }
                     } else {
-                        apply_existing_object_expiry(api.clone(), object, event, src).await;
+                        apply_existing_object_expiry(context.api.clone(), object, event, context.src).await;
                     }
                 } else {
-                    apply_expiry_rule(event, src, object).await;
+                    apply_expiry_rule(event, context.src, object).await;
                 }
             }
             _ => {}
@@ -2140,7 +2144,7 @@ async fn enqueue_expiry_for_existing_object_group(
         expiry_state
             .write()
             .await
-            .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
+            .enqueue_by_newer_noncurrent(context.bucket, to_delete_objs, event, context.src)
             .await;
     }
 }
@@ -2162,6 +2166,15 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;
     let defer_date_expiry_once = should_defer_date_expiry_for_recent_config_update(&lc, OffsetDateTime::now_utc());
+    let expiry_context = ExistingObjectExpiryContext {
+        api: api.clone(),
+        bucket,
+        lc: lc.clone(),
+        lock_config: lock_config.clone(),
+        replication: replication.clone(),
+        src: &src,
+        defer_date_expiry_once,
+    };
     let mut date_expiry_deferred_once = false;
     let mut pending_group = Vec::new();
     let mut pending_object = None::<String>;
@@ -2174,18 +2187,7 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
 
         for object in page.objects {
             if pending_object.as_ref().is_some_and(|name| name != &object.name) {
-                enqueue_expiry_for_existing_object_group(
-                    api.clone(),
-                    bucket,
-                    lc.clone(),
-                    lock_config.clone(),
-                    replication.clone(),
-                    &pending_group,
-                    &src,
-                    defer_date_expiry_once,
-                    &mut date_expiry_deferred_once,
-                )
-                .await;
+                enqueue_expiry_for_existing_object_group(&expiry_context, &pending_group, &mut date_expiry_deferred_once).await;
                 pending_group.clear();
             }
             pending_object = Some(object.name.clone());
@@ -2193,18 +2195,7 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
         }
 
         if !page.is_truncated {
-            enqueue_expiry_for_existing_object_group(
-                api.clone(),
-                bucket,
-                lc.clone(),
-                lock_config.clone(),
-                replication.clone(),
-                &pending_group,
-                &src,
-                defer_date_expiry_once,
-                &mut date_expiry_deferred_once,
-            )
-            .await;
+            enqueue_expiry_for_existing_object_group(&expiry_context, &pending_group, &mut date_expiry_deferred_once).await;
             return Ok(());
         }
 
