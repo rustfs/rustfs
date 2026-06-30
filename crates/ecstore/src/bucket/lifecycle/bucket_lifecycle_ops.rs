@@ -2427,6 +2427,32 @@ pub async fn post_restore_opts(version_id: &str, bucket: &str, object: &str) -> 
     })
 }
 
+fn select_restore_s3_location(rreq: &RestoreRequest) -> Result<Option<&s3s::dto::S3Location>, std::io::Error> {
+    if rreq
+        .type_
+        .as_ref()
+        .is_none_or(|type_| type_.as_str() != RestoreRequestType::SELECT)
+    {
+        return Ok(None);
+    }
+    let output_location = rreq
+        .output_location
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("OutputLocation required for SELECT requests"))?;
+    let s3 = output_location
+        .s3
+        .as_ref()
+        .ok_or_else(|| std::io::Error::other("OutputLocation.S3 required for SELECT requests"))?;
+    if let Some(user_metadata) = s3.user_metadata.as_ref() {
+        for metadata in user_metadata {
+            if metadata.name.as_deref().is_none_or(|name| name.is_empty()) {
+                return Err(std::io::Error::other("SELECT restore metadata name is required"));
+            }
+        }
+    }
+    Ok(Some(s3))
+}
+
 pub async fn put_restore_opts(
     bucket: &str,
     object: &str,
@@ -2445,38 +2471,30 @@ pub async fn put_restore_opts(
     if let Some(type_) = &rreq.type_
         && type_.as_str() == RestoreRequestType::SELECT
     {
-        for v in rreq
-            .output_location
-            .as_ref()
-            .unwrap()
-            .s3
-            .as_ref()
-            .unwrap()
-            .user_metadata
-            .as_ref()
-            .unwrap()
-        {
-            if !strings_has_prefix_fold(&v.name.clone().unwrap(), "x-amz-meta") {
-                meta.insert(
-                    format!("x-amz-meta-{}", v.name.as_ref().unwrap()),
-                    v.value.clone().unwrap_or_else(|| "".to_string()),
-                );
-                continue;
+        let Some(s3) = select_restore_s3_location(rreq)? else {
+            return Err(std::io::Error::other("OutputLocation.S3 required for SELECT requests"));
+        };
+        if let Some(user_metadata) = s3.user_metadata.as_ref() {
+            for metadata in user_metadata {
+                let name = metadata
+                    .name
+                    .as_deref()
+                    .ok_or_else(|| std::io::Error::other("SELECT restore metadata name is required"))?;
+                let value = metadata.value.clone().unwrap_or_default();
+                if strings_has_prefix_fold(name, "x-amz-meta") {
+                    meta.insert(name.to_string(), value);
+                } else {
+                    meta.insert(format!("x-amz-meta-{name}"), value);
+                }
             }
-            meta.insert(v.name.clone().unwrap(), v.value.clone().unwrap_or_else(|| "".to_string()));
         }
-        if let Some(output_location) = rreq.output_location.as_ref()
-            && let Some(s3) = &output_location.s3
-            && let Some(tags) = &s3.tagging
-        {
+        if let Some(tags) = &s3.tagging {
             meta.insert(
                 AMZ_OBJECT_TAGGING.to_string(),
                 serde_urlencoded::to_string(tags.tag_set.clone()).unwrap_or_else(|_| "".to_string()),
             );
         }
-        if let Some(output_location) = rreq.output_location.as_ref()
-            && let Some(s3) = &output_location.s3
-            && let Some(encryption) = &s3.encryption
+        if let Some(encryption) = &s3.encryption
             && encryption.encryption_type.as_str() != ""
         {
             meta.insert(X_AMZ_SERVER_SIDE_ENCRYPTION.as_str().to_string(), AMZ_ENCRYPTION_AES.to_string());
@@ -2567,12 +2585,7 @@ impl RestoreRequestOps for RestoreRequest {
         if self.type_.as_ref().is_none_or(|t| t.as_str() != RestoreRequestType::SELECT) && self.output_location.is_some() {
             return Err(std::io::Error::other("OutputLocation can only be specified with SELECT request type"));
         }
-        if let Some(type_) = &self.type_
-            && type_.as_str() == RestoreRequestType::SELECT
-            && self.output_location.is_none()
-        {
-            return Err(std::io::Error::other("OutputLocation required for SELECT requests"));
-        }
+        select_restore_s3_location(self)?;
 
         // Days must not be specified with SELECT requests
         if let Some(type_) = &self.type_
@@ -2912,8 +2925,8 @@ mod tests {
         lifecycle_version_purge_state_from_completed_targets, mark_delete_opts_skip_decommissioned_on_remote_success,
         merge_stale_multipart_candidate, replication_state_for_delete, resolve_transition_queue_capacity,
         resolve_transition_queue_send_timeout, resolve_transition_worker_count, resolve_transition_workers_absolute_max,
-        should_defer_date_expiry_for_recent_config_update, should_reuse_lifecycle_delete_replication_state,
-        transitioned_cleanup_tuple,
+        select_restore_s3_location, should_defer_date_expiry_for_recent_config_update,
+        should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
@@ -2936,7 +2949,10 @@ mod tests {
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
     use rustfs_filemeta::{ReplicateDecision, VersionPurgeStatusType};
-    use s3s::dto::{BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Timestamp};
+    use s3s::dto::{
+        BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
+        RestoreRequest, RestoreRequestType, S3Location, Timestamp,
+    };
     use serial_test::serial;
     use sha2::{Digest, Sha256};
     use std::collections::HashMap;
@@ -3224,6 +3240,57 @@ mod tests {
 
         assert!(dobj.delete_marker);
         assert!(dobj.transitioned_object.name.is_empty());
+    }
+
+    fn select_restore_request(output_location: Option<OutputLocation>) -> RestoreRequest {
+        RestoreRequest {
+            days: None,
+            description: None,
+            glacier_job_parameters: None,
+            output_location,
+            select_parameters: None,
+            tier: None,
+            type_: Some(RestoreRequestType::from_static(RestoreRequestType::SELECT)),
+        }
+    }
+
+    #[test]
+    fn select_restore_s3_location_rejects_missing_s3_output_location() {
+        let request = select_restore_request(Some(OutputLocation { s3: None }));
+
+        let err = select_restore_s3_location(&request).expect_err("missing S3 location should be rejected");
+
+        assert!(err.to_string().contains("OutputLocation.S3 required"));
+    }
+
+    #[test]
+    fn select_restore_s3_location_rejects_missing_metadata_name() {
+        let request = select_restore_request(Some(OutputLocation {
+            s3: Some(S3Location {
+                user_metadata: Some(vec![MetadataEntry {
+                    name: None,
+                    value: Some("value".to_string()),
+                }]),
+                ..Default::default()
+            }),
+        }));
+
+        let err = select_restore_s3_location(&request).expect_err("metadata without name should be rejected");
+
+        assert!(err.to_string().contains("metadata name is required"));
+    }
+
+    #[test]
+    fn select_restore_s3_location_allows_missing_user_metadata() {
+        let request = select_restore_request(Some(OutputLocation {
+            s3: Some(S3Location::default()),
+        }));
+
+        let s3 = select_restore_s3_location(&request)
+            .expect("missing user metadata should be allowed")
+            .expect("S3 location should be present");
+
+        assert!(s3.user_metadata.is_none());
     }
 
     // SAFETY: this helper is only used from `#[serial]` tests and those tests run under a
