@@ -43,6 +43,9 @@ The architecture guard snapshots the files currently allowed to reference
 
 - `rustfs/src/storage/storage_api.rs`
 
+That boundary now keeps only bootstrap writes and lifecycle controls in the
+global facade. Read-only runtime getters must be exported through
+`rustfs_ecstore::api::runtime` and consumed through the local storage facade.
 New direct uses must either move behind an existing owner-local boundary or
 update this plan and the guard in the same reviewed migration PR.
 

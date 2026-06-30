@@ -32,10 +32,10 @@ use crate::{
         GLOBAL_BOOT_TIME, GLOBAL_EVENT_NOTIFIER, GLOBAL_IS_ERASURE_SD, GLOBAL_LIFECYCLE_SYS, GLOBAL_LOCAL_DISK_ID_MAP,
         GLOBAL_LOCAL_DISK_MAP, GLOBAL_LOCAL_DISK_SET_DRIVES, GLOBAL_LOCAL_NODE_NAME_FALLBACK, GLOBAL_ROOT_DISK_THRESHOLD,
         GLOBAL_TIER_CONFIG_MGR, TypeLocalDiskSetDrives, get_background_services_cancel_token, get_global_bucket_monitor,
-        get_global_deployment_id, get_global_endpoints, get_global_endpoints_opt, get_global_lock_clients, get_global_region,
-        get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor, is_dist_erasure, is_erasure,
-        is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id, set_global_lock_client,
-        set_global_lock_clients, set_object_layer, update_erasure_type,
+        get_global_deployment_id, get_global_endpoints, get_global_endpoints_opt, get_global_lock_client,
+        get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port, init_global_bucket_monitor,
+        is_dist_erasure, is_erasure, is_first_cluster_node_local, resolve_object_store_handle, set_global_deployment_id,
+        set_global_lock_client, set_global_lock_clients, set_object_layer, update_erasure_type,
     },
     services::batch_processor::{GlobalBatchProcessors, get_global_processors},
     services::event_notification::EventNotifier,
@@ -113,7 +113,7 @@ pub fn object_store_handle() -> Option<Arc<ECStore>> {
     resolve_object_store_handle()
 }
 
-pub(crate) fn endpoint_pools() -> Option<EndpointServerPools> {
+pub fn endpoint_pools() -> Option<EndpointServerPools> {
     get_global_endpoints_opt()
 }
 
@@ -140,7 +140,7 @@ pub async fn setup_is_erasure() -> bool {
     is_erasure().await
 }
 
-pub(crate) async fn setup_is_dist_erasure() -> bool {
+pub async fn setup_is_dist_erasure() -> bool {
     is_dist_erasure().await
 }
 
@@ -176,7 +176,7 @@ pub(crate) fn default_local_node_name() -> String {
     GLOBAL_LOCAL_NODE_NAME_FALLBACK.to_string()
 }
 
-pub(crate) fn rustfs_port() -> u16 {
+pub fn rustfs_port() -> u16 {
     global_rustfs_port()
 }
 
@@ -263,7 +263,7 @@ pub(crate) fn deployment_upload_id(upload_id: &str) -> String {
         .encode_to_string(format!("{}.{}", get_global_deployment_id().unwrap_or_default(), upload_id).as_bytes())
 }
 
-pub(crate) fn deployment_id() -> Option<String> {
+pub fn deployment_id() -> Option<String> {
     get_global_deployment_id()
 }
 
@@ -289,7 +289,11 @@ pub(crate) fn global_lock_manager() -> Arc<rustfs_lock::GlobalLockManager> {
     rustfs_lock::get_global_lock_manager()
 }
 
-pub(crate) fn global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
+pub fn global_lock_client() -> Option<Arc<dyn LockClient>> {
+    get_global_lock_client()
+}
+
+pub fn global_lock_clients() -> Option<&'static HashMap<String, Arc<dyn LockClient>>> {
     get_global_lock_clients()
 }
 
@@ -320,7 +324,7 @@ pub(crate) fn bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
     get_global_bucket_metadata_sys()
 }
 
-pub(crate) fn region() -> Option<Region> {
+pub fn region() -> Option<Region> {
     get_global_region()
 }
 

@@ -187,6 +187,8 @@ EXTERNAL_RUNTIME_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/external_runtime_stora
 GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE="${TMP_DIR}/global_facade_boundary_expected.txt"
 GLOBAL_FACADE_BOUNDARY_ACTUAL_FILE="${TMP_DIR}/global_facade_boundary_actual.txt"
 GLOBAL_FACADE_BOUNDARY_DIFF_FILE="${TMP_DIR}/global_facade_boundary_diff.txt"
+ECSTORE_GLOBAL_READ_ONLY_EXPORT_HITS_FILE="${TMP_DIR}/ecstore_global_read_only_export_hits.txt"
+RUSTFS_STORAGE_GLOBAL_READ_ONLY_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_global_read_only_import_hits.txt"
 EXTERNAL_STORAGE_API_DOMAIN_BYPASS_HITS_FILE="${TMP_DIR}/external_storage_api_domain_bypass_hits.txt"
 EXTERNAL_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/external_storage_api_root_reexport_hits.txt"
 RUSTFS_STORAGE_API_ROOT_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_api_root_reexport_hits.txt"
@@ -1693,6 +1695,28 @@ EOF
 
 if ! diff -u "$GLOBAL_FACADE_BOUNDARY_EXPECTED_FILE" "$GLOBAL_FACADE_BOUNDARY_ACTUAL_FILE" >"$GLOBAL_FACADE_BOUNDARY_DIFF_FILE"; then
   report_failure "ECStore global facade access must stay inside reviewed local storage_api boundaries: $(tr '\n' '; ' <"$GLOBAL_FACADE_BOUNDARY_DIFF_FILE")"
+fi
+
+READ_ONLY_ECSTORE_GLOBAL_SYMBOL_PATTERN='get_global_bucket_monitor|get_global_deployment_id|get_global_endpoints|get_global_endpoints_opt|get_global_lock_client|get_global_lock_clients|get_global_region|get_global_tier_config_mgr|global_rustfs_port|is_dist_erasure|is_erasure|is_erasure_sd|is_first_cluster_node_local|new_object_layer_fn|resolve_object_store_handle'
+
+(
+  cd "$ROOT_DIR"
+  awk '/pub mod global \{/,/^}/ {print FILENAME ":" FNR ":" $0}' crates/ecstore/src/api/mod.rs |
+    rg "\b(${READ_ONLY_ECSTORE_GLOBAL_SYMBOL_PATTERN})\b" || true
+) >"$ECSTORE_GLOBAL_READ_ONLY_EXPORT_HITS_FILE"
+
+if [[ -s "$ECSTORE_GLOBAL_READ_ONLY_EXPORT_HITS_FILE" ]]; then
+  report_failure "read-only ECStore runtime getters must be exported through rustfs_ecstore::api::runtime, not api::global: $(paste -sd '; ' "$ECSTORE_GLOBAL_READ_ONLY_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  awk '/pub\(crate\) mod ecstore_global \{/,/^}/ {print FILENAME ":" FNR ":" $0}' rustfs/src/storage/storage_api.rs |
+    rg "\b(${READ_ONLY_ECSTORE_GLOBAL_SYMBOL_PATTERN})\b" || true
+) >"$RUSTFS_STORAGE_GLOBAL_READ_ONLY_IMPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_GLOBAL_READ_ONLY_IMPORT_HITS_FILE" ]]; then
+  report_failure "RustFS storage facade must source read-only ECStore runtime getters through api::runtime: $(paste -sd '; ' "$RUSTFS_STORAGE_GLOBAL_READ_ONLY_IMPORT_HITS_FILE")"
 fi
 
 (

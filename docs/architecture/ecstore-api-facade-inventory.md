@@ -12,7 +12,7 @@ replication, or `SetDisks` runtime behavior.
 | `storage`, `disk`, `layout`, `error`, `runtime`, `cluster`, `rpc` | Compatibility spine for storage, disk topology, runtime handles, cluster control, and internode calls. | Keep until replacement contracts compile in downstream boundary files. |
 | `bucket`, `config`, `tier`, `data_usage`, `capacity`, `notification`, `metrics`, `rebalance` | Domain and service facades still consumed through owner-local `storage_api` boundaries. | Narrow one group at a time after explicit aliases or wrappers exist. |
 | `set_disk`, `object`, `rio`, `bitrot`, `erasure`, `compression`, `cache`, `client`, `store_list` | Low-level object IO, reader, erasure, cache, and migration helper compatibility. | Keep stable while `SetDisks` remains the shared state carrier. |
-| `admin`, `event`, `global` | Admin, event hook, and legacy global compatibility. | Do not widen; replace mutable/global access with runtime-source contracts first. |
+| `admin`, `event`, `global` | Admin, event hook, and legacy global compatibility. | Keep `global` limited to bootstrap writes and lifecycle controls; read-only runtime access must use runtime-source contracts. |
 
 ## External Consumer Boundaries
 
@@ -20,7 +20,7 @@ External `rustfs_ecstore::api` imports must stay in these local boundary files:
 
 | Boundary file | Current facade families |
 |---|---|
-| `rustfs/src/storage/storage_api.rs` | Broad RustFS storage owner bridge for admin, bucket, capacity, client, compression, cluster, config, data usage, disk, error, event, global, layout, metrics, notification, rebalance, rio, rpc, set disk, storage, and tier. |
+| `rustfs/src/storage/storage_api.rs` | Broad RustFS storage owner bridge for admin, bucket, capacity, client, compression, cluster, config, data usage, disk, error, event, global bootstrap controls, runtime-source getters, layout, metrics, notification, rebalance, rio, rpc, set disk, storage, and tier. |
 | `crates/scanner/src/storage_api.rs` | Scanner bridge for bucket lifecycle, replication, metadata, capacity, config, data usage, disk, error, runtime, set disk, storage, and tier. |
 | `crates/obs/src/metrics/storage_api.rs` | Metrics bridge for bucket bandwidth, lifecycle, replication, quota, capacity, data usage, error, runtime, and storage. |
 | `crates/iam/src/storage_api.rs` | IAM bridge for config, error, notification, runtime, and storage. |
