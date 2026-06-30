@@ -1570,8 +1570,7 @@ impl TargetClient {
         object: &str,
         opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        let mut headers = opts.header();
-
+        let mut headers = HeaderMap::new();
         let version_id = opts.internal.source_version_id.clone();
         if !version_id.is_empty() {
             insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
