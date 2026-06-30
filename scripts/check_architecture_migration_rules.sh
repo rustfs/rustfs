@@ -2590,14 +2590,21 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'BucketTargetSys::get\(\)' \
-    crates/ecstore/src/bucket/replication \
-    --glob '*.rs' |
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/(?:(?:crate::bucket|super(?:::super)+)(?:::\{[^;]*\bbucket_target_sys\b|::bucket_target_sys\b)|BucketTargetSys::get\(\))/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
 ) >"$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication bucket-target access must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
+  report_failure "replication bucket-target access and types must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
