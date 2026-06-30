@@ -3836,6 +3836,205 @@ mod test {
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, ReadBuf};
 
+    fn test_file_info(name: &str, version_id: Uuid, data_dir: Option<Uuid>, data: Option<Bytes>) -> FileInfo {
+        let size = data
+            .as_ref()
+            .map(|data| i64::try_from(data.len()).expect("test data length should fit i64"))
+            .unwrap_or(1);
+        FileInfo {
+            name: name.to_string(),
+            version_id: Some(version_id),
+            data_dir,
+            data,
+            size,
+            mod_time: Some(OffsetDateTime::now_utc()),
+            ..Default::default()
+        }
+    }
+
+    fn test_meta(fi: FileInfo) -> Vec<u8> {
+        let mut meta = FileMeta::default();
+        meta.add_version(fi).expect("test metadata should accept file info");
+        meta.marshal_msg().expect("test metadata should encode")
+    }
+
+    async fn ensure_test_volume(disk: &LocalDisk, volume: &str) {
+        match disk.make_volume(volume).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("test volume should be available: {err:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_writes_old_metadata_backup_before_non_inline_undo() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let tmp_object = "tmp-write";
+        let version_id = Uuid::parse_str("11111111-1111-1111-1111-111111111111").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("22222222-2222-2222-2222-222222222222").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("33333333-3333-3333-3333-333333333333").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("rename_data should commit");
+
+        assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert!(
+            dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
+        assert!(
+            !dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_writes_old_metadata_backup_for_inline_overwrite() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "inline-object";
+        let tmp_object = "tmp-inline-write";
+        let version_id = Uuid::parse_str("12121212-1212-1212-1212-121212121212").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("34343434-3434-3434-3434-343434343434").expect("old data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let dst_object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(dst_object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(dst_object_dir.join(STORAGE_FORMAT_FILE), test_meta(old_fi))
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_object_dir = dir.path().join(RUSTFS_META_TMP_BUCKET).join(tmp_object);
+        fs::create_dir_all(&tmp_object_dir)
+            .await
+            .expect("tmp object dir should be created");
+
+        let new_fi = test_file_info(object, version_id, None, Some(Bytes::from_static(b"inline-new")));
+        let resp = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await
+            .expect("inline rename_data should commit");
+
+        assert_eq!(resp.old_data_dir, Some(old_data_dir));
+        assert!(
+            dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
+        assert!(
+            !dst_object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE)
+                .exists()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_undo_restores_backup_to_object_root() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old backup dir should be created");
+        fs::create_dir_all(object_dir.join(new_data_dir.to_string()))
+            .await
+            .expect("new data dir should be created");
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        fs::write(
+            object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            old_meta.clone(),
+        )
+        .await
+        .expect("old metadata backup should be written");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), test_meta(new_fi.clone()))
+            .await
+            .expect("new metadata should be written");
+
+        disk.delete_version(
+            bucket,
+            object,
+            new_fi,
+            false,
+            DeleteOptions {
+                undo_write: true,
+                old_data_dir: Some(old_data_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo should restore old metadata");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("restored metadata should be readable");
+        assert_eq!(restored_meta, old_meta);
+        assert!(!object_dir.join("dir/object").join(STORAGE_FORMAT_FILE).exists());
+    }
+
     #[tokio::test]
     async fn test_skip_access_checks() {
         // let arr = Vec::new();
