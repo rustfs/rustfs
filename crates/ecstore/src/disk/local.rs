@@ -121,6 +121,8 @@ fn mmap_rusage_who() -> libc::c_int {
 }
 
 #[cfg(unix)]
+// SAFETY: this allowance is limited to reading kernel-provided rusage data via
+// libc; each unsafe operation below documents pointer validity and initialization.
 #[allow(unsafe_code)]
 fn read_mmap_page_fault_counts(enabled: bool) -> Option<MmapPageFaultCounts> {
     if !enabled {

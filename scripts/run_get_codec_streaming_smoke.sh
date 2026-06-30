@@ -61,6 +61,8 @@ COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
 COMPAT_OBJECT_SIZE=65536
 DRY_RUN=false
 SKIP_BUILD=false
+DETACH=false
+DETACH_LOG=""
 PROFILE_FAILURES=0
 declare -a ORIGINAL_ARGS=()
 
@@ -142,6 +144,10 @@ Binary/options:
   --compat-object-key <key>      Object key used by the compatibility probe
   --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
   --skip-build                   do not run cargo build --release -p rustfs
+  --detach                       start this script under nohup and exit after
+                                 writing detached pid/log metadata
+  --detach-log <path>            log file used with --detach
+                                 (default: <out-dir>/detached.log)
   --dry-run                      print benchmark commands without starting RustFS
 
 Credentials:
@@ -274,6 +280,8 @@ parse_args() {
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --region) REGION="$2"; shift 2 ;;
       --skip-build) SKIP_BUILD=true; shift ;;
+      --detach) DETACH=true; shift ;;
+      --detach-log) DETACH_LOG="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *)
@@ -361,6 +369,9 @@ validate_args() {
     require_cmd cargo
     require_cmd "$PYTHON_BIN"
   fi
+  if [[ "$DETACH" == "true" && "$DRY_RUN" != "true" ]]; then
+    require_cmd nohup
+  fi
 }
 
 setup_output() {
@@ -390,6 +401,71 @@ dry_run_multipart_expected_reason() {
 
 command_line_string() {
   printf '%q ' "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+}
+
+detached_child_args() {
+  local skip_next=false
+  local arg
+
+  for arg in "${ORIGINAL_ARGS[@]}"; do
+    if [[ "$skip_next" == "true" ]]; then
+      skip_next=false
+      continue
+    fi
+
+    case "$arg" in
+      --detach)
+        ;;
+      --detach-log)
+        skip_next=true
+        ;;
+      *)
+        printf '%s\0' "$arg"
+        ;;
+    esac
+  done
+}
+
+run_detached_if_requested() {
+  if [[ "$DETACH" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$DETACH_LOG" ]]; then
+    DETACH_LOG="${OUT_DIR}/detached.log"
+  fi
+
+  local script_path="${PROJECT_ROOT}/scripts/run_get_codec_streaming_smoke.sh"
+  local pid_file="${OUT_DIR}/detached.pid"
+  local command_file="${OUT_DIR}/detached_command.txt"
+  local -a child_args=()
+
+  while IFS= read -r -d '' arg; do
+    child_args+=("$arg")
+  done < <(detached_child_args)
+
+  {
+    printf '%q ' "$script_path" "${child_args[@]}"
+    printf '\n'
+  } >"$command_file"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] detach requested"
+    log "[DRY-RUN] detached log: ${DETACH_LOG}"
+    log "[DRY-RUN] detached command: ${command_file}"
+    return 0
+  fi
+
+  nohup "$script_path" "${child_args[@]}" >"$DETACH_LOG" 2>&1 < /dev/null &
+  local detached_pid="$!"
+  printf '%s\n' "$detached_pid" >"$pid_file"
+
+  log "Detached GET codec streaming smoke started."
+  log "PID: ${detached_pid}"
+  log "Output dir: ${OUT_DIR}"
+  log "Log: ${DETACH_LOG}"
+  log "Command: ${command_file}"
+  exit 0
 }
 
 sanitize_metric_label_value() {
@@ -3312,6 +3388,7 @@ main() {
   parse_args "$@"
   validate_args
   setup_output
+  run_detached_if_requested
   local codec_profiles=()
   local profiles=()
   local profiles_csv=""
