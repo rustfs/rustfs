@@ -69,6 +69,7 @@ pub(crate) const GET_STAGE_READER_MMAP_ACCESS_CHECK: &str = "reader_mmap_access_
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_TASK: &str = "reader_mmap_blocking_task";
 pub(crate) const GET_STAGE_READER_MMAP_BLOCKING_WAIT: &str = "reader_mmap_blocking_wait";
 pub(crate) const GET_STAGE_READER_MMAP_COPY_BUFFER: &str = "reader_mmap_copy_buffer";
+pub(crate) const GET_STAGE_READER_MMAP_DIRECT_READ_COPY: &str = "reader_mmap_direct_read_copy";
 pub(crate) const GET_STAGE_READER_MMAP_FILE_OPEN: &str = "reader_mmap_file_open";
 pub(crate) const GET_STAGE_READER_MMAP_MAP: &str = "reader_mmap_map";
 pub(crate) const GET_STAGE_READER_MMAP_METADATA_LOOKUP: &str = "reader_mmap_metadata_lookup";

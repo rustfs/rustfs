@@ -71,6 +71,7 @@ pub struct MmapCopyStageMetrics {
     pub(crate) file_open_stage: &'static str,
     pub(crate) mmap_map_stage: &'static str,
     pub(crate) mmap_copy_stage: &'static str,
+    pub(crate) direct_read_copy_stage: &'static str,
 }
 
 #[derive(Debug)]
