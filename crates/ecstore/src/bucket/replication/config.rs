@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_filemeta_boundary::ReplicationType;
 use super::replication_tagging_boundary as tagging_boundary;
 use crate::bucket::replication::ReplicationRuleExt as _;
-use rustfs_filemeta::ReplicationType;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;
