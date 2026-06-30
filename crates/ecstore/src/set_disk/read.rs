@@ -358,6 +358,14 @@ impl MetadataQuorumAccumulator {
         if self.requested_version_id.is_empty() {
             return None;
         }
+        if self.conflicting_metadata
+            || self.delete_marker_seen
+            || self.not_found_responses > 0
+            || self.version_not_found_responses > 0
+            || self.hard_errors > 0
+        {
+            return None;
+        }
         if self.matching_version_votes >= self.read_quorum_for_version() {
             return Some(MetadataEarlyStopDecision {
                 reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM,
@@ -432,6 +440,7 @@ fn metadata_early_stop_candidate_matches(left: &FileInfo, right: &FileInfo) -> b
         && left.parts == right.parts
         && left.checksum == right.checksum
         && left.versioned == right.versioned
+        && left.data_dir == right.data_dir
         && left.erasure.algorithm == right.erasure.algorithm
         && left.erasure.data_blocks == right.erasure.data_blocks
         && left.erasure.parity_blocks == right.erasure.parity_blocks
@@ -728,7 +737,7 @@ async fn submit_read_repair_heal_with_submitter(
         bucket.to_string(),
         Some(object.to_string()),
         false,
-        Some(HealChannelPriority::Normal),
+        Some(HealChannelPriority::Low),
         Some(pool_index),
         Some(set_index),
     );
@@ -2468,10 +2477,13 @@ mod metadata_cache_tests {
     use super::*;
     use rustfs_common::heal_channel::HealAdmissionDropReason;
     use serial_test::serial;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     static SLOW_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
     static DROPPED_READ_REPAIR_SUBMITTER_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static CAPTURED_READ_REPAIR_PRIORITY: Mutex<Option<HealChannelPriority>> = Mutex::new(None);
+    static CAPTURED_READ_REPAIR_CALLS: AtomicUsize = AtomicUsize::new(0);
 
     fn slow_read_repair_submitter(_request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
         SLOW_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -2485,6 +2497,15 @@ mod metadata_cache_tests {
         DROPPED_READ_REPAIR_SUBMITTER_CALLS.fetch_add(1, Ordering::Relaxed);
         Box::pin(async {
             ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Dropped(HealAdmissionDropReason::PolicyDropped))
+        })
+    }
+
+    fn capture_read_repair_submitter(request: rustfs_common::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+        CAPTURED_READ_REPAIR_CALLS.fetch_add(1, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = Some(request.priority);
+        Box::pin(async {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+            ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted)
         })
     }
 
@@ -2669,6 +2690,41 @@ mod metadata_cache_tests {
 
         assert_eq!(DROPPED_READ_REPAIR_SUBMITTER_CALLS.load(Ordering::Relaxed), 1);
         release_read_repair_heal_reservation(&released_key).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn submit_read_repair_heal_uses_low_priority() {
+        CAPTURED_READ_REPAIR_CALLS.store(0, Ordering::Relaxed);
+        *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned") = None;
+        let bucket = format!("bucket-{}", Uuid::new_v4());
+
+        submit_read_repair_heal_with_submitter(
+            ReadRepairHealSubmission {
+                bucket: &bucket,
+                object: "object",
+                version_id: None,
+                pool_index: 0,
+                set_index: 0,
+                part_number: Some(1),
+                reason: "missing_shards",
+            },
+            capture_read_repair_submitter,
+        )
+        .await;
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while CAPTURED_READ_REPAIR_CALLS.load(Ordering::Relaxed) == 0 {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("background read-repair submitter should be called");
+
+        assert_eq!(
+            *CAPTURED_READ_REPAIR_PRIORITY.lock().expect("capture mutex poisoned"),
+            Some(HealChannelPriority::Low)
+        );
     }
 
     #[test]
@@ -3166,6 +3222,21 @@ mod tests {
     }
 
     #[test]
+    fn metadata_quorum_accumulator_falls_back_on_split_data_dir() {
+        let mut accumulator = metadata_early_stop_accumulator();
+        let mut first = metadata_early_stop_candidate("object", 1);
+        let mut second = metadata_early_stop_candidate("object", 2);
+        first.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+        second.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+    }
+
+    #[test]
     fn metadata_quorum_accumulator_falls_back_on_explicit_version_quorum() {
         let mut accumulator = MetadataQuorumAccumulator::new(4, 2, false);
 
@@ -3342,28 +3413,40 @@ mod tests {
     }
 
     #[test]
-    fn version_early_stop_tracks_matching_votes_independently_of_candidate() {
+    fn version_early_stop_falls_back_on_conflicting_metadata() {
         let requested_vid = Uuid::new_v4();
         let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
 
         // Two valid responses with matching version_id but different erasure.index
-        // (so they conflict on the candidate path but still count for version votes)
+        // (so they conflict on the candidate path and must keep the fanout open)
         let mut fi1 = version_early_stop_candidate("object", 1, requested_vid);
         fi1.size = 100;
         let mut fi2 = version_early_stop_candidate("object", 2, requested_vid);
-        fi2.size = 200; // different size → conflicting metadata on candidate path
+        fi2.size = 200;
 
         accumulator.observe_file_info(&fi1);
         accumulator.observe_file_info(&fi2);
 
-        // Candidate path sees conflict, but version path sees quorum
         assert!(accumulator.early_stop_decision().is_none());
-        assert_eq!(
-            accumulator.version_early_stop_decision(),
-            Some(MetadataEarlyStopDecision {
-                reason: GET_METADATA_EARLY_STOP_REASON_VERSION_MATCH_QUORUM
-            })
-        );
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
+    }
+
+    #[test]
+    fn version_early_stop_falls_back_on_split_data_dir() {
+        let requested_vid = Uuid::new_v4();
+        let mut accumulator = version_early_stop_accumulator(&requested_vid.to_string());
+        let mut first = version_early_stop_candidate("object", 1, requested_vid);
+        let mut second = version_early_stop_candidate("object", 2, requested_vid);
+        first.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000001").expect("static uuid should parse"));
+        second.data_dir = Some(Uuid::parse_str("00000000-0000-0000-0000-000000000002").expect("static uuid should parse"));
+
+        accumulator.observe_file_info(&first);
+        accumulator.observe_file_info(&second);
+
+        assert!(accumulator.early_stop_decision().is_none());
+        assert!(accumulator.version_early_stop_decision().is_none());
+        assert_eq!(accumulator.final_miss_reason(), GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA);
     }
 
     fn codec_streaming_test_object_info(fi: &FileInfo) -> ObjectInfo {

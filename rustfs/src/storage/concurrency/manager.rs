@@ -169,6 +169,14 @@ impl ConcurrencyManager {
         self.disk_read_semaphore.acquire().await
     }
 
+    /// Acquire an owned permit to perform a disk read operation.
+    ///
+    /// Use this when the permit must outlive the borrow of the manager, such as
+    /// response body streams that continue after the S3 handler returns.
+    pub async fn acquire_owned_disk_read_permit(&self) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::AcquireError> {
+        self.disk_read_semaphore.clone().acquire_owned().await
+    }
+
     // ============================================
     // Adaptive I/O Strategy Methods
     // ============================================
@@ -724,6 +732,24 @@ mod integration_tests {
 
         assert_eq!(snapshot.active, Some(1));
         assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_concurrency_manager_owned_disk_read_permit_tracks_queue_snapshot() {
+        let manager = ConcurrencyManager::new();
+
+        let permit = manager
+            .acquire_owned_disk_read_permit()
+            .await
+            .expect("owned disk read permit should be acquired");
+        let snapshot = manager.get_object_admission_snapshot();
+
+        assert_eq!(snapshot.active, Some(1));
+        assert_eq!(snapshot.limit, Some(manager.scheduler_config().max_concurrent_reads));
+
+        drop(permit);
+        assert_eq!(manager.get_object_admission_snapshot().active, Some(0));
     }
 
     #[tokio::test]
