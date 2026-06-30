@@ -23,8 +23,8 @@ use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
-        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
-        validate_transition_tier,
+        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
+        validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
