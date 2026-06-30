@@ -1507,7 +1507,7 @@ pub fn resync_target(
 
     if rs.is_none() {
         let reset_before_date = reset_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if !reset_id.is_empty() && mod_time < reset_before_date {
+        if !reset_id.is_empty() && mod_time <= reset_before_date {
             dec.replicate = true;
             return dec;
         }
@@ -1536,7 +1536,7 @@ pub fn resync_target(
         return dec;
     }
 
-    dec.replicate = new_reset && mod_time < reset_before_date;
+    dec.replicate = new_reset && mod_time <= reset_before_date;
 
     dec
 }
@@ -4492,6 +4492,22 @@ mod tests {
             get_replication_action(&source, &target, ReplicationType::ExistingObject),
             ReplicationAction::None,
             "a newer target null-version object should not be overwritten by existing-object replication"
+        );
+    }
+
+    #[test]
+    fn test_resync_target_includes_object_at_reset_before_boundary() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(reset_before),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "reset-1", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(
+            decision.replicate,
+            "objects whose mod_time equals reset_before must be included in the reset window"
         );
     }
 
