@@ -14,7 +14,7 @@
 
 use super::replication_bandwidth_boundary;
 use super::replication_config_store as config_store;
-use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
@@ -1755,7 +1755,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "replication_config_missing",
                 "Skipping replication delete because replication config is missing"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -1766,7 +1766,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
 
@@ -1782,7 +1781,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "replication_config_lookup_failed",
                 "Skipping replication delete because replication config lookup failed"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -1793,7 +1792,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -1881,7 +1879,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "replicate_decision_parse_failed",
                 "Failed to parse replicate decision"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -1892,7 +1890,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -1914,7 +1911,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "ns_lock_unavailable",
                 "Skipping replication delete"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -1925,7 +1922,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -1945,7 +1941,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "write_lock_unavailable",
                 "Skipping replication delete"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -1956,7 +1952,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -1994,7 +1989,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 reason = "target_client_missing",
                 "Skipping replication delete because target client is unavailable"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2005,7 +2000,6 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             continue;
@@ -2248,7 +2242,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 reason = "replication_config_missing",
                 "Skipping replication force-delete because replication config is missing"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2257,7 +2251,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2272,7 +2265,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 reason = "replication_config_lookup_failed",
                 "Skipping replication force-delete because replication config lookup failed"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2281,7 +2274,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2304,7 +2296,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 error = %e,
                 "Skipping replication force-delete"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2313,7 +2305,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2333,7 +2324,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 error = %e,
                 "Skipping replication force-delete"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2342,7 +2333,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             return;
@@ -2371,7 +2361,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                 reason = "target_client_missing",
                 "Skipping replication force-delete because target client is unavailable"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: ObjectInfo {
@@ -2380,7 +2370,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     ..Default::default()
                 },
                 user_agent: "Internal: [Replication]".to_string(),
-                host: runtime_sources::default_local_node_name(),
                 ..Default::default()
             });
             continue;
@@ -2401,7 +2390,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     endpoint = %tgt_client.to_url(),
                     "Skipping replication force-delete"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -2410,7 +2399,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                         ..Default::default()
                     },
                     user_agent: "Internal: [Replication]".to_string(),
-                    host: runtime_sources::default_local_node_name(),
                     ..Default::default()
                 });
                 return;
@@ -2444,7 +2432,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     error = %e,
                     "Replication target operation failed"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationFailed.to_string(),
                     bucket_name: bucket.clone(),
                     object: ObjectInfo {
@@ -2453,7 +2441,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                         ..Default::default()
                     },
                     user_agent: "Internal: [Replication]".to_string(),
-                    host: runtime_sources::default_local_node_name(),
                     ..Default::default()
                 });
             }
@@ -2649,11 +2636,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 reason = "replication_config_missing",
                 "Skipping replication object because replication config is missing"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2669,11 +2655,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 error = %err,
                 "Failed to look up replication config for object replication"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2708,11 +2693,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 reason = "ns_lock_create_failed",
                 "Skipping replication object"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2732,11 +2716,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 reason = "ns_lock_write_lock_failed",
                 "Skipping replication object"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2757,11 +2740,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                 reason = "target_client_missing",
                 "Skipping replication object target"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: roi.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2800,11 +2782,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
                     error = %e,
                     "Replication resync task failed"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: roi.to_object_info(),
-                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -2848,11 +2829,10 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
         EventName::ObjectReplicationFailed.to_string()
     };
 
-    send_event(EventArgs {
+    send_local_event(EventArgs {
         event_name,
         bucket_name: bucket.clone(),
         object: object_info,
-        host: runtime_sources::default_local_node_name(),
         user_agent: "Internal: [Replication]".to_string(),
         ..Default::default()
     });
@@ -2925,11 +2905,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 endpoint = %tgt_client.to_url(),
                 "Skipping replication object target"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -2965,11 +2944,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         "Skipping replication object target"
                     );
 
-                    send_event(EventArgs {
+                    send_local_event(EventArgs {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
-                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -2996,11 +2974,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     reason = "actual_size_unavailable",
                     "Skipping replication object target"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3018,11 +2995,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 reason = "target_bucket_empty",
                 "Skipping replication object target"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3113,11 +3089,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     error = %e,
                     "Replication target operation failed"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3216,11 +3191,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 reason = "target_offline",
                 "Skipped replication because target is offline"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: self.to_object_info(),
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3255,11 +3229,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         reason = "object_reader_unavailable",
                         "Skipped replication because object reader is unavailable"
                     );
-                    send_event(EventArgs {
+                    send_local_event(EventArgs {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: self.to_object_info(),
-                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -3295,11 +3268,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     reason = "actual_size_unavailable",
                     "Skipped replication because actual object size is unavailable"
                 );
-                send_event(EventArgs {
+                send_local_event(EventArgs {
                     event_name: EventName::ObjectReplicationNotTracked.to_string(),
                     bucket_name: bucket.clone(),
                     object: object_info,
-                    host: runtime_sources::default_local_node_name(),
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
@@ -3319,11 +3291,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 reason = "target_bucket_empty",
                 "Skipped replication because target bucket is empty"
             );
-            send_event(EventArgs {
+            send_local_event(EventArgs {
                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                 bucket_name: bucket.clone(),
                 object: object_info,
-                host: runtime_sources::default_local_node_name(),
                 user_agent: "Internal: [Replication]".to_string(),
                 ..Default::default()
             });
@@ -3382,11 +3353,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             reason = "newer_target_version_exists",
                             "Skipping replication because newer target version exists"
                         );
-                        send_event(EventArgs {
+                        send_local_event(EventArgs {
                             event_name: EventName::ObjectReplicationNotTracked.to_string(),
                             bucket_name: bucket.clone(),
                             object: object_info.clone(),
-                            host: runtime_sources::default_local_node_name(),
                             user_agent: "Internal: [Replication]".to_string(),
                             ..Default::default()
                         });
@@ -3445,11 +3415,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                                 reason = "head_object_fallback_failed",
                                 "Failed replication head-object fallback"
                             );
-                            send_event(EventArgs {
+                            send_local_event(EventArgs {
                                 event_name: EventName::ObjectReplicationNotTracked.to_string(),
                                 bucket_name: bucket.clone(),
                                 object: object_info,
-                                host: runtime_sources::default_local_node_name(),
                                 user_agent: "Internal: [Replication]".to_string(),
                                 ..Default::default()
                             });
@@ -3472,11 +3441,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         "Skipped replication because head-object failed"
                     );
 
-                    send_event(EventArgs {
+                    send_local_event(EventArgs {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
-                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });
@@ -3508,11 +3476,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                         error = %e,
                         "Replication target operation failed"
                     );
-                    send_event(EventArgs {
+                    send_local_event(EventArgs {
                         event_name: EventName::ObjectReplicationNotTracked.to_string(),
                         bucket_name: bucket.clone(),
                         object: object_info,
-                        host: runtime_sources::default_local_node_name(),
                         user_agent: "Internal: [Replication]".to_string(),
                         ..Default::default()
                     });

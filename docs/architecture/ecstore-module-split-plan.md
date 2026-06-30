@@ -147,7 +147,7 @@ Required contracts before crate movement:
 - `ReplicationBandwidthLimiter`: target reader wrapping for replication
   bandwidth accounting and throttling.
 - `ReplicationEventSink`: notification/audit events for skipped, failed, and
-  completed replication operations.
+  completed replication operations, including local event host selection.
 - `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
   scheduling without importing lifecycle internals.
 
