@@ -3658,7 +3658,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
-            delete_marker: true,
+            delete_marker: self.delete_marker,
             checksum: self.checksum.clone(),
             ..Default::default()
         }
@@ -4543,6 +4543,25 @@ mod tests {
         let decision = resync_target(&oi, "arn:target", "same-reset", Some(reset_before), ReplicationStatusType::Completed);
 
         assert!(!decision.replicate, "the same completed reset id must not resync again");
+    }
+
+    #[test]
+    fn test_replicate_object_info_to_object_info_preserves_delete_marker_flag() {
+        let live = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            delete_marker: false,
+            ..Default::default()
+        };
+        let delete_marker = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert!(!live.to_object_info().delete_marker);
+        assert!(delete_marker.to_object_info().delete_marker);
     }
 
     #[test]

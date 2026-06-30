@@ -869,6 +869,28 @@ pub fn version_purge_statuses_map(s: &str) -> HashMap<String, VersionPurgeStatus
     targets
 }
 
+fn replication_statuses_string(targets: &HashMap<String, ReplicationStatusType>) -> Option<String> {
+    let mut result = String::new();
+    for (arn, status) in targets {
+        if arn.is_empty() || status.is_empty() {
+            continue;
+        }
+        result.push_str(&format!("{arn}={status};"));
+    }
+    if result.is_empty() { None } else { Some(result) }
+}
+
+fn version_purge_statuses_string(targets: &HashMap<String, VersionPurgeStatusType>) -> Option<String> {
+    let mut result = String::new();
+    for (arn, status) in targets {
+        if arn.is_empty() || status.is_empty() {
+            continue;
+        }
+        result.push_str(&format!("{arn}={status};"));
+    }
+    if result.is_empty() { None } else { Some(result) }
+}
+
 pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationState, _vid: Option<String>) -> ReplicationState {
     let reset_status_map: Vec<(String, String)> = rinfos
         .targets
@@ -877,8 +899,18 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         .map(|t| (target_reset_header(t.arn.as_str()), t.resync_timestamp.clone()))
         .collect();
 
-    let repl_statuses = rinfos.replication_status_internal();
-    let vpurge_statuses = rinfos.version_purge_status_internal();
+    let mut targets = prev_state.targets.clone();
+    for (arn, status) in replication_statuses_map(&rinfos.replication_status_internal().unwrap_or_default()) {
+        targets.insert(arn, status);
+    }
+
+    let mut purge_targets = prev_state.purge_targets.clone();
+    for (arn, status) in version_purge_statuses_map(&rinfos.version_purge_status_internal().unwrap_or_default()) {
+        purge_targets.insert(arn, status);
+    }
+
+    let repl_statuses = replication_statuses_string(&targets);
+    let vpurge_statuses = version_purge_statuses_string(&purge_targets);
 
     let mut reset_statuses_map = prev_state.reset_statuses_map.clone();
     for (key, value) in reset_status_map {
@@ -890,10 +922,10 @@ pub fn get_replication_state(rinfos: &ReplicatedInfos, prev_state: &ReplicationS
         reset_statuses_map,
         replica_timestamp: prev_state.replica_timestamp,
         replica_status: prev_state.replica_status.clone(),
-        targets: replication_statuses_map(&repl_statuses.clone().unwrap_or_default()),
+        targets,
         replication_status_internal: repl_statuses,
         replication_timestamp: rinfos.replication_timestamp,
-        purge_targets: version_purge_statuses_map(&vpurge_statuses.clone().unwrap_or_default()),
+        purge_targets,
         version_purge_status_internal: vpurge_statuses,
 
         ..Default::default()
@@ -956,5 +988,32 @@ mod tests {
         let target_state = state.target_state(arn);
 
         assert_eq!(target_state.resync_timestamp, timestamp);
+    }
+
+    #[test]
+    fn get_replication_state_preserves_untouched_target_statuses() {
+        let target_a = "arn:target:a".to_string();
+        let target_b = "arn:target:b".to_string();
+        let mut prev_state = ReplicationState::default();
+        prev_state.targets.insert(target_a.clone(), ReplicationStatusType::Failed);
+        prev_state.targets.insert(target_b.clone(), ReplicationStatusType::Completed);
+
+        let rinfos = ReplicatedInfos {
+            replication_timestamp: None,
+            targets: vec![ReplicatedTargetInfo {
+                arn: target_a.clone(),
+                replication_status: ReplicationStatusType::Completed,
+                ..Default::default()
+            }],
+        };
+
+        let state = get_replication_state(&rinfos, &prev_state, None);
+
+        assert_eq!(state.targets.get(&target_a), Some(&ReplicationStatusType::Completed));
+        assert_eq!(state.targets.get(&target_b), Some(&ReplicationStatusType::Completed));
+        assert_eq!(
+            replication_statuses_map(&state.replication_status_internal.unwrap_or_default()).get(&target_b),
+            Some(&ReplicationStatusType::Completed)
+        );
     }
 }
