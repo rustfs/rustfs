@@ -14,8 +14,12 @@
 
 use std::sync::Arc;
 
-use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys, TargetClient};
+use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
 use crate::bucket::target::BucketTargets;
+
+pub(crate) use crate::bucket::bucket_target_sys::{
+    AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+};
 
 pub(crate) async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets, BucketTargetError> {
     BucketTargetSys::get().list_bucket_targets(bucket).await

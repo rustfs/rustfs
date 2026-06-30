@@ -19,12 +19,12 @@ use super::replication_lock_boundary as lock_boundary;
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
 use super::replication_tagging_boundary as tagging_boundary;
-use super::replication_target_boundary as target_boundary;
-use super::replication_versioning_boundary as versioning_boundary;
-use super::runtime_boundary as runtime_sources;
-use crate::bucket::bucket_target_sys::{
+use super::replication_target_boundary;
+use super::replication_target_boundary::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
+use super::replication_versioning_boundary as versioning_boundary;
+use super::runtime_boundary as runtime_sources;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use crate::bucket::target::BucketTargets;
@@ -875,7 +875,7 @@ impl ReplicationResyncer {
             }
         };
 
-        let targets = match target_boundary::list_bucket_targets(&opts.bucket).await {
+        let targets = match replication_target_boundary::list_bucket_targets(&opts.bucket).await {
             Ok(targets) => targets,
             Err(err) => {
                 debug!(
@@ -920,7 +920,7 @@ impl ReplicationResyncer {
             return;
         }
 
-        let Some(target_client) = target_boundary::remote_target_client(&opts.bucket, &target_arns[0]).await else {
+        let Some(target_client) = replication_target_boundary::remote_target_client(&opts.bucket, &target_arns[0]).await else {
             error!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1675,7 +1675,7 @@ pub async fn check_replicate_delete(
             continue;
         }
 
-        let tgt = target_boundary::remote_target_client(bucket, &tgt_arn).await;
+        let tgt = replication_target_boundary::remote_target_client(bucket, &tgt_arn).await;
         // The target online status should not be used here while deciding
         // whether to replicate deletes as the target could be temporarily down
         let tgt_dsc = if let Some(tgt) = tgt {
@@ -1800,7 +1800,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     let mut dsc = ReplicateDecision::default();
 
     for arn in arns {
-        let cli = target_boundary::remote_target_client(bucket, &arn).await;
+        let cli = replication_target_boundary::remote_target_client(bucket, &arn).await;
 
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
@@ -2067,7 +2067,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // Get the remote target client
-        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = replication_target_boundary::remote_target_client(&bucket, &tgt_entry.arn).await else {
             debug!(
                 event = EVENT_REPLICATION_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2293,7 +2293,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
             continue;
         }
-        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = replication_target_boundary::remote_target_client(bucket, &tgt_entry.arn).await else {
             continue;
         };
 
@@ -2444,7 +2444,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = target_boundary::remote_target_client(bucket, &arn).await else {
+        let Some(tgt_client) = replication_target_boundary::remote_target_client(bucket, &arn).await else {
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2473,7 +2473,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         let object_name = object_name.clone();
 
         join_set.spawn(async move {
-            if target_boundary::target_is_offline(&tgt_client).await {
+            if replication_target_boundary::target_is_offline(&tgt_client).await {
                 error!(
                     event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2601,7 +2601,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if target_boundary::target_is_offline(&tgt_client).await {
+    if replication_target_boundary::target_is_offline(&tgt_client).await {
         if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
@@ -2830,7 +2830,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = target_boundary::remote_target_client(&bucket, &arn).await else {
+        let Some(tgt_client) = replication_target_boundary::remote_target_client(&bucket, &arn).await else {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2988,7 +2988,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if target_boundary::target_is_offline(&tgt_client).await {
+        if replication_target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3275,7 +3275,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        if target_boundary::target_is_offline(&tgt_client).await {
+        if replication_target_boundary::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
