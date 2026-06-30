@@ -135,8 +135,10 @@ python3 scripts/table-catalog/pyiceberg_smoke.py --print-production-readiness
 
 Use these outputs when updating release notes, PR descriptions, or follow-up
 work items. They are intentionally conservative: only PyIceberg is automated by
-this script today. Spark now has generated configuration and SQL smoke input;
-other engines are documented until a repeatable harness is added.
+this script today. Spark has a repeatable manual/live harness with pinned
+client package inputs, generated configuration, generated SQL, expected
+results, and a CI opt-in gate; other engines are documented until a repeatable
+harness is added.
 
 Vendor profiles are machine-readable connection references. They include the
 catalog URI shape, warehouse shape, signing name, credential model, namespace
@@ -187,6 +189,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --table-bucket analytics \
   --print-spark-config
 python3 scripts/table-catalog/engine_compatibility.py --print-spark-sql --cleanup
+python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
 ```
 
 The production failure helper records the negative coverage required before
@@ -233,7 +236,7 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 | Client | Current status | Claim |
 |---|---|---|
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
-| Spark Iceberg REST catalog | Generated smoke harness | configuration and SQL can be generated for create namespace, create table, append, reload, count, and cleanup against a running RustFS endpoint |
+| Spark Iceberg REST catalog | Manual/live harness | pinned Spark and Iceberg package inputs, configuration, SQL, run command, expected row count, and cleanup can be generated for a running RustFS endpoint; CI execution is opt-in |
 | Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
 | DuckDB Iceberg | Documented, not automated | read-path reference only |
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
@@ -327,11 +330,37 @@ RUSTFS_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS=900
 
 The TTL is clamped to the supported short-lived range by the server.
 
-## Spark Manual Baseline
+## Spark Manual/Live Harness
 
 Spark validation should use the same RustFS endpoint and warehouse bucket as the
-PyIceberg smoke test. The exact Spark and Iceberg package versions should be
-recorded in the client matrix after each run.
+PyIceberg smoke test. The harness records default pinned client package inputs,
+the exact command shape, and the expected row count. It is manual by default and
+should only run in CI when explicitly gated with
+`RUSTFS_TABLE_CATALOG_LIVE_CONFORMANCE=1`.
+
+Generate the full live harness document:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --access-key rustfsadmin \
+  --secret-key rustfsadmin \
+  --pyiceberg-version 0.10.0 \
+  --spark-version 3.5.4 \
+  --iceberg-version 1.7.1 \
+  --print-live-conformance \
+  --cleanup
+```
+
+The output includes:
+
+- PyIceberg install and smoke commands
+- Spark package coordinates for `iceberg-spark-runtime` and `iceberg-aws-bundle`
+- Spark REST catalog properties
+- generated Spark SQL
+- a `spark-sql` command using the generated properties
+- expected `row_count=2` before optional cleanup
 
 Generate the configuration properties:
 
@@ -373,6 +402,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
 ```
 
 The generated SQL covers namespace creation, table creation, append, refresh,
-count, and optional cleanup. Until Spark execution is automated in CI, do not
-claim Spark support beyond a manually verified run with the exact Spark and
-Iceberg versions recorded.
+count, and optional cleanup. Until Spark execution is enabled in CI through the
+explicit live-conformance gate, do not claim Spark support beyond a manually
+verified run with the exact RustFS build, Spark version, Iceberg version, and
+expected output recorded.
