@@ -3436,10 +3436,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 rinfo.replication_status = ReplicationStatusType::Completed;
                 if replication_action == ReplicationAction::None {
                     if self.op_type == ReplicationType::ExistingObject
-                        && object_info.mod_time
-                            > oi.last_modified
-                                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-                        && object_info.version_id.is_none()
+                        && target_is_newer_than_source_null_version(&object_info, &oi)
                     {
                         warn!(
                             event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -3449,7 +3446,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             object = %object,
                             arn = %tgt_client.arn,
                             endpoint = %tgt_client.to_url(),
-                            reason = "newer_target_version_exists",
+                            reason = "target_newer_than_source_null_version",
                             "Skipping replication because newer target version exists"
                         );
                         send_event(EventArgs {
@@ -4091,14 +4088,15 @@ async fn replicate_object_with_multipart<S: EcstoreObjectIO>(ctx: MultipartRepli
     Ok(())
 }
 
-fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
-    if op_type == ReplicationType::ExistingObject
-        && oi1.mod_time
-            > oi2
-                .last_modified
-                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+fn target_is_newer_than_source_null_version(oi1: &ObjectInfo, oi2: &HeadObjectOutput) -> bool {
+    oi2.last_modified
+        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+        .is_some_and(|target_mod_time| target_mod_time > oi1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))
         && oi1.version_id.is_none()
-    {
+}
+
+fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
+    if op_type == ReplicationType::ExistingObject && target_is_newer_than_source_null_version(oi1, oi2) {
         return ReplicationAction::None;
     }
 
@@ -4201,8 +4199,9 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_types::DateTime;
     use std::collections::HashMap;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
     #[test]
@@ -4461,6 +4460,38 @@ mod tests {
         assert!(
             !heal_should_use_check_replicate_delete(&oi),
             "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
+        );
+    }
+
+    #[test]
+    fn test_get_replication_action_existing_object_source_newer_null_version_requires_replication() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(10)).build();
+
+        assert_eq!(
+            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::All,
+            "a newer source null version must not be skipped during existing-object replication"
+        );
+    }
+
+    #[test]
+    fn test_get_replication_action_existing_object_target_newer_null_version_skips() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(20)).build();
+
+        assert_eq!(
+            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::None,
+            "a newer target null-version object should not be overwritten by existing-object replication"
         );
     }
 
