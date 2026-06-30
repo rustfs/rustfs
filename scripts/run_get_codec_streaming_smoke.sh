@@ -830,10 +830,13 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_ROLLOUT="$rollout_target"
     export RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED="$body_compat_confirmed"
     export RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED="$header_compat_confirmed"
-    export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
-    export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
+    RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
+    export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE
+    RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
+    export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
-    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
+    RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
+    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
@@ -841,7 +844,8 @@ start_server() {
       export RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES"
     fi
     if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY" ]]; then
-      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY="$(bool_from_on_off "$GET_SMALL_OBJECT_DIRECT_MEMORY")"
+      RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY="$(bool_from_on_off "$GET_SMALL_OBJECT_DIRECT_MEMORY")"
+      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY
     fi
     if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
       export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD"
@@ -3115,7 +3119,7 @@ write_default_switch_readiness_report() {
 
   local stable not_worse improved_over_five two_sizes_gt_five
   local headers_compatible p95_p99_ok cpu_rss_ok runtime_metrics_ok fallback_proven kill_switch_verified correctness_matrix_ok
-  local all_pass decision
+  local decision
 
   if [[ -f "$baseline_compare_path" ]]; then
     read -r stable not_worse improved_over_five < <(
@@ -3218,10 +3222,8 @@ PY
      && "$headers_compatible" == "pass" \
      && "$fallback_proven" == "pass" \
      && "$kill_switch_verified" == "pass" ]]; then
-    all_pass="pass"
     decision="Default enablement prerequisites passed; scoped default enablement may be considered."
   else
-    all_pass="fail"
     decision="Default enablement is not ready; keep opt-in only."
   fi
 

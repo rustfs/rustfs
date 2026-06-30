@@ -485,7 +485,7 @@ run_one_attempt() {
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("--insecure")
     fi
-    if [[ ${EXTRA_ARGS[@]+_} ]]; then
+    if ((${#EXTRA_ARGS[@]} > 0)); then
       cmd+=("${EXTRA_ARGS[@]}")
     fi
 
@@ -516,7 +516,7 @@ run_one_attempt() {
     if [[ "$INSECURE" == "true" ]]; then
       cmd+=("-insecure")
     fi
-    if [[ ${EXTRA_ARGS[@]+_} ]]; then
+    if ((${#EXTRA_ARGS[@]} > 0)); then
       cmd+=("${EXTRA_ARGS[@]}")
     fi
 
