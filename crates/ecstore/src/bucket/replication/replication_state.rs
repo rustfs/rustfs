@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use super::runtime_boundary as runtime_sources;
 use crate::error::Error;
-use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;

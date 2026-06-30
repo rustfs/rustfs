@@ -15,6 +15,12 @@
 use super::replication_bandwidth_boundary;
 use super::replication_config_store as config_store;
 use super::replication_event_sink::{EventArgs, send_event};
+use super::replication_filemeta_boundary::{
+    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
+    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
+    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
+    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+};
 use super::replication_lock_boundary as lock_boundary;
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
@@ -49,12 +55,6 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 use regex::Regex;
 use rmp_serde;
-use rustfs_filemeta::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
-    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
-    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
-    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
-};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
@@ -1262,7 +1262,7 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
             version_id: self.delete_object.version_id,
             retry_count: 0,
             size: 0,
-            op: rustfs_filemeta::MrfOpKind::Delete,
+            op: MrfOpKind::Delete,
             delete_marker_version_id: self.delete_object.delete_marker_version_id,
             delete_marker: self.delete_object.delete_marker,
         }

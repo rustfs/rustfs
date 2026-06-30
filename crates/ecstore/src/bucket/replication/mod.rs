@@ -17,6 +17,7 @@ pub mod datatypes;
 mod replication_bandwidth_boundary;
 mod replication_config_store;
 mod replication_event_sink;
+mod replication_filemeta_boundary;
 mod replication_lock_boundary;
 mod replication_metadata_boundary;
 mod replication_msgp_boundary;

@@ -13,6 +13,11 @@
 // limitations under the License.
 
 use super::replication_config_store as config_store;
+use super::replication_filemeta_boundary::{
+    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
+    ReplicateObjectInfo, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+    ResyncDecision, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+};
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
 use super::replication_target_boundary as target_boundary;
@@ -29,19 +34,6 @@ use crate::bucket::replication::replication_resyncer::{
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::error::Error as EcstoreError;
 use lazy_static::lazy_static;
-use rustfs_filemeta::MrfOpKind;
-use rustfs_filemeta::MrfReplicateEntry;
-use rustfs_filemeta::ReplicateDecision;
-use rustfs_filemeta::ReplicateObjectInfo;
-use rustfs_filemeta::ReplicatedTargetInfo;
-use rustfs_filemeta::ReplicationStatusType;
-use rustfs_filemeta::ReplicationType;
-use rustfs_filemeta::ReplicationWorkerOperation;
-use rustfs_filemeta::ResyncDecision;
-use rustfs_filemeta::VersionPurgeStatusType;
-use rustfs_filemeta::replication_statuses_map;
-use rustfs_filemeta::version_purge_statuses_map;
-use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
