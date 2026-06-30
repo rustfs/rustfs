@@ -2184,18 +2184,19 @@ fi
       $comment =~ s/[^\n]/ /g;
       $comment;
     }egs;
-    while ($source =~ /^[[:space:]]*pub\(crate\)\s+use\s+storage_api::([^;]+);/mg) {
+    while ($source =~ /^[[:space:]]*pub(?:\(crate\))?\s+use\s+storage_api::([^;]+);/mg) {
+      my $start = $-[0];
       my $body = $1;
-      next unless $body =~ /\b(ObjectStoreResolver|set_object_store_resolver|ecstore_global)\b/;
-      my $prefix = substr($source, 0, $-[0]);
+      next unless $body =~ /\b(ObjectStoreResolver|set_object_store_resolver|ecstore_global|get_global_[A-Za-z0-9_]+|set_global_[A-Za-z0-9_]+|global_rustfs_port|is_dist_erasure|shutdown_background_services|update_erasure_type|init_global_config_sys|new_global_notification_sys|set_workload_admission_snapshot_provider|register_event_dispatch_hook|reload_transition_tier_config|replication_queue_current_count|bucket_metadata_runtime_initialized)\b/;
+      my $prefix = substr($source, 0, $start);
       my $line = ($prefix =~ tr/\n//) + 1;
-      print "$ARGV:$line:storage_api root re-export includes object-store resolver or raw ECStore global facade\n";
+      print "$ARGV:$line:storage_api root re-export includes runtime/global facade symbols\n";
     }
   ' rustfs/src/storage/mod.rs || true
 ) >"$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE"
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE" ]]; then
-  report_failure "RustFS storage owner root must not re-export object-store resolver or raw ECStore global facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE")"
+  report_failure "RustFS storage owner root must not re-export ECStore runtime/global facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE")"
 fi
 
 (
