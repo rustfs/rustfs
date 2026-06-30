@@ -64,8 +64,8 @@ use rustfs_filemeta::{
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
-    BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
-    RestoreRequestType, RestoreStatus, Timestamp,
+    BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ObjectLockConfiguration, ReplicationConfiguration,
+    RestoreRequest, RestoreRequestType, RestoreStatus, Timestamp,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_SERVER_SIDE_ENCRYPTION};
 use sha2::{Digest, Sha256};
@@ -1952,7 +1952,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
 
     let object_opts = object_infos
         .iter()
-        .map(|object| object.to_lifecycle_opts())
+        .map(ObjectOpts::from_object_info)
         .collect::<Vec<ObjectOpts>>();
     let Ok(events) = Evaluator::new(Arc::new(lifecycle))
         .with_lock_retention(lock_config)
@@ -2055,20 +2055,116 @@ async fn apply_existing_object_expiry(api: Arc<ECStore>, object: &ObjectInfo, ev
     }
 }
 
+async fn enqueue_expiry_for_existing_object_group(
+    api: Arc<ECStore>,
+    bucket: &str,
+    lc: Arc<BucketLifecycleConfiguration>,
+    lock_config: Option<Arc<ObjectLockConfiguration>>,
+    replication: Option<Arc<replication_sink::LifecycleReplicationConfig>>,
+    object_infos: &[ObjectInfo],
+    src: &LcEventSrc,
+    defer_date_expiry_once: bool,
+    date_expiry_deferred_once: &mut bool,
+) {
+    if object_infos.is_empty() {
+        return;
+    }
+
+    let object_opts = object_infos
+        .iter()
+        .map(ObjectOpts::from_object_info)
+        .collect::<Vec<ObjectOpts>>();
+    let events = match Evaluator::new(lc.clone())
+        .with_lock_retention(lock_config)
+        .with_replication_config(replication)
+        .eval(&object_opts)
+        .await
+    {
+        Ok(events) => events,
+        Err(err) => {
+            warn!(
+                bucket,
+                object = %object_infos[0].name,
+                error = %err,
+                "failed to evaluate lifecycle events for existing object versions"
+            );
+            return;
+        }
+    };
+
+    let mut to_delete_objs = Vec::new();
+    let mut noncurrent_event = None;
+
+    for (object, event) in object_infos.iter().zip(events.iter()) {
+        match event.action {
+            IlmAction::DeleteAction
+            | IlmAction::DeleteVersionAction
+            | IlmAction::DeleteRestoredAction
+            | IlmAction::DeleteRestoredVersionAction
+            | IlmAction::DeleteAllVersionsAction
+            | IlmAction::DelMarkerDeleteAllVersionsAction => {
+                let now = OffsetDateTime::now_utc();
+                if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
+                    if defer_date_expiry_once
+                        && !*date_expiry_deferred_once
+                        && lifecycle_rule_has_date_expiration(&lc, &event.rule_id)
+                    {
+                        tokio::time::sleep(StdDuration::from_secs(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS as u64)).await;
+                        *date_expiry_deferred_once = true;
+                    }
+
+                    if event.action == IlmAction::DeleteVersionAction {
+                        to_delete_objs.push(ObjectToDelete {
+                            object_name: object.name.clone(),
+                            version_id: object.version_id,
+                            ..Default::default()
+                        });
+                        if noncurrent_event.is_none() {
+                            noncurrent_event = Some(event.clone());
+                        }
+                    } else {
+                        apply_existing_object_expiry(api.clone(), object, event, src).await;
+                    }
+                } else {
+                    apply_expiry_rule(event, src, object).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if !to_delete_objs.is_empty()
+        && let Some(event) = noncurrent_event
+    {
+        let expiry_state = runtime_sources::expiry_state_handle();
+        expiry_state
+            .write()
+            .await
+            .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
+            .await;
+    }
+}
+
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
     let Ok((lc, _)) = metadata_boundary::get_lifecycle_config(bucket).await else {
         return Ok(());
     };
-    let lock_retention = metadata_boundary::get_object_lock_config(bucket)
+    let lc = Arc::new(lc);
+    let lock_config = metadata_boundary::get_object_lock_config(bucket)
         .await
         .ok()
-        .and_then(|(cfg, _)| cfg.rule.and_then(|rule| rule.default_retention));
-    let replication_config = metadata_boundary::get_replication_config(bucket).await.ok();
+        .map(|(cfg, _)| Arc::new(cfg));
+    let replication = match metadata_boundary::get_replication_config(bucket).await {
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(replication_sink::new_replication_config(cfg))),
+        _ => None,
+    };
     let mut marker = None;
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;
     let defer_date_expiry_once = should_defer_date_expiry_for_recent_config_update(&lc, OffsetDateTime::now_utc());
     let mut date_expiry_deferred_once = false;
+    let mut pending_group = Vec::new();
+    let mut pending_object = None::<String>;
 
     loop {
         let page = api
@@ -2076,34 +2172,39 @@ pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str
             .list_object_versions(bucket, "", marker.clone(), version_marker.clone(), None, 1000)
             .await?;
 
-        for object in &page.objects {
-            let event = eval_action_from_lifecycle(&lc, lock_retention.clone(), replication_config.clone(), object).await;
-            match event.action {
-                IlmAction::DeleteAction
-                | IlmAction::DeleteVersionAction
-                | IlmAction::DeleteRestoredAction
-                | IlmAction::DeleteRestoredVersionAction
-                | IlmAction::DeleteAllVersionsAction
-                | IlmAction::DelMarkerDeleteAllVersionsAction => {
-                    let now = OffsetDateTime::now_utc();
-                    if event.due.is_some_and(|due| due.unix_timestamp() <= now.unix_timestamp()) {
-                        if defer_date_expiry_once
-                            && !date_expiry_deferred_once
-                            && lifecycle_rule_has_date_expiration(&lc, &event.rule_id)
-                        {
-                            tokio::time::sleep(StdDuration::from_secs(DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS as u64)).await;
-                            date_expiry_deferred_once = true;
-                        }
-                        apply_existing_object_expiry(api.clone(), object, &event, &src).await;
-                    } else {
-                        apply_expiry_rule(&event, &src, object).await;
-                    }
-                }
-                _ => {}
+        for object in page.objects {
+            if pending_object.as_ref().is_some_and(|name| name != &object.name) {
+                enqueue_expiry_for_existing_object_group(
+                    api.clone(),
+                    bucket,
+                    lc.clone(),
+                    lock_config.clone(),
+                    replication.clone(),
+                    &pending_group,
+                    &src,
+                    defer_date_expiry_once,
+                    &mut date_expiry_deferred_once,
+                )
+                .await;
+                pending_group.clear();
             }
+            pending_object = Some(object.name.clone());
+            pending_group.push(object);
         }
 
         if !page.is_truncated {
+            enqueue_expiry_for_existing_object_group(
+                api.clone(),
+                bucket,
+                lc.clone(),
+                lock_config.clone(),
+                replication.clone(),
+                &pending_group,
+                &src,
+                defer_date_expiry_once,
+                &mut date_expiry_deferred_once,
+            )
+            .await;
             return Ok(());
         }
 

@@ -441,7 +441,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
         event.unwrap_or_default()
     }
 
-    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, _newer_noncurrent_versions: usize) -> Event {
+    async fn eval_inner(&self, obj: &ObjectOpts, now: OffsetDateTime, newer_noncurrent_versions: usize) -> Event {
         let mut events = Vec::<Event>::new();
         debug!(
             "eval_inner: object={}, mod_time={:?}, successor_mod_time={:?}, now={:?}, is_latest={}, delete_marker={}",
@@ -526,8 +526,8 @@ impl Lifecycle for BucketLifecycleConfiguration {
 
                 if !obj.is_latest
                     && let Some(ref noncurrent_version_expiration) = rule.noncurrent_version_expiration
-                    && let Some(newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions
-                    && newer_noncurrent_versions > 0
+                    && let Some(retain_newer_noncurrent_versions) = noncurrent_version_expiration.newer_noncurrent_versions
+                    && newer_noncurrent_versions < retain_newer_noncurrent_versions as usize
                 {
                     continue;
                 }
@@ -1660,6 +1660,60 @@ mod tests {
         assert_eq!(event.rule_id, "noncurrent-limit");
         assert_eq!(event.noncurrent_days, 7);
         assert_eq!(event.newer_noncurrent_versions, 3);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn evaluator_honors_newer_noncurrent_versions_retention_count() {
+        let base_time = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = Arc::new(BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("retain-two-noncurrent".to_string()),
+                noncurrent_version_expiration: Some(s3s::dto::NoncurrentVersionExpiration {
+                    noncurrent_days: Some(1),
+                    newer_noncurrent_versions: Some(2),
+                }),
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        });
+        let mut objs = vec![ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(base_time + Duration::days(4)),
+            successor_mod_time: None,
+            is_latest: true,
+            version_id: Some(Uuid::new_v4()),
+            num_versions: 5,
+            ..Default::default()
+        }];
+        for days_ago in (0..4).rev() {
+            objs.push(ObjectOpts {
+                name: "obj".to_string(),
+                mod_time: Some(base_time + Duration::days(days_ago)),
+                successor_mod_time: Some(base_time + Duration::days(days_ago + 1)),
+                is_latest: false,
+                version_id: Some(Uuid::new_v4()),
+                num_versions: 5,
+                ..Default::default()
+            });
+        }
+
+        let events = crate::bucket::lifecycle::evaluator::Evaluator::new(lc)
+            .eval(&objs)
+            .await
+            .expect("version group should evaluate");
+
+        assert_eq!(events[1].action, IlmAction::NoneAction);
+        assert_eq!(events[2].action, IlmAction::NoneAction);
+        assert_eq!(events[3].action, IlmAction::DeleteVersionAction);
+        assert_eq!(events[4].action, IlmAction::DeleteVersionAction);
     }
 
     #[tokio::test]
