@@ -3142,6 +3142,32 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
+            if let Some(old_data_dir) = has_old_data_dir
+                && let Some(dst_buf) = has_dst_buf.as_ref()
+                && let Err(err) = self
+                    .write_all_private(
+                        dst_volume,
+                        &format!("{}/{}/{}", &dst_path, &old_data_dir, STORAGE_FORMAT_FILE_BACKUP),
+                        dst_buf.clone().into(),
+                        true,
+                        &skip_parent,
+                    )
+                    .await
+            {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "write_old_metadata_backup_failed",
+                    error = ?err,
+                    "Disk local rename flow failed"
+                );
+                return Err(err);
+            }
+
             if let Err(err) = rename_all(&src_file_path, &dst_file_path, &skip_parent).await {
                 if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
                     let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
@@ -3153,29 +3179,6 @@ impl DiskAPI for LocalDisk {
                     reason = "rename_all_metadata_failed",
                     src_path = ?src_file_path,
                     dst_path = ?dst_file_path,
-                    error = ?err,
-                    "Disk local rename flow failed"
-                );
-                return Err(err);
-            }
-
-            if let Some(old_data_dir) = has_old_data_dir
-                && let Some(dst_buf) = has_dst_buf
-                && let Err(err) = self
-                    .write_all_private(
-                        dst_volume,
-                        &format!("{}/{}/{}", &dst_path, &old_data_dir.to_string(), STORAGE_FORMAT_FILE),
-                        dst_buf.into(),
-                        true,
-                        &skip_parent,
-                    )
-                    .await
-            {
-                info!(
-                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                    reason = "write_old_metadata_failed",
                     error = ?err,
                     "Disk local rename flow failed"
                 );
@@ -3240,6 +3243,17 @@ impl DiskAPI for LocalDisk {
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
+                if let Some(old_dir) = old_data_dir.as_ref()
+                    && let Some(ref buf) = has_dst_buf
+                    && let Some(dst_parent) = dst.parent()
+                {
+                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP);
+                    if let Some(old_parent) = old_path.parent() {
+                        std::fs::create_dir_all(old_parent)?;
+                    }
+                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
+                }
+
                 match std::fs::rename(&src, &dst) {
                     Ok(()) => Ok(()),
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound && !src.exists() => Ok(()),
@@ -3252,17 +3266,6 @@ impl DiskAPI for LocalDisk {
                     }
                     Err(err) => Err(to_file_error(err)),
                 }?;
-
-                if let Some(old_dir) = old_data_dir.as_ref()
-                    && let Some(ref buf) = has_dst_buf
-                    && let Some(dst_parent) = dst.parent()
-                {
-                    let old_path = dst_parent.join(old_dir.to_string()).join(STORAGE_FORMAT_FILE);
-                    if let Some(old_parent) = old_path.parent() {
-                        std::fs::create_dir_all(old_parent)?;
-                    }
-                    std::fs::write(&old_path, buf).map_err(to_file_error)?;
-                }
 
                 Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
             })
@@ -3643,10 +3646,7 @@ impl DiskAPI for LocalDisk {
                 file_path.as_path(),
                 Path::new(format!("{old_data_dir}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE_BACKUP}").as_str()),
             ]);
-            let dst_path = path_join(&[
-                file_path.as_path(),
-                Path::new(format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str()),
-            ]);
+            let dst_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
             return rename_all(&src_path, &dst_path, file_path).await;
         }
 
