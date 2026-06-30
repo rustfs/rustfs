@@ -107,6 +107,34 @@ fn get_direct_io_read_threshold() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
 }
 
+#[cfg(test)]
+static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn set_rename_data_fail_before_old_metadata_backup(dst_path: &str) {
+    *RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+        .lock()
+        .expect("test failpoint lock should not be poisoned") = Some(dst_path.to_string());
+}
+
+#[cfg(test)]
+fn should_fail_before_old_metadata_backup(dst_path: &str) -> bool {
+    let mut target = RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
+        .lock()
+        .expect("test failpoint lock should not be poisoned");
+    if target.as_deref() == Some(dst_path) {
+        target.take();
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(not(test))]
+fn should_fail_before_old_metadata_backup(_dst_path: &str) -> bool {
+    false
+}
+
 fn log_startup_disk_io_error(stage: &str, path: &Path, err: &IoError) {
     warn!(
         event = EVENT_DISK_LOCAL_STARTUP_CLEANUP,
@@ -3142,6 +3170,20 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
+            if should_fail_before_old_metadata_backup(dst_path) {
+                if let Some((_, dst_data_path)) = has_data_dir_path.as_ref() {
+                    let _ = self.delete_file(&dst_volume_dir, dst_data_path, false, false).await;
+                }
+                info!(
+                    event = EVENT_DISK_LOCAL_RENAME_REJECTED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    reason = "test_fail_before_old_metadata_backup",
+                    "Disk local rename flow failed before metadata commit"
+                );
+                return Err(DiskError::Unexpected);
+            }
+
             if let Some(old_data_dir) = has_old_data_dir
                 && let Some(dst_buf) = has_dst_buf.as_ref()
                 && let Err(err) = self
@@ -4033,6 +4075,60 @@ mod test {
             .expect("restored metadata should be readable");
         assert_eq!(restored_meta, old_meta);
         assert!(!object_dir.join("dir/object").join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_failure_before_metadata_commit_preserves_old_metadata() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "failpoint-object";
+        let tmp_object = "tmp-object";
+        let version_id = Uuid::parse_str("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("cccccccc-cccc-cccc-cccc-cccccccccccc").expect("version id should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let old_meta = test_meta(old_fi);
+        let object_dir = dir.path().join(bucket).join(object);
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = dir
+            .path()
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new-data")
+            .await
+            .expect("new tmp data should be written");
+
+        set_rename_data_fail_before_old_metadata_backup(object);
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let result = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)
+            .await;
+
+        assert!(result.is_err());
+        let current_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("old metadata should still be readable");
+        assert_eq!(current_meta, old_meta);
+        assert!(!object_dir.join("object").join(STORAGE_FORMAT_FILE).exists());
     }
 
     #[tokio::test]
