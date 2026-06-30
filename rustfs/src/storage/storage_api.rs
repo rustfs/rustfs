@@ -376,14 +376,16 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
-        get_global_lock_clients, get_global_region, global_rustfs_port, is_dist_erasure, set_global_endpoints, set_global_region,
-        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
+        set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver, shutdown_background_services,
+        update_erasure_type,
     };
 }
 
 pub(crate) mod ecstore_runtime {
-    pub(crate) use rustfs_ecstore::api::runtime::{boot_time, global_tier_config_mgr};
+    pub(crate) use rustfs_ecstore::api::runtime::{
+        boot_time, bucket_monitor, deployment_id, endpoint_pools, global_lock_client, global_lock_clients,
+        global_tier_config_mgr, region, rustfs_port, setup_is_dist_erasure,
+    };
 }
 
 #[allow(unused_imports)]
@@ -1083,32 +1085,32 @@ pub(crate) fn is_all_buckets_not_found(errs: &[Option<DiskError>]) -> bool {
 }
 
 pub(crate) fn get_global_lock_client() -> Option<Arc<dyn rustfs_lock::client::LockClient>> {
-    ecstore_global::get_global_lock_client()
+    ecstore_runtime::global_lock_client()
 }
 
 pub(crate) fn get_global_lock_clients()
 -> Option<&'static std::collections::HashMap<String, Arc<dyn rustfs_lock::client::LockClient>>> {
-    ecstore_global::get_global_lock_clients()
+    ecstore_runtime::global_lock_clients()
 }
 
 pub(crate) fn get_global_bucket_monitor() -> Option<Arc<BucketBandwidthMonitor>> {
-    ecstore_global::get_global_bucket_monitor()
+    ecstore_runtime::bucket_monitor()
 }
 
 pub(crate) fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    ecstore_global::get_global_endpoints_opt()
+    ecstore_runtime::endpoint_pools()
 }
 
 pub(crate) fn get_global_deployment_id() -> Option<String> {
-    ecstore_global::get_global_deployment_id()
+    ecstore_runtime::deployment_id()
 }
 
 pub(crate) fn get_global_region() -> Option<s3s::region::Region> {
-    ecstore_global::get_global_region()
+    ecstore_runtime::region()
 }
 
 pub(crate) fn global_rustfs_port() -> u16 {
-    ecstore_global::global_rustfs_port()
+    ecstore_runtime::rustfs_port()
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
@@ -1130,7 +1132,7 @@ pub(crate) fn get_global_notification_sys() -> Option<&'static NotificationSys> 
 }
 
 pub(crate) async fn is_dist_erasure() -> bool {
-    ecstore_global::is_dist_erasure().await
+    ecstore_runtime::setup_is_dist_erasure().await
 }
 
 pub(crate) async fn collect_local_metrics(
