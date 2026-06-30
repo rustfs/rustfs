@@ -29,12 +29,12 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertContainsScenario(pyiceberg, "drop-table", "automated-with-cleanup")
 
         spark = by_client["Spark Iceberg REST catalog"]
-        self.assertEqual(spark["status"], "generated-smoke-harness")
-        self.assertContainsScenario(spark, "create-namespace", "generated-spark-sql")
-        self.assertContainsScenario(spark, "create-table", "generated-spark-sql")
-        self.assertContainsScenario(spark, "append", "generated-spark-sql")
-        self.assertContainsScenario(spark, "reload-table", "generated-spark-sql")
-        self.assertContainsScenario(spark, "drop-table", "generated-spark-sql")
+        self.assertEqual(spark["status"], "manual-live-harness")
+        self.assertContainsScenario(spark, "create-namespace", "manual-live-harness")
+        self.assertContainsScenario(spark, "create-table", "manual-live-harness")
+        self.assertContainsScenario(spark, "append", "manual-live-harness")
+        self.assertContainsScenario(spark, "reload-table", "manual-live-harness")
+        self.assertContainsScenario(spark, "drop-table", "manual-live-harness")
         self.assertContainsScenario(spark, "commit-conflict", "manual-validation-required")
 
         trino = by_client["Trino Iceberg REST catalog"]
@@ -209,6 +209,86 @@ class EngineCompatibilityTest(unittest.TestCase):
 
         self.assertEqual(config["spark.sql.catalog.rustfs.uri"], "http://127.0.0.1:9000/_iceberg")
         self.assertEqual(config["spark.sql.catalog.rustfs.rest.signing-name"], "s3tables")
+
+    def test_live_conformance_harness_pins_clients_and_records_commands(self) -> None:
+        harness = engine_compatibility.live_conformance_harness(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            namespace="smoke",
+            table="events",
+            rest_path="/iceberg",
+            rest_signing_name="s3",
+            pyiceberg_version="0.10.0",
+            spark_version="3.5.4",
+            iceberg_version="1.7.1",
+            scala_version="2.12",
+            cleanup=True,
+        )
+
+        self.assertEqual(harness["mode"], "manual-or-ci-optional")
+        self.assertEqual(harness["ci_gate"], "RUSTFS_TABLE_CATALOG_LIVE_CONFORMANCE=1")
+        self.assertEqual(harness["expected_results"]["row_count"], 2)
+        self.assertIn("RustFS endpoint is reachable", harness["prerequisites"])
+
+        by_client = {client["name"]: client for client in harness["clients"]}
+        pyiceberg = by_client["PyIceberg"]
+        self.assertEqual(pyiceberg["version"], "0.10.0")
+        self.assertIn("pyiceberg[pyarrow]==0.10.0", pyiceberg["install"])
+        self.assertIn("scripts/table-catalog/pyiceberg_smoke.py", pyiceberg["command"])
+        self.assertIn("--replace", pyiceberg["command"])
+        self.assertIn("--cleanup", pyiceberg["command"])
+
+        spark = by_client["Spark Iceberg REST catalog"]
+        self.assertEqual(spark["spark_version"], "3.5.4")
+        self.assertEqual(spark["iceberg_version"], "1.7.1")
+        self.assertIn("iceberg-spark-runtime-3.5_2.12:1.7.1", spark["packages"])
+        self.assertIn("iceberg-aws-bundle:1.7.1", spark["packages"])
+        self.assertIn("spark-sql", spark["command"])
+        self.assertIn("spark.sql.catalog.rustfs.uri=http://127.0.0.1:9000/iceberg", spark["command"])
+        self.assertIn("SELECT COUNT(*) AS row_count", spark["sql"])
+
+    def test_cli_prints_live_conformance_harness(self) -> None:
+        payload = engine_compatibility.cli_json(
+            [
+                "--print-live-conformance",
+                "--pyiceberg-version",
+                "0.10.0",
+                "--spark-version",
+                "3.5.4",
+                "--iceberg-version",
+                "1.7.1",
+                "--cleanup",
+            ]
+        )
+        document = json.loads(payload)
+
+        self.assertEqual(document["live_conformance"]["mode"], "manual-or-ci-optional")
+        self.assertEqual(document["live_conformance"]["expected_results"]["row_count"], 2)
+
+    def test_live_conformance_harness_sanitizes_sql_file_path(self) -> None:
+        harness = engine_compatibility.live_conformance_harness(
+            endpoint="http://127.0.0.1:9000",
+            warehouse="rustfs-s3table-smoke",
+            access_key="rustfsadmin",
+            secret_key="rustfsadmin",
+            region="us-east-1",
+            catalog_name="rustfs",
+            namespace="sales/prod",
+            table="orders 2026",
+            rest_path="/iceberg",
+            rest_signing_name="s3",
+            pyiceberg_version="0.10.0",
+            spark_version="3.5.4",
+            iceberg_version="1.7.1",
+            scala_version="2.12",
+        )
+
+        spark = {client["name"]: client for client in harness["clients"]}["Spark Iceberg REST catalog"]
+        self.assertEqual(spark["sql_file"], "/tmp/rustfs-s3tables-sales-prod-orders-2026-spark.sql")
 
     def assertContainsScenario(self, entry: dict[str, object], name: str, status: str) -> None:
         scenarios = entry.get("scenarios")

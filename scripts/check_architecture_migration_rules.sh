@@ -198,6 +198,7 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
+REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
@@ -2534,6 +2535,25 @@ fi
 
 (
   cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/crate::bucket::bandwidth(?:::\{[^;]*\breader\b|::reader\b)/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_bandwidth_boundary\.rs:' || true
+) >"$REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication bandwidth reader access must stay behind replication bandwidth boundary: $(paste -sd '; ' "$REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename 'crate::set_disk::get_lock_acquire_timeout|\bget_lock_acquire_timeout\(' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' |
@@ -2570,14 +2590,21 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'BucketTargetSys::get\(\)' \
-    crates/ecstore/src/bucket/replication \
-    --glob '*.rs' |
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/(?:(?:crate::bucket|super(?:::super)+)(?:::\{[^;]*\bbucket_target_sys\b|::bucket_target_sys\b)|BucketTargetSys::get\(\))/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
 ) >"$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication bucket-target access must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
+  report_failure "replication bucket-target access and types must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

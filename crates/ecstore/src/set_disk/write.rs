@@ -132,26 +132,21 @@ impl SetDisks {
                     let fi = file_infos[i].clone();
                     let old_data_dir = data_dirs[i];
                     let disk = disk.clone();
-                    let src_bucket = src_bucket.clone();
-                    let src_object = src_object.clone();
+                    let dst_bucket = dst_bucket.clone();
+                    let dst_object = dst_object.clone();
                     futures.push(tokio::spawn(async move {
-                        let _ = disk
-                            .delete_version(
-                                &src_bucket,
-                                &src_object,
-                                fi,
-                                false,
-                                DeleteOptions {
-                                    undo_write: true,
-                                    old_data_dir,
-                                    ..Default::default()
-                                },
-                            )
-                            .await
-                            .map_err(|e| {
-                                debug!("rename_data delete_version err {:?}", e);
-                                e
-                            });
+                        disk.delete_version(
+                            &dst_bucket,
+                            &dst_object,
+                            fi,
+                            false,
+                            DeleteOptions {
+                                undo_write: true,
+                                old_data_dir,
+                                ..Default::default()
+                            },
+                        )
+                        .await
                     }));
                 }
             }
@@ -171,7 +166,23 @@ impl SetDisks {
                 );
             }
 
-            let _ = join_all(futures).await;
+            let undo_results = join_all(futures).await;
+            let undo_error_count = undo_results
+                .iter()
+                .filter(|result| match result {
+                    Err(_) | Ok(Err(_)) => true,
+                    Ok(Ok(_)) => false,
+                })
+                .count();
+            if undo_error_count > 0 {
+                warn!(
+                    target: "rustfs_ecstore::set_disk",
+                    dst_bucket = %dst_bucket,
+                    dst_object = %dst_object,
+                    undo_error_count,
+                    "rename_data quorum rollback reported errors"
+                );
+            }
             return Err(ret_err);
         }
 
