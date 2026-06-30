@@ -24,6 +24,8 @@ ROUNDS=3
 RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=20
 WARP_OBJECTS=""
+WARP_OBJECT_LIFECYCLE="per-round"
+WARP_PREPARE_DURATION="1s"
 GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
 GET_SMALL_OBJECT_DIRECT_MEMORY=""
 GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
@@ -59,6 +61,8 @@ RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
 COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
 COMPAT_OBJECT_SIZE=65536
+SKIP_COMPAT_PROBE=false
+RESOURCE_SAMPLE_INTERVAL_SECS="${RUSTFS_GET_BENCH_RESOURCE_SAMPLE_INTERVAL_SECS:-5}"
 DRY_RUN=false
 SKIP_BUILD=false
 DETACH=false
@@ -126,6 +130,11 @@ Core options:
   --duration <duration>          warp duration per round (default: 30s)
   --warp-objects <n>             Number of objects prepared by warp for each size
                                  (default: warp default)
+  --warp-object-lifecycle <mode> Object lifecycle mode for warp GET:
+                                 per-round|prepare-once|existing-only
+                                 (default: per-round)
+  --warp-prepare-duration <dur>  Duration used by the prepare-once warmup
+                                 warp GET run (default: 1s)
   --metadata-cache-max-entries <n>
                                  RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES for RustFS
   --direct-memory <on|off>       RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY for RustFS
@@ -143,6 +152,9 @@ Binary/options:
   --codec-min-size <bytes>       RUSTFS_GET_CODEC_STREAMING_MIN_SIZE (default: 1)
   --compat-object-key <key>      Object key used by the compatibility probe
   --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
+  --skip-compat-probe            skip post-benchmark compatibility/fallback probes
+  --resource-sample-interval-secs <n>
+                                 Process resource sampler interval (default: 5)
   --skip-build                   do not run cargo build --release -p rustfs
   --detach                       start this script under nohup and exit after
                                  writing detached pid/log metadata
@@ -174,6 +186,8 @@ Output:
   <out-dir>/service_metrics_round_summary.csv   per-round stage/page-fault deltas when direct --diagnostic-metrics is set
   <out-dir>/service_metrics_stage_distribution.csv
                                                 per-round stage histogram bucket deltas when direct --diagnostic-metrics is set
+  <out-dir>/service_metrics_round_percentiles.csv
+                                                per-round request/stage histogram percentile bucket upper bounds
   <out-dir>/service_metrics_acceptance.csv      when --diagnostic-metrics is set
   <out-dir>/fallback_probe_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
@@ -187,6 +201,7 @@ Output:
   <out-dir>/<profile>/service_metrics_summary.csv
   <out-dir>/<profile>/service_metrics_round_summary.csv
   <out-dir>/<profile>/service_metrics_stage_distribution.csv
+  <out-dir>/<profile>/service_metrics_round_percentiles.csv
   <out-dir>/<profile>/service-metrics/*.prom     before/after snapshots when --diagnostic-metrics is set
   <out-dir>/<profile>/service-metrics/rounds/*.prom
                                                   per-round snapshots when direct --diagnostic-metrics is set
@@ -263,6 +278,8 @@ parse_args() {
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
       --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
+      --warp-object-lifecycle) WARP_OBJECT_LIFECYCLE="$2"; shift 2 ;;
+      --warp-prepare-duration) WARP_PREPARE_DURATION="$2"; shift 2 ;;
       --metadata-cache-max-entries) GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$2"; shift 2 ;;
       --direct-memory) GET_SMALL_OBJECT_DIRECT_MEMORY="$2"; shift 2 ;;
       --direct-memory-threshold) GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$2"; shift 2 ;;
@@ -276,6 +293,8 @@ parse_args() {
       --codec-min-size) CODEC_MIN_SIZE="$2"; shift 2 ;;
       --compat-object-key) COMPAT_OBJECT_KEY="$2"; shift 2 ;;
       --compat-object-size) COMPAT_OBJECT_SIZE="$2"; shift 2 ;;
+      --skip-compat-probe) SKIP_COMPAT_PROBE=true; shift ;;
+      --resource-sample-interval-secs) RESOURCE_SAMPLE_INTERVAL_SECS="$2"; shift 2 ;;
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --region) REGION="$2"; shift 2 ;;
@@ -338,6 +357,15 @@ validate_args() {
   if [[ -n "$WARP_OBJECTS" ]]; then
     validate_positive_int "$WARP_OBJECTS" "--warp-objects"
   fi
+  case "$WARP_OBJECT_LIFECYCLE" in
+    per-round|prepare-once|existing-only) ;;
+    *) die "--warp-object-lifecycle must be per-round, prepare-once, or existing-only" ;;
+  esac
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
+    local size_count
+    size_count="$(printf '%s\n' "$SIZES" | awk -F',' '{ count=0; for (i=1; i<=NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") count++ } print count }')"
+    [[ "$size_count" -eq 1 ]] || die "--warp-object-lifecycle=${WARP_OBJECT_LIFECYCLE} currently requires a single --sizes value to avoid mixing object sizes in one bucket"
+  fi
   if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
     validate_positive_int "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" "--metadata-cache-max-entries"
   fi
@@ -352,6 +380,7 @@ validate_args() {
   fi
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
+  validate_positive_int "$RESOURCE_SAMPLE_INTERVAL_SECS" "--resource-sample-interval-secs"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
   validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
   validate_positive_int "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS" "--diagnostic-metrics-capture-attempts"
@@ -742,6 +771,18 @@ endpoint_url() {
   echo "http://${ADDRESS}"
 }
 
+single_benchmark_size() {
+  printf '%s\n' "$SIZES" | awk -F',' '{
+    for (i=1; i<=NF; i++) {
+      gsub(/^[ \t]+|[ \t]+$/, "", $i)
+      if ($i != "") {
+        print $i
+        exit
+      }
+    }
+  }'
+}
+
 write_manifest() {
   local profile="$1"
   local profile_dir="$2"
@@ -774,6 +815,8 @@ rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 warp_objects=${WARP_OBJECTS}
+warp_object_lifecycle=${WARP_OBJECT_LIFECYCLE}
+warp_prepare_duration=${WARP_PREPARE_DURATION}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 python_bin=${PYTHON_BIN}
@@ -816,6 +859,8 @@ RUSTFS_SCANNER_START_DELAY_SECS=3600
 RUSTFS_SCANNER_CYCLE=3600
 RUSTFS_CONSOLE_ENABLE=false
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+resource_sample_interval_secs=${RESOURCE_SAMPLE_INTERVAL_SECS}
+skip_compat_probe=${SKIP_COMPAT_PROBE}
 EOF
 }
 
@@ -955,6 +1000,58 @@ start_server() {
   wait_for_health "$profile" "$rustfs_log"
 }
 
+prepare_warp_existing_objects() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local prepare_dir="${profile_dir}/warp_prepare"
+  local size
+  size="$(single_benchmark_size)"
+
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "prepare-once" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$prepare_dir"
+
+  local cmd=(
+    "$WARP_BIN" get
+    --host "$ADDRESS"
+    --access-key "$ACCESS_KEY"
+    --secret-key "$SECRET_KEY"
+    --bucket "$BUCKET"
+    --obj.size "$size"
+    --concurrent "$CONCURRENCY"
+    --duration "$WARP_PREPARE_DURATION"
+    --region "$REGION"
+    --noclear
+  )
+  if [[ -n "$WARP_OBJECTS" ]]; then
+    cmd+=(--objects "$WARP_OBJECTS")
+  fi
+
+  {
+    printf 'profile=%s\n' "$profile"
+    printf 'mode=prepare-once\n'
+    printf 'size=%s\n' "$size"
+    printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
+    printf 'bucket=%s\n' "$BUCKET"
+    printf 'command='
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  } >"${prepare_dir}/manifest.env"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size}"
+    printf '[DRY-RUN] ' >"${prepare_dir}/prepare.log"
+    printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare.log"
+    printf '\n' >>"${prepare_dir}/prepare.log"
+    return 0
+  fi
+
+  log "Preparing existing warp objects profile=${profile} size=${size} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
+  "${cmd[@]}" >"${prepare_dir}/prepare.log" 2>&1
+}
+
 run_bench() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -982,8 +1079,15 @@ run_bench() {
   if [[ -n "$baseline_csv" ]]; then
     cmd+=(--baseline-csv "$baseline_csv")
   fi
-  if [[ -n "$WARP_OBJECTS" ]]; then
+  if [[ "$WARP_OBJECT_LIFECYCLE" == "per-round" && -n "$WARP_OBJECTS" ]]; then
     cmd+=(--extra-args "--objects ${WARP_OBJECTS}")
+  fi
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
+    local lifecycle_args="--list-existing --noclear"
+    if [[ -n "$WARP_OBJECTS" ]]; then
+      lifecycle_args="${lifecycle_args} --objects ${WARP_OBJECTS}"
+    fi
+    cmd+=(--extra-args "$lifecycle_args")
   fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
     cmd+=(
@@ -1287,6 +1391,7 @@ write_profile_service_metrics_round_breakdown() {
   local round_metrics_dir="${profile_dir}/service-metrics/rounds"
   local out_summary="${profile_dir}/service_metrics_round_summary.csv"
   local out_distribution="${profile_dir}/service_metrics_stage_distribution.csv"
+  local out_percentiles="${profile_dir}/service_metrics_round_percentiles.csv"
 
   if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
     cat >"$out_summary" <<EOF
@@ -1296,6 +1401,10 @@ EOF
     cat >"$out_distribution" <<EOF
 profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
 ${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled,diagnostic_metrics_disabled
 EOF
     return
   fi
@@ -1309,6 +1418,10 @@ EOF
 profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
 ${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run
 EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run,not_run_dry_run
+EOF
     return
   fi
 
@@ -1321,21 +1434,26 @@ EOF
 profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
 ${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,prometheus_query,prometheus_query
 EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,prometheus_query,prometheus_query
+EOF
     return
   fi
 
   "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$round_csv" "$round_metrics_dir" \
-    "$out_summary" "$out_distribution" "$(diagnostic_service_name "$profile")" <<'PY'
+    "$out_summary" "$out_distribution" "$out_percentiles" "$(diagnostic_service_name "$profile")" <<'PY'
 import csv
 import pathlib
 import re
 import sys
 
-profile, metric_prefix, round_raw, metrics_dir_raw, summary_raw, distribution_raw, service_name = sys.argv[1:]
+profile, metric_prefix, round_raw, metrics_dir_raw, summary_raw, distribution_raw, percentiles_raw, service_name = sys.argv[1:]
 round_path = pathlib.Path(round_raw)
 metrics_dir = pathlib.Path(metrics_dir_raw)
 summary_path = pathlib.Path(summary_raw)
 distribution_path = pathlib.Path(distribution_raw)
+percentiles_path = pathlib.Path(percentiles_raw)
 
 TARGET_STAGES = [
     "store_reader_setup",
@@ -1429,10 +1547,74 @@ def fault_delta(before, after, kind):
     return total
 
 
+def histogram_bucket_deltas(before, after, metric_name, path="", stage="", status=""):
+    buckets = {}
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != f"{metric_name}_bucket":
+            continue
+        if path and label_value(labels, "path") != path:
+            continue
+        if stage and label_value(labels, "stage") != stage:
+            continue
+        if status and label_value(labels, "status") != status:
+            continue
+        le = label_value(labels, "le")
+        if not le:
+            continue
+        buckets[le] = buckets.get(le, 0.0) + after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return buckets
+
+
+def bucket_sort_key(le):
+    return float("inf") if le == "+Inf" else float(le)
+
+
+def percentile_bucket_upper_bound(buckets, quantile):
+    if not buckets:
+        return "N/A"
+    finite_or_inf = sorted(buckets.items(), key=lambda item: bucket_sort_key(item[0]))
+    total = buckets.get("+Inf", finite_or_inf[-1][1])
+    if total <= 0:
+        return "N/A"
+    threshold = total * quantile
+    for le, cumulative in finite_or_inf:
+        if cumulative >= threshold:
+            return le
+    return finite_or_inf[-1][0]
+
+
+def metric_count_sum(before, after, metric_name, path="", stage="", status=""):
+    count = 0.0
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if path and label_value(labels, "path") != path:
+            continue
+        if stage and label_value(labels, "stage") != stage:
+            continue
+        if status and label_value(labels, "status") != status:
+            continue
+        if metric == f"{metric_name}_count":
+            count += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+        elif metric == f"{metric_name}_sum":
+            total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return count, total
+
+
+PERCENTILE_TARGETS = [
+    ("request_duration_ok", "rustfs_io_get_object_request_duration_seconds", "", "", "ok"),
+    ("total_duration", "rustfs_io_get_object_total_duration_seconds", "", "", ""),
+    ("request_context", "rustfs_io_get_object_stage_duration_seconds", "s3_handler", "request_context", ""),
+]
+for stage_name in TARGET_STAGES:
+    PERCENTILE_TARGETS.append((stage_name, "rustfs_io_get_object_stage_duration_seconds", "", stage_name, ""))
+
+
 with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
-        distribution_path.open("w", encoding="utf-8", newline="") as distribution_handle:
+        distribution_path.open("w", encoding="utf-8", newline="") as distribution_handle, \
+        percentiles_path.open("w", encoding="utf-8", newline="") as percentiles_handle:
     summary_writer = csv.writer(summary_handle)
     distribution_writer = csv.writer(distribution_handle)
+    percentiles_writer = csv.writer(percentiles_handle)
     summary_writer.writerow([
         "profile", "size", "tool", "round", "attempt", "round_status", "stage",
         "count_delta", "sum_delta", "avg_ms", "minor_fault_delta", "major_fault_delta",
@@ -1441,6 +1623,12 @@ with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
     distribution_writer.writerow([
         "profile", "size", "tool", "round", "attempt", "round_status", "path", "stage",
         "le", "bucket_delta", "before_status", "after_status",
+    ])
+    percentiles_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "target",
+        "path", "stage", "count_delta", "sum_delta", "avg_ms",
+        "p50_le_seconds", "p90_le_seconds", "p99_le_seconds", "bucket_resolution_note",
+        "before_status", "after_status",
     ])
 
     if not round_path.exists() or not metrics_dir.exists():
@@ -1451,6 +1639,11 @@ with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
         distribution_writer.writerow([
             profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
             "N/A", "N/A", "N/A", "missing", "missing",
+        ])
+        percentiles_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A",
+            "snapshot_missing", "missing", "missing",
         ])
         raise SystemExit(0)
 
@@ -1491,6 +1684,40 @@ with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
                 f"{stage_major_faults:.12g}",
                 f"{(stage_minor_faults / count_delta) if count_delta else 0.0:.6f}",
                 f"{(stage_major_faults / count_delta) if count_delta else 0.0:.6f}",
+                before_status,
+                after_status,
+            ])
+
+        for target, metric_name, path_label, stage_label, status_label in PERCENTILE_TARGETS:
+            buckets = histogram_bucket_deltas(before, after, metric_name, path_label, stage_label, status_label)
+            count_delta, sum_delta = metric_count_sum(before, after, metric_name, path_label, stage_label, status_label)
+            avg_ms = (sum_delta / count_delta * 1000.0) if count_delta else 0.0
+            p50 = percentile_bucket_upper_bound(buckets, 0.50)
+            p90 = percentile_bucket_upper_bound(buckets, 0.90)
+            p99 = percentile_bucket_upper_bound(buckets, 0.99)
+            if not buckets:
+                note = "no_buckets"
+            elif p50 == p90 == p99 and p99 not in {"N/A", "+Inf"} and bucket_sort_key(p99) >= 1.0 and avg_ms < 1000.0:
+                note = "coarse_seconds_buckets"
+            else:
+                note = "bucket_upper_bound"
+            percentiles_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                target,
+                path_label or "N/A",
+                stage_label or "N/A",
+                f"{count_delta:.12g}",
+                f"{sum_delta:.12g}",
+                f"{avg_ms:.6f}",
+                p50,
+                p90,
+                p99,
+                note,
                 before_status,
                 after_status,
             ])
@@ -1908,22 +2135,75 @@ start_server_sampler() {
 
   if [[ "$DRY_RUN" == "true" ]]; then
     cat >"$SERVER_SAMPLER_LOG" <<'EOF'
-timestamp_utc,rss_kib,cpu_pct
-DRY_RUN,N/A,N/A
+timestamp_utc,rss_kib,cpu_pct,threads,fd_count,vm_hwm_kib,vm_data_kib,voluntary_ctxt_switches,nonvoluntary_ctxt_switches,sched_runtime_ns,sched_wait_ns,sched_timeslices
+DRY_RUN,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
 EOF
     return
   fi
 
-  echo "timestamp_utc,rss_kib,cpu_pct" >"$SERVER_SAMPLER_LOG"
+  echo "timestamp_utc,rss_kib,cpu_pct,threads,fd_count,vm_hwm_kib,vm_data_kib,voluntary_ctxt_switches,nonvoluntary_ctxt_switches,sched_runtime_ns,sched_wait_ns,sched_timeslices" >"$SERVER_SAMPLER_LOG"
   (
     while kill -0 "$pid" >/dev/null 2>&1; do
-      local timestamp sample
+      local timestamp sample rss_cpu threads fd_count vm_hwm vm_data voluntary_ctxt nonvoluntary_ctxt sched_runtime sched_wait sched_slices
       timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      sample="$(ps -o rss= -o %cpu= -p "$pid" 2>/dev/null | awk 'NF >= 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }')"
-      if [[ -n "$sample" ]]; then
-        echo "${timestamp},${sample}" >>"$SERVER_SAMPLER_LOG"
+      rss_cpu="$(ps -o rss= -o %cpu= -p "$pid" 2>/dev/null | awk 'NF >= 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }')"
+      if [[ -z "$rss_cpu" ]]; then
+        sleep "$RESOURCE_SAMPLE_INTERVAL_SECS"
+        continue
       fi
-      sleep 5
+
+      threads="N/A"
+      fd_count="N/A"
+      vm_hwm="N/A"
+      vm_data="N/A"
+      voluntary_ctxt="N/A"
+      nonvoluntary_ctxt="N/A"
+      sched_runtime="N/A"
+      sched_wait="N/A"
+      sched_slices="N/A"
+
+      if [[ -r "/proc/${pid}/status" ]]; then
+        sample="$(awk '
+          /^Threads:/ { threads=$2 }
+          /^VmHWM:/ { vm_hwm=$2 }
+          /^VmData:/ { vm_data=$2 }
+          /^voluntary_ctxt_switches:/ { voluntary=$2 }
+          /^nonvoluntary_ctxt_switches:/ { nonvoluntary=$2 }
+          END {
+            printf "%s,%s,%s,%s,%s",
+              threads ? threads : "N/A",
+              vm_hwm ? vm_hwm : "N/A",
+              vm_data ? vm_data : "N/A",
+              voluntary ? voluntary : "N/A",
+              nonvoluntary ? nonvoluntary : "N/A"
+          }
+        ' "/proc/${pid}/status")"
+        IFS=',' read -r threads vm_hwm vm_data voluntary_ctxt nonvoluntary_ctxt <<<"$sample"
+      fi
+      if [[ -d "/proc/${pid}/fd" ]]; then
+        fd_count="$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | awk 'END { print NR + 0 }')"
+      fi
+      if [[ -d "/proc/${pid}/task" ]]; then
+        sample="$(awk '
+          {
+            runtime += $1
+            wait += $2
+            slices += $3
+            seen = 1
+          }
+          END {
+            if (seen) {
+              printf "%.0f %.0f %.0f", runtime, wait, slices
+            }
+          }
+        ' /proc/"${pid}"/task/*/schedstat 2>/dev/null || true)"
+        if [[ -n "$sample" ]]; then
+          read -r sched_runtime sched_wait sched_slices <<<"$sample"
+        fi
+      fi
+
+      echo "${timestamp},${rss_cpu},${threads},${fd_count},${vm_hwm},${vm_data},${voluntary_ctxt},${nonvoluntary_ctxt},${sched_runtime},${sched_wait},${sched_slices}" >>"$SERVER_SAMPLER_LOG"
+      sleep "$RESOURCE_SAMPLE_INTERVAL_SECS"
     done
   ) &
   SERVER_SAMPLER_PID="$!"
@@ -1960,8 +2240,26 @@ EOF
     $2 != "N/A" && $2 != "" {
       rss = $2 + 0
       cpu = $3 + 0
+      threads = ($4 != "N/A" && $4 != "") ? $4 + 0 : 0
+      fd_count = ($5 != "N/A" && $5 != "") ? $5 + 0 : 0
+      vm_hwm = ($6 != "N/A" && $6 != "") ? $6 + 0 : 0
+      vm_data = ($7 != "N/A" && $7 != "") ? $7 + 0 : 0
+      voluntary = ($8 != "N/A" && $8 != "") ? $8 + 0 : -1
+      nonvoluntary = ($9 != "N/A" && $9 != "") ? $9 + 0 : -1
       if (count == 0 || rss > max_rss) max_rss = rss
       if (count == 0 || cpu > max_cpu) max_cpu = cpu
+      if (threads > max_threads) max_threads = threads
+      if (fd_count > max_fd_count) max_fd_count = fd_count
+      if (vm_hwm > max_vm_hwm) max_vm_hwm = vm_hwm
+      if (vm_data > max_vm_data) max_vm_data = vm_data
+      if (voluntary >= 0) {
+        if (!seen_voluntary) { first_voluntary = voluntary; seen_voluntary = 1 }
+        last_voluntary = voluntary
+      }
+      if (nonvoluntary >= 0) {
+        if (!seen_nonvoluntary) { first_nonvoluntary = nonvoluntary; seen_nonvoluntary = 1 }
+        last_nonvoluntary = nonvoluntary
+      }
       cpu_sum += cpu
       count++
     }
@@ -1978,11 +2276,41 @@ EOF
         printf "max_rss_kib=%.0f\n", max_rss
         printf "max_cpu_pct=%.2f\n", max_cpu
         printf "avg_cpu_pct=%.2f\n", cpu_sum / count
+        printf "max_threads=%.0f\n", max_threads
+        printf "max_fd_count=%.0f\n", max_fd_count
+        printf "max_vm_hwm_kib=%.0f\n", max_vm_hwm
+        printf "max_vm_data_kib=%.0f\n", max_vm_data
+        if (seen_voluntary) {
+          printf "voluntary_ctxt_switches_delta=%.0f\n", last_voluntary - first_voluntary
+        } else {
+          print "voluntary_ctxt_switches_delta=unknown"
+        }
+        if (seen_nonvoluntary) {
+          printf "nonvoluntary_ctxt_switches_delta=%.0f\n", last_nonvoluntary - first_nonvoluntary
+        } else {
+          print "nonvoluntary_ctxt_switches_delta=unknown"
+        }
         print "cpu_rss_acceptability=manual_review_required"
-        print "note=Harness captured runtime samples but does not impose a hard pass/fail threshold."
+        print "note=Harness captured runtime/resource samples but does not impose a hard pass/fail threshold."
       }
     }
   ' "$sample_csv" >"$notes_file"
+}
+
+write_skipped_compat_probe() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local compat_dir="${profile_dir}/compat"
+
+  mkdir -p "$compat_dir"
+  cat >"${compat_dir}/compat_summary.csv" <<EOF
+size,path,body_sha256_match,content_length_match,etag_match,content_range_match,checksum_headers_match,sse_headers_match,status_code_match,error_count,body_sha256,status_code,content_length,etag
+${COMPAT_OBJECT_SIZE},${profile},skipped,skipped,skipped,skipped,skipped,skipped,skipped,0,SKIPPED,N/A,N/A,SKIPPED
+EOF
+  cat >"${compat_dir}/fallback_probe_summary.csv" <<EOF
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+${profile},all,${COMPAT_OBJECT_KEY},skipped,N/A,N/A,N/A,skipped by --skip-compat-probe
+EOF
 }
 
 run_compat_probe() {
@@ -3166,6 +3494,7 @@ write_raw_output_paths() {
 	        -o -name 'service_metrics_summary.csv' \
 	        -o -name 'service_metrics_round_summary.csv' \
 	        -o -name 'service_metrics_stage_distribution.csv' \
+	        -o -name 'service_metrics_round_percentiles.csv' \
 	        -o -name 'service_metrics_acceptance.csv' \) | sort
 	    for profile_dir in "${OUT_DIR}"/*; do
 	      [[ -d "$profile_dir" ]] || continue
@@ -3173,15 +3502,19 @@ write_raw_output_paths() {
 	        \( -name 'metrics_summary.csv' \
 	          -o -name 'service_metrics_summary.csv' \
 	          -o -name 'service_metrics_round_summary.csv' \
-	          -o -name 'service_metrics_stage_distribution.csv' \) | sort
+	          -o -name 'service_metrics_stage_distribution.csv' \
+	          -o -name 'service_metrics_round_percentiles.csv' \) | sort
 	      if [[ -d "${profile_dir}/service-metrics" ]]; then
 	        find "${profile_dir}/service-metrics" -type f | sort
 	      fi
 	      if [[ -d "${profile_dir}/warp/logs" ]]; then
 	        find "${profile_dir}/warp/logs" -type f | sort
 	      fi
+	      if [[ -d "${profile_dir}/warp_prepare" ]]; then
+	        find "${profile_dir}/warp_prepare" -type f | sort
+	      fi
 	    done
-  } >"$out_file"
+	  } >"$out_file"
 }
 
 write_default_switch_readiness_report() {
@@ -3353,6 +3686,7 @@ run_profile() {
 
   stop_server
   start_server "$profile"
+  prepare_warp_existing_objects "$profile"
   capture_service_metrics_snapshot "$profile" before
   if run_bench "$profile" "$baseline_csv"; then
     :
@@ -3360,7 +3694,12 @@ run_profile() {
     bench_rc=$?
   fi
   write_metrics_summary "$profile"
-  run_compat_probe "$profile"
+  if [[ "$SKIP_COMPAT_PROBE" == "true" ]]; then
+    log "Skipping compatibility probe for profile=${profile}"
+    write_skipped_compat_probe "$profile"
+  else
+    run_compat_probe "$profile"
+  fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && "$DIAGNOSTIC_METRICS_SETTLE_SECS" -gt 0 ]]; then
     sleep "$DIAGNOSTIC_METRICS_SETTLE_SECS"
   fi
@@ -3375,6 +3714,7 @@ run_profile() {
   log "Service metrics summary: ${OUT_DIR}/${profile}/service_metrics_summary.csv"
   log "Service metrics round summary: ${OUT_DIR}/${profile}/service_metrics_round_summary.csv"
   log "Service metrics stage distribution: ${OUT_DIR}/${profile}/service_metrics_stage_distribution.csv"
+  log "Service metrics round percentiles: ${OUT_DIR}/${profile}/service_metrics_round_percentiles.csv"
   log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
@@ -3443,6 +3783,7 @@ main() {
   write_root_service_metrics_summary "${profiles[@]}"
   write_root_profile_csv service_metrics_round_summary.csv "${profiles[@]}"
   write_root_profile_csv service_metrics_stage_distribution.csv "${profiles[@]}"
+  write_root_profile_csv service_metrics_round_percentiles.csv "${profiles[@]}"
   write_service_metrics_acceptance
   write_root_compat_summary "${profiles[@]}"
   write_root_fallback_probe_summary "${profiles[@]}"
