@@ -107,9 +107,9 @@ Current coupling:
   classification, runtime replication pool/stat handles, bucket monitor and
   bandwidth reader access through local boundaries, local node names, and
   notification events;
-- resync and delete replication paths call metadata directly, while bucket
-  target system access and target operation types are concentrated behind the
-  replication target boundary;
+- resync and delete replication paths call metadata paths through the metadata
+  boundary, while bucket target system access, target config types, and target
+  operation types are concentrated behind the replication target boundary;
 - lifecycle and heal paths schedule replication work through the current ECStore
   module;
 - global replication pool/stat initialization still lives with ECStore runtime
@@ -127,9 +127,14 @@ Required contracts before crate movement:
   storage-api contracts, and read option types are concentrated in
   `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
 - `ReplicationMetadataStore`: replication config, target reset headers,
-  MRF/resync state, and status persistence.
+  MRF/resync state, and status persistence. Metadata sys access and replication
+  metadata path constants are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_metadata_boundary.rs`.
 - `ReplicationTargetStore`: bucket target listing, target client lookup,
-  target offline checks, and target operation option types.
+  target offline checks, target config types, and target operation option
+  types. Bucket target sys access, `BucketTargets`, and target operation types
+  are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`.
 - `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
   node identity, cancellation, and queue sizing.
 - `ReplicationBandwidthLimiter`: target reader wrapping for replication

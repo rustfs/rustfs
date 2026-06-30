@@ -2612,12 +2612,124 @@ fi
   cd "$ROOT_DIR"
   find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
     xargs -0 perl -0ne '
-      while (/(?:(?:crate::bucket|super(?:::super)+)(?:::\{[^;]*\bbucket_target_sys\b|::bucket_target_sys\b)|BucketTargetSys::get\(\))/sg) {
+      while (/(?:crate::bucket::(?:bucket_target_sys|target)\b|super(?:::super)+::(?:bucket_target_sys|target)\b|BucketTargetSys::get\(\))/sg) {
         my $prefix = substr($_, 0, $-[0]);
         my $line = ($prefix =~ tr/\n//) + 1;
         my $match = $&;
         $match =~ s/\s+/ /g;
         print "$ARGV:$line:$match\n";
+      }
+      while (/crate::bucket::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            if ($part =~ /^\s*(?:bucket_target_sys|target)\b/s) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:crate::bucket::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
+      }
+      while (/super(?:::super)+::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            if ($part =~ /^\s*(?:bucket_target_sys|target)\b/s) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:super::super::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
+      }
+      while (/crate::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            my $hit = $part =~ /^\s*bucket\s*::\s*(?:bucket_target_sys|target)\b/s;
+            if (!$hit && $part =~ /^\s*bucket\s*::\s*\{(.*)\}\s*$/s) {
+              my $bucket_body = $1;
+              my $bucket_part_start = 0;
+              my $bucket_depth = 0;
+              for (my $k = 0; $k <= length($bucket_body); $k++) {
+                my $bucket_ch = $k < length($bucket_body) ? substr($bucket_body, $k, 1) : ",";
+                $bucket_depth++ if $bucket_ch eq "{";
+                $bucket_depth-- if $bucket_ch eq "}";
+                if ($bucket_ch eq "," && $bucket_depth == 0) {
+                  my $bucket_part = substr($bucket_body, $bucket_part_start, $k - $bucket_part_start);
+                  if ($bucket_part =~ /^\s*(?:bucket_target_sys|target)\b/s) {
+                    $hit = 1;
+                    last;
+                  }
+                  $bucket_part_start = $k + 1;
+                }
+              }
+            }
+            if ($hit) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:crate::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
       }
     ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
@@ -2629,9 +2741,128 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::bucket::metadata_sys|metadata_sys::get_replication_config' \
-    crates/ecstore/src/bucket/replication \
-    --glob '*.rs' |
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/(?:crate::bucket::metadata_sys|super(?:::super)+::metadata_sys\b|metadata_sys::get_replication_config|crate::disk::(?:BUCKET_META_PREFIX|RUSTFS_META_BUCKET)\b)/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+      while (/super(?:::super)+::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            if ($part =~ /^\s*metadata_sys\b/s) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:super::super::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
+      }
+      while (/crate::disk::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            if ($part =~ /^\s*(?:BUCKET_META_PREFIX|RUSTFS_META_BUCKET)\b/s) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:crate::disk::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
+      }
+      while (/crate::\{/g) {
+        my $start = $-[0];
+        my $body_start = pos($_);
+        my $depth = 1;
+        my $i = $body_start;
+        while ($i < length($_) && $depth > 0) {
+          my $ch = substr($_, $i, 1);
+          $depth++ if $ch eq "{";
+          $depth-- if $ch eq "}";
+          $i++;
+        }
+        next if $depth != 0;
+        my $body = substr($_, $body_start, $i - $body_start - 1);
+        my $part_start = 0;
+        my $inner_depth = 0;
+        for (my $j = 0; $j <= length($body); $j++) {
+          my $ch = $j < length($body) ? substr($body, $j, 1) : ",";
+          $inner_depth++ if $ch eq "{";
+          $inner_depth-- if $ch eq "}";
+          if ($ch eq "," && $inner_depth == 0) {
+            my $part = substr($body, $part_start, $j - $part_start);
+            my $hit = $part =~ /^\s*disk\s*::\s*(?:BUCKET_META_PREFIX|RUSTFS_META_BUCKET)\b/s;
+            if (!$hit && $part =~ /^\s*disk\s*::\s*\{(.*)\}\s*$/s) {
+              my $disk_body = $1;
+              my $disk_part_start = 0;
+              my $disk_depth = 0;
+              for (my $k = 0; $k <= length($disk_body); $k++) {
+                my $disk_ch = $k < length($disk_body) ? substr($disk_body, $k, 1) : ",";
+                $disk_depth++ if $disk_ch eq "{";
+                $disk_depth-- if $disk_ch eq "}";
+                if ($disk_ch eq "," && $disk_depth == 0) {
+                  my $disk_part = substr($disk_body, $disk_part_start, $k - $disk_part_start);
+                  if ($disk_part =~ /^\s*(?:BUCKET_META_PREFIX|RUSTFS_META_BUCKET)\b/s) {
+                    $hit = 1;
+                    last;
+                  }
+                  $disk_part_start = $k + 1;
+                }
+              }
+            }
+            if ($hit) {
+              my $prefix = substr($_, 0, $start);
+              my $line = ($prefix =~ tr/\n//) + 1;
+              $part =~ s/\s+/ /g;
+              print "$ARGV:$line:crate::{$part}\n";
+            }
+            $part_start = $j + 1;
+          }
+        }
+      }
+    ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_metadata_boundary\.rs:' || true
 ) >"$REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE"
 
