@@ -338,6 +338,30 @@ impl SetDisks {
         (new_disk, mod_time, None)
     }
 
+    pub(super) fn latest_fileinfo_selection_quorum(
+        version_id: &str,
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> usize {
+        if !version_id.is_empty() || write_quorum <= read_quorum {
+            return read_quorum;
+        }
+
+        let usable_metadata = parts_metadata
+            .iter()
+            .zip(errs.iter())
+            .filter(|(meta, err)| err.is_none() && meta.is_valid())
+            .count();
+
+        if usable_metadata >= write_quorum {
+            write_quorum
+        } else {
+            read_quorum
+        }
+    }
+
     pub(super) fn pick_valid_fileinfo(
         metas: &[FileInfo],
         mod_time: Option<OffsetDateTime>,

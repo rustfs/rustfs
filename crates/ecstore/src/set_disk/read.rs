@@ -2362,7 +2362,7 @@ impl SetDisks {
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
         let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
+        let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
             .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
         {
             Ok(v) => v,
@@ -2378,7 +2378,11 @@ impl SetDisks {
         };
         let read_quorum =
             usize::try_from(read_quorum).map_err(|_| to_object_err(DiskError::ErasureReadQuorum.into(), vec![bucket, object]))?;
-        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, read_quorum);
+        let write_quorum = usize::try_from(write_quorum)
+            .map_err(|_| to_object_err(DiskError::ErasureWriteQuorum.into(), vec![bucket, object]))?;
+        let fileinfo_selection_quorum =
+            Self::latest_fileinfo_selection_quorum(vid.as_str(), &parts_metadata, &errs, read_quorum, write_quorum);
+        metadata_fanout_diagnostics.record_quorum_candidate_latency(GET_OBJECT_PATH_LEGACY_DUPLEX, fileinfo_selection_quorum);
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
@@ -2390,9 +2394,10 @@ impl SetDisks {
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
-        let (op_online_disks, mot_time, etag) = Self::list_online_disks(&disks, &parts_metadata, &errs, read_quorum);
+        let (op_online_disks, mot_time, etag) =
+            Self::list_online_disks(&disks, &parts_metadata, &errs, fileinfo_selection_quorum);
 
-        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, read_quorum)?;
+        let fi = Self::pick_valid_fileinfo(&parts_metadata, mot_time, etag, fileinfo_selection_quorum)?;
         if errs.iter().any(|err| err.is_some()) {
             let version_id = resolved_read_repair_version_id(&fi, opts.version_id.as_deref());
             submit_read_repair_heal(

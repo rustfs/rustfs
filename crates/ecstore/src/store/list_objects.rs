@@ -408,10 +408,19 @@ fn list_objects_paginate(
     (objects, prefixes, is_truncated, next_marker, next_version_idmarker)
 }
 
-fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versioned: bool) -> MetadataResolutionParams {
+fn list_metadata_resolution_params(
+    bucket: String,
+    listing_quorum: usize,
+    latest_object_quorum: usize,
+    versioned: bool,
+) -> MetadataResolutionParams {
     let mut resolver = MetadataResolutionParams {
         dir_quorum: listing_quorum,
-        obj_quorum: listing_quorum,
+        obj_quorum: if versioned {
+            listing_quorum
+        } else {
+            latest_object_quorum.max(listing_quorum)
+        },
         bucket,
         ..Default::default()
     };
@@ -421,6 +430,40 @@ fn list_metadata_resolution_params(bucket: String, listing_quorum: usize, versio
     }
 
     resolver
+}
+
+fn latest_listing_object_quorum(
+    listing_quorum: usize,
+    ask_disks: i32,
+    drive_count: usize,
+    parity_count: usize,
+    versioned: bool,
+) -> usize {
+    if versioned || ask_disks <= 0 {
+        return listing_quorum;
+    }
+
+    let asked_disks = ask_disks as usize;
+    if asked_disks < drive_count {
+        return listing_quorum;
+    }
+
+    write_quorum_for_drive_count(drive_count, parity_count)
+        .max(listing_quorum)
+        .min(asked_disks)
+}
+
+fn write_quorum_for_drive_count(drive_count: usize, parity_count: usize) -> usize {
+    if drive_count == 0 {
+        return 0;
+    }
+
+    let data_drives = drive_count.saturating_sub(parity_count);
+    if data_drives == parity_count {
+        data_drives.saturating_add(1)
+    } else {
+        data_drives
+    }
 }
 
 fn parse_version_marker(marker: String) -> Result<VersionMarker> {
@@ -1039,10 +1082,17 @@ impl ECStore {
                     };
 
                     let listing_quorum = ((ask_disks + 1) / 2) as usize;
+                    let obj_quorum = latest_listing_object_quorum(
+                        listing_quorum,
+                        ask_disks,
+                        set.set_drive_count,
+                        set.default_parity_count,
+                        false,
+                    );
 
                     let resolver = MetadataResolutionParams {
                         dir_quorum: listing_quorum,
-                        obj_quorum: listing_quorum,
+                        obj_quorum,
                         bucket: bucket.to_owned(),
                         ..Default::default()
                     };
@@ -2067,9 +2117,11 @@ impl Sets {
                 };
 
                 let listing_quorum = ((ask_disks + 1) / 2) as usize;
+                let obj_quorum =
+                    latest_listing_object_quorum(listing_quorum, ask_disks, set.set_drive_count, set.default_parity_count, false);
                 let resolver = MetadataResolutionParams {
                     dir_quorum: listing_quorum,
-                    obj_quorum: listing_quorum,
+                    obj_quorum,
                     bucket: bucket.to_owned(),
                     ..Default::default()
                 };
@@ -2820,7 +2872,14 @@ impl SetDisks {
 
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
-        let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, opts.versioned);
+        let latest_object_quorum = latest_listing_object_quorum(
+            listing_quorum,
+            ask_disks,
+            self.set_drive_count,
+            self.default_parity_count,
+            opts.versioned,
+        );
+        let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, latest_object_quorum, opts.versioned);
 
         debug!(
             bucket = %bucket,
@@ -2828,6 +2887,7 @@ impl SetDisks {
             set_drive_count = self.set_drive_count,
             asked_disks = ask_disks,
             listing_quorum = listing_quorum,
+            latest_object_quorum = latest_object_quorum,
             fallback_disks = fallback_disks.len(),
             limit = opts.limit,
             stop_disk_at_limit = opts.stop_disk_at_limit,
@@ -2990,9 +3050,9 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 mod test {
     use super::{
         ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker,
-        gather_results, list_metadata_resolution_params, list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one,
-        merge_entry_channels, normalize_list_quorum, parse_version_marker, version_marker_for_entries,
-        walk_result_from_set_errors,
+        gather_results, latest_listing_object_quorum, list_metadata_resolution_params, list_objects_quorum_from_env,
+        list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum, parse_version_marker,
+        version_marker_for_entries, walk_result_from_set_errors,
     };
     use crate::error::StorageError;
     use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
@@ -3295,22 +3355,34 @@ mod test {
 
     #[test]
     fn list_metadata_resolution_params_limits_plain_listing_to_latest_version() {
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, false);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 3, false);
 
         assert_eq!(resolver.dir_quorum, 2);
-        assert_eq!(resolver.obj_quorum, 2);
+        assert_eq!(resolver.obj_quorum, 3);
         assert_eq!(resolver.bucket, "bucket");
         assert_eq!(resolver.requested_versions, 1);
     }
 
     #[test]
     fn list_metadata_resolution_params_keeps_all_versions_for_version_listing() {
-        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, true);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, true);
 
         assert_eq!(resolver.dir_quorum, 3);
         assert_eq!(resolver.obj_quorum, 3);
         assert_eq!(resolver.bucket, "bucket");
         assert_eq!(resolver.requested_versions, 0);
+    }
+
+    #[test]
+    fn latest_listing_object_quorum_uses_write_quorum_for_strict_latest_listing() {
+        assert_eq!(latest_listing_object_quorum(2, 4, 4, 2, false), 3);
+        assert_eq!(latest_listing_object_quorum(4, 8, 8, 4, false), 5);
+    }
+
+    #[test]
+    fn latest_listing_object_quorum_keeps_reduced_and_versioned_listing_quorum() {
+        assert_eq!(latest_listing_object_quorum(1, 1, 4, 2, false), 1);
+        assert_eq!(latest_listing_object_quorum(2, 4, 4, 2, true), 2);
     }
 
     #[test]

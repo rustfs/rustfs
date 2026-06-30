@@ -8097,6 +8097,40 @@ mod tests {
     }
 
     #[test]
+    fn test_latest_fileinfo_selection_quorum_requires_write_quorum_when_full_metadata_is_available() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let metas = vec![
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 3),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-b", 4),
+        ];
+        let errs = vec![None, None, None, None];
+
+        let quorum = SetDisks::latest_fileinfo_selection_quorum("", &metas, &errs, 2, 3);
+
+        assert_eq!(quorum, 3);
+    }
+
+    #[test]
+    fn test_latest_fileinfo_selection_quorum_preserves_read_quorum_for_version_or_degraded_reads() {
+        let mod_time = OffsetDateTime::now_utc();
+        let data_dir = Uuid::new_v4();
+        let metas = vec![
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 1),
+            quorum_test_fileinfo(mod_time, data_dir, "part-etag-a", 2),
+            FileInfo::default(),
+            FileInfo::default(),
+        ];
+        let degraded_errs = vec![None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+        let clean_errs = vec![None, None, None, None];
+
+        assert_eq!(SetDisks::latest_fileinfo_selection_quorum("", &metas, &degraded_errs, 2, 3), 2);
+        assert_eq!(SetDisks::latest_fileinfo_selection_quorum("version-id", &metas, &clean_errs, 2, 3), 2);
+    }
+
+    #[test]
     fn test_list_object_parities() {
         // Test extracting parity counts from file info
         let file_info1 = FileInfo {
