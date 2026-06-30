@@ -1257,6 +1257,17 @@ impl SizeSummary {
     }
 }
 
+/// Aggregated compression metrics: original size, compressed size, and operation count.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+pub struct CompressionTotalInfo {
+    // Total bytes before compression since compression is used.
+    pub original_bytes_total: u64,
+    // Total bytes after compression since compression is used.
+    pub compressed_bytes_total: u64,
+    // Total number of compression operations since compression is used.
+    pub compression_operations_total: u64,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

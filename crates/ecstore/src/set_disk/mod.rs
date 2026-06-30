@@ -25,6 +25,7 @@ use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
+use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
     GET_OBJECT_PATH_CODEC_STREAMING, GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE,
     GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT,
@@ -2214,6 +2215,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             }
 
+            if fi.is_compressed() {
+                record_compression_total_memory(actual_size as u64, w_size as u64).await;
+            }
             record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
             fi.replication_state_internal = Some(opts.put_replication_state());
@@ -4395,6 +4399,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
         }
 
+        if fi.is_compressed() {
+            record_compression_total_memory(actual_size as u64, w_size as u64).await;
+        }
         let checksums = data.as_hash_reader().content_crc();
 
         let part_info = ObjectPartInfo {

@@ -347,10 +347,10 @@ pub(crate) mod ecstore_config {
 
 pub(crate) mod ecstore_data_usage {
     pub(crate) use rustfs_ecstore::api::data_usage::{
-        apply_bucket_usage_memory_overlay, load_data_usage_from_backend, record_bucket_delete_marker_memory,
-        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
-        refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
-        replace_bucket_usage_memory_from_info,
+        apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend, load_data_usage_from_backend,
+        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
+        record_bucket_object_write_memory, refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
+        replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
     };
 }
 
@@ -1238,3 +1238,11 @@ pub(crate) type GetObjectReader = <ECStore as contract::object::ObjectIO>::GetOb
 pub(crate) type ObjectInfo = <ECStore as contract::object::ObjectOperations>::ObjectInfo;
 pub(crate) type ObjectOptions = <ECStore as contract::object::ObjectOperations>::ObjectOptions;
 pub(crate) type PutObjReader = <ECStore as contract::object::ObjectIO>::PutObjectReader;
+
+pub(crate) async fn store_compression_total_in_backend() {
+    ecstore_data_usage::store_compression_total_in_backend().await;
+}
+
+pub(crate) async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
+    ecstore_data_usage::init_compression_total_memory_from_backend(store).await
+}
