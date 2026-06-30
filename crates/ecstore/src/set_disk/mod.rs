@@ -6287,12 +6287,16 @@ mod tests {
     use super::*;
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
+    use crate::disk::DiskOption;
     use crate::disk::RUSTFS_META_BUCKET;
+    use crate::disk::RUSTFS_META_TMP_BUCKET;
     use crate::disk::STORAGE_FORMAT_FILE;
+    use crate::disk::STORAGE_FORMAT_FILE_BACKUP;
     use crate::disk::WalkDirOptions;
     use crate::disk::endpoint::Endpoint;
     use crate::disk::error::DiskError;
     use crate::disk::health_state::RuntimeDriveHealthState;
+    use crate::disk::new_disk;
     use crate::layout::endpoints::SetupType;
     use crate::object_api::ObjectInfo;
     use crate::storage_api_contracts::{
@@ -6302,6 +6306,7 @@ mod tests {
     use crate::store::init_format::save_format_file;
     use crate::store::list_objects::ListPathOptions;
     use rustfs_filemeta::ErasureInfo;
+    use rustfs_filemeta::FileMeta;
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
@@ -6310,6 +6315,7 @@ mod tests {
     use std::collections::HashMap;
     use tempfile::TempDir;
     use time::OffsetDateTime;
+    use tokio::fs;
 
     #[test]
     fn complete_part_error_maps_confirmed_missing_to_invalid_part() {
@@ -6515,6 +6521,92 @@ mod tests {
             .expect("format should be saved");
 
         (dir, endpoint, disk)
+    }
+
+    #[tokio::test]
+    async fn test_rename_data_quorum_failure_rolls_back_destination_object() {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let disk_root = dir.path().join("disk0");
+        fs::create_dir_all(&disk_root).await.expect("disk root should be created");
+        let endpoint = Endpoint::try_from(disk_root.to_str().expect("disk path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+
+        let bucket = "bucket";
+        let object = "object";
+        let tmp_object = "tmp-object";
+        let version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("99999999-9999-9999-9999-999999999999").expect("new data dir should parse");
+
+        match disk.make_volume(bucket).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("bucket should be available: {err:?}"),
+        }
+        match disk.make_volume(RUSTFS_META_TMP_BUCKET).await {
+            Ok(()) | Err(DiskError::VolumeExists) => {}
+            Err(err) => panic!("tmp bucket should be available: {err:?}"),
+        }
+
+        let object_dir = disk_root.join(bucket).join(object);
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old data dir should be created");
+        let mut old_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        old_fi.name = object.to_string();
+        old_fi.version_id = Some(version_id);
+        old_fi.data_dir = Some(old_data_dir);
+        old_fi.size = 1;
+        old_fi.mod_time = Some(OffsetDateTime::now_utc());
+        let mut old_meta = FileMeta::default();
+        old_meta.add_version(old_fi).expect("old metadata should accept file info");
+        let old_meta_buf = old_meta.marshal_msg().expect("old metadata should encode");
+        fs::write(object_dir.join(STORAGE_FORMAT_FILE), old_meta_buf.clone())
+            .await
+            .expect("old metadata should be written");
+
+        let tmp_data_dir = disk_root
+            .join(RUSTFS_META_TMP_BUCKET)
+            .join(tmp_object)
+            .join(new_data_dir.to_string());
+        fs::create_dir_all(&tmp_data_dir)
+            .await
+            .expect("new tmp data dir should be created");
+        fs::write(tmp_data_dir.join("part.1"), b"new")
+            .await
+            .expect("new tmp part should be written");
+
+        let mut new_fi = FileInfo::new(&format!("{bucket}/{object}"), 1, 1);
+        new_fi.name = object.to_string();
+        new_fi.version_id = Some(version_id);
+        new_fi.data_dir = Some(new_data_dir);
+        new_fi.size = 1;
+        new_fi.mod_time = Some(OffsetDateTime::now_utc());
+
+        let disks = vec![Some(disk), None];
+        let file_infos = vec![new_fi.clone(), new_fi];
+        let result = SetDisks::rename_data(&disks, RUSTFS_META_TMP_BUCKET, tmp_object, &file_infos, bucket, object, 2).await;
+
+        assert!(result.is_err());
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("destination metadata should remain readable");
+        assert_eq!(restored_meta, old_meta_buf);
+        assert!(!object_dir.join(object).join(STORAGE_FORMAT_FILE).exists());
+        assert!(!object_dir.join(new_data_dir.to_string()).exists());
+        assert!(
+            !object_dir
+                .join(old_data_dir.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .exists()
+        );
     }
 
     #[test]

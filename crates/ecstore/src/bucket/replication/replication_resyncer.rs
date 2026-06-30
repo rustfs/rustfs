@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_bandwidth_boundary;
 use super::replication_config_store as config_store;
 use super::replication_event_sink::{EventArgs, send_event};
 use super::replication_lock_boundary as lock_boundary;
@@ -21,7 +22,6 @@ use super::replication_tagging_boundary as tagging_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 use crate::bucket::bucket_target_sys::{
     AdvancedPutOptions, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
 };
@@ -3703,17 +3703,7 @@ fn wrap_with_bandwidth_monitor_with_header(
     header_size: usize,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
     if let Some(monitor) = runtime_sources::bucket_monitor() {
-        Box::new(MonitoredReader::new(
-            monitor,
-            stream,
-            MonitorReaderOptions {
-                bucket_options: BucketOptions {
-                    name: bucket.to_string(),
-                    replication_arn: arn.to_string(),
-                },
-                header_size,
-            },
-        ))
+        replication_bandwidth_boundary::wrap_reader(stream, monitor, bucket, arn, header_size)
     } else {
         WARNED_MONITOR_UNINIT.call_once(|| {
             warn!(

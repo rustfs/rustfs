@@ -104,7 +104,8 @@ Current coupling:
 - replication workers depend on `ReplicationStorage`, ECStore object APIs,
   bucket target clients, bucket metadata, file metadata replication state,
   scanner repair classification, runtime replication pool/stat handles, bucket
-  monitor, local node names, and notification events;
+  monitor and bandwidth reader access through local boundaries, local node
+  names, and notification events;
 - resync and delete replication paths call metadata and bucket target systems
   directly;
 - lifecycle and heal paths schedule replication work through the current ECStore
@@ -121,6 +122,8 @@ Required contracts before crate movement:
   headers, MRF/resync state, and status persistence.
 - `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
   node identity, cancellation, and queue sizing.
+- `ReplicationBandwidthLimiter`: target reader wrapping for replication
+  bandwidth accounting and throttling.
 - `ReplicationEventSink`: notification/audit events for skipped, failed, and
   completed replication operations.
 - `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
