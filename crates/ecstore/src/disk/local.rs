@@ -2828,18 +2828,6 @@ impl DiskAPI for LocalDisk {
             record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
         }
 
-        // Verify file exists and get metadata
-        let file_path_clone = file_path.clone();
-        let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
-        let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
-            .await
-            .map_err(DiskError::from)
-            .and_then(|result| result);
-        if let Some(metrics) = metrics {
-            record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
-        }
-        let meta = meta_result?;
-
         let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
         let Some(end_offset) = offset.checked_add(length) else {
             if let Some(metrics) = metrics {
@@ -2847,27 +2835,6 @@ impl DiskAPI for LocalDisk {
             }
             return Err(DiskError::FileCorrupt);
         };
-        if meta.len() < end_offset as u64 {
-            if let Some(metrics) = metrics {
-                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
-            }
-            error!(
-                event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
-                volume,
-                path,
-                offset,
-                length,
-                actual_size = meta.len(),
-                reason = "read_file_mmap_copy_out_of_bounds",
-                "Disk local read fallback failed"
-            );
-            return Err(DiskError::FileCorrupt);
-        }
-        if let Some(metrics) = metrics {
-            record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
-        }
 
         // Unix: use mmap to read the data (copies into Bytes for safe ownership)
         // Non-Unix: fall back to efficient read
@@ -2878,10 +2845,23 @@ impl DiskAPI for LocalDisk {
 
             struct MmapCopyReadResult {
                 bytes: Bytes,
+                metadata_lookup_duration: StdDuration,
+                metadata_validate_duration: StdDuration,
                 file_open_duration: StdDuration,
                 mmap_map_duration: StdDuration,
                 mmap_copy_duration: StdDuration,
                 blocking_task_duration: StdDuration,
+            }
+
+            enum MmapCopyReadError {
+                Disk(DiskError),
+                OutOfBounds { actual_size: u64 },
+            }
+
+            impl From<DiskError> for MmapCopyReadError {
+                fn from(err: DiskError) -> Self {
+                    Self::Disk(err)
+                }
             }
 
             let start = StdInstant::now();
@@ -2891,6 +2871,18 @@ impl DiskAPI for LocalDisk {
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
             let read_result = tokio::task::spawn_blocking(move || {
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
+
+                let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
+                let meta = std::fs::metadata(&file_path_clone).map_err(DiskError::from)?;
+                let metadata_lookup_duration = metadata_lookup_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let metadata_validate_start = metrics_enabled.then(StdInstant::now);
+                if meta.len() < end_offset as u64 {
+                    return Err(MmapCopyReadError::OutOfBounds { actual_size: meta.len() });
+                }
+                let metadata_validate_duration =
+                    metadata_validate_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
                 let file_open_start = metrics_enabled.then(StdInstant::now);
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
@@ -2907,7 +2899,7 @@ impl DiskAPI for LocalDisk {
                 // only queries process-global OS configuration.
                 let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
                 if page_size <= 0 {
-                    return Err(DiskError::other("failed to determine system page size"));
+                    return Err(DiskError::other("failed to determine system page size").into());
                 }
                 let page_size = page_size as u64;
                 let offset_u64 = offset as u64;
@@ -2949,8 +2941,10 @@ impl DiskAPI for LocalDisk {
 
                 let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
-                Ok::<MmapCopyReadResult, DiskError>(MmapCopyReadResult {
+                Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
                     bytes,
+                    metadata_lookup_duration,
+                    metadata_validate_duration,
                     file_open_duration,
                     mmap_map_duration,
                     mmap_copy_duration,
@@ -2959,16 +2953,45 @@ impl DiskAPI for LocalDisk {
             })
             .await
             .map_err(DiskError::from)
+            .map_err(MmapCopyReadError::Disk)
             .and_then(|result| result);
             if let Some(metrics) = metrics {
                 record_mmap_copy_stage(metrics, metrics.blocking_wait_stage, blocking_wait_start);
             }
-            let read_result = read_result?;
+            let read_result = match read_result {
+                Ok(read_result) => read_result,
+                Err(MmapCopyReadError::Disk(err)) => return Err(err),
+                Err(MmapCopyReadError::OutOfBounds { actual_size }) => {
+                    error!(
+                        event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                        volume,
+                        path,
+                        offset,
+                        length,
+                        actual_size,
+                        reason = "read_file_mmap_copy_out_of_bounds",
+                        "Disk local read fallback failed"
+                    );
+                    return Err(DiskError::FileCorrupt);
+                }
+            };
             if metrics_enabled && let Some(metrics) = metrics {
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics.path,
                     metrics.blocking_task_stage,
                     read_result.blocking_task_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_lookup_stage,
+                    read_result.metadata_lookup_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.metadata_validate_stage,
+                    read_result.metadata_validate_duration.as_secs_f64(),
                 );
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics.path,
@@ -3006,6 +3029,40 @@ impl DiskAPI for LocalDisk {
             rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
 
             debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
+            let file_path_clone = file_path.clone();
+            let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
+            let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+                .await
+                .map_err(DiskError::from)
+                .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
+            }
+            let meta = meta_result?;
+
+            let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+            if meta.len() < end_offset as u64 {
+                if let Some(metrics) = metrics {
+                    record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+                }
+                error!(
+                    event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_DISK_LOCAL,
+                    volume,
+                    path,
+                    offset,
+                    length,
+                    actual_size = meta.len(),
+                    reason = "read_file_mmap_copy_out_of_bounds",
+                    "Disk local read fallback failed"
+                );
+                return Err(DiskError::FileCorrupt);
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
 
             let mut f = self.open_file(file_path, O_RDONLY, volume_dir).await?;
 
