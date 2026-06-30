@@ -876,10 +876,6 @@ mod tests {
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-        if let Some(store) = runtime_sources::object_store() {
-            return (temp_dir, store, endpoint_pools);
-        }
-
         init_local_disks(endpoint_pools.clone()).await.expect("test local disks");
         let store = ECStore::new(
             "127.0.0.1:0".parse().expect("test addr"),
