@@ -25,7 +25,10 @@ use crate::disk::{
     error::{DiskError, Error, FileAccessDeniedWithContext, Result},
     error_conv::{to_access_error, to_file_error, to_unformatted_disk_error, to_volume_error},
     format::FormatV3,
-    fs::{O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, lstat, lstat_std, remove, remove_all_std, remove_std, rename},
+    fs::{
+        O_APPEND, O_CREATE, O_RDONLY, O_TRUNC, O_WRONLY, access, access_std, lstat, lstat_std, remove, remove_all_std,
+        remove_std, rename,
+    },
     os,
     os::{check_path_length, is_empty_dir, is_root_disk, rename_all, rename_all_ignore_missing_source},
 };
@@ -1215,62 +1218,21 @@ impl LocalDisk {
 
     // Get the absolute path of an object
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
-        // For high-frequency paths, use faster string concatenation
-        let cache_key = if key.is_empty() {
-            bucket.to_string()
-        } else {
-            path_join_buf(&[bucket, key])
-        };
-
-        #[cfg(windows)]
-        let path = self.root.join(cache_key.replace('/', "\\"));
-        #[cfg(not(windows))]
-        let path = self.root.join(cache_key);
-
-        self.check_valid_path(&path)?;
-        Ok(path)
+        local_disk_object_path(&self.root, bucket, key)
     }
 
     // Get the absolute path of a bucket
     pub fn get_bucket_path(&self, bucket: &str) -> Result<PathBuf> {
-        #[cfg(windows)]
-        let bucket_path = self.root.join(bucket.replace('/', "\\"));
-        #[cfg(not(windows))]
-        let bucket_path = self.root.join(bucket);
-
-        self.check_valid_path(&bucket_path)?;
-        Ok(bucket_path)
+        local_disk_bucket_path(&self.root, bucket)
     }
 
     // Check if a path is valid
     fn check_valid_path<P: AsRef<Path>>(&self, path: P) -> Result<()> {
-        let path = normalize_path_components(path);
-        if !path.starts_with(&self.root) {
-            return Err(DiskError::InvalidPath);
-        }
-
-        self.reject_symlink_components(&path)
+        check_local_disk_valid_path(&self.root, path)
     }
 
     fn reject_symlink_components(&self, path: &Path) -> Result<()> {
-        let relative = path.strip_prefix(&self.root).map_err(|_| DiskError::InvalidPath)?;
-        let mut current = self.root.clone();
-
-        for component in relative.components() {
-            current.push(component.as_os_str());
-
-            match lstat_std(&current) {
-                Ok(metadata) => {
-                    if metadata.file_type().is_symlink() {
-                        return Err(DiskError::InvalidPath);
-                    }
-                }
-                Err(err) if err.kind() == ErrorKind::NotFound => break,
-                Err(err) => return Err(to_file_error(err).into()),
-            }
-        }
-
-        Ok(())
+        reject_local_disk_symlink_components(&self.root, path)
     }
 
     // Batch path generation with single lock acquisition
@@ -2230,6 +2192,62 @@ fn skip_access_checks(p: impl AsRef<str>) -> bool {
     false
 }
 
+fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBuf> {
+    let cache_key = if key.is_empty() {
+        bucket.to_string()
+    } else {
+        path_join_buf(&[bucket, key])
+    };
+
+    #[cfg(windows)]
+    let path = root.join(cache_key.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let path = root.join(cache_key);
+
+    check_local_disk_valid_path(root, &path)?;
+    Ok(path)
+}
+
+fn local_disk_bucket_path(root: &Path, bucket: &str) -> Result<PathBuf> {
+    #[cfg(windows)]
+    let bucket_path = root.join(bucket.replace('/', "\\"));
+    #[cfg(not(windows))]
+    let bucket_path = root.join(bucket);
+
+    check_local_disk_valid_path(root, &bucket_path)?;
+    Ok(bucket_path)
+}
+
+fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
+    let path = normalize_path_components(path);
+    if !path.starts_with(root) {
+        return Err(DiskError::InvalidPath);
+    }
+
+    reject_local_disk_symlink_components(root, &path)
+}
+
+fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let mut current = root.to_path_buf();
+
+    for component in relative.components() {
+        current.push(component.as_os_str());
+
+        match lstat_std(&current) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() {
+                    return Err(DiskError::InvalidPath);
+                }
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => break,
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+
+    Ok(())
+}
+
 // Lightweight path normalization without filesystem calls
 fn normalize_path_components(path: impl AsRef<Path>) -> PathBuf {
     let path = path.as_ref();
@@ -2948,24 +2966,6 @@ impl DiskAPI for LocalDisk {
     ) -> Result<Bytes> {
         let metrics_enabled = metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
 
-        let access_check_start = metrics_enabled.then(std::time::Instant::now);
-        let volume_dir = self.get_bucket_path(volume)?;
-        if !skip_access_checks(volume) {
-            access(&volume_dir)
-                .await
-                .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
-        }
-        if let Some(metrics) = metrics {
-            record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
-        }
-
-        let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
-        let file_path = self.get_object_path(volume, path)?;
-        check_path_length(file_path.to_string_lossy().as_ref())?;
-        if let Some(metrics) = metrics {
-            record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
-        }
-
         let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
         let Some(end_offset) = offset.checked_add(length) else {
             if let Some(metrics) = metrics {
@@ -2983,6 +2983,8 @@ impl DiskAPI for LocalDisk {
 
             struct MmapCopyReadResult {
                 bytes: Bytes,
+                access_check_duration: StdDuration,
+                path_resolve_duration: StdDuration,
                 metadata_lookup_duration: StdDuration,
                 metadata_validate_duration: StdDuration,
                 file_open_duration: StdDuration,
@@ -3007,7 +3009,9 @@ impl DiskAPI for LocalDisk {
             }
 
             let start = StdInstant::now();
-            let file_path_clone = file_path.clone();
+            let root = self.root.clone();
+            let volume_owned = volume.to_owned();
+            let path_owned = path.to_owned();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
             let should_populate_mmap_read = should_populate_mmap_read(length);
@@ -3018,8 +3022,20 @@ impl DiskAPI for LocalDisk {
             let read_result = tokio::task::spawn_blocking(move || {
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
 
+                let access_check_start = metrics_enabled.then(StdInstant::now);
+                let volume_dir = local_disk_bucket_path(&root, &volume_owned)?;
+                if !skip_access_checks(&volume_owned) {
+                    access_std(&volume_dir).map_err(|e| DiskError::from(to_access_error(e, DiskError::VolumeAccessDenied)))?;
+                }
+                let access_check_duration = access_check_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
+                let path_resolve_start = metrics_enabled.then(StdInstant::now);
+                let file_path = local_disk_object_path(&root, &volume_owned, &path_owned)?;
+                check_path_length(file_path.to_string_lossy().as_ref())?;
+                let path_resolve_duration = path_resolve_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
                 let file_open_start = metrics_enabled.then(StdInstant::now);
-                let mut file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
+                let mut file = std::fs::File::open(&file_path).map_err(DiskError::from)?;
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 let metadata_lookup_start = metrics_enabled.then(StdInstant::now);
@@ -3132,6 +3148,8 @@ impl DiskAPI for LocalDisk {
 
                 Ok::<MmapCopyReadResult, MmapCopyReadError>(MmapCopyReadResult {
                     bytes,
+                    access_check_duration,
+                    path_resolve_duration,
                     metadata_lookup_duration,
                     metadata_validate_duration,
                     file_open_duration,
@@ -3175,6 +3193,16 @@ impl DiskAPI for LocalDisk {
                     metrics.path,
                     metrics.blocking_task_stage,
                     read_result.blocking_task_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.access_check_stage,
+                    read_result.access_check_duration.as_secs_f64(),
+                );
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.path_resolve_stage,
+                    read_result.path_resolve_duration.as_secs_f64(),
                 );
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics.path,
@@ -3246,6 +3274,24 @@ impl DiskAPI for LocalDisk {
             rustfs_io_metrics::record_zero_copy_fallback("non_unix_platform");
 
             debug!(reason = "non_unix_platform", "zero_copy_fallback");
+
+            let access_check_start = metrics_enabled.then(std::time::Instant::now);
+            let volume_dir = self.get_bucket_path(volume)?;
+            if !skip_access_checks(volume) {
+                access(&volume_dir)
+                    .await
+                    .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
+            }
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
+            }
+
+            let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
+            let file_path = self.get_object_path(volume, path)?;
+            check_path_length(file_path.to_string_lossy().as_ref())?;
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
+            }
 
             let file_path_clone = file_path.clone();
             let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
