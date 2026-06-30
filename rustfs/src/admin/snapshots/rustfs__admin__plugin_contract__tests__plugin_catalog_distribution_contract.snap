@@ -1,0 +1,36 @@
+---
+source: rustfs/src/admin/plugin_contract.rs
+expression: value
+---
+{
+  "api_compatibility_version": "rustfs.target-plugin.v1",
+  "display_name": "Webhook+",
+  "distribution": {
+    "artifacts": [
+      {
+        "artifact_id": "sidecar-linux-amd64",
+        "digest_sha256": "0123456789abcdef",
+        "download_uri": "https://plugins.example.test/webhook.tar.zst",
+        "provenance_uri": "https://plugins.example.test/webhook.tar.zst.intoto.jsonl",
+        "signature_uri": "https://plugins.example.test/webhook.tar.zst.sig",
+        "size_bytes": 4096,
+        "target_triple": "x86_64-unknown-linux-gnu"
+      }
+    ]
+  },
+  "domain_configs": [],
+  "entrypoint_kind": "sidecar",
+  "packaging": "builtin",
+  "plugin_id": "external:webhook",
+  "provider": "example",
+  "runtime_contract": {
+    "protocol_version": "rustfs.target-runtime.v1",
+    "transport": "grpc"
+  },
+  "secret_fields": [],
+  "supported_domains": [
+    "notify"
+  ],
+  "target_type": "webhook",
+  "version": "1.2.3"
+}

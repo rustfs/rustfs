@@ -171,7 +171,7 @@ Classification:
 | Remote shard read stream | `crates/ecstore/src/rpc/remote_disk.rs::RemoteDisk::read_file_stream`; `crates/ecstore/src/rpc/internode_data_transport.rs::InternodeDataTransport::open_read`; `crates/ecstore/src/bitrot.rs::create_bitrot_reader` | `rustfs/src/storage/rpc/http_service.rs::handle_read_file` | Covered by `InternodeDataTransport` | Object GET, repair reads, and erasure decode use this path for remote shard bytes. |
 | Remote shard write stream | `RemoteDisk::create_file`; `RemoteDisk::append_file`; `InternodeDataTransport::open_write`; `crates/ecstore/src/bitrot.rs::create_bitrot_writer` | `rustfs/src/storage/rpc/http_service.rs::handle_put_file` | Covered by `InternodeDataTransport` | Object PUT and multipart part upload use this path for remote shard bytes. |
 | Remote namespace walk stream | `RemoteDisk::walk_dir`; `InternodeDataTransport::open_walk_dir`; `crates/ecstore/src/cache_value/metacache_set.rs` walk producers | `rustfs/src/storage/rpc/http_service.rs::handle_walk_dir` | Covered by `InternodeDataTransport` | High-volume listing/scanner/heal metadata stream. It is not object byte data, but it is a large internode stream. |
-| Remote zero-copy read fallback | `RemoteDisk::read_file_zero_copy` | same as remote shard read stream | Covered by `InternodeDataTransport` through `read_file_stream` | The remote path buffers the stream into `Bytes`; true zero-copy is not guaranteed for remote disks. |
+| Remote mmap-copy read fallback | `RemoteDisk::read_file_mmap_copy` | same as remote shard read stream | Covered by `InternodeDataTransport` through `read_file_stream` | The remote path buffers the stream into `Bytes`; true zero-copy is not guaranteed for remote disks. |
 
 ### Still Direct TCP/HTTP/gRPC
 
@@ -210,7 +210,7 @@ Classification:
 | Medium | `ReadAll` and `WriteAll` still carry unary `bytes` over gRPC. They appear metadata-oriented today, but there is no size threshold or routing policy. |
 | Medium | `ReadMultiple` can aggregate many metadata files into one gRPC response. |
 | Low | Legacy gRPC `WalkDir` remains implemented while `RemoteDisk::walk_dir` uses HTTP through the transport. |
-| Medium | Remote `read_file_zero_copy` is a buffered read over the transport, not a remote zero-copy contract. |
+| Medium | Remote `read_file_mmap_copy` is a buffered read over the transport, not a remote zero-copy contract. |
 | Medium | Server-side TCP HTTP route handling is outside the client-side trait. |
 
 ## Current Object Write Path
@@ -235,7 +235,7 @@ This is the primary write data-plane candidate.
 For object GETs and repair reads in distributed erasure mode, the relevant flow is:
 
 1. `SetDisks` prepares shard readers for the selected disks.
-2. `create_bitrot_reader` uses local zero-copy only when `disk.is_local()`.
+2. `create_bitrot_reader` uses local mmap-copy reads only when `disk.is_local()`.
 3. For a remote disk, it calls `disk.read_file_stream(...)`.
 4. `RemoteDisk::read_file_stream` delegates to
    `InternodeDataTransport::open_read`.
@@ -385,7 +385,7 @@ The initial TCP backend can keep the current signed HTTP URLs internally.
 `RemoteDisk` delegates only these methods to the data transport:
 
 - `read_file_stream`
-- `read_file_zero_copy` as the current wrapper over `read_file_stream`
+- `read_file_mmap_copy` as the current wrapper over `read_file_stream`
 - `append_file`
 - `create_file`
 - `walk_dir`

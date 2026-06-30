@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: set-layout contracts are staged while ECStore ownership boundaries shrink.
+#![allow(dead_code)]
+
 //! Static ECStore layout boundaries.
 //!
 //! This module owns read-only layout descriptors used to keep static set

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: SetDisks still hosts staged read/heal/write migration helpers.
+#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 
@@ -420,15 +422,27 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 /// When enabled, read locks are released after metadata read instead of
 /// being held for the entire data transfer duration.
 ///
-/// **Note**: Cached via `OnceLock` — env var changes require process restart.
+/// **Note**: Cached via `OnceLock` in production — env var changes require
+/// process restart. In test builds the env var is read directly so that
+/// `temp_env` overrides take effect.
 pub fn is_lock_optimization_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
             rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+                rustfs_config::DEFAULT_OBJECT_LOCK_OPTIMIZATION_ENABLE,
+            )
+        })
+    }
 }
 
 /// Check if deadlock detection is enabled.

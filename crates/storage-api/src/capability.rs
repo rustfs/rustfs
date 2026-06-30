@@ -95,13 +95,36 @@ impl std::error::Error for CapabilitySnapshotError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(object) => {
+                let mut entries: Vec<_> = object.into_iter().collect();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn capability_status_serializes_unknown_and_unsupported_states() {
         let unknown = CapabilityStatus::unknown();
         let unsupported = CapabilityStatus::unsupported().with_reason("target does not expose profiler");
 
-        let encoded = serde_json::to_string(&(unknown, unsupported)).expect("serialize capability statuses");
+        let encoded = serde_json::to_string(&(&unknown, &unsupported)).expect("serialize capability statuses");
+        insta::assert_json_snapshot!(
+            "capability_status_contract",
+            sorted_json_value(serde_json::to_value((&unknown, &unsupported)).expect("capability statuses should serialize"))
+        );
         let decoded: (CapabilityStatus, CapabilityStatus) =
             serde_json::from_str(&encoded).expect("deserialize capability statuses");
 

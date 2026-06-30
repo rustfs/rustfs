@@ -5211,10 +5211,11 @@
             "uid": "${datasource}"
           },
           "expr": "rate(rustfs_s3_put_object_total{job=~\"$job\"}[5m])",
-          "legendFormat": "PutObject - {{zero_copy_enabled}}",
+          "legendFormat": "PutObject",
           "refId": "B"
         }
       ],
+      "description": "Aggregate S3 operation rate. Data-plane copy mode uses dedicated mmap-copy and buffered-write metrics.",
       "title": "S3 Operations Rate",
       "type": "timeseries"
     },
@@ -5479,12 +5480,13 @@
             "type": "prometheus",
             "uid": "${datasource}"
           },
-          "expr": "sum(increase(rustfs_zero_copy_memory_saved_bytes_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_bytes_saved_total{job=~\"$job\"}[$__rate_interval])) or vector(0)",
-          "legendFormat": "Memory Saved",
+          "expr": "sum(increase(rustfs_mmap_copy_bytes_copied_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_memory_saved_bytes_total{job=~\"$job\"}[$__rate_interval])) or sum(increase(rustfs_zero_copy_bytes_saved_total{job=~\"$job\"}[$__rate_interval])) or vector(0)",
+          "legendFormat": "Mmap-copy bytes",
           "refId": "A"
         }
       ],
-      "title": "Zero-Copy Memory Savings",
+      "description": "Prefers rustfs_mmap_copy_bytes_copied_total. Legacy zero_copy counters are retained as compatibility fallbacks during the metric rename transition.",
+      "title": "Mmap Copy Read Bytes",
       "type": "timeseries"
     },
     {

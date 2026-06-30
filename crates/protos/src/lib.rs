@@ -19,7 +19,7 @@ mod generated;
 mod runtime_sources;
 
 use proto_gen::node_service::node_service_client::NodeServiceClient;
-use rustfs_common::{GLOBAL_CONN_MAP, evict_connection_with_log_level};
+use rustfs_common::{cache_connection, evict_connection_with_log_level};
 use std::{
     collections::HashMap,
     error::Error,
@@ -188,10 +188,7 @@ pub async fn create_new_channel(addr: &str) -> Result<Channel, Box<dyn Error>> {
         }
     };
 
-    // Cache the new connection
-    {
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel.clone());
-    }
+    cache_connection(addr.to_string(), channel.clone()).await;
     {
         let mut generation_cache = TLS_GENERATION_CACHE.lock().await;
         enforce_tls_generation_cache_bound(&mut generation_cache, generation, addr);
@@ -261,10 +258,10 @@ mod tests {
     async fn evict_failed_connection_with_log_level_removes_cached_connection() {
         let addr = "http://evict-failed-connection-debug-test";
         let channel = Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
-        GLOBAL_CONN_MAP.write().await.insert(addr.to_string(), channel);
+        cache_connection(addr.to_string(), channel).await;
 
         evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
 
-        assert!(!GLOBAL_CONN_MAP.read().await.contains_key(addr));
+        assert!(!rustfs_common::has_cached_connection(addr).await);
     }
 }

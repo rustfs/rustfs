@@ -53,8 +53,8 @@ members = [
     "crates/trusted-proxies", # Trusted proxies management
     "crates/tls-runtime", # Project-wide TLS runtime foundation
     "crates/utils", # Utility functions and helpers
-    "crates/io-metrics", # Zero-copy metrics collection for performance analysis
-    "crates/io-core", # Zero-copy core reader and writer implementations
+    "crates/io-metrics", # I/O metrics collection for performance analysis
+    "crates/io-core", # Buffered Bytes, mmap-then-copy, and aligned pread I/O helpers
     "crates/zip", # ZIP file handling and compression
 ]
 resolver = "3"
@@ -180,10 +180,10 @@ serde_urlencoded = "0.7.1"
 # matching stable releases are not available yet, while previous stable lines
 # have incompatible APIs. Keep them exact-pinned and monitor upstream for stable
 # releases.
-aes-gcm = { version = "=0.11.0-rc.4", features = ["rand_core"] }
+aes-gcm = { version = "=0.11.0", features = ["rand_core"] }
 argon2 = { version = "=0.6.0-rc.8" }
 blake2 = "=0.11.0-rc.6"
-chacha20poly1305 = { version = "=0.11.0-rc.3" }
+chacha20poly1305 = { version = "=0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "10.4.0", features = ["aws_lc_rs"] }

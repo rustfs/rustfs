@@ -243,6 +243,9 @@ boundary files after the external runtime, test, and fuzz consumers have been
 narrowed. IAM, heal, scanner, notify, observability, Swift, S3 Select, e2e, and
 fuzz code must not reintroduce direct `rustfs_ecstore::api::...` references
 outside those boundary files.
+The observability ECStore dependency baseline is tracked in
+[`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md);
+future observability extraction PRs must update that inventory with the guard.
 
 ECStore ClusterControlPlane read models must stay owned by the crate-private
 `cluster` module. Public access goes through `rustfs_ecstore::api::cluster` so

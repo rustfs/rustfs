@@ -1030,7 +1030,6 @@ impl TierConfigMgr {
         let Some(api) = runtime_sources::object_store_handle() else {
             return Err(tier_config_not_initialized_error("save tiering config"));
         };
-        //let (pr, opts) = GLOBAL_TierConfigMgr.write().config_reader()?;
 
         self.save_tiering_config(api).await
     }

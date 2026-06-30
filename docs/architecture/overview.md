@@ -38,9 +38,15 @@ hot-path behavior must not drift during this migration.
 - [`global-state-crate-split-plan.md`](global-state-crate-split-plan.md): late
   global-state cleanup, runtime-source boundaries, fallback removal rules, and
   crate-split evaluation criteria.
+- [`obs-ecstore-dependency-inventory.md`](obs-ecstore-dependency-inventory.md):
+  observability-to-ECStore dependency inventory, classification, and extraction
+  guardrails.
 - [`ecstore-config-consumer-inventory.md`](ecstore-config-consumer-inventory.md):
   current `ecstore::config::{Config, KV, KVS}` definitions, consumers,
   migration risks, and do-not-change contract.
+- [`ecstore-api-facade-inventory.md`](ecstore-api-facade-inventory.md): current
+  `rustfs_ecstore::api` facade groups, external consumer boundaries, shrink
+  rules, and split dependency inventory.
 - [`config-model-boundary-adr.md`](config-model-boundary-adr.md): target crate,
   module path, dependency rules, and verification gates for moving the pure
   server-config model.

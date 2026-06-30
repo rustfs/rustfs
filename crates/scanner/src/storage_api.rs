@@ -16,7 +16,6 @@ pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys a
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
     apply_expiry_rule as ecstore_apply_expiry_rule, apply_transition_rule as ecstore_apply_transition_rule,
-    get_global_expiry_state as ecstore_get_global_expiry_state,
 };
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::evaluator::Evaluator as EcstoreEvaluator;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::lifecycle::{
@@ -66,8 +65,9 @@ pub(crate) use rustfs_ecstore::api::error::{
     Error as EcstoreErrorType, Result as EcstoreResultType, StorageError as EcstoreStorageError,
 };
 pub(crate) use rustfs_ecstore::api::runtime::{
-    global_tier_config_mgr as ecstore_get_global_tier_config_mgr, object_store_handle as ecstore_resolve_object_store_handle,
-    setup_is_erasure as ecstore_is_erasure, setup_is_erasure_sd as ecstore_is_erasure_sd,
+    expiry_state_handle as ecstore_expiry_state_handle, global_tier_config_mgr as ecstore_get_global_tier_config_mgr,
+    object_store_handle as ecstore_resolve_object_store_handle, setup_is_erasure as ecstore_is_erasure,
+    setup_is_erasure_sd as ecstore_is_erasure_sd,
 };
 pub(crate) use rustfs_ecstore::api::set_disk::SetDisks as EcstoreSetDisks;
 pub(crate) use rustfs_ecstore::api::storage::ECStore as EcstoreStore;
@@ -85,7 +85,7 @@ pub(crate) mod owner {
         EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfig,
         EcstoreReplicationConfigurationExt, EcstoreReplicationHealQueueResult, EcstoreReplicationQueueAdmission,
         EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig,
-        EcstoreVersioningApi, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_get_global_expiry_state,
+        EcstoreVersioningApi, ecstore_apply_expiry_rule, ecstore_apply_transition_rule, ecstore_expiry_state_handle,
         ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config, ecstore_get_object_lock_config,
         ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd, ecstore_is_reserved_or_invalid_bucket,
         ecstore_list_path_raw, ecstore_path2_bucket_object, ecstore_path2_bucket_object_with_base_path,

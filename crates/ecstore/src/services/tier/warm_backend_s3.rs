@@ -93,7 +93,6 @@ impl WarmBackendS3 {
         let opts = Options {
             creds,
             secure: u.scheme() == "https",
-            //transport: GLOBAL_RemoteTargetTransport,
             region: conf.region.clone(),
             ..Default::default()
         };

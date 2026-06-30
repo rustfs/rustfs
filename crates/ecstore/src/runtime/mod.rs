@@ -12,5 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: runtime source migration keeps fallback handles until all owners inject state.
+#![allow(dead_code)]
+
 pub(crate) mod global;
 pub(crate) mod sources;

@@ -113,3 +113,8 @@ address normalization, and process-local shutdown cleanup.
 Early AppContext work should split resolver files and add compatibility tests before
 boot extraction or consumer migration. This keeps the migration context-first while
 preserving the old global fallback path during transition.
+
+AppContext remains a context-first facade, not a full replacement for every
+process global. New migration work must keep fallback reads inside owner-local
+runtime-source boundaries and follow the global-state target inventory in
+[`global-state-inventory.md`](global-state-inventory.md).

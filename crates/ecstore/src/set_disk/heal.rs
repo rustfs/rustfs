@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::*;
+use crate::io_support::bitrot::object_mmap_read_enabled;
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
-use rustfs_config::{DEFAULT_OBJECT_ZERO_COPY_ENABLE, ENV_OBJECT_ZERO_COPY_ENABLE};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_HEAL: &str = "heal";
@@ -360,10 +360,7 @@ impl SetDisks {
 
                             for (part_index, part) in latest_meta.parts.iter().enumerate() {
                                 let till_offset = erasure.shard_file_offset(0, part.size, part.size);
-                                // Read zero-copy configuration from environment variable
-                                // Default: enabled (true) for performance
-                                let use_mmap_read =
-                                    rustfs_utils::get_env_bool(ENV_OBJECT_ZERO_COPY_ENABLE, DEFAULT_OBJECT_ZERO_COPY_ENABLE);
+                                let use_mmap_read = object_mmap_read_enabled();
 
                                 let mut readers = Vec::with_capacity(latest_disks.len());
                                 let mut writers = Vec::with_capacity(out_dated_disks.len());

@@ -29,7 +29,7 @@ pub use interfaces::*;
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use super::storage_api::context::{ECStore, EndpointServerPools};
 use crate::config::RustFSBufferConfig;
@@ -193,12 +193,12 @@ pub fn resolve_runtime_port() -> Option<u16> {
 
 /// Resolve lock client using AppContext-first precedence.
 pub fn resolve_lock_client() -> Option<Arc<dyn LockClient>> {
-    resolve_lock_client_with(get_global_app_context())
+    resolve_lock_client_with_startup_fallback(get_global_app_context(), runtime_sources::lock_client)
 }
 
 /// Resolve lock clients using AppContext-first precedence.
 pub fn resolve_lock_clients_handle() -> Option<HashMap<String, Arc<dyn LockClient>>> {
-    resolve_lock_clients_handle_with(get_global_app_context())
+    resolve_lock_clients_handle_with_startup_fallback(get_global_app_context(), runtime_sources::lock_clients)
 }
 
 /// Resolve performance metrics using AppContext-first precedence.
@@ -246,6 +246,11 @@ pub fn resolve_tier_config_handle() -> Option<Arc<RwLock<TierConfigMgr>>> {
 /// Resolve lifecycle expiry state using AppContext-first precedence.
 pub fn resolve_expiry_state_handle() -> Option<Arc<RwLock<ExpiryState>>> {
     resolve_expiry_state_handle_with(get_global_app_context())
+}
+
+/// Resolve lifecycle transition state using AppContext-first precedence.
+pub fn resolve_transition_state_handle() -> Option<Arc<TransitionState>> {
+    resolve_transition_state_handle_with(get_global_app_context())
 }
 
 /// Resolve server config using AppContext-first precedence.
@@ -351,7 +356,7 @@ fn resolve_boot_time_with(context: Option<Arc<AppContext>>) -> Option<SystemTime
 }
 
 fn resolve_daily_tier_stats_with(context: Option<Arc<AppContext>>) -> Option<DailyAllTierStats> {
-    context.map(|context| context.tier_stats().daily_all())
+    context.map(|context| context.transition_state().daily_tier_stats())
 }
 
 async fn resolve_scanner_metrics_report_with(context: Option<Arc<AppContext>>) -> Option<ScannerMetricsReport> {
@@ -383,8 +388,25 @@ fn resolve_lock_client_with(context: Option<Arc<AppContext>>) -> Option<Arc<dyn 
     context.and_then(|context| context.lock_client().handle())
 }
 
+fn resolve_lock_client_with_startup_fallback<F>(context: Option<Arc<AppContext>>, fallback: F) -> Option<Arc<dyn LockClient>>
+where
+    F: FnOnce() -> Option<Arc<dyn LockClient>>,
+{
+    resolve_lock_client_with(context).or_else(fallback)
+}
+
 fn resolve_lock_clients_handle_with(context: Option<Arc<AppContext>>) -> Option<HashMap<String, Arc<dyn LockClient>>> {
     context.and_then(|context| context.lock_clients().handle())
+}
+
+fn resolve_lock_clients_handle_with_startup_fallback<F>(
+    context: Option<Arc<AppContext>>,
+    fallback: F,
+) -> Option<HashMap<String, Arc<dyn LockClient>>>
+where
+    F: FnOnce() -> Option<HashMap<String, Arc<dyn LockClient>>>,
+{
+    resolve_lock_clients_handle_with(context).or_else(fallback)
 }
 
 fn resolve_performance_metrics_with(context: Option<Arc<AppContext>>) -> Option<Arc<PerformanceMetrics>> {
@@ -425,6 +447,10 @@ fn resolve_tier_config_handle_with(context: Option<Arc<AppContext>>) -> Option<A
 
 fn resolve_expiry_state_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<RwLock<ExpiryState>>> {
     context.map(|context| context.expiry_state().handle())
+}
+
+fn resolve_transition_state_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<TransitionState>> {
+    context.map(|context| context.transition_state().handle())
 }
 
 fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config> {
@@ -468,7 +494,7 @@ mod tests {
         EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
         LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
         RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -596,16 +622,6 @@ mod tests {
     impl BootTimeInterface for TestBootTimeInterface {
         fn get(&self) -> Option<SystemTime> {
             self.boot_time
-        }
-    }
-
-    struct TestTierStatsInterface {
-        daily_stats: DailyAllTierStats,
-    }
-
-    impl TierStatsInterface for TestTierStatsInterface {
-        fn daily_all(&self) -> DailyAllTierStats {
-            self.daily_stats.clone()
         }
     }
 
@@ -781,6 +797,21 @@ mod tests {
         }
     }
 
+    struct TestTransitionStateInterface {
+        transition_state: Arc<TransitionState>,
+        daily_stats: DailyAllTierStats,
+    }
+
+    impl TransitionStateInterface for TestTransitionStateInterface {
+        fn handle(&self) -> Arc<TransitionState> {
+            self.transition_state.clone()
+        }
+
+        fn daily_tier_stats(&self) -> DailyAllTierStats {
+            self.daily_stats.clone()
+        }
+    }
+
     struct TestServerConfigInterface {
         config: Option<Config>,
         published: Arc<AtomicUsize>,
@@ -876,6 +907,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn lock_client_resolver_uses_startup_fallback_before_app_context() {
+        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+
+        let resolved = resolve_lock_client_with_startup_fallback(None, || Some(fallback_lock_client.clone()))
+            .expect("startup fallback lock client");
+
+        assert!(Arc::ptr_eq(&resolved, &fallback_lock_client));
+    }
+
+    #[test]
+    fn lock_clients_resolver_uses_startup_fallback_before_app_context() {
+        let fallback_lock_client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let mut fallback_lock_clients = HashMap::new();
+        fallback_lock_clients.insert("startup-node:9000".to_string(), fallback_lock_client.clone());
+
+        let resolved = resolve_lock_clients_handle_with_startup_fallback(None, || Some(fallback_lock_clients.clone()))
+            .expect("startup fallback lock clients");
+
+        assert!(Arc::ptr_eq(
+            resolved.get("startup-node:9000").expect("startup fallback lock client entry"),
+            &fallback_lock_client
+        ));
+    }
+
     #[tokio::test]
     async fn resolver_helpers_are_context_first_and_empty_when_context_is_absent() {
         let (_temp_dir, object_store, endpoints) = test_store().await;
@@ -883,14 +939,15 @@ mod tests {
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
         let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let mut context_daily_tier_stats = DailyAllTierStats::new();
-        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let context_scanner_metrics = ScannerMetricsReport {
             current_cycle: 7,
             ..Default::default()
         };
         let tier_config = TierConfigMgr::new();
         let context_expiry_state = ExpiryState::new();
+        let context_transition_state = TransitionState::new();
+        let mut context_daily_tier_stats = DailyAllTierStats::new();
+        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let context_storage_class_published = Arc::new(AtomicUsize::new(0));
@@ -956,9 +1013,6 @@ mod tests {
                 boot_time: Arc::new(TestBootTimeInterface {
                     boot_time: Some(context_boot_time),
                 }),
-                tier_stats: Arc::new(TestTierStatsInterface {
-                    daily_stats: context_daily_tier_stats.clone(),
-                }),
                 scanner_metrics: Arc::new(TestScannerMetricsInterface {
                     report: context_scanner_metrics.clone(),
                 }),
@@ -1000,6 +1054,10 @@ mod tests {
                 }),
                 expiry_state: Arc::new(TestExpiryStateInterface {
                     expiry_state: context_expiry_state.clone(),
+                }),
+                transition_state: Arc::new(TestTransitionStateInterface {
+                    transition_state: context_transition_state.clone(),
+                    daily_stats: context_daily_tier_stats.clone(),
                 }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
@@ -1130,6 +1188,10 @@ mod tests {
             &resolve_expiry_state_handle_with(Some(context.clone())).expect("context expiry state"),
             &context_expiry_state
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_transition_state_handle_with(Some(context.clone())).expect("context transition state"),
+            &context_transition_state
+        ));
         assert_eq!(
             resolve_server_config_with(Some(context.clone())).expect("context server config"),
             server_config
@@ -1175,6 +1237,7 @@ mod tests {
         assert!(resolve_region_with(None).is_none());
         assert!(resolve_tier_config_handle_with(None).is_none());
         assert!(resolve_expiry_state_handle_with(None).is_none());
+        assert!(resolve_transition_state_handle_with(None).is_none());
         assert!(resolve_server_config_with(None).is_none());
         assert!(!publish_server_config_with(None, Config::new()));
         assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));

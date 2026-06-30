@@ -382,8 +382,25 @@ mod tests {
         PluginInstanceDetail, PluginInstanceDiagnostic, PluginInstanceDiagnosticCode, PluginInstanceDiagnosticCount,
         PluginInstanceEntry, PluginInstanceSource, PluginInstancesResponse, PluginRuntimeContract, PluginRuntimeTransport,
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
     use std::collections::HashMap;
+
+    fn sorted_json_value(value: Value) -> Value {
+        match value {
+            Value::Array(values) => Value::Array(values.into_iter().map(sorted_json_value).collect()),
+            Value::Object(map) => {
+                let mut entries = map.into_iter().collect::<Vec<_>>();
+                entries.sort_by(|(left, _), (right, _)| left.cmp(right));
+                Value::Object(
+                    entries
+                        .into_iter()
+                        .map(|(key, value)| (key, sorted_json_value(value)))
+                        .collect(),
+                )
+            }
+            value => value,
+        }
+    }
 
     #[test]
     fn plugin_catalog_contract_serializes_stable_json_shape() {
@@ -418,7 +435,8 @@ mod tests {
             },
         };
 
-        let value = serde_json::to_value(response).expect("catalog response should serialize");
+        let value = sorted_json_value(serde_json::to_value(response).expect("catalog response should serialize"));
+        insta::assert_json_snapshot!("plugin_catalog_contract", value);
         assert_eq!(
             value,
             json!({
@@ -481,7 +499,8 @@ mod tests {
             next_marker: None,
         };
 
-        let value = serde_json::to_value(response).expect("instance response should serialize");
+        let value = sorted_json_value(serde_json::to_value(response).expect("instance response should serialize"));
+        insta::assert_json_snapshot!("plugin_instance_contract", value);
         assert_eq!(
             value,
             json!({
@@ -534,7 +553,8 @@ mod tests {
             }],
         };
 
-        let value = serde_json::to_value(detail).expect("instance detail should serialize");
+        let value = sorted_json_value(serde_json::to_value(detail).expect("instance detail should serialize"));
+        insta::assert_json_snapshot!("plugin_instance_detail_contract", value);
         assert_eq!(
             value,
             json!({
@@ -591,7 +611,8 @@ mod tests {
             installation: None,
         };
 
-        let value = serde_json::to_value(entry).expect("catalog entry should serialize");
+        let value = sorted_json_value(serde_json::to_value(entry).expect("catalog entry should serialize"));
+        insta::assert_json_snapshot!("plugin_catalog_distribution_contract", value);
         assert_eq!(value["distribution"]["artifacts"][0]["artifact_id"], "sidecar-linux-amd64");
         assert_eq!(value["distribution"]["artifacts"][0]["target_triple"], "x86_64-unknown-linux-gnu");
         assert_eq!(

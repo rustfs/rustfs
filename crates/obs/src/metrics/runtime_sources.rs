@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use crate::metrics::{
-    OBS_GLOBAL_EXPIRY_STATE, OBS_GLOBAL_REPLICATION_STATS, OBS_GLOBAL_TRANSITION_STATE, ObsBucketBandwidthMonitor,
-    ObsReplicationStats, obs_get_global_bucket_monitor,
+    ObsBucketBandwidthMonitor, ObsReplicationStats, obs_expiry_state_handle, obs_get_global_bucket_monitor,
+    obs_get_global_replication_stats, obs_transition_state_handle,
 };
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use std::sync::Arc;
@@ -64,21 +64,22 @@ pub(crate) fn bucket_monitor_available() -> bool {
 }
 
 pub(crate) fn replication_stats_handle() -> Option<ObsReplicationStatsHandle> {
-    OBS_GLOBAL_REPLICATION_STATS.get().cloned()
+    obs_get_global_replication_stats()
 }
 
 pub(crate) async fn ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
+    let expiry_state = obs_expiry_state_handle();
+    let transition_state = obs_transition_state_handle();
+
     ObsIlmRuntimeSnapshot {
-        expiry_pending_tasks: usize_to_u64_saturating(OBS_GLOBAL_EXPIRY_STATE.read().await.pending_tasks()),
-        transition_active_tasks: i64_to_u64_floor_zero(OBS_GLOBAL_TRANSITION_STATE.active_tasks()),
-        transition_pending_tasks: usize_to_u64_saturating(OBS_GLOBAL_TRANSITION_STATE.pending_tasks()),
-        transition_missed_immediate_tasks: i64_to_u64_floor_zero(OBS_GLOBAL_TRANSITION_STATE.missed_immediate_tasks()),
-        transition_queue_full_tasks: i64_to_u64_floor_zero(OBS_GLOBAL_TRANSITION_STATE.queue_full_tasks()),
-        transition_queue_send_timeout_tasks: i64_to_u64_floor_zero(OBS_GLOBAL_TRANSITION_STATE.queue_send_timeout_tasks()),
-        transition_compensation_scheduled_tasks: i64_to_u64_floor_zero(
-            OBS_GLOBAL_TRANSITION_STATE.compensation_scheduled_tasks(),
-        ),
-        transition_compensation_running_tasks: i64_to_u64_floor_zero(OBS_GLOBAL_TRANSITION_STATE.compensation_running_tasks()),
+        expiry_pending_tasks: usize_to_u64_saturating(expiry_state.read().await.pending_tasks()),
+        transition_active_tasks: i64_to_u64_floor_zero(transition_state.active_tasks()),
+        transition_pending_tasks: usize_to_u64_saturating(transition_state.pending_tasks()),
+        transition_missed_immediate_tasks: i64_to_u64_floor_zero(transition_state.missed_immediate_tasks()),
+        transition_queue_full_tasks: i64_to_u64_floor_zero(transition_state.queue_full_tasks()),
+        transition_queue_send_timeout_tasks: i64_to_u64_floor_zero(transition_state.queue_send_timeout_tasks()),
+        transition_compensation_scheduled_tasks: i64_to_u64_floor_zero(transition_state.compensation_scheduled_tasks()),
+        transition_compensation_running_tasks: i64_to_u64_floor_zero(transition_state.compensation_running_tasks()),
     }
 }
 

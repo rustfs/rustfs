@@ -14,10 +14,19 @@
 
 mod config;
 pub mod datatypes;
+mod replication_config_store;
+mod replication_event_sink;
+mod replication_lock_boundary;
+mod replication_metadata_boundary;
+mod replication_msgp_boundary;
 mod replication_pool;
 mod replication_resyncer;
 mod replication_state;
+mod replication_tagging_boundary;
+mod replication_target_boundary;
+mod replication_versioning_boundary;
 mod rule;
+mod runtime_boundary;
 
 pub use config::*;
 pub use datatypes::*;

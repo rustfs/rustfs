@@ -16,7 +16,7 @@ use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use super::interfaces::{
     ActionCredentialInterface, BootTimeInterface, BucketMetadataInterface, BucketMonitorInterface, BufferConfigInterface,
@@ -24,7 +24,7 @@ use super::interfaces::{
     KmsRuntimeInterface, LocalNodeNameInterface, LockClientInterface, LockClientsInterface, NotificationSystemInterface,
     NotifyInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface, RegionInterface,
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
+    ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
 use super::runtime_sources;
 use crate::config::RustFSBufferConfig;
@@ -233,16 +233,6 @@ impl BootTimeInterface for BootTimeHandle {
     }
 }
 
-/// Default tier transition statistics interface adapter.
-#[derive(Default)]
-pub struct TierStatsHandle;
-
-impl TierStatsInterface for TierStatsHandle {
-    fn daily_all(&self) -> DailyAllTierStats {
-        runtime_sources::daily_tier_stats()
-    }
-}
-
 /// Default scanner metrics report interface adapter.
 #[derive(Default)]
 pub struct ScannerMetricsHandle;
@@ -390,6 +380,20 @@ impl ExpiryStateInterface for ExpiryStateHandle {
     }
 }
 
+/// Default lifecycle transition state interface adapter.
+#[derive(Default)]
+pub struct TransitionStateHandle;
+
+impl TransitionStateInterface for TransitionStateHandle {
+    fn handle(&self) -> Arc<TransitionState> {
+        runtime_sources::transition_state()
+    }
+
+    fn daily_tier_stats(&self) -> DailyAllTierStats {
+        runtime_sources::daily_tier_stats()
+    }
+}
+
 /// Default server config interface adapter.
 #[derive(Default)]
 pub struct ServerConfigHandle;
@@ -460,10 +464,6 @@ pub fn default_boot_time_interface() -> Arc<dyn BootTimeInterface> {
     Arc::new(BootTimeHandle)
 }
 
-pub fn default_tier_stats_interface() -> Arc<dyn TierStatsInterface> {
-    Arc::new(TierStatsHandle)
-}
-
 pub fn default_scanner_metrics_interface() -> Arc<dyn ScannerMetricsInterface> {
     Arc::new(ScannerMetricsHandle)
 }
@@ -526,6 +526,10 @@ pub fn default_tier_config_interface() -> Arc<dyn TierConfigInterface> {
 
 pub fn default_expiry_state_interface() -> Arc<dyn ExpiryStateInterface> {
     Arc::new(ExpiryStateHandle)
+}
+
+pub fn default_transition_state_interface() -> Arc<dyn TransitionStateInterface> {
+    Arc::new(TransitionStateHandle)
 }
 
 pub fn default_server_config_interface() -> Arc<dyn ServerConfigInterface> {

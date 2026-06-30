@@ -2750,13 +2750,12 @@ impl DiskAPI for LocalDisk {
         Ok(Box::new(StallTimeoutReader::new(reader, get_object_disk_read_timeout())))
     }
 
-    /// Zero-copy file read using memory mapping (Unix) or efficient read (non-Unix).
-    /// Returns Bytes that can be shared without copying.
+    /// File read using mmap-then-copy on Unix or efficient read on non-Unix.
     // SAFETY: Unix unsafe calls in this function only query page size and mmap
     // a read-only file region after bounds and alignment are validated.
     #[allow(unsafe_code)]
     #[tracing::instrument(level = "debug", skip(self))]
-    async fn read_file_zero_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
+    async fn read_file_mmap_copy(&self, volume: &str, path: &str, offset: usize, length: usize) -> Result<Bytes> {
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
@@ -2784,7 +2783,7 @@ impl DiskAPI for LocalDisk {
                 offset,
                 length,
                 actual_size = meta.len(),
-                reason = "read_file_zero_copy_out_of_bounds",
+                reason = "read_file_mmap_copy_out_of_bounds",
                 "Disk local read fallback failed"
             );
             return Err(DiskError::FileCorrupt);
@@ -4871,7 +4870,26 @@ mod test {
     }
 
     #[tokio::test]
-    async fn test_read_file_zero_copy_rejects_offset_length_overflow() {
+    async fn test_read_file_mmap_copy_rejects_offset_length_overflow() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("operation should succeed");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("operation should succeed")).expect("operation should succeed");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("operation should succeed");
+
+        disk.make_volume("test-volume").await.expect("operation should succeed");
+        disk.write_all("test-volume", "test-file.txt", Bytes::from_static(b"test"))
+            .await
+            .expect("operation should succeed");
+
+        let result = disk.read_file_mmap_copy("test-volume", "test-file.txt", usize::MAX, 1).await;
+        assert!(matches!(result, Err(DiskError::FileCorrupt)));
+    }
+
+    #[tokio::test]
+    #[allow(deprecated)]
+    async fn test_read_file_zero_copy_legacy_alias_rejects_offset_length_overflow() {
         use tempfile::tempdir;
 
         let dir = tempdir().expect("operation should succeed");

@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: background service owners still contain staged notification/rebalance/tier paths.
+#![allow(dead_code)]
+
 pub(crate) mod batch_processor;
 pub(crate) mod event_notification;
 pub(crate) mod metrics_realtime;

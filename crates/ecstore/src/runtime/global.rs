@@ -42,28 +42,28 @@ pub const DISK_RESERVE_FRACTION: f64 = 0.15;
 // These should be migrated to AppContext over time.
 // See issue #730 for migration plan.
 //
-// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_IsErasure*, GLOBAL_LOCAL_DISK_*,
-//   GLOBAL_RootDiskThreshold, GLOBAL_LifecycleSys, GLOBAL_EventNotifier, etc.
+// Tier A (needs migration): GLOBAL_OBJECT_API, GLOBAL_IS_ERASURE*, GLOBAL_LOCAL_DISK_*,
+//   GLOBAL_ROOT_DISK_THRESHOLD, GLOBAL_LIFECYCLE_SYS, GLOBAL_EVENT_NOTIFIER, etc.
 // Tier B (keep as static): GLOBAL_RUSTFS_PORT, GLOBAL_REGION, env var caches, etc.
 lazy_static! {
     static ref GLOBAL_RUSTFS_PORT: OnceLock<u16> = OnceLock::new();
-    static ref globalDeploymentIDPtr: OnceLock<Uuid> = OnceLock::new();
+    static ref GLOBAL_DEPLOYMENT_ID: OnceLock<Uuid> = OnceLock::new();
     pub static ref GLOBAL_OBJECT_API: OnceLock<Arc<ECStore>> = OnceLock::new();
-    pub static ref GLOBAL_IsErasure: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IsDistErasure: RwLock<bool> = RwLock::new(false);
-    pub static ref GLOBAL_IsErasureSD: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IS_ERASURE: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IS_DIST_ERASURE: RwLock<bool> = RwLock::new(false);
+    pub static ref GLOBAL_IS_ERASURE_SD: RwLock<bool> = RwLock::new(false);
     pub static ref GLOBAL_LOCAL_DISK_MAP: Arc<RwLock<HashMap<String, Option<DiskStore>>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_ID_MAP: Arc<RwLock<HashMap<Uuid, String>>> = Arc::new(RwLock::new(HashMap::new()));
     pub static ref GLOBAL_LOCAL_DISK_SET_DRIVES: Arc<RwLock<TypeLocalDiskSetDrives>> = Arc::new(RwLock::new(Vec::new()));
-    pub static ref GLOBAL_Endpoints: OnceLock<EndpointServerPools> = OnceLock::new();
-    pub static ref GLOBAL_RootDiskThreshold: RwLock<u64> = RwLock::new(0);
-    pub static ref GLOBAL_TierConfigMgr: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
-    pub static ref GLOBAL_LifecycleSys: Arc<LifecycleSys> = LifecycleSys::new();
-    pub static ref GLOBAL_EventNotifier: Arc<RwLock<EventNotifier>> = EventNotifier::new();
+    pub static ref GLOBAL_ENDPOINTS: OnceLock<EndpointServerPools> = OnceLock::new();
+    pub static ref GLOBAL_ROOT_DISK_THRESHOLD: RwLock<u64> = RwLock::new(0);
+    pub static ref GLOBAL_TIER_CONFIG_MGR: Arc<RwLock<TierConfigMgr>> = TierConfigMgr::new();
+    pub static ref GLOBAL_LIFECYCLE_SYS: Arc<LifecycleSys> = LifecycleSys::new();
+    pub static ref GLOBAL_EVENT_NOTIFIER: Arc<RwLock<EventNotifier>> = EventNotifier::new();
     pub static ref GLOBAL_BOOT_TIME: OnceCell<SystemTime> = OnceCell::new();
-    pub static ref GLOBAL_LocalNodeName: String = "127.0.0.1:9000".to_string();
-    pub static ref GLOBAL_LocalNodeNameHex: String = rustfs_utils::crypto::hex(GLOBAL_LocalNodeName.as_bytes());
-    pub static ref GLOBAL_NodeNamesHex: HashMap<String, ()> = HashMap::new();
+    pub static ref GLOBAL_LOCAL_NODE_NAME_FALLBACK: String = "127.0.0.1:9000".to_string();
+    pub static ref GLOBAL_LOCAL_NODE_NAME_HEX_FALLBACK: String =
+        rustfs_utils::crypto::hex(GLOBAL_LOCAL_NODE_NAME_FALLBACK.as_bytes());
     pub static ref GLOBAL_REGION: OnceLock<s3s::region::Region> = OnceLock::new();
     pub static ref GLOBAL_LOCAL_LOCK_CLIENT: OnceLock<Arc<dyn LockClient>> = OnceLock::new();
     pub static ref GLOBAL_LOCK_CLIENTS: OnceLock<HashMap<String, Arc<dyn LockClient>>> = OnceLock::new();
@@ -82,6 +82,9 @@ pub fn init_global_bucket_monitor(num_nodes: u64) {
 pub fn get_global_bucket_monitor() -> Option<Arc<Monitor>> {
     GLOBAL_BUCKET_MONITOR.get().cloned()
 }
+
+// Startup-owned process globals intentionally fail fast on duplicate writes.
+// A second write means startup published conflicting runtime scalar state.
 
 /// Global cancellation token for background services (data scanner and auto heal)
 static GLOBAL_BACKGROUND_SERVICES_CANCEL_TOKEN: OnceLock<CancellationToken> = OnceLock::new();
@@ -107,7 +110,9 @@ pub fn global_rustfs_port() -> u16 {
 /// # Returns
 /// * None
 pub fn set_global_rustfs_port(value: u16) {
-    GLOBAL_RUSTFS_PORT.set(value).expect("set_global_rustfs_port fail");
+    GLOBAL_RUSTFS_PORT
+        .set(value)
+        .expect("GLOBAL_RUSTFS_PORT should be initialized once during startup");
 }
 
 /// Set the global deployment id
@@ -119,7 +124,9 @@ pub fn set_global_rustfs_port(value: u16) {
 /// * None
 ///
 pub fn set_global_deployment_id(id: Uuid) {
-    globalDeploymentIDPtr.set(id).expect("operation should succeed");
+    GLOBAL_DEPLOYMENT_ID
+        .set(id)
+        .expect("GLOBAL_DEPLOYMENT_ID should be initialized once during startup");
 }
 
 /// Get the global deployment id
@@ -128,7 +135,7 @@ pub fn set_global_deployment_id(id: Uuid) {
 /// * `Option<String>` - The global deployment id as a string, if set
 ///
 pub fn get_global_deployment_id() -> Option<String> {
-    globalDeploymentIDPtr.get().map(|v| v.to_string())
+    GLOBAL_DEPLOYMENT_ID.get().map(|v| v.to_string())
 }
 /// Set the global endpoints
 ///
@@ -139,9 +146,9 @@ pub fn get_global_deployment_id() -> Option<String> {
 /// * None
 ///
 pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
-    GLOBAL_Endpoints
+    GLOBAL_ENDPOINTS
         .set(EndpointServerPools::from(eps))
-        .expect("GLOBAL_Endpoints set failed")
+        .expect("GLOBAL_ENDPOINTS should be initialized once during storage startup")
 }
 
 /// Get the global endpoints
@@ -150,7 +157,7 @@ pub fn set_global_endpoints(eps: Vec<PoolEndpoints>) {
 /// * `EndpointServerPools` - The global endpoints
 ///
 pub fn get_global_endpoints() -> EndpointServerPools {
-    if let Some(eps) = GLOBAL_Endpoints.get() {
+    if let Some(eps) = GLOBAL_ENDPOINTS.get() {
         eps.clone()
     } else {
         EndpointServerPools::default()
@@ -158,7 +165,7 @@ pub fn get_global_endpoints() -> EndpointServerPools {
 }
 
 pub fn get_global_endpoints_opt() -> Option<EndpointServerPools> {
-    GLOBAL_Endpoints.get().cloned()
+    GLOBAL_ENDPOINTS.get().cloned()
 }
 
 #[cfg(test)]
@@ -173,7 +180,7 @@ pub async fn is_first_cluster_node_local() -> bool {
 }
 
 pub fn get_global_tier_config_mgr() -> Arc<RwLock<TierConfigMgr>> {
-    GLOBAL_TierConfigMgr.clone()
+    GLOBAL_TIER_CONFIG_MGR.clone()
 }
 
 /// Create a new object layer instance
@@ -208,7 +215,9 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
 /// # Returns
 /// * None
 pub async fn set_object_layer(o: Arc<ECStore>) {
-    GLOBAL_OBJECT_API.set(o).expect("set_object_layer fail ")
+    if GLOBAL_OBJECT_API.set(o).is_err() {
+        warn!("global object layer already initialized, ignoring re-initialization");
+    }
 }
 
 /// Check if the setup type is distributed erasure coding
@@ -217,7 +226,7 @@ pub async fn set_object_layer(o: Arc<ECStore>) {
 /// * `bool` - True if the setup type is distributed erasure coding, false otherwise
 ///
 pub async fn is_dist_erasure() -> bool {
-    let lock = GLOBAL_IsDistErasure.read().await;
+    let lock = GLOBAL_IS_DIST_ERASURE.read().await;
     *lock
 }
 
@@ -227,7 +236,7 @@ pub async fn is_dist_erasure() -> bool {
 /// * `bool` - True if the setup type is erasure coding with single data center, false otherwise
 ///
 pub async fn is_erasure_sd() -> bool {
-    let lock = GLOBAL_IsErasureSD.read().await;
+    let lock = GLOBAL_IS_ERASURE_SD.read().await;
     *lock
 }
 
@@ -237,7 +246,7 @@ pub async fn is_erasure_sd() -> bool {
 /// * `bool` - True if the setup type is erasure coding, false otherwise
 ///
 pub async fn is_erasure() -> bool {
-    let lock = GLOBAL_IsErasure.read().await;
+    let lock = GLOBAL_IS_ERASURE.read().await;
     *lock
 }
 
@@ -249,22 +258,22 @@ pub async fn is_erasure() -> bool {
 /// # Returns
 /// * None
 pub async fn update_erasure_type(setup_type: SetupType) {
-    let mut is_erasure = GLOBAL_IsErasure.write().await;
+    let mut is_erasure = GLOBAL_IS_ERASURE.write().await;
     *is_erasure = setup_type == SetupType::Erasure;
 
-    let mut is_dist_erasure = GLOBAL_IsDistErasure.write().await;
+    let mut is_dist_erasure = GLOBAL_IS_DIST_ERASURE.write().await;
     *is_dist_erasure = setup_type == SetupType::DistErasure;
 
     if *is_dist_erasure {
         *is_erasure = true
     }
 
-    let mut is_erasure_sd = GLOBAL_IsErasureSD.write().await;
+    let mut is_erasure_sd = GLOBAL_IS_ERASURE_SD.write().await;
     *is_erasure_sd = setup_type == SetupType::ErasureSD;
 }
 
 // pub fn is_legacy() -> bool {
-//     if let Some(endpoints) = GLOBAL_Endpoints.get() {
+//     if let Some(endpoints) = GLOBAL_ENDPOINTS.get() {
 //         endpoints.as_ref().len() == 1 && endpoints.as_ref()[0].legacy
 //     } else {
 //         false
@@ -281,7 +290,9 @@ pub(crate) type TypeLocalDiskSetDrives = Vec<Vec<Vec<Option<DiskStore>>>>;
 /// # Returns
 /// * None
 pub fn set_global_region(region: s3s::region::Region) {
-    GLOBAL_REGION.set(region).expect("operation should succeed");
+    GLOBAL_REGION
+        .set(region)
+        .expect("GLOBAL_REGION should be initialized once during startup");
 }
 
 /// Get the global region
@@ -322,7 +333,8 @@ pub fn get_background_services_cancel_token() -> Option<&'static CancellationTok
 ///
 pub fn create_background_services_cancel_token() -> CancellationToken {
     let cancel_token = CancellationToken::new();
-    init_background_services_cancel_token(cancel_token.clone()).expect("Background services cancel token already initialized");
+    init_background_services_cancel_token(cancel_token.clone())
+        .expect("background services cancel token should be initialized once during startup");
     cancel_token
 }
 

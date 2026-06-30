@@ -376,11 +376,14 @@ pub(crate) mod ecstore_event {
 
 pub(crate) mod ecstore_global {
     pub(crate) use rustfs_ecstore::api::global::{
-        GLOBAL_BOOT_TIME, GLOBAL_TierConfigMgr, get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt,
-        get_global_lock_client, get_global_lock_clients, get_global_region, get_global_tier_config_mgr, global_rustfs_port,
-        is_dist_erasure, set_global_endpoints, set_global_region, set_global_rustfs_port, set_object_store_resolver,
-        shutdown_background_services, update_erasure_type,
+        get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
+        get_global_lock_clients, get_global_region, global_rustfs_port, is_dist_erasure, set_global_endpoints, set_global_region,
+        set_global_rustfs_port, set_object_store_resolver, shutdown_background_services, update_erasure_type,
     };
+}
+
+pub(crate) mod ecstore_runtime {
+    pub(crate) use rustfs_ecstore::api::runtime::{boot_time, global_tier_config_mgr};
 }
 
 #[allow(unused_imports)]
@@ -510,6 +513,7 @@ pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
 pub(crate) type Result<T> = ecstore_error::Result<T>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
@@ -562,19 +566,19 @@ pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
 }
 
 pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
-    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().cloned()
+    ecstore_bucket::replication::get_global_replication_stats()
 }
 
 pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
-    ecstore_global::GLOBAL_BOOT_TIME.get().cloned()
-}
-
-pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state().get_daily_all_tier_stats()
+    ecstore_runtime::boot_time()
 }
 
 pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
+}
+
+pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
@@ -614,7 +618,7 @@ pub(crate) async fn prewarm_local_disk_id_map() {
 }
 
 pub(crate) fn replication_queue_current_count() -> Option<i64> {
-    ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get().and_then(|stats| {
+    get_global_replication_stats().and_then(|stats| {
         stats
             .q_cache
             .try_lock()
@@ -942,7 +946,7 @@ pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Res
 
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
-    ecstore_bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some()
+    ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
 }
 
 #[cfg(test)]
@@ -1041,7 +1045,7 @@ pub(crate) fn check_retention_for_modification(
 }
 
 pub(crate) async fn record_replication_proxy(bucket: &str, api: &str, is_err: bool) {
-    if let Some(stats) = ecstore_bucket::replication::GLOBAL_REPLICATION_STATS.get() {
+    if let Some(stats) = get_global_replication_stats() {
         stats.inc_proxy(bucket, api, is_err).await;
     }
 }
@@ -1108,7 +1112,7 @@ pub(crate) fn global_rustfs_port() -> u16 {
 }
 
 pub(crate) fn get_global_tier_config_mgr() -> Arc<tokio::sync::RwLock<TierConfigMgr>> {
-    ecstore_global::get_global_tier_config_mgr()
+    ecstore_runtime::global_tier_config_mgr()
 }
 
 pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
@@ -1195,7 +1199,7 @@ pub(crate) fn topology_snapshot_from_endpoint_pools_with_capabilities(
 }
 
 pub(crate) async fn reload_transition_tier_config(api: Arc<ECStore>) -> std::io::Result<()> {
-    ecstore_global::GLOBAL_TierConfigMgr.write().await.reload(api).await
+    ecstore_runtime::global_tier_config_mgr().write().await.reload(api).await
 }
 
 pub(crate) async fn all_local_disk_path() -> Vec<String> {

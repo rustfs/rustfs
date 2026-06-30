@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: scanner/data-usage state is partially migrated and still owns staged cache helpers.
+#![allow(dead_code)]
+
 pub mod local_snapshot;
 
 use crate::storage_api_contracts::{

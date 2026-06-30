@@ -12,19 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::bucket::lifecycle::bucket_lifecycle_audit::{LcAuditEvent, LcEventSrc};
+use super::{object_lock_boundary, runtime_boundary as runtime_sources};
+use crate::bucket::lifecycle::bucket_lifecycle_audit::{
+    LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
+    emit_transition_failed_event, emit_transitioned_expiration_event,
+};
 use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
-use crate::bucket::replication::{
-    DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
-};
 use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -33,8 +34,6 @@ use crate::error::Error;
 use crate::error::StorageError;
 use crate::error::{error_resp_to_object_err, is_err_object_not_found, is_err_version_not_found, is_network_or_host_down};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
-use crate::runtime::sources as runtime_sources;
-use crate::services::event_notification::{EventArgs, send_event};
 use crate::services::tier::warm_backend::WarmBackendGetOpts;
 use crate::set_disk::{MAX_PARTS_COUNT, RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY, SetDisks};
 use crate::storage_api_contracts::{
@@ -60,10 +59,9 @@ use rustfs_config::{
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
-    VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, ReplicateDecision, ReplicationState, RestoreStatusOps, VersionPurgeStatusType,
+    get_file_info, is_restored_object_on_disk,
 };
-use rustfs_s3_types::EventName;
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ReplicationConfiguration, RestoreRequest,
@@ -122,16 +120,16 @@ const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
 lazy_static! {
-    pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
-    pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
+    pub static ref GLOBAL_EXPIRY_STATE: Arc<RwLock<ExpiryState>> = ExpiryState::new();
+    pub static ref GLOBAL_TRANSITION_STATE: Arc<TransitionState> = TransitionState::new();
 }
 
 pub fn get_global_expiry_state() -> Arc<RwLock<ExpiryState>> {
-    GLOBAL_ExpiryState.clone()
+    GLOBAL_EXPIRY_STATE.clone()
 }
 
 pub fn get_global_transition_state() -> Arc<TransitionState> {
-    GLOBAL_TransitionState.clone()
+    GLOBAL_TRANSITION_STATE.clone()
 }
 
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
@@ -622,7 +620,7 @@ impl ExpiryState {
     }
 
     async fn worker(rx: &mut Receiver<Option<ExpiryOpType>>, api: Arc<ECStore>, stats: Arc<ExpiryStats>) {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token().unwrap_or_else(|| {
+        let cancel_token = runtime_sources::background_services_cancel_token().unwrap_or_else(|| {
             static FALLBACK: std::sync::OnceLock<tokio_util::sync::CancellationToken> = std::sync::OnceLock::new();
             FALLBACK.get_or_init(tokio_util::sync::CancellationToken::new)
         });
@@ -1140,7 +1138,6 @@ impl TransitionState {
             "Lifecycle worker configuration resolved"
         );
 
-        //let mut transition_state = GLOBAL_TransitionState.write().await;
         //self.objAPI = objAPI
         Self::update_workers(api, n).await;
     }
@@ -1231,15 +1228,7 @@ impl TransitionState {
                                         "Lifecycle tier operation failed"
                                     );
                                 }
-                                // Send s3:ObjectTransition:Failed event
-                                send_event(EventArgs {
-                                event_name: EventName::ObjectTransitionFailed.to_string(),
-                                bucket_name: obj_info_for_event.bucket.clone(),
-                                object: obj_info_for_event,
-                                user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: runtime_sources::default_local_node_name(),
-                                ..Default::default()
-                            });
+                            emit_transition_failed_event(obj_info_for_event);
                         } else {
                             global_metrics().record_scanner_transition_completed(1);
                             let mut ts = TierStats {
@@ -1252,15 +1241,7 @@ impl TransitionState {
                             }
                             transition_state.add_lastday_stats(&task.event.storage_class, ts);
 
-                            // Send s3:ObjectTransition:Complete event
-                            send_event(EventArgs {
-                                event_name: EventName::ObjectTransitionComplete.to_string(),
-                                bucket_name: obj_info_for_event.bucket.clone(),
-                                object: obj_info_for_event,
-                                user_agent: "Internal: [ILM-Transition]".to_string(),
-                                host: runtime_sources::default_local_node_name(),
-                                ..Default::default()
-                            });
+                            emit_transition_complete_event(obj_info_for_event);
                         }
                         TransitionState::add_counter(&transition_state.active_tasks, -1);
                         transition_state.record_scanner_transition_state();
@@ -1364,7 +1345,6 @@ pub async fn init_background_expiry(api: Arc<ECStore>) {
         workers = get_env_usize("RUSTFS_DEFAULT_EXPIRY_WORKERS", 8);
     }
 
-    //let expiry_state = GLOBAL_ExpiryStSate.write().await;
     ExpiryState::resize_workers(workers, api.clone()).await;
     spawn_tier_free_version_recovery_once(api.clone());
     spawn_tier_delete_journal_recovery_once(api);
@@ -1376,7 +1356,7 @@ fn spawn_tier_free_version_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
+        let cancel_token = runtime_sources::background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         let mut interval = tokio::time::interval(StdDuration::from_secs(60));
@@ -1451,7 +1431,7 @@ fn spawn_tier_delete_journal_recovery_once(api: Arc<ECStore>) {
     }
 
     tokio::spawn(async move {
-        let cancel_token = crate::runtime::global::get_background_services_cancel_token()
+        let cancel_token = runtime_sources::background_services_cancel_token()
             .cloned()
             .unwrap_or_else(CancellationToken::new);
         run_tier_delete_journal_recovery_loop(api, cancel_token).await;
@@ -1966,7 +1946,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         Err(_) => None,
     };
     let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
-        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(ReplicationConfig::new(Some(cfg), None))),
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(replication_sink::new_replication_config(cfg))),
         _ => None,
     };
 
@@ -2153,7 +2133,6 @@ pub async fn expire_transitioned_object(
     lc_event: &lifecycle::Event,
     _src: &LcEventSrc,
 ) -> Result<ObjectInfo, std::io::Error> {
-    //let traceFn = GLOBAL_LifecycleSys.trace(oi);
     let mut opts = ObjectOptions {
         versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
         version_suspended: BucketVersioningSys::prefix_suspended(&oi.bucket, &oi.name).await,
@@ -2202,39 +2181,7 @@ pub async fn expire_transitioned_object(
 
     //audit_log_lifecycle(oi, ILMExpiry, tags);
 
-    let event_name = if oi.delete_marker {
-        EventName::LifecycleExpirationDelete
-    } else if dobj.delete_marker {
-        EventName::LifecycleExpirationDeleteMarkerCreated
-    } else {
-        EventName::LifecycleExpirationDelete
-    };
-    let obj_info = ObjectInfo {
-        bucket: oi.bucket.clone(),
-        name: oi.name.clone(),
-        size: oi.size,
-        version_id: oi.version_id,
-        delete_marker: oi.delete_marker,
-        ..Default::default()
-    };
-    send_event(EventArgs {
-        event_name: event_name.to_string(),
-        bucket_name: obj_info.bucket.clone(),
-        object: obj_info,
-        user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: runtime_sources::default_local_node_name(),
-        ..Default::default()
-    });
-    /*let system = match notification_system() {
-        Some(sys) => sys,
-        None => {
-            let config = Config::new();
-            initialize(config).await?;
-            notification_system().expect("Failed to initialize notification system")
-        }
-    };
-    let event = Arc::new(Event::new_test_event("my-bucket", "document.pdf", EventName::ObjectCreatedPut));
-    system.send_event(event).await;*/
+    emit_transitioned_expiration_event(oi, &dobj);
 
     Ok(dobj)
 }
@@ -2572,7 +2519,11 @@ pub async fn eval_action_from_lifecycle(
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
+            if lock_enabled
+                && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
+                    .await
+                    .is_some()
+            {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     debug!(
@@ -2684,20 +2635,7 @@ pub async fn apply_expiry_on_non_transitioned_objects(
     //let tags = LcAuditEvent::new(lc_event.clone(), src.clone()).tags();
     //tags["version-id"] = dobj.version_id;
 
-    let event_name = match lc_event.action {
-        IlmAction::DeleteAllVersionsAction | IlmAction::DelMarkerDeleteAllVersionsAction => EventName::LifecycleExpirationDelete,
-        _ if oi.delete_marker => EventName::LifecycleExpirationDelete,
-        _ if dobj.delete_marker => EventName::LifecycleExpirationDeleteMarkerCreated,
-        _ => EventName::LifecycleExpirationDelete,
-    };
-    send_event(EventArgs {
-        event_name: event_name.to_string(),
-        bucket_name: dobj.bucket.clone(),
-        object: dobj,
-        user_agent: "Internal: [ILM-Expiry]".to_string(),
-        host: runtime_sources::default_local_node_name(),
-        ..Default::default()
-    });
+    emit_non_transitioned_expiration_event(lc_event.action, oi, dobj);
 
     if lc_event.action != IlmAction::NoneAction {
         let mut num_versions = 1_u64;
@@ -2763,13 +2701,7 @@ async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: 
 
     delete_object.replication_state = replication_state;
 
-    schedule_replication_delete(DeletedObjectReplicationInfo {
-        delete_object,
-        bucket: oi.bucket.clone(),
-        event_type: REPLICATE_INCOMING_DELETE.to_string(),
-        ..Default::default()
-    })
-    .await;
+    replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
 }
 
 fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
@@ -2812,9 +2744,9 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
         return Some(state);
     }
 
-    let dsc = check_replicate_delete(
+    let dsc = replication_sink::check_delete_replication(
         &oi.bucket,
-        &ObjectToDelete {
+        ObjectToDelete {
             object_name: oi.name.clone(),
             version_id,
             ..Default::default()
@@ -2825,7 +2757,6 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
             versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
             ..Default::default()
         },
-        None,
     )
     .await;
     if !dsc.replicate_any() {
@@ -2884,6 +2815,7 @@ mod tests {
         transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
     use crate::bucket::metadata_sys;
@@ -2892,7 +2824,6 @@ mod tests {
     use crate::error::is_err_invalid_upload_id;
     use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
-    use crate::runtime::sources as runtime_sources;
     use crate::set_disk::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
     use crate::storage_api_contracts::{
         bucket::{BucketOperations, BucketOptions, MakeBucketOptions},
