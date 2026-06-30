@@ -14,6 +14,7 @@
 
 use super::replication_config_store as config_store;
 use super::replication_metadata_boundary as metadata_boundary;
+use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
 use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::replication::ResyncOpts;
@@ -22,15 +23,12 @@ use crate::bucket::replication::replicate_delete;
 use crate::bucket::replication::replicate_object;
 use crate::bucket::replication::replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MRF_REPLICATION_FILE, REPLICATION_DIR, RESYNC_FILE_NAME,
-    ReplicationConfig, ReplicationResyncer, ReplicationStorage, TargetReplicationResyncStatus, decode_mrf_file,
-    decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, save_resync_status,
+    ReplicationConfig, ReplicationResyncer, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file,
+    get_heal_replicate_object_info, save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::disk::BUCKET_META_PREFIX;
 use crate::error::Error as EcstoreError;
-use crate::object_api::{ObjectInfo, ObjectOptions};
-use crate::storage_api_contracts::object::DeletedObject;
-use crate::storage_api_contracts::object::EcstoreObjectIO;
 use lazy_static::lazy_static;
 use rustfs_filemeta::MrfOpKind;
 use rustfs_filemeta::MrfReplicateEntry;
@@ -1254,7 +1252,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 /// Returns `true` on success; on failure logs the error and returns `false`.
 /// Callers must NOT clear their in-memory buffer on `false` so the next tick
 /// can retry — otherwise a transient storage error permanently drops the batch.
-async fn flush_mrf_to_disk<S: EcstoreObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
+async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
             if let Err(e) = config_store::save(storage.clone(), MRF_REPLICATION_FILE, data).await {
@@ -1283,7 +1281,7 @@ async fn flush_mrf_to_disk<S: EcstoreObjectIO>(entries: &[MrfReplicateEntry], st
 }
 
 /// Load bucket resync metadata from disk
-async fn load_bucket_resync_metadata<S: EcstoreObjectIO>(
+async fn load_bucket_resync_metadata<S: ReplicationObjectIO>(
     bucket: &str,
     obj_api: Arc<S>,
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {

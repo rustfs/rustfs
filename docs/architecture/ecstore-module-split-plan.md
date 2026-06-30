@@ -101,11 +101,12 @@ Focused verification for the first code-bearing lifecycle PR:
 
 Current coupling:
 
-- replication workers depend on `ReplicationStorage`, ECStore object APIs,
-  bucket target clients, bucket metadata, file metadata replication state,
-  scanner repair classification, runtime replication pool/stat handles, bucket
-  monitor and bandwidth reader access through local boundaries, local node
-  names, and notification events;
+- replication workers depend on `ReplicationStorage`, ECStore object APIs and
+  storage-api contracts through the replication storage boundary, bucket target
+  clients, bucket metadata, file metadata replication state, scanner repair
+  classification, runtime replication pool/stat handles, bucket monitor and
+  bandwidth reader access through local boundaries, local node names, and
+  notification events;
 - resync and delete replication paths call metadata directly, while bucket
   target system access and target operation types are concentrated behind the
   replication target boundary;
@@ -116,9 +117,15 @@ Current coupling:
 
 Required contracts before crate movement:
 
+- `ReplicationObjectIO`: object read/write primitives for config, MRF, resync
+  status, and multipart replication paths. ECStore object API reader/writer
+  types and storage-api object IO contracts are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
 - `ReplicationStorage`: keep the existing trait as the starting point, then
   split object read/write/delete, walk, and metadata update responsibilities
-  only when call sites prove a narrower shape.
+  only when call sites prove a narrower shape. ECStore object API,
+  storage-api contracts, and read option types are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
 - `ReplicationMetadataStore`: replication config, target reset headers,
   MRF/resync state, and status persistence.
 - `ReplicationTargetStore`: bucket target listing, target client lookup,
