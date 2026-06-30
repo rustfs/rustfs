@@ -300,11 +300,18 @@ impl ReplicationState {
 
     /// Returns replicatedInfos struct initialized with the previous state of replication
     pub fn target_state(&self, arn: &str) -> ReplicatedTargetInfo {
+        let resync_timestamp = self
+            .reset_statuses_map
+            .get(&target_reset_header(arn))
+            .or_else(|| self.reset_statuses_map.get(arn))
+            .cloned()
+            .unwrap_or_default();
+
         ReplicatedTargetInfo {
             arn: arn.to_string(),
             prev_replication_status: self.targets.get(arn).cloned().unwrap_or_default(),
             version_purge_status: self.purge_targets.get(arn).cloned().unwrap_or_default(),
-            resync_timestamp: self.reset_statuses_map.get(arn).cloned().unwrap_or_default(),
+            resync_timestamp,
             ..Default::default()
         }
     }
@@ -932,5 +939,22 @@ impl ResyncDecision {
 impl Default for ResyncDecision {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn target_state_reads_resync_timestamp_from_target_reset_header_key() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let timestamp = "2026-06-30T00:00:00Z;reset-1".to_string();
+        let mut state = ReplicationState::default();
+        state.reset_statuses_map.insert(target_reset_header(arn), timestamp.clone());
+
+        let target_state = state.target_state(arn);
+
+        assert_eq!(target_state.resync_timestamp, timestamp);
     }
 }

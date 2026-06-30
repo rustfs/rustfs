@@ -1530,7 +1530,7 @@ pub fn resync_target(
         return dec;
     }
 
-    let new_reset = parts[0] == reset_id;
+    let new_reset = parts[1] != reset_id;
 
     if !new_reset && status == ReplicationStatusType::Completed {
         return dec;
@@ -4509,6 +4509,40 @@ mod tests {
             decision.replicate,
             "objects whose mod_time equals reset_before must be included in the reset window"
         );
+    }
+
+    #[test]
+    fn test_resync_target_replicates_when_reset_id_changes() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: Arc::new(HashMap::from([(
+                target_reset_header("arn:target"),
+                "1970-01-01T00:00:20Z;old-reset".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "new-reset", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(decision.replicate, "a new reset id must resync objects marked by an older reset");
+    }
+
+    #[test]
+    fn test_resync_target_skips_completed_object_for_same_reset_id() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: Arc::new(HashMap::from([(
+                target_reset_header("arn:target"),
+                "1970-01-01T00:00:20Z;same-reset".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "same-reset", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(!decision.replicate, "the same completed reset id must not resync again");
     }
 
     #[test]
