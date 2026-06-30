@@ -1779,12 +1779,26 @@ fn validate_replication_check_config_targets(
         .map(|target| target.arn.as_str())
         .collect::<HashSet<_>>();
 
-    for configured_arn in config.filter_target_arns(&ObjectOpts {
-        op_type: ReplicationType::All,
-        ..Default::default()
-    }) {
-        if !configured_arns.contains(configured_arn.as_str()) {
-            return Err(s3_error!(InvalidRequest, "replication config has a stale target"));
+    let role = config.role.trim();
+    if !role.is_empty() {
+        if !configured_arns.contains(role) {
+            return Err(s3_error!(InvalidRequest, "replication config has stale target {role}"));
+        }
+        return Ok(());
+    }
+
+    for rule in &config.rules {
+        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
+        let configured_arn = rule.destination.bucket.trim();
+        if !configured_arn.is_empty() && !configured_arns.contains(configured_arn) {
+            let rule_id = rule.id.as_deref().unwrap_or("<unknown>");
+            return Err(s3_error!(
+                InvalidRequest,
+                "replication rule {rule_id} references stale target {configured_arn}"
+            ));
         }
     }
 
