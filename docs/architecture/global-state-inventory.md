@@ -79,6 +79,46 @@ of reaching across module boundaries.
 | `TIER_FREE_VERSION_RECOVERY_STARTED`, `TIER_DELETE_JOURNAL_RECOVERY_STARTED` | `crates/ecstore/src/bucket/lifecycle/bucket_lifecycle_ops.rs` | Cache or constant / owner-local static guard | Lifecycle recovery single-run guards stay local to lifecycle operations. |
 | `REMOTE_DELETE_INFLIGHT`, `REMOTE_DELETE_LIMITER`, `REMOTE_DELETE_BREAKER`, `REMOTE_TIER_DELETE_TEST_HOOK` | `crates/ecstore/src/bucket/lifecycle/tier_sweeper.rs` | Cache or constant / owner-local static guard | Remote tier delete concurrency, breaker, and test hook state stay local to the tier sweeper owner. |
 
+## RustFS Owner-Local Static Inventory
+
+These RustFS-side lazy, atomic, and `OnceLock` statics are also part of the
+issue #730 process-static audit. They are private implementation details for
+their owner modules, not shared runtime ownership handles. This section excludes
+allocator statics, public contract/error references, route handler constants,
+and `APP_CONTEXT_SINGLETON`, which is classified in the runtime migration
+inventory. Generic function-local names such as `CACHE`, `LOCK`, `INIT`, and
+`ENABLED` are documented by owner row instead of name-regex guarded.
+
+| State | Owner boundary | Category | Migration stance |
+|---|---|---|---|
+| `KEYSTONE_AUTH`, `KEYSTONE_MAPPER`, `KEYSTONE_CONFIG` | `rustfs/src/auth_keystone.rs` | Process-global owner-local state | Keystone authentication provider, identity mapper, and config stay private to the Keystone auth owner. |
+| `LICENSE_STATE`, `LICENSE_VERIFIER` | `rustfs/src/license.rs` | Process-global owner-local state | License state and verifier selection stay private to the license owner; callers use license helper functions. |
+| `CPU_CONT_GUARD`, `PROFILING_CANCEL_TOKEN` | `rustfs/src/profiling.rs` | Process-global owner-local guard | CPU profiling guard and cancellation state stay private to the profiling owner. |
+| `MEMORY_SYSTEM` | `rustfs/src/memory_observability.rs` | Process-global owner-local cache | Memory sampling keeps the `sysinfo::System` cache private to the memory observability owner. |
+| `DIAL9_TELEMETRY_GUARD` | `rustfs/src/server/runtime.rs` | Process-global owner-local guard | Dial9 telemetry lifetime state stays private to runtime setup. |
+| `DISPLAY_CONFIG_SNAPSHOT`, `GLOBAL_CONFIG_SNAPSHOT` | `rustfs/src/config/snapshot.rs` | Process-global owner-local state | Config snapshots stay private to the config snapshot owner. |
+| `BUFFER_CONFIG_SINGLETON`, `BUFFER_PROFILE_ENABLED` | `rustfs/src/config/workload_profiles.rs` | Process-global owner-local state | Workload buffer profile configuration stays private to workload profile helpers. |
+| `LEGACY_CREDENTIAL_WARNED_KEYS` | `rustfs/src/config/config_struct.rs` | Process-global owner-local cache | Legacy credential warning de-duplication stays private to config parsing. |
+| `CONSOLE_CONFIG` | `rustfs/src/admin/console.rs` | Process-global owner-local state | Console bootstrap config stays private to the admin console owner. |
+| `ACTIVE_HTTP_REQUESTS` | `rustfs/src/server/http.rs` | Process-global owner-local counter | HTTP request inflight accounting stays private to the HTTP server owner. |
+| Function-local `CACHE` and `LOCK` statics | `rustfs/src/server/readiness.rs` | Cache or constant / owner-local cache | Readiness and cluster-health caches stay function-local to readiness probes. |
+| `USE_STARSHARD_CACHE`, `BUCKET_CACHE_SMALL`, `BUCKET_CACHE_LARGE` | `rustfs/src/storage/ecfs_extend.rs` | Cache or constant / owner-local cache | Bucket validation cache backend selection and cache storage stay private to the ECFS extension owner. |
+| `GLOBAL_SSE_DEK_PROVIDER`, `SSE_TEST_LOCK` | `rustfs/src/storage/sse.rs` | Owner-local cache / test state | SSE DEK provider cache and test serialization lock stay private to the SSE owner. |
+| `AUTH_FS` | `rustfs/src/storage/access.rs` | Cache or constant / owner-local cache | Authorization tag-condition lookup keeps its filesystem helper private to the access owner. |
+| `LOCK_STATS` | `rustfs/src/storage/lock_optimizer.rs` | Process-global owner-local metrics | Lock optimization statistics stay private behind lock optimizer helper APIs. |
+| `DEADLOCK_DETECTOR` | `rustfs/src/storage/deadlock_detector.rs` | Process-global owner-local state | Deadlock detector lifecycle state stays private to the storage deadlock detector owner. |
+| `CONCURRENCY_MANAGER`, `ACTIVE_GET_REQUESTS`, `ACTIVE_PUT_REQUESTS`, `IO_PRIORITY_METRICS` | `rustfs/src/storage/concurrency/*` | Process-global owner-local scheduler state | Storage concurrency manager, counters, and metrics remain inside the storage concurrency owner boundary. |
+| `GET_OBJECT_BUFFER_THRESHOLD_WARNED`, `GET_READER_STREAM_BUFFER_SIZE_OVERRIDE`, function-local `ENABLED`, `OBJECT_SEEK_SUPPORT_THRESHOLD`, `OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS` | `rustfs/src/app/object_usecase.rs` | Cache or constant / owner-local cache | Object GET/seek tuning caches and warning guards stay private to object usecase helpers. |
+| `SUPPORTED_HEADERS` | `rustfs/src/storage/options.rs` | Cache or constant / owner-local constant | Supported-header lookup state stays private to storage option parsing. |
+| `AUDIT_TARGET_SPECS`, `NOTIFICATION_TARGET_SPECS` | `rustfs/src/admin/handlers/audit.rs`, `rustfs/src/admin/handlers/event.rs`, `rustfs/src/admin/handlers/plugins_instances.rs` | Cache or constant / owner-local constant | Admin target descriptor tables stay private to their handler owners. |
+| `SITE_REPLICATION_PEER_CLIENT`, `SITE_REPLICATION_STATE_LOCK` | `rustfs/src/admin/handlers/site_replication.rs` | Process-global owner-local cache / guard | Site-replication peer client cache and state lock stay private to site-replication handlers. |
+| `AUDIT_MODULE_ENABLED`, `NOTIFY_MODULE_ENABLED`, `PERSISTED_NOTIFY_MODULE_ENABLED`, `PERSISTED_AUDIT_MODULE_ENABLED`, `PERSISTED_MODULE_SWITCH_CONFIGURED` | `rustfs/src/server/audit.rs`, `rustfs/src/server/event.rs`, `rustfs/src/server/module_switch.rs` | Process-global owner-local toggles | Audit/notify module snapshots stay private to the server module switch owners. |
+| `DELETE_TAIL_TOTAL`, `DELETE_CLEANUP_TOTAL`, `DELETE_REPLICATION_TOTAL`, `DELETE_NOTIFY_TOTAL` | `rustfs/src/delete_tail_activity.rs` | Process-global owner-local counters | Delete-tail activity counters stay private behind delete-tail activity helpers. |
+| `EMBEDDED_SERVER_STARTED` | `rustfs/src/startup_lifecycle.rs` | Process-global owner-local guard | Embedded startup single-start protection stays private to startup lifecycle. |
+| `TEST_OUTBOUND_TLS_GENERATION` | `rustfs/src/admin/runtime_sources.rs` | Test or fixture state | Outbound TLS generation test hook state stays private to admin runtime-source tests. |
+| `TEST_REMAINING_FAILURES` | `rustfs/src/startup_iam.rs` | Test or fixture state | IAM startup retry injection state stays private to debug/test startup code. |
+| `CAPACITY_DIRTY_SCOPE_ENV`, `CAPACITY_DIRTY_SCOPE_INIT`, `GLOBAL_ENV`, function-local `INIT` | `rustfs/src/app/*_test.rs` | Test or fixture state | App integration test fixture state stays private to the owning test modules. |
+
 ## First Code-Bearing Candidate
 
 `GLOBAL_EXPIRY_STATE` is the safest first runtime migration candidate:

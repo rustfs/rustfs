@@ -75,6 +75,10 @@ require_source_contains "docs/architecture/global-state-crate-split-plan.md" "gl
 require_source_contains "docs/architecture/global-state-inventory.md" "## Global State Classification" "global state inventory classification section"
 require_source_contains "docs/architecture/global-state-inventory.md" "## Runtime Migration Inventory" "global state inventory migration section"
 require_source_contains "docs/architecture/global-state-inventory.md" "GLOBAL_EXPIRY_STATE" "global state inventory first candidate"
+require_source_contains "docs/architecture/global-state-inventory.md" "## RustFS Owner-Local Static Inventory" "global state inventory RustFS owner-local static section"
+require_source_contains "docs/architecture/global-state-inventory.md" "KEYSTONE_AUTH" "global state inventory RustFS auth static inventory"
+require_source_contains "docs/architecture/global-state-inventory.md" "DEADLOCK_DETECTOR" "global state inventory RustFS storage static inventory"
+require_source_contains "docs/architecture/global-state-inventory.md" "CONCURRENCY_MANAGER" "global state inventory RustFS concurrency static inventory"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Dependency Inventory" "observability ECStore dependency inventory section"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "## Extraction Plan" "observability ECStore extraction plan section"
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "crates/obs/src/metrics/storage_api.rs" "observability ECStore storage_api boundary"
@@ -213,6 +217,11 @@ ECSTORE_SET_DISK_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_set_disk_cache_bypas
 ECSTORE_DRIVE_TIMEOUT_CACHE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_drive_timeout_cache_bypass_hits.txt"
 ECSTORE_LIFECYCLE_RECOVERY_GUARD_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_lifecycle_recovery_guard_bypass_hits.txt"
 ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_remote_tier_delete_state_bypass_hits.txt"
+RUSTFS_OWNER_LOCAL_STATIC_PUBLIC_HITS_FILE="${TMP_DIR}/rustfs_owner_local_static_public_hits.txt"
+RUSTFS_OWNER_LOCAL_STATIC_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_owner_local_static_reexport_hits.txt"
+RUSTFS_ADMIN_TARGET_SPEC_STATIC_PUBLIC_HITS_FILE="${TMP_DIR}/rustfs_admin_target_spec_static_public_hits.txt"
+RUSTFS_ADMIN_TARGET_SPEC_STATIC_REEXPORT_HITS_FILE="${TMP_DIR}/rustfs_admin_target_spec_static_reexport_hits.txt"
+RUSTFS_STORAGE_CONCURRENCY_STATIC_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_concurrency_static_bypass_hits.txt"
 GLOBAL_BUCKET_MONITOR_BYPASS_HITS_FILE="${TMP_DIR}/global_bucket_monitor_bypass_hits.txt"
 GLOBAL_ENDPOINTS_BYPASS_HITS_FILE="${TMP_DIR}/global_endpoints_bypass_hits.txt"
 GLOBAL_IS_ERASURE_BYPASS_HITS_FILE="${TMP_DIR}/global_is_erasure_bypass_hits.txt"
@@ -2712,6 +2721,70 @@ fi
 
 if [[ -s "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE" ]]; then
   report_failure "remote tier delete state access must stay behind ECStore tier sweeper owner helpers: $(paste -sd '; ' "$ECSTORE_REMOTE_TIER_DELETE_STATE_BYPASS_HITS_FILE")"
+fi
+
+RUSTFS_OWNER_LOCAL_STATIC_NAMES='(KEYSTONE_AUTH|KEYSTONE_MAPPER|KEYSTONE_CONFIG|LICENSE_STATE|LICENSE_VERIFIER|CPU_CONT_GUARD|PROFILING_CANCEL_TOKEN|MEMORY_SYSTEM|DIAL9_TELEMETRY_GUARD|DISPLAY_CONFIG_SNAPSHOT|GLOBAL_CONFIG_SNAPSHOT|BUFFER_CONFIG_SINGLETON|BUFFER_PROFILE_ENABLED|LEGACY_CREDENTIAL_WARNED_KEYS|CONSOLE_CONFIG|ACTIVE_HTTP_REQUESTS|USE_STARSHARD_CACHE|BUCKET_CACHE_SMALL|BUCKET_CACHE_LARGE|GLOBAL_SSE_DEK_PROVIDER|SSE_TEST_LOCK|AUTH_FS|LOCK_STATS|DEADLOCK_DETECTOR|GET_OBJECT_BUFFER_THRESHOLD_WARNED|GET_READER_STREAM_BUFFER_SIZE_OVERRIDE|OBJECT_SEEK_SUPPORT_THRESHOLD|OBJECT_SEEK_SUPPORT_CONCURRENCY_THRESHOLDS|SUPPORTED_HEADERS|SITE_REPLICATION_PEER_CLIENT|SITE_REPLICATION_STATE_LOCK|AUDIT_MODULE_ENABLED|NOTIFY_MODULE_ENABLED|PERSISTED_NOTIFY_MODULE_ENABLED|PERSISTED_AUDIT_MODULE_ENABLED|PERSISTED_MODULE_SWITCH_CONFIGURED|DELETE_TAIL_TOTAL|DELETE_CLEANUP_TOTAL|DELETE_REPLICATION_TOTAL|DELETE_NOTIFY_TOTAL|EMBEDDED_SERVER_STARTED|TEST_OUTBOUND_TLS_GENERATION|TEST_REMAINING_FAILURES|CAPACITY_DIRTY_SCOPE_ENV|CAPACITY_DIRTY_SCOPE_INIT|GLOBAL_ENV)'
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    "^[[:space:]]*pub[[:space:]]*(?:\\([^)]*\\)[[:space:]]*)?static(?:[[:space:]]+mut)?[[:space:]]+${RUSTFS_OWNER_LOCAL_STATIC_NAMES}[[:space:]]*:" \
+    rustfs/src \
+    --glob '*.rs' || true
+) >"$RUSTFS_OWNER_LOCAL_STATIC_PUBLIC_HITS_FILE"
+
+if [[ -s "$RUSTFS_OWNER_LOCAL_STATIC_PUBLIC_HITS_FILE" ]]; then
+  report_failure "RustFS owner-local statics must remain private to their owner modules: $(paste -sd '; ' "$RUSTFS_OWNER_LOCAL_STATIC_PUBLIC_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    "^[[:space:]]*pub[[:space:]]*(?:\\([^)]*\\)[[:space:]]*)?use[[:space:]][^;]*\\b${RUSTFS_OWNER_LOCAL_STATIC_NAMES}\\b" \
+    rustfs/src \
+    --glob '*.rs' || true
+) >"$RUSTFS_OWNER_LOCAL_STATIC_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_OWNER_LOCAL_STATIC_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS owner-local statics must not be re-exported across owner boundaries: $(paste -sd '; ' "$RUSTFS_OWNER_LOCAL_STATIC_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '^[[:space:]]*pub[[:space:]]*(?:\([^)]*\)[[:space:]]*)?static(?:[[:space:]]+mut)?[[:space:]]+(AUDIT_TARGET_SPECS|NOTIFICATION_TARGET_SPECS)[[:space:]]*:' \
+    rustfs/src/admin/handlers/audit.rs \
+    rustfs/src/admin/handlers/event.rs \
+    rustfs/src/admin/handlers/plugins_instances.rs || true
+) >"$RUSTFS_ADMIN_TARGET_SPEC_STATIC_PUBLIC_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_TARGET_SPEC_STATIC_PUBLIC_HITS_FILE" ]]; then
+  report_failure "RustFS admin target spec statics must remain private to their handler owners: $(paste -sd '; ' "$RUSTFS_ADMIN_TARGET_SPEC_STATIC_PUBLIC_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename \
+    '^[[:space:]]*pub[[:space:]]*(?:\([^)]*\)[[:space:]]*)?use[[:space:]][^;]*\b(AUDIT_TARGET_SPECS|NOTIFICATION_TARGET_SPECS)\b' \
+    rustfs/src \
+    --glob '*.rs' || true
+) >"$RUSTFS_ADMIN_TARGET_SPEC_STATIC_REEXPORT_HITS_FILE"
+
+if [[ -s "$RUSTFS_ADMIN_TARGET_SPEC_STATIC_REEXPORT_HITS_FILE" ]]; then
+  report_failure "RustFS admin target spec statics must not be re-exported across handler boundaries: $(paste -sd '; ' "$RUSTFS_ADMIN_TARGET_SPEC_STATIC_REEXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename \
+    '\b(CONCURRENCY_MANAGER|ACTIVE_GET_REQUESTS|ACTIVE_PUT_REQUESTS|IO_PRIORITY_METRICS)\b' \
+    rustfs/src \
+    --glob '*.rs' |
+    rg -v '^rustfs/src/storage/concurrency/' || true
+) >"$RUSTFS_STORAGE_CONCURRENCY_STATIC_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_STORAGE_CONCURRENCY_STATIC_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage concurrency statics must stay inside the storage concurrency owner boundary: $(paste -sd '; ' "$RUSTFS_STORAGE_CONCURRENCY_STATIC_BYPASS_HITS_FILE")"
 fi
 
 (
