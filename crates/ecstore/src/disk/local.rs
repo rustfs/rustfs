@@ -84,6 +84,13 @@ const EVENT_DISK_LOCAL_ACCESS_FAILED: &str = "disk_local_access_failed";
 const EVENT_DISK_LOCAL_VOLUME_SETUP_FAILED: &str = "disk_local_volume_setup_failed";
 const EVENT_DISK_LOCAL_FORMAT_DECODE_FAILED: &str = "disk_local_format_decode_failed";
 
+#[inline(always)]
+fn record_mmap_copy_stage(metrics: MmapCopyStageMetrics, stage: &'static str, started_at: Option<std::time::Instant>) {
+    if let Some(started_at) = started_at {
+        rustfs_io_metrics::record_get_object_stage_duration(metrics.path, stage, started_at.elapsed().as_secs_f64());
+    }
+}
+
 /// Enable O_DIRECT for large sequential reads.
 /// When enabled, shard reads bypass the page cache using O_DIRECT flag.
 /// Requires aligned buffers (typically 512 bytes or 4096 bytes).
@@ -2801,24 +2808,49 @@ impl DiskAPI for LocalDisk {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
+        let metrics_enabled = metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+
+        let access_check_start = metrics_enabled.then(std::time::Instant::now);
         let volume_dir = self.get_bucket_path(volume)?;
         if !skip_access_checks(volume) {
             access(&volume_dir)
                 .await
                 .map_err(|e| to_access_error(e, DiskError::VolumeAccessDenied))?;
         }
+        if let Some(metrics) = metrics {
+            record_mmap_copy_stage(metrics, metrics.access_check_stage, access_check_start);
+        }
 
+        let path_resolve_start = metrics_enabled.then(std::time::Instant::now);
         let file_path = self.get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
+        if let Some(metrics) = metrics {
+            record_mmap_copy_stage(metrics, metrics.path_resolve_stage, path_resolve_start);
+        }
 
         // Verify file exists and get metadata
         let file_path_clone = file_path.clone();
-        let meta = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
+        let metadata_lookup_start = metrics_enabled.then(std::time::Instant::now);
+        let meta_result = tokio::task::spawn_blocking(move || std::fs::metadata(&file_path_clone).map_err(DiskError::from))
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)
+            .and_then(|result| result);
+        if let Some(metrics) = metrics {
+            record_mmap_copy_stage(metrics, metrics.metadata_lookup_stage, metadata_lookup_start);
+        }
+        let meta = meta_result?;
 
-        let end_offset = offset.checked_add(length).ok_or(DiskError::FileCorrupt)?;
+        let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
+        let Some(end_offset) = offset.checked_add(length) else {
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
+            return Err(DiskError::FileCorrupt);
+        };
         if meta.len() < end_offset as u64 {
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+            }
             error!(
                 event = EVENT_DISK_LOCAL_READ_VERSION_FALLBACK,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2833,6 +2865,9 @@ impl DiskAPI for LocalDisk {
             );
             return Err(DiskError::FileCorrupt);
         }
+        if let Some(metrics) = metrics {
+            record_mmap_copy_stage(metrics, metrics.metadata_validate_stage, metadata_validate_start);
+        }
 
         // Unix: use mmap to read the data (copies into Bytes for safe ownership)
         // Non-Unix: fall back to efficient read
@@ -2846,14 +2881,16 @@ impl DiskAPI for LocalDisk {
                 file_open_duration: StdDuration,
                 mmap_map_duration: StdDuration,
                 mmap_copy_duration: StdDuration,
+                blocking_task_duration: StdDuration,
             }
 
-            let metrics_enabled = metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
             let start = StdInstant::now();
             let file_path_clone = file_path.clone();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
+            let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
             let read_result = tokio::task::spawn_blocking(move || {
+                let blocking_task_start = metrics_enabled.then(StdInstant::now);
                 let file_open_start = metrics_enabled.then(StdInstant::now);
                 let file = std::fs::File::open(&file_path_clone).map_err(DiskError::from)?;
                 let file_open_duration = file_open_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
@@ -2910,16 +2947,29 @@ impl DiskAPI for LocalDisk {
                         .map_err(DiskError::from)?;
                 }
 
+                let blocking_task_duration = blocking_task_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
+
                 Ok::<MmapCopyReadResult, DiskError>(MmapCopyReadResult {
                     bytes,
                     file_open_duration,
                     mmap_map_duration,
                     mmap_copy_duration,
+                    blocking_task_duration,
                 })
             })
             .await
-            .map_err(DiskError::from)??;
+            .map_err(DiskError::from)
+            .and_then(|result| result);
+            if let Some(metrics) = metrics {
+                record_mmap_copy_stage(metrics, metrics.blocking_wait_stage, blocking_wait_start);
+            }
+            let read_result = read_result?;
             if metrics_enabled && let Some(metrics) = metrics {
+                rustfs_io_metrics::record_get_object_stage_duration(
+                    metrics.path,
+                    metrics.blocking_task_stage,
+                    read_result.blocking_task_duration.as_secs_f64(),
+                );
                 rustfs_io_metrics::record_get_object_stage_duration(
                     metrics.path,
                     metrics.file_open_stage,

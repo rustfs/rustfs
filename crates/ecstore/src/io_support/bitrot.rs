@@ -13,7 +13,9 @@
 // limitations under the License.
 
 use crate::diagnostics::get::{
+    GET_STAGE_READER_MMAP_ACCESS_CHECK, GET_STAGE_READER_MMAP_BLOCKING_TASK, GET_STAGE_READER_MMAP_BLOCKING_WAIT,
     GET_STAGE_READER_MMAP_COPY_BUFFER, GET_STAGE_READER_MMAP_FILE_OPEN, GET_STAGE_READER_MMAP_MAP,
+    GET_STAGE_READER_MMAP_METADATA_LOOKUP, GET_STAGE_READER_MMAP_METADATA_VALIDATE, GET_STAGE_READER_MMAP_PATH_RESOLVE,
     GET_STAGE_READER_OPEN_MMAP_COPY_FALLBACK, GET_STAGE_READER_OPEN_MMAP_COPY_SUCCESS, GET_STAGE_READER_OPEN_STREAM,
     GET_STAGE_READER_STREAM_FIRST_READ, record_get_stage_duration_if_enabled,
 };
@@ -221,6 +223,12 @@ async fn open_disk_reader(
         let zero_copy_start = Instant::now();
         let mmap_metrics = metrics_path.map(|metrics_path| MmapCopyStageMetrics {
             path: metrics_path,
+            access_check_stage: GET_STAGE_READER_MMAP_ACCESS_CHECK,
+            path_resolve_stage: GET_STAGE_READER_MMAP_PATH_RESOLVE,
+            metadata_lookup_stage: GET_STAGE_READER_MMAP_METADATA_LOOKUP,
+            metadata_validate_stage: GET_STAGE_READER_MMAP_METADATA_VALIDATE,
+            blocking_wait_stage: GET_STAGE_READER_MMAP_BLOCKING_WAIT,
+            blocking_task_stage: GET_STAGE_READER_MMAP_BLOCKING_TASK,
             file_open_stage: GET_STAGE_READER_MMAP_FILE_OPEN,
             mmap_map_stage: GET_STAGE_READER_MMAP_MAP,
             mmap_copy_stage: GET_STAGE_READER_MMAP_COPY_BUFFER,

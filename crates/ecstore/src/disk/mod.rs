@@ -62,6 +62,12 @@ pub type FileWriter = Box<dyn AsyncWrite + Send + Sync + Unpin>;
 #[derive(Clone, Copy, Debug)]
 pub struct MmapCopyStageMetrics {
     pub(crate) path: &'static str,
+    pub(crate) access_check_stage: &'static str,
+    pub(crate) path_resolve_stage: &'static str,
+    pub(crate) metadata_lookup_stage: &'static str,
+    pub(crate) metadata_validate_stage: &'static str,
+    pub(crate) blocking_wait_stage: &'static str,
+    pub(crate) blocking_task_stage: &'static str,
     pub(crate) file_open_stage: &'static str,
     pub(crate) mmap_map_stage: &'static str,
     pub(crate) mmap_copy_stage: &'static str,
