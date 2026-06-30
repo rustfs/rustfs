@@ -336,6 +336,13 @@ pub(crate) mod bucket {
                 .await
             }
 
+            pub(crate) async fn run_stale_multipart_upload_cleanup_once(api: Arc<crate::storage::storage_api::ECStore>) -> usize {
+                crate::storage::storage_api::ecstore_bucket::lifecycle::bucket_lifecycle_ops::run_stale_multipart_upload_cleanup_once(
+                    api,
+                )
+                .await
+            }
+
             pub(crate) async fn enqueue_transition_immediate(
                 oi: &crate::storage::storage_api::StorageObjectInfo,
                 src: LcEventSrc,

@@ -23,8 +23,8 @@ use super::storage_api::bucket_usecase::bucket::{
     ObjectLockConfigExt as _, VersioningConfigExt as _,
     bucket_target_sys::BucketTargetSys,
     lifecycle::bucket_lifecycle_ops::{
-        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, validate_lifecycle_config,
-        validate_transition_tier,
+        enqueue_expiry_for_existing_objects, enqueue_transition_for_existing_objects, run_stale_multipart_upload_cleanup_once,
+        validate_lifecycle_config, validate_transition_tier,
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
@@ -753,6 +753,13 @@ fn lifecycle_has_expiry_rules(config: &BucketLifecycleConfiguration) -> bool {
     config.rules.iter().any(|rule| {
         rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
             && (rule.expiration.is_some() || rule.del_marker_expiration.is_some() || rule.noncurrent_version_expiration.is_some())
+    })
+}
+
+fn lifecycle_has_abort_multipart_rules(config: &BucketLifecycleConfiguration) -> bool {
+    config.rules.iter().any(|rule| {
+        rule.status == ExpirationStatus::from_static(ExpirationStatus::ENABLED)
+            && rule.abort_incomplete_multipart_upload.is_some()
     })
 }
 
@@ -1718,6 +1725,17 @@ impl DefaultBucketUsecase {
                 if let Err(err) = enqueue_expiry_for_existing_objects(store, &bucket_name).await {
                     warn!(bucket = %bucket_name, error = ?err, "failed to enqueue expiry for existing objects");
                 }
+            });
+        }
+
+        if lifecycle_has_abort_multipart_rules(&input_cfg)
+            && let Some(store) = self.object_store()
+        {
+            let bucket_name = bucket.clone();
+            let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
+            spawn_background_with_context(request_context, async move {
+                let deleted = run_stale_multipart_upload_cleanup_once(store).await;
+                debug!(bucket = %bucket_name, deleted, "completed lifecycle abort multipart cleanup trigger");
             });
         }
 
@@ -2787,6 +2805,30 @@ mod tests {
         };
 
         assert!(lifecycle_has_transition_rules(&config));
+    }
+
+    #[test]
+    fn lifecycle_has_abort_multipart_rules_accepts_enabled_abort_rule() {
+        let config = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("enabled-abort".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        assert!(lifecycle_has_abort_multipart_rules(&config));
+        assert!(!lifecycle_has_expiry_rules(&config));
     }
 
     #[tokio::test]
