@@ -42,7 +42,7 @@ use tokio::time::sleep;
 use tracing::error;
 
 lazy_static! {
-    pub static ref GLOBAL_BucketMetadataSys: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
+    pub static ref GLOBAL_BUCKET_METADATA_SYS: OnceLock<Arc<RwLock<BucketMetadataSys>>> = OnceLock::new();
 }
 
 pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
@@ -51,19 +51,19 @@ pub async fn init_bucket_metadata_sys(api: Arc<ECStore>, buckets: Vec<String>) {
 
     let sys = Arc::new(RwLock::new(sys));
 
-    GLOBAL_BucketMetadataSys.set(sys).unwrap();
+    GLOBAL_BUCKET_METADATA_SYS.set(sys).unwrap();
 }
 
 pub fn get_global_bucket_metadata_sys() -> Option<Arc<RwLock<BucketMetadataSys>>> {
-    GLOBAL_BucketMetadataSys.get().cloned()
+    GLOBAL_BUCKET_METADATA_SYS.get().cloned()
 }
 
 // panic if not init
 pub(super) fn get_bucket_metadata_sys() -> Result<Arc<RwLock<BucketMetadataSys>>> {
-    if let Some(sys) = GLOBAL_BucketMetadataSys.get() {
+    if let Some(sys) = GLOBAL_BUCKET_METADATA_SYS.get() {
         Ok(sys.clone())
     } else {
-        Err(Error::other("GLOBAL_BucketMetadataSys not init"))
+        Err(Error::other("GLOBAL_BUCKET_METADATA_SYS not init"))
     }
 }
 

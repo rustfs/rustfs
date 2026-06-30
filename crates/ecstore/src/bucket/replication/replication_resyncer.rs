@@ -17,6 +17,7 @@ use super::replication_event_sink::{EventArgs, send_event};
 use super::replication_lock_boundary as lock_boundary;
 use super::replication_metadata_boundary as metadata_boundary;
 use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
+use super::replication_tagging_boundary as tagging_boundary;
 use super::replication_target_boundary as target_boundary;
 use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
@@ -26,7 +27,6 @@ use crate::bucket::bucket_target_sys::{
 };
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
-use crate::bucket::tagging::decode_tags_to_map;
 use crate::bucket::target::BucketTargets;
 use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
@@ -3870,7 +3870,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     };
 
     if !object_info.user_tags.is_empty() {
-        let tags = decode_tags_to_map(&object_info.user_tags);
+        let tags = tagging_boundary::decode_tags_to_map(&object_info.user_tags);
 
         if !tags.is_empty() {
             put_op.user_tags = tags;
@@ -4140,8 +4140,8 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
         }
     }
 
-    let oi1_tags = decode_tags_to_map(&oi1.user_tags);
-    let oi2_tags = decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
+    let oi1_tags = tagging_boundary::decode_tags_to_map(&oi1.user_tags);
+    let oi2_tags = tagging_boundary::decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
 
     if (oi2.tag_count.unwrap_or_default() > 0 && oi1_tags != oi2_tags)
         || oi2.tag_count.unwrap_or_default() != oi1_tags.len() as i32

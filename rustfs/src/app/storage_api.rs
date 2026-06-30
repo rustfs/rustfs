@@ -125,6 +125,7 @@ pub(crate) mod runtime {
     pub(crate) type ScannerMetricsReport = rustfs_common::metrics::ScannerMetricsReport;
     pub(crate) type StorageClassConfig = crate::storage::storage_api::ecstore_config::storageclass::Config;
     pub(crate) type TierConfigMgr = crate::storage::storage_api::TierConfigMgr;
+    pub(crate) type TransitionState = crate::storage::storage_api::TransitionState;
 
     #[cfg(test)]
     pub(crate) type TierConfig = crate::storage::storage_api::ecstore_tier::tier_config::TierConfig;
@@ -171,9 +172,8 @@ pub(crate) mod runtime {
         crate::storage::storage_api::get_global_expiry_state()
     }
 
-    #[cfg(test)]
-    pub(crate) fn new_object_layer_fn() -> Option<Arc<crate::storage::storage_api::ECStore>> {
-        crate::storage::storage_api::ecstore_global::new_object_layer_fn()
+    pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
+        crate::storage::storage_api::get_global_transition_state()
     }
 
     pub(crate) fn set_object_store_resolver(resolver: Arc<ObjectStoreResolver>) -> bool {
@@ -198,10 +198,6 @@ pub(crate) mod runtime {
 
     pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
         crate::storage::storage_api::get_global_boot_time()
-    }
-
-    pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-        crate::storage::storage_api::get_daily_all_tier_stats()
     }
 
     pub(crate) async fn collect_scanner_metrics_report() -> ScannerMetricsReport {

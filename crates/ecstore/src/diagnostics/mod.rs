@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: diagnostics constants are staged for request-path telemetry migration.
+#![allow(dead_code)]
+
 pub(crate) mod admin_server_info;
 pub(crate) mod get;
 pub(crate) mod pool;

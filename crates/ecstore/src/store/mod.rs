@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: store startup/listing helpers are staged while global state is moved to owners.
+#![allow(dead_code)]
 #![allow(clippy::map_entry)]
 
 use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;

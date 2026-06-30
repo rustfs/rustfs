@@ -12,8 +12,22 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// #730: erasure codec migration keeps staged streaming decode paths in this module.
-#![allow(dead_code)]
+use std::collections::HashMap;
 
-pub(crate) mod codec;
-pub(crate) mod coding;
+pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
+    crate::bucket::tagging::decode_tags_to_map(tags)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_tags_to_map;
+
+    #[test]
+    fn decode_tags_to_map_preserves_bucket_tagging_parser_behavior() {
+        let tags = decode_tags_to_map("env=prod&encoded=a%2Fb&=ignored");
+
+        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
+        assert_eq!(tags.get("encoded").map(String::as_str), Some("a/b"));
+        assert!(!tags.contains_key(""));
+    }
+}

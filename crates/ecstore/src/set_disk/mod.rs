@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: SetDisks still hosts staged read/heal/write migration helpers.
+#![allow(dead_code)]
 #![allow(unused_imports)]
 #![allow(unused_variables)]
 

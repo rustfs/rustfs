@@ -1,3 +1,6 @@
+// #730: storage contract traits are staged for facade migration and external owners.
+#![allow(dead_code)]
+
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use rustfs_filemeta::FileInfo;

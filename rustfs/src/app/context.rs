@@ -29,7 +29,7 @@ pub use interfaces::*;
 use super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::storage_api::context::runtime::{
     BucketBandwidthMonitor, DailyAllTierStats, DynReplicationPool, ExpiryState, NotificationSys, ReplicationStats,
-    ScannerMetricsReport, StorageClassConfig, TierConfigMgr,
+    ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use super::storage_api::context::{ECStore, EndpointServerPools};
 use crate::config::RustFSBufferConfig;
@@ -248,6 +248,11 @@ pub fn resolve_expiry_state_handle() -> Option<Arc<RwLock<ExpiryState>>> {
     resolve_expiry_state_handle_with(get_global_app_context())
 }
 
+/// Resolve lifecycle transition state using AppContext-first precedence.
+pub fn resolve_transition_state_handle() -> Option<Arc<TransitionState>> {
+    resolve_transition_state_handle_with(get_global_app_context())
+}
+
 /// Resolve server config using AppContext-first precedence.
 pub fn resolve_server_config() -> Option<Config> {
     resolve_server_config_with(get_global_app_context())
@@ -351,7 +356,7 @@ fn resolve_boot_time_with(context: Option<Arc<AppContext>>) -> Option<SystemTime
 }
 
 fn resolve_daily_tier_stats_with(context: Option<Arc<AppContext>>) -> Option<DailyAllTierStats> {
-    context.map(|context| context.tier_stats().daily_all())
+    context.map(|context| context.transition_state().daily_tier_stats())
 }
 
 async fn resolve_scanner_metrics_report_with(context: Option<Arc<AppContext>>) -> Option<ScannerMetricsReport> {
@@ -444,6 +449,10 @@ fn resolve_expiry_state_handle_with(context: Option<Arc<AppContext>>) -> Option<
     context.map(|context| context.expiry_state().handle())
 }
 
+fn resolve_transition_state_handle_with(context: Option<Arc<AppContext>>) -> Option<Arc<TransitionState>> {
+    context.map(|context| context.transition_state().handle())
+}
+
 fn resolve_server_config_with(context: Option<Arc<AppContext>>) -> Option<Config> {
     context.and_then(|context| context.server_config().get())
 }
@@ -485,7 +494,7 @@ mod tests {
         EndpointsInterface, IamInterface, InternodeMetricsInterface, KmsInterface, KmsRuntimeInterface, LocalNodeNameInterface,
         LockClientInterface, LockClientsInterface, OidcInterface, OutboundTlsRuntimeInterface, PerformanceMetricsInterface,
         RegionInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
-        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TierStatsInterface,
+        ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
     };
     use crate::config::{RustFSBufferConfig, WorkloadProfile};
     use async_trait::async_trait;
@@ -613,16 +622,6 @@ mod tests {
     impl BootTimeInterface for TestBootTimeInterface {
         fn get(&self) -> Option<SystemTime> {
             self.boot_time
-        }
-    }
-
-    struct TestTierStatsInterface {
-        daily_stats: DailyAllTierStats,
-    }
-
-    impl TierStatsInterface for TestTierStatsInterface {
-        fn daily_all(&self) -> DailyAllTierStats {
-            self.daily_stats.clone()
         }
     }
 
@@ -798,6 +797,21 @@ mod tests {
         }
     }
 
+    struct TestTransitionStateInterface {
+        transition_state: Arc<TransitionState>,
+        daily_stats: DailyAllTierStats,
+    }
+
+    impl TransitionStateInterface for TestTransitionStateInterface {
+        fn handle(&self) -> Arc<TransitionState> {
+            self.transition_state.clone()
+        }
+
+        fn daily_tier_stats(&self) -> DailyAllTierStats {
+            self.daily_stats.clone()
+        }
+    }
+
     struct TestServerConfigInterface {
         config: Option<Config>,
         published: Arc<AtomicUsize>,
@@ -862,10 +876,6 @@ mod tests {
         };
         let endpoint_pools = EndpointServerPools(vec![pool_endpoints]);
 
-        if let Some(store) = runtime_sources::object_store() {
-            return (temp_dir, store, endpoint_pools);
-        }
-
         init_local_disks(endpoint_pools.clone()).await.expect("test local disks");
         let store = ECStore::new(
             "127.0.0.1:0".parse().expect("test addr"),
@@ -929,14 +939,15 @@ mod tests {
         let bucket_metadata = Arc::new(RwLock::new(BucketMetadataSys::new(object_store.clone())));
         let context_replication_stats = Arc::new(ReplicationStats::new());
         let context_boot_time = SystemTime::UNIX_EPOCH + Duration::from_secs(10);
-        let mut context_daily_tier_stats = DailyAllTierStats::new();
-        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let context_scanner_metrics = ScannerMetricsReport {
             current_cycle: 7,
             ..Default::default()
         };
         let tier_config = TierConfigMgr::new();
         let context_expiry_state = ExpiryState::new();
+        let context_transition_state = TransitionState::new();
+        let mut context_daily_tier_stats = DailyAllTierStats::new();
+        context_daily_tier_stats.insert("CONTEXT".to_string(), Default::default());
         let server_config = Config::new();
         let context_server_config_published = Arc::new(AtomicUsize::new(0));
         let context_storage_class_published = Arc::new(AtomicUsize::new(0));
@@ -1002,9 +1013,6 @@ mod tests {
                 boot_time: Arc::new(TestBootTimeInterface {
                     boot_time: Some(context_boot_time),
                 }),
-                tier_stats: Arc::new(TestTierStatsInterface {
-                    daily_stats: context_daily_tier_stats.clone(),
-                }),
                 scanner_metrics: Arc::new(TestScannerMetricsInterface {
                     report: context_scanner_metrics.clone(),
                 }),
@@ -1046,6 +1054,10 @@ mod tests {
                 }),
                 expiry_state: Arc::new(TestExpiryStateInterface {
                     expiry_state: context_expiry_state.clone(),
+                }),
+                transition_state: Arc::new(TestTransitionStateInterface {
+                    transition_state: context_transition_state.clone(),
+                    daily_stats: context_daily_tier_stats.clone(),
                 }),
                 server_config: Arc::new(TestServerConfigInterface {
                     config: Some(server_config.clone()),
@@ -1176,6 +1188,10 @@ mod tests {
             &resolve_expiry_state_handle_with(Some(context.clone())).expect("context expiry state"),
             &context_expiry_state
         ));
+        assert!(Arc::ptr_eq(
+            &resolve_transition_state_handle_with(Some(context.clone())).expect("context transition state"),
+            &context_transition_state
+        ));
         assert_eq!(
             resolve_server_config_with(Some(context.clone())).expect("context server config"),
             server_config
@@ -1221,6 +1237,7 @@ mod tests {
         assert!(resolve_region_with(None).is_none());
         assert!(resolve_tier_config_handle_with(None).is_none());
         assert!(resolve_expiry_state_handle_with(None).is_none());
+        assert!(resolve_transition_state_handle_with(None).is_none());
         assert!(resolve_server_config_with(None).is_none());
         assert!(!publish_server_config_with(None, Config::new()));
         assert!(!publish_storage_class_config_with(None, StorageClassConfig::default()));

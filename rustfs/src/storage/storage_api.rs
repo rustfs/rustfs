@@ -375,8 +375,6 @@ pub(crate) mod ecstore_event {
 }
 
 pub(crate) mod ecstore_global {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::global::new_object_layer_fn;
     pub(crate) use rustfs_ecstore::api::global::{
         get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
         get_global_lock_clients, get_global_region, global_rustfs_port, is_dist_erasure, set_global_endpoints, set_global_region,
@@ -515,6 +513,7 @@ pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
+pub(crate) type TransitionState = ecstore_bucket::lifecycle::bucket_lifecycle_ops::TransitionState;
 pub(crate) type Error = ecstore_error::Error;
 pub(crate) type Result<T> = ecstore_error::Result<T>;
 pub(crate) type UpdateMetadataOpts = ecstore_disk::UpdateMetadataOpts;
@@ -574,12 +573,12 @@ pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
     ecstore_runtime::boot_time()
 }
 
-pub(crate) fn get_daily_all_tier_stats() -> DailyAllTierStats {
-    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state().get_daily_all_tier_stats()
-}
-
 pub(crate) fn get_global_expiry_state() -> Arc<tokio::sync::RwLock<ExpiryState>> {
     ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_expiry_state()
+}
+
+pub(crate) fn get_global_transition_state() -> Arc<TransitionState> {
+    ecstore_bucket::lifecycle::bucket_lifecycle_ops::get_global_transition_state()
 }
 
 pub(crate) async fn try_migrate_bucket_metadata(store: Arc<ECStore>) {
@@ -947,7 +946,7 @@ pub(crate) async fn load_bucket_metadata(api: Arc<ECStore>, bucket: &str) -> Res
 
 #[cfg(test)]
 pub(crate) fn bucket_metadata_sys_initialized() -> bool {
-    ecstore_bucket::metadata_sys::GLOBAL_BucketMetadataSys.get().is_some()
+    ecstore_bucket::metadata_sys::get_global_bucket_metadata_sys().is_some()
 }
 
 #[cfg(test)]

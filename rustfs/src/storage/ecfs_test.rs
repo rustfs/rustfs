@@ -958,7 +958,7 @@ mod tests {
         use time::OffsetDateTime;
 
         if !bucket_metadata_sys_initialized() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 
@@ -1539,7 +1539,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_cors_headers_unmatched_origin_with_cors_config() {
         if get_global_bucket_metadata_sys().is_none() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 
@@ -1577,7 +1577,7 @@ mod tests {
     #[tokio::test]
     async fn test_apply_cors_headers_credentialed_request_with_wildcard_origin() {
         if get_global_bucket_metadata_sys().is_none() {
-            eprintln!("Skipping test: GLOBAL_BucketMetadataSys not initialized");
+            eprintln!("Skipping test: bucket metadata system not initialized");
             return;
         }
 

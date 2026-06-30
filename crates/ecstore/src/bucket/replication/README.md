@@ -9,7 +9,7 @@ and lifecycle/heal scheduling paths.
 
 | Module | Current role | Split blocker |
 |---|---|---|
-| `config.rs` | Replication config helpers, rule matching, and tag filtering. | Uses ECStore bucket tagging helpers and S3 DTOs directly. |
+| `config.rs` | Replication config helpers, rule matching, and tag filtering. | Uses replication-local tagging boundary and S3 DTOs directly. |
 | `datatypes.rs` | Replication status and operation DTOs. | Publicly re-exported through the ECStore replication facade. |
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, config storage, object API, runtime sources, notification state, and storage-api object IO contracts. |
 | `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on bucket target clients, metadata/versioning systems, ECStore object readers/writers, disk paths, runtime sources, notification events, and SetDisks lock timing. |
@@ -25,6 +25,7 @@ and lifecycle/heal scheduling paths.
 | `ReplicationMetadataStore` | Replication config, bucket targets, MRF/resync state, target reset headers, and status persistence. | Direct bucket target sys, metadata sys, versioning sys, config storage, and file metadata imports. |
 | `ReplicationRuntime` | Worker pool, queue sizing, stats, bucket monitor, local node identity, cancellation, and admission state. | Direct runtime source/global access and shared replication pool/stat state. |
 | `ReplicationEventSink` | Notification and audit events for skipped, failed, pending, and completed replication operations. | Direct event notification service calls from worker code. |
+| `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Direct bucket tagging helper imports from replication workers. |
 | `ReplicationLifecycleBridge` | Lifecycle-originated delete and version-purge scheduling. | Direct coupling between lifecycle worker paths and replication delete scheduling. |
 
 ## Migration Rules

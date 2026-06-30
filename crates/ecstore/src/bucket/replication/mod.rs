@@ -22,6 +22,7 @@ mod replication_msgp_boundary;
 mod replication_pool;
 mod replication_resyncer;
 mod replication_state;
+mod replication_tagging_boundary;
 mod replication_target_boundary;
 mod replication_versioning_boundary;
 mod rule;

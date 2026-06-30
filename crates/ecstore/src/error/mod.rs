@@ -12,6 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// #730: error taxonomy still exposes compatibility variants while callers move to contracts.
+#![allow(dead_code)]
+
 use crate::bucket::error::BucketMetadataError;
 use crate::disk::error::DiskError;
 use crate::storage_api_contracts::{error::StorageErrorCode, range::HTTPRangeError};

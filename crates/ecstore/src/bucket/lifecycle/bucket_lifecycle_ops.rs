@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::runtime_boundary as runtime_sources;
+use super::{object_lock_boundary, runtime_boundary as runtime_sources};
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{
     LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
     emit_transition_failed_event, emit_transitioned_expiration_event,
@@ -21,14 +21,11 @@ use crate::bucket::lifecycle::evaluator::Evaluator;
 use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
+use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::bucket::object_lock::objectlock_sys::check_object_lock_for_deletion;
-use crate::bucket::replication::{
-    DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete, schedule_replication_delete,
-};
 use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
@@ -62,8 +59,8 @@ use rustfs_config::{
 };
 use rustfs_data_usage::TierStats;
 use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, RestoreStatusOps,
-    VersionPurgeStatusType, get_file_info, is_restored_object_on_disk,
+    FileInfo, FileInfoOpts, NULL_VERSION_ID, ReplicateDecision, ReplicationState, RestoreStatusOps, VersionPurgeStatusType,
+    get_file_info, is_restored_object_on_disk,
 };
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
@@ -123,16 +120,16 @@ const DATE_EXPIRY_EXISTING_OBJECTS_GRACE_SECS: i64 = 5;
 const EXPIRY_WORKER_QUEUE_CAPACITY: usize = 1000;
 
 lazy_static! {
-    pub static ref GLOBAL_ExpiryState: Arc<RwLock<ExpiryState>> = ExpiryState::new();
-    pub static ref GLOBAL_TransitionState: Arc<TransitionState> = TransitionState::new();
+    pub static ref GLOBAL_EXPIRY_STATE: Arc<RwLock<ExpiryState>> = ExpiryState::new();
+    pub static ref GLOBAL_TRANSITION_STATE: Arc<TransitionState> = TransitionState::new();
 }
 
 pub fn get_global_expiry_state() -> Arc<RwLock<ExpiryState>> {
-    GLOBAL_ExpiryState.clone()
+    GLOBAL_EXPIRY_STATE.clone()
 }
 
 pub fn get_global_transition_state() -> Arc<TransitionState> {
-    GLOBAL_TransitionState.clone()
+    GLOBAL_TRANSITION_STATE.clone()
 }
 
 fn resolve_transition_worker_count() -> (i64, i64, i64) {
@@ -1949,7 +1946,7 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         Err(_) => None,
     };
     let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
-        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(ReplicationConfig::new(Some(cfg), None))),
+        Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(replication_sink::new_replication_config(cfg))),
         _ => None,
     };
 
@@ -2522,7 +2519,11 @@ pub async fn eval_action_from_lifecycle(
                 return lifecycle::Event::default();
             }
             // Lifecycle operations should never bypass governance retention
-            if lock_enabled && check_object_lock_for_deletion(&oi.bucket, oi, false).await.is_some() {
+            if lock_enabled
+                && object_lock_boundary::check_object_lock_for_deletion(&oi.bucket, oi, false)
+                    .await
+                    .is_some()
+            {
                 //if serverDebugLog {
                 if oi.version_id.is_some() {
                     debug!(
@@ -2700,13 +2701,7 @@ async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: 
 
     delete_object.replication_state = replication_state;
 
-    schedule_replication_delete(DeletedObjectReplicationInfo {
-        delete_object,
-        bucket: oi.bucket.clone(),
-        event_type: REPLICATE_INCOMING_DELETE.to_string(),
-        ..Default::default()
-    })
-    .await;
+    replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
 }
 
 fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_delete: bool) -> bool {
@@ -2749,9 +2744,9 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
         return Some(state);
     }
 
-    let dsc = check_replicate_delete(
+    let dsc = replication_sink::check_delete_replication(
         &oi.bucket,
-        &ObjectToDelete {
+        ObjectToDelete {
             object_name: oi.name.clone(),
             version_id,
             ..Default::default()
@@ -2762,7 +2757,6 @@ async fn lifecycle_delete_replication_state(oi: &ObjectInfo, version_id: Option<
             versioned: BucketVersioningSys::prefix_enabled(&oi.bucket, &oi.name).await,
             ..Default::default()
         },
-        None,
     )
     .await;
     if !dsc.replicate_any() {
