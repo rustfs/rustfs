@@ -49,9 +49,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
     /// Check whether any object-replication rules exist
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
         let mut has_arn = false;
+        let arn = arn.trim();
 
         for rule in &self.rules {
-            if rule.destination.bucket == arn || self.role == arn {
+            if rule.destination.bucket.trim() == arn || self.role.trim() == arn {
                 if !has_arn {
                     has_arn = true;
                 }
@@ -77,7 +78,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if !obj.target_arn.is_empty() && rule.destination.bucket != obj.target_arn && self.role != obj.target_arn {
+            if !obj.target_arn.is_empty()
+                && rule.destination.bucket.trim() != obj.target_arn.trim()
+                && self.role.trim() != obj.target_arn.trim()
+            {
                 continue;
             }
 
@@ -215,6 +219,11 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
 
     /// Filter target ARNs and return a slice of the distinct values in the config
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String> {
+        let role = self.role.trim();
+        if !role.is_empty() {
+            return vec![role.to_string()];
+        }
+
         let mut arns = Vec::new();
         let mut targets_map: HashSet<String> = HashSet::new();
         let rules = self.filter_actionable_rules(obj);
@@ -224,14 +233,10 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
                 continue;
             }
 
-            if !rule.destination.bucket.is_empty() && !targets_map.contains(&rule.destination.bucket) {
-                targets_map.insert(rule.destination.bucket.clone());
+            let arn = rule.destination.bucket.trim();
+            if !arn.is_empty() && !targets_map.contains(arn) {
+                targets_map.insert(arn.to_string());
             }
-        }
-
-        if targets_map.is_empty() && !self.role.is_empty() {
-            arns.push(self.role.clone());
-            return arns;
         }
 
         for arn in targets_map {
@@ -267,9 +272,9 @@ mod tests {
     }
 
     #[test]
-    fn filter_target_arns_keeps_multiple_destinations_when_role_is_present() {
+    fn filter_target_arns_uses_role_when_role_is_present() {
         let config = ReplicationConfiguration {
-            role: "arn:legacy:target".to_string(),
+            role: " arn:legacy:target ".to_string(),
             rules: vec![
                 replication_rule("rule-1", "arn:target:a"),
                 replication_rule("rule-2", "arn:target:b"),
@@ -282,9 +287,7 @@ mod tests {
             ..Default::default()
         });
 
-        assert_eq!(arns.len(), 2);
-        assert!(arns.iter().any(|arn| arn == "arn:target:a"));
-        assert!(arns.iter().any(|arn| arn == "arn:target:b"));
+        assert_eq!(arns, vec!["arn:legacy:target".to_string()]);
     }
 
     #[test]

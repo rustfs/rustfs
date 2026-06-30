@@ -246,15 +246,14 @@ fn notify_bucket_metadata_reload(
     });
 }
 
-fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+fn active_replication_rule_destination_arns(config: &ReplicationConfiguration) -> HashSet<String> {
     let mut arns = HashSet::new();
 
-    if !config.role.trim().is_empty() {
-        arns.insert(config.role.clone());
-        return arns;
-    }
-
     for rule in &config.rules {
+        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
         let arn = rule.destination.bucket.trim();
         if !arn.is_empty() {
             arns.insert(arn.to_string());
@@ -262,6 +261,17 @@ fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String>
     }
 
     arns
+}
+
+fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+    let role = config.role.trim();
+    if !role.is_empty() {
+        let mut arns = HashSet::new();
+        arns.insert(role.to_string());
+        return arns;
+    }
+
+    active_replication_rule_destination_arns(config)
 }
 
 fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
@@ -272,26 +282,19 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
         .map(|target| target.arn.as_str())
         .collect::<HashSet<_>>();
 
-    for rule in &config.rules {
-        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
-            continue;
-        }
-
-        let configured_arn = if config.role.trim().is_empty() {
-            rule.destination.bucket.trim()
-        } else {
-            config.role.trim()
-        };
-
-        if !configured_arn.is_empty() && configured_arns.contains(configured_arn) {
-            continue;
-        }
-
+    let role = config.role.trim();
+    let destination_arns = active_replication_rule_destination_arns(config);
+    if !role.is_empty() && destination_arns.len() > 1 {
         return Err(s3_error!(
             InvalidRequest,
-            "replication config with rule ID {} has a stale target",
-            rule.id.clone().unwrap_or_default()
+            "replication config with Role cannot define multiple destination targets"
         ));
+    }
+
+    for configured_arn in replication_target_arns(config) {
+        if !configured_arns.contains(configured_arn.as_str()) {
+            return Err(s3_error!(InvalidRequest, "replication config has a stale target"));
+        }
     }
 
     Ok(())
@@ -2301,7 +2304,7 @@ mod tests {
         let role = "arn:rustfs:replication:us-east-1:source:bucket";
         let destination = "arn:rustfs:replication:us-east-1:target:bucket";
         let config = ReplicationConfiguration {
-            role: role.to_string(),
+            role: format!(" {role} "),
             rules: vec![replication_rule_for_target(destination)],
         };
 
@@ -2368,11 +2371,42 @@ mod tests {
         let arn = "arn:rustfs:replication:us-east-1:role-target:bucket";
         let targets = replication_targets_with_arn(&[arn]);
         let config = ReplicationConfiguration {
-            role: arn.to_string(),
+            role: format!(" {arn} "),
             rules: vec![replication_rule_for_target("arn:rustfs:replication:us-east-1:ignored:bucket")],
         };
 
         validate_replication_config_targets(&targets, &config).expect("matching role ARN should pass validation");
+    }
+
+    #[test]
+    fn validate_replication_config_targets_rejects_role_with_multiple_destinations() {
+        let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
+        let targets = replication_targets_with_arn(&[role]);
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![
+                replication_rule_for_target("arn:rustfs:replication:us-east-1:target-a:bucket"),
+                replication_rule_for_target("arn:rustfs:replication:us-east-1:target-b:bucket"),
+            ],
+        };
+
+        let err = validate_replication_config_targets(&targets, &config)
+            .expect_err("role plus multiple destinations should be rejected");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[test]
+    fn validate_replication_config_targets_trims_destination_arns() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let targets = replication_targets_with_arn(&[arn]);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule_for_target(
+                " arn:rustfs:replication:us-east-1:target:bucket ",
+            )],
+        };
+
+        validate_replication_config_targets(&targets, &config).expect("trimmed destination ARN should match configured target");
     }
 
     #[test]

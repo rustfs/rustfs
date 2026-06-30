@@ -1586,17 +1586,17 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
             continue;
         }
 
-        let arn = if config.role.is_empty() {
-            rule.destination.bucket.clone()
+        let arn = if config.role.trim().is_empty() {
+            rule.destination.bucket.trim().to_string()
         } else {
-            config.role.clone()
+            config.role.trim().to_string()
         };
 
         if seen.insert(arn.clone()) {
             arns.push(arn);
         }
 
-        if !config.role.is_empty() {
+        if !config.role.trim().is_empty() {
             break;
         }
     }
@@ -1775,26 +1775,13 @@ fn validate_replication_check_config_targets(
         .map(|target| target.arn.as_str())
         .collect::<HashSet<_>>();
 
-    for rule in &config.rules {
-        if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
-            continue;
+    for configured_arn in config.filter_target_arns(&ObjectOpts {
+        op_type: ReplicationType::All,
+        ..Default::default()
+    }) {
+        if !configured_arns.contains(configured_arn.as_str()) {
+            return Err(s3_error!(InvalidRequest, "replication config has a stale target"));
         }
-
-        let configured_arn = if config.role.is_empty() {
-            rule.destination.bucket.as_str()
-        } else {
-            config.role.as_str()
-        };
-
-        if configured_arns.contains(configured_arn) {
-            continue;
-        }
-
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication config with rule ID {} has a stale target",
-            rule.id.clone().unwrap_or_default()
-        ));
     }
 
     Ok(())
