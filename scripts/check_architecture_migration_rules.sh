@@ -201,6 +201,7 @@ REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.t
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
+REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
 REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
@@ -2521,6 +2522,18 @@ fi
 
 if [[ -s "$REPLICATION_EVENT_SINK_BYPASS_HITS_FILE" ]]; then
   report_failure "replication event notification access must stay behind replication event sink: $(paste -sd '; ' "$REPLICATION_EVENT_SINK_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\b(runtime_sources|runtime_boundary)::default_local_node_name\(\)' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_event_sink\.rs:' || true
+) >"$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication event host selection must stay behind replication event sink: $(paste -sd '; ' "$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE")"
 fi
 
 (
