@@ -43,6 +43,8 @@ const ERR_LIFECYCLE_BUCKET_LOCKED: &str =
 const ERR_LIFECYCLE_TOO_MANY_RULES: &str = "Lifecycle configuration should have at most 1000 rules";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DAYS: &str = "Lifecycle expiration days must not be negative";
 const ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS: &str = "Lifecycle noncurrent expiration days must not be negative";
+const ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS: &str =
+    "DaysAfterInitiation must be 0 or greater when used with AbortIncompleteMultipartUpload";
 const ERR_LIFECYCLE_INVALID_EXPIRATION_DATE_NOT_MIDNIGHT: &str = "Expiration.Date must be at midnight UTC";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
@@ -317,6 +319,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 && noncurrent_days < 0
             {
                 return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS));
+            }
+            if let Some(abort_incomplete_multipart_upload) = &r.abort_incomplete_multipart_upload {
+                match abort_incomplete_multipart_upload.days_after_initiation {
+                    Some(days) if days >= 0 => {}
+                    _ => return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS)),
+                }
             }
             if let Some(transitions) = &r.transitions {
                 for transition in transitions {
@@ -863,7 +871,7 @@ pub async fn abort_incomplete_multipart_upload_due(
                 .abort_incomplete_multipart_upload
                 .as_ref()?
                 .days_after_initiation
-                .filter(|days| *days > 0)?;
+                .filter(|days| *days >= 0)?;
             Some((expected_expiry_time(initiated, days), rule.id.unwrap_or_default()))
         })
         .min_by_key(|(due, _)| due.unix_timestamp_nanos())
@@ -1170,6 +1178,119 @@ mod tests {
         lc.validate(&ObjectLockConfiguration::default())
             .await
             .expect("expected validation to pass");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_accepts_zero_abort_incomplete_multipart_upload_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-zero".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        lc.validate(&ObjectLockConfiguration::default())
+            .await
+            .expect("zero-day abort incomplete multipart upload should be accepted");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_missing_abort_incomplete_multipart_upload_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: None,
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-missing".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_negative_abort_incomplete_multipart_upload_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(-1),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-negative".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
+                transitions: None,
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_ABORT_INCOMPLETE_MPU_DAYS);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn abort_incomplete_multipart_upload_due_accepts_zero_days() {
+        let initiated = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: Some(s3s::dto::AbortIncompleteMultipartUpload {
+                    days_after_initiation: Some(0),
+                }),
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("abort-zero".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: Some("test/".to_string()),
+                transitions: None,
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "test/object".to_string(),
+            mod_time: Some(initiated),
+            ..Default::default()
+        };
+
+        let (due, rule_id) = abort_incomplete_multipart_upload_due(&lc, &opts)
+            .await
+            .expect("zero-day abort rule should be due");
+
+        assert_eq!(rule_id, "abort-zero");
+        assert_eq!(due, OffsetDateTime::UNIX_EPOCH);
     }
 
     #[tokio::test]

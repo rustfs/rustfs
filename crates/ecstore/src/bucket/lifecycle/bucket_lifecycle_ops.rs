@@ -4083,6 +4083,43 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn stale_multipart_cleanup_applies_zero_day_abort_lifecycle_immediately() {
+        let (_paths, ecstore) = setup_test_env().await;
+        let bucket = format!("stale-zero-lifecycle-{}", Uuid::new_v4().simple());
+        let object = "logs/immediate/object.txt";
+        create_test_bucket(&ecstore, &bucket).await;
+        set_abort_incomplete_lifecycle(&bucket, "logs/", 0).await;
+
+        let initiated = OffsetDateTime::now_utc() - time::Duration::minutes(5);
+        let upload = ecstore
+            .new_multipart_upload(
+                &bucket,
+                object,
+                &ObjectOptions {
+                    mod_time: Some(initiated),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("multipart upload should be created");
+
+        let deleted = cleanup_stale_multipart_uploads_once_at(
+            ecstore.clone(),
+            OffsetDateTime::now_utc(),
+            StdDuration::from_secs(7 * 24 * 60 * 60),
+        )
+        .await;
+        assert!(deleted >= 1, "expected zero-day lifecycle abort cleanup to run immediately");
+
+        let err = ecstore
+            .get_multipart_info(&bucket, object, &upload.upload_id, &ObjectOptions::default())
+            .await
+            .expect_err("multipart upload should be removed by zero-day lifecycle abort rule");
+        assert!(is_err_invalid_upload_id(&err));
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn stale_multipart_cleanup_applies_abort_lifecycle_with_size_filter() {
         let (_paths, ecstore) = setup_test_env().await;
         let bucket = format!("stale-size-{}", Uuid::new_v4().simple());
