@@ -27,6 +27,7 @@ use std::{
 };
 use tokio::io::AsyncRead;
 use tokio::spawn;
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
@@ -59,6 +60,10 @@ fn is_missing_path_error(err: &DiskError) -> bool {
     matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound)
 }
 
+async fn take_fallback_candidate<T>(fallback_items: &Arc<TokioMutex<VecDeque<T>>>) -> Option<T> {
+    fallback_items.lock().await.pop_front()
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) enum TestReaderBehavior {
@@ -67,6 +72,7 @@ pub(crate) enum TestReaderBehavior {
     Stall,
     IgnoreCancel,
     ProducerError(DiskError),
+    PrimaryErrorThenFallback(DiskError),
     PartialThenTimeout(Vec<MetaCacheEntry>),
 }
 
@@ -88,6 +94,8 @@ pub struct ListPathRawOptions {
     pub finished: Option<FinishedFn>,
     #[cfg(test)]
     pub(crate) test_reader_behaviors: Vec<TestReaderBehavior>,
+    #[cfg(test)]
+    pub(crate) test_fallback_reader_behaviors: Vec<TestReaderBehavior>,
     #[cfg(test)]
     pub(crate) peek_timeout: Option<Duration>,
     // pub agreed: Option<Arc<dyn Fn(MetaCacheEntry) + Send + Sync>>,
@@ -112,6 +120,8 @@ impl Clone for ListPathRawOptions {
             #[cfg(test)]
             test_reader_behaviors: self.test_reader_behaviors.clone(),
             #[cfg(test)]
+            test_fallback_reader_behaviors: self.test_fallback_reader_behaviors.clone(),
+            #[cfg(test)]
             peek_timeout: self.peek_timeout,
             ..Default::default()
         }
@@ -128,7 +138,11 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
     let mut jobs: Vec<tokio::task::JoinHandle<std::result::Result<(), DiskError>>> = Vec::new();
     let mut readers = Vec::with_capacity(opts.disks.len());
-    let fds = opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>();
+    let fds = Arc::new(TokioMutex::new(opts.fallback_disks.iter().flatten().cloned().collect::<VecDeque<_>>()));
+    #[cfg(test)]
+    let test_fallbacks = Arc::new(TokioMutex::new(
+        opts.test_fallback_reader_behaviors.iter().cloned().collect::<VecDeque<_>>(),
+    ));
     let max_disk_failures = opts.disks.len().saturating_sub(opts.min_disks);
     let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
@@ -137,14 +151,16 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
-        let mut fds_clone = fds.clone();
+        let fds_clone = fds.clone();
+        #[cfg(test)]
+        let test_fallbacks_clone = test_fallbacks.clone();
         let cancel_rx_clone = cancel_rx.clone();
         let producer_errs_clone = producer_errs.clone();
         let (rd, wr) = tokio::io::duplex(64);
         readers.push(MetacacheReader::new(rd));
         jobs.push(spawn(async move {
             #[cfg(test)]
-            if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
+            let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
                 match behavior {
                     TestReaderBehavior::Eof => return Ok(()),
                     TestReaderBehavior::Entries(entries) => {
@@ -168,6 +184,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         record_producer_error(&producer_errs_clone, disk_idx, &err);
                         return Err(err);
                     }
+                    TestReaderBehavior::PrimaryErrorThenFallback(err) => Some(err),
                     TestReaderBehavior::PartialThenTimeout(entries) => {
                         let mut wr = wr;
                         let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
@@ -178,7 +195,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         return Err(err);
                     }
                 }
-            }
+            } else {
+                None
+            };
 
             let mut wr = wr;
             let wakl_opts = WalkDirOptions {
@@ -195,7 +214,13 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
 
             let mut need_fallback = false;
             let mut last_err = None;
-            if let Some(disk) = opdisk {
+            #[cfg(test)]
+            if let Some(err) = test_primary_error {
+                last_err = Some(err);
+                need_fallback = true;
+            }
+
+            if !need_fallback && let Some(disk) = opdisk {
                 let primary_walk_started = std::time::Instant::now();
                 match disk.walk_dir(wakl_opts, &mut wr).await {
                     Ok(_res) => {
@@ -238,7 +263,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                         need_fallback = true;
                     }
                 }
-            } else {
+            } else if !need_fallback {
                 last_err = Some(DiskError::DiskNotFound);
                 need_fallback = true;
             }
@@ -249,8 +274,37 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             }
 
             while need_fallback {
+                #[cfg(test)]
+                if let Some(behavior) = take_fallback_candidate(&test_fallbacks_clone).await {
+                    match behavior {
+                        TestReaderBehavior::Eof => {
+                            need_fallback = false;
+                            last_err = None;
+                            continue;
+                        }
+                        TestReaderBehavior::Entries(entries) => {
+                            let mut out = rustfs_filemeta::MetacacheWriter::new(&mut wr);
+                            out.write(&entries).await.expect("test fallback entries should be written");
+                            out.close().await.expect("test fallback entries should close");
+                            need_fallback = false;
+                            last_err = None;
+                            continue;
+                        }
+                        TestReaderBehavior::ProducerError(err) | TestReaderBehavior::PrimaryErrorThenFallback(err) => {
+                            last_err = Some(err);
+                            continue;
+                        }
+                        TestReaderBehavior::Stall
+                        | TestReaderBehavior::IgnoreCancel
+                        | TestReaderBehavior::PartialThenTimeout(_) => {
+                            last_err = Some(DiskError::Timeout);
+                            continue;
+                        }
+                    }
+                }
+
                 let mut disk_op = None;
-                while let Some(disk) = fds_clone.pop_front() {
+                while let Some(disk) = take_fallback_candidate(&fds_clone).await {
                     if disk.is_online().await {
                         disk_op = Some(disk);
                         break;
@@ -751,6 +805,88 @@ mod tests {
         assert!(!is_missing_path_error(&DiskError::Timeout));
         assert!(!is_missing_path_error(&DiskError::DiskNotFound));
         assert!(!is_missing_path_error(&DiskError::FileAccessDenied));
+    }
+
+    #[tokio::test]
+    async fn fallback_candidates_are_claimed_once_across_producers() {
+        let mut queue = VecDeque::new();
+        queue.push_back(1usize);
+        let candidates = Arc::new(TokioMutex::new(queue));
+
+        let first = take_fallback_candidate(&candidates).await;
+        let second = take_fallback_candidate(&candidates).await;
+
+        assert_eq!(first, Some(1));
+        assert_eq!(second, None);
+    }
+
+    fn fallback_test_entry() -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: "bucket/object".to_string(),
+            metadata: vec![1, 2, 3],
+            cached: None,
+            reusable: false,
+        }
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_does_not_reuse_one_fallback_for_multiple_failed_producers() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound),
+                    TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound),
+                ],
+                test_fallback_reader_behaviors: vec![TestReaderBehavior::Entries(vec![fallback_test_entry()])],
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("one fallback must not be counted as two failed primary producers");
+
+        assert_eq!(err, DiskError::DiskNotFound);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_uses_distinct_fallbacks_to_restore_quorum() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 2,
+                test_reader_behaviors: vec![
+                    TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound),
+                    TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound),
+                ],
+                test_fallback_reader_behaviors: vec![
+                    TestReaderBehavior::Entries(vec![fallback_test_entry()]),
+                    TestReaderBehavior::Entries(vec![fallback_test_entry()]),
+                ],
+                partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        let matches = entries
+                            .0
+                            .iter()
+                            .flatten()
+                            .filter(|entry| entry.name == "bucket/object")
+                            .count();
+                        seen.lock().expect("seen mutex poisoned").push(matches);
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("distinct fallback producers should restore listing quorum");
+
+        assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &[2]);
     }
 
     #[tokio::test]
