@@ -103,6 +103,8 @@ const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE: bool = false;
 /// Default: 4MB.
 const ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: &str = "RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD";
 const DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD: usize = 4 * 1024 * 1024;
+const ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: &str = "RUSTFS_OBJECT_MMAP_POPULATE_ENABLE";
+const DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE: bool = false;
 
 /// Check if O_DIRECT reads are enabled.
 fn is_direct_io_read_enabled() -> bool {
@@ -112,6 +114,10 @@ fn is_direct_io_read_enabled() -> bool {
 /// Get the O_DIRECT read threshold size.
 fn get_direct_io_read_threshold() -> usize {
     rustfs_utils::get_env_usize(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_THRESHOLD)
+}
+
+fn should_populate_mmap_read(length: usize) -> bool {
+    length > 0 && rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, DEFAULT_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE)
 }
 
 #[cfg(test)]
@@ -2868,6 +2874,7 @@ impl DiskAPI for LocalDisk {
             let file_path_clone = file_path.clone();
 
             let should_reclaim_after_read = should_reclaim_file_cache_after_read(length);
+            let should_populate_mmap_read = should_populate_mmap_read(length);
             let blocking_wait_start = metrics_enabled.then(std::time::Instant::now);
             let read_result = tokio::task::spawn_blocking(move || {
                 let blocking_task_start = metrics_enabled.then(StdInstant::now);
@@ -2913,8 +2920,12 @@ impl DiskAPI for LocalDisk {
                 // that we've already verified exists and is within file bounds. The
                 // file offset passed to mmap is page-size aligned as required on Unix.
                 let mmap_map_start = metrics_enabled.then(StdInstant::now);
-                let mmap =
-                    unsafe { MmapOptions::new().offset(aligned_offset).len(map_len).map(&file) }.map_err(DiskError::other)?;
+                let mut mmap_options = MmapOptions::new();
+                mmap_options.offset(aligned_offset).len(map_len);
+                if should_populate_mmap_read {
+                    mmap_options.populate();
+                }
+                let mmap = unsafe { mmap_options.map(&file) }.map_err(DiskError::other)?;
                 let mmap_map_duration = mmap_map_start.map_or(StdDuration::ZERO, |started_at| started_at.elapsed());
 
                 // Copy only the requested logical range into a Bytes buffer. This
@@ -3017,7 +3028,12 @@ impl DiskAPI for LocalDisk {
             // Record mmap read metrics
             rustfs_io_metrics::record_zero_copy_read(length, duration_ms);
 
-            debug!(size = length, duration_ms = duration_ms, "mmap_read_success");
+            debug!(
+                size = length,
+                duration_ms = duration_ms,
+                mmap_populate = should_populate_mmap_read,
+                "mmap_read_success"
+            );
 
             return Ok(bytes);
         }
@@ -5652,6 +5668,22 @@ mod test {
                 assert!(should_reclaim_file_cache_after_read(8 * 1024 * 1024));
                 assert!(!should_reclaim_file_cache_after_read(1024));
             });
+        });
+    }
+
+    #[test]
+    fn should_populate_mmap_read_respects_env() {
+        temp_env::with_var_unset(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, || {
+            assert!(!should_populate_mmap_read(512 * 1024));
+        });
+
+        temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, Some("true"), || {
+            assert!(should_populate_mmap_read(512 * 1024));
+            assert!(!should_populate_mmap_read(0));
+        });
+
+        temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_POPULATE_ENABLE, Some("false"), || {
+            assert!(!should_populate_mmap_read(512 * 1024));
         });
     }
 
