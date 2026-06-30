@@ -1,0 +1,243 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+services:
+  rustfs-site1:
+    image: ${RUSTFS_SITE_REPL_IMAGE:-rustfs/rustfs:latest}
+    container_name: rustfs-site-repl-1
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_SITE_REPL_LOG_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    volumes:
+      - site1_data_0:/data/rustfs0
+      - site1_data_1:/data/rustfs1
+      - site1_data_2:/data/rustfs2
+      - site1_data_3:/data/rustfs3
+      - site1_logs:/app/logs
+    networks:
+      - rustfs-site-replication
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      site-replication-volume-permission-helper:
+        condition: service_completed_successfully
+
+  rustfs-site2:
+    image: ${RUSTFS_SITE_REPL_IMAGE:-rustfs/rustfs:latest}
+    container_name: rustfs-site-repl-2
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9010:9000"
+      - "9011:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_SITE_REPL_LOG_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    volumes:
+      - site2_data_0:/data/rustfs0
+      - site2_data_1:/data/rustfs1
+      - site2_data_2:/data/rustfs2
+      - site2_data_3:/data/rustfs3
+      - site2_logs:/app/logs
+    networks:
+      - rustfs-site-replication
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      site-replication-volume-permission-helper:
+        condition: service_completed_successfully
+
+  rustfs-site3:
+    image: ${RUSTFS_SITE_REPL_IMAGE:-rustfs/rustfs:latest}
+    container_name: rustfs-site-repl-3
+    security_opt:
+      - "no-new-privileges:true"
+    ports:
+      - "9020:9000"
+      - "9021:9001"
+    environment:
+      - RUSTFS_VOLUMES=/data/rustfs{0...3}
+      - RUSTFS_ADDRESS=0.0.0.0:9000
+      - RUSTFS_CONSOLE_ADDRESS=0.0.0.0:9001
+      - RUSTFS_CONSOLE_ENABLE=true
+      - RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS=*
+      - RUSTFS_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_OBS_LOGGER_LEVEL=${RUSTFS_SITE_REPL_LOG_LEVEL:-info}
+      - RUSTFS_UNSAFE_BYPASS_DISK_CHECK=${RUSTFS_UNSAFE_BYPASS_DISK_CHECK:-true}
+    volumes:
+      - site3_data_0:/data/rustfs0
+      - site3_data_1:/data/rustfs1
+      - site3_data_2:/data/rustfs2
+      - site3_data_3:/data/rustfs3
+      - site3_logs:/app/logs
+    networks:
+      - rustfs-site-replication
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:9000/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    depends_on:
+      site-replication-volume-permission-helper:
+        condition: service_completed_successfully
+
+  site-replication-setup:
+    image: minio/mc:latest
+    container_name: rustfs-site-repl-setup
+    depends_on:
+      rustfs-site1:
+        condition: service_healthy
+      rustfs-site2:
+        condition: service_healthy
+      rustfs-site3:
+        condition: service_healthy
+    environment:
+      - RUSTFS_SITE_REPL_ACCESS_KEY=${RUSTFS_SITE_REPL_ACCESS_KEY:-rustfsadmin}
+      - RUSTFS_SITE_REPL_SECRET_KEY=${RUSTFS_SITE_REPL_SECRET_KEY:-rustfsadmin}
+      - RUSTFS_SITE_REPL_BUCKET=${RUSTFS_SITE_REPL_BUCKET:-site-repl-demo}
+      - RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY=${RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY:-false}
+    networks:
+      - rustfs-site-replication
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+
+        access_key="$${RUSTFS_SITE_REPL_ACCESS_KEY}"
+        secret_key="$${RUSTFS_SITE_REPL_SECRET_KEY}"
+        bucket="$${RUSTFS_SITE_REPL_BUCKET}"
+
+        mc alias set site1 http://rustfs-site1:9000 "$${access_key}" "$${secret_key}"
+        mc alias set site2 http://rustfs-site2:9000 "$${access_key}" "$${secret_key}"
+        mc alias set site3 http://rustfs-site3:9000 "$${access_key}" "$${secret_key}"
+
+        for site in site1 site2 site3; do
+          until mc ls "$${site}" >/dev/null 2>&1; do
+            echo "waiting for $${site} S3 API"
+            sleep 2
+          done
+        done
+
+        ilm_flag=""
+        if [ "$${RUSTFS_SITE_REPL_ENABLE_ILM_EXPIRY}" = "true" ]; then
+          ilm_flag="--replicate-ilm-expiry"
+        fi
+
+        echo "configuring 3-site replication"
+        if ! mc admin replicate add site1 site2 site3 $${ilm_flag}; then
+          echo "replicate add failed; showing current replication info before exiting"
+          mc admin replicate info site1 || true
+          exit 1
+        fi
+
+        mc mb --ignore-existing "site1/$${bucket}"
+        printf 'rustfs 3-site replication check\n' > /tmp/site-replication-check.txt
+        mc cp /tmp/site-replication-check.txt "site1/$${bucket}/from-site1.txt"
+
+        for site in site2 site3; do
+          for attempt in $$(seq 1 60); do
+            if mc stat "$${site}/$${bucket}/from-site1.txt" >/dev/null 2>&1; then
+              echo "$${site} received replicated object"
+              break
+            fi
+            if [ "$${attempt}" = "60" ]; then
+              echo "$${site} did not receive replicated object in time"
+              exit 1
+            fi
+            sleep 2
+          done
+        done
+
+        mc admin replicate status site1
+        echo "3-site replication example is ready"
+    restart: "no"
+
+  site-replication-volume-permission-helper:
+    image: alpine:3.23.4
+    volumes:
+      - site1_data_0:/site1/data0
+      - site1_data_1:/site1/data1
+      - site1_data_2:/site1/data2
+      - site1_data_3:/site1/data3
+      - site1_logs:/site1/logs
+      - site2_data_0:/site2/data0
+      - site2_data_1:/site2/data1
+      - site2_data_2:/site2/data2
+      - site2_data_3:/site2/data3
+      - site2_logs:/site2/logs
+      - site3_data_0:/site3/data0
+      - site3_data_1:/site3/data1
+      - site3_data_2:/site3/data2
+      - site3_data_3:/site3/data3
+      - site3_logs:/site3/logs
+    command: >
+      sh -c "
+        chown -R 10001:10001 /site1 /site2 /site3 &&
+        echo 'site replication volume permissions fixed'
+      "
+    networks:
+      - rustfs-site-replication
+    restart: "no"
+
+networks:
+  rustfs-site-replication:
+
+volumes:
+  site1_data_0:
+  site1_data_1:
+  site1_data_2:
+  site1_data_3:
+  site1_logs:
+  site2_data_0:
+  site2_data_1:
+  site2_data_2:
+  site2_data_3:
+  site2_logs:
+  site3_data_0:
+  site3_data_1:
+  site3_data_2:
+  site3_data_3:
+  site3_logs:

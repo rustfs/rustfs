@@ -4082,6 +4082,11 @@ async fn replicate_object_with_multipart<S: EcstoreObjectIO>(ctx: MultipartRepli
         uploaded_parts,
         &PutObjectOptions {
             user_metadata,
+            internal: AdvancedPutOptions {
+                replication_status: ReplicationStatusType::Replica,
+                replication_request: true,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )

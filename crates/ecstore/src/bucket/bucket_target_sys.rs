@@ -1570,14 +1570,7 @@ impl TargetClient {
         object: &str,
         opts: &PutObjectOptions,
     ) -> Result<String, S3ClientError> {
-        let mut headers = HeaderMap::new();
-        let version_id = opts.internal.source_version_id.clone();
-        if !version_id.is_empty() {
-            insert_header(&mut headers, SUFFIX_SOURCE_VERSION_ID, &version_id);
-        }
-        if opts.internal.replication_request {
-            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        }
+        let headers = opts.header();
 
         match self
             .client
@@ -1652,7 +1645,10 @@ impl TargetClient {
     ) -> Result<CompleteMultipartUploadOutput, S3ClientError> {
         let multipart_upload = CompletedMultipartUpload::builder().set_parts(Some(parts)).build();
 
-        let headers = opts.header();
+        let mut headers = opts.header();
+        if opts.internal.replication_request {
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+        }
 
         match self
             .client

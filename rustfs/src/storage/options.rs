@@ -16,14 +16,15 @@ use super::{BucketVersioningSys, Result, StorageError};
 use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
+use rustfs_filemeta::ReplicationStatusType;
+use rustfs_utils::http::{
+    AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
+    SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
+    insert_header_map, is_encryption_metadata_key, is_internal_key,
+};
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
     AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-};
-use rustfs_utils::http::{
-    SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_SOURCE_DELETEMARKER,
-    SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header, insert_header_map,
-    is_encryption_metadata_key, is_internal_key,
 };
 use s3s::header::X_AMZ_OBJECT_LOCK_MODE;
 use s3s::header::X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE;
@@ -275,6 +276,7 @@ pub fn get_complete_multipart_upload_opts(headers: &HeaderMap<HeaderValue>) -> s
         replication_request,
         ..Default::default()
     };
+    apply_replica_status_from_headers(headers, &mut opts);
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
     Ok(opts)
@@ -297,6 +299,7 @@ pub fn copy_src_opts(_bucket: &str, _object: &str, headers: &HeaderMap<HeaderVal
 
 pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap<String, String>) -> Result<ObjectOptions> {
     let mut opts = get_default_opts(headers, metadata, false)?;
+    apply_replica_status_from_headers(headers, &mut opts);
     if get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
         if let Some(v) = get_header(headers, SUFFIX_SOURCE_MTIME) {
@@ -311,6 +314,16 @@ pub fn put_opts_from_headers(headers: &HeaderMap<HeaderValue>, metadata: HashMap
         }
     }
     Ok(opts)
+}
+
+fn apply_replica_status_from_headers(headers: &HeaderMap<HeaderValue>, opts: &mut ObjectOptions) {
+    if headers
+        .get(AMZ_BUCKET_REPLICATION_STATUS)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|status| status.eq_ignore_ascii_case(ReplicationStatusType::Replica.as_str()))
+    {
+        opts.set_replica_status(ReplicationStatusType::Replica);
+    }
 }
 
 /// Creates default options for getting an object from a bucket.
@@ -788,13 +801,15 @@ mod tests {
     use super::{
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
         detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_default_opts, get_opts, parse_copy_source_range,
-        put_opts, put_opts_from_headers, validate_archive_content_encoding,
+        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
+        get_default_opts, get_opts, parse_copy_source_range, put_opts, put_opts_from_headers, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
+    use rustfs_filemeta::ReplicationStatusType;
     use rustfs_utils::http::{
-        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
-        SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, insert_header,
+        AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
+        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,
+        insert_header,
     };
     use s3s::S3ErrorCode;
     use std::collections::HashMap;
@@ -1124,6 +1139,32 @@ mod tests {
         let opts_invalid = result_invalid.unwrap();
         assert!(opts_invalid.replication_request);
         assert!(opts_invalid.mod_time.is_none());
+    }
+
+    #[test]
+    fn test_put_opts_from_headers_with_replica_status() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let opts = put_opts_from_headers(&headers, HashMap::new()).expect("replica status header should parse");
+
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn test_complete_multipart_opts_with_replica_status() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AMZ_BUCKET_REPLICATION_STATUS,
+            HeaderValue::from_static(ReplicationStatusType::Replica.as_str()),
+        );
+
+        let opts = get_complete_multipart_upload_opts(&headers).expect("replica status header should parse");
+
+        assert_eq!(opts.delete_marker_replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]

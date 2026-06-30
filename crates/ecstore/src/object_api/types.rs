@@ -109,6 +109,14 @@ impl ObjectOptions {
     }
 
     pub fn put_replication_state(&self) -> ReplicationState {
+        if self
+            .delete_replication
+            .as_ref()
+            .is_some_and(|state| !state.replica_status.is_empty())
+        {
+            return self.delete_replication.clone().unwrap_or_default();
+        }
+
         let rs = match rustfs_utils::http::get_str(&self.user_defined, rustfs_utils::http::SUFFIX_REPLICATION_STATUS) {
             Some(v) => v,
             None => return ReplicationState::default(),
@@ -795,6 +803,21 @@ mod tests {
 
         assert_eq!(versions.len(), 1);
         assert_eq!(versions[0].version_id, Some(last_version));
+    }
+
+    #[test]
+    fn put_replication_state_preserves_replica_status() {
+        let opts = ObjectOptions {
+            delete_replication: Some(ReplicationState {
+                replica_status: ReplicationStatusType::Replica,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let state = opts.put_replication_state();
+
+        assert_eq!(state.composite_replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]

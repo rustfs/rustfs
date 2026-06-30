@@ -63,7 +63,7 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, Uri};
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_filemeta::ReplicationType;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -560,8 +560,13 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         let mt2 = obj_info.user_defined.clone();
-        let replicate_options =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
+        let replicate_options = get_must_replicate_options(
+            &mt2,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            ReplicationType::Object,
+            opts.clone(),
+        );
         let dsc = must_replicate(&bucket, &key, replicate_options).await;
 
         if dsc.replicate_any() {
@@ -694,8 +699,13 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let replicate_options =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
+        let replicate_options = get_must_replicate_options(
+            &mt2,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            ReplicationType::Object,
+            opts.clone(),
+        );
         let dsc = must_replicate(&bucket, &key, replicate_options).await;
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
