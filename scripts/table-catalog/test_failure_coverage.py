@@ -85,6 +85,80 @@ class FailureCoverageTest(unittest.TestCase):
             "/_iceberg/v1/lake/namespaces/sales/tables/orders",
         )
 
+    def test_disaster_recovery_rehearsal_plan_covers_operator_recovery_path(self) -> None:
+        rehearsal = failure_coverage.disaster_recovery_rehearsal_plan(
+            warehouse="lake",
+            namespace="sales",
+            table="orders",
+            rest_path="/iceberg",
+            table_warehouse_location="s3://lake/tables/orders",
+        )
+
+        self.assertEqual(rehearsal["mode"], "manual-or-ci-optional")
+        self.assertEqual(rehearsal["ci_gate"], "RUSTFS_TABLE_CATALOG_DR_REHEARSAL=1")
+        self.assertIn("record the RustFS build and catalog backing mode before starting", rehearsal["preconditions"])
+        self.assertIn("current metadata pointer remains recoverable or deliberately rolled back", rehearsal["expected_invariants"])
+
+        phases = {phase["name"]: phase for phase in rehearsal["phases"]}
+        self.assertIn("capture-baseline", phases)
+        self.assertIn("diagnose-and-repair", phases)
+        self.assertIn("rollback-or-import", phases)
+        self.assertIn("migration-preflight", phases)
+        self.assertIn("post-recovery-validation", phases)
+
+        baseline_steps = {step["name"]: step for step in phases["capture-baseline"]["steps"]}
+        self.assertEqual(
+            baseline_steps["export-catalog-state"]["path"],
+            "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/export",
+        )
+        self.assertEqual(baseline_steps["load-table-before-recovery"]["method"], "GET")
+
+        repair_steps = {step["name"]: step for step in phases["diagnose-and-repair"]["steps"]}
+        self.assertEqual(repair_steps["read-recovery-diagnostics"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/diagnostics")
+        self.assertEqual(repair_steps["safe-recovery-repair"]["method"], "POST")
+        self.assertEqual(repair_steps["safe-recovery-repair"]["body"], {"mode": "safe-repair"})
+
+        rollback_steps = {step["name"]: step for step in phases["rollback-or-import"]["steps"]}
+        self.assertEqual(rollback_steps["rollback-to-known-metadata"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/rollback")
+        self.assertIn("metadata-location", rollback_steps["rollback-to-known-metadata"]["body"])
+        self.assertIn("version-token", rollback_steps["rollback-to-known-metadata"]["body"])
+        self.assertNotIn("expected-version-token", rollback_steps["rollback-to-known-metadata"]["body"])
+        self.assertEqual(rollback_steps["import-known-metadata"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders/catalog/import")
+        self.assertIn("metadata-location", rollback_steps["import-known-metadata"]["body"])
+        self.assertIn("properties", rollback_steps["import-known-metadata"]["body"])
+        self.assertNotIn("external-version-token", rollback_steps["import-known-metadata"]["body"])
+
+        migration_steps = {step["name"]: step for step in phases["migration-preflight"]["steps"]}
+        self.assertEqual(migration_steps["durable-backing-migration-dry-run"]["path"], "/iceberg/v1/lake/catalog/migration")
+        self.assertEqual(migration_steps["durable-backing-migration-dry-run"]["expected_behavior"], "migration blockers must be empty before cutover")
+
+        validation_steps = {step["name"]: step for step in phases["post-recovery-validation"]["steps"]}
+        self.assertEqual(validation_steps["load-table-after-recovery"]["path"], "/iceberg/v1/lake/namespaces/sales/tables/orders")
+        self.assertEqual(validation_steps["table-data-plane-policy-probe"]["path"], "s3://lake/tables/orders")
+        self.assertEqual(validation_steps["table-data-plane-policy-probe"]["method"], "S3-PROBE")
+
+    def test_cli_prints_disaster_recovery_rehearsal_plan(self) -> None:
+        payload = failure_coverage.cli_json(
+            [
+                "--warehouse",
+                "lake",
+                "--namespace",
+                "sales",
+                "--table",
+                "orders",
+                "--rest-path",
+                "/_iceberg",
+                "--table-warehouse-location",
+                "s3://lake/tables/orders",
+                "--print-disaster-recovery-rehearsal",
+            ]
+        )
+        document = json.loads(payload)
+
+        self.assertEqual(document["disaster_recovery_rehearsal"]["phases"][0]["name"], "capture-baseline")
+        first_step = document["disaster_recovery_rehearsal"]["phases"][0]["steps"][0]
+        self.assertEqual(first_step["path"], "/_iceberg/v1/lake/namespaces/sales/tables/orders/catalog/export")
+
 
 if __name__ == "__main__":
     unittest.main()

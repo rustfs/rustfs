@@ -204,6 +204,12 @@ python3 scripts/table-catalog/failure_coverage.py \
   --table events \
   --rest-path /iceberg \
   --print-failure-probes
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --print-disaster-recovery-rehearsal
 ```
 
 The generated probe plan covers stale-token commit conflicts, missing metadata
@@ -270,6 +276,44 @@ The current failure matrix covers:
 Do not promote a failure case from `probe-required` or `load-test-required` to
 an automated claim until the live probe or stress harness is repeatable and its
 RustFS build, client version, and expected response shape are recorded.
+
+## Disaster Recovery Rehearsal
+
+The disaster recovery rehearsal plan is a machine-readable operator runbook. It
+does not mutate state by itself and does not claim automatic repair. It records
+the REST and S3 probes an operator or CI opt-in job should run against a
+prepared table when validating recovery behavior.
+
+Generate the rehearsal plan:
+
+```bash
+python3 scripts/table-catalog/failure_coverage.py \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --table-warehouse-location s3://rustfs-s3table-smoke/tables/table-id \
+  --print-disaster-recovery-rehearsal
+```
+
+The plan is gated for CI by:
+
+```text
+RUSTFS_TABLE_CATALOG_DR_REHEARSAL=1
+```
+
+The generated phases cover:
+
+- baseline capture through catalog export and `loadTable`
+- recovery diagnostics and safe idempotency/commit repair
+- operator-selected rollback or import of a known metadata location
+- durable backing migration dry-run blocker checks
+- post-recovery `loadTable` and table warehouse data-plane policy probes
+
+Record the RustFS build, catalog backing mode, table identifier, metadata
+location, and expected response status for each run. Treat migration blockers,
+manual-review diagnostics, stale rollback/import conflicts, and data-plane
+policy failures as fail-closed results that require operator investigation
+before cutover or release claims.
 
 ## Vendor Profile References
 
