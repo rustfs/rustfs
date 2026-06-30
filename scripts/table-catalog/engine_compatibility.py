@@ -5,9 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
+import shlex
 from collections import OrderedDict
 from io import StringIO
 from typing import Any
+
+DEFAULT_PYICEBERG_VERSION = "0.10.0"
+DEFAULT_SPARK_VERSION = "3.5.4"
+DEFAULT_ICEBERG_VERSION = "1.7.1"
+DEFAULT_SCALA_VERSION = "2.12"
 
 VENDOR_SPARK_PROFILES: dict[str, dict[str, str]] = {
     "rustfs": {
@@ -75,14 +82,14 @@ def engine_compatibility_matrix() -> list[dict[str, Any]]:
         },
         {
             "client": "Spark Iceberg REST catalog",
-            "status": "generated-smoke-harness",
-            "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-spark-sql",
+            "status": "manual-live-harness",
+            "entrypoint": "scripts/table-catalog/engine_compatibility.py --print-live-conformance",
             "scenarios": [
-                scenario("create-namespace", "generated-spark-sql", "CREATE NAMESPACE IF NOT EXISTS"),
-                scenario("create-table", "generated-spark-sql", "CREATE TABLE USING iceberg"),
-                scenario("append", "generated-spark-sql", "INSERT INTO"),
-                scenario("reload-table", "generated-spark-sql", "REFRESH TABLE and SELECT COUNT"),
-                scenario("drop-table", "generated-spark-sql", "DROP TABLE and optional DROP NAMESPACE"),
+                scenario("create-namespace", "manual-live-harness", "CREATE NAMESPACE IF NOT EXISTS"),
+                scenario("create-table", "manual-live-harness", "CREATE TABLE USING iceberg"),
+                scenario("append", "manual-live-harness", "INSERT INTO"),
+                scenario("reload-table", "manual-live-harness", "REFRESH TABLE and SELECT COUNT"),
+                scenario("drop-table", "manual-live-harness", "DROP TABLE and optional DROP NAMESPACE"),
                 scenario("commit-conflict", "manual-validation-required", "requires a two-writer Spark or REST conflict harness"),
             ],
         },
@@ -310,6 +317,163 @@ def spark_sql_smoke(
     return "\n".join(statements) + "\n"
 
 
+def shell_join(parts: list[str]) -> str:
+    return " ".join(shlex.quote(part) for part in parts)
+
+
+def safe_file_segment(value: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-")
+    return safe or "value"
+
+
+def spark_packages(*, spark_version: str, iceberg_version: str, scala_version: str) -> str:
+    spark_minor = ".".join(spark_version.split(".")[:2])
+    return ",".join(
+        [
+            f"org.apache.iceberg:iceberg-spark-runtime-{spark_minor}_{scala_version}:{iceberg_version}",
+            f"org.apache.iceberg:iceberg-aws-bundle:{iceberg_version}",
+        ]
+    )
+
+
+def spark_sql_command(*, packages: str, config: OrderedDict[str, str], sql_file: str) -> str:
+    parts = ["spark-sql", "--packages", packages]
+    for key, value in config.items():
+        parts.extend(["--conf", f"{key}={value}"])
+    parts.extend(["-f", sql_file])
+    return shell_join(parts)
+
+
+def live_conformance_harness(
+    *,
+    endpoint: str,
+    warehouse: str,
+    access_key: str,
+    secret_key: str,
+    region: str,
+    catalog_name: str,
+    namespace: str,
+    table: str,
+    rest_path: str,
+    rest_signing_name: str,
+    pyiceberg_version: str,
+    spark_version: str,
+    iceberg_version: str,
+    scala_version: str,
+    cleanup: bool = False,
+) -> OrderedDict[str, Any]:
+    endpoint = normalized_endpoint(endpoint)
+    rest_path = normalized_rest_path(rest_path)
+    sql_file = f"/tmp/rustfs-s3tables-{safe_file_segment(namespace)}-{safe_file_segment(table)}-spark.sql"
+    spark_config = spark_catalog_config(
+        endpoint=endpoint,
+        warehouse=warehouse,
+        access_key=access_key,
+        secret_key=secret_key,
+        region=region,
+        catalog_name=catalog_name,
+        rest_path=rest_path,
+        rest_signing_name=rest_signing_name,
+    )
+    sql = spark_sql_smoke(catalog_name=catalog_name, namespace=namespace, table=table, cleanup=cleanup)
+    packages = spark_packages(spark_version=spark_version, iceberg_version=iceberg_version, scala_version=scala_version)
+    pyiceberg_command = shell_join(
+        [
+            "python3",
+            "scripts/table-catalog/pyiceberg_smoke.py",
+            "--endpoint",
+            endpoint,
+            "--access-key",
+            access_key,
+            "--secret-key",
+            secret_key,
+            "--bucket",
+            warehouse,
+            "--namespace",
+            namespace,
+            "--table",
+            table,
+            "--rest-path",
+            rest_path,
+            "--rest-signing-name",
+            rest_signing_name,
+            "--replace",
+            *([] if not cleanup else ["--cleanup"]),
+        ]
+    )
+    return OrderedDict(
+        [
+            ("mode", "manual-or-ci-optional"),
+            ("ci_gate", "RUSTFS_TABLE_CATALOG_LIVE_CONFORMANCE=1"),
+            (
+                "prerequisites",
+                [
+                    "RustFS endpoint is reachable",
+                    "table bucket can be created or reused",
+                    "Python, PyIceberg, PyArrow, boto3, Spark, and Iceberg Spark runtime packages are available",
+                ],
+            ),
+            (
+                "expected_results",
+                OrderedDict(
+                    [
+                        ("namespace", namespace),
+                        ("table", table),
+                        ("row_count", 2),
+                        ("cleanup", cleanup),
+                    ]
+                ),
+            ),
+            (
+                "clients",
+                [
+                    OrderedDict(
+                        [
+                            ("name", "PyIceberg"),
+                            ("version", pyiceberg_version),
+                            ("install", shell_join(["python3", "-m", "pip", "install", f"pyiceberg[pyarrow]=={pyiceberg_version}", "boto3"])),
+                            ("command", pyiceberg_command),
+                            ("expected", "append two rows, reload the table, scan row_count=2, and run direct REST catalog probes"),
+                        ]
+                    ),
+                    OrderedDict(
+                        [
+                            ("name", "Spark Iceberg REST catalog"),
+                            ("spark_version", spark_version),
+                            ("iceberg_version", iceberg_version),
+                            ("scala_version", scala_version),
+                            ("packages", packages),
+                            ("spark_config", spark_config),
+                            ("sql_file", sql_file),
+                            (
+                                "prepare_sql",
+                                shell_join(
+                                    [
+                                        "python3",
+                                        "scripts/table-catalog/engine_compatibility.py",
+                                        "--print-spark-sql",
+                                        "--namespace",
+                                        namespace,
+                                        "--table",
+                                        table,
+                                        "--catalog-name",
+                                        catalog_name,
+                                        *([] if not cleanup else ["--cleanup"]),
+                                    ]
+                                )
+                                + f" > {shlex.quote(sql_file)}",
+                            ),
+                            ("sql", sql),
+                            ("command", spark_sql_command(packages=packages, config=spark_config, sql_file=sql_file)),
+                            ("expected", "Spark SQL SELECT COUNT(*) returns row_count=2 before optional cleanup"),
+                        ]
+                    ),
+                ],
+            ),
+        ]
+    )
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Print RustFS S3 Tables Iceberg engine compatibility helpers.")
     parser.add_argument("--endpoint", default="http://127.0.0.1:9000")
@@ -327,8 +491,13 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--catalog-name", default="rustfs")
     parser.add_argument("--rest-path")
     parser.add_argument("--rest-signing-name")
+    parser.add_argument("--pyiceberg-version", default=DEFAULT_PYICEBERG_VERSION)
+    parser.add_argument("--spark-version", default=DEFAULT_SPARK_VERSION)
+    parser.add_argument("--iceberg-version", default=DEFAULT_ICEBERG_VERSION)
+    parser.add_argument("--scala-version", default=DEFAULT_SCALA_VERSION)
     parser.add_argument("--cleanup", action="store_true")
     parser.add_argument("--print-engine-matrix", action="store_true")
+    parser.add_argument("--print-live-conformance", action="store_true")
     parser.add_argument("--print-spark-config", action="store_true")
     parser.add_argument("--print-spark-sql", action="store_true")
     return parser.parse_args(argv)
@@ -370,6 +539,30 @@ def run(args: argparse.Namespace, output: StringIO | None = None) -> None:
                     warehouse_name=args.warehouse_name,
                     rest_path=args.rest_path,
                     rest_signing_name=args.rest_signing_name,
+                )
+            },
+            output,
+        )
+        printed = True
+    if args.print_live_conformance:
+        print_json(
+            {
+                "live_conformance": live_conformance_harness(
+                    endpoint=args.endpoint,
+                    warehouse=args.warehouse,
+                    access_key=args.access_key,
+                    secret_key=args.secret_key,
+                    region=args.region,
+                    catalog_name=args.catalog_name,
+                    namespace=args.namespace,
+                    table=args.table,
+                    rest_path=args.rest_path or "/iceberg",
+                    rest_signing_name=args.rest_signing_name or "s3",
+                    pyiceberg_version=args.pyiceberg_version,
+                    spark_version=args.spark_version,
+                    iceberg_version=args.iceberg_version,
+                    scala_version=args.scala_version,
+                    cleanup=args.cleanup,
                 )
             },
             output,

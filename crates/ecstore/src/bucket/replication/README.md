@@ -12,7 +12,7 @@ and lifecycle/heal scheduling paths.
 | `config.rs` | Replication config helpers, rule matching, and tag filtering. | Uses replication-local tagging boundary and S3 DTOs directly. |
 | `datatypes.rs` | Replication status and operation DTOs. | Publicly re-exported through the ECStore replication facade. |
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, config storage, object API, runtime sources, notification state, and storage-api object IO contracts. |
-| `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on bucket target clients, metadata/versioning systems, ECStore object readers/writers, disk paths, runtime sources, notification events, bandwidth reader wrapping, and SetDisks lock timing. |
+| `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls through the replication target boundary, metadata/versioning systems, ECStore object readers/writers, disk paths, runtime sources, notification events, bandwidth reader wrapping, and SetDisks lock timing. |
 | `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources and owns shared replication pool/stat state. |
 | `rule.rs` | Rule evaluation helpers for object replication options. | Depends on ECStore replication object option types. |
 | `mod.rs` | Compatibility re-export facade for the current ECStore owner. | Must stay stable until downstream scanner, lifecycle, heal, and metrics paths compile through replacement contracts. |
@@ -22,7 +22,8 @@ and lifecycle/heal scheduling paths.
 | Contract | Responsibility | Current dependency to remove |
 |---|---|---|
 | `ReplicationStorage` | Object read/write/delete, object walk, metadata update, and target object IO. | Direct ECStore object API and storage-api object IO coupling in worker paths. |
-| `ReplicationMetadataStore` | Replication config, bucket targets, MRF/resync state, target reset headers, and status persistence. | Direct bucket target sys, metadata sys, versioning sys, config storage, and file metadata imports. |
+| `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Direct metadata sys, versioning sys, config storage, and file metadata imports. |
+| `ReplicationTargetStore` | Bucket target listing, target client lookup, target offline checks, and target operation option types. | Bucket target sys access and target operation types are concentrated in `replication_target_boundary.rs`. |
 | `ReplicationRuntime` | Worker pool, queue sizing, stats, bucket monitor, local node identity, cancellation, and admission state. | Direct runtime source/global access and shared replication pool/stat state. |
 | `ReplicationBandwidthLimiter` | Target reader wrapping for replication bandwidth accounting and throttling. | Direct bucket bandwidth reader imports from resyncer paths. |
 | `ReplicationEventSink` | Notification and audit events for skipped, failed, pending, and completed replication operations. | Direct event notification service calls from worker code. |

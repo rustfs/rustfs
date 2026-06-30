@@ -106,8 +106,9 @@ Current coupling:
   scanner repair classification, runtime replication pool/stat handles, bucket
   monitor and bandwidth reader access through local boundaries, local node
   names, and notification events;
-- resync and delete replication paths call metadata and bucket target systems
-  directly;
+- resync and delete replication paths call metadata directly, while bucket
+  target system access and target operation types are concentrated behind the
+  replication target boundary;
 - lifecycle and heal paths schedule replication work through the current ECStore
   module;
 - global replication pool/stat initialization still lives with ECStore runtime
@@ -118,8 +119,10 @@ Required contracts before crate movement:
 - `ReplicationStorage`: keep the existing trait as the starting point, then
   split object read/write/delete, walk, and metadata update responsibilities
   only when call sites prove a narrower shape.
-- `ReplicationMetadataStore`: replication config, bucket targets, target reset
-  headers, MRF/resync state, and status persistence.
+- `ReplicationMetadataStore`: replication config, target reset headers,
+  MRF/resync state, and status persistence.
+- `ReplicationTargetStore`: bucket target listing, target client lookup,
+  target offline checks, and target operation option types.
 - `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
   node identity, cancellation, and queue sizing.
 - `ReplicationBandwidthLimiter`: target reader wrapping for replication
