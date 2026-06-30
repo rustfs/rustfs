@@ -16,7 +16,7 @@ use rustfs_config::{DEFAULT_ILM_PROCESS_TIME_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM
 use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
-    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition, TransitionStorageClass,
+    NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
 };
 use std::cmp::Ordering;
 use std::collections::HashMap;
@@ -26,6 +26,7 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::bucket::lifecycle::rule::{NoncurrentVersionTransitionOps, TransitionOps};
 use crate::object_api::ObjectInfo;
 
 pub const TRANSITION_COMPLETE: &str = "complete";
@@ -200,7 +201,7 @@ pub trait Lifecycle {
 impl Lifecycle for BucketLifecycleConfiguration {
     async fn has_transition(&self) -> bool {
         for rule in self.rules.iter() {
-            if rule.transitions.is_some() {
+            if rule.transitions.as_ref().is_some_and(|transitions| !transitions.is_empty()) {
                 return true;
             }
         }
@@ -246,7 +247,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     return true;
                 }
             }
-            if rule.noncurrent_version_transitions.is_some() {
+            if rule
+                .noncurrent_version_transitions
+                .as_ref()
+                .is_some_and(|transitions| !transitions.is_empty())
+            {
                 return true;
             }
             if let Some(rule_expiration) = &rule.expiration {
@@ -267,15 +272,12 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     return true;
                 }
             }
-            if let Some(rule_transitions) = &rule.transitions {
-                let rule_transitions_0 = rule_transitions[0].clone();
-                if let Some(date1) = rule_transitions_0.date
+            if let Some(rule_transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first()) {
+                if let Some(date1) = rule_transition.date.clone()
                     && OffsetDateTime::from(date1).unix_timestamp() < OffsetDateTime::now_utc().unix_timestamp()
                 {
                     return true;
                 }
-            }
-            if rule.transitions.is_some() {
                 return true;
             }
         }
@@ -315,6 +317,16 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 && noncurrent_days < 0
             {
                 return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_NONCURRENT_EXPIRATION_DAYS));
+            }
+            if let Some(transitions) = &r.transitions {
+                for transition in transitions {
+                    TransitionOps::validate(transition)?;
+                }
+            }
+            if let Some(noncurrent_transitions) = &r.noncurrent_version_transitions {
+                for transition in noncurrent_transitions {
+                    NoncurrentVersionTransitionOps::validate(transition)?;
+                }
             }
             if let Some(id) = &r.id
                 && id.len() > 255
@@ -551,13 +563,16 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
 
                 if !obj.is_latest
-                    && let Some(ref noncurrent_version_transitions) = rule.noncurrent_version_transitions
-                    && let Some(ref storage_class) = noncurrent_version_transitions[0].storage_class
-                    && storage_class.as_str() != ""
+                    && let Some(noncurrent_version_transition) = rule
+                        .noncurrent_version_transitions
+                        .as_ref()
+                        .and_then(|transitions| transitions.first())
+                    && let Some(storage_class) = noncurrent_version_transition.storage_class.as_ref()
+                    && !storage_class.as_str().is_empty()
                     && !obj.delete_marker
                     && obj.transition_status != TRANSITION_COMPLETE
                 {
-                    let due = rule.noncurrent_version_transitions.as_ref().unwrap()[0].next_due(obj);
+                    let due = noncurrent_version_transition.next_due(obj);
                     if let Some(due0) = due
                         && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp())
                     {
@@ -565,12 +580,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                             action: IlmAction::TransitionVersionAction,
                             rule_id: rule.id.clone().unwrap_or_default(),
                             due,
-                            storage_class: rule.noncurrent_version_transitions.as_ref().unwrap()[0]
-                                .storage_class
-                                .clone()
-                                .unwrap()
-                                .as_str()
-                                .to_string(),
+                            storage_class: storage_class.as_str().to_string(),
                             ..Default::default()
                         });
                     }
@@ -639,9 +649,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                     }
 
                     if obj.transition_status != TRANSITION_COMPLETE
-                        && let Some(ref transitions) = rule.transitions
+                        && let Some(transition) = rule.transitions.as_ref().and_then(|transitions| transitions.first())
+                        && let Some(storage_class) = transition.storage_class.as_ref()
+                        && !storage_class.as_str().is_empty()
                     {
-                        let due = transitions[0].next_due(obj);
+                        let due = transition.next_due(obj);
                         if let Some(due0) = due
                             && (now.unix_timestamp() == 0 || now.unix_timestamp() > due0.unix_timestamp())
                         {
@@ -649,12 +661,7 @@ impl Lifecycle for BucketLifecycleConfiguration {
                                 action: IlmAction::TransitionAction,
                                 rule_id: rule.id.clone().unwrap_or_default(),
                                 due,
-                                storage_class: transitions[0]
-                                    .storage_class
-                                    .clone()
-                                    .unwrap_or_else(|| TransitionStorageClass::from_static(""))
-                                    .as_str()
-                                    .to_string(),
+                                storage_class: storage_class.as_str().to_string(),
                                 noncurrent_days: 0,
                                 newer_noncurrent_versions: 0,
                             });
@@ -962,7 +969,7 @@ impl Default for TransitionOptions {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use s3s::dto::LifecycleRuleFilter;
+    use s3s::dto::{LifecycleRuleFilter, TransitionStorageClass};
     use serial_test::serial;
     use std::sync::Arc;
     use time::macros::datetime;
@@ -1359,6 +1366,120 @@ mod tests {
 
         let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
         assert_eq!(err.to_string(), ERR_LIFECYCLE_DUPLICATE_ID);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_transition_without_storage_class() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("transition-no-storage".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: Some(1),
+                    date: None,
+                    storage_class: None,
+                }]),
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert_eq!(err.to_string(), "ERR_XML_NOT_WELL_FORMED");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_transition_without_date_or_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("transition-no-schedule".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: None,
+                prefix: None,
+                transitions: Some(vec![Transition {
+                    days: None,
+                    date: None,
+                    storage_class: Some(TransitionStorageClass::from_static("WARM")),
+                }]),
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert!(err.to_string().contains("Exactly one of Days"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn validate_rejects_noncurrent_transition_without_days() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("noncurrent-transition-no-days".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![NoncurrentVersionTransition {
+                    noncurrent_days: None,
+                    newer_noncurrent_versions: None,
+                    storage_class: Some(TransitionStorageClass::from_static("COLD")),
+                }]),
+                prefix: None,
+                transitions: None,
+            }],
+        };
+
+        let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+        assert!(err.to_string().contains("Exactly one of Days"));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn empty_transition_vectors_are_not_active_or_due() {
+        let lc = BucketLifecycleConfiguration {
+            expiry_updated_at: None,
+            rules: vec![LifecycleRule {
+                status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                expiration: None,
+                abort_incomplete_multipart_upload: None,
+                del_marker_expiration: None,
+                filter: None,
+                id: Some("empty-transition".to_string()),
+                noncurrent_version_expiration: None,
+                noncurrent_version_transitions: Some(vec![]),
+                prefix: None,
+                transitions: Some(vec![]),
+            }],
+        };
+        let opts = ObjectOpts {
+            name: "obj".to_string(),
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(1_000_000).unwrap()),
+            is_latest: true,
+            ..Default::default()
+        };
+
+        assert!(!lc.has_transition().await);
+        assert!(!lc.has_active_rules("obj"));
+        assert_eq!(lc.eval_inner(&opts, OffsetDateTime::now_utc(), 0).await.action, IlmAction::NoneAction);
     }
 
     #[tokio::test]

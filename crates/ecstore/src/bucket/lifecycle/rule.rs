@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 use super::tagging_boundary;
-use s3s::dto::{LifecycleRuleAndOperator, LifecycleRuleFilter, Tag, Transition};
+use s3s::dto::{LifecycleRuleAndOperator, LifecycleRuleFilter, NoncurrentVersionTransition, Tag, Transition};
+use time::OffsetDateTime;
 
 const _ERR_TRANSITION_INVALID_DAYS: &str = "Days must be 0 or greater when used with Transition";
 const _ERR_TRANSITION_INVALID_DATE: &str = "Date must be provided in ISO 8601 format";
@@ -80,14 +81,55 @@ pub trait TransitionOps {
     fn validate(&self) -> Result<(), std::io::Error>;
 }
 
+pub trait NoncurrentVersionTransitionOps {
+    fn validate(&self) -> Result<(), std::io::Error>;
+}
+
+fn is_midnight(date: OffsetDateTime) -> bool {
+    date.hour() == 0 && date.minute() == 0 && date.second() == 0 && date.nanosecond() == 0
+}
+
 impl TransitionOps for Transition {
     fn validate(&self) -> Result<(), std::io::Error> {
-        if self.date.is_some() && self.days.is_some_and(|d| d > 0) {
+        if self
+            .storage_class
+            .as_ref()
+            .is_none_or(|storage_class| storage_class.as_str().is_empty())
+        {
+            return Err(std::io::Error::other("ERR_XML_NOT_WELL_FORMED"));
+        }
+        if self.date.is_some() == self.days.is_some() {
             return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
         }
+        if self.days.is_some_and(|days| days < 0) {
+            return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
+        }
+        if let Some(date) = self.date.clone() {
+            let date = OffsetDateTime::from(date);
+            if date.unix_timestamp() <= 0 || !is_midnight(date) {
+                return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
+            }
+        }
+        Ok(())
+    }
+}
 
-        if self.storage_class.is_none() {
+impl NoncurrentVersionTransitionOps for NoncurrentVersionTransition {
+    fn validate(&self) -> Result<(), std::io::Error> {
+        if self
+            .storage_class
+            .as_ref()
+            .is_none_or(|storage_class| storage_class.as_str().is_empty())
+        {
             return Err(std::io::Error::other("ERR_XML_NOT_WELL_FORMED"));
+        }
+        if self.noncurrent_days.is_none() {
+            return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
+        }
+        if self.noncurrent_days.is_some_and(|days| days < 0)
+            || self.newer_noncurrent_versions.is_some_and(|versions| versions < 0)
+        {
+            return Err(std::io::Error::other(ERR_TRANSITION_INVALID));
         }
         Ok(())
     }
