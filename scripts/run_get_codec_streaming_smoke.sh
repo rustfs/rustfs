@@ -44,6 +44,8 @@ DIAGNOSTIC_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
 DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-codec}"
+DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS:-5}"
+DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS:-1}"
 SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
 COMPRESSED_FALLBACK_PROBE=false
 COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
@@ -100,6 +102,11 @@ Core options:
   --diagnostic-metrics-settle-secs <n>
                                  Seconds to wait before the after snapshot so OTLP periodic
                                  metrics can export probe counters (default: 2)
+  --diagnostic-metrics-capture-attempts <n>
+                                 Retry attempts for each direct /metrics scrape (default: 5)
+  --diagnostic-metrics-capture-retry-secs <n>
+                                 Sleep seconds between failed direct /metrics scrape attempts
+                                 (default: 1)
   --diagnostic-obs-endpoint <url>
                                  RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
   --diagnostic-obs-metric-endpoint <url>
@@ -158,6 +165,9 @@ Output:
   <out-dir>/compat_summary.csv                  when legacy and codec profiles both run
   <out-dir>/metrics_summary.csv
   <out-dir>/service_metrics_summary.csv         when --diagnostic-metrics is set
+  <out-dir>/service_metrics_round_summary.csv   per-round stage/page-fault deltas when direct --diagnostic-metrics is set
+  <out-dir>/service_metrics_stage_distribution.csv
+                                                per-round stage histogram bucket deltas when direct --diagnostic-metrics is set
   <out-dir>/service_metrics_acceptance.csv      when --diagnostic-metrics is set
   <out-dir>/fallback_probe_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
@@ -169,7 +179,11 @@ Output:
   <out-dir>/<profile>/manifest.env
   <out-dir>/<profile>/metrics_summary.csv
   <out-dir>/<profile>/service_metrics_summary.csv
+  <out-dir>/<profile>/service_metrics_round_summary.csv
+  <out-dir>/<profile>/service_metrics_stage_distribution.csv
   <out-dir>/<profile>/service-metrics/*.prom     before/after snapshots when --diagnostic-metrics is set
+  <out-dir>/<profile>/service-metrics/rounds/*.prom
+                                                  per-round snapshots when direct --diagnostic-metrics is set
   <out-dir>/<profile>/compat/compat_summary.csv
   <out-dir>/<profile>/compat/fallback_probe_summary.csv
   <out-dir>/<profile>/compat/response_headers.json
@@ -230,6 +244,8 @@ parse_args() {
       --diagnostic-prometheus-query-url) DIAGNOSTIC_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
       --diagnostic-prometheus-query) DIAGNOSTIC_PROMETHEUS_QUERY="$2"; shift 2 ;;
       --diagnostic-metrics-settle-secs) DIAGNOSTIC_METRICS_SETTLE_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-capture-attempts) DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
+      --diagnostic-metrics-capture-retry-secs) DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
       --diagnostic-obs-endpoint) DIAGNOSTIC_OBS_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
@@ -330,6 +346,8 @@ validate_args() {
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
   validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS" "--diagnostic-metrics-capture-attempts"
+  validate_non_negative_int "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS" "--diagnostic-metrics-capture-retry-secs"
   validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
   [[ -n "$DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX" ]] || die "--diagnostic-obs-service-name-prefix must not be empty"
@@ -887,6 +905,14 @@ run_bench() {
   if [[ -n "$WARP_OBJECTS" ]]; then
     cmd+=(--extra-args "--objects ${WARP_OBJECTS}")
   fi
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    cmd+=(
+      --service-metrics-url "$DIAGNOSTIC_METRICS_URL"
+      --service-metrics-dir "${profile_dir}/service-metrics/rounds"
+      --service-metrics-attempts "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS"
+      --service-metrics-retry-secs "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
+    )
+  fi
   if [[ "$DRY_RUN" == "true" ]]; then
     cmd+=(--dry-run)
   fi
@@ -1023,30 +1049,36 @@ EOF
     return 0
   fi
 
-  if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$snapshot_file"; then
-    if [[ ! -s "$snapshot_file" ]]; then
-      cat >"$status_file" <<EOF
-phase=${phase}
-status=empty_response
-url=${DIAGNOSTIC_METRICS_URL}
-EOF
-      log "WARN: captured empty service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
-      return 0
-    fi
-    cat >"$status_file" <<EOF
+  local tmp_file capture_attempt
+  tmp_file="${snapshot_file}.tmp"
+  for ((capture_attempt=1; capture_attempt<=DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+    if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$tmp_file"; then
+      if [[ -s "$tmp_file" ]]; then
+        mv "$tmp_file" "$snapshot_file"
+        cat >"$status_file" <<EOF
 phase=${phase}
 status=ok
+capture_attempt=${capture_attempt}
 url=${DIAGNOSTIC_METRICS_URL}
 EOF
-  else
-    : >"$snapshot_file"
-    cat >"$status_file" <<EOF
+        return 0
+      fi
+    fi
+
+    rm -f "$tmp_file"
+    if (( capture_attempt < DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS && DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS > 0 )); then
+      sleep "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
+    fi
+  done
+
+  : >"$snapshot_file"
+  cat >"$status_file" <<EOF
 phase=${phase}
 status=capture_failed
+capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
 url=${DIAGNOSTIC_METRICS_URL}
 EOF
-    log "WARN: failed to capture service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
-  fi
+  log "WARN: failed to capture service metrics profile=${profile} phase=${phase} attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS} url=${DIAGNOSTIC_METRICS_URL}"
 }
 
 write_profile_service_metrics_summary() {
@@ -1168,6 +1200,247 @@ with out_path.open("w", encoding="utf-8", newline="") as handle:
 PY
 }
 
+write_profile_service_metrics_round_breakdown() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local round_csv="${profile_dir}/warp/round_results.csv"
+  local round_metrics_dir="${profile_dir}/service-metrics/rounds"
+  local out_summary="${profile_dir}/service_metrics_round_summary.csv"
+  local out_distribution="${profile_dir}/service_metrics_stage_distribution.csv"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    return
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run
+EOF
+    return
+  fi
+
+  if [[ -n "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,prometheus_query,prometheus_query
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,prometheus_query,prometheus_query
+EOF
+    return
+  fi
+
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$round_csv" "$round_metrics_dir" \
+    "$out_summary" "$out_distribution" "$(diagnostic_service_name "$profile")" <<'PY'
+import csv
+import pathlib
+import re
+import sys
+
+profile, metric_prefix, round_raw, metrics_dir_raw, summary_raw, distribution_raw, service_name = sys.argv[1:]
+round_path = pathlib.Path(round_raw)
+metrics_dir = pathlib.Path(metrics_dir_raw)
+summary_path = pathlib.Path(summary_raw)
+distribution_path = pathlib.Path(distribution_raw)
+
+TARGET_STAGES = [
+    "store_reader_setup",
+    "reader_open_mmap_copy_success",
+    "reader_mmap_blocking_wait",
+    "reader_mmap_blocking_task",
+    "reader_mmap_copy_buffer",
+    "reader_mmap_map",
+    "body_build",
+    "body_memory_blob",
+    "response_handoff",
+]
+DISTRIBUTION_STAGES = {
+    "reader_mmap_blocking_wait",
+    "reader_mmap_blocking_task",
+    "reader_mmap_copy_buffer",
+    "reader_open_mmap_copy_success",
+}
+LINE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'(?:\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)?\s*$'
+)
+
+
+def snapshot_token(tool, size, round_id, attempt):
+    safe_size = re.sub(r"[^A-Za-z0-9_.-]", "_", size)
+    return f"{tool}_{safe_size}_r{round_id}_a{attempt}"
+
+
+def status_for(path):
+    if not path.exists():
+        return "missing"
+    values = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in raw:
+            key, value = raw.split("=", 1)
+            values[key] = value
+    return values.get("status", "unknown")
+
+
+def label_value(labels, key):
+    match = re.search(rf'(?:^|,){re.escape(key)}="((?:\\.|[^"\\])*)"', labels)
+    if match is None:
+        return ""
+    return match.group(1).replace(r'\"', '"').replace(r"\\", "\\")
+
+
+def read_metrics(path):
+    rows = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return rows
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        match = LINE.match(raw)
+        if match is None:
+            continue
+        metric, labels, value = match.groups()
+        if not metric.startswith(metric_prefix):
+            continue
+        labels = labels or ""
+        if service_name and f'service_name="{service_name}"' not in labels \
+                and f'service.name="{service_name}"' not in labels:
+            continue
+        rows[(metric, labels)] = float(value)
+    return rows
+
+
+def metric_delta(before, after, metric_name, stage, suffix):
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != f"{metric_name}_{suffix}":
+            continue
+        if label_value(labels, "stage") != stage:
+            continue
+        total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return total
+
+
+def fault_delta(before, after, kind):
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != "rustfs_io_get_object_mmap_page_faults_total":
+            continue
+        if label_value(labels, "stage") != "reader_mmap_copy_buffer":
+            continue
+        if label_value(labels, "kind") != kind:
+            continue
+        total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return total
+
+
+with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
+        distribution_path.open("w", encoding="utf-8", newline="") as distribution_handle:
+    summary_writer = csv.writer(summary_handle)
+    distribution_writer = csv.writer(distribution_handle)
+    summary_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "stage",
+        "count_delta", "sum_delta", "avg_ms", "minor_fault_delta", "major_fault_delta",
+        "minor_faults_per_call", "major_faults_per_call", "before_status", "after_status",
+    ])
+    distribution_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "path", "stage",
+        "le", "bucket_delta", "before_status", "after_status",
+    ])
+
+    if not round_path.exists() or not metrics_dir.exists():
+        summary_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "missing", "missing",
+        ])
+        distribution_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "missing", "missing",
+        ])
+        raise SystemExit(0)
+
+    for round_row in csv.DictReader(round_path.open(encoding="utf-8", newline="")):
+        size = round_row["size"]
+        tool = round_row["tool"]
+        round_id = round_row["round"]
+        attempt = round_row["attempt"]
+        round_status = round_row["status"]
+        token = snapshot_token(tool, size, round_id, attempt)
+        before_path = metrics_dir / f"{token}_before.prom"
+        after_path = metrics_dir / f"{token}_after.prom"
+        before_status = status_for(metrics_dir / f"{token}_before.status")
+        after_status = status_for(metrics_dir / f"{token}_after.status")
+        before = read_metrics(before_path)
+        after = read_metrics(after_path)
+
+        minor_faults = fault_delta(before, after, "minor")
+        major_faults = fault_delta(before, after, "major")
+        for stage in TARGET_STAGES:
+            count_delta = metric_delta(before, after, "rustfs_io_get_object_stage_duration_seconds", stage, "count")
+            sum_delta = metric_delta(before, after, "rustfs_io_get_object_stage_duration_seconds", stage, "sum")
+            avg_ms = (sum_delta / count_delta * 1000.0) if count_delta else 0.0
+            stage_minor_faults = minor_faults if stage == "reader_mmap_copy_buffer" else 0.0
+            stage_major_faults = major_faults if stage == "reader_mmap_copy_buffer" else 0.0
+            summary_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                stage,
+                f"{count_delta:.12g}",
+                f"{sum_delta:.12g}",
+                f"{avg_ms:.6f}",
+                f"{stage_minor_faults:.12g}",
+                f"{stage_major_faults:.12g}",
+                f"{(stage_minor_faults / count_delta) if count_delta else 0.0:.6f}",
+                f"{(stage_major_faults / count_delta) if count_delta else 0.0:.6f}",
+                before_status,
+                after_status,
+            ])
+
+        for metric, labels in sorted(set(before) | set(after)):
+            if metric != "rustfs_io_get_object_stage_duration_seconds_bucket":
+                continue
+            stage = label_value(labels, "stage")
+            if stage not in DISTRIBUTION_STAGES:
+                continue
+            bucket_delta = after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+            if bucket_delta == 0:
+                continue
+            distribution_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                label_value(labels, "path"),
+                stage,
+                label_value(labels, "le"),
+                f"{bucket_delta:.12g}",
+                before_status,
+                after_status,
+            ])
+PY
+}
+
 write_root_service_metrics_summary() {
   local out_csv="${OUT_DIR}/service_metrics_summary.csv"
   local profile summary wrote_header=false
@@ -1188,6 +1461,32 @@ write_root_service_metrics_summary() {
     cat >"$out_csv" <<'EOF'
 profile,status,metric,labels,before,after,delta,classification
 N/A,missing,N/A,N/A,N/A,N/A,N/A,no_profile_service_metrics_summary
+EOF
+  fi
+}
+
+write_root_profile_csv() {
+  local basename="$1"
+  shift
+  local out_csv="${OUT_DIR}/${basename}"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/${basename}"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,status,note
+N/A,missing,no_profile_csv
 EOF
   fi
 }
@@ -2781,13 +3080,27 @@ write_root_cpu_rss_notes() {
 
 write_raw_output_paths() {
   local out_file="${OUT_DIR}/raw_output_paths.txt"
-  {
-    for profile_dir in "${OUT_DIR}"/*; do
-      [[ -d "$profile_dir" ]] || continue
-      if [[ -d "${profile_dir}/warp/logs" ]]; then
-        find "${profile_dir}/warp/logs" -type f | sort
-      fi
-    done
+	  {
+	    find "$OUT_DIR" -maxdepth 1 -type f \
+	      \( -name 'metrics_summary.csv' \
+	        -o -name 'service_metrics_summary.csv' \
+	        -o -name 'service_metrics_round_summary.csv' \
+	        -o -name 'service_metrics_stage_distribution.csv' \
+	        -o -name 'service_metrics_acceptance.csv' \) | sort
+	    for profile_dir in "${OUT_DIR}"/*; do
+	      [[ -d "$profile_dir" ]] || continue
+	      find "$profile_dir" -maxdepth 1 -type f \
+	        \( -name 'metrics_summary.csv' \
+	          -o -name 'service_metrics_summary.csv' \
+	          -o -name 'service_metrics_round_summary.csv' \
+	          -o -name 'service_metrics_stage_distribution.csv' \) | sort
+	      if [[ -d "${profile_dir}/service-metrics" ]]; then
+	        find "${profile_dir}/service-metrics" -type f | sort
+	      fi
+	      if [[ -d "${profile_dir}/warp/logs" ]]; then
+	        find "${profile_dir}/warp/logs" -type f | sort
+	      fi
+	    done
   } >"$out_file"
 }
 
@@ -2975,12 +3288,15 @@ run_profile() {
   fi
   capture_service_metrics_snapshot "$profile" after
   write_profile_service_metrics_summary "$profile"
+  write_profile_service_metrics_round_breakdown "$profile"
   stop_server
   write_profile_cpu_rss_notes "$profile"
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
   log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
   log "Service metrics summary: ${OUT_DIR}/${profile}/service_metrics_summary.csv"
+  log "Service metrics round summary: ${OUT_DIR}/${profile}/service_metrics_round_summary.csv"
+  log "Service metrics stage distribution: ${OUT_DIR}/${profile}/service_metrics_stage_distribution.csv"
   log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
@@ -3046,6 +3362,8 @@ main() {
 
   write_root_metrics_summary "${profiles[@]}"
   write_root_service_metrics_summary "${profiles[@]}"
+  write_root_profile_csv service_metrics_round_summary.csv "${profiles[@]}"
+  write_root_profile_csv service_metrics_stage_distribution.csv "${profiles[@]}"
   write_service_metrics_acceptance
   write_root_compat_summary "${profiles[@]}"
   write_root_fallback_probe_summary "${profiles[@]}"

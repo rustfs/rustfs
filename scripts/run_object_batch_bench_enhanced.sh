@@ -38,6 +38,12 @@ COOLDOWN_SECS=0
 BASELINE_CSV=""
 EXTRA_ARGS=()
 FAILED_FINAL_ROUNDS=0
+SERVICE_METRICS_URL=""
+SERVICE_METRICS_DIR=""
+SERVICE_METRICS_CAPTURE_ATTEMPTS=3
+SERVICE_METRICS_CAPTURE_RETRY_SECS=1
+SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
+SERVICE_METRICS_MAX_TIME_SECS=5
 
 usage() {
   cat <<'USAGE'
@@ -77,11 +83,16 @@ Enhanced options:
   --round-cooldown-secs        Compatibility alias for --cooldown-secs
   --baseline-csv               Baseline median CSV to compare
   --extra-args                 Extra args appended to tool command, quoted as one string
+  --service-metrics-url        Optional Prometheus scrape URL captured before/after each round attempt
+  --service-metrics-dir        Output directory for per-round service metric snapshots
+  --service-metrics-attempts   Capture attempts for each snapshot (default: 3)
+  --service-metrics-retry-secs Sleep seconds between failed capture attempts (default: 1)
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
   median_summary.csv           Median metrics per object size
   baseline_compare.csv         Delta vs baseline (if --baseline-csv is set)
+  <service-metrics-dir>/*.prom  Optional per-round service metric snapshots
 
 Example:
   scripts/run_object_batch_bench_enhanced.sh \
@@ -134,6 +145,10 @@ parse_args() {
       --cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
+      --service-metrics-url) SERVICE_METRICS_URL="$2"; shift 2 ;;
+      --service-metrics-dir) SERVICE_METRICS_DIR="$2"; shift 2 ;;
+      --service-metrics-attempts) SERVICE_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
+      --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -193,6 +208,12 @@ validate_args() {
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_positive_int "$RETRY_SLEEP_SECS" "--retry-sleep-secs"
   validate_nonnegative_int "$COOLDOWN_SECS" "--cooldown-secs"
+  validate_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" "--service-metrics-attempts"
+  validate_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" "--service-metrics-retry-secs"
+  if [[ -n "$SERVICE_METRICS_URL" && -z "$SERVICE_METRICS_DIR" ]]; then
+    echo "ERROR: --service-metrics-dir is required when --service-metrics-url is set" >&2
+    exit 1
+  fi
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
   fi
@@ -215,6 +236,9 @@ setup_output() {
     OUT_DIR="target/bench/object-batch-enhanced-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "$OUT_DIR/logs"
+  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+    mkdir -p "$SERVICE_METRICS_DIR"
+  fi
 
   ROUND_CSV="$OUT_DIR/round_results.csv"
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
@@ -334,6 +358,83 @@ extract_metrics() {
   echo "$throughput,${reqps_num:-N/A},$latency,$req_p90,$req_p99"
 }
 
+metric_snapshot_token() {
+  local size="$1"
+  local round="$2"
+  local attempt="$3"
+  local safe_size
+  safe_size="$(printf '%s' "$size" | tr -c '[:alnum:]_.-' '_')"
+  printf '%s_%s_r%s_a%s' "$TOOL" "$safe_size" "$round" "$attempt"
+}
+
+capture_round_service_metrics() {
+  local size="$1"
+  local round="$2"
+  local attempt="$3"
+  local phase="$4"
+
+  if [[ -z "$SERVICE_METRICS_URL" ]]; then
+    return 0
+  fi
+
+  local token snapshot_file status_file tmp_file capture_attempt
+  token="$(metric_snapshot_token "$size" "$round" "$attempt")"
+  snapshot_file="${SERVICE_METRICS_DIR}/${token}_${phase}.prom"
+  status_file="${SERVICE_METRICS_DIR}/${token}_${phase}.status"
+  tmp_file="${snapshot_file}.tmp"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+status=not_run_dry_run
+url=${SERVICE_METRICS_URL}
+EOF
+    return 0
+  fi
+
+  for ((capture_attempt=1; capture_attempt<=SERVICE_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+    if curl -fsS --noproxy '*' \
+      --connect-timeout "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" \
+      --max-time "$SERVICE_METRICS_MAX_TIME_SECS" \
+      "$SERVICE_METRICS_URL" >"$tmp_file"; then
+      if [[ -s "$tmp_file" ]]; then
+        mv "$tmp_file" "$snapshot_file"
+        cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+status=ok
+capture_attempt=${capture_attempt}
+url=${SERVICE_METRICS_URL}
+EOF
+        return 0
+      fi
+    fi
+
+    rm -f "$tmp_file"
+    if (( capture_attempt < SERVICE_METRICS_CAPTURE_ATTEMPTS && SERVICE_METRICS_CAPTURE_RETRY_SECS > 0 )); then
+      sleep "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
+    fi
+  done
+
+  : >"$snapshot_file"
+  cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+status=capture_failed
+capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
+url=${SERVICE_METRICS_URL}
+EOF
+  echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase} url=${SERVICE_METRICS_URL}" >&2
+}
+
 median_from_numbers() {
   local values="$1"
   local count
@@ -364,6 +465,7 @@ run_one_attempt() {
   local status="ok"
   local exit_code=0
   local started_at_utc finished_at_utc
+  capture_round_service_metrics "$size" "$round" "$attempt" before
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
@@ -432,6 +534,7 @@ run_one_attempt() {
     fi
   fi
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  capture_round_service_metrics "$size" "$round" "$attempt" after
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms
   if [[ "$DRY_RUN" == "true" ]]; then
