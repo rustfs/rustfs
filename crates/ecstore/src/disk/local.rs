@@ -2966,7 +2966,8 @@ impl DiskAPI for LocalDisk {
         length: usize,
         metrics: Option<MmapCopyStageMetrics>,
     ) -> Result<Bytes> {
-        let metrics_enabled = metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+        let metrics = metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+        let metrics_enabled = metrics.is_some();
 
         let metadata_validate_start = metrics_enabled.then(std::time::Instant::now);
         let Some(end_offset) = offset.checked_add(length) else {

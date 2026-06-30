@@ -1386,6 +1386,7 @@ async fn create_data_block_bitrot_readers(
     let mut setup = BitrotReaderSetup::new(total_shards);
     let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
     let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+    let reader_stage_metrics = stage_metrics_enabled.then_some(DIRECT_MEMORY_BITROT_READER_STAGE_METRICS);
 
     rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), BitrotReaderSetupMode::ReadQuorum.as_str());
 
@@ -1406,7 +1407,7 @@ async fn create_data_block_bitrot_readers(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-            Some(DIRECT_MEMORY_BITROT_READER_STAGE_METRICS),
+            reader_stage_metrics,
         );
     }
     record_get_stage_duration_if_enabled(GET_OBJECT_PATH_DIRECT_MEMORY, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
@@ -1431,6 +1432,9 @@ async fn create_data_block_bitrot_readers(
         GET_STAGE_READER_SETUP_DROP_PENDING,
         drop_pending_stage_start,
     );
+
+    // The direct-memory path only consumes the data shard readers. If one of
+    // them is missing, the caller falls back to the regular GET path.
     record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup);
 
     setup

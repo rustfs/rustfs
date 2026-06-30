@@ -216,7 +216,8 @@ async fn open_disk_reader(
     use_mmap_read: bool,
     metrics_path: Option<&'static str>,
 ) -> disk::error::Result<FileReader> {
-    let stage_metrics_enabled = metrics_path.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+    let metrics_path = metrics_path.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+    let stage_metrics_enabled = metrics_path.is_some();
 
     if use_mmap_read && disk.is_local() {
         let start = stage_metrics_enabled.then(Instant::now);
@@ -423,7 +424,8 @@ async fn create_bitrot_reader_from_bytes_with_stage_metrics(
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> disk::error::Result<Option<BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>>> {
-    let stage_metrics_enabled = stage_metrics.is_some() && rustfs_io_metrics::get_stage_metrics_enabled();
+    let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+    let stage_metrics_enabled = stage_metrics.is_some();
 
     let reader_construction_start = stage_metrics_enabled.then(Instant::now);
     let (offset, length) = bitrot_encoded_range(offset, length, shard_size, checksum_algo.clone());
