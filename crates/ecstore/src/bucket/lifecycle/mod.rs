@@ -17,6 +17,7 @@ pub mod bucket_lifecycle_ops;
 mod config_boundary;
 pub mod core;
 pub mod evaluator;
+mod metadata_boundary;
 mod object_lock_boundary;
 pub use self::core as lifecycle;
 mod replication_sink;
