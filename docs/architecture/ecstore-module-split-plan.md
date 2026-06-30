@@ -57,10 +57,12 @@ Current coupling:
 - lifecycle workers and transition state read ECStore runtime sources for
   object-store handles, expiry state, transition state, tier config, deployment
   IDs, and local node names;
-- stale multipart cleanup depends on `SetDisks` internals and bucket metadata;
+- stale multipart cleanup depends on `SetDisks` internals and bucket metadata
+  through the lifecycle metadata boundary;
 - lifecycle expiry schedules bucket replication delete work directly;
 - lifecycle evaluation shares S3 DTOs, object metadata, object lock, replication
-  config, scanner metrics, notification/audit side effects, and tier services.
+  config reads through lifecycle-local boundaries, scanner metrics,
+  notification/audit side effects, and tier services.
 
 Required contracts before crate movement:
 
@@ -68,7 +70,8 @@ Required contracts before crate movement:
   cleanup, and version-aware metadata operations needed by lifecycle workers.
 - `LifecycleMetadataStore`: lifecycle, object-lock, replication, bucket
   versioning, and stale multipart metadata lookups without importing ECStore
-  implementation modules.
+  implementation modules. Current lifecycle config reads are concentrated in
+  `crates/ecstore/src/bucket/lifecycle/metadata_boundary.rs`.
 - `LifecycleRuntime`: expiry state, transition state, tier config, deployment
   ID, local node name, queue metrics, cancellation, and worker sizing.
 - `LifecycleReplicationSink`: schedule lifecycle-originated replication deletes
