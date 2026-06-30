@@ -320,39 +320,79 @@ async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationCo
     validate_replication_config_targets(&targets, config)
 }
 
-async fn remove_replication_targets_for_config(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
+async fn replication_targets_without_config_targets(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+) -> S3Result<Option<(BucketTargets, usize)>> {
     let target_arns = replication_target_arns(config);
     if target_arns.is_empty() {
-        return Ok(());
+        return Ok(None);
     }
 
     let mut targets = match metadata_sys::get_bucket_targets_config(bucket).await {
         Ok(targets) => targets,
         Err(StorageError::ConfigNotFound) => {
             BucketTargetSys::get().update_all_targets(bucket, None).await;
-            return Ok(());
+            return Ok(None);
         }
         Err(err) => return Err(ApiError::from(err).into()),
     };
 
+    let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+    if removed == 0 {
+        return Ok(None);
+    }
+
+    Ok(Some((targets, removed)))
+}
+
+fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, target_arns: &HashSet<String>) -> usize {
     let original_len = targets.targets.len();
     targets.targets.retain(|target| {
         target.target_type != BucketTargetType::ReplicationService || !target_arns.contains(target.arn.as_str())
     });
 
-    if targets.targets.len() == original_len {
-        return Ok(());
-    }
+    original_len - targets.targets.len()
+}
 
-    let removed = original_len - targets.targets.len();
+async fn write_replication_targets_after_config_delete(bucket: &str, targets: &BucketTargets, removed: usize) -> S3Result<()> {
     let json_targets = serde_json::to_vec(&targets).map_err(to_internal_error)?;
     metadata_sys::update(bucket, BUCKET_TARGETS_FILE, json_targets)
         .await
         .map_err(ApiError::from)?;
-    BucketTargetSys::get().update_all_targets(bucket, Some(&targets)).await;
+    BucketTargetSys::get().update_all_targets(bucket, Some(targets)).await;
     info!(bucket = %bucket, removed, "removed replication remote targets referenced by deleted bucket replication config");
 
     Ok(())
+}
+
+async fn restore_replication_config_after_target_cleanup_failure(
+    bucket: &str,
+    config: &ReplicationConfiguration,
+    cleanup_err: S3Error,
+) -> S3Error {
+    match serialize(config) {
+        Ok(data) => {
+            if let Err(restore_err) = metadata_sys::update(bucket, BUCKET_REPLICATION_CONFIG, data).await {
+                error!(
+                    bucket = %bucket,
+                    error = ?restore_err,
+                    cleanup_error = ?cleanup_err,
+                    "failed to restore bucket replication config after target cleanup failure"
+                );
+            }
+        }
+        Err(restore_err) => {
+            error!(
+                bucket = %bucket,
+                error = ?restore_err,
+                cleanup_error = ?cleanup_err,
+                "failed to serialize bucket replication config for restore after target cleanup failure"
+            );
+        }
+    }
+
+    cleanup_err
 }
 
 fn versioning_configuration_has_object_lock_incompatible_settings(config: &VersioningConfiguration) -> bool {
@@ -1125,14 +1165,22 @@ impl DefaultBucketUsecase {
             Err(StorageError::ConfigNotFound) => None,
             Err(err) => return Err(ApiError::from(err).into()),
         };
+        let updated_targets = if let Some(config) = replication_config.as_ref() {
+            replication_targets_without_config_targets(&bucket, config).await?
+        } else {
+            None
+        };
 
         metadata_sys::delete(&bucket, BUCKET_REPLICATION_CONFIG)
             .await
             .map_err(ApiError::from)?;
-        if let Some(config) = replication_config.as_ref()
-            && let Err(err) = remove_replication_targets_for_config(&bucket, config).await
+        if let Some((targets, removed)) = updated_targets
+            && let Err(err) = write_replication_targets_after_config_delete(&bucket, &targets, removed).await
         {
-            warn!(bucket = %bucket, error = ?err, "failed to remove replication targets referenced by deleted bucket replication config");
+            if let Some(config) = replication_config.as_ref() {
+                return Err(restore_replication_config_after_target_cleanup_failure(&bucket, config, err).await);
+            }
+            return Err(err);
         }
 
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
@@ -2420,6 +2468,45 @@ mod tests {
         };
 
         validate_replication_config_targets(&targets, &config).expect("disabled rules should not require live targets");
+    }
+
+    #[test]
+    fn remove_replication_targets_from_config_targets_only_removes_referenced_replication_targets() {
+        let removed_arn = "arn:rustfs:replication:us-east-1:removed:bucket";
+        let kept_replication_arn = "arn:rustfs:replication:us-east-1:kept:bucket";
+        let kept_ilm_arn = "arn:rustfs:ilm:us-east-1:kept:bucket";
+        let mut targets = BucketTargets {
+            targets: vec![
+                BucketTarget {
+                    arn: removed_arn.to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: kept_replication_arn.to_string(),
+                    target_type: BucketTargetType::ReplicationService,
+                    ..Default::default()
+                },
+                BucketTarget {
+                    arn: kept_ilm_arn.to_string(),
+                    target_type: BucketTargetType::IlmService,
+                    ..Default::default()
+                },
+            ],
+        };
+        let target_arns = HashSet::from([removed_arn.to_string(), kept_ilm_arn.to_string()]);
+
+        let removed = remove_replication_targets_from_config_targets(&mut targets, &target_arns);
+
+        assert_eq!(removed, 1);
+        let remaining_arns = targets
+            .targets
+            .iter()
+            .map(|target| target.arn.as_str())
+            .collect::<HashSet<_>>();
+        assert!(!remaining_arns.contains(removed_arn));
+        assert!(remaining_arns.contains(kept_replication_arn));
+        assert!(remaining_arns.contains(kept_ilm_arn));
     }
 
     #[test]
