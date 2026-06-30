@@ -3673,14 +3673,6 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        if !meta.versions.is_empty() {
-            let buf = meta.marshal_msg()?;
-            return self
-                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
-                .await;
-        }
-
-        // opts.undo_write && opts.old_data_dir.is_some_and(f)
         if let Some(old_data_dir) = opts.old_data_dir
             && opts.undo_write
         {
@@ -3690,6 +3682,13 @@ impl DiskAPI for LocalDisk {
             ]);
             let dst_path = path_join(&[file_path.as_path(), Path::new(STORAGE_FORMAT_FILE)]);
             return rename_all(&src_path, &dst_path, file_path).await;
+        }
+
+        if !meta.versions.is_empty() {
+            let buf = meta.marshal_msg()?;
+            return self
+                .write_all_meta(volume, format!("{path}{SLASH_SEPARATOR}{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
+                .await;
         }
 
         self.delete_file(&volume_dir, &xl_path, true, false).await
@@ -4075,6 +4074,85 @@ mod test {
             .expect("restored metadata should be readable");
         assert_eq!(restored_meta, old_meta);
         assert!(!object_dir.join("dir/object").join(STORAGE_FORMAT_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn test_delete_version_undo_restores_backup_when_other_versions_remain() {
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+
+        let bucket = "bucket";
+        let object = "dir/object";
+        let version_id = Uuid::parse_str("44444444-4444-4444-4444-444444444444").expect("version id should parse");
+        let other_version_id = Uuid::parse_str("77777777-7777-7777-7777-777777777777").expect("version id should parse");
+        let old_data_dir = Uuid::parse_str("55555555-5555-5555-5555-555555555555").expect("old data dir should parse");
+        let new_data_dir = Uuid::parse_str("66666666-6666-6666-6666-666666666666").expect("new data dir should parse");
+        let other_data_dir = Uuid::parse_str("88888888-8888-8888-8888-888888888888").expect("other data dir should parse");
+
+        ensure_test_volume(&disk, bucket).await;
+
+        let object_dir = dir.path().join(bucket).join("dir/object");
+        fs::create_dir_all(object_dir.join(old_data_dir.to_string()))
+            .await
+            .expect("old backup dir should be created");
+        fs::create_dir_all(object_dir.join(new_data_dir.to_string()))
+            .await
+            .expect("new data dir should be created");
+
+        let old_fi = test_file_info(object, version_id, Some(old_data_dir), None);
+        let other_fi = test_file_info(object, other_version_id, Some(other_data_dir), None);
+        let mut old_meta = FileMeta::default();
+        old_meta
+            .add_version(old_fi)
+            .expect("old metadata should accept old file info");
+        old_meta
+            .add_version(other_fi.clone())
+            .expect("old metadata should accept other file info");
+        let old_meta = old_meta.marshal_msg().expect("old metadata should encode");
+
+        let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
+        let mut new_meta = FileMeta::default();
+        new_meta
+            .add_version(new_fi.clone())
+            .expect("new metadata should accept new file info");
+        new_meta
+            .add_version(other_fi)
+            .expect("new metadata should accept other file info");
+
+        fs::write(
+            object_dir.join(old_data_dir.to_string()).join(STORAGE_FORMAT_FILE_BACKUP),
+            old_meta.clone(),
+        )
+        .await
+        .expect("old metadata backup should be written");
+        fs::write(
+            object_dir.join(STORAGE_FORMAT_FILE),
+            new_meta.marshal_msg().expect("new metadata should encode"),
+        )
+        .await
+        .expect("new metadata should be written");
+
+        disk.delete_version(
+            bucket,
+            object,
+            new_fi,
+            false,
+            DeleteOptions {
+                undo_write: true,
+                old_data_dir: Some(old_data_dir),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("undo should restore old metadata");
+
+        let restored_meta = fs::read(object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("restored metadata should be readable");
+        assert_eq!(restored_meta, old_meta);
     }
 
     #[tokio::test]
