@@ -14,6 +14,7 @@ catalog extension.
 | Label | Meaning |
 |---|---|
 | Automated | Covered by a runnable RustFS script or server test. |
+| Manual/live harness | RustFS can generate pinned client package inputs, commands, expected outputs, and CI opt-in gates for a live endpoint, but the live run is not enabled by default in CI. |
 | Generated harness | RustFS can generate client configuration or probe input, but live execution is not automated in CI. |
 | Supported | Implemented server-side and covered by focused RustFS tests. |
 | Preview / controlled | Implemented behind explicit operator action or a run-once endpoint. No automatic background claim is made. |
@@ -40,7 +41,7 @@ catalog extension.
 | Client or engine | Status | Current RustFS claim |
 |---|---|---|
 | PyIceberg | Automated | Creates namespace and table, appends rows, reloads, scans, probes metadata-location, refs, views, maintenance, diagnostics, and optional catalog-vended table credentials with an exact-prefix data-plane scope check. |
-| Spark Iceberg REST catalog | Generated harness | RustFS can generate Spark REST catalog properties and SQL for namespace creation, table creation, append, refresh, count, and cleanup. Live Spark execution and commit-conflict probing are manual validation items. |
+| Spark Iceberg REST catalog | Manual/live harness | RustFS can generate pinned Spark/Iceberg package inputs, REST catalog properties, SQL, run commands, expected `row_count=2`, and a CI opt-in gate for namespace creation, table creation, append, refresh, count, and cleanup. Live Spark execution and commit-conflict probing are still manual validation items unless explicitly enabled in the runner. |
 | Trino Iceberg REST catalog | Documented, not automated | Read-path configuration reference only. Write compatibility is not claimed. |
 | DuckDB Iceberg | Documented, not automated | Read-path reference only. Write and commit compatibility are not claimed. |
 | StarRocks Iceberg REST catalog | Documented, not automated | External catalog read-path reference only. Write compatibility is not claimed. |
@@ -187,6 +188,7 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --account-id 123456789012 \
   --table-bucket analytics \
   --print-spark-config
+python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
 python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
@@ -202,8 +204,8 @@ Acceptable wording:
 
 > RustFS includes a core Iceberg REST Catalog-based S3 Tables implementation
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
-> controlled maintenance, catalog recovery diagnostics, and generated Spark and
-> production-failure probe harnesses.
+> controlled maintenance, catalog recovery diagnostics, Spark manual/live
+> conformance input, and production-failure probe harnesses.
 
 Do not claim:
 
