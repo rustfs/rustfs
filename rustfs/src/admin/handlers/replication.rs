@@ -20,7 +20,7 @@ use crate::admin::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use crate::admin::storage_api::bucket::metadata_sys;
 use crate::admin::storage_api::bucket::metadata_sys::get_replication_config;
 use crate::admin::storage_api::bucket::replication::BucketStats;
-use crate::admin::storage_api::bucket::target::BucketTarget;
+use crate::admin::storage_api::bucket::target::{BucketTarget, BucketTargetType, Credentials as TargetCredentials, LatencyStat};
 use crate::admin::storage_api::bucket::target_sys::{BucketTargetError, BucketTargetSys};
 use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOptions};
 use crate::admin::storage_api::error::StorageError;
@@ -36,7 +36,10 @@ use rustfs_credentials::Credentials;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
+use serde::Deserialize;
 use std::collections::HashMap;
+use std::time::Duration;
+use time::OffsetDateTime;
 use tracing::{debug, error, info, warn};
 use url::Host;
 
@@ -65,6 +68,139 @@ fn map_bucket_target_error(err: BucketTargetError) -> S3Error {
             S3Error::with_message(S3ErrorCode::InvalidRequest, err.to_string())
         }
         BucketTargetError::Io(io_err) => S3Error::with_message(S3ErrorCode::InternalError, io_err.to_string()),
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTargetCredentialsRequest {
+    #[serde(rename = "accessKey")]
+    access_key: String,
+    #[serde(rename = "secretKey")]
+    secret_key: String,
+    session_token: Option<String>,
+    expiration: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl From<RemoteTargetCredentialsRequest> for TargetCredentials {
+    fn from(value: RemoteTargetCredentialsRequest) -> Self {
+        Self {
+            access_key: value.access_key,
+            secret_key: value.secret_key,
+            session_token: value.session_token,
+            expiration: value.expiration,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RemoteTargetRequest {
+    #[serde(rename = "sourcebucket", default)]
+    source_bucket: String,
+    endpoint: String,
+    credentials: RemoteTargetCredentialsRequest,
+    #[serde(rename = "targetbucket")]
+    target_bucket: String,
+    #[serde(default)]
+    secure: bool,
+    #[serde(default)]
+    path: String,
+    #[serde(default)]
+    api: String,
+    #[serde(default)]
+    arn: String,
+    #[serde(rename = "type")]
+    target_type: BucketTargetType,
+    #[serde(default)]
+    region: String,
+    #[serde(alias = "bandwidth", default)]
+    bandwidth_limit: i64,
+    #[serde(rename = "replicationSync", default)]
+    replication_sync: bool,
+    #[serde(default)]
+    storage_class: String,
+    #[serde(rename = "skipTlsVerify", default)]
+    skip_tls_verify: bool,
+    #[serde(rename = "caCertPem", default)]
+    ca_cert_pem: String,
+    #[serde(rename = "healthCheckDuration", default)]
+    health_check_duration: u64,
+    #[serde(rename = "disableProxy", default)]
+    disable_proxy: bool,
+    #[serde(rename = "resetBeforeDate", with = "time::serde::rfc3339::option", default)]
+    reset_before_date: Option<OffsetDateTime>,
+    #[serde(default)]
+    reset_id: String,
+    #[serde(rename = "totalDowntime", default)]
+    total_downtime: u64,
+    #[serde(rename = "lastOnline", with = "time::serde::rfc3339::option", default)]
+    last_online: Option<OffsetDateTime>,
+    #[serde(rename = "isOnline", default)]
+    online: bool,
+    #[serde(default)]
+    latency: LatencyStat,
+    #[serde(default)]
+    deployment_id: String,
+    #[serde(default)]
+    edge: bool,
+    #[serde(rename = "edgeSyncBeforeExpiry", default)]
+    edge_sync_before_expiry: bool,
+    #[serde(rename = "offlineCount", default)]
+    offline_count: u64,
+}
+
+impl RemoteTargetRequest {
+    fn into_bucket_target(self) -> S3Result<BucketTarget> {
+        if self.endpoint.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "endpoint is required"));
+        }
+
+        if self.target_bucket.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "targetbucket is required"));
+        }
+
+        if !self.target_type.is_valid() {
+            return Err(s3_error!(InvalidRequest, "type is invalid"));
+        }
+
+        if self.credentials.access_key.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "credentials.accessKey is required"));
+        }
+
+        if self.credentials.secret_key.trim().is_empty() {
+            return Err(s3_error!(InvalidRequest, "credentials.secretKey is required"));
+        }
+
+        Ok(BucketTarget {
+            source_bucket: self.source_bucket,
+            endpoint: self.endpoint,
+            credentials: Some(self.credentials.into()),
+            target_bucket: self.target_bucket,
+            secure: self.secure,
+            path: self.path,
+            api: self.api,
+            arn: self.arn,
+            target_type: self.target_type,
+            region: self.region,
+            bandwidth_limit: self.bandwidth_limit,
+            replication_sync: self.replication_sync,
+            storage_class: self.storage_class,
+            skip_tls_verify: self.skip_tls_verify,
+            ca_cert_pem: self.ca_cert_pem,
+            health_check_duration: Duration::from_secs(self.health_check_duration),
+            disable_proxy: self.disable_proxy,
+            reset_before_date: self.reset_before_date,
+            reset_id: self.reset_id,
+            total_downtime: Duration::from_secs(self.total_downtime),
+            last_online: self.last_online,
+            online: self.online,
+            latency: self.latency,
+            deployment_id: self.deployment_id,
+            edge: self.edge,
+            edge_sync_before_expiry: self.edge_sync_before_expiry,
+            offline_count: self.offline_count,
+        })
     }
 }
 
@@ -227,10 +363,12 @@ impl Operation for SetRemoteTargetHandler {
                 }
             };
 
-        let mut remote_target: BucketTarget = serde_json::from_slice(&body).map_err(|e| {
-            error!("Failed to parse BucketTarget from body: {}", e);
-            ApiError::other(e)
-        })?;
+        let mut remote_target = serde_json::from_slice::<RemoteTargetRequest>(&body)
+            .map_err(|e| {
+                error!("Failed to parse remote target request body: {}", e);
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid remote target request: {e}"))
+            })?
+            .into_bucket_target()?;
         validate_remote_target_tls_settings(&remote_target)?;
 
         let Ok(target_url) = remote_target.url() else {
@@ -448,9 +586,22 @@ impl Operation for RemoveRemoteTargetHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_query_params, validate_remote_target_tls_settings};
+    use super::{RemoteTargetRequest, extract_query_params, validate_remote_target_tls_settings};
     use crate::admin::storage_api::bucket::target::BucketTarget;
     use http::Uri;
+
+    fn valid_remote_target_request() -> serde_json::Value {
+        serde_json::json!({
+            "endpoint": "192.168.1.10:9000",
+            "credentials": {
+                "accessKey": "access",
+                "secretKey": "secret"
+            },
+            "targetbucket": "target",
+            "secure": true,
+            "type": "replication"
+        })
+    }
 
     #[test]
     fn test_extract_query_params_decodes_percent_encoded_values() {
@@ -511,5 +662,58 @@ mod tests {
             ..Default::default()
         })
         .expect("HTTPS targets should allow skipTlsVerify when no custom CA is configured");
+    }
+
+    #[test]
+    fn remote_target_request_rejects_unknown_fields() {
+        let mut request = valid_remote_target_request();
+        request["unexpected"] = serde_json::json!(true);
+
+        let err = serde_json::from_value::<RemoteTargetRequest>(request)
+            .expect_err("remote target request should reject unknown fields");
+
+        assert!(err.to_string().contains("unknown field"));
+    }
+
+    #[test]
+    fn remote_target_request_rejects_missing_credentials() {
+        let mut request = valid_remote_target_request();
+        request
+            .as_object_mut()
+            .expect("request should be an object")
+            .remove("credentials");
+
+        let err =
+            serde_json::from_value::<RemoteTargetRequest>(request).expect_err("remote target request should require credentials");
+
+        assert!(err.to_string().contains("missing field"));
+    }
+
+    #[test]
+    fn remote_target_request_rejects_empty_secret_key() {
+        let mut request = valid_remote_target_request();
+        request["credentials"]["secretKey"] = serde_json::json!("");
+        let request: RemoteTargetRequest =
+            serde_json::from_value(request).expect("request should deserialize before semantic validation");
+
+        let err = match request.into_bucket_target() {
+            Ok(_) => panic!("empty secret key should fail semantic validation"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains("credentials.secretKey is required"));
+    }
+
+    #[test]
+    fn remote_target_request_converts_to_bucket_target() {
+        let target = serde_json::from_value::<RemoteTargetRequest>(valid_remote_target_request())
+            .expect("request should deserialize")
+            .into_bucket_target()
+            .expect("request should pass semantic validation");
+
+        assert_eq!(target.endpoint, "192.168.1.10:9000");
+        assert_eq!(target.target_bucket, "target");
+        assert!(target.secure);
+        assert_eq!(target.credentials.expect("credentials should be present").access_key, "access");
     }
 }

@@ -82,8 +82,13 @@ use uuid::Uuid;
 
 const DEFAULT_HEALTH_CHECK_DURATION: Duration = Duration::from_secs(5);
 const DEFAULT_HEALTH_CHECK_RELOAD_DURATION: Duration = Duration::from_secs(30 * 60);
+const REDACTED_CREDENTIAL: &str = "<redacted>";
 
 pub static GLOBAL_BUCKET_TARGET_SYS: OnceLock<BucketTargetSys> = OnceLock::new();
+
+fn replication_target_versioning_enabled(versioning: Option<&BucketVersioningStatus>) -> bool {
+    matches!(versioning, Some(BucketVersioningStatus::Enabled))
+}
 
 #[derive(Debug, Clone)]
 pub struct ArnTarget {
@@ -475,7 +480,7 @@ impl BucketTargetSys {
                     error: e.to_string(),
                 })?;
 
-            if versioning.is_none() {
+            if !replication_target_versioning_enabled(versioning.as_ref()) {
                 return Err(BucketTargetError::BucketRemoteTargetNotVersioned {
                     bucket: target.target_bucket.to_string(),
                 });
@@ -1763,10 +1768,13 @@ impl fmt::Display for BucketTargetError {
             }
             BucketTargetError::RemoteTargetConnectionErr {
                 bucket,
-                access_key,
+                access_key: _,
                 error,
             } => {
-                write!(f, "Connection error for bucket: {bucket}, access key: {access_key}, error: {error}")
+                write!(
+                    f,
+                    "Connection error for bucket: {bucket}, access key: {REDACTED_CREDENTIAL}, error: {error}"
+                )
             }
             BucketTargetError::BucketReplicationSourceNotVersioned { bucket } => {
                 write!(f, "Replication source bucket not versioned: {bucket}")
@@ -1794,6 +1802,30 @@ impl Error for BucketTargetError {}
 mod tests {
     use super::*;
     use rcgen::generate_simple_self_signed;
+
+    #[test]
+    fn replication_target_versioning_enabled_requires_enabled_status() {
+        let enabled = BucketVersioningStatus::Enabled;
+        let suspended = BucketVersioningStatus::Suspended;
+
+        assert!(replication_target_versioning_enabled(Some(&enabled)));
+        assert!(!replication_target_versioning_enabled(Some(&suspended)));
+        assert!(!replication_target_versioning_enabled(None));
+    }
+
+    #[test]
+    fn remote_target_connection_error_display_redacts_access_key() {
+        let err = BucketTargetError::RemoteTargetConnectionErr {
+            bucket: "target".to_string(),
+            access_key: "sensitive-access-key".to_string(),
+            error: "connection refused".to_string(),
+        };
+        let message = err.to_string();
+
+        assert!(message.contains(REDACTED_CREDENTIAL));
+        assert!(!message.contains("sensitive-access-key"));
+        assert!(message.contains("connection refused"));
+    }
 
     #[test]
     fn build_remove_object_headers_includes_internal_version_id_for_replication_delete() {
