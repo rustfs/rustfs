@@ -21,6 +21,8 @@ pub(crate) use rustfs_ecstore::api::capacity::{
     get_total_usable_capacity as obs_get_total_usable_capacity,
     get_total_usable_capacity_free as obs_get_total_usable_capacity_free,
 };
+pub(crate) use rustfs_ecstore::api::compression::is_disk_compression_enabled as obs_is_disk_compression_enabled;
+pub(crate) use rustfs_ecstore::api::data_usage::load_compression_total_from_memory as obs_load_compression_total_from_memory;
 pub(crate) use rustfs_ecstore::api::data_usage::load_data_usage_from_backend as obs_load_data_usage_from_backend;
 pub(crate) use rustfs_ecstore::api::error::Result as ObsEcstoreResult;
 pub(crate) use rustfs_ecstore::api::runtime::{
@@ -36,7 +38,7 @@ pub(crate) mod metrics {
     pub(crate) use super::{
         ObsBucketBandwidthMonitor, ObsEcstoreResult, ObsReplicationStats, ObsStore, obs_expiry_state_handle,
         obs_get_global_bucket_monitor, obs_get_global_replication_stats, obs_get_quota_config, obs_get_total_usable_capacity,
-        obs_get_total_usable_capacity_free, obs_load_data_usage_from_backend, obs_resolve_object_store_handle,
-        obs_transition_state_handle,
+        obs_get_total_usable_capacity_free, obs_is_disk_compression_enabled, obs_load_compression_total_from_memory,
+        obs_load_data_usage_from_backend, obs_resolve_object_store_handle, obs_transition_state_handle,
     };
 }

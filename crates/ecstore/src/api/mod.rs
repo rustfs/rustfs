@@ -57,7 +57,7 @@ pub mod cluster {
 }
 
 pub mod compression {
-    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible};
+    pub use crate::io_support::compress::{MIN_DISK_COMPRESSIBLE_SIZE, is_disk_compressible, is_disk_compression_enabled};
 }
 
 pub mod config {
@@ -69,10 +69,11 @@ pub mod config {
 
 pub mod data_usage {
     pub use crate::data_usage::{
-        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, load_data_usage_from_backend,
-        record_bucket_delete_marker_memory, record_bucket_object_delete_memory, record_bucket_object_version_write_memory,
-        record_bucket_object_write_memory, refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
-        replace_bucket_usage_memory_from_info,
+        DATA_USAGE_CACHE_NAME, apply_bucket_usage_memory_overlay, init_compression_total_memory_from_backend,
+        load_compression_total_from_memory, load_data_usage_from_backend, record_bucket_delete_marker_memory,
+        record_bucket_object_delete_memory, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+        record_compression_total_memory, refresh_versioned_bucket_usage_from_object_layer, remove_bucket_usage_from_backend,
+        replace_bucket_usage_memory_from_info, store_compression_total_in_backend,
     };
 }
 

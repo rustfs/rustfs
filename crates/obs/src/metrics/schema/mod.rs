@@ -22,6 +22,7 @@ pub mod cluster_health;
 pub mod cluster_iam;
 pub mod cluster_notification;
 pub mod cluster_usage;
+pub mod compression;
 pub mod entry;
 pub mod ilm;
 pub mod node_bucket;

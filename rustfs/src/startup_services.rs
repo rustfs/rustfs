@@ -80,7 +80,7 @@ pub(crate) async fn init_startup_runtime_services(
     init_auth_integrations().await?;
     init_notification_runtime(endpoint_pools, buckets).await?;
     let enable_scanner = init_background_service_runtime(store.clone()).await?;
-    init_observability_runtime(ctx.clone()).await;
+    init_observability_runtime(store.clone(), ctx.clone()).await;
 
     Ok(StartupServiceRuntime {
         optional_runtimes,
