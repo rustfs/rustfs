@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(test)]
-use super::super::storage_api::context::ECStore;
 use super::super::storage_api::context::EndpointServerPools;
 use super::super::storage_api::context::bucket::metadata_sys::BucketMetadataSys;
 use super::super::storage_api::context::runtime::{
@@ -183,11 +181,6 @@ pub fn expiry_state() -> Arc<RwLock<ExpiryState>> {
 
 pub fn transition_state() -> Arc<TransitionState> {
     get_global_transition_state()
-}
-
-#[cfg(test)]
-pub fn object_store() -> Option<Arc<ECStore>> {
-    super::super::storage_api::context::runtime::new_object_layer_fn()
 }
 
 pub fn server_config() -> Option<Config> {

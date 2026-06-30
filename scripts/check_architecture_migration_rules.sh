@@ -338,6 +338,7 @@ RUSTFS_STORAGE_OWNER_RPC_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owne
 RUSTFS_STORAGE_OWNER_WILDCARD_IMPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_wildcard_import_hits.txt"
 RUSTFS_STORAGE_OWNER_ROOT_EXPORT_GLOB_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_root_export_glob_hits.txt"
 RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_runtime_root_export_hits.txt"
+RUSTFS_OBJECT_LAYER_FALLBACK_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_object_layer_fallback_bypass_hits.txt"
 RUSTFS_STORAGE_FACADE_DIRECT_OWNER_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_storage_facade_direct_owner_bypass_hits.txt"
 RUSTFS_STORAGE_OWNER_SSE_ROOT_EXPORT_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_sse_root_export_hits.txt"
 RUSTFS_STORAGE_OWNER_TEST_ROOT_CONSUMER_HITS_FILE="${TMP_DIR}/rustfs_storage_owner_test_root_consumer_hits.txt"
@@ -2195,6 +2196,17 @@ fi
 
 if [[ -s "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE" ]]; then
   report_failure "RustFS storage owner root must not re-export object-store resolver or raw ECStore global facades: $(paste -sd '; ' "$RUSTFS_STORAGE_OWNER_RUNTIME_ROOT_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '\bnew_object_layer_fn\b' \
+    rustfs/src \
+    --glob '*.rs' || true
+) >"$RUSTFS_OBJECT_LAYER_FALLBACK_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_OBJECT_LAYER_FALLBACK_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS AppContext/storage facades must not use the legacy object-layer fallback helper: $(paste -sd '; ' "$RUSTFS_OBJECT_LAYER_FALLBACK_BYPASS_HITS_FILE")"
 fi
 
 (

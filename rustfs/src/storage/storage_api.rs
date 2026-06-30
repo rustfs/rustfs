@@ -375,8 +375,6 @@ pub(crate) mod ecstore_event {
 }
 
 pub(crate) mod ecstore_global {
-    #[cfg(test)]
-    pub(crate) use rustfs_ecstore::api::global::new_object_layer_fn;
     pub(crate) use rustfs_ecstore::api::global::{
         get_global_bucket_monitor, get_global_deployment_id, get_global_endpoints_opt, get_global_lock_client,
         get_global_lock_clients, get_global_region, global_rustfs_port, is_dist_erasure, set_global_endpoints, set_global_region,
