@@ -12,39 +12,21 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_storage_boundary::ReplicationObjectIO;
 use crate::config::com;
 use crate::error::Result;
-use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::storage_api_contracts::{object::ObjectIO, range::HTTPRangeSpec};
-use http::HeaderMap;
 use std::sync::Arc;
 
 pub(crate) async fn read<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
 where
-    S: ObjectIO<
-            Error = crate::error::Error,
-            RangeSpec = HTTPRangeSpec,
-            HeaderMap = HeaderMap,
-            ObjectOptions = ObjectOptions,
-            ObjectInfo = ObjectInfo,
-            GetObjectReader = GetObjectReader,
-            PutObjectReader = PutObjReader,
-        >,
+    S: ReplicationObjectIO,
 {
     com::read_config(api, file).await
 }
 
 pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
 where
-    S: ObjectIO<
-            Error = crate::error::Error,
-            RangeSpec = HTTPRangeSpec,
-            HeaderMap = HeaderMap,
-            ObjectOptions = ObjectOptions,
-            ObjectInfo = ObjectInfo,
-            GetObjectReader = GetObjectReader,
-            PutObjectReader = PutObjReader,
-        >,
+    S: ReplicationObjectIO,
 {
     com::save_config(api, file, data).await
 }
