@@ -55,8 +55,10 @@ docs/heal-scanner-logging-governance.md
 docs/benchmark/rustfs-target-bench/
 docs/benchmark/*.md
 .codegraph/*
-.docker/compat/data/*
-.docker/compat/kms/*
+.docker/test/compat/data/*
+.docker/test/compat/kms/*
+reasonix.toml
+.reasonix/*
 
 # nix stuff
 result*

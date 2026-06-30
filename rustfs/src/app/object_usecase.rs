@@ -2994,8 +2994,13 @@ impl DefaultObjectUsecase {
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
-        let repoptions =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts.clone());
+        let repoptions = get_must_replicate_options(
+            &mt2,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            ReplicationType::Object,
+            opts.clone(),
+        );
         let dsc = must_replicate(&bucket, &key, repoptions).await;
 
         if dsc.replicate_any() {
@@ -3105,8 +3110,13 @@ impl DefaultObjectUsecase {
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
-        let repoptions =
-            get_must_replicate_options(&mt2, "".to_string(), ReplicationStatusType::Empty, ReplicationType::Object, opts);
+        let repoptions = get_must_replicate_options(
+            &mt2,
+            "".to_string(),
+            opts.delete_marker_replication_status(),
+            ReplicationType::Object,
+            opts,
+        );
 
         let dsc = must_replicate(&bucket, &key, repoptions).await;
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
