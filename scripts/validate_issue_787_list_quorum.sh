@@ -190,8 +190,11 @@ run_live_listing_two_page_smoke() {
 
   page1_key_count=$(extract_xml_keys "$page1" | grep -cv '^$' || true)
   token1=$(printf '%s' "$page1" | sed -n 's:.*<NextContinuationToken>\(.*\)</NextContinuationToken>.*:\1:p' | head -n 1)
-  local -a page1_keys
-  mapfile -t page1_keys < <(extract_xml_keys "$page1")
+  local -a page1_keys=()
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    page1_keys+=("$key")
+  done < <(extract_xml_keys "$page1")
 
   log_info "Mode=${mode} first page keys=${page1_key_count} duration=${page1_duration_ms}ms" | tee -a "$log_file"
 
@@ -223,9 +226,12 @@ PY)
   fi
 
   local duplicate=0
-  local dkeys=()
-  local -a page2_keys
-  mapfile -t page2_keys < <(extract_xml_keys "$page2")
+  local -a dkeys=()
+  local -a page2_keys=()
+  while IFS= read -r key; do
+    [[ -n "$key" ]] || continue
+    page2_keys+=("$key")
+  done < <(extract_xml_keys "$page2")
 
   for key in "${page2_keys[@]}"; do
     if printf '%s\n' "${page1_keys[@]}" | grep -Fx -- "$key" >/dev/null 2>&1; then
