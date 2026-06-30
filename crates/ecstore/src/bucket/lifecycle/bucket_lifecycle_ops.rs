@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::{object_lock_boundary, runtime_boundary as runtime_sources};
+use super::{metadata_boundary, object_lock_boundary, runtime_boundary as runtime_sources};
 use crate::bucket::lifecycle::bucket_lifecycle_audit::{
     LcAuditEvent, LcEventSrc, emit_non_transitioned_expiration_event, emit_transition_complete_event,
     emit_transition_failed_event, emit_transitioned_expiration_event,
@@ -26,7 +26,7 @@ use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
 use crate::bucket::lifecycle::tier_sweeper::{Jentry, delete_object_from_remote_tier_idempotent};
-use crate::bucket::{metadata_sys, metadata_sys::get_lifecycle_config, versioning_sys::BucketVersioningSys};
+use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::object_api_utils::new_getobjectreader;
 use crate::disk::error::DiskError;
 use crate::disk::{DeleteOptions, Disk, DiskAPI, RUSTFS_META_MULTIPART_BUCKET, STORAGE_FORMAT_FILE};
@@ -211,7 +211,7 @@ impl LifecycleSys {
     }
 
     pub async fn get(&self, bucket: &str) -> Option<BucketLifecycleConfiguration> {
-        match get_lifecycle_config(bucket).await {
+        match metadata_boundary::get_lifecycle_config(bucket).await {
             Ok((lc, _)) => Some(lc),
             Err(Error::ConfigNotFound) => None,
             Err(err) => {
@@ -1506,7 +1506,7 @@ async fn stale_upload_lifecycle_due(
     let bucket = metadata.get(RUSTFS_MULTIPART_BUCKET_KEY)?;
     let object = metadata.get(RUSTFS_MULTIPART_OBJECT_KEY)?;
 
-    let lifecycle = match metadata_sys::get_lifecycle_config(bucket).await {
+    let lifecycle = match metadata_boundary::get_lifecycle_config(bucket).await {
         Ok((lifecycle, _)) => lifecycle,
         Err(_) => return None,
     };
@@ -1941,11 +1941,11 @@ pub async fn enqueue_immediate_expiry(oi: &ObjectInfo, src: LcEventSrc) {
         object_infos.push(oi.clone());
     }
 
-    let lock_config = match metadata_sys::get_object_lock_config(&oi.bucket).await {
+    let lock_config = match metadata_boundary::get_object_lock_config(&oi.bucket).await {
         Ok((cfg, _)) => Some(Arc::new(cfg)),
         Err(_) => None,
     };
-    let replication = match metadata_sys::get_replication_config(&oi.bucket).await {
+    let replication = match metadata_boundary::get_replication_config(&oi.bucket).await {
         Ok((cfg, _)) if !cfg.rules.is_empty() => Some(Arc::new(replication_sink::new_replication_config(cfg))),
         _ => None,
     };
@@ -2056,14 +2056,14 @@ async fn apply_existing_object_expiry(api: Arc<ECStore>, object: &ObjectInfo, ev
 }
 
 pub async fn enqueue_expiry_for_existing_objects(api: Arc<ECStore>, bucket: &str) -> Result<(), Error> {
-    let Ok((lc, _)) = metadata_sys::get_lifecycle_config(bucket).await else {
+    let Ok((lc, _)) = metadata_boundary::get_lifecycle_config(bucket).await else {
         return Ok(());
     };
-    let lock_retention = metadata_sys::get_object_lock_config(bucket)
+    let lock_retention = metadata_boundary::get_object_lock_config(bucket)
         .await
         .ok()
         .and_then(|(cfg, _)| cfg.rule.and_then(|rule| rule.default_retention));
-    let replication_config = metadata_sys::get_replication_config(bucket).await.ok();
+    let replication_config = metadata_boundary::get_replication_config(bucket).await.ok();
     let mut marker = None;
     let mut version_marker = None;
     let src = LcEventSrc::Scanner;

@@ -132,6 +132,7 @@ STORE_API_LIFECYCLE_HELPER_DEFINITION_HITS_FILE="${TMP_DIR}/store_api_lifecycle_
 STORE_API_LIFECYCLE_HELPER_OLD_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_lifecycle_helper_old_consumer_hits.txt"
 LIFECYCLE_AUDIT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_audit_sink_bypass_hits.txt"
 LIFECYCLE_CONFIG_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_config_boundary_bypass_hits.txt"
+LIFECYCLE_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_metadata_boundary_bypass_hits.txt"
 LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_boundary_bypass_hits.txt"
 LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_lock_boundary_bypass_hits.txt"
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
@@ -852,6 +853,18 @@ fi
 
 if [[ -s "$LIFECYCLE_CONFIG_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle config persistence access must stay behind lifecycle config_boundary: $(paste -sd '; ' "$LIFECYCLE_CONFIG_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'metadata_sys::get_(lifecycle|object_lock|replication)_config|use crate::bucket::metadata_sys::get_(lifecycle|object_lock|replication)_config' \
+    crates/ecstore/src/bucket/lifecycle \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/lifecycle/metadata_boundary\.rs:' || true
+) >"$LIFECYCLE_METADATA_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$LIFECYCLE_METADATA_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle metadata config reads must stay behind lifecycle metadata_boundary: $(paste -sd '; ' "$LIFECYCLE_METADATA_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
