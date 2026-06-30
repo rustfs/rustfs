@@ -207,6 +207,7 @@ pub struct EpHealth {
     pub last_online: Option<OffsetDateTime>,
     pub last_hc_at: Option<OffsetDateTime>,
     pub offline_duration: Duration,
+    pub offline_count: u64,
     pub latency: LatencyStat,
 }
 
@@ -219,9 +220,35 @@ impl Default for EpHealth {
             last_online: None,
             last_hc_at: None,
             offline_duration: Duration::from_secs(0),
+            offline_count: 0,
             latency: LatencyStat::new(),
         }
     }
+}
+
+fn endpoint_health_key(url: &Url) -> String {
+    let host = url.host_str().unwrap_or_default();
+    match url.port() {
+        Some(port) => format!("{host}:{port}"),
+        None => host.to_string(),
+    }
+}
+
+fn update_endpoint_health(health: &mut EpHealth, online: bool, latency: Duration, now: OffsetDateTime) {
+    let prev_online = health.online;
+    health.online = online;
+    health.last_hc_at = Some(now);
+    health.latency.update(latency);
+
+    if online {
+        health.last_online = Some(now);
+        return;
+    }
+
+    if prev_online {
+        health.offline_count += 1;
+    }
+    health.offline_duration += latency;
 }
 
 #[derive(Debug, Default)]
@@ -251,9 +278,10 @@ impl BucketTargetSys {
     }
 
     pub async fn is_offline(&self, url: &Url) -> bool {
+        let key = endpoint_health_key(url);
         {
             let health_map = self.h_mutex.read().await;
-            if let Some(health) = health_map.get(url.host_str().unwrap_or("")) {
+            if let Some(health) = health_map.get(&key) {
                 return !health.online;
             }
         }
@@ -263,15 +291,16 @@ impl BucketTargetSys {
     }
 
     pub async fn mark_offline(&self, url: &Url) {
+        let key = endpoint_health_key(url);
         let mut health_map = self.h_mutex.write().await;
-        if let Some(health) = health_map.get_mut(url.host_str().unwrap_or("")) {
-            health.online = false;
+        if let Some(health) = health_map.get_mut(&key) {
+            update_endpoint_health(health, false, Duration::from_secs(0), OffsetDateTime::now_utc());
         }
     }
 
     pub async fn init_hc(&self, url: &Url) {
         let mut health_map = self.h_mutex.write().await;
-        let host = url.host_str().unwrap_or("").to_string();
+        let host = endpoint_health_key(url);
         health_map.insert(
             host.clone(),
             EpHealth {
@@ -290,51 +319,35 @@ impl BucketTargetSys {
 
             let endpoints = {
                 let health_map = self.h_mutex.read().await;
-                health_map.keys().cloned().collect::<Vec<_>>()
+                health_map
+                    .iter()
+                    .map(|(endpoint, health)| (endpoint.clone(), health.scheme.clone()))
+                    .collect::<Vec<_>>()
             };
 
-            for endpoint in endpoints {
+            for (endpoint, scheme) in endpoints {
                 // Perform health check
                 let start = Instant::now();
-                let online = self.check_endpoint_health(&endpoint).await;
+                let online = self.check_endpoint_health(&endpoint, &scheme).await;
                 let duration = start.elapsed();
 
                 {
                     let mut health_map = self.h_mutex.write().await;
                     if let Some(health) = health_map.get_mut(&endpoint) {
-                        let prev_online = health.online;
-                        health.online = online;
-                        health.last_hc_at = Some(OffsetDateTime::now_utc());
-                        health.latency.update(duration);
-
-                        if online {
-                            health.last_online = Some(OffsetDateTime::now_utc());
-                        } else if prev_online {
-                            // Just went offline
-                            health.offline_duration += duration;
-                        }
+                        update_endpoint_health(health, online, duration, OffsetDateTime::now_utc());
                     }
                 }
             }
         }
     }
 
-    async fn check_endpoint_health(&self, _endpoint: &str) -> bool {
-        true
-        // TODO: Health check
-
-        // // Simple health check implementation
-        // // In a real implementation, you would make actual HTTP requests
-        // match self
-        //     .hc_client
-        //     .get(format!("https://{}/rustfs/health/ready", endpoint))
-        //     .timeout(Duration::from_secs(3))
-        //     .send()
-        //     .await
-        // {
-        //     Ok(response) => response.status().is_success(),
-        //     Err(_) => false,
-        // }
+    async fn check_endpoint_health(&self, endpoint: &str, scheme: &str) -> bool {
+        let scheme = if scheme.is_empty() { "https" } else { scheme };
+        let url = format!("{scheme}://{endpoint}/");
+        match self.hc_client.head(url).timeout(Duration::from_secs(3)).send().await {
+            Ok(response) => response.status().as_u16() < 500,
+            Err(_) => false,
+        }
     }
 
     pub async fn health_stats(&self) -> HashMap<String, EpHealth> {
@@ -359,6 +372,7 @@ impl BucketTargetSys {
                                 avg: health.latency.avg,
                                 max: health.latency.peak,
                             };
+                            target.offline_count = health.offline_count;
                         }
                         targets.push(target);
                     }
@@ -380,6 +394,7 @@ impl BucketTargetSys {
                             avg: health.latency.avg,
                             max: health.latency.peak,
                         };
+                        target.offline_count = health.offline_count;
                     }
                     targets.push(target);
                 }
@@ -1825,6 +1840,52 @@ mod tests {
         assert!(message.contains(REDACTED_CREDENTIAL));
         assert!(!message.contains("sensitive-access-key"));
         assert!(message.contains("connection refused"));
+    }
+
+    #[test]
+    fn endpoint_health_key_preserves_explicit_port() {
+        let url = Url::parse("https://remote.example:9443").expect("url should parse");
+
+        assert_eq!(endpoint_health_key(&url), "remote.example:9443");
+    }
+
+    #[test]
+    fn update_endpoint_health_counts_offline_transitions() {
+        let mut health = EpHealth::default();
+        let now = OffsetDateTime::now_utc();
+
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+        update_endpoint_health(&mut health, true, Duration::from_millis(10), now);
+        update_endpoint_health(&mut health, false, Duration::from_millis(25), now);
+
+        assert_eq!(health.offline_count, 2);
+        assert_eq!(health.offline_duration, Duration::from_millis(75));
+        assert_eq!(health.last_online, Some(now));
+    }
+
+    #[tokio::test]
+    async fn list_targets_applies_health_stats_for_endpoint_with_port() {
+        let sys = BucketTargetSys::default();
+        let url = Url::parse("https://remote.example:9443").expect("url should parse");
+        sys.init_hc(&url).await;
+        sys.mark_offline(&url).await;
+
+        sys.targets_map.write().await.insert(
+            "bucket".to_string(),
+            vec![BucketTarget {
+                endpoint: "remote.example:9443".to_string(),
+                arn: "arn:rustfs:replication:us-east-1:bucket:id".to_string(),
+                target_type: BucketTargetType::ReplicationService,
+                ..Default::default()
+            }],
+        );
+
+        let targets = sys.list_targets("", "").await;
+
+        assert_eq!(targets.len(), 1);
+        assert!(!targets[0].online);
+        assert_eq!(targets[0].offline_count, 1);
     }
 
     #[test]
