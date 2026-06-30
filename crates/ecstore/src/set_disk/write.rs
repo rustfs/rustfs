@@ -169,7 +169,10 @@ impl SetDisks {
             let undo_results = join_all(futures).await;
             let undo_error_count = undo_results
                 .iter()
-                .filter(|result| matches!(result, Err(_)) || matches!(result, Ok(Err(_))))
+                .filter(|result| match result {
+                    Err(_) | Ok(Err(_)) => true,
+                    Ok(Ok(_)) => false,
+                })
                 .count();
             if undo_error_count > 0 {
                 warn!(
