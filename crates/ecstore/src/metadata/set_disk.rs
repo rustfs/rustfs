@@ -13,6 +13,14 @@
 // limitations under the License.
 
 use super::*;
+use rustfs_utils::http;
+
+#[derive(Clone, Copy)]
+struct FileInfoIdentityGroup {
+    hash: [u8; 32],
+    count: usize,
+    mod_time: Option<OffsetDateTime>,
+}
 
 impl SetDisks {
     pub(super) fn all_not_found_metadata(errs: &[Option<DiskError>]) -> bool {
@@ -338,6 +346,23 @@ impl SetDisks {
         (new_disk, mod_time, None)
     }
 
+    fn usable_fileinfo_count(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> (usize, bool) {
+        let mut has_read_error = false;
+        let mut usable_metadata = 0;
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() {
+                has_read_error = true;
+                continue;
+            }
+
+            if meta.is_valid() {
+                usable_metadata += 1;
+            }
+        }
+
+        (usable_metadata, has_read_error)
+    }
+
     pub(super) fn latest_fileinfo_selection_quorum(
         version_id: &str,
         parts_metadata: &[FileInfo],
@@ -349,17 +374,60 @@ impl SetDisks {
             return read_quorum;
         }
 
-        let usable_metadata = parts_metadata
-            .iter()
-            .zip(errs.iter())
-            .filter(|(meta, err)| err.is_none() && meta.is_valid())
-            .count();
+        let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
 
-        if usable_metadata >= write_quorum {
-            write_quorum
-        } else {
-            read_quorum
+        if usable_metadata < write_quorum {
+            return read_quorum;
         }
+
+        if !has_read_error {
+            return write_quorum;
+        }
+
+        let mut identity_counts = HashMap::with_capacity(usable_metadata);
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() || !meta.is_valid() {
+                continue;
+            }
+
+            let key = Self::file_info_quorum_hash(meta);
+
+            let count = identity_counts.entry(key).or_insert(0);
+            *count += 1;
+            if *count >= write_quorum {
+                return write_quorum;
+            }
+        }
+
+        read_quorum
+    }
+
+    pub(super) fn select_valid_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        version_id: &str,
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo, usize)> {
+        let selection_quorum =
+            Self::latest_fileinfo_selection_quorum(version_id, parts_metadata, errs, read_quorum, write_quorum);
+        let (usable_metadata, has_read_error) = Self::usable_fileinfo_count(parts_metadata, errs);
+
+        if version_id.is_empty()
+            && write_quorum > read_quorum
+            && has_read_error
+            && usable_metadata >= write_quorum
+            && selection_quorum == read_quorum
+        {
+            let (online_disks, fi) = Self::pick_degraded_latest_fileinfo(disks, parts_metadata, errs, read_quorum, write_quorum)?;
+            return Ok((online_disks, fi, read_quorum));
+        }
+
+        let (online_disks, mod_time, etag) = Self::list_online_disks(disks, parts_metadata, errs, selection_quorum);
+        let fi = Self::pick_valid_fileinfo(parts_metadata, mod_time, etag, selection_quorum)?;
+
+        Ok((online_disks, fi, selection_quorum))
     }
 
     pub(super) fn pick_valid_fileinfo(
@@ -371,50 +439,269 @@ impl SetDisks {
         Self::find_file_info_in_quorum(metas, &mod_time, &etag, quorum)
     }
 
+    fn update_hash_bytes(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update(value.len().to_le_bytes());
+        hasher.update(value);
+    }
+
+    fn update_hash_str(hasher: &mut Sha256, value: &str) {
+        Self::update_hash_bytes(hasher, value.as_bytes());
+    }
+
+    fn update_hash_optional_uuid(hasher: &mut Sha256, value: Option<Uuid>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.as_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_time(hasher: &mut Sha256, value: Option<OffsetDateTime>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.unix_timestamp_nanos().to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_u32(hasher: &mut Sha256, value: Option<u32>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            hasher.update(value.to_le_bytes());
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_bytes(hasher: &mut Sha256, value: Option<&Bytes>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            Self::update_hash_bytes(hasher, value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn update_hash_optional_str(hasher: &mut Sha256, value: Option<&str>) {
+        if let Some(value) = value {
+            hasher.update([1]);
+            Self::update_hash_str(hasher, value);
+        } else {
+            hasher.update([0]);
+        }
+    }
+
+    fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+        value
+            .get(..prefix.len())
+            .is_some_and(|value_prefix| value_prefix.eq_ignore_ascii_case(prefix))
+    }
+
+    fn internal_metadata_suffix(name: &str) -> Option<&str> {
+        name.get(http::RUSTFS_INTERNAL_PREFIX.len()..)
+            .filter(|_| Self::starts_with_ignore_ascii_case(name, http::RUSTFS_INTERNAL_PREFIX))
+            .or_else(|| {
+                name.get(http::MINIO_INTERNAL_PREFIX.len()..)
+                    .filter(|_| Self::starts_with_ignore_ascii_case(name, http::MINIO_INTERNAL_PREFIX))
+            })
+    }
+
+    fn is_replication_quorum_metadata_key(name: &str) -> bool {
+        if name.eq_ignore_ascii_case(http::AMZ_BUCKET_REPLICATION_STATUS) {
+            return true;
+        }
+
+        let Some(suffix) = Self::internal_metadata_suffix(name) else {
+            return false;
+        };
+
+        suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICA_STATUS)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICA_TIMESTAMP)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_STATUS)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_REPLICATION_TIMESTAMP)
+            || suffix.eq_ignore_ascii_case(http::SUFFIX_PURGESTATUS)
+            || Self::starts_with_ignore_ascii_case(suffix, http::SUFFIX_REPLICATION_RESET_ARN_PREFIX)
+    }
+
+    fn update_hash_quorum_metadata_map(hasher: &mut Sha256, entries: &HashMap<String, String>) {
+        let mut entries = entries
+            .iter()
+            .filter(|(name, _)| !Self::is_replication_quorum_metadata_key(name))
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(right.0));
+        hasher.update(entries.len().to_le_bytes());
+        for (name, value) in entries {
+            Self::update_hash_str(hasher, name);
+            Self::update_hash_str(hasher, value);
+        }
+    }
+
+    fn file_info_quorum_hash(meta: &FileInfo) -> [u8; 32] {
+        let mut hasher = Sha256::new();
+        Self::update_file_info_quorum_hash(&mut hasher, meta);
+        let digest = hasher.finalize();
+        let mut key = [0u8; 32];
+        key.copy_from_slice(digest.as_slice());
+        key
+    }
+
     fn update_file_info_quorum_hash(hasher: &mut Sha256, meta: &FileInfo) {
         hasher.update(meta.size.to_le_bytes());
-        hasher.update([meta.deleted as u8, meta.mark_deleted as u8]);
+        hasher.update([u8::from(meta.deleted), u8::from(meta.mark_deleted)]);
+        hasher.update([u8::from(meta.expire_restored)]);
+        Self::update_hash_optional_time(hasher, meta.mod_time);
+        Self::update_hash_str(hasher, &meta.transition_status);
+        Self::update_hash_str(hasher, &meta.transition_tier);
+        Self::update_hash_str(hasher, &meta.transitioned_objname);
+        Self::update_hash_optional_uuid(hasher, meta.transition_version_id);
+        Self::update_hash_optional_u32(hasher, meta.mode);
+        Self::update_hash_optional_u64(hasher, meta.written_by_version);
 
-        if let Some(version_id) = meta.version_id {
-            hasher.update(version_id.as_bytes());
-        }
+        Self::update_hash_optional_uuid(hasher, meta.version_id);
+        Self::update_hash_optional_uuid(hasher, meta.data_dir);
 
-        if let Some(data_dir) = meta.data_dir {
-            hasher.update(data_dir.as_bytes());
-        }
+        Self::update_hash_optional_bytes(hasher, meta.checksum.as_ref());
 
-        if let Some(checksum) = &meta.checksum {
-            hasher.update(checksum);
-        }
+        Self::update_hash_quorum_metadata_map(hasher, &meta.metadata);
 
+        hasher.update(meta.parts.len().to_le_bytes());
         for part in meta.parts.iter() {
-            hasher.update(format!("part.{}", part.number).as_bytes());
-            hasher.update(format!("part.{}", part.size).as_bytes());
+            hasher.update(part.number.to_le_bytes());
+            hasher.update(part.size.to_le_bytes());
             hasher.update(part.actual_size.to_le_bytes());
-            hasher.update(part.etag.as_bytes());
+            Self::update_hash_str(hasher, &part.etag);
 
-            if let Some(mod_time) = part.mod_time {
-                hasher.update(mod_time.unix_timestamp_nanos().to_le_bytes());
-            }
+            Self::update_hash_optional_time(hasher, part.mod_time);
 
-            if let Some(index) = &part.index {
-                hasher.update(index);
-            }
+            Self::update_hash_optional_bytes(hasher, part.index.as_ref());
+            Self::update_hash_optional_str(hasher, part.error.as_deref());
 
             if let Some(checksums) = &part.checksums {
                 let mut checksum_entries = checksums.iter().collect::<Vec<_>>();
                 checksum_entries.sort_by(|left, right| left.0.cmp(right.0));
+                hasher.update(checksum_entries.len().to_le_bytes());
                 for (name, value) in checksum_entries {
-                    hasher.update(name.as_bytes());
-                    hasher.update(value.as_bytes());
+                    Self::update_hash_str(hasher, name);
+                    Self::update_hash_str(hasher, value);
                 }
+            } else {
+                hasher.update(0usize.to_le_bytes());
             }
         }
 
         if !meta.deleted && meta.size != 0 {
-            hasher.update(format!("{}+{}", meta.erasure.data_blocks, meta.erasure.parity_blocks).as_bytes());
-            hasher.update(format!("{:?}", meta.erasure.distribution).as_bytes());
+            hasher.update(meta.erasure.data_blocks.to_le_bytes());
+            hasher.update(meta.erasure.parity_blocks.to_le_bytes());
+            hasher.update(meta.erasure.distribution.len().to_le_bytes());
+            for disk_index in meta.erasure.distribution.iter() {
+                hasher.update(disk_index.to_le_bytes());
+            }
         }
+    }
+
+    fn latest_fileinfo_identity_groups(parts_metadata: &[FileInfo], errs: &[Option<DiskError>]) -> Vec<FileInfoIdentityGroup> {
+        let mut groups: Vec<FileInfoIdentityGroup> = Vec::with_capacity(parts_metadata.len());
+        for (meta, err) in parts_metadata.iter().zip(errs.iter()) {
+            if err.is_some() || !meta.is_valid() {
+                continue;
+            }
+
+            let hash = Self::file_info_quorum_hash(meta);
+            if let Some(group) = groups.iter_mut().find(|group| group.hash == hash) {
+                group.count += 1;
+                continue;
+            }
+
+            groups.push(FileInfoIdentityGroup {
+                hash,
+                count: 1,
+                mod_time: meta.mod_time,
+            });
+        }
+
+        groups
+    }
+
+    fn pick_fileinfo_identity(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        hash: [u8; 32],
+        quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let mut online_disks = vec![None; disks.len()];
+        let mut selected = None;
+        let mut count = 0;
+
+        for (i, ((meta, err), disk)) in parts_metadata.iter().zip(errs.iter()).zip(disks.iter()).enumerate() {
+            if err.is_some() || !meta.is_valid() || Self::file_info_quorum_hash(meta) != hash {
+                continue;
+            }
+
+            count += 1;
+            online_disks[i].clone_from(disk);
+            if selected.is_none() {
+                selected = Some(meta.clone());
+            }
+        }
+
+        if count < quorum {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        selected
+            .map(|mut fi| {
+                fi.is_latest = fi.successor_mod_time.is_none();
+                (online_disks, fi)
+            })
+            .ok_or(DiskError::ErasureReadQuorum)
+    }
+
+    fn pick_degraded_latest_fileinfo(
+        disks: &[Option<DiskStore>],
+        parts_metadata: &[FileInfo],
+        errs: &[Option<DiskError>],
+        read_quorum: usize,
+        write_quorum: usize,
+    ) -> disk::error::Result<(Vec<Option<DiskStore>>, FileInfo)> {
+        let mut groups = Self::latest_fileinfo_identity_groups(parts_metadata, errs);
+        if groups.is_empty() {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        groups.sort_by(|left, right| right.mod_time.cmp(&left.mod_time).then_with(|| right.count.cmp(&left.count)));
+        let latest_mod_time = groups[0].mod_time;
+
+        let mut older_start = 0;
+        while older_start < groups.len() && groups[older_start].mod_time == latest_mod_time {
+            if groups[older_start].count >= write_quorum {
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, groups[older_start].hash, write_quorum);
+            }
+            older_start += 1;
+        }
+
+        if older_start > 1 {
+            return Err(DiskError::ErasureReadQuorum);
+        }
+
+        for group in groups.iter().skip(older_start) {
+            if group.count >= read_quorum {
+                return Self::pick_fileinfo_identity(disks, parts_metadata, errs, group.hash, read_quorum);
+            }
+        }
+
+        Err(DiskError::ErasureReadQuorum)
     }
 
     pub(super) fn find_file_info_in_quorum(
@@ -528,7 +815,7 @@ impl SetDisks {
                 }
 
                 let props = ObjProps {
-                    mod_time: metas[i].mod_time,
+                    successor_mod_time: metas[i].successor_mod_time,
                     num_versions: metas[i].num_versions,
                 };
 
@@ -541,9 +828,9 @@ impl SetDisks {
 
             for (val, &count) in &valid_obj_map {
                 if count >= quorum {
-                    fi.mod_time = val.mod_time;
+                    fi.successor_mod_time = val.successor_mod_time;
                     fi.num_versions = val.num_versions;
-                    fi.is_latest = val.mod_time.is_none();
+                    fi.is_latest = val.successor_mod_time.is_none();
 
                     break;
                 }

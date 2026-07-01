@@ -15,10 +15,10 @@
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::utils::check_list_objs_args;
 use crate::bucket::versioning::VersioningApi;
-use crate::cache_value::metacache_set::{ListPathRawOptions, list_path_raw};
+use crate::cache_value::metacache_set::{FallbackClaimTracker, ListPathRawOptions, list_path_raw_with_claim_tracker};
 use crate::core::sets::Sets;
 use crate::disk::error::DiskError;
-use crate::disk::{DiskInfo, DiskStore};
+use crate::disk::{DiskAPI, DiskInfo, DiskStore, WalkDirOptions};
 use crate::error::{
     Error, Result, StorageError, is_all_not_found, is_all_volume_not_found, is_err_bucket_not_found, to_object_err,
 };
@@ -36,12 +36,14 @@ use crate::store::utils::is_reserved_or_invalid_bucket;
 use futures::future::join_all;
 use rand::seq::SliceRandom;
 use rustfs_filemeta::{
-    MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry, MetadataResolutionParams,
-    merge_file_meta_versions,
+    FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntriesSortedResult, MetaCacheEntry,
+    MetacacheReader, MetadataResolutionParams, is_io_eof, merge_file_meta_versions,
 };
 use rustfs_utils::path::{self, SLASH_SEPARATOR, base_dir_from_prefix};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use tokio::io::duplex;
+use tokio::sync::OnceCell;
 use tokio::sync::broadcast::{self};
 use tokio::sync::mpsc::{self, Receiver, Sender};
 use tokio_util::sync::CancellationToken;
@@ -414,13 +416,14 @@ fn list_metadata_resolution_params(
     latest_object_quorum: usize,
     versioned: bool,
 ) -> MetadataResolutionParams {
+    let quorum = if versioned {
+        listing_quorum
+    } else {
+        latest_object_quorum.max(listing_quorum)
+    };
     let mut resolver = MetadataResolutionParams {
-        dir_quorum: listing_quorum,
-        obj_quorum: if versioned {
-            listing_quorum
-        } else {
-            latest_object_quorum.max(listing_quorum)
-        },
+        dir_quorum: quorum,
+        obj_quorum: quorum,
         bucket,
         ..Default::default()
     };
@@ -432,25 +435,529 @@ fn list_metadata_resolution_params(
     resolver
 }
 
+fn resolve_listing_entries(
+    entries: MetaCacheEntries,
+    resolver: MetadataResolutionParams,
+    enforce_write_quorum: bool,
+) -> Option<MetaCacheEntry> {
+    if enforce_write_quorum {
+        entries.resolve_with_write_quorum(resolver)
+    } else {
+        entries.resolve(resolver)
+    }
+}
+
+enum ListingEntryResolution {
+    Resolved(MetaCacheEntry),
+    NeedsSupplement(MetaCacheEntry, Option<MetaCacheEntry>),
+    Rejected,
+}
+
+#[derive(Clone)]
+struct FallbackListingEntry {
+    endpoint: String,
+    entry: MetaCacheEntry,
+}
+
+type FallbackListingEntries = HashMap<String, Vec<FallbackListingEntry>>;
+
+#[derive(Clone)]
+struct ListingSupplementOptions {
+    bucket: String,
+    path: String,
+    recursive: bool,
+    filter_prefix: Option<String>,
+    forward_to: Option<String>,
+    per_disk_limit: i32,
+    skip_total_timeout: bool,
+}
+
+struct ListingSupplement {
+    options: ListingSupplementOptions,
+    fallback_disks: Arc<Vec<DiskStore>>,
+    claim_tracker: FallbackClaimTracker,
+    entries: Option<Arc<OnceCell<FallbackListingEntries>>>,
+}
+
+impl ListingSupplement {
+    fn new(
+        options: ListingSupplementOptions,
+        fallback_disks: Arc<Vec<DiskStore>>,
+        claim_tracker: FallbackClaimTracker,
+    ) -> Arc<Self> {
+        let entries = if options.per_disk_limit > 0 {
+            Some(Arc::new(OnceCell::new()))
+        } else {
+            None
+        };
+
+        Arc::new(Self {
+            options,
+            fallback_disks,
+            claim_tracker,
+            entries,
+        })
+    }
+
+    fn is_empty(&self) -> bool {
+        self.fallback_disks.is_empty()
+    }
+
+    async fn entries_for(&self, object: &str) -> Vec<Option<MetaCacheEntry>> {
+        if self.fallback_disks.is_empty() {
+            return Vec::new();
+        }
+
+        let claimed_keys = self.claim_tracker.claimed_keys().await;
+        let Some(entries) = &self.entries else {
+            return self.read_object_entries(object, &claimed_keys).await;
+        };
+
+        let entries = entries.get_or_init(|| self.load_entries()).await;
+        let claimed_keys = self.claim_tracker.claimed_keys().await;
+        fallback_entries_for_object(entries, object, &claimed_keys)
+    }
+
+    async fn load_entries(&self) -> FallbackListingEntries {
+        let claimed_keys = self.claim_tracker.claimed_keys().await;
+        let futures = self.fallback_disks.iter().filter_map(|disk| {
+            let endpoint = disk.endpoint().to_string();
+            if claimed_keys.contains(&endpoint) {
+                return None;
+            }
+
+            Some(read_fallback_listing_disk(disk.clone(), endpoint, self.options.clone()))
+        });
+
+        let per_disk_entries = join_all(futures).await;
+        let entry_count = per_disk_entries.iter().map(Vec::len).sum();
+        let mut entries = FallbackListingEntries::with_capacity(entry_count);
+        for disk_entries in per_disk_entries {
+            for entry in disk_entries {
+                entries.entry(entry.entry.name.clone()).or_default().push(entry);
+            }
+        }
+
+        entries
+    }
+
+    async fn read_object_entries(&self, object: &str, claimed_keys: &HashSet<String>) -> Vec<Option<MetaCacheEntry>> {
+        let futures = self.fallback_disks.iter().filter_map(|disk| {
+            let endpoint = disk.endpoint().to_string();
+            if claimed_keys.contains(&endpoint) {
+                return None;
+            }
+
+            Some(read_fallback_object_disk(
+                disk.clone(),
+                endpoint,
+                self.options.bucket.clone(),
+                object.to_owned(),
+            ))
+        });
+
+        let entries = join_all(futures).await;
+        let claimed_keys = self.claim_tracker.claimed_keys().await;
+        entries
+            .into_iter()
+            .flatten()
+            .filter(|entry| !claimed_keys.contains(&entry.endpoint))
+            .map(|entry| Some(entry.entry))
+            .collect()
+    }
+}
+
+fn fallback_entries_for_object(
+    entries: &FallbackListingEntries,
+    object: &str,
+    claimed_keys: &HashSet<String>,
+) -> Vec<Option<MetaCacheEntry>> {
+    entries
+        .get(object)
+        .into_iter()
+        .flat_map(|entries| entries.iter())
+        .filter(|entry| !claimed_keys.contains(&entry.endpoint))
+        .map(|entry| Some(entry.entry.clone()))
+        .collect()
+}
+
+async fn read_fallback_listing_disk(
+    disk: DiskStore,
+    endpoint: String,
+    options: ListingSupplementOptions,
+) -> Vec<FallbackListingEntry> {
+    let (rd, mut wr) = duplex(64);
+    let walk_endpoint = endpoint.clone();
+    let walk_job = tokio::spawn(async move {
+        disk.walk_dir(
+            WalkDirOptions {
+                bucket: options.bucket,
+                base_dir: options.path,
+                recursive: options.recursive,
+                report_notfound: false,
+                filter_prefix: options.filter_prefix,
+                forward_to: options.forward_to,
+                limit: options.per_disk_limit,
+                skip_total_timeout: options.skip_total_timeout,
+                ..Default::default()
+            },
+            &mut wr,
+        )
+        .await
+    });
+
+    let mut reader = MetacacheReader::new(rd);
+    let mut entries = Vec::new();
+    let mut stream_ok = true;
+    loop {
+        match reader.peek().await {
+            Ok(Some(entry)) => {
+                entries.push(FallbackListingEntry {
+                    endpoint: endpoint.clone(),
+                    entry,
+                });
+                if let Err(err) = reader.skip(1).await {
+                    debug!(
+                        endpoint = %endpoint,
+                        error = ?err,
+                        "fallback listing supplement stream failed while advancing reader"
+                    );
+                    stream_ok = false;
+                    break;
+                }
+            }
+            Ok(None) => break,
+            Err(err) if err == rustfs_filemeta::Error::Unexpected || is_io_eof(&err) => break,
+            Err(err) => {
+                debug!(
+                    endpoint = %endpoint,
+                    error = ?err,
+                    "fallback listing supplement stream failed while reading entry"
+                );
+                stream_ok = false;
+                break;
+            }
+        }
+    }
+    drop(reader);
+
+    match walk_job.await {
+        Ok(Ok(())) if stream_ok => entries,
+        Ok(Ok(())) => Vec::new(),
+        Ok(Err(err)) => {
+            debug!(
+                endpoint = %walk_endpoint,
+                error = ?err,
+                "fallback listing supplement walk_dir failed"
+            );
+            Vec::new()
+        }
+        Err(err) => {
+            debug!(
+                endpoint = %walk_endpoint,
+                error = ?err,
+                "fallback listing supplement task failed"
+            );
+            Vec::new()
+        }
+    }
+}
+
+async fn read_fallback_object_disk(
+    disk: DiskStore,
+    endpoint: String,
+    bucket: String,
+    object: String,
+) -> Option<FallbackListingEntry> {
+    match disk.read_xl(&bucket, &object, false).await {
+        Ok(raw) if raw.buf.is_empty() => None,
+        Ok(raw) => Some(FallbackListingEntry {
+            endpoint,
+            entry: MetaCacheEntry {
+                name: object,
+                metadata: raw.buf,
+                cached: None,
+                reusable: false,
+            },
+        }),
+        Err(err) if DiskError::is_err_object_not_found(&err) || DiskError::is_err_version_not_found(&err) => None,
+        Err(err) => {
+            debug!(
+                endpoint = %endpoint,
+                bucket = %bucket,
+                object = %object,
+                error = ?err,
+                "fallback listing supplement read_xl failed"
+            );
+            None
+        }
+    }
+}
+
+fn version_requires_supplement(
+    version_required_quorum: usize,
+    reader_disks: usize,
+    selected_object_versions: usize,
+    requested_versions: usize,
+) -> bool {
+    reader_disks < version_required_quorum && (requested_versions == 0 || selected_object_versions < requested_versions)
+}
+
+fn cached_entry_needs_supplement(
+    cached: &FileMeta,
+    reader_disks: usize,
+    resolver: &MetadataResolutionParams,
+    enforce_write_quorum: bool,
+) -> bool {
+    if !enforce_write_quorum {
+        return false;
+    }
+
+    let mut selected_object_versions = 0;
+    for version in cached.versions.iter() {
+        let required_quorum = version.write_quorum(resolver.obj_quorum).max(resolver.obj_quorum);
+        if version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions) {
+            return true;
+        }
+
+        if !version.header.free_version() {
+            selected_object_versions += 1;
+        }
+        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
+            break;
+        }
+    }
+
+    false
+}
+
+fn listing_entries_supplement_target(
+    entries: &MetaCacheEntries,
+    resolver: &MetadataResolutionParams,
+    enforce_write_quorum: bool,
+) -> Option<String> {
+    if !enforce_write_quorum {
+        return None;
+    }
+
+    for entry in entries.0.iter().flatten() {
+        if entry.is_dir() {
+            continue;
+        }
+
+        let reader_disks = entries
+            .0
+            .iter()
+            .filter(|candidate| {
+                candidate
+                    .as_ref()
+                    .is_some_and(|candidate| candidate.name == entry.name && candidate.is_object())
+            })
+            .count();
+        let mut entry = entry.clone();
+        if let Ok(cached) = entry.xl_meta()
+            && cached_entry_needs_supplement(&cached, reader_disks, resolver, enforce_write_quorum)
+        {
+            return Some(entry.name);
+        }
+    }
+
+    None
+}
+
+async fn resolve_listing_entries_with_supplement(
+    entries: MetaCacheEntries,
+    resolver: MetadataResolutionParams,
+    enforce_write_quorum: bool,
+    supplement: Arc<ListingSupplement>,
+) -> Option<MetaCacheEntry> {
+    if !supplement.is_empty()
+        && let Some(object) = listing_entries_supplement_target(&entries, &resolver, enforce_write_quorum)
+    {
+        let mut candidates = entries.0;
+        candidates.extend(supplement.entries_for(&object).await);
+        return resolve_listing_entries(MetaCacheEntries(candidates), resolver, enforce_write_quorum);
+    }
+
+    resolve_listing_entries(entries, resolver, enforce_write_quorum)
+}
+
+async fn resolve_agreed_listing_entry_with_supplement(
+    entry: MetaCacheEntry,
+    reader_disks: usize,
+    resolver: MetadataResolutionParams,
+    enforce_write_quorum: bool,
+    supplement: Arc<ListingSupplement>,
+) -> Option<MetaCacheEntry> {
+    if supplement.is_empty() {
+        return None;
+    }
+
+    let mut candidates = Vec::with_capacity(reader_disks);
+    candidates.resize(reader_disks, Some(entry.clone()));
+    candidates.extend(supplement.entries_for(&entry.name).await);
+    resolve_listing_entries(MetaCacheEntries(candidates), resolver, enforce_write_quorum)
+}
+
+fn listing_entry_with_selected_versions(
+    mut entry: MetaCacheEntry,
+    meta_ver: u8,
+    data: rustfs_filemeta::InlineData,
+    selected_versions: Vec<FileMetaShallowVersion>,
+) -> Option<MetaCacheEntry> {
+    let merged_cached = FileMeta {
+        meta_ver,
+        data,
+        versions: selected_versions,
+    };
+    let metadata = merged_cached.marshal_msg().ok()?;
+
+    entry.metadata = metadata;
+    entry.cached = Some(merged_cached);
+    Some(entry)
+}
+
+fn resolve_agreed_listing_entry(
+    mut entry: MetaCacheEntry,
+    reader_disks: usize,
+    resolver: MetadataResolutionParams,
+    enforce_write_quorum: bool,
+) -> ListingEntryResolution {
+    if !enforce_write_quorum {
+        return ListingEntryResolution::Resolved(entry);
+    }
+
+    if entry.is_dir() {
+        return if reader_disks >= resolver.dir_quorum {
+            ListingEntryResolution::Resolved(entry)
+        } else {
+            ListingEntryResolution::Rejected
+        };
+    }
+
+    if reader_disks < resolver.obj_quorum {
+        return ListingEntryResolution::Rejected;
+    }
+
+    let cached = match entry.xl_meta() {
+        Ok(cached) => cached,
+        Err(_) if resolver.obj_quorum <= 1 => return ListingEntryResolution::Resolved(entry),
+        Err(_) => return ListingEntryResolution::Rejected,
+    };
+    let mut selected_versions = Vec::new();
+    let mut selected_object_versions = 0;
+    let mut first_selected_idx = None;
+    let mut needs_supplement = false;
+
+    for (idx, version) in cached.versions.iter().enumerate() {
+        let required_quorum = version.write_quorum(resolver.obj_quorum).max(resolver.obj_quorum);
+        if reader_disks < required_quorum {
+            needs_supplement |=
+                version_requires_supplement(required_quorum, reader_disks, selected_object_versions, resolver.requested_versions);
+            continue;
+        }
+
+        if first_selected_idx.is_none() {
+            first_selected_idx = Some(idx);
+        }
+        if !version.header.free_version() {
+            selected_object_versions += 1;
+        }
+        selected_versions.push(version.clone());
+
+        if resolver.requested_versions > 0 && selected_object_versions == resolver.requested_versions {
+            break;
+        }
+    }
+
+    if needs_supplement {
+        let fallback = if selected_versions.is_empty() {
+            None
+        } else if selected_versions.len() == cached.versions.len() {
+            Some(entry.clone())
+        } else {
+            listing_entry_with_selected_versions(entry.clone(), cached.meta_ver, cached.data, selected_versions)
+        };
+        return ListingEntryResolution::NeedsSupplement(entry, fallback);
+    }
+
+    if selected_versions.is_empty() {
+        return ListingEntryResolution::Rejected;
+    }
+
+    let selected_latest = first_selected_idx == Some(0)
+        && resolver.requested_versions == 1
+        && selected_versions
+            .first()
+            .is_some_and(|version| !version.header.free_version());
+    if selected_latest || selected_versions.len() == cached.versions.len() {
+        return ListingEntryResolution::Resolved(entry);
+    }
+
+    listing_entry_with_selected_versions(entry, cached.meta_ver, cached.data, selected_versions)
+        .map(ListingEntryResolution::Resolved)
+        .unwrap_or(ListingEntryResolution::Rejected)
+}
+
 fn latest_listing_object_quorum(
     listing_quorum: usize,
-    ask_disks: i32,
     drive_count: usize,
     parity_count: usize,
-    versioned: bool,
+    enforce_write_quorum: bool,
 ) -> usize {
-    if versioned || ask_disks <= 0 {
+    latest_listing_required_object_quorum(listing_quorum, drive_count, parity_count, enforce_write_quorum)
+}
+
+fn latest_listing_required_object_quorum(
+    listing_quorum: usize,
+    drive_count: usize,
+    parity_count: usize,
+    enforce_write_quorum: bool,
+) -> usize {
+    if !enforce_write_quorum {
         return listing_quorum;
     }
 
-    let asked_disks = ask_disks as usize;
-    if asked_disks < drive_count {
-        return listing_quorum;
-    }
+    write_quorum_for_drive_count(drive_count, parity_count).max(listing_quorum)
+}
 
-    write_quorum_for_drive_count(drive_count, parity_count)
-        .max(listing_quorum)
-        .min(asked_disks)
+fn enforce_latest_listing_write_quorum(strict_latest: bool, ask_disks: &str) -> bool {
+    strict_latest && !matches!(normalize_list_quorum(ask_disks), "disk" | "reduced")
+}
+
+#[cfg(test)]
+fn latest_listing_allow_agreed_objects(enforce_write_quorum: bool, reader_disks: usize, object_quorum: usize) -> bool {
+    !enforce_write_quorum || reader_disks >= object_quorum
+}
+
+fn latest_listing_raw_min_disks(listing_quorum: usize, object_quorum: usize, enforce_write_quorum: bool) -> usize {
+    if enforce_write_quorum { object_quorum } else { listing_quorum }
+}
+
+fn positive_ask_disks(ask_disks: i32) -> Option<usize> {
+    usize::try_from(ask_disks).ok().filter(|asked| *asked > 0)
+}
+
+fn listing_quorum_from_ask_disks(ask_disks: i32) -> usize {
+    positive_ask_disks(ask_disks)
+        .map(|asked| asked.div_ceil(2))
+        .unwrap_or_default()
+}
+
+fn bounded_usize_to_i32(value: usize) -> i32 {
+    i32::try_from(value).unwrap_or(i32::MAX)
+}
+
+fn clamp_ask_disks_to_available(ask_disks: i32, available_disks: usize) -> i32 {
+    ask_disks.min(bounded_usize_to_i32(available_disks))
+}
+
+fn expand_ask_disks_for_object_quorum(ask_disks: i32, available_disks: usize, object_quorum: usize) -> i32 {
+    let Some(asked_disks) = positive_ask_disks(ask_disks) else {
+        return ask_disks;
+    };
+
+    bounded_usize_to_i32(asked_disks.max(object_quorum).min(available_disks))
 }
 
 fn write_quorum_for_drive_count(drive_count: usize, parity_count: usize) -> usize {
@@ -1067,35 +1574,49 @@ impl ECStore {
                         }
                     }
 
-                    if set.set_drive_count == 4 || ask_disks > disks.len() as i32 {
-                        ask_disks = disks.len() as i32;
+                    if set.set_drive_count == 4 {
+                        ask_disks = bounded_usize_to_i32(disks.len());
+                    } else if ask_disks > bounded_usize_to_i32(disks.len()) {
+                        ask_disks = clamp_ask_disks_to_available(ask_disks, disks.len());
                     }
 
+                    let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
+                    let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
+                    let write_quorum_parity = set.default_parity_count;
+                    let required_obj_quorum = latest_listing_required_object_quorum(
+                        listing_quorum,
+                        set.set_drive_count,
+                        write_quorum_parity,
+                        enforce_write_quorum,
+                    );
+                    ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
                     let fallback_disks = {
-                        if ask_disks > 0 && disks.len() > ask_disks as usize {
+                        if let Some(asked_disks) = positive_ask_disks(ask_disks)
+                            && disks.len() > asked_disks
+                        {
                             let mut rand = rand::rng();
                             disks.shuffle(&mut rand);
-                            disks.split_off(ask_disks as usize)
+                            disks.split_off(asked_disks)
                         } else {
                             Vec::new()
                         }
                     };
+                    let fallback_disks = Arc::new(fallback_disks);
+                    let claim_tracker = FallbackClaimTracker::default();
 
-                    let listing_quorum = ((ask_disks + 1) / 2) as usize;
                     let obj_quorum = latest_listing_object_quorum(
                         listing_quorum,
-                        ask_disks,
                         set.set_drive_count,
-                        set.default_parity_count,
-                        false,
+                        write_quorum_parity,
+                        enforce_write_quorum,
                     );
+                    let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
 
-                    let resolver = MetadataResolutionParams {
-                        dir_quorum: listing_quorum,
-                        obj_quorum,
-                        bucket: bucket.to_owned(),
-                        ..Default::default()
-                    };
+                    let resolver =
+                        list_metadata_resolution_params(bucket.to_owned(), listing_quorum, obj_quorum, !opts.latest_only);
+                    let agreed_resolver = resolver.clone();
+                    let partial_resolver = resolver.clone();
+                    let reader_disks = disks.len();
 
                     let path = base_dir_from_prefix(prefix);
                     ensure_non_empty_listing_disks(bucket, &path, &disks)?;
@@ -1116,8 +1637,23 @@ impl ECStore {
 
                     let tx1 = sender.clone();
                     let tx2 = sender.clone();
+                    let supplement = ListingSupplement::new(
+                        ListingSupplementOptions {
+                            bucket: bucket.to_owned(),
+                            path: path.clone(),
+                            recursive: true,
+                            filter_prefix: Some(filter_prefix.clone()),
+                            forward_to: opts.marker.clone(),
+                            per_disk_limit: bounded_usize_to_i32(opts.limit),
+                            skip_total_timeout: false,
+                        },
+                        fallback_disks.clone(),
+                        claim_tracker.clone(),
+                    );
+                    let agreed_supplement = supplement.clone();
+                    let partial_supplement = supplement;
 
-                    list_path_raw(
+                    list_path_raw_with_claim_tracker(
                         rx_clone,
                         ListPathRawOptions {
                             disks: disks.iter().cloned().map(Some).collect(),
@@ -1127,12 +1663,37 @@ impl ECStore {
                             recursive: true,
                             filter_prefix: Some(filter_prefix),
                             forward_to: opts.marker.clone(),
-                            min_disks: listing_quorum,
-                            per_disk_limit: opts.limit as i32,
+                            min_disks: raw_min_disks,
+                            per_disk_limit: bounded_usize_to_i32(opts.limit),
                             agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                                 Box::pin({
                                     let value = tx1.clone();
+                                    let resolver = agreed_resolver.clone();
+                                    let supplement = agreed_supplement.clone();
                                     async move {
+                                        let entry = match resolve_agreed_listing_entry(
+                                            entry,
+                                            reader_disks,
+                                            resolver.clone(),
+                                            enforce_write_quorum,
+                                        ) {
+                                            ListingEntryResolution::Resolved(entry) => entry,
+                                            ListingEntryResolution::NeedsSupplement(entry, fallback) => {
+                                                let Some(entry) = resolve_agreed_listing_entry_with_supplement(
+                                                    entry,
+                                                    reader_disks,
+                                                    resolver,
+                                                    enforce_write_quorum,
+                                                    supplement,
+                                                )
+                                                .await
+                                                .or(fallback) else {
+                                                    return;
+                                                };
+                                                entry
+                                            }
+                                            ListingEntryResolution::Rejected => return,
+                                        };
                                         if entry.is_dir() {
                                             return;
                                         }
@@ -1145,9 +1706,16 @@ impl ECStore {
                             partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                                 Box::pin({
                                     let value = tx2.clone();
-                                    let resolver = resolver.clone();
+                                    let resolver = partial_resolver.clone();
+                                    let supplement = partial_supplement.clone();
                                     async move {
-                                        if let Some(entry) = entries.resolve(resolver)
+                                        if let Some(entry) = resolve_listing_entries_with_supplement(
+                                            entries,
+                                            resolver,
+                                            enforce_write_quorum,
+                                            supplement,
+                                        )
+                                        .await
                                             && let Err(err) = value.send(entry).await
                                         {
                                             error!("list_path send fail {:?}", err);
@@ -1158,6 +1726,7 @@ impl ECStore {
                             finished: None,
                             ..Default::default()
                         },
+                        claim_tracker,
                     )
                     .await
                 });
@@ -2104,27 +2673,41 @@ impl Sets {
                     }
                 }
 
-                if set.set_drive_count == 4 || ask_disks > disks.len() as i32 {
-                    ask_disks = disks.len() as i32;
+                if set.set_drive_count == 4 {
+                    ask_disks = bounded_usize_to_i32(disks.len());
+                } else if ask_disks > bounded_usize_to_i32(disks.len()) {
+                    ask_disks = clamp_ask_disks_to_available(ask_disks, disks.len());
                 }
 
-                let fallback_disks = if ask_disks > 0 && disks.len() > ask_disks as usize {
+                let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
+                let enforce_write_quorum = enforce_latest_listing_write_quorum(opts.latest_only, &opts.ask_disks);
+                let write_quorum_parity = set.default_parity_count;
+                let required_obj_quorum = latest_listing_required_object_quorum(
+                    listing_quorum,
+                    set.set_drive_count,
+                    write_quorum_parity,
+                    enforce_write_quorum,
+                );
+                ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
+                let fallback_disks = if let Some(asked_disks) = positive_ask_disks(ask_disks)
+                    && disks.len() > asked_disks
+                {
                     let mut rand = rand::rng();
                     disks.shuffle(&mut rand);
-                    disks.split_off(ask_disks as usize)
+                    disks.split_off(asked_disks)
                 } else {
                     Vec::new()
                 };
+                let fallback_disks = Arc::new(fallback_disks);
+                let claim_tracker = FallbackClaimTracker::default();
 
-                let listing_quorum = ((ask_disks + 1) / 2) as usize;
                 let obj_quorum =
-                    latest_listing_object_quorum(listing_quorum, ask_disks, set.set_drive_count, set.default_parity_count, false);
-                let resolver = MetadataResolutionParams {
-                    dir_quorum: listing_quorum,
-                    obj_quorum,
-                    bucket: bucket.to_owned(),
-                    ..Default::default()
-                };
+                    latest_listing_object_quorum(listing_quorum, set.set_drive_count, write_quorum_parity, enforce_write_quorum);
+                let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, obj_quorum, enforce_write_quorum);
+                let resolver = list_metadata_resolution_params(bucket.to_owned(), listing_quorum, obj_quorum, !opts.latest_only);
+                let agreed_resolver = resolver.clone();
+                let partial_resolver = resolver.clone();
+                let reader_disks = disks.len();
 
                 let path = base_dir_from_prefix(prefix);
                 ensure_non_empty_listing_disks(bucket, &path, &disks)?;
@@ -2140,8 +2723,23 @@ impl Sets {
 
                 let tx1 = sender.clone();
                 let tx2 = sender.clone();
+                let supplement = ListingSupplement::new(
+                    ListingSupplementOptions {
+                        bucket: bucket.to_owned(),
+                        path: path.clone(),
+                        recursive: true,
+                        filter_prefix: Some(filter_prefix.clone()),
+                        forward_to: opts.marker.clone(),
+                        per_disk_limit: bounded_usize_to_i32(opts.limit),
+                        skip_total_timeout: false,
+                    },
+                    fallback_disks.clone(),
+                    claim_tracker.clone(),
+                );
+                let agreed_supplement = supplement.clone();
+                let partial_supplement = supplement;
 
-                list_path_raw(
+                list_path_raw_with_claim_tracker(
                     rx_clone,
                     ListPathRawOptions {
                         disks: disks.iter().cloned().map(Some).collect(),
@@ -2151,12 +2749,37 @@ impl Sets {
                         recursive: true,
                         filter_prefix: Some(filter_prefix),
                         forward_to: opts.marker.clone(),
-                        min_disks: listing_quorum,
-                        per_disk_limit: opts.limit as i32,
+                        min_disks: raw_min_disks,
+                        per_disk_limit: bounded_usize_to_i32(opts.limit),
                         agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                             Box::pin({
                                 let value = tx1.clone();
+                                let resolver = agreed_resolver.clone();
+                                let supplement = agreed_supplement.clone();
                                 async move {
+                                    let entry = match resolve_agreed_listing_entry(
+                                        entry,
+                                        reader_disks,
+                                        resolver.clone(),
+                                        enforce_write_quorum,
+                                    ) {
+                                        ListingEntryResolution::Resolved(entry) => entry,
+                                        ListingEntryResolution::NeedsSupplement(entry, fallback) => {
+                                            let Some(entry) = resolve_agreed_listing_entry_with_supplement(
+                                                entry,
+                                                reader_disks,
+                                                resolver,
+                                                enforce_write_quorum,
+                                                supplement,
+                                            )
+                                            .await
+                                            .or(fallback) else {
+                                                return;
+                                            };
+                                            entry
+                                        }
+                                        ListingEntryResolution::Rejected => return,
+                                    };
                                     if entry.is_dir() {
                                         return;
                                     }
@@ -2169,9 +2792,16 @@ impl Sets {
                         partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                             Box::pin({
                                 let value = tx2.clone();
-                                let resolver = resolver.clone();
+                                let resolver = partial_resolver.clone();
+                                let supplement = partial_supplement.clone();
                                 async move {
-                                    if let Some(entry) = entries.resolve(resolver)
+                                    if let Some(entry) = resolve_listing_entries_with_supplement(
+                                        entries,
+                                        resolver,
+                                        enforce_write_quorum,
+                                        supplement,
+                                    )
+                                    .await
                                         && let Err(err) = value.send(entry).await
                                     {
                                         error!("list_path send fail {:?}", err);
@@ -2182,6 +2812,7 @@ impl Sets {
                         finished: None,
                         ..Default::default()
                     },
+                    claim_tracker,
                 )
                 .await
             });
@@ -2854,32 +3485,46 @@ impl SetDisks {
             }
         }
 
-        if self.set_drive_count == 4 || ask_disks > disks.len() as i32 {
-            ask_disks = disks.len() as i32;
+        if self.set_drive_count == 4 {
+            ask_disks = bounded_usize_to_i32(disks.len());
+        } else if ask_disks > bounded_usize_to_i32(disks.len()) {
+            ask_disks = clamp_ask_disks_to_available(ask_disks, disks.len());
         }
 
-        let listing_quorum = ((ask_disks + 1) / 2) as usize;
+        let listing_quorum = listing_quorum_from_ask_disks(ask_disks);
         ensure_non_empty_listing_disks(&opts.bucket, &opts.base_dir, &disks)?;
 
+        let enforce_write_quorum = enforce_latest_listing_write_quorum(!opts.versioned, &opts.ask_disks);
+        let write_quorum_parity = self.default_parity_count;
+        let required_obj_quorum = latest_listing_required_object_quorum(
+            listing_quorum,
+            self.set_drive_count,
+            write_quorum_parity,
+            enforce_write_quorum,
+        );
+        ask_disks = expand_ask_disks_for_object_quorum(ask_disks, disks.len(), required_obj_quorum);
         let mut fallback_disks = Vec::new();
 
-        if ask_disks > 0 && disks.len() > ask_disks as usize {
+        if let Some(asked_disks) = positive_ask_disks(ask_disks)
+            && disks.len() > asked_disks
+        {
             let mut rand = rand::rng();
             disks.shuffle(&mut rand);
 
-            fallback_disks = disks.split_off(ask_disks as usize);
+            fallback_disks = disks.split_off(asked_disks);
         }
+        let fallback_disks = Arc::new(fallback_disks);
+        let claim_tracker = FallbackClaimTracker::default();
 
         let bucket = opts.bucket.clone();
         let base_dir = opts.base_dir.clone();
-        let latest_object_quorum = latest_listing_object_quorum(
-            listing_quorum,
-            ask_disks,
-            self.set_drive_count,
-            self.default_parity_count,
-            opts.versioned,
-        );
+        let latest_object_quorum =
+            latest_listing_object_quorum(listing_quorum, self.set_drive_count, write_quorum_parity, enforce_write_quorum);
+        let raw_min_disks = latest_listing_raw_min_disks(listing_quorum, latest_object_quorum, enforce_write_quorum);
         let resolver = list_metadata_resolution_params(bucket.clone(), listing_quorum, latest_object_quorum, opts.versioned);
+        let agreed_resolver = resolver.clone();
+        let partial_resolver = resolver.clone();
+        let reader_disks = disks.len();
 
         debug!(
             bucket = %bucket,
@@ -2888,6 +3533,7 @@ impl SetDisks {
             asked_disks = ask_disks,
             listing_quorum = listing_quorum,
             latest_object_quorum = latest_object_quorum,
+            raw_min_disks = raw_min_disks,
             fallback_disks = fallback_disks.len(),
             limit = opts.limit,
             stop_disk_at_limit = opts.stop_disk_at_limit,
@@ -2906,8 +3552,23 @@ impl SetDisks {
         let tx2 = sender.clone();
         let cancel_for_send1 = rx.clone();
         let cancel_for_send2 = rx.clone();
+        let supplement = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: bucket.clone(),
+                path: opts.base_dir.clone(),
+                recursive: opts.recursive,
+                filter_prefix: opts.filter_prefix.clone(),
+                forward_to: opts.marker.clone(),
+                per_disk_limit: limit,
+                skip_total_timeout: false,
+            },
+            fallback_disks.clone(),
+            claim_tracker.clone(),
+        );
+        let agreed_supplement = supplement.clone();
+        let partial_supplement = supplement;
 
-        let result = list_path_raw(
+        let result = list_path_raw_with_claim_tracker(
             rx,
             ListPathRawOptions {
                 disks: disks.iter().cloned().map(Some).collect(),
@@ -2917,13 +3578,35 @@ impl SetDisks {
                 recursive: opts.recursive,
                 filter_prefix: opts.filter_prefix,
                 forward_to: opts.marker,
-                min_disks: listing_quorum,
+                min_disks: raw_min_disks,
                 per_disk_limit: limit,
                 agreed: Some(Box::new(move |entry: MetaCacheEntry| {
                     Box::pin({
                         let value = tx1.clone();
                         let cancel_token = cancel_for_send1.clone();
+                        let resolver = agreed_resolver.clone();
+                        let supplement = agreed_supplement.clone();
                         async move {
+                            let entry =
+                                match resolve_agreed_listing_entry(entry, reader_disks, resolver.clone(), enforce_write_quorum) {
+                                    ListingEntryResolution::Resolved(entry) => entry,
+                                    ListingEntryResolution::NeedsSupplement(entry, fallback) => {
+                                        let Some(entry) = resolve_agreed_listing_entry_with_supplement(
+                                            entry,
+                                            reader_disks,
+                                            resolver,
+                                            enforce_write_quorum,
+                                            supplement,
+                                        )
+                                        .await
+                                        .or(fallback) else {
+                                            return;
+                                        };
+                                        entry
+                                    }
+                                    ListingEntryResolution::Rejected => return,
+                                };
+
                             if let Err(err) = value.send(entry).await
                                 && !cancel_token.is_cancelled()
                             {
@@ -2935,10 +3618,12 @@ impl SetDisks {
                 partial: Some(Box::new(move |entries: MetaCacheEntries, _: &[Option<DiskError>]| {
                     Box::pin({
                         let value = tx2.clone();
-                        let resolver = resolver.clone();
+                        let resolver = partial_resolver.clone();
                         let cancel_token = cancel_for_send2.clone();
+                        let supplement = partial_supplement.clone();
                         async move {
-                            if let Some(entry) = entries.resolve(resolver)
+                            if let Some(entry) =
+                                resolve_listing_entries_with_supplement(entries, resolver, enforce_write_quorum, supplement).await
                                 && let Err(err) = value.send(entry).await
                                 && !cancel_token.is_cancelled()
                             {
@@ -2950,6 +3635,7 @@ impl SetDisks {
                 finished: None,
                 ..Default::default()
             },
+            claim_tracker,
         )
         .await;
 
@@ -3049,13 +3735,21 @@ fn calc_common_counter(infos: &[DiskInfo], read_quorum: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::{
-        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, GatherResultsState, ListPathOptions, MAX_OBJECT_LIST, VersionMarker,
-        gather_results, latest_listing_object_quorum, list_metadata_resolution_params, list_objects_quorum_from_env,
-        list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum, parse_version_marker,
-        version_marker_for_entries, walk_result_from_set_errors,
+        ENV_API_LIST_OBJECTS_QUORUM, ENV_API_LIST_QUORUM, FallbackListingEntries, FallbackListingEntry, GatherResultsState,
+        ListPathOptions, ListPathRawOptions, ListingEntryResolution, ListingSupplement, ListingSupplementOptions,
+        MAX_OBJECT_LIST, VersionMarker, enforce_latest_listing_write_quorum, expand_ask_disks_for_object_quorum,
+        fallback_entries_for_object, gather_results, latest_listing_allow_agreed_objects, latest_listing_object_quorum,
+        latest_listing_raw_min_disks, latest_listing_required_object_quorum, list_metadata_resolution_params,
+        list_objects_quorum_from_env, list_quorum_from_env, max_keys_plus_one, merge_entry_channels, normalize_list_quorum,
+        parse_version_marker, resolve_agreed_listing_entry, resolve_listing_entries, version_marker_for_entries,
+        walk_result_from_set_errors,
     };
+    use crate::cache_value::metacache_set::{FallbackClaimTracker, TestReaderBehavior, list_path_raw};
+    use crate::disk::{DiskAPI, DiskOption, endpoint::Endpoint, error::DiskError, new_disk};
     use crate::error::StorageError;
-    use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
+    use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntries, MetaCacheEntriesSorted, MetaCacheEntry};
+    use std::collections::{HashMap, HashSet};
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
@@ -3063,6 +3757,177 @@ mod test {
     use uuid::Uuid;
 
     fn test_meta_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    fn test_object_meta_entry(name: &str) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        meta.add_version(FileInfo {
+            volume: "bucket".to_owned(),
+            name: name.to_owned(),
+            size: 1,
+            mod_time: Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp")),
+            ..Default::default()
+        })
+        .expect("test metadata should accept object version");
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    #[test]
+    fn fallback_entries_for_object_filters_claimed_physical_disks() {
+        let mut entries = FallbackListingEntries::new();
+        entries.insert(
+            "object".to_string(),
+            vec![
+                FallbackListingEntry {
+                    endpoint: "disk-a".to_string(),
+                    entry: test_meta_entry("object"),
+                },
+                FallbackListingEntry {
+                    endpoint: "disk-b".to_string(),
+                    entry: test_meta_entry("object"),
+                },
+            ],
+        );
+        let claimed = HashSet::from(["disk-a".to_string()]);
+
+        let candidates = fallback_entries_for_object(&entries, "object", &claimed);
+
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].as_ref().map(|entry| entry.name.as_str()), Some("object"));
+    }
+
+    #[test]
+    fn listing_supplement_uses_page_cache_only_for_bounded_walks() {
+        let bounded = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: "bucket".to_string(),
+                path: String::new(),
+                recursive: true,
+                filter_prefix: None,
+                forward_to: None,
+                per_disk_limit: 100,
+                skip_total_timeout: true,
+            },
+            Arc::new(Vec::new()),
+            FallbackClaimTracker::default(),
+        );
+        let unbounded = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: "bucket".to_string(),
+                path: String::new(),
+                recursive: true,
+                filter_prefix: None,
+                forward_to: None,
+                per_disk_limit: 0,
+                skip_total_timeout: false,
+            },
+            Arc::new(Vec::new()),
+            FallbackClaimTracker::default(),
+        );
+
+        assert!(bounded.entries.is_some());
+        assert!(bounded.options.skip_total_timeout);
+        assert!(unbounded.entries.is_none());
+        assert!(!unbounded.options.skip_total_timeout);
+    }
+
+    #[tokio::test]
+    async fn listing_supplement_unbounded_reads_object_metadata_from_fallback_disk() {
+        let tempdir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(tempdir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("local disk should be created");
+        let mut fi = FileInfo::new("object", 1, 1);
+        fi.volume = "bucket".to_owned();
+        fi.name = "object".to_owned();
+        fi.size = 1;
+        fi.fresh = true;
+        fi.erasure.index = 1;
+        fi.mod_time = Some(time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp"));
+        fi.metadata.insert("etag".to_owned(), "object-etag".to_owned());
+        disk.write_metadata("", "bucket", "object", fi)
+            .await
+            .expect("test metadata should be written");
+
+        let supplement = ListingSupplement::new(
+            ListingSupplementOptions {
+                bucket: "bucket".to_string(),
+                path: String::new(),
+                recursive: true,
+                filter_prefix: None,
+                forward_to: None,
+                per_disk_limit: 0,
+                skip_total_timeout: false,
+            },
+            Arc::new(vec![disk]),
+            FallbackClaimTracker::default(),
+        );
+
+        let entries = supplement.entries_for("object").await;
+
+        assert!(supplement.entries.is_none());
+        assert_eq!(entries.len(), 1);
+        let entry = entries
+            .into_iter()
+            .next()
+            .and_then(|entry| entry)
+            .expect("fallback object metadata should be returned");
+        let info = entry.to_fileinfo("bucket").expect("fallback metadata should decode");
+        assert_eq!(entry.name, "object");
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("object-etag"));
+    }
+
+    fn test_object_meta_entry_with_erasure_versions(
+        name: &str,
+        versions: &[(time::OffsetDateTime, &str, usize, usize)],
+    ) -> MetaCacheEntry {
+        let mut meta = FileMeta::new();
+        for (idx, (mod_time, etag, data_blocks, parity_blocks)) in versions.iter().enumerate() {
+            let mut metadata = HashMap::new();
+            metadata.insert("etag".to_string(), (*etag).to_string());
+
+            let mut fi = FileInfo::new(name, *data_blocks, *parity_blocks);
+            fi.volume = "bucket".to_owned();
+            fi.name = name.to_owned();
+            let version_idx = u128::try_from(idx + 1).expect("test version index should fit u128");
+            fi.version_id = Some(Uuid::from_u128(version_idx));
+            fi.versioned = true;
+            fi.size = 1;
+            fi.mod_time = Some(*mod_time);
+            fi.metadata = metadata;
+
+            meta.add_version(fi).expect("test metadata should accept object version");
+        }
+        let metadata = meta.marshal_msg().expect("test metadata should marshal");
+
+        MetaCacheEntry {
+            name: name.to_owned(),
+            metadata,
+            cached: Some(meta),
+            reusable: false,
+        }
+    }
+
+    fn test_dir_meta_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
             name: name.to_owned(),
             ..Default::default()
@@ -3357,7 +4222,7 @@ mod test {
     fn list_metadata_resolution_params_limits_plain_listing_to_latest_version() {
         let resolver = list_metadata_resolution_params("bucket".to_string(), 2, 3, false);
 
-        assert_eq!(resolver.dir_quorum, 2);
+        assert_eq!(resolver.dir_quorum, 3);
         assert_eq!(resolver.obj_quorum, 3);
         assert_eq!(resolver.bucket, "bucket");
         assert_eq!(resolver.requested_versions, 1);
@@ -3375,14 +4240,283 @@ mod test {
 
     #[test]
     fn latest_listing_object_quorum_uses_write_quorum_for_strict_latest_listing() {
-        assert_eq!(latest_listing_object_quorum(2, 4, 4, 2, false), 3);
-        assert_eq!(latest_listing_object_quorum(4, 8, 8, 4, false), 5);
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true);
+        let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
+
+        assert_eq!(required_quorum, 5);
+        assert_eq!(ask_disks, 5);
+        assert_eq!(latest_listing_object_quorum(2, 8, 4, true), 5);
+    }
+
+    #[test]
+    fn latest_listing_object_quorum_calculates_low_parity_write_quorum() {
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 1, true);
+        let ask_disks = expand_ask_disks_for_object_quorum(4, 8, required_quorum);
+
+        assert_eq!(required_quorum, 7);
+        assert_eq!(ask_disks, 7);
+        assert_eq!(latest_listing_object_quorum(2, 8, 1, true), 7);
     }
 
     #[test]
     fn latest_listing_object_quorum_keeps_reduced_and_versioned_listing_quorum() {
-        assert_eq!(latest_listing_object_quorum(1, 1, 4, 2, false), 1);
-        assert_eq!(latest_listing_object_quorum(2, 4, 4, 2, true), 2);
+        assert!(!enforce_latest_listing_write_quorum(true, "reduced"));
+        assert!(!enforce_latest_listing_write_quorum(true, "disk"));
+        assert!(enforce_latest_listing_write_quorum(true, "optimal"));
+        assert!(!enforce_latest_listing_write_quorum(false, "optimal"));
+        assert_eq!(latest_listing_required_object_quorum(1, 4, 2, false), 1);
+        assert_eq!(latest_listing_object_quorum(1, 4, 2, false), 1);
+        assert_eq!(latest_listing_required_object_quorum(2, 4, 2, false), 2);
+        assert_eq!(latest_listing_object_quorum(2, 4, 2, false), 2);
+        assert_eq!(expand_ask_disks_for_object_quorum(2, 4, 2), 2);
+    }
+
+    #[test]
+    fn latest_listing_object_quorum_requires_write_quorum_when_degraded_cannot_satisfy_it() {
+        let required_quorum = latest_listing_required_object_quorum(2, 8, 4, true);
+        let ask_disks = expand_ask_disks_for_object_quorum(4, 4, required_quorum);
+
+        assert_eq!(required_quorum, 5);
+        assert_eq!(ask_disks, 4);
+        assert_eq!(latest_listing_object_quorum(2, 8, 4, true), 5);
+    }
+
+    #[tokio::test]
+    async fn latest_listing_agreed_path_requires_enough_readers_for_write_quorum() {
+        let entry = test_object_meta_entry("object");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let allow_agreed_objects = latest_listing_allow_agreed_objects(true, 4, 5);
+        let raw_min_disks = latest_listing_raw_min_disks(2, 5, true);
+
+        assert!(!allow_agreed_objects);
+        assert_eq!(raw_min_disks, 5);
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: raw_min_disks,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry.clone()]); 4],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        if !allow_agreed_objects && !entry.is_dir() {
+                            return;
+                        }
+                        seen.lock().expect("seen mutex poisoned").push(entry.name);
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("latest listing should fail when selected readers cannot satisfy write quorum");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        assert!(seen.lock().expect("seen mutex poisoned").is_empty());
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+        let allow_agreed_objects = latest_listing_allow_agreed_objects(true, 5, 5);
+        let raw_min_disks = latest_listing_raw_min_disks(3, 5, true);
+
+        assert!(allow_agreed_objects);
+        assert_eq!(raw_min_disks, 5);
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None, None],
+                min_disks: raw_min_disks,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 5],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    Box::pin(async move {
+                        if !allow_agreed_objects && !entry.is_dir() {
+                            return;
+                        }
+                        seen.lock().expect("seen mutex poisoned").push(entry.name);
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write-quorum all-agree listing should complete");
+
+        assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn latest_listing_agreed_path_reconciles_low_parity_partial_latest() {
+        let old_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let entry = test_object_meta_entry_with_erasure_versions(
+            "object",
+            &[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)],
+        );
+        let fallback_old_entry = test_object_meta_entry_with_erasure_versions("object", &[(old_mod_time, "old-etag", 4, 4)]);
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None, None],
+                min_disks: 5,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 5],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    let resolver = resolver.clone();
+                    let fallback_old_entry = fallback_old_entry.clone();
+                    Box::pin(async move {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver.clone(), true) {
+                            ListingEntryResolution::Resolved(entry) => entry,
+                            ListingEntryResolution::NeedsSupplement(entry, _) => {
+                                let mut candidates = vec![Some(entry); 5];
+                                candidates.extend(vec![Some(fallback_old_entry); 2]);
+                                let Some(entry) = resolve_listing_entries(MetaCacheEntries(candidates), resolver, true) else {
+                                    return;
+                                };
+                                entry
+                            }
+                            ListingEntryResolution::Rejected => return,
+                        };
+                        let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
+                        seen.lock().expect("seen mutex poisoned").push((
+                            entry.name,
+                            info.mod_time,
+                            info.metadata.get("etag").cloned(),
+                        ));
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("all-agree listing should complete");
+
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &[("object".to_string(), Some(old_mod_time), Some("old-etag".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_listing_agreed_path_falls_back_to_previous_version_without_supplement() {
+        let old_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
+        let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let entry = test_object_meta_entry_with_erasure_versions(
+            "object",
+            &[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)],
+        );
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None, None],
+                min_disks: 5,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 5],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    let resolver = resolver.clone();
+                    Box::pin(async move {
+                        let entry = match resolve_agreed_listing_entry(entry, 5, resolver, true) {
+                            ListingEntryResolution::Resolved(entry) => entry,
+                            ListingEntryResolution::NeedsSupplement(_, Some(entry)) => entry,
+                            ListingEntryResolution::NeedsSupplement(_, None) | ListingEntryResolution::Rejected => return,
+                        };
+                        let info = entry.to_fileinfo("bucket").expect("resolved entry should decode");
+                        seen.lock().expect("seen mutex poisoned").push((
+                            entry.name,
+                            info.mod_time,
+                            info.metadata.get("etag").cloned(),
+                        ));
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("all-agree listing should complete");
+
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &[("object".to_string(), Some(old_mod_time), Some("old-etag".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_listing_agreed_path_supplements_committed_low_parity_latest() {
+        let new_mod_time = time::OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
+        let entry = test_object_meta_entry_with_erasure_versions("object", &[(new_mod_time, "new-etag", 7, 1)]);
+        let fallback_entry = entry.clone();
+        let resolver = list_metadata_resolution_params("bucket".to_string(), 3, 5, false);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = seen.clone();
+
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None, None],
+                min_disks: 5,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 5],
+                agreed: Some(Box::new(move |entry: MetaCacheEntry| {
+                    let seen = seen_clone.clone();
+                    let resolver = resolver.clone();
+                    let fallback_entry = fallback_entry.clone();
+                    Box::pin(async move {
+                        let ListingEntryResolution::NeedsSupplement(entry, _) =
+                            resolve_agreed_listing_entry(entry, 5, resolver.clone(), true)
+                        else {
+                            return;
+                        };
+                        let mut candidates = vec![Some(entry); 5];
+                        candidates.extend(vec![Some(fallback_entry); 2]);
+                        let resolved = resolve_listing_entries(MetaCacheEntries(candidates), resolver, true)
+                            .expect("supplemented low-parity latest should satisfy object write quorum");
+                        let info = resolved.to_fileinfo("bucket").expect("resolved entry should decode");
+                        seen.lock().expect("seen mutex poisoned").push((
+                            resolved.name,
+                            info.mod_time,
+                            info.metadata.get("etag").cloned(),
+                        ));
+                    })
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("all-agree listing should complete");
+
+        assert_eq!(
+            seen.lock().expect("seen mutex poisoned").as_slice(),
+            &[("object".to_string(), Some(new_mod_time), Some("new-etag".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn latest_listing_agreed_directory_requires_write_quorum() {
+        let entry = test_dir_meta_entry("prefix/");
+        let raw_min_disks = latest_listing_raw_min_disks(2, 5, true);
+
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None, None, None],
+                min_disks: raw_min_disks,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![entry]); 4],
+                agreed: Some(Box::new(move |_| Box::pin(async {}))),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("latest listing should not expose prefixes below write quorum");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
     #[test]
