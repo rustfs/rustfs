@@ -2799,10 +2799,12 @@ impl SetDisks {
             let use_mmap_read = object_mmap_read_enabled();
 
             let reader_setup_stage_start = Instant::now();
-            let read_costs = disks
-                .iter()
-                .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
-                .collect::<Vec<_>>();
+            let read_costs = coding::decode::should_collect_shard_read_costs().then(|| {
+                disks
+                    .iter()
+                    .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
+                    .collect::<Vec<_>>()
+            });
             let reader_setup = create_bitrot_readers_until_quorum_with_preference(
                 &files,
                 &disks,
@@ -2965,9 +2967,13 @@ impl SetDisks {
             let decode_stage_start = Instant::now();
             let unattempted_data_shards = !reader_setup.data_shards_attempted(erasure.data_shards);
             let readers = reader_setup.readers;
-            let (written, err) = erasure
-                .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
-                .await;
+            let (written, err) = if let Some(read_costs) = read_costs {
+                erasure
+                    .decode_with_read_costs(writer, readers, part_offset, part_length, part_size, read_costs)
+                    .await
+            } else {
+                erasure.decode(writer, readers, part_offset, part_length, part_size).await
+            };
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
             rustfs_io_metrics::record_get_object_stage_duration_by_size(
@@ -3220,10 +3226,12 @@ impl SetDisks {
             bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let read_costs = disks
-            .iter()
-            .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
-            .collect::<Vec<_>>();
+        let read_costs = coding::decode::should_collect_shard_read_costs().then(|| {
+            disks
+                .iter()
+                .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
+                .collect::<Vec<_>>()
+        });
         let reader_setup = create_bitrot_readers_until_quorum(
             files,
             disks,
@@ -3266,14 +3274,24 @@ impl SetDisks {
         }
 
         let readers = reader_setup.readers;
-        let source = coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
-            readers,
-            erasure.clone(),
-            part_offset,
-            part_size,
-            Some(metrics_path),
-            read_costs,
-        );
+        let source = if let Some(read_costs) = read_costs {
+            coding::decode::ParallelReader::new_with_metrics_path_read_costs_and_reconstruction_verification(
+                readers,
+                erasure.clone(),
+                part_offset,
+                part_size,
+                Some(metrics_path),
+                read_costs,
+            )
+        } else {
+            coding::decode::ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+                readers,
+                erasure.clone(),
+                part_offset,
+                part_size,
+                Some(metrics_path),
+            )
+        };
         let engine = build_get_codec_streaming_decode_engine(erasure.clone())?;
         let reader =
             coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(source, engine, part_length, metrics_path)?;

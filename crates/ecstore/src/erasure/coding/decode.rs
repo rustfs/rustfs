@@ -50,6 +50,10 @@ fn get_shard_locality_preference_enabled() -> bool {
     )
 }
 
+pub(crate) fn should_collect_shard_read_costs() -> bool {
+    rustfs_io_metrics::get_stage_metrics_enabled() || get_shard_locality_preference_enabled()
+}
+
 /// Number of stripes to prefetch in the legacy decode path.
 /// When > 1, stripe reads are batched to overlap disk I/O with decode.
 /// Default: 1 (no prefetch, current behavior).
