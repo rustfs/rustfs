@@ -53,6 +53,7 @@ use headers::{
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
+#[cfg(test)]
 use rmp_serde;
 use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use rustfs_s3_types::EventName;
