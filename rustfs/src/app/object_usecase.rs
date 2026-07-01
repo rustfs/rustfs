@@ -72,6 +72,7 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+    validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -2814,6 +2815,13 @@ impl DefaultObjectUsecase {
         // Validate object key
         validate_object_key(&key, request_method_name)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
+
+        // Validate archive content encoding (reject when strict mode is enabled)
+        validate_archive_content_encoding(
+            &key,
+            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
+            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+        )?;
 
         if let Some(size) = content_length {
             self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
