@@ -630,6 +630,8 @@ pub(crate) mod bucket {
             crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
         pub(crate) type MustReplicateOptions = crate::storage::storage_api::ecstore_bucket::replication::MustReplicateOptions;
         pub(crate) type ObjectOpts = crate::storage::storage_api::ecstore_bucket::replication::ObjectOpts;
+        pub(crate) type ReplicationObjectBridge =
+            crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type ReplicateDecision = rustfs_filemeta::ReplicateDecision;
 
         pub(crate) async fn check_replicate_delete(
@@ -639,8 +641,7 @@ pub(crate) mod bucket {
             del_opts: &crate::storage::storage_api::StorageObjectOptions,
             gerr: Option<String>,
         ) -> ReplicateDecision {
-            crate::storage::storage_api::ecstore_bucket::replication::check_replicate_delete(bucket, dobj, oi, del_opts, gerr)
-                .await
+            ReplicationObjectBridge::check_delete(bucket, dobj, oi, del_opts, gerr).await
         }
 
         pub(crate) fn get_must_replicate_options(
@@ -650,17 +651,11 @@ pub(crate) mod bucket {
             op_type: rustfs_filemeta::ReplicationType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> MustReplicateOptions {
-            crate::storage::storage_api::ecstore_bucket::replication::get_must_replicate_options(
-                user_defined,
-                user_tags,
-                status,
-                op_type,
-                opts,
-            )
+            ReplicationObjectBridge::must_replicate_options(user_defined, user_tags, status, op_type, opts)
         }
 
         pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-            crate::storage::storage_api::ecstore_bucket::replication::must_replicate(bucket, object, mopts).await
+            ReplicationObjectBridge::must_replicate(bucket, object, mopts).await
         }
 
         pub(crate) async fn schedule_replication(
@@ -669,11 +664,11 @@ pub(crate) mod bucket {
             dsc: ReplicateDecision,
             op_type: rustfs_filemeta::ReplicationType,
         ) {
-            crate::storage::storage_api::ecstore_bucket::replication::schedule_replication(oi, store, dsc, op_type).await;
+            ReplicationObjectBridge::schedule_object(oi, store, dsc, op_type).await;
         }
 
         pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
-            crate::storage::storage_api::ecstore_bucket::replication::schedule_replication_delete(dv).await;
+            ReplicationObjectBridge::schedule_delete(dv).await;
         }
     }
 

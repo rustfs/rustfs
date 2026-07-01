@@ -115,13 +115,16 @@ Current coupling:
   operation types are concentrated behind the replication target boundary;
 - lifecycle delete paths schedule replication work through
   `ReplicationLifecycleBridge`, while scanner heal paths schedule replication
-  work through `ReplicationScannerBridge`;
+  work through `ReplicationScannerBridge`, and app/SetDisks object write/delete
+  paths use `ReplicationObjectBridge`;
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
   ECStore owner path for replication self-imports;
 - replication runtime source access uses storage/bandwidth boundary aliases for
-  ECStore object store and bucket monitor implementation types.
+  ECStore object store and bucket monitor implementation types;
+- the ECStore replication facade in `mod.rs` uses explicit compatibility
+  exports instead of wildcard re-exports from implementation modules.
 
 Required contracts before crate movement:
 
@@ -171,9 +174,15 @@ Required contracts before crate movement:
 - `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
   scheduling is exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_lifecycle_bridge.rs`.
+- `ReplicationObjectBridge`: app and SetDisks object write/delete replication
+  decisions and scheduling are exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_object_bridge.rs`.
 - `ReplicationScannerBridge`: scanner-originated replication heal scheduling is
   exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_scanner_bridge.rs`.
+- `ReplicationFacade`: the current `rustfs_ecstore::api::bucket::replication`
+  compatibility surface is an explicit symbol list guarded against wildcard
+  re-exports while downstream owners migrate to narrower contracts.
 
 First safe PR:
 
