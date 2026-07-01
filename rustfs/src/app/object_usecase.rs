@@ -156,6 +156,8 @@ use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
+const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES";
+const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 32 * 1024 * 1024;
 const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
 const PUT_EAGER_STATUS_EXTRACT: &str = "extract";
 const PUT_EAGER_STATUS_COMPRESSED: &str = "compressed";
@@ -164,6 +166,7 @@ const PUT_EAGER_STATUS_INVALID_SIZE: &str = "invalid_size";
 const PUT_EAGER_STATUS_ABOVE_EAGER_MAX: &str = "above_eager_max";
 const PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE: &str = "zero_copy_ineligible";
 const PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH: &str = "aws_chunked_missing_decoded_length";
+static CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
@@ -1033,8 +1036,24 @@ fn zero_copy_eager_put_path_status(
     should_compress: bool,
     is_extract: bool,
 ) -> &'static str {
-    const ZERO_COPY_EAGER_PUT_MAX_SIZE: i64 = 32 * 1024 * 1024;
+    zero_copy_eager_put_path_status_with_max_size(
+        size,
+        headers,
+        server_side_encryption_requested,
+        should_compress,
+        is_extract,
+        zero_copy_eager_put_max_size_bytes(),
+    )
+}
 
+fn zero_copy_eager_put_path_status_with_max_size(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+    max_size: i64,
+) -> &'static str {
     if is_extract {
         return PUT_EAGER_STATUS_EXTRACT;
     }
@@ -1048,7 +1067,7 @@ fn zero_copy_eager_put_path_status(
     if size <= 0 {
         return PUT_EAGER_STATUS_INVALID_SIZE;
     }
-    if size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
+    if size > max_size {
         return PUT_EAGER_STATUS_ABOVE_EAGER_MAX;
     }
 
@@ -1061,6 +1080,13 @@ fn zero_copy_eager_put_path_status(
     }
 
     PUT_EAGER_STATUS_ELIGIBLE
+}
+
+fn zero_copy_eager_put_max_size_bytes() -> i64 {
+    let configured = *CACHED_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES.get_or_init(|| {
+        rustfs_utils::get_env_usize(ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES, DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES)
+    });
+    i64::try_from(configured).unwrap_or(i64::MAX)
 }
 
 fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
@@ -6715,6 +6741,21 @@ mod tests {
         );
         assert_eq!(
             zero_copy_eager_put_path_status(32 * 1024 * 1024 + 1, &headers, false, false, false),
+            PUT_EAGER_STATUS_ABOVE_EAGER_MAX
+        );
+    }
+
+    #[test]
+    fn zero_copy_eager_put_path_status_honors_configured_cap() {
+        let headers = HeaderMap::new();
+        let max_size = 64 * 1024 * 1024;
+
+        assert_eq!(
+            zero_copy_eager_put_path_status_with_max_size(33 * 1024 * 1024, &headers, false, false, false, max_size),
+            PUT_EAGER_STATUS_ELIGIBLE
+        );
+        assert_eq!(
+            zero_copy_eager_put_path_status_with_max_size(65 * 1024 * 1024, &headers, false, false, false, max_size),
             PUT_EAGER_STATUS_ABOVE_EAGER_MAX
         );
     }
