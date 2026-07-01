@@ -15,8 +15,7 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::replication::ObjectOpts;
-use crate::bucket::replication::ReplicationConfigurationExt;
+use crate::bucket::replication::ReplicationTargetConfigBridge;
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
@@ -50,7 +49,7 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use reqwest::Client as HttpClient;
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_filemeta::ReplicationStatusType;
 use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
@@ -553,17 +552,12 @@ impl BucketTargetSys {
         if arn.arn_type == BucketTargetType::ReplicationService
             && let Ok((config, _)) = get_replication_config(bucket).await
         {
-            for rule in config.filter_target_arns(&ObjectOpts {
-                op_type: ReplicationType::All,
-                ..Default::default()
-            }) {
-                if rule == arn_str || config.role == arn_str {
-                    let arn_remotes_map = self.arn_remotes_map.read().await;
-                    if arn_remotes_map.get(arn_str).is_some() {
-                        return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
-                            bucket: bucket.to_string(),
-                        });
-                    }
+            if ReplicationTargetConfigBridge::target_is_used_by_rules(&config, arn_str) {
+                let arn_remotes_map = self.arn_remotes_map.read().await;
+                if arn_remotes_map.get(arn_str).is_some() {
+                    return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                        bucket: bucket.to_string(),
+                    });
                 }
             }
         }
