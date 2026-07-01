@@ -119,7 +119,6 @@ impl ECStore {
                 version,
                 bucket_configs.lifecycle_config.as_ref(),
                 bucket_configs.lock_retention.clone(),
-                bucket_configs.replication_config.clone(),
                 true,
                 &crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc::Rebal,
             )

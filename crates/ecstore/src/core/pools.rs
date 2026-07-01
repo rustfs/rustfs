@@ -18,6 +18,7 @@ use crate::bucket::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{
             LifecycleOps, apply_expiry_on_transitioned_object, apply_expiry_rule, eval_action_from_lifecycle,
+            lifecycle_delete_all_versions_blocked_by_replication,
         },
         lifecycle::IlmAction,
     },
@@ -2155,7 +2156,6 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
     version: &rustfs_filemeta::FileInfo,
     lifecycle_config: Option<&BucketLifecycleConfiguration>,
     lock_retention: Option<DefaultRetention>,
-    replication_config: Option<(ReplicationConfiguration, OffsetDateTime)>,
     apply_actions: bool,
     event_source: &LcEventSrc,
 ) -> Result<bool> {
@@ -2165,7 +2165,7 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
 
     let versioned = BucketVersioningSys::prefix_enabled(bucket, &version.name).await;
     let object_info = crate::object_api::ObjectInfo::from_file_info(version, bucket, &version.name, versioned);
-    let event = eval_action_from_lifecycle(lifecycle_config, lock_retention, replication_config, &object_info).await;
+    let event = eval_action_from_lifecycle(lifecycle_config, lock_retention, &object_info).await;
 
     match event.action {
         IlmAction::DeleteRestoredAction | IlmAction::DeleteRestoredVersionAction => {
@@ -2175,6 +2175,9 @@ pub(crate) async fn should_skip_lifecycle_for_data_movement(
             Ok(false)
         }
         action if lifecycle_action_removes_data_movement_version(action) => {
+            if lifecycle_delete_all_versions_blocked_by_replication(store.clone(), bucket, &object_info.name, action).await? {
+                return Ok(false);
+            }
             let applied = !apply_actions || apply_expiry_rule(&event, event_source, &object_info).await;
             resolve_data_movement_lifecycle_expiry_result(action, apply_actions, applied)
         }
@@ -2661,7 +2664,6 @@ impl ECStore {
                 version,
                 lifecycle_config.as_ref(),
                 lock_retention.clone(),
-                replication_config.clone(),
                 true,
                 &LcEventSrc::Decom,
             )
@@ -3920,15 +3922,9 @@ impl ECStore {
             for bucket_info in &buckets {
                 let mut lifecycle_config = None;
                 let mut lock_retention = None;
-                let mut replication_config = None;
                 if bucket_info.name != RUSTFS_META_BUCKET {
                     lifecycle_config = runtime_sources::bucket_lifecycle_config(&bucket_info.name).await;
                     lock_retention = BucketObjectLockSys::get(&bucket_info.name).await;
-                    replication_config = resolve_decommission_optional_bucket_config_result(
-                        &bucket_info.name,
-                        "replication",
-                        metadata_sys::get_replication_config(&bucket_info.name).await,
-                    )?;
                 }
 
                 let versions_found = Arc::new(AtomicUsize::new(0));
@@ -3939,7 +3935,6 @@ impl ECStore {
                 let bucket_name = bucket_info.name.clone();
                 let lifecycle_config_cb = lifecycle_config.clone();
                 let lock_retention_cb = lock_retention.clone();
-                let replication_config_cb = replication_config.clone();
                 let store = Arc::clone(self);
                 let callback_rx_cb = callback_rx.clone();
 
@@ -3949,7 +3944,6 @@ impl ECStore {
                     let bucket_name = bucket_name.clone();
                     let lifecycle_config = lifecycle_config_cb.clone();
                     let lock_retention = lock_retention_cb.clone();
-                    let replication_config = replication_config_cb.clone();
                     let store = Arc::clone(&store);
                     let callback_rx = callback_rx_cb.clone();
                     Box::pin(async move {
@@ -3992,7 +3986,6 @@ impl ECStore {
                                 version,
                                 lifecycle_config.as_ref(),
                                 lock_retention.clone(),
-                                replication_config.clone(),
                                 false,
                                 &LcEventSrc::Decom,
                             )
