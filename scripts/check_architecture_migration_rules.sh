@@ -201,6 +201,7 @@ REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.t
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
+SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_dto_boundary_bypass_hits.txt"
 OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/obs_replication_stats_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
@@ -2591,6 +2592,24 @@ fi
 
 if [[ -s "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "app replication ObjectOpts/MustReplicateOptions/bridge access must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_ecstore::api::bucket::replication' \
+      crates/scanner/src crates/scanner/tests \
+      --glob '*.rs' \
+      --glob '!crates/scanner/src/storage_api.rs' || true
+    rg -n --with-filename '\b(ReplicateObjectInfo|ReplicationType|ResyncDecision|ResyncTargetDecision|EcstoreReplicationConfig|EcstoreReplicationHealQueueResult|EcstoreReplicationQueueAdmission)\b|ReplicationConfig\s*\{' \
+      crates/scanner/src crates/scanner/tests \
+      --glob '*.rs' \
+      --glob '!crates/scanner/src/storage_api.rs' || true
+  }
+) >"$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication queue DTO access must stay behind crates/scanner/src/storage_api.rs: $(paste -sd '; ' "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
