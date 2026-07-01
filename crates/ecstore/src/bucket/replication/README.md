@@ -15,8 +15,10 @@ and lifecycle/heal scheduling paths.
 | `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
 | `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources, file metadata replication contracts, error contracts, and bucket monitor handles through local boundaries, and owns shared replication pool/stat state. |
 | `replication_lifecycle_bridge.rs` | Lifecycle-originated delete replication admission and version-purge state construction. | Depends on replication config/rule matching, delete-replication decisions, and replication delete scheduling through a local contract type. |
+| `replication_migration_bridge.rs` | Bucket migration access to persisted replication resync codec helpers. | Keeps migration normalization behind a bridge instead of re-exporting resyncer codec helpers. |
 | `replication_object_bridge.rs` | App and SetDisks object replication decisions plus object/delete scheduling. | Keeps object write/delete replication call sites behind a bridge instead of exporting low-level resyncer and pool helpers. |
 | `replication_scanner_bridge.rs` | Scanner-originated replication heal admission. | Keeps scanner-facing heal queueing behind a local contract type instead of exporting the internal queue function directly. |
+| `replication_target_config_bridge.rs` | Bucket target removal checks against replication target rules. | Keeps bucket target sys from importing replication config helper types directly. |
 | `rule.rs` | Rule evaluation helpers for object replication options. | Depends on ECStore replication object option types. |
 | `mod.rs` | Explicit compatibility re-export facade for the current ECStore owner. | Wildcard re-exports are guarded so internal helpers do not leak back into the public facade. |
 
@@ -39,8 +41,10 @@ and lifecycle/heal scheduling paths.
 | `ReplicationMsgpCodec` | MessagePack time encode/decode and unknown value skipping for persisted resync/MRF state. | Bucket MessagePack helpers are exposed through the contract type in `replication_msgp_boundary.rs`. |
 | `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Bucket tagging helper access is exposed through the contract type in `replication_tagging_boundary.rs`. |
 | `ReplicationLifecycleBridge` | Lifecycle-originated delete and version-purge scheduling. | Lifecycle delete paths call the bridge contract in `replication_lifecycle_bridge.rs` instead of constructing replication delete work directly. |
+| `ReplicationMigrationBridge` | Persisted resync status decode/encode access for bucket metadata migration. | Bucket migration calls the bridge contract in `replication_migration_bridge.rs` instead of importing internal resyncer codec helpers. |
 | `ReplicationObjectBridge` | Object write/delete replication decision and scheduling entry point for app storage and SetDisks paths. | App and SetDisks object paths call the bridge contract in `replication_object_bridge.rs` instead of importing internal resyncer/pool helpers. |
 | `ReplicationScannerBridge` | Scanner-originated replication heal scheduling. | Scanner heal paths call the bridge contract in `replication_scanner_bridge.rs` instead of importing the internal queue function directly. |
+| `ReplicationTargetConfigBridge` | Bucket target removal checks against replication target rules. | Bucket target sys calls the bridge contract in `replication_target_config_bridge.rs` instead of importing replication config helper types directly. |
 
 ## Migration Rules
 
@@ -67,6 +71,8 @@ and lifecycle/heal scheduling paths.
 9. Keep object write/delete replication helpers behind `ReplicationObjectBridge`;
    do not export internal resyncer or pool scheduling helpers through the
    compatibility facade.
+10. Keep ECStore owner modules outside `bucket/replication` behind bridge
+    contracts when they need replication codec or config helper behavior.
 
 ## First Code-Bearing Step
 

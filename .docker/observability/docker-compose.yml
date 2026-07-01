@@ -63,7 +63,7 @@ services:
       - jaeger-data:/badger
     ports:
       - "16686:16686" # Web UI
-      - "14269:14269" # Admin/Metrics
+      - "18888:8888" # Metrics
       - "4317" # otlp grpc
       - "4318" # otlp http
     command: [ "--config", "/etc/jaeger/config.yml" ]
@@ -71,7 +71,7 @@ services:
       - otel-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:14269" ]
+      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:8888/metrics" ]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -118,7 +118,7 @@ services:
       - otel-network
     restart: unless-stopped
     healthcheck:
-      test: [ "CMD", "wget", "--spider", "-q", "http://localhost:3100/ready" ]
+      test: [ "CMD", "/usr/bin/loki", "--version" ]
       interval: 15s
       timeout: 10s
       retries: 5

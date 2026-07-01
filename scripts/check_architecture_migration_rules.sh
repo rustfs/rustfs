@@ -210,6 +210,7 @@ REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
+REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_ecstore_owner_bridge_bypass_hits.txt"
 REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_object_bridge_bypass_hits.txt"
 REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_scanner_bridge_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
@@ -2529,6 +2530,26 @@ fi
 
 if [[ -s "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE" ]]; then
   report_failure "object replication work entry points must stay behind ReplicationObjectBridge: $(paste -sd '; ' "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'crate::bucket::replication::(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'use\s+crate::bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'crate::\{[^;]*bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+  } |
+    rg -v '^crates/ecstore/src/bucket/replication/' || true
+) >"$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "ECStore owner modules must use replication bridge contracts instead of internal replication helpers: $(paste -sd '; ' "$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE")"
 fi
 
 (

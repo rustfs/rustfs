@@ -15,7 +15,7 @@
 //! Migration of bucket metadata and IAM config from legacy format to RustFS format.
 
 use crate::bucket::metadata::BUCKET_METADATA_FILE;
-use crate::bucket::replication::{decode_resync_file, encode_resync_file};
+use crate::bucket::replication::ReplicationMigrationBridge;
 use crate::disk::{BUCKET_META_PREFIX, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET};
 use crate::error::Error;
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -179,8 +179,9 @@ fn normalize_bucket_meta_blob(path: &str, data: &[u8]) -> std::result::Result<Op
     if !is_resync_meta_path(path) {
         return Ok(None);
     }
-    let status = decode_resync_file(data).map_err(|err| format!("decode resync meta failed: {err}"))?;
-    encode_resync_file(&status)
+    let status =
+        ReplicationMigrationBridge::decode_resync_status(data).map_err(|err| format!("decode resync meta failed: {err}"))?;
+    ReplicationMigrationBridge::encode_resync_status(&status)
         .map(Some)
         .map_err(|err| format!("encode resync meta failed: {err}"))
 }
@@ -420,7 +421,7 @@ where
 mod tests {
     use super::{normalize_bucket_meta_blob, normalize_iam_config_blob};
     use crate::bucket::replication::{
-        BucketReplicationResyncStatus, ResyncStatusType, TargetReplicationResyncStatus, decode_resync_file, encode_resync_file,
+        BucketReplicationResyncStatus, ReplicationMigrationBridge, ResyncStatusType, TargetReplicationResyncStatus,
     };
     use std::collections::HashMap;
 
@@ -459,12 +460,12 @@ mod tests {
             },
         )]);
 
-        let input = encode_resync_file(&status).expect("encode should succeed");
+        let input = ReplicationMigrationBridge::encode_resync_status(&status).expect("encode should succeed");
         let output = normalize_bucket_meta_blob(path, &input)
             .expect("normalize should succeed")
             .expect("resync path should be normalized");
 
-        let decoded = decode_resync_file(&output).expect("decode should succeed");
+        let decoded = ReplicationMigrationBridge::decode_resync_status(&output).expect("decode should succeed");
         assert_eq!(decoded.id, 123);
         assert_eq!(decoded.targets_map["arn:replication::1:dest"].resync_id, "reset-1");
     }
