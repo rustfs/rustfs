@@ -21,26 +21,14 @@ const EVENT_LIFECYCLE_CLEANUP_SKIPPED: &str = "lifecycle_cleanup_skipped";
 const EVENT_LIFECYCLE_CLEANUP_FAILED: &str = "lifecycle_cleanup_failed";
 
 use crate::bucket::lifecycle::lifecycle;
-use crate::bucket::replication::{DeletedObjectReplicationInfo, check_replicate_delete, schedule_replication_delete};
+use crate::bucket::replication::ReplicationLifecycleBridge;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::object_api::ObjectOptions;
 use crate::storage_api_contracts::object::{ObjectOperations as _, ObjectToDelete};
 use crate::store::ECStore;
-use rustfs_filemeta::{REPLICATE_INCOMING_DELETE, ReplicationState, version_purge_statuses_map};
+use rustfs_filemeta::ReplicationState;
 use rustfs_lock::MAX_DELETE_LIST;
-
-fn lifecycle_version_delete_replication_state(
-    replicate_decision_str: String,
-    pending_status: Option<String>,
-) -> ReplicationState {
-    ReplicationState {
-        replicate_decision_str,
-        version_purge_status_internal: pending_status.clone(),
-        purge_targets: version_purge_statuses_map(pending_status.as_deref().unwrap_or_default()),
-        ..Default::default()
-    }
-}
 
 pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[ObjectToDelete], _lc_event: lifecycle::Event) {
     let version_suspended = match BucketVersioningSys::get(bucket).await {
@@ -79,9 +67,9 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
             };
             let candidate = match api.get_object_info(bucket, &object.object_name, &opts).await {
                 Ok(info) => {
-                    let dsc = check_replicate_delete(bucket, object, &info, &opts, None).await;
+                    let dsc = ReplicationLifecycleBridge::check_delete_replication(bucket, object, &info, &opts).await;
                     dsc.replicate_any()
-                        .then(|| lifecycle_version_delete_replication_state(dsc.to_string(), dsc.pending_status()))
+                        .then(|| ReplicationLifecycleBridge::version_delete_replication_state(&dsc))
                 }
                 Err(err) => {
                     debug!(
@@ -120,13 +108,7 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
                 continue;
             };
             deleted_obj.replication_state = Some(replication_state);
-            schedule_replication_delete(DeletedObjectReplicationInfo {
-                delete_object: deleted_obj.clone(),
-                bucket: bucket.to_string(),
-                event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                ..Default::default()
-            })
-            .await;
+            ReplicationLifecycleBridge::schedule_delete(bucket.to_string(), deleted_obj.clone()).await;
         }
 
         for (i, err) in errors.iter().enumerate() {
@@ -152,22 +134,5 @@ pub async fn delete_object_versions(api: &Arc<ECStore>, bucket: &str, to_del: &[
         if remaining.is_empty() {
             break;
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::lifecycle_version_delete_replication_state;
-
-    #[test]
-    fn lifecycle_version_delete_replication_state_tracks_pending_purge_targets() {
-        let state = lifecycle_version_delete_replication_state(
-            "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
-            Some("arn:aws:s3:::target=PENDING;".to_string()),
-        );
-
-        assert_eq!(state.version_purge_status_internal.as_deref(), Some("arn:aws:s3:::target=PENDING;"));
-        assert!(state.purge_targets.contains_key("arn:aws:s3:::target"));
-        assert_eq!(state.replicate_decision_str, "arn:aws:s3:::target=true;false;arn:aws:s3:::target;");
     }
 }

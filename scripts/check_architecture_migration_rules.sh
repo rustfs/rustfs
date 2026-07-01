@@ -209,6 +209,7 @@ REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
+REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_scanner_bridge_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_boundary_bypass_hits.txt"
@@ -2627,21 +2628,25 @@ fi
       $source = blank_block_comments($source);
       $source =~ s{//[^\n]*}{blank($&)}eg;
 
-      for my $statement (split /;/, $source) {
+      while ($source =~ /([^;]+)(?:;|$)/g) {
+        my $statement_start = $-[1];
+        my $statement = $1;
         my $normalized = $statement;
         $normalized =~ s/\s+//g;
 
         my $hits_ecstore =
-          $normalized =~ /\bECStore\b/
-          && $normalized =~ /crate::(?:store(?:::|::\{)|\{.*store(?:::|::\{))/s;
+          $normalized =~ /\bECStore(?:\b|as)/
+          && $normalized =~ /crate::(?:store::\{?|\{.*store::\{?)/s;
         my $hits_monitor =
-          $normalized =~ /\bMonitor\b/
-          && $normalized =~ /crate::(?:bucket(?:::|::\{)|\{.*bucket(?:::|::\{))/s
-          && $normalized =~ /bucket(?:::|::\{).*bandwidth(?:::|::\{).*monitor(?:::|::\{)/s;
+          $normalized =~ /\bMonitor(?:\b|as)/
+          && $normalized =~ /crate::(?:bucket::\{?|\{.*bucket::\{?)/s
+          && $normalized =~ /bucket::\{?.*bandwidth::\{?.*monitor::\{?/s;
 
         if ($hits_ecstore || $hits_monitor) {
-          my $prefix = substr($source, 0, index($source, $statement));
-          my $line = ($prefix =~ tr/\n//) + 1;
+          my $leading = $statement;
+          $leading =~ s/^(\s*).*$/$1/s;
+          my $prefix = substr($source, 0, $statement_start);
+          my $line = ($prefix =~ tr/\n//) + ($leading =~ tr/\n//) + 1;
           $normalized =~ s/\s+/ /g;
           print "$ARGV:$line:$normalized\n";
         }
@@ -2663,6 +2668,17 @@ fi
 
 if [[ -s "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication runtime-source access must stay behind replication runtime boundary: $(paste -sd '; ' "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'queue_replication_heal_internal' \
+    crates/scanner/src crates/scanner/tests \
+    --glob '*.rs' || true
+) >"$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication heal queueing must stay behind ReplicationScannerBridge: $(paste -sd '; ' "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE")"
 fi
 
 (
