@@ -257,6 +257,24 @@ fn local_read_copy_method() -> LocalReadCopyMethod {
     }
 }
 
+#[cfg(unix)]
+#[allow(unsafe_code)]
+fn mmap_page_size() -> Result<u64> {
+    static PAGE_SIZE: OnceLock<Option<u64>> = OnceLock::new();
+
+    PAGE_SIZE
+        .get_or_init(|| {
+            // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and only
+            // queries process-global OS configuration.
+            let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+            if page_size <= 0 {
+                return None;
+            }
+            u64::try_from(page_size).ok()
+        })
+        .ok_or_else(|| DiskError::other("failed to determine system page size"))
+}
+
 #[cfg(test)]
 static RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 
@@ -3071,13 +3089,7 @@ impl DiskAPI for LocalDisk {
                         // mmap offsets on Unix must be page-size aligned. Align the
                         // mapping down to the nearest page boundary, then slice out the
                         // originally requested logical range.
-                        // SAFETY: `sysconf(_SC_PAGESIZE)` has no pointer arguments and
-                        // only queries process-global OS configuration.
-                        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
-                        if page_size <= 0 {
-                            return Err(DiskError::other("failed to determine system page size").into());
-                        }
-                        let page_size = u64::try_from(page_size).map_err(|_| DiskError::other("invalid system page size"))?;
+                        let page_size = mmap_page_size()?;
                         let aligned_offset = offset_u64 - (offset_u64 % page_size);
                         let logical_offset =
                             usize::try_from(offset_u64 - aligned_offset).map_err(|_| DiskError::other("mmap offset overflow"))?;
@@ -5954,6 +5966,16 @@ mod test {
         temp_env::with_var(ENV_RUSTFS_OBJECT_MMAP_READ_METHOD, Some("unknown"), || {
             assert_eq!(local_read_copy_method(), LocalReadCopyMethod::MmapCopy);
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mmap_page_size_is_cached_positive() {
+        let first = mmap_page_size().expect("page size should be available");
+        let second = mmap_page_size().expect("cached page size should be available");
+
+        assert!(first > 0);
+        assert_eq!(first, second);
     }
 
     #[cfg(unix)]
