@@ -14,10 +14,14 @@
 
 use crate::bucket::versioning_sys::BucketVersioningSys;
 
-pub(crate) async fn prefix_enabled(bucket: &str, prefix: &str) -> bool {
-    BucketVersioningSys::prefix_enabled(bucket, prefix).await
-}
+pub(crate) struct ReplicationVersioningStore;
 
-pub(crate) async fn prefix_suspended(bucket: &str, prefix: &str) -> bool {
-    BucketVersioningSys::prefix_suspended(bucket, prefix).await
+impl ReplicationVersioningStore {
+    pub(crate) async fn prefix_enabled(bucket: &str, prefix: &str) -> bool {
+        BucketVersioningSys::prefix_enabled(bucket, prefix).await
+    }
+
+    pub(crate) async fn prefix_suspended(bucket: &str, prefix: &str) -> bool {
+        BucketVersioningSys::prefix_suspended(bucket, prefix).await
+    }
 }

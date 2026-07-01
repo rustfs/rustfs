@@ -15,7 +15,7 @@
 use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::datatypes::ResyncStatusType;
 use super::replication_bandwidth_boundary;
-use super::replication_config_store as config_store;
+use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
@@ -24,19 +24,19 @@ use super::replication_filemeta_boundary::{
     ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
-use super::replication_lock_boundary as lock_boundary;
-use super::replication_metadata_boundary as metadata_boundary;
-use super::replication_msgp_boundary::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
+use super::replication_lock_boundary::ReplicationLockTiming;
+use super::replication_metadata_boundary::ReplicationMetadataStore;
+use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_storage_boundary::{
     AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
     ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
-use super::replication_tagging_boundary as tagging_boundary;
-use super::replication_target_boundary;
+use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::replication_target_boundary::{
-    AdvancedPutOptions, BucketTargets, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, TargetClient,
+    AdvancedPutOptions, BucketTargets, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, ReplicationTargetStore,
+    TargetClient,
 };
-use super::replication_versioning_boundary as versioning_boundary;
+use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
@@ -267,7 +267,7 @@ impl BucketReplicationResyncStatus {
         rmp::encode::write_str(&mut wr, "id")?;
         rmp::encode::write_i32(&mut wr, self.id)?;
         rmp::encode::write_str(&mut wr, "lu")?;
-        write_msgp_time(&mut wr, wire_time_or_default(self.last_update))?;
+        ReplicationMsgpCodec::write_time(&mut wr, wire_time_or_default(self.last_update))?;
         Ok(wr)
     }
 
@@ -300,7 +300,7 @@ impl BucketReplicationResyncStatus {
                 "lu" => {
                     out.last_update = normalize_wire_time(read_msgp_time_or_nil(&mut rd)?);
                 }
-                _ => skip_msgp_value(&mut rd)?,
+                _ => ReplicationMsgpCodec::skip_value(&mut rd)?,
             }
         }
         Ok(out)
@@ -385,13 +385,13 @@ impl TargetReplicationResyncStatus {
     fn marshal_wire_msg(&self, wr: &mut Vec<u8>) -> Result<()> {
         rmp::encode::write_map_len(wr, 11)?;
         rmp::encode::write_str(wr, "st")?;
-        write_msgp_time(wr, wire_time_or_default(self.start_time))?;
+        ReplicationMsgpCodec::write_time(wr, wire_time_or_default(self.start_time))?;
         rmp::encode::write_str(wr, "lst")?;
-        write_msgp_time(wr, wire_time_or_default(self.last_update))?;
+        ReplicationMsgpCodec::write_time(wr, wire_time_or_default(self.last_update))?;
         rmp::encode::write_str(wr, "id")?;
         rmp::encode::write_str(wr, &self.resync_id)?;
         rmp::encode::write_str(wr, "rdt")?;
-        write_msgp_time(wr, wire_time_or_default(self.resync_before_date))?;
+        ReplicationMsgpCodec::write_time(wr, wire_time_or_default(self.resync_before_date))?;
         rmp::encode::write_str(wr, "rst")?;
         rmp::encode::write_i32(wr, resync_status_to_i32(self.resync_status))?;
         rmp::encode::write_str(wr, "fs")?;
@@ -431,7 +431,7 @@ impl TargetReplicationResyncStatus {
                 "rrc" => out.replicated_count = rmp::decode::read_int(rd)?,
                 "bkt" => out.bucket = read_msgp_str(rd)?,
                 "obj" => out.object = read_msgp_str(rd)?,
-                _ => skip_msgp_value(rd)?,
+                _ => ReplicationMsgpCodec::skip_value(rd)?,
             }
         }
         Ok(out)
@@ -449,7 +449,7 @@ fn read_msgp_time_or_nil<R: Read>(rd: &mut R) -> Result<Option<OffsetDateTime>> 
     let marker = rmp::decode::read_marker(rd).map_err(|e| Error::other(format!("{e:?}")))?;
     match marker {
         rmp::Marker::Null => Ok(None),
-        rmp::Marker::Ext8 => Ok(Some(read_msgp_ext8_time(rd)?)),
+        rmp::Marker::Ext8 => Ok(Some(ReplicationMsgpCodec::read_ext8_time(rd)?)),
         other => Err(Error::other(format!("expected time ext or nil, got marker: {other:?}"))),
     }
 }
@@ -737,9 +737,9 @@ impl ReplicationResyncer {
         // Acquire a cluster-wide leader lock for this (bucket, ARN) pair so that only
         // one node runs the resync scan at a time. Without this, every cluster node would
         // scan and replicate every object independently, causing N-fold duplicate traffic.
-        let resync_lock_key = metadata_boundary::resync_lock_key(&opts.bucket, &opts.arn);
+        let resync_lock_key = ReplicationMetadataStore::resync_lock_key(&opts.bucket, &opts.arn);
         let resync_ns_lock = match storage
-            .new_ns_lock(metadata_boundary::rustfs_meta_bucket(), &resync_lock_key)
+            .new_ns_lock(ReplicationMetadataStore::rustfs_meta_bucket(), &resync_lock_key)
             .await
         {
             Ok(l) => l,
@@ -757,7 +757,7 @@ impl ReplicationResyncer {
                 return;
             }
         };
-        let _resync_leader_guard = match resync_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
+        let _resync_leader_guard = match resync_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
             Ok(g) => g,
             Err(_) => {
                 debug!(
@@ -792,7 +792,7 @@ impl ReplicationResyncer {
             }
         };
 
-        let targets = match replication_target_boundary::list_bucket_targets(&opts.bucket).await {
+        let targets = match ReplicationTargetStore::list_bucket_targets(&opts.bucket).await {
             Ok(targets) => targets,
             Err(err) => {
                 debug!(
@@ -837,7 +837,7 @@ impl ReplicationResyncer {
             return;
         }
 
-        let Some(target_client) = replication_target_boundary::remote_target_client(&opts.bucket, &target_arns[0]).await else {
+        let Some(target_client) = ReplicationTargetStore::remote_target_client(&opts.bucket, &target_arns[0]).await else {
             error!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -1164,8 +1164,8 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
             },
             &oi,
             &ObjectOptions {
-                versioned: versioning_boundary::prefix_enabled(&oi.bucket, &oi.name).await,
-                version_suspended: versioning_boundary::prefix_suspended(&oi.bucket, &oi.name).await,
+                versioned: ReplicationVersioningStore::prefix_enabled(&oi.bucket, &oi.name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(&oi.bucket, &oi.name).await,
                 ..Default::default()
             },
             None,
@@ -1228,14 +1228,14 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
 ) -> Result<()> {
     let data = encode_resync_file(status)?;
 
-    let config_file = metadata_boundary::bucket_resync_file_path(bucket);
-    config_store::save(api, &config_file, data).await?;
+    let config_file = ReplicationMetadataStore::bucket_resync_file_path(bucket);
+    ReplicationConfigStore::save(api, &config_file, data).await?;
 
     Ok(())
 }
 
 async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
-    metadata_boundary::optional_replication_config(bucket).await
+    ReplicationMetadataStore::optional_replication_config(bucket).await
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1592,7 +1592,7 @@ pub async fn check_replicate_delete(
             continue;
         }
 
-        let tgt = replication_target_boundary::remote_target_client(bucket, &tgt_arn).await;
+        let tgt = ReplicationTargetStore::remote_target_client(bucket, &tgt_arn).await;
         // The target online status should not be used here while deciding
         // whether to replicate deletes as the target could be temporarily down
         let tgt_dsc = if let Some(tgt) = tgt {
@@ -1673,7 +1673,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
         return ReplicateDecision::default();
     }
 
-    if !versioning_boundary::prefix_enabled(bucket, object).await {
+    if !ReplicationVersioningStore::prefix_enabled(bucket, object).await {
         return ReplicateDecision::default();
     }
 
@@ -1717,7 +1717,7 @@ pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOpti
     let mut dsc = ReplicateDecision::default();
 
     for arn in arns {
-        let cli = replication_target_boundary::remote_target_client(bucket, &arn).await;
+        let cli = ReplicationTargetStore::remote_target_client(bucket, &arn).await;
 
         let mut sopts = opts.clone();
         sopts.target_arn = arn.clone();
@@ -1807,8 +1807,9 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 &dobj.delete_object.object_name,
                 &ObjectOptions {
                     version_id: Some(delete_marker_version_id.to_string()),
-                    versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                    version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                    versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                    version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name)
+                        .await,
                     ..Default::default()
                 },
             )
@@ -1928,7 +1929,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(lock_guard) => lock_guard,
         Err(e) => {
             debug!(
@@ -1979,7 +1980,7 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
         }
 
         // Get the remote target client
-        let Some(tgt_client) = replication_target_boundary::remote_target_client(&bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &tgt_entry.arn).await else {
             debug!(
                 event = EVENT_REPLICATION_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2125,8 +2126,8 @@ pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicat
                 version_id: version_id.map(|v| v.to_string()),
                 mod_time: dobj.delete_object.delete_marker_mtime,
                 delete_replication: Some(drs),
-                versioned: versioning_boundary::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
-                version_suspended: versioning_boundary::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
+                versioned: ReplicationVersioningStore::prefix_enabled(&bucket, &dobj.delete_object.object_name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(&bucket, &dobj.delete_object.object_name).await,
                 ..Default::default()
             },
         )
@@ -2180,8 +2181,8 @@ async fn source_delete_marker_missing<S: EcstoreObjectOperations>(
             object_name,
             &ObjectOptions {
                 version_id: Some(delete_marker_version_id.to_string()),
-                versioned: versioning_boundary::prefix_enabled(bucket, object_name).await,
-                version_suspended: versioning_boundary::prefix_suspended(bucket, object_name).await,
+                versioned: ReplicationVersioningStore::prefix_enabled(bucket, object_name).await,
+                version_suspended: ReplicationVersioningStore::prefix_suspended(bucket, object_name).await,
                 ..Default::default()
             },
         )
@@ -2204,7 +2205,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
         if !dobj.target_arn.is_empty() && dobj.target_arn != tgt_entry.arn {
             continue;
         }
-        let Some(tgt_client) = replication_target_boundary::remote_target_client(bucket, &tgt_entry.arn).await else {
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &tgt_entry.arn).await else {
             continue;
         };
 
@@ -2311,7 +2312,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         }
     };
 
-    let _lock_guard = match ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
+    let _lock_guard = match ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(guard) => guard,
         Err(e) => {
             warn!(
@@ -2351,7 +2352,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = replication_target_boundary::remote_target_client(bucket, &arn).await else {
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &arn).await else {
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2379,7 +2380,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
         let object_name = object_name.clone();
 
         join_set.spawn(async move {
-            if replication_target_boundary::target_is_offline(&tgt_client).await {
+            if ReplicationTargetStore::target_is_offline(&tgt_client).await {
                 error!(
                     event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                     component = LOG_COMPONENT_ECSTORE,
@@ -2505,7 +2506,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
         return rinfo;
     }
 
-    if replication_target_boundary::target_is_offline(&tgt_client).await {
+    if ReplicationTargetStore::target_is_offline(&tgt_client).await {
         if !is_version_purge {
             rinfo.replication_status = ReplicationStatusType::Failed;
         } else {
@@ -2703,7 +2704,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
             return;
         }
     };
-    let _obj_lock_guard = match obj_ns_lock.get_write_lock(lock_boundary::acquire_timeout()).await {
+    let _obj_lock_guard = match obj_ns_lock.get_write_lock(ReplicationLockTiming::acquire_timeout()).await {
         Ok(g) => g,
         Err(e) => {
             debug!(
@@ -2730,7 +2731,7 @@ pub async fn replicate_object<S: ReplicationStorage>(roi: ReplicateObjectInfo, s
     let mut join_set = JoinSet::new();
 
     for arn in tgt_arns {
-        let Some(tgt_client) = replication_target_boundary::remote_target_client(&bucket, &arn).await else {
+        let Some(tgt_client) = ReplicationTargetStore::remote_target_client(&bucket, &arn).await else {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2894,7 +2895,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        if replication_target_boundary::target_is_offline(&tgt_client).await {
+        if ReplicationTargetStore::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -2915,8 +2916,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
-        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
+        let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
+        let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),
@@ -3180,7 +3181,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             ..Default::default()
         };
 
-        if replication_target_boundary::target_is_offline(&tgt_client).await {
+        if ReplicationTargetStore::target_is_offline(&tgt_client).await {
             debug!(
                 event = EVENT_RESYNC_RUNTIME_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3201,8 +3202,8 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             return rinfo;
         }
 
-        let versioned = versioning_boundary::prefix_enabled(&bucket, &object).await;
-        let version_suspended = versioning_boundary::prefix_suspended(&bucket, &object).await;
+        let versioned = ReplicationVersioningStore::prefix_enabled(&bucket, &object).await;
+        let version_suspended = ReplicationVersioningStore::prefix_suspended(&bucket, &object).await;
 
         let obj_opts = ObjectOptions {
             version_id: self.version_id.map(|v| v.to_string()),
@@ -3726,7 +3727,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     // Handle storage class default
     let storage_class = if sc.is_empty() {
         let obj_sc = object_info.storage_class.as_deref().unwrap_or_default();
-        if obj_sc == config_store::STANDARD || obj_sc == config_store::RRS {
+        if obj_sc == ReplicationConfigStore::STANDARD || obj_sc == ReplicationConfigStore::RRS {
             obj_sc.to_string()
         } else {
             sc.to_string()
@@ -3753,7 +3754,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     };
 
     if !object_info.user_tags.is_empty() {
-        let tags = tagging_boundary::decode_tags_to_map(&object_info.user_tags);
+        let tags = ReplicationTagFilter::decode_tags_to_map(&object_info.user_tags);
 
         if !tags.is_empty() {
             put_op.user_tags = tags;
@@ -4029,8 +4030,9 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
         }
     }
 
-    let oi1_tags = tagging_boundary::decode_tags_to_map(&oi1.user_tags);
-    let oi2_tags = tagging_boundary::decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
+    let oi1_tags = ReplicationTagFilter::decode_tags_to_map(&oi1.user_tags);
+    let oi2_tags =
+        ReplicationTagFilter::decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
 
     if (oi2.tag_count.unwrap_or_default() > 0 && oi1_tags != oi2_tags)
         || oi2.tag_count.unwrap_or_default() != oi1_tags.len() as i32
@@ -4125,13 +4127,13 @@ mod tests {
         rmp::encode::write_str(&mut payload, "arn:replication::1:dest").expect("write arn");
         rmp::encode::write_map_len(&mut payload, 11).expect("write target");
         rmp::encode::write_str(&mut payload, "st").expect("write key");
-        write_msgp_time(&mut payload, start).expect("write time");
+        ReplicationMsgpCodec::write_time(&mut payload, start).expect("write time");
         rmp::encode::write_str(&mut payload, "lst").expect("write key");
-        write_msgp_time(&mut payload, last).expect("write time");
+        ReplicationMsgpCodec::write_time(&mut payload, last).expect("write time");
         rmp::encode::write_str(&mut payload, "id").expect("write key");
         rmp::encode::write_str(&mut payload, "resync-1").expect("write id");
         rmp::encode::write_str(&mut payload, "rdt").expect("write key");
-        write_msgp_time(&mut payload, before).expect("write time");
+        ReplicationMsgpCodec::write_time(&mut payload, before).expect("write time");
         rmp::encode::write_str(&mut payload, "rst").expect("write key");
         rmp::encode::write_i32(&mut payload, 3).expect("write status");
         rmp::encode::write_str(&mut payload, "fs").expect("write key");
@@ -4149,7 +4151,7 @@ mod tests {
         rmp::encode::write_str(&mut payload, "id").expect("write key");
         rmp::encode::write_i32(&mut payload, 42).expect("write id");
         rmp::encode::write_str(&mut payload, "lu").expect("write key");
-        write_msgp_time(&mut payload, bucket_last).expect("write lu");
+        ReplicationMsgpCodec::write_time(&mut payload, bucket_last).expect("write lu");
 
         let got = BucketReplicationResyncStatus::unmarshal_msg(&payload).expect("decode");
         assert_eq!(got.version, 1);

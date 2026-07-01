@@ -14,6 +14,10 @@
 
 use std::time::Duration;
 
-pub(crate) fn acquire_timeout() -> Duration {
-    crate::set_disk::get_lock_acquire_timeout()
+pub(crate) struct ReplicationLockTiming;
+
+impl ReplicationLockTiming {
+    pub(crate) fn acquire_timeout() -> Duration {
+        crate::set_disk::get_lock_acquire_timeout()
+    }
 }

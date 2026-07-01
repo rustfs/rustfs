@@ -12,4 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub(crate) use crate::bucket::msgp_decode::{read_msgp_ext8_time, skip_msgp_value, write_msgp_time};
+use std::io::{Read, Write};
+
+use time::OffsetDateTime;
+
+use super::replication_error_boundary::Result;
+use crate::bucket::msgp_decode;
+
+pub(crate) struct ReplicationMsgpCodec;
+
+impl ReplicationMsgpCodec {
+    pub(crate) fn read_ext8_time<R: Read>(rd: &mut R) -> Result<OffsetDateTime> {
+        msgp_decode::read_msgp_ext8_time(rd)
+    }
+
+    pub(crate) fn skip_value<R: Read>(rd: &mut R) -> Result<()> {
+        msgp_decode::skip_msgp_value(rd)
+    }
+
+    pub(crate) fn write_time<W: Write>(wr: &mut W, time: OffsetDateTime) -> Result<()> {
+        msgp_decode::write_msgp_time(wr, time)
+    }
+}

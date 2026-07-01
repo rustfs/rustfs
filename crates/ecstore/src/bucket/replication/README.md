@@ -23,15 +23,18 @@ and lifecycle/heal scheduling paths.
 |---|---|---|
 | `ReplicationObjectIO` | Object read/write primitives used by config, MRF, resync status, and multipart replication paths. | ECStore object API reader/writer types and storage-api object IO contracts are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationStorage` | Object read/write/delete, object walk, metadata update, and target object IO. | ECStore object API, storage-api contracts, and read option types are concentrated in `replication_storage_boundary.rs`. |
-| `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Metadata sys access and replication metadata path constants are concentrated in `replication_metadata_boundary.rs`; versioning sys and config storage imports remain. |
-| `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are concentrated in `replication_config_store.rs`. |
+| `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Metadata sys access and replication metadata path constants are exposed through the contract type in `replication_metadata_boundary.rs`; versioning sys and config storage imports remain separate contracts. |
+| `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
 | `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
 | `ReplicationErrorBoundary` | ECStore error/result contracts and replication-specific error classifiers. | `crate::error` imports are concentrated in `replication_error_boundary.rs`. |
-| `ReplicationTargetStore` | Bucket target listing, target client lookup, target offline checks, target config types, and target operation option types. | Bucket target sys access, `BucketTargets`, and target operation types are concentrated in `replication_target_boundary.rs`. |
+| `ReplicationTargetStore` | Bucket target listing, target client lookup, target offline checks, target config types, and target operation option types. | Bucket target sys access, `BucketTargets`, and target operation types are exposed through the contract type in `replication_target_boundary.rs`. |
 | `ReplicationRuntime` | Worker pool, queue sizing, stats, bucket monitor, local node identity, cancellation, and admission state. | Direct runtime source/global access and shared replication pool/stat state; ECStore object store and bucket monitor implementation types stay behind local storage/bandwidth boundaries. |
 | `ReplicationBandwidthLimiter` | Target reader wrapping for replication bandwidth accounting and throttling. | Direct bucket bandwidth reader imports from resyncer paths. |
 | `ReplicationEventSink` | Notification and audit events for skipped, failed, pending, and completed replication operations. | Event notification service calls and local event host selection are concentrated in `replication_event_sink.rs`. |
-| `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Direct bucket tagging helper imports from replication workers. |
+| `ReplicationVersioningStore` | Versioning state checks for object and delete replication decisions. | Bucket versioning sys access is exposed through the contract type in `replication_versioning_boundary.rs`. |
+| `ReplicationLockTiming` | Namespace lock timing for replication resync, object replication, and delete replication locks. | SetDisks lock timeout access is exposed through the contract type in `replication_lock_boundary.rs`. |
+| `ReplicationMsgpCodec` | MessagePack time encode/decode and unknown value skipping for persisted resync/MRF state. | Bucket MessagePack helpers are exposed through the contract type in `replication_msgp_boundary.rs`. |
+| `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Bucket tagging helper access is exposed through the contract type in `replication_tagging_boundary.rs`. |
 | `ReplicationLifecycleBridge` | Lifecycle-originated delete and version-purge scheduling. | Direct coupling between lifecycle worker paths and replication delete scheduling. |
 
 ## Migration Rules
@@ -50,8 +53,10 @@ and lifecycle/heal scheduling paths.
    replication module, not `crate::bucket::replication::*` self paths.
 6. Keep runtime source access from importing ECStore object store or bucket
    monitor implementation types directly; use local boundary-owned aliases.
-7. Move at most one contract boundary per code-bearing PR and verify it with
-   focused replication tests before broad gates.
+7. Move at most one owner boundary per code-bearing PR and verify it with
+   focused replication tests before broad gates. Non-behavioral contract-shape
+   cleanup may batch already-established boundary wrappers when the owner and
+   call semantics do not change.
 
 ## First Code-Bearing Step
 

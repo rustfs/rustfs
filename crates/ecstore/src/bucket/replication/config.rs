@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use super::replication_filemeta_boundary::ReplicationType;
-use super::replication_tagging_boundary as tagging_boundary;
+use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::rule::ReplicationRuleExt as _;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
@@ -102,7 +102,7 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             }
 
             if let Some(filter) = &rule.filter {
-                let object_tags = tagging_boundary::decode_tags_to_map(&obj.user_tags);
+                let object_tags = ReplicationTagFilter::decode_tags_to_map(&obj.user_tags);
                 if filter.test_tags(&object_tags) {
                     rules.push(rule.clone());
                 }
