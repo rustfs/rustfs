@@ -44,7 +44,6 @@ use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
 use aws_smithy_types::body::SdkBody;
-use byteorder::ByteOrder;
 use futures::future::join_all;
 use futures::stream::StreamExt;
 use headers::{
@@ -55,7 +54,6 @@ use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
 use regex::Regex;
-use rmp_serde;
 use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -101,8 +99,8 @@ const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_ch
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
-const MRF_META_FORMAT: u16 = 1;
-const MRF_META_VERSION: u16 = 1;
+pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT;
+pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
@@ -189,49 +187,27 @@ fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
     src_etag.is_some() && src_etag == tgt_etag
 }
 
-fn map_resync_error(err: rustfs_replication::resync::Error) -> Error {
+fn map_replication_error(err: rustfs_replication::Error) -> Error {
     match err {
-        rustfs_replication::resync::Error::CorruptedFormat => Error::CorruptedFormat,
-        rustfs_replication::resync::Error::Other(err) => Error::other(err),
+        rustfs_replication::Error::CorruptedFormat => Error::CorruptedFormat,
+        rustfs_replication::Error::Other(err) => Error::other(err),
     }
 }
 
 pub(crate) fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
-    rustfs_replication::encode_resync_file(status).map_err(map_resync_error)
+    rustfs_replication::encode_resync_file(status).map_err(map_replication_error)
 }
 
 pub(crate) fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
-    rustfs_replication::decode_resync_file(data).map_err(map_resync_error)
+    rustfs_replication::decode_resync_file(data).map_err(map_replication_error)
 }
 
 pub(crate) fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
-    let payload = rmp_serde::to_vec_named(entries).map_err(|e| Error::other(e.to_string()))?;
-    let mut data = Vec::with_capacity(4 + payload.len());
-    let mut fmt = [0u8; 2];
-    byteorder::LittleEndian::write_u16(&mut fmt, MRF_META_FORMAT);
-    data.extend_from_slice(&fmt);
-    let mut ver = [0u8; 2];
-    byteorder::LittleEndian::write_u16(&mut ver, MRF_META_VERSION);
-    data.extend_from_slice(&ver);
-    data.extend_from_slice(&payload);
-    Ok(data)
+    rustfs_replication::encode_mrf_file(entries).map_err(map_replication_error)
 }
 
 pub(crate) fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
-    if data.len() <= 4 {
-        return Err(Error::CorruptedFormat);
-    }
-    let mut fmt = [0u8; 2];
-    fmt.copy_from_slice(&data[0..2]);
-    if byteorder::LittleEndian::read_u16(&fmt) != MRF_META_FORMAT {
-        return Err(Error::CorruptedFormat);
-    }
-    let mut ver = [0u8; 2];
-    ver.copy_from_slice(&data[2..4]);
-    if byteorder::LittleEndian::read_u16(&ver) != MRF_META_VERSION {
-        return Err(Error::CorruptedFormat);
-    }
-    rmp_serde::from_slice(&data[4..]).map_err(|e| Error::other(e.to_string()))
+    rustfs_replication::decode_mrf_file(data).map_err(map_replication_error)
 }
 
 static RESYNC_WORKER_COUNT: usize = 10;
