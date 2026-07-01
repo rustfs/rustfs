@@ -31,6 +31,16 @@ BASELINE_ROOT=""
 EXTRA_ARGS=""
 INSECURE=false
 DRY_RUN=false
+PYTHON_BIN="python3"
+SERVICE_METRICS_URL=""
+SERVICE_PROMETHEUS_QUERY_URL=""
+SERVICE_PROMETHEUS_QUERY=""
+SERVICE_METRICS_SERVICE_NAME=""
+SERVICE_METRICS_FILTER_REGEX=""
+SERVICE_METRICS_CAPTURE_ATTEMPTS=3
+SERVICE_METRICS_CAPTURE_RETRY_SECS=1
+SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
+SERVICE_METRICS_MAX_TIME_SECS=15
 
 TOPOLOGY_NODES=""
 TOPOLOGY_DISKS_PER_NODE=""
@@ -70,6 +80,20 @@ Core options:
   --warp-bin <path>                   warp binary (default: warp)
   --insecure                          Pass --insecure to warp
   --dry-run                           Print commands only
+  --python-bin <path>                 Python binary for Prometheus query capture (default: python3)
+  --service-metrics-url <url>         Plain Prometheus text scrape URL
+  --service-prometheus-query-url <url>
+                                      Prometheus HTTP API /api/v1/query URL for OTLP-exported metrics
+  --service-prometheus-query <promql> PromQL for --service-prometheus-query-url
+  --service-metrics-service-name <name>
+                                      Optional service.name/service_name filter for query results
+  --service-metrics-filter-regex <regex>
+                                      Regex for retained plain text metrics lines
+  --service-metrics-attempts <n>      Direct scrape attempts per snapshot (default: 3)
+  --service-metrics-retry-secs <n>    Sleep between direct scrape attempts (default: 1)
+  --service-metrics-connect-timeout-secs <n>
+                                      Curl connect timeout for direct scrape (default: 2)
+  --service-metrics-max-time-secs <n> Curl max time for direct scrape (default: 15)
 
 Topology metadata (optional but recommended):
   --nodes <n>
@@ -136,6 +160,16 @@ parse_args() {
       --baseline-root) BASELINE_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --warp-bin) WARP_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --python-bin) PYTHON_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-url) SERVICE_METRICS_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-prometheus-query) SERVICE_PROMETHEUS_QUERY="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-service-name) SERVICE_METRICS_SERVICE_NAME="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-attempts) SERVICE_METRICS_CAPTURE_ATTEMPTS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --nodes) TOPOLOGY_NODES="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --disks-per-node) TOPOLOGY_DISKS_PER_NODE="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --total-disks) TOPOLOGY_TOTAL_DISKS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -195,6 +229,14 @@ validate_args() {
     echo "ERROR: --baseline-root does not exist: $BASELINE_ROOT" >&2
     exit 1
   fi
+  if [[ -n "$SERVICE_METRICS_URL" && -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
+    exit 1
+  fi
+  if ! is_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" || ! is_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" || ! is_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" || ! is_positive_int "$SERVICE_METRICS_MAX_TIME_SECS"; then
+    echo "ERROR: service metrics attempt/timeout options must be valid integers" >&2
+    exit 1
+  fi
 }
 
 setup_output() {
@@ -204,11 +246,13 @@ setup_output() {
   RUNS_DIR="${OUT_DIR}/runs"
   AGG_MEDIAN_CSV="${OUT_DIR}/aggregate_median_summary.csv"
   AGG_COMPARE_CSV="${OUT_DIR}/aggregate_baseline_compare.csv"
+  AGG_SERVICE_METRICS_CSV="${OUT_DIR}/aggregate_service_metrics_captures.csv"
   RUN_MATRIX_CSV="${OUT_DIR}/run_matrix.csv"
   mkdir -p "$RUNS_DIR"
 
   echo "concurrency,size,tool,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,bucket,run_dir" > "$AGG_MEDIAN_CSV"
   echo "concurrency,size,tool,new_median_reqps,baseline_median_reqps,delta_reqps_pct,new_median_latency_ms,baseline_median_latency_ms,delta_latency_pct,new_median_throughput_bps,baseline_median_throughput_bps,delta_throughput_pct,run_dir" > "$AGG_COMPARE_CSV"
+  echo "concurrency,run_dir,size,tool,round,attempt,phase,source,status,capture_attempt,raw_bytes,snapshot_bytes,status_file,snapshot_file,filter_regex,prometheus_query" > "$AGG_SERVICE_METRICS_CSV"
   echo "concurrency,bucket,run_dir,baseline_csv,status" > "$RUN_MATRIX_CSV"
 }
 
@@ -253,6 +297,16 @@ write_manifest() {
     echo "dry_run=$(join_bool "$DRY_RUN")"
     echo "baseline_root=${BASELINE_ROOT:-N/A}"
     echo "extra_args_present=$([[ -n "$EXTRA_ARGS" ]] && echo true || echo false)"
+    echo "python_bin=${PYTHON_BIN}"
+    echo "service_metrics_url=${SERVICE_METRICS_URL:-N/A}"
+    echo "service_prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL:-N/A}"
+    echo "service_prometheus_query=${SERVICE_PROMETHEUS_QUERY:-N/A}"
+    echo "service_metrics_service_name=${SERVICE_METRICS_SERVICE_NAME:-N/A}"
+    echo "service_metrics_filter_regex=${SERVICE_METRICS_FILTER_REGEX:-N/A}"
+    echo "service_metrics_capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}"
+    echo "service_metrics_retry_secs=${SERVICE_METRICS_CAPTURE_RETRY_SECS}"
+    echo "service_metrics_connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}"
+    echo "service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}"
     echo "workload_label=${WORKLOAD_LABEL}"
     echo "nodes=${TOPOLOGY_NODES:-N/A}"
     echo "disks_per_node=${TOPOLOGY_DISKS_PER_NODE:-N/A}"
@@ -275,11 +329,13 @@ Top-level artifacts:
 - run_matrix.csv: one row per concurrency run, including bucket and baseline linkage
 - aggregate_median_summary.csv: merged median_summary rows from every concurrency run
 - aggregate_baseline_compare.csv: merged baseline_compare rows when a matching baseline exists
+- aggregate_service_metrics_captures.csv: merged service metrics capture status from every concurrency run
 - runs/cXX/: direct output directory of scripts/run_object_batch_bench_enhanced.sh
 
 Per-concurrency directory:
 - round_results.csv
 - median_summary.csv
+- service_metrics_captures.csv (when service metrics capture is enabled)
 - baseline_compare.csv (only when a baseline CSV is supplied)
 - logs/
 EOF
@@ -338,11 +394,15 @@ append_aggregate_rows() {
   local run_dir="$3"
   local median_csv="$4"
   local compare_csv="$5"
+  local service_metrics_csv="${run_dir}/service_metrics_captures.csv"
 
   awk -F',' -v c="$concurrency" -v b="$bucket" -v rd="$run_dir" 'NR>1 {print c "," $1 "," $2 "," $4 "," $5 "," $6 "," $7 "," $8 "," b "," rd}' "$median_csv" >> "$AGG_MEDIAN_CSV"
 
   if [[ -f "$compare_csv" ]]; then
     awk -F',' -v c="$concurrency" -v rd="$run_dir" 'NR>1 {print c "," $1 "," $2 "," $4 "," $5 "," $6 "," $7 "," $8 "," $9 "," $10 "," $11 "," $12 "," rd}' "$compare_csv" >> "$AGG_COMPARE_CSV"
+  fi
+  if [[ -f "$service_metrics_csv" ]]; then
+    awk -F',' -v c="$concurrency" -v rd="$run_dir" 'NR>1 {print c "," rd "," $0}' "$service_metrics_csv" >> "$AGG_SERVICE_METRICS_CSV"
   fi
 }
 
@@ -383,6 +443,31 @@ run_concurrency() {
   if [[ -n "$EXTRA_ARGS" ]]; then
     cmd+=(--extra-args "$EXTRA_ARGS")
   fi
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    cmd+=(--service-metrics-dir "${run_dir}/service-metrics")
+  fi
+  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+    cmd+=(--service-metrics-url "$SERVICE_METRICS_URL")
+  fi
+  if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    cmd+=(--service-prometheus-query-url "$SERVICE_PROMETHEUS_QUERY_URL")
+  fi
+  if [[ -n "$SERVICE_PROMETHEUS_QUERY" ]]; then
+    cmd+=(--service-prometheus-query "$SERVICE_PROMETHEUS_QUERY")
+  fi
+  if [[ -n "$SERVICE_METRICS_SERVICE_NAME" ]]; then
+    cmd+=(--service-metrics-service-name "$SERVICE_METRICS_SERVICE_NAME")
+  fi
+  if [[ -n "$SERVICE_METRICS_FILTER_REGEX" ]]; then
+    cmd+=(--service-metrics-filter-regex "$SERVICE_METRICS_FILTER_REGEX")
+  fi
+  cmd+=(
+    --python-bin "$PYTHON_BIN"
+    --service-metrics-attempts "$SERVICE_METRICS_CAPTURE_ATTEMPTS"
+    --service-metrics-retry-secs "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
+    --service-metrics-connect-timeout-secs "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS"
+    --service-metrics-max-time-secs "$SERVICE_METRICS_MAX_TIME_SECS"
+  )
   if [[ "$DRY_RUN" == "true" ]]; then
     cmd+=(--dry-run)
   fi
@@ -433,6 +518,10 @@ main() {
   echo "Duration: $DURATION"
   echo "Rounds: $ROUNDS"
   echo "Cooldown secs: $COOLDOWN_SECS"
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    echo "Service metrics capture: enabled"
+    echo "Service metrics source: $([[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]] && echo prometheus_query || echo prometheus_text)"
+  fi
 
   local conc_count conc_index
   conc_count="$(csv_to_lines "$CONCURRENCIES" | awk 'END{print NR+0}')"
@@ -452,6 +541,9 @@ main() {
   echo "Top-level summaries:"
   echo "  - $RUN_MATRIX_CSV"
   echo "  - $AGG_MEDIAN_CSV"
+  if [[ -s "$AGG_SERVICE_METRICS_CSV" ]]; then
+    echo "  - $AGG_SERVICE_METRICS_CSV"
+  fi
   if [[ -s "$AGG_COMPARE_CSV" ]]; then
     echo "  - $AGG_COMPARE_CSV"
   fi
