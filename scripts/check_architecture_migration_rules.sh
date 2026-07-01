@@ -2534,9 +2534,17 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::bucket::replication::(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)' \
-    crates/ecstore/src \
-    --glob '*.rs' |
+  {
+    rg -n --with-filename 'crate::bucket::replication::(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'use\s+crate::bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'crate::\{[^;]*bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+  } |
     rg -v '^crates/ecstore/src/bucket/replication/' || true
 ) >"$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE"
 

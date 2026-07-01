@@ -551,14 +551,13 @@ impl BucketTargetSys {
 
         if arn.arn_type == BucketTargetType::ReplicationService
             && let Ok((config, _)) = get_replication_config(bucket).await
+            && ReplicationTargetConfigBridge::target_is_used_by_rules(&config, arn_str)
         {
-            if ReplicationTargetConfigBridge::target_is_used_by_rules(&config, arn_str) {
-                let arn_remotes_map = self.arn_remotes_map.read().await;
-                if arn_remotes_map.get(arn_str).is_some() {
-                    return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
-                        bucket: bucket.to_string(),
-                    });
-                }
+            let arn_remotes_map = self.arn_remotes_map.read().await;
+            if arn_remotes_map.get(arn_str).is_some() {
+                return Err(BucketTargetError::BucketRemoteRemoveDisallowed {
+                    bucket: bucket.to_string(),
+                });
             }
         }
 

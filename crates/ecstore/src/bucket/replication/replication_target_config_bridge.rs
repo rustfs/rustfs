@@ -27,7 +27,7 @@ impl ReplicationTargetConfigBridge {
                 ..Default::default()
             })
             .into_iter()
-            .any(|rule| rule == arn || config.role == arn)
+            .any(|rule| rule == arn)
     }
 }
 
@@ -38,7 +38,7 @@ mod tests {
     #[test]
     fn target_config_bridge_matches_role_target() {
         let config = ReplicationConfiguration {
-            role: "arn:target".to_string(),
+            role: " arn:target ".to_string(),
             rules: Vec::new(),
         };
 
