@@ -45,7 +45,8 @@ SERVICE_METRICS_CAPTURE_ATTEMPTS=3
 SERVICE_METRICS_CAPTURE_RETRY_SECS=1
 SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
 SERVICE_METRICS_MAX_TIME_SECS=15
-SERVICE_METRICS_FILTER_REGEX="rustfs_io_get_object_"
+SERVICE_METRICS_FILTER_REGEX=""
+SERVICE_METRICS_FILTER_REGEX_EXPLICIT=false
 
 usage() {
   cat <<'USAGE'
@@ -97,7 +98,7 @@ Enhanced options:
                                Curl max time for each metrics capture (default: 15)
   --service-metrics-filter-regex
                                Regex for retained metrics lines after scrape
-                               (default: rustfs_io_get_object_)
+                               (default: auto by tool/mode)
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
@@ -163,7 +164,7 @@ parse_args() {
       --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
       --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
       --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
-      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; shift 2 ;;
+      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; SERVICE_METRICS_FILTER_REGEX_EXPLICIT=true; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -209,6 +210,27 @@ cooldown_sleep() {
   fi
 }
 
+default_service_metrics_filter_regex() {
+  if [[ "$TOOL" == "warp" ]]; then
+    case "$WARP_MODE" in
+      get)
+        echo "rustfs_io_get_object_|rustfs_s3_get_object_|rustfs_zero_copy_read|rustfs_mmap_|rustfs_get_object_"
+        return
+        ;;
+      put)
+        echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_write|rustfs_buffer_|rustfs_ec_|rustfs_io_bytespool_"
+        return
+        ;;
+      mixed)
+        echo "rustfs_s3_get_object_|rustfs_io_get_object_|rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_|rustfs_buffer_|rustfs_ec_"
+        return
+        ;;
+    esac
+  fi
+
+  echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_s3_get_object_|rustfs_io_get_object_"
+}
+
 validate_args() {
   if [[ "$TOOL" != "warp" && "$TOOL" != "s3bench" ]]; then
     echo "ERROR: --tool must be warp or s3bench" >&2
@@ -242,6 +264,10 @@ validate_args() {
     exit 1
   fi
   if [[ "$TOOL" == "warp" ]]; then
+    if [[ "$WARP_MODE" != "get" && "$WARP_MODE" != "put" && "$WARP_MODE" != "mixed" ]]; then
+      echo "ERROR: --warp-mode must be get, put, or mixed" >&2
+      exit 1
+    fi
     local warp_host
     warp_host="$(normalize_warp_host "$ENDPOINT")"
     if [[ -z "$warp_host" ]]; then
@@ -249,6 +275,81 @@ validate_args() {
       exit 1
     fi
   fi
+  if [[ "$SERVICE_METRICS_FILTER_REGEX_EXPLICIT" != "true" && -z "$SERVICE_METRICS_FILTER_REGEX" ]]; then
+    SERVICE_METRICS_FILTER_REGEX="$(default_service_metrics_filter_regex)"
+  fi
+}
+
+git_value() {
+  local default_value="$1"
+  shift
+  git "$@" 2>/dev/null || echo "$default_value"
+}
+
+git_dirty_state() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "unknown"
+    return
+  fi
+  if ! git diff --quiet --ignore-submodules --; then
+    echo "dirty"
+    return
+  fi
+  if ! git diff --cached --quiet --ignore-submodules --; then
+    echo "dirty"
+    return
+  fi
+  echo "clean"
+}
+
+write_run_manifest() {
+  local manifest_file="$OUT_DIR/run_manifest.env"
+  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
+  started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  git_commit="$(git_value unknown rev-parse --short HEAD)"
+  git_branch="$(git_value unknown branch --show-current)"
+  git_dirty="$(git_dirty_state)"
+  rustc_version="$(rustc --version 2>/dev/null || echo unknown)"
+  uname_s="$(uname -a 2>/dev/null || echo unknown)"
+  service_metrics_csv="${SERVICE_METRICS_CSV:-}"
+
+  cat >"$manifest_file" <<EOF
+started_at_utc=${started_at_utc}
+git_commit=${git_commit}
+git_branch=${git_branch}
+git_dirty=${git_dirty}
+rustc_version=${rustc_version}
+uname=${uname_s}
+tool=${TOOL}
+endpoint=${ENDPOINT}
+access_key=REDACTED
+secret_key=REDACTED
+bucket=${BUCKET}
+bucket_size_suffix=${BUCKET_SIZE_SUFFIX}
+region=${REGION}
+concurrency=${CONCURRENCY}
+sizes=${SIZES}
+rounds=${ROUNDS}
+retry_per_round=${RETRY_PER_ROUND}
+retry_sleep_secs=${RETRY_SLEEP_SECS}
+cooldown_secs=${COOLDOWN_SECS}
+warp_bin=${WARP_BIN}
+warp_mode=${WARP_MODE}
+duration=${DURATION}
+s3bench_bin=${S3BENCH_BIN}
+samples=${SAMPLES}
+baseline_csv=${BASELINE_CSV}
+service_metrics_url=${SERVICE_METRICS_URL}
+service_metrics_dir=${SERVICE_METRICS_DIR}
+service_metrics_csv=${service_metrics_csv}
+service_metrics_filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+service_metrics_filter_regex_explicit=${SERVICE_METRICS_FILTER_REGEX_EXPLICIT}
+service_metrics_capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
+service_metrics_retry_secs=${SERVICE_METRICS_CAPTURE_RETRY_SECS}
+service_metrics_connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
+service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+dry_run=${DRY_RUN}
+EOF
 }
 
 setup_output() {
@@ -263,9 +364,14 @@ setup_output() {
   ROUND_CSV="$OUT_DIR/round_results.csv"
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
   COMPARE_CSV="$OUT_DIR/baseline_compare.csv"
+  SERVICE_METRICS_CSV="$OUT_DIR/service_metrics_captures.csv"
 
   echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms" > "$ROUND_CSV"
   echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,median_req_p90_ms,median_req_p99_ms" > "$MEDIAN_CSV"
+  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+    echo "size,tool,round,attempt,phase,status,capture_attempt,raw_bytes,snapshot_bytes,status_file,snapshot_file,filter_regex" > "$SERVICE_METRICS_CSV"
+  fi
+  write_run_manifest
 }
 
 trim() {
@@ -445,6 +551,7 @@ status=not_run_dry_run
 url=${SERVICE_METRICS_URL}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 EOF
+    echo "$size,$TOOL,$round,$attempt,$phase,not_run_dry_run,0,0,0,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX" >> "$SERVICE_METRICS_CSV"
     return 0
   fi
 
@@ -472,6 +579,7 @@ filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 raw_bytes=${raw_bytes}
 snapshot_bytes=${snapshot_bytes}
 EOF
+        echo "$size,$TOOL,$round,$attempt,$phase,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX" >> "$SERVICE_METRICS_CSV"
         return 0
       fi
     fi
@@ -495,6 +603,7 @@ connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 EOF
+  echo "$size,$TOOL,$round,$attempt,$phase,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX" >> "$SERVICE_METRICS_CSV"
   echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
 }
 
@@ -753,6 +862,9 @@ main() {
   echo "Rounds: $ROUNDS"
   echo "Retry per round: $RETRY_PER_ROUND"
   echo "Cooldown secs: $COOLDOWN_SECS"
+  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+    echo "Service metrics filter: $SERVICE_METRICS_FILTER_REGEX"
+  fi
 
   IFS=',' read -r -a size_arr <<< "$SIZES"
   local total_sizes="${#size_arr[@]}"
