@@ -797,10 +797,13 @@ impl FileMeta {
 
         if !include_free_versions {
             versions.versions = versions_vec;
-        }
 
-        for fi in versions.free_versions.iter_mut() {
-            fi.num_versions = n;
+            for fi in versions.versions.iter_mut() {
+                fi.num_versions = n;
+            }
+            for fi in versions.free_versions.iter_mut() {
+                fi.num_versions = n;
+            }
         }
 
         Ok(versions)
@@ -1712,6 +1715,68 @@ mod test {
             fm.versions.is_empty(),
             "delete-marker version purge should remove the local marker instead of rewriting purge metadata onto it"
         );
+    }
+
+    #[test]
+    fn get_file_info_versions_excludes_free_versions_from_num_versions() {
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let delete_marker_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("transitioned object version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create a free-version record");
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(delete_marker_id),
+            deleted: true,
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("delete marker should be added");
+
+        let versions = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("file info versions should parse");
+
+        assert_eq!(versions.versions.len(), 1);
+        assert_eq!(versions.free_versions.len(), 1);
+        assert!(versions.versions[0].deleted);
+        assert_eq!(versions.versions[0].num_versions, 1);
+        assert_eq!(versions.free_versions[0].num_versions, 1);
+
+        let versions_with_free = fm
+            .get_file_info_versions("bucket", "object", true)
+            .expect("file info versions should preserve all versions");
+
+        assert_eq!(versions_with_free.versions.len(), 2);
+        assert!(versions_with_free.free_versions.is_empty());
+        assert!(versions_with_free.versions.iter().all(|version| version.num_versions == 2));
     }
 
     #[test]

@@ -229,8 +229,9 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   `main` cannot be deleted
 - Iceberg views support basic create, list, load, replace, existence check, and
   drop routes with persisted view metadata and view-scoped authorization
-- metadata maintenance supports safe dry-run planning and controlled worker
-  execution checks
+- metadata maintenance supports safe dry-run planning, controlled worker
+  execution checks, and a scheduler status report with disabled, paused,
+  backpressure, retry, quarantine, and audit-timeline state
 - catalog diagnostics exposes the table recovery and consistency state used by
   operators
 - catalog export and diagnostics expose the current catalog backing manifest,
@@ -333,10 +334,10 @@ Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
 - credential vending: automated after table bootstrap with exact-prefix validation and a data-plane scope probe; full no-long-term-data-credential bootstrap is not claimed
-- background maintenance worker: controlled run-once and heartbeat endpoints are registered; continuous in-process scheduling is not claimed
+- background maintenance worker: controlled run-once, heartbeat, and scheduler status endpoints are registered; disabled/paused/backpressure/retry/quarantine/audit-timeline state is machine-readable; continuous in-process scheduling is not claimed
 - manifest/data reachability cleanup: metadata maintenance reads manifest-list and manifest Avro references, reports manifest/data/delete reachability, and deletes only unreferenced table objects that pass the safety window
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
-- automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint; built-in periodic scheduling is not claimed
+- automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint and scheduler status report; built-in periodic scheduling is not claimed
 - compaction rewrite: controlled run-once support for partition-local Parquet binpack through metadata maintenance; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed
 - row-level delete/update/merge commits: standard catalog commit validates append, overwrite, delete, and replace snapshot manifests for table-warehouse scope, referenced object existence, current-live-file deletes, and stale add/delete conflicts; end-to-end SQL DML client coverage remains a compatibility validation item
 - external catalog bridges: metadata import/register and operator-supplied metadata pointer sync are supported for Polaris/Glue/DLF/Hive identity boundaries; online vendor SDK polling and policy mirroring are not claimed

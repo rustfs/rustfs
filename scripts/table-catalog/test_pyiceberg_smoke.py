@@ -294,6 +294,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
         maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
         job_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")
+        scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
         worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
 
         def fake_signed_request(
@@ -311,6 +312,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 return {"job": {"job-id": "job-1"}}
             if (method, path) == ("GET", job_path):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}}
+            if (method, path) == ("GET", scheduler_path):
+                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1"}]}
             if (method, path) == ("POST", worker_path):
                 return {"job": {"status": "UNKNOWN"}}
             raise AssertionError(f"unexpected REST request: {method} {path}")
@@ -330,6 +333,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         view_path = pyiceberg_smoke.view_endpoint_path(args)
         config_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/config")
         maintenance_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/metadata")
+        scheduler_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/scheduler")
         worker_path = pyiceberg_smoke.table_endpoint_path(args, "/maintenance/worker/run")
         diagnostics_path = pyiceberg_smoke.table_endpoint_path(args, "/catalog/diagnostics")
 
@@ -369,6 +373,8 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
                 return {"job": {"job-id": "job-1"}}
             if (method, path) == ("GET", pyiceberg_smoke.table_endpoint_path(args, "/maintenance/jobs/job-1")):
                 return {"job": {"job-id": "job-1", "status": "SUCCESSFUL"}}
+            if (method, path) == ("GET", scheduler_path):
+                return {"status": "DISABLED", "audit_timeline": [{"job_id": "job-1"}]}
             if (method, path) == ("POST", worker_path):
                 return {"job": {"status": "PAUSED"}}
             if (method, path) == ("GET", diagnostics_path):
@@ -398,6 +404,7 @@ class PyIcebergSmokeConfigTest(unittest.TestCase):
         )
         self.assertIn(("GET", metadata_location_path, None), calls)
         self.assertIn(("GET", diagnostics_path, None), calls)
+        self.assertIn(("GET", scheduler_path, None), calls)
         self.assertIn(("POST", worker_path, {}), calls)
 
     def test_table_ref_probe_force_deletes_smoke_ref_after_validation_failure(self) -> None:

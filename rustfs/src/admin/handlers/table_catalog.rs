@@ -135,6 +135,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "PUT /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/config",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}",
+    "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
@@ -179,6 +180,7 @@ static TABLE_METADATA_MAINTENANCE_HANDLER: RestTableMetadataMaintenanceHandler =
 static GET_TABLE_MAINTENANCE_CONFIG_HANDLER: GetTableMaintenanceConfigHandler = GetTableMaintenanceConfigHandler {};
 static PUT_TABLE_MAINTENANCE_CONFIG_HANDLER: PutTableMaintenanceConfigHandler = PutTableMaintenanceConfigHandler {};
 static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTableMaintenanceJobHandler {};
+static GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER: GetTableMaintenanceSchedulerHandler = GetTableMaintenanceSchedulerHandler {};
 static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
 static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
@@ -941,6 +943,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::GET,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}").as_str(),
         AdminOperation(&GET_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
+        Method::GET,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/scheduler").as_str(),
+        AdminOperation(&GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER),
     )?;
     r.insert(
         Method::POST,
@@ -5201,6 +5208,26 @@ impl Operation for GetTableMaintenanceJobHandler {
     }
 }
 
+pub struct GetTableMaintenanceSchedulerHandler {}
+
+#[async_trait::async_trait]
+impl Operation for GetTableMaintenanceSchedulerHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableLifecycleAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .get_table_maintenance_scheduler_report(&warehouse, &namespace.public_name(), &table)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct RunTableMaintenanceWorkerHandler {}
 
 #[async_trait::async_trait]
@@ -5641,6 +5668,7 @@ mod tests {
             ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5694,6 +5722,7 @@ mod tests {
             ("GetTableMaintenanceConfigHandler", "AdminAction::GetTableLifecycleAction"),
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
+            ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5749,6 +5778,7 @@ mod tests {
             "GetTableMaintenanceConfigHandler",
             "PutTableMaintenanceConfigHandler",
             "GetTableMaintenanceJobHandler",
+            "GetTableMaintenanceSchedulerHandler",
             "RunTableMaintenanceWorkerHandler",
             "HeartbeatTableMaintenanceJobHandler",
             "ExportTableCatalogHandler",
@@ -5857,6 +5887,7 @@ mod tests {
         let _: &GetTableMaintenanceConfigHandler = &GET_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &PutTableMaintenanceConfigHandler = &PUT_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
+        let _: &GetTableMaintenanceSchedulerHandler = &GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
         let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
@@ -5894,6 +5925,7 @@ mod tests {
         assert_operation::<GetTableMaintenanceConfigHandler>();
         assert_operation::<PutTableMaintenanceConfigHandler>();
         assert_operation::<GetTableMaintenanceJobHandler>();
+        assert_operation::<GetTableMaintenanceSchedulerHandler>();
         assert_operation::<RunTableMaintenanceWorkerHandler>();
         assert_operation::<HeartbeatTableMaintenanceJobHandler>();
         assert_operation::<ExportTableCatalogHandler>();

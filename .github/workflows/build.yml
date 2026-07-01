@@ -201,7 +201,7 @@ jobs:
     name: Build RustFS
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux' && fromJSON('["self-hosted","linux","compile"]') || matrix.os }}
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

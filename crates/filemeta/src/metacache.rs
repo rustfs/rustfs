@@ -188,7 +188,9 @@ impl MetaCacheEntry {
 
         let mut fm = FileMeta::new();
         fm.unmarshal_msg(&self.metadata)?;
-        fm.into_file_info_versions(bucket, self.name.as_str(), false)
+        let mut versions = fm.get_file_info_versions(bucket, self.name.as_str(), false)?;
+        versions.free_versions.clear();
+        Ok(versions)
     }
 
     pub fn file_info_versions_with_free_versions(&self, bucket: &str) -> Result<FileInfoVersions> {
@@ -1005,6 +1007,70 @@ mod tests {
         assert_eq!(with_free.free_versions[0].transitioned_objname, "remote/object");
         assert_eq!(with_free.free_versions[0].transition_tier, "WARM");
         assert_eq!(with_free.free_versions[0].transition_version_id, Some(remote_version_id));
+    }
+
+    #[test]
+    fn file_info_versions_excludes_free_versions_from_visible_version_count() {
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let delete_marker_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("transitioned object version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create a free-version record");
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(delete_marker_id),
+            deleted: true,
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("delete marker should be added");
+
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("metadata should marshal"),
+            ..Default::default()
+        };
+
+        let normal = entry.file_info_versions("bucket").expect("normal versions should parse");
+        assert_eq!(normal.versions.len(), 1);
+        assert!(normal.free_versions.is_empty());
+        assert!(normal.versions[0].deleted);
+        assert_eq!(normal.versions[0].num_versions, 1);
+
+        let with_free = entry
+            .file_info_versions_with_free_versions("bucket")
+            .expect("versions with free versions should parse");
+        assert_eq!(with_free.versions.len(), 1);
+        assert_eq!(with_free.free_versions.len(), 1);
+        assert_eq!(with_free.versions[0].num_versions, 1);
+        assert_eq!(with_free.free_versions[0].num_versions, 1);
     }
 
     #[test]

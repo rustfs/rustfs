@@ -778,7 +778,7 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustfs_filemeta::ReplicationState;
+    use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, ReplicationState, TRANSITION_COMPLETE};
 
     #[test]
     fn versions_after_marker_handles_null_version_marker() {
@@ -887,6 +887,67 @@ mod tests {
         assert_eq!(obj_a_count, 2);
         assert_eq!(obj_b_count, 3);
         assert_eq!(objects.len(), 5);
+    }
+
+    #[tokio::test]
+    async fn versions_listing_excludes_tier_free_versions_from_delete_marker_count() {
+        let object_version_id = Uuid::new_v4();
+        let remote_version_id = Uuid::new_v4();
+        let free_version_id = Uuid::new_v4();
+        let delete_marker_id = Uuid::new_v4();
+        let base_time = OffsetDateTime::now_utc();
+        let mut fm = FileMeta::new();
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            transition_status: TRANSITION_COMPLETE.to_string(),
+            transitioned_objname: "remote/object".to_string(),
+            transition_version_id: Some(remote_version_id),
+            transition_tier: "WARM".to_string(),
+            mod_time: Some(base_time),
+            ..Default::default()
+        })
+        .expect("transitioned object version should be added");
+
+        let mut delete_fi = FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(object_version_id),
+            mod_time: Some(base_time),
+            ..Default::default()
+        };
+        delete_fi.set_tier_free_version_id(&free_version_id.to_string());
+        fm.delete_version(&delete_fi)
+            .expect("transitioned delete should create a free-version record");
+
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(delete_marker_id),
+            deleted: true,
+            mod_time: Some(base_time + time::Duration::seconds(1)),
+            ..Default::default()
+        })
+        .expect("delete marker should be added");
+
+        let entries = MetaCacheEntriesSorted {
+            o: rustfs_filemeta::MetaCacheEntries(vec![Some(MetaCacheEntry {
+                name: "object".to_string(),
+                metadata: fm.marshal_msg().expect("metadata should marshal"),
+                ..Default::default()
+            })]),
+            ..Default::default()
+        };
+
+        let objects = ObjectInfo::from_meta_cache_entries_sorted_versions(&entries, "bucket", "", None, None).await;
+
+        assert_eq!(objects.len(), 1);
+        assert_eq!(objects[0].name, "object");
+        assert!(objects[0].delete_marker);
+        assert!(objects[0].is_latest);
+        assert_eq!(objects[0].num_versions, 1);
     }
 
     #[test]
