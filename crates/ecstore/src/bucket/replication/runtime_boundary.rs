@@ -14,13 +14,13 @@
 
 use std::sync::Arc;
 
+use super::replication_bandwidth_boundary::ReplicationBucketMonitor;
 use super::replication_pool::DynReplicationPool;
 use super::replication_state::ReplicationStats;
-use crate::bucket::bandwidth::monitor::Monitor;
+use super::replication_storage_boundary::ReplicationObjectStore;
 use crate::runtime::sources;
-use crate::store::ECStore;
 
-pub(crate) fn object_store_handle() -> Option<Arc<ECStore>> {
+pub(crate) fn object_store_handle() -> Option<Arc<ReplicationObjectStore>> {
     sources::object_store_handle()
 }
 
@@ -40,6 +40,6 @@ pub(crate) fn replication_runtime_initialized() -> bool {
     sources::replication_runtime_initialized()
 }
 
-pub(crate) fn bucket_monitor() -> Option<Arc<Monitor>> {
+pub(crate) fn bucket_monitor() -> Option<Arc<ReplicationBucketMonitor>> {
     sources::bucket_monitor()
 }

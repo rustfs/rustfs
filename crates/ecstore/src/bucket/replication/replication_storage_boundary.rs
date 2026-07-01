@@ -16,6 +16,7 @@ use rustfs_filemeta::FileInfo;
 use tokio_util::sync::CancellationToken;
 
 use super::replication_error_boundary::Error;
+pub(crate) type ReplicationObjectStore = crate::store::ECStore;
 pub(crate) use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 pub(crate) use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 pub(crate) use crate::storage_api_contracts::list::{

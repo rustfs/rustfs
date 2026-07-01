@@ -117,7 +117,9 @@ Current coupling:
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
-  ECStore owner path for replication self-imports.
+  ECStore owner path for replication self-imports;
+- replication runtime source access uses storage/bandwidth boundary aliases for
+  ECStore object store and bucket monitor implementation types.
 
 Required contracts before crate movement:
 
@@ -154,7 +156,8 @@ Required contracts before crate movement:
   are concentrated in
   `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`.
 - `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
-  node identity, cancellation, and queue sizing.
+  node identity, cancellation, and queue sizing. Concrete ECStore object store
+  and bucket monitor types stay behind local storage/bandwidth boundaries.
 - `ReplicationBandwidthLimiter`: target reader wrapping for replication
   bandwidth accounting and throttling.
 - `ReplicationEventSink`: notification/audit events for skipped, failed, and

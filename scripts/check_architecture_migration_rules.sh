@@ -208,6 +208,7 @@ REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_local_path_bypas
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
+REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_boundary_bypass_hits.txt"
@@ -2568,6 +2569,88 @@ fi
 
 if [[ -s "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE" ]]; then
   report_failure "replication modules must use local relative paths instead of crate-qualified replication self paths: $(paste -sd '; ' "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      next if $ARGV =~ m{replication_(storage|bandwidth)_boundary\.rs$};
+
+      sub blank {
+        my ($text) = @_;
+        $text =~ s/[^\n]/ /g;
+        return $text;
+      }
+
+      sub blank_block_comments {
+        my ($text) = @_;
+        my $out = $text;
+        my $len = length($text);
+        my $i = 0;
+
+        while ($i < $len) {
+          if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+            my $start = $i;
+            my $depth = 0;
+
+            while ($i < $len) {
+              if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+                $depth++;
+                $i += 2;
+                next;
+              }
+              if ($i + 1 < $len && substr($text, $i, 2) eq "*/") {
+                $depth--;
+                $i += 2;
+                last if $depth == 0;
+                next;
+              }
+              $i++;
+            }
+
+            substr($out, $start, $i - $start) = blank(substr($text, $start, $i - $start));
+            next;
+          }
+
+          $i++;
+        }
+
+        return $out;
+      }
+
+      my $source = $_;
+      my $hash = chr(35);
+      $source =~ s{b?r(${hash}*)".*?"\1}{blank($&)}egs;
+      $source =~ s{b?"(?:\\.|[^"\\])*"}{blank($&)}egs;
+      $source =~ s{'\''(?:\\.|[^'\''\\])+'\''}{blank($&)}egs;
+      $source = blank_block_comments($source);
+      $source =~ s{//[^\n]*}{blank($&)}eg;
+
+      for my $statement (split /;/, $source) {
+        my $normalized = $statement;
+        $normalized =~ s/\s+//g;
+
+        my $hits_ecstore =
+          $normalized =~ /\bECStore\b/
+          && $normalized =~ /crate::(?:store(?:::|::\{)|\{.*store(?:::|::\{))/s;
+        my $hits_monitor =
+          $normalized =~ /\bMonitor\b/
+          && $normalized =~ /crate::(?:bucket(?:::|::\{)|\{.*bucket(?:::|::\{))/s
+          && $normalized =~ /bucket(?:::|::\{).*bandwidth(?:::|::\{).*monitor(?:::|::\{)/s;
+
+        if ($hits_ecstore || $hits_monitor) {
+          my $prefix = substr($source, 0, index($source, $statement));
+          my $line = ($prefix =~ tr/\n//) + 1;
+          $normalized =~ s/\s+/ /g;
+          print "$ARGV:$line:$normalized\n";
+        }
+      }
+    ' || true
+) >"$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication runtime concrete types must stay behind local storage or bandwidth boundaries: $(paste -sd '; ' "$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE")"
 fi
 
 (
