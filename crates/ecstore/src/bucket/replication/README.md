@@ -13,7 +13,7 @@ and lifecycle/heal scheduling paths.
 | `datatypes.rs` | Replication status and operation DTOs. | Publicly re-exported through the ECStore replication facade. |
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, metadata paths, and file metadata replication contracts through local boundaries, config storage, storage contracts through the replication storage boundary, runtime sources, and notification state. |
 | `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
-| `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources, file metadata replication contracts, and error contracts through local boundaries, and owns shared replication pool/stat state. |
+| `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources, file metadata replication contracts, error contracts, and bucket monitor handles through local boundaries, and owns shared replication pool/stat state. |
 | `rule.rs` | Rule evaluation helpers for object replication options. | Depends on ECStore replication object option types. |
 | `mod.rs` | Compatibility re-export facade for the current ECStore owner. | Must stay stable until downstream scanner, lifecycle, heal, and metrics paths compile through replacement contracts. |
 
@@ -28,7 +28,7 @@ and lifecycle/heal scheduling paths.
 | `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
 | `ReplicationErrorBoundary` | ECStore error/result contracts and replication-specific error classifiers. | `crate::error` imports are concentrated in `replication_error_boundary.rs`. |
 | `ReplicationTargetStore` | Bucket target listing, target client lookup, target offline checks, target config types, and target operation option types. | Bucket target sys access, `BucketTargets`, and target operation types are concentrated in `replication_target_boundary.rs`. |
-| `ReplicationRuntime` | Worker pool, queue sizing, stats, bucket monitor, local node identity, cancellation, and admission state. | Direct runtime source/global access and shared replication pool/stat state. |
+| `ReplicationRuntime` | Worker pool, queue sizing, stats, bucket monitor, local node identity, cancellation, and admission state. | Direct runtime source/global access and shared replication pool/stat state; ECStore object store and bucket monitor implementation types stay behind local storage/bandwidth boundaries. |
 | `ReplicationBandwidthLimiter` | Target reader wrapping for replication bandwidth accounting and throttling. | Direct bucket bandwidth reader imports from resyncer paths. |
 | `ReplicationEventSink` | Notification and audit events for skipped, failed, pending, and completed replication operations. | Event notification service calls and local event host selection are concentrated in `replication_event_sink.rs`. |
 | `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Direct bucket tagging helper imports from replication workers. |
@@ -48,7 +48,9 @@ and lifecycle/heal scheduling paths.
    lifecycle, scanner, OBS, heal, and tests compile through replacement paths.
 5. Keep imports between modules in this directory relative to the local
    replication module, not `crate::bucket::replication::*` self paths.
-6. Move at most one contract boundary per code-bearing PR and verify it with
+6. Keep runtime source access from importing ECStore object store or bucket
+   monitor implementation types directly; use local boundary-owned aliases.
+7. Move at most one contract boundary per code-bearing PR and verify it with
    focused replication tests before broad gates.
 
 ## First Code-Bearing Step
