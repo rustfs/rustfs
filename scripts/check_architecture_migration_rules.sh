@@ -199,8 +199,10 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
+STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
+SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_dto_boundary_bypass_hits.txt"
 OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/obs_replication_stats_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
@@ -2541,6 +2543,24 @@ fi
 (
   cd "$ROOT_DIR"
   {
+    rg -n --with-filename 'ecstore_bucket::replication::(DynReplicationPool|ReplicationStats|get_global_replication_pool|get_global_replication_stats|init_background_replication)' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage/storage_api.rs' || true
+    rg -n --with-filename '\b(get_sr_metrics_for_node|q_cache|inc_proxy)\b' \
+      rustfs/src \
+      --glob '*.rs' \
+      --glob '!rustfs/src/storage/storage_api.rs' || true
+  }
+) >"$STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS replication pool/stat handles must stay behind rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
     rg -n --with-filename '\b(ObjectOpts|ResyncOpts)\s*\{' \
       rustfs/src/admin \
       --glob '*.rs' \
@@ -2591,6 +2611,24 @@ fi
 
 if [[ -s "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "app replication ObjectOpts/MustReplicateOptions/bridge access must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_ecstore::api::bucket::replication' \
+      crates/scanner/src crates/scanner/tests \
+      --glob '*.rs' \
+      --glob '!crates/scanner/src/storage_api.rs' || true
+    rg -n --with-filename '\b(ReplicateObjectInfo|ReplicationType|ResyncDecision|ResyncTargetDecision|EcstoreReplicationConfig|EcstoreReplicationHealQueueResult|EcstoreReplicationQueueAdmission)\b|ReplicationConfig\s*\{' \
+      crates/scanner/src crates/scanner/tests \
+      --glob '*.rs' \
+      --glob '!crates/scanner/src/storage_api.rs' || true
+  }
+) >"$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication queue DTO access must stay behind crates/scanner/src/storage_api.rs: $(paste -sd '; ' "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

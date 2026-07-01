@@ -1518,10 +1518,7 @@ impl ScannerIODisk for Disk {
         if replication_config.has_active_rules("", true)
             && let Ok(targets) = BucketTargetSys::get().list_bucket_targets(&cache.info.name).await
         {
-            cache.info.replication = Some(Arc::new(ReplicationConfig {
-                config: Some(replication_config),
-                remotes: Some(targets),
-            }));
+            cache.info.replication = Some(Arc::new(ReplicationConfig::new(Some(replication_config), Some(targets))));
         }
 
         // TODO: object lock

@@ -17,6 +17,7 @@
 use std::sync::Arc;
 
 use rustfs_storage_api as storage_contracts;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod contract {
     pub(crate) mod admin {
@@ -483,7 +484,9 @@ pub(crate) type DiskResult<T> = ecstore_disk::error::Result<T>;
 pub(crate) type DiskStore = ecstore_disk::DiskStore;
 #[cfg(test)]
 pub(crate) type DisksLayout = ecstore_layout::DisksLayout;
-pub(crate) type DynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
+type EcstoreDynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
+type EcstoreReplicationStats = ecstore_bucket::replication::ReplicationStats;
+pub(crate) type DynReplicationPool = StorageReplicationPoolHandle;
 pub(crate) type DynReader = ecstore_rio::DynReader;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
@@ -511,7 +514,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
-pub(crate) type ReplicationStats = ecstore_bucket::replication::ReplicationStats;
+pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
@@ -530,6 +533,128 @@ pub(crate) type EncryptReader<R> = ecstore_rio::EncryptReader<R>;
 #[cfg(test)]
 pub(crate) type HardLimitReader<R> = ecstore_rio::HardLimitReader<R>;
 pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageReplicationPoolHandle {
+    inner: Arc<EcstoreDynReplicationPool>,
+}
+
+impl StorageReplicationPoolHandle {
+    fn new(inner: Arc<EcstoreDynReplicationPool>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    pub(crate) fn active_workers(&self) -> i32 {
+        self.inner.active_workers()
+    }
+
+    pub(crate) fn active_mrf_workers(&self) -> i32 {
+        self.inner.active_mrf_workers()
+    }
+
+    pub(crate) fn active_lrg_workers(&self) -> i32 {
+        self.inner.active_lrg_workers()
+    }
+
+    pub(crate) async fn get_bucket_resync_status(
+        &self,
+        bucket: &str,
+    ) -> Result<ecstore_bucket::replication::BucketReplicationResyncStatus> {
+        self.inner.get_bucket_resync_status(bucket).await
+    }
+
+    pub(crate) async fn cancel_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<()> {
+        self.inner.clone().cancel_bucket_resync(opts).await
+    }
+
+    pub(crate) async fn start_bucket_resync(&self, opts: ecstore_bucket::replication::ResyncOpts) -> Result<()> {
+        self.inner.clone().start_bucket_resync(opts).await
+    }
+
+    pub(crate) async fn init_resync(self: Arc<Self>, ctx: CancellationToken, buckets: Vec<String>) -> Result<()> {
+        self.inner.clone().init_resync(ctx, buckets).await
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct StorageReplicationStatsHandle {
+    inner: Arc<EcstoreReplicationStats>,
+}
+
+impl StorageReplicationStatsHandle {
+    #[cfg(test)]
+    pub(crate) fn new() -> Self {
+        Self {
+            inner: Arc::new(EcstoreReplicationStats::new()),
+        }
+    }
+
+    fn from_ecstore(inner: Arc<EcstoreReplicationStats>) -> Arc<Self> {
+        Arc::new(Self { inner })
+    }
+
+    pub(crate) async fn get_latest_replication_stats(&self, bucket: &str) -> ecstore_bucket::replication::BucketStats {
+        self.inner.get_latest_replication_stats(bucket).await
+    }
+
+    pub(crate) async fn site_metrics_snapshot(&self) -> ReplicationSiteMetricsSnapshot {
+        let metrics = self.inner.get_sr_metrics_for_node().await;
+        ReplicationSiteMetricsSnapshot {
+            uptime: metrics.uptime,
+            queued_curr_count: metrics.queued.curr.count,
+            queued_curr_bytes: metrics.queued.curr.bytes,
+            queued_avg_count: metrics.queued.avg.count,
+            queued_avg_bytes: metrics.queued.avg.bytes,
+            queued_max_count: metrics.queued.max.count,
+            queued_max_bytes: metrics.queued.max.bytes,
+            active_workers_curr: metrics.active_workers.curr,
+            active_workers_avg: metrics.active_workers.avg,
+            active_workers_max: metrics.active_workers.max,
+            proxy_get_total: metrics.proxied.get_total,
+            proxy_head_total: metrics.proxied.head_total,
+            proxy_get_failed: metrics.proxied.get_failed,
+            proxy_head_failed: metrics.proxied.head_failed,
+            proxy_put_tag_total: metrics.proxied.put_tag_total,
+            proxy_put_tag_failed: metrics.proxied.put_tag_failed,
+            replica_size: metrics.replica_size,
+            replica_count: metrics.replica_count,
+        }
+    }
+
+    fn queue_current_count(&self) -> Option<i64> {
+        self.inner
+            .q_cache
+            .try_lock()
+            .ok()
+            .map(|cache| cache.sr_queue_stats.curr.get_current_count())
+    }
+
+    async fn record_proxy(&self, bucket: &str, api: &str, is_err: bool) {
+        self.inner.inc_proxy(bucket, api, is_err).await;
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ReplicationSiteMetricsSnapshot {
+    pub(crate) uptime: i64,
+    pub(crate) queued_curr_count: i64,
+    pub(crate) queued_curr_bytes: i64,
+    pub(crate) queued_avg_count: i64,
+    pub(crate) queued_avg_bytes: i64,
+    pub(crate) queued_max_count: i64,
+    pub(crate) queued_max_bytes: i64,
+    pub(crate) active_workers_curr: i32,
+    pub(crate) active_workers_avg: f64,
+    pub(crate) active_workers_max: i32,
+    pub(crate) proxy_get_total: i64,
+    pub(crate) proxy_head_total: i64,
+    pub(crate) proxy_get_failed: i64,
+    pub(crate) proxy_head_failed: i64,
+    pub(crate) proxy_put_tag_total: i64,
+    pub(crate) proxy_put_tag_failed: i64,
+    pub(crate) replica_size: i64,
+    pub(crate) replica_count: i64,
+}
 
 pub(crate) async fn get_local_server_property() -> rustfs_madmin::ServerProperties {
     ecstore_admin::get_local_server_property().await
@@ -564,11 +689,11 @@ pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
 }
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
-    ecstore_bucket::replication::get_global_replication_pool()
+    ecstore_bucket::replication::get_global_replication_pool().map(StorageReplicationPoolHandle::new)
 }
 
 pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
-    ecstore_bucket::replication::get_global_replication_stats()
+    ecstore_bucket::replication::get_global_replication_stats().map(StorageReplicationStatsHandle::from_ecstore)
 }
 
 pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {
@@ -620,13 +745,7 @@ pub(crate) async fn prewarm_local_disk_id_map() {
 }
 
 pub(crate) fn replication_queue_current_count() -> Option<i64> {
-    get_global_replication_stats().and_then(|stats| {
-        stats
-            .q_cache
-            .try_lock()
-            .ok()
-            .map(|cache| cache.sr_queue_stats.curr.get_current_count())
-    })
+    get_global_replication_stats().and_then(|stats| stats.queue_current_count())
 }
 
 pub(crate) async fn save_config(api: Arc<ECStore>, file: &str, data: Vec<u8>) -> Result<()> {
@@ -1048,7 +1167,7 @@ pub(crate) fn check_retention_for_modification(
 
 pub(crate) async fn record_replication_proxy(bucket: &str, api: &str, is_err: bool) {
     if let Some(stats) = get_global_replication_stats() {
-        stats.inc_proxy(bucket, api, is_err).await;
+        stats.record_proxy(bucket, api, is_err).await;
     }
 }
 

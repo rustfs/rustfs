@@ -174,8 +174,10 @@ Required evidence before proposing the split:
 
 Decision: do not split in code yet. Replication remains coupled to ECStore
 object APIs, bucket target clients, metadata systems, file metadata replication
-state, runtime replication pool/stat handles, bucket monitor state, scanner
-repair classification, lifecycle-originated deletes, and notification events.
+state, ECStore-owned runtime replication pool/stat handles, bucket monitor
+state, scanner repair classification, lifecycle-originated deletes, and
+notification events. RustFS-facing runtime consumers should use storage-owner
+wrapper handles while that state remains in ECStore.
 
 Required evidence before proposing the split:
 

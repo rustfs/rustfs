@@ -126,6 +126,9 @@ Current coupling:
 - app object and multipart writes call object-replication boundary helpers
   instead of constructing replication work DTOs or choosing object replication
   operation types at the use-case layer;
+- RustFS runtime consumers receive replication pool/stat handles through
+  storage-owner wrapper types instead of carrying ECStore replication handles
+  through app, admin, startup, or workload-admission layers;
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
@@ -193,9 +196,16 @@ Required contracts before crate movement:
   metrics through obs-local snapshot DTOs in
   `crates/obs/src/metrics/storage_api.rs` instead of carrying the ECStore
   replication stats handle through collectors.
+- `StorageReplicationPoolHandle` / `StorageReplicationStatsHandle`: RustFS app, admin,
+  startup, and workload-admission code use storage-owner wrapper types from
+  `rustfs/src/storage/storage_api.rs` for pool activity, resync, queue counts,
+  proxy stats, and site metrics snapshots.
 - `ReplicationScannerBridge`: scanner-originated replication heal scheduling is
   exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_scanner_bridge.rs`.
+  Scanner consumers receive scanner-local replication config/admission/heal
+  object DTOs from `crates/scanner/src/storage_api.rs` instead of constructing
+  or inspecting replication queue DTOs directly.
 - `ReplicationTargetConfigBridge`: bucket target removal checks against
   replication target rules are exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_target_config_bridge.rs`.

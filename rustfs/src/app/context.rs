@@ -157,12 +157,12 @@ pub fn resolve_bucket_monitor_handle() -> Option<Arc<BucketBandwidthMonitor>> {
 }
 
 /// Resolve replication pool handle using AppContext-first precedence.
-pub fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
+pub(crate) fn resolve_replication_pool_handle() -> Option<Arc<DynReplicationPool>> {
     resolve_replication_pool_handle_with(get_global_app_context())
 }
 
 /// Resolve replication statistics handle using AppContext-first precedence.
-pub fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
+pub(crate) fn resolve_replication_stats_handle() -> Option<Arc<ReplicationStats>> {
     resolve_replication_stats_handle_with(get_global_app_context())
 }
 
