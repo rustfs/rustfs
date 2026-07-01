@@ -2250,6 +2250,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
+                    object_class.as_str(),
+                    size_bucket,
                 )
                 .await?
                 {

@@ -844,6 +844,13 @@ struct BitrotReaderSetup {
 }
 
 #[derive(Clone, Copy)]
+struct BitrotReaderSetupAttribution {
+    path: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+}
+
+#[derive(Clone, Copy)]
 enum BitrotReaderSetupMode {
     ReadQuorum,
     VerifyReconstruction,
@@ -1113,16 +1120,49 @@ fn record_bitrot_reader_setup_fanout(
     strategy: BitrotReaderSetupStrategy,
     mode: BitrotReaderSetupMode,
     setup: &BitrotReaderSetup,
+    attribution: Option<BitrotReaderSetupAttribution>,
 ) {
-    rustfs_io_metrics::record_get_object_reader_setup_fanout(
-        strategy.as_str(),
-        mode.as_str(),
-        setup.scheduled_shards(),
-        setup.attempted_shards(),
-        setup.available_shards(),
-        setup.completed_failed_shards(),
-        setup.deferred_shards(),
-    );
+    let strategy = strategy.as_str();
+    let mode = mode.as_str();
+    let scheduled = setup.scheduled_shards();
+    let attempted = setup.attempted_shards();
+    let ready = setup.available_shards();
+    let failed = setup.completed_failed_shards();
+    let deferred = setup.deferred_shards();
+    rustfs_io_metrics::record_get_object_reader_setup_fanout(strategy, mode, scheduled, attempted, ready, failed, deferred);
+    if let Some(attribution) = attribution {
+        rustfs_io_metrics::record_get_object_reader_setup_fanout_by_size(
+            attribution.path,
+            strategy,
+            mode,
+            attribution.object_class,
+            attribution.size_bucket,
+            scheduled,
+            attempted,
+            ready,
+            failed,
+            deferred,
+        );
+    }
+}
+
+fn record_bitrot_reader_setup_strategy(
+    strategy: BitrotReaderSetupStrategy,
+    mode: BitrotReaderSetupMode,
+    attribution: Option<BitrotReaderSetupAttribution>,
+) {
+    let strategy = strategy.as_str();
+    let mode = mode.as_str();
+    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy, mode);
+    if let Some(attribution) = attribution {
+        rustfs_io_metrics::record_get_object_reader_setup_strategy_by_size(
+            attribution.path,
+            strategy,
+            mode,
+            attribution.object_class,
+            attribution.size_bucket,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1142,13 +1182,14 @@ async fn create_bitrot_readers_until_quorum_all_shards(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
     stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
     let strategy = BitrotReaderSetupStrategy::AllShards;
     let mut setup = BitrotReaderSetup::new(disks.len());
     let mut reader_tasks = FuturesUnordered::new();
     let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
 
-    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
+    record_bitrot_reader_setup_strategy(strategy, mode, attribution);
 
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     for (idx, disk_op) in disks.iter().enumerate() {
@@ -1215,7 +1256,7 @@ async fn create_bitrot_readers_until_quorum_all_shards(
     if let Some(stage_metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
     }
-    record_bitrot_reader_setup_fanout(strategy, mode, &setup);
+    record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
 
     setup
 }
@@ -1237,6 +1278,7 @@ async fn create_bitrot_readers_until_quorum(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
     stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
     create_bitrot_readers_until_quorum_with_preference(
         files,
@@ -1255,6 +1297,7 @@ async fn create_bitrot_readers_until_quorum(
         mode,
         false,
         stage_metrics,
+        attribution,
     )
     .await
 }
@@ -1277,6 +1320,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     mode: BitrotReaderSetupMode,
     prefer_data_blocks_first: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
     if strategy == BitrotReaderSetupStrategy::AllShards {
@@ -1296,6 +1340,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             parity_shards,
             mode,
             stage_metrics,
+            attribution,
         )
         .await;
     }
@@ -1305,7 +1350,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     let total_shards = disks.len();
     let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
 
-    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
+    record_bitrot_reader_setup_strategy(strategy, mode, attribution);
 
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     let initial_target = setup.setup_target(data_shards, parity_shards, mode);
@@ -1390,7 +1435,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     if let Some(stage_metrics) = stage_metrics {
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
     }
-    record_bitrot_reader_setup_fanout(strategy, mode, &setup);
+    record_bitrot_reader_setup_fanout(strategy, mode, &setup, attribution);
 
     setup
 }
@@ -1464,7 +1509,7 @@ async fn create_data_block_bitrot_readers(
 
     // The direct-memory path only consumes the data shard readers. If one of
     // them is missing, the caller falls back to the regular GET path.
-    record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup);
+    record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup, None);
 
     setup
 }
@@ -2775,6 +2820,11 @@ impl SetDisks {
                 BitrotReaderSetupMode::ReadQuorum,
                 prefer_data_blocks_first_reader_setup,
                 None,
+                Some(BitrotReaderSetupAttribution {
+                    path: metrics_path,
+                    object_class: metrics_object_class,
+                    size_bucket: metrics_size_bucket,
+                }),
             )
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
@@ -3045,6 +3095,8 @@ impl SetDisks {
         _set_index: usize,
         _pool_index: usize,
         skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
@@ -3071,6 +3123,8 @@ impl SetDisks {
                 part_length,
                 part.size,
                 skip_verify_bitrot,
+                metrics_object_class,
+                metrics_size_bucket,
             )
             .await;
         }
@@ -3110,6 +3164,8 @@ impl SetDisks {
                 part.size,
                 part.size,
                 skip_verify_bitrot,
+                metrics_object_class,
+                metrics_size_bucket,
             )
             .await?
             {
@@ -3138,6 +3194,8 @@ impl SetDisks {
         part_length: usize,
         part_size: usize,
         skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
@@ -3182,6 +3240,11 @@ impl SetDisks {
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
             reader_stage_metrics,
+            Some(BitrotReaderSetupAttribution {
+                path: metrics_path,
+                object_class: metrics_object_class,
+                size_bucket: metrics_size_bucket,
+            }),
         )
         .await;
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
@@ -4545,6 +4608,7 @@ mod tests {
                     parity_shards,
                     mode,
                     None,
+                    None,
                 )
                 .await
             },
@@ -4578,6 +4642,7 @@ mod tests {
             parity_shards,
             mode,
             prefer_data_blocks_first,
+            None,
             None,
         )
         .await

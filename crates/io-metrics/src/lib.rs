@@ -1124,6 +1124,29 @@ pub fn record_get_object_reader_setup_strategy(strategy: &'static str, mode: &'s
     .increment(1);
 }
 
+/// Record the bitrot reader setup scheduling strategy with bounded GET attribution labels.
+#[inline(always)]
+pub fn record_get_object_reader_setup_strategy_by_size(
+    path: &'static str,
+    strategy: &'static str,
+    mode: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_reader_setup_strategy_by_size_total",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .increment(1);
+}
+
 /// Record the final bitrot reader setup fanout shape for a GET read.
 #[inline(always)]
 pub fn record_get_object_reader_setup_fanout(
@@ -1166,6 +1189,71 @@ pub fn record_get_object_reader_setup_fanout(
         "rustfs_io_get_object_reader_setup_deferred",
         "strategy" => strategy,
         "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(deferred));
+}
+
+/// Record the final bitrot reader setup fanout shape with bounded GET attribution labels.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_get_object_reader_setup_fanout_by_size(
+    path: &'static str,
+    strategy: &'static str,
+    mode: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    scheduled: usize,
+    attempted: usize,
+    ready: usize,
+    failed: usize,
+    deferred: usize,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_reader_setup_scheduled_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(scheduled));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_attempted_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(attempted));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_ready_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(ready));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_failed_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(failed));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_deferred_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
     )
     .record(shard_read_fanout_to_f64(deferred));
 }
@@ -2001,7 +2089,26 @@ mod tests {
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
         record_get_object_reader_setup_strategy("data_blocks_first", "read_quorum");
+        record_get_object_reader_setup_strategy_by_size(
+            "codec_streaming",
+            "data_blocks_first",
+            "read_quorum",
+            "plain_single_part",
+            "le_1mib",
+        );
         record_get_object_reader_setup_fanout("data_blocks_first", "read_quorum", 3, 2, 2, 0, 2);
+        record_get_object_reader_setup_fanout_by_size(
+            "codec_streaming",
+            "data_blocks_first",
+            "read_quorum",
+            "plain_single_part",
+            "le_1mib",
+            3,
+            2,
+            2,
+            0,
+            2,
+        );
 
         assert!(0.005_f64.is_sign_positive());
     }
