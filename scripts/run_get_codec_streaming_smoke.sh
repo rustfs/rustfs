@@ -1281,7 +1281,7 @@ EOF
     return 0
   fi
 
-  local tmp_file filtered_file capture_attempt
+  local tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes
   tmp_file="${snapshot_file}.tmp"
   filtered_file="${snapshot_file}.filtered.tmp"
   for ((capture_attempt=1; capture_attempt<=DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
@@ -1290,8 +1290,10 @@ EOF
       --max-time "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" \
       "$DIAGNOSTIC_METRICS_URL" >"$tmp_file"; then
       if [[ -s "$tmp_file" ]]; then
+        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
         filter_diagnostic_metrics_snapshot "$tmp_file" "$filtered_file"
         mv "$filtered_file" "$snapshot_file"
+        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
         cat >"$status_file" <<EOF
 phase=${phase}
 status=ok
@@ -1300,6 +1302,8 @@ url=${DIAGNOSTIC_METRICS_URL}
 connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
 filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
+raw_bytes=${raw_bytes}
+snapshot_bytes=${snapshot_bytes}
 EOF
         return 0
       fi

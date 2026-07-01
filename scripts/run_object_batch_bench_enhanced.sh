@@ -410,7 +410,7 @@ capture_round_service_metrics() {
     return 0
   fi
 
-  local token snapshot_file status_file tmp_file filtered_file capture_attempt
+  local token snapshot_file status_file tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes
   token="$(metric_snapshot_token "$size" "$round" "$attempt")"
   snapshot_file="${SERVICE_METRICS_DIR}/${token}_${phase}.prom"
   status_file="${SERVICE_METRICS_DIR}/${token}_${phase}.status"
@@ -437,8 +437,10 @@ EOF
       --max-time "$SERVICE_METRICS_MAX_TIME_SECS" \
       "$SERVICE_METRICS_URL" >"$tmp_file"; then
       if [[ -s "$tmp_file" ]]; then
+        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
         filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
         mv "$filtered_file" "$snapshot_file"
+        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
         cat >"$status_file" <<EOF
 size=${size}
 round=${round}
@@ -450,6 +452,8 @@ url=${SERVICE_METRICS_URL}
 connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+raw_bytes=${raw_bytes}
+snapshot_bytes=${snapshot_bytes}
 EOF
         return 0
       fi
