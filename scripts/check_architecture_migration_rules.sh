@@ -209,6 +209,7 @@ REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
+REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_scanner_bridge_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_boundary_bypass_hits.txt"
@@ -2667,6 +2668,17 @@ fi
 
 if [[ -s "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication runtime-source access must stay behind replication runtime boundary: $(paste -sd '; ' "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'queue_replication_heal_internal' \
+    crates/scanner/src crates/scanner/tests \
+    --glob '*.rs' || true
+) >"$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication heal queueing must stay behind ReplicationScannerBridge: $(paste -sd '; ' "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE")"
 fi
 
 (

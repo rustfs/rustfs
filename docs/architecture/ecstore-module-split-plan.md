@@ -59,7 +59,8 @@ Current coupling:
   IDs, and local node names;
 - stale multipart cleanup depends on `SetDisks` internals and bucket metadata
   through the lifecycle metadata boundary;
-- lifecycle expiry schedules bucket replication delete work directly;
+- lifecycle expiry schedules bucket replication delete work through the
+  replication lifecycle bridge contract;
 - lifecycle evaluation shares S3 DTOs, object metadata, object lock, replication
   config reads through lifecycle-local boundaries, scanner metrics,
   notification/audit side effects, and tier services.
@@ -112,8 +113,9 @@ Current coupling:
 - resync and delete replication paths call metadata paths through the metadata
   boundary, while bucket target system access, target config types, and target
   operation types are concentrated behind the replication target boundary;
-- lifecycle and heal paths schedule replication work through the current ECStore
-  module;
+- lifecycle delete paths schedule replication work through
+  `ReplicationLifecycleBridge`, while scanner heal paths schedule replication
+  work through `ReplicationScannerBridge`;
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
@@ -167,7 +169,11 @@ Required contracts before crate movement:
 - `ReplicationEventSink`: notification/audit events for skipped, failed, and
   completed replication operations, including local event host selection.
 - `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
-  scheduling without importing lifecycle internals.
+  scheduling is exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_lifecycle_bridge.rs`.
+- `ReplicationScannerBridge`: scanner-originated replication heal scheduling is
+  exposed through the contract type in
+  `crates/ecstore/src/bucket/replication/replication_scanner_bridge.rs`.
 
 First safe PR:
 
