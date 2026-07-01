@@ -486,7 +486,7 @@ pub(crate) type DiskStore = ecstore_disk::DiskStore;
 pub(crate) type DisksLayout = ecstore_layout::DisksLayout;
 type EcstoreDynReplicationPool = ecstore_bucket::replication::DynReplicationPool;
 type EcstoreReplicationStats = ecstore_bucket::replication::ReplicationStats;
-pub(crate) type DynReplicationPool = ReplicationPoolHandle;
+pub(crate) type DynReplicationPool = StorageReplicationPoolHandle;
 pub(crate) type DynReader = ecstore_rio::DynReader;
 pub(crate) type ECStore = ecstore_storage::ECStore;
 pub(crate) type Endpoint = ecstore_disk::endpoint::Endpoint;
@@ -514,7 +514,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
-pub(crate) type ReplicationStats = ReplicationStatsHandle;
+pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;
 pub(crate) type TierConfigMgr = ecstore_tier::TierConfigMgr;
@@ -535,11 +535,11 @@ pub(crate) type HardLimitReader<R> = ecstore_rio::HardLimitReader<R>;
 pub(crate) type NotificationSys = ecstore_notification::NotificationSys;
 
 #[derive(Debug, Clone)]
-pub struct ReplicationPoolHandle {
+pub(crate) struct StorageReplicationPoolHandle {
     inner: Arc<EcstoreDynReplicationPool>,
 }
 
-impl ReplicationPoolHandle {
+impl StorageReplicationPoolHandle {
     fn new(inner: Arc<EcstoreDynReplicationPool>) -> Arc<Self> {
         Arc::new(Self { inner })
     }
@@ -577,11 +577,11 @@ impl ReplicationPoolHandle {
 }
 
 #[derive(Debug, Clone)]
-pub struct ReplicationStatsHandle {
+pub(crate) struct StorageReplicationStatsHandle {
     inner: Arc<EcstoreReplicationStats>,
 }
 
-impl ReplicationStatsHandle {
+impl StorageReplicationStatsHandle {
     #[cfg(test)]
     pub(crate) fn new() -> Self {
         Self {
@@ -689,11 +689,11 @@ pub(crate) fn disk_endpoint(disk: &DiskStore) -> String {
 }
 
 pub(crate) fn get_global_replication_pool() -> Option<Arc<DynReplicationPool>> {
-    ecstore_bucket::replication::get_global_replication_pool().map(ReplicationPoolHandle::new)
+    ecstore_bucket::replication::get_global_replication_pool().map(StorageReplicationPoolHandle::new)
 }
 
 pub(crate) fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
-    ecstore_bucket::replication::get_global_replication_stats().map(ReplicationStatsHandle::from_ecstore)
+    ecstore_bucket::replication::get_global_replication_stats().map(StorageReplicationStatsHandle::from_ecstore)
 }
 
 pub(crate) fn get_global_boot_time() -> Option<std::time::SystemTime> {

@@ -196,7 +196,7 @@ Required contracts before crate movement:
   metrics through obs-local snapshot DTOs in
   `crates/obs/src/metrics/storage_api.rs` instead of carrying the ECStore
   replication stats handle through collectors.
-- `ReplicationPoolHandle` / `ReplicationStatsHandle`: RustFS app, admin,
+- `StorageReplicationPoolHandle` / `StorageReplicationStatsHandle`: RustFS app, admin,
   startup, and workload-admission code use storage-owner wrapper types from
   `rustfs/src/storage/storage_api.rs` for pool activity, resync, queue counts,
   proxy stats, and site metrics snapshots.

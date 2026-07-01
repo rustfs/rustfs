@@ -166,11 +166,11 @@ impl AppContext {
         self.bucket_monitor.clone()
     }
 
-    pub fn replication_pool(&self) -> Arc<dyn ReplicationPoolInterface> {
+    pub(crate) fn replication_pool(&self) -> Arc<dyn ReplicationPoolInterface> {
         self.replication_pool.clone()
     }
 
-    pub fn replication_stats(&self) -> Arc<dyn ReplicationStatsInterface> {
+    pub(crate) fn replication_stats(&self) -> Arc<dyn ReplicationStatsInterface> {
         self.replication_stats.clone()
     }
 
