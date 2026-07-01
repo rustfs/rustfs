@@ -1532,15 +1532,19 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
         }
     })?;
 
-    let action = match ext_req.route {
-        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 | ReplicationExtRoute::Check => {
+    authorize_request(req, replication_extension_policy_action(ext_req.route)).await
+}
+
+fn replication_extension_policy_action(route: ReplicationExtRoute) -> Action {
+    match route {
+        ReplicationExtRoute::MetricsV1 | ReplicationExtRoute::MetricsV2 => {
             Action::S3Action(S3Action::GetReplicationConfigurationAction)
         }
+        ReplicationExtRoute::Check => Action::S3Action(S3Action::PutReplicationConfigurationAction),
         ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
             Action::S3Action(S3Action::ResetBucketReplicationStateAction)
         }
-    };
-    authorize_request(req, action).await
+    }
 }
 
 fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest> {
@@ -1586,17 +1590,17 @@ fn collect_resettable_replication_target_arns(config: &s3s::dto::ReplicationConf
             continue;
         }
 
-        let arn = if config.role.is_empty() {
-            rule.destination.bucket.clone()
+        let arn = if config.role.trim().is_empty() {
+            rule.destination.bucket.trim().to_string()
         } else {
-            config.role.clone()
+            config.role.trim().to_string()
         };
 
         if seen.insert(arn.clone()) {
             arns.push(arn);
         }
 
-        if !config.role.is_empty() {
+        if !config.role.trim().is_empty() {
             break;
         }
     }
@@ -1775,26 +1779,27 @@ fn validate_replication_check_config_targets(
         .map(|target| target.arn.as_str())
         .collect::<HashSet<_>>();
 
+    let role = config.role.trim();
+    if !role.is_empty() {
+        if !configured_arns.contains(role) {
+            return Err(s3_error!(InvalidRequest, "replication config has stale target {role}"));
+        }
+        return Ok(());
+    }
+
     for rule in &config.rules {
         if rule.status == s3s::dto::ReplicationRuleStatus::from_static(s3s::dto::ReplicationRuleStatus::DISABLED) {
             continue;
         }
 
-        let configured_arn = if config.role.is_empty() {
-            rule.destination.bucket.as_str()
-        } else {
-            config.role.as_str()
-        };
-
-        if configured_arns.contains(configured_arn) {
-            continue;
+        let configured_arn = rule.destination.bucket.trim();
+        if !configured_arn.is_empty() && !configured_arns.contains(configured_arn) {
+            let rule_id = rule.id.as_deref().unwrap_or("<unknown>");
+            return Err(s3_error!(
+                InvalidRequest,
+                "replication rule {rule_id} references stale target {configured_arn}"
+            ));
         }
-
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication config with rule ID {} has a stale target",
-            rule.id.clone().unwrap_or_default()
-        ));
     }
 
     Ok(())
@@ -2628,6 +2633,22 @@ mod tests {
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method).is_none());
         assert!(parse_replication_extension_request(&Method::GET, &wrong_method_reset).is_none());
         assert!(parse_replication_extension_request(&Method::PUT, &wrong_method_status).is_none());
+    }
+
+    #[test]
+    fn replication_extension_policy_action_uses_write_permission_for_active_check() {
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::MetricsV1),
+            Action::S3Action(S3Action::GetReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::Check),
+            Action::S3Action(S3Action::PutReplicationConfigurationAction)
+        );
+        assert_eq!(
+            replication_extension_policy_action(ReplicationExtRoute::ResetStart),
+            Action::S3Action(S3Action::ResetBucketReplicationStateAction)
+        );
     }
 
     #[test]

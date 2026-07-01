@@ -319,6 +319,7 @@ pub(crate) mod target {
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;
     pub(crate) type Credentials = super::ecstore_bucket::target::Credentials;
+    pub(crate) type LatencyStat = super::ecstore_bucket::target::LatencyStat;
 }
 
 pub(crate) mod ecstore_utils {

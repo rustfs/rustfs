@@ -1424,7 +1424,7 @@ pub fn resync_target(
 
     if rs.is_none() {
         let reset_before_date = reset_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if !reset_id.is_empty() && mod_time < reset_before_date {
+        if !reset_id.is_empty() && mod_time <= reset_before_date {
             dec.replicate = true;
             return dec;
         }
@@ -1447,13 +1447,13 @@ pub fn resync_target(
         return dec;
     }
 
-    let new_reset = parts[0] == reset_id;
+    let new_reset = parts[1] != reset_id;
 
     if !new_reset && status == ReplicationStatusType::Completed {
         return dec;
     }
 
-    dec.replicate = new_reset && mod_time < reset_before_date;
+    dec.replicate = new_reset && mod_time <= reset_before_date;
 
     dec
 }
@@ -3337,10 +3337,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 rinfo.replication_status = ReplicationStatusType::Completed;
                 if replication_action == ReplicationAction::None {
                     if self.op_type == ReplicationType::ExistingObject
-                        && object_info.mod_time
-                            > oi.last_modified
-                                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-                        && object_info.version_id.is_none()
+                        && target_is_newer_than_source_null_version(&object_info, &oi)
                     {
                         warn!(
                             event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -3350,7 +3347,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                             object = %object,
                             arn = %tgt_client.arn,
                             endpoint = %tgt_client.to_url(),
-                            reason = "newer_target_version_exists",
+                            reason = "target_newer_than_source_null_version",
                             "Skipping replication because newer target version exists"
                         );
                         send_local_event(EventArgs {
@@ -3558,7 +3555,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             replication_status: self.replication_status.clone(),
             version_purge_status_internal: self.version_purge_status_internal.clone(),
             version_purge_status: self.version_purge_status.clone(),
-            delete_marker: true,
+            delete_marker: self.delete_marker,
             checksum: self.checksum.clone(),
             ..Default::default()
         }
@@ -3983,14 +3980,15 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     Ok(())
 }
 
-fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
-    if op_type == ReplicationType::ExistingObject
-        && oi1.mod_time
-            > oi2
-                .last_modified
-                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+fn target_is_newer_than_source_null_version(oi1: &ObjectInfo, oi2: &HeadObjectOutput) -> bool {
+    oi2.last_modified
+        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+        .is_some_and(|target_mod_time| target_mod_time > oi1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))
         && oi1.version_id.is_none()
-    {
+}
+
+fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
+    if op_type == ReplicationType::ExistingObject && target_is_newer_than_source_null_version(oi1, oi2) {
         return ReplicationAction::None;
     }
 
@@ -4093,8 +4091,9 @@ fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: Rep
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_types::DateTime;
     use std::collections::HashMap;
-    use time::OffsetDateTime;
+    use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
 
     #[test]
@@ -4354,6 +4353,107 @@ mod tests {
             !heal_should_use_check_replicate_delete(&oi),
             "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
         );
+    }
+
+    #[test]
+    fn test_get_replication_action_existing_object_source_newer_null_version_requires_replication() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(10)).build();
+
+        assert_eq!(
+            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::All,
+            "a newer source null version must not be skipped during existing-object replication"
+        );
+    }
+
+    #[test]
+    fn test_get_replication_action_existing_object_target_newer_null_version_skips() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(20)).build();
+
+        assert_eq!(
+            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::None,
+            "a newer target null-version object should not be overwritten by existing-object replication"
+        );
+    }
+
+    #[test]
+    fn test_resync_target_includes_object_at_reset_before_boundary() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(reset_before),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "reset-1", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(
+            decision.replicate,
+            "objects whose mod_time equals reset_before must be included in the reset window"
+        );
+    }
+
+    #[test]
+    fn test_resync_target_replicates_when_reset_id_changes() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: Arc::new(HashMap::from([(
+                target_reset_header("arn:target"),
+                "1970-01-01T00:00:20Z;old-reset".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "new-reset", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(decision.replicate, "a new reset id must resync objects marked by an older reset");
+    }
+
+    #[test]
+    fn test_resync_target_skips_completed_object_for_same_reset_id() {
+        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
+        let oi = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            user_defined: Arc::new(HashMap::from([(
+                target_reset_header("arn:target"),
+                "1970-01-01T00:00:20Z;same-reset".to_string(),
+            )])),
+            ..Default::default()
+        };
+
+        let decision = resync_target(&oi, "arn:target", "same-reset", Some(reset_before), ReplicationStatusType::Completed);
+
+        assert!(!decision.replicate, "the same completed reset id must not resync again");
+    }
+
+    #[test]
+    fn test_replicate_object_info_to_object_info_preserves_delete_marker_flag() {
+        let live = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            delete_marker: false,
+            ..Default::default()
+        };
+        let delete_marker = ReplicateObjectInfo {
+            bucket: "source".to_string(),
+            name: "object".to_string(),
+            delete_marker: true,
+            ..Default::default()
+        };
+
+        assert!(!live.to_object_info().delete_marker);
+        assert!(delete_marker.to_object_info().delete_marker);
     }
 
     #[test]
