@@ -1788,8 +1788,12 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
     }
 }
 
-fn known_put_object_size(data_size: i64, actual_size: i64) -> i64 {
-    if data_size >= 0 { data_size } else { actual_size }
+fn known_put_object_storage_size(data_size: i64) -> i64 {
+    if data_size >= 0 {
+        data_size
+    } else {
+        HashReader::SIZE_PRESERVE_LAYER
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2551,7 +2555,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
-            let put_object_size = known_put_object_size(data.size(), data.actual_size());
+            let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer =
                 runtime_sources::storage_class_should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
@@ -10007,9 +10011,20 @@ mod tests {
     }
 
     #[test]
-    fn put_object_classification_size_falls_back_to_actual_size() {
-        assert_eq!(known_put_object_size(42, 100), 42);
-        assert_eq!(known_put_object_size(-1, 33 * 1024 * 1024), 33 * 1024 * 1024);
+    fn put_object_classification_uses_only_known_storage_size() {
+        assert_eq!(known_put_object_storage_size(42), 42);
+        assert_eq!(
+            known_put_object_storage_size(HashReader::SIZE_PRESERVE_LAYER),
+            HashReader::SIZE_PRESERVE_LAYER
+        );
+        assert!(matches!(
+            classify_put_write_path(false, known_put_object_storage_size(HashReader::SIZE_PRESERVE_LAYER), 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_put_write_path(false, known_put_object_storage_size(1024 * 1024), 1024 * 1024),
+            SmallWritePath::SingleBlockNonInline
+        ));
     }
 
     #[test]
