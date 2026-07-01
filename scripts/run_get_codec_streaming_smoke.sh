@@ -63,6 +63,8 @@ RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
 CODEC_MIN_SIZE=""
+DEFAULT_CODEC_MIN_SIZE=1048576
+DEFAULT_RUSTFS_CODEC_MIN_SIZE=524288
 RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
 COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
@@ -814,6 +816,20 @@ profile_metrics_path() {
     codec-legacy) echo "codec_streaming_legacy_engine" ;;
     codec-rustfs) echo "codec_streaming_rustfs_engine" ;;
     *) die "unknown profile: $profile" ;;
+  esac
+}
+
+compat_probe_codec_min_size() {
+  local profile="$1"
+  if [[ -n "$CODEC_MIN_SIZE" ]]; then
+    echo "$CODEC_MIN_SIZE"
+    return
+  fi
+
+  case "$profile" in
+    codec-rustfs) echo "${RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE:-$DEFAULT_RUSTFS_CODEC_MIN_SIZE}" ;;
+    codec-legacy) echo "$DEFAULT_CODEC_MIN_SIZE" ;;
+    *) echo "0" ;;
   esac
 }
 
@@ -2550,7 +2566,7 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "${CODEC_MIN_SIZE:-0}" "$compat_dir" "$profile" \
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$(compat_probe_codec_min_size "$profile")" "$compat_dir" "$profile" \
     "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" \
     "$CODEC_MULTIPART" "$CODEC_MULTIPART_MAX_PARTS" <<'PY'
 import base64

@@ -595,17 +595,19 @@ capture_prometheus_query_snapshot() {
   local phase="$1"
   local snapshot_file="$2"
   local status_file="$3"
+  local capture_attempt="$4"
 
-  "$PYTHON_BIN" - "$SERVICE_PROMETHEUS_QUERY_URL" "$SERVICE_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$SERVICE_METRICS_SERVICE_NAME" "$SERVICE_METRICS_SETTLE_SECS" <<'PY'
+  "$PYTHON_BIN" - "$SERVICE_PROMETHEUS_QUERY_URL" "$SERVICE_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$SERVICE_METRICS_SERVICE_NAME" "$SERVICE_METRICS_SETTLE_SECS" "$SERVICE_METRICS_MAX_TIME_SECS" "$SERVICE_METRICS_FILTER_REGEX" "$capture_attempt" <<'PY'
 import json
 import pathlib
 import sys
 import urllib.parse
 import urllib.request
 
-query_url, query, phase, snapshot_raw, status_raw, service_name, settle_secs = sys.argv[1:]
+query_url, query, phase, snapshot_raw, status_raw, service_name, settle_secs, timeout_secs_raw, filter_regex, capture_attempt = sys.argv[1:]
 snapshot_path = pathlib.Path(snapshot_raw)
 status_path = pathlib.Path(status_raw)
+timeout_secs = float(timeout_secs_raw)
 
 
 def write_status(status):
@@ -618,6 +620,9 @@ def write_status(status):
                 f"query={query}",
                 f"service_name={service_name}",
                 f"settle_secs={settle_secs}",
+                f"max_time_secs={timeout_secs_raw}",
+                f"filter_regex={filter_regex}",
+                f"capture_attempt={capture_attempt}",
                 "",
             ]
         ),
@@ -647,7 +652,7 @@ try:
     separator = "&" if "?" in query_url else "?"
     url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
     request = urllib.request.Request(url, headers={"Accept": "application/json"})
-    with urllib.request.urlopen(request, timeout=5) as response:
+    with urllib.request.urlopen(request, timeout=timeout_secs) as response:
         payload = json.loads(response.read().decode("utf-8"))
 except Exception as err:  # noqa: BLE001 - shell harness reports failures in status files.
     snapshot_path.write_text(f"# prometheus_query_failed error={err}\n", encoding="utf-8")
@@ -713,10 +718,44 @@ EOF
   fi
 
   if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
-    capture_prometheus_query_snapshot "$phase" "$snapshot_file" "$status_file"
-    capture_status="$(awk -F= '$1=="status" {print $2; exit}' "$status_file")"
-    snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
-    echo "$size,$TOOL,$round,$attempt,$phase,prometheus_query,${capture_status:-unknown},1,$snapshot_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+    for ((capture_attempt=1; capture_attempt<=SERVICE_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+      capture_prometheus_query_snapshot "$phase" "$tmp_file" "$status_file" "$capture_attempt"
+      capture_status="$(awk -F= '$1=="status" {print $2; exit}' "$status_file")"
+      if [[ "${capture_status:-unknown}" == "ok" && -s "$tmp_file" ]]; then
+        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
+        filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
+        mv "$filtered_file" "$snapshot_file"
+        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
+        {
+          echo "raw_bytes=${raw_bytes}"
+          echo "snapshot_bytes=${snapshot_bytes}"
+        } >>"$status_file"
+        echo "$size,$TOOL,$round,$attempt,$phase,prometheus_query,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+        return 0
+      fi
+
+      rm -f "$tmp_file" "$filtered_file"
+      if (( capture_attempt < SERVICE_METRICS_CAPTURE_ATTEMPTS && SERVICE_METRICS_CAPTURE_RETRY_SECS > 0 )); then
+        sleep "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
+      fi
+    done
+
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+status=capture_failed
+capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
+url=${SERVICE_PROMETHEUS_QUERY_URL}
+query=${SERVICE_PROMETHEUS_QUERY}
+max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
+EOF
+    echo "$size,$TOOL,$round,$attempt,$phase,prometheus_query,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+    echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
     return 0
   fi
 
