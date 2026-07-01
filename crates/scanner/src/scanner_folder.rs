@@ -41,9 +41,7 @@ use rustfs_common::metrics::{
     IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
     current_path_updater, global_metrics,
 };
-use rustfs_filemeta::{
-    MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicateObjectInfo, ReplicationStatusType, ReplicationType,
-};
+use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use time::OffsetDateTime;
@@ -54,10 +52,10 @@ use tracing::{debug, error, warn};
 
 use crate::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
-    ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
-    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
+    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
+    ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule, enqueue_runtime_newer_noncurrent,
+    is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path,
+    queue_replication_heal, scanner_is_erasure, scanner_replication_config_for_lifecycle_eval,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
@@ -213,14 +211,14 @@ fn scanner_replication_work_update(admission: ReplicationQueueAdmission) -> Scan
     }
 }
 
-fn scanner_replication_repair_kind(roi: &ReplicateObjectInfo) -> Option<ScannerReplicationRepairKind> {
-    if roi.bucket.is_empty() && roi.name.is_empty() {
+fn scanner_replication_repair_kind(roi: &ReplicationHealObject) -> Option<ScannerReplicationRepairKind> {
+    if roi.is_empty_identity() {
         return None;
     }
 
-    if roi.op_type == ReplicationType::ExistingObject || roi.existing_obj_resync.must_resync() {
+    if roi.is_existing_object_repair() {
         Some(ScannerReplicationRepairKind::BucketExistingObject)
-    } else if !roi.version_purge_status.is_empty() {
+    } else if roi.has_version_purge_status() {
         Some(ScannerReplicationRepairKind::BucketVersionPurge)
     } else if roi.delete_marker {
         Some(ScannerReplicationRepairKind::BucketDeleteMarker)
@@ -229,7 +227,7 @@ fn scanner_replication_repair_kind(roi: &ReplicateObjectInfo) -> Option<ScannerR
     }
 }
 
-fn record_scanner_replication_admission(metrics: &Metrics, roi: &ReplicateObjectInfo, admission: ReplicationQueueAdmission) {
+fn record_scanner_replication_admission(metrics: &Metrics, roi: &ReplicationHealObject, admission: ReplicationQueueAdmission) {
     let work = scanner_replication_work_update(admission);
     metrics.record_scanner_source_work(ScannerWorkSource::BucketReplication, work);
     if let Some(kind) = scanner_replication_repair_kind(roi) {
@@ -801,7 +799,7 @@ impl ScannerItem {
 
         let events = match Evaluator::new(lifecycle.clone())
             .with_lock_retention(lock_retention)
-            .with_replication_config(self.replication.clone())
+            .with_replication_config(scanner_replication_config_for_lifecycle_eval(self.replication.clone()))
             .eval(&object_opts)
             .await
         {
@@ -1765,14 +1763,17 @@ impl FolderScanner {
                 None
             };
 
-            let active_replication =
-                if self.old_cache.info.replication.as_ref().is_some_and(|v| {
-                    !v.is_empty() && v.config.as_ref().is_some_and(|config| config.has_active_rules(&prefix, true))
-                }) {
-                    self.old_cache.info.replication.clone()
-                } else {
-                    None
-                };
+            let active_replication = if self
+                .old_cache
+                .info
+                .replication
+                .as_ref()
+                .is_some_and(|v| v.has_active_rules(&prefix, true))
+            {
+                self.old_cache.info.replication.clone()
+            } else {
+                None
+            };
 
             self.sleeper.sleep_folder().await;
 
@@ -2835,9 +2836,7 @@ mod tests {
 
     use super::*;
     use crate::{DiskOption, Endpoint, new_disk};
-    use rustfs_filemeta::{
-        FileInfo, FileMeta, ReplicateObjectInfo, ReplicationType, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
-    };
+    use rustfs_filemeta::{FileInfo, FileMeta, VersionPurgeStatusType};
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
@@ -3089,11 +3088,7 @@ mod tests {
     #[tokio::test]
     async fn test_scanner_replication_admission_accounting_maps_source_work() {
         let metrics = Metrics::new();
-        let object = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "object-a".to_string(),
-            ..Default::default()
-        };
+        let object = ReplicationHealObject::new("bucket-a", "object-a");
 
         record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Skipped);
         record_scanner_replication_admission(&metrics, &object, ReplicationQueueAdmission::Queued);
@@ -3124,70 +3119,36 @@ mod tests {
 
     #[test]
     fn test_scanner_replication_repair_kind_maps_bucket_variants() {
-        let object = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "object-a".to_string(),
-            replication_status: ReplicationStatusType::Pending,
-            ..Default::default()
-        };
+        let object = ReplicationHealObject::new("bucket-a", "object-a");
         assert_eq!(scanner_replication_repair_kind(&object), Some(ScannerReplicationRepairKind::BucketObject));
 
-        let delete_marker = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "delete-marker-a".to_string(),
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Failed,
-            ..Default::default()
-        };
+        let delete_marker = ReplicationHealObject::new("bucket-a", "delete-marker-a").with_delete_marker();
         assert_eq!(
             scanner_replication_repair_kind(&delete_marker),
             Some(ScannerReplicationRepairKind::BucketDeleteMarker)
         );
 
-        let version_purge = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "version-purge-a".to_string(),
-            version_purge_status: VersionPurgeStatusType::Pending,
-            ..Default::default()
-        };
+        let version_purge = ReplicationHealObject::new("bucket-a", "version-purge-a").with_pending_version_purge();
         assert_eq!(
             scanner_replication_repair_kind(&version_purge),
             Some(ScannerReplicationRepairKind::BucketVersionPurge)
         );
 
-        let existing_object = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "existing-object-a".to_string(),
-            op_type: ReplicationType::ExistingObject,
-            ..Default::default()
-        };
+        let existing_object = ReplicationHealObject::new("bucket-a", "existing-object-a").with_existing_object();
         assert_eq!(
             scanner_replication_repair_kind(&existing_object),
             Some(ScannerReplicationRepairKind::BucketExistingObject)
         );
 
-        let mut existing_obj_resync = ResyncDecision::new();
-        existing_obj_resync.targets.insert(
-            "arn:minio:replication:::target".to_string(),
-            ResyncTargetDecision {
-                replicate: true,
-                ..Default::default()
-            },
-        );
-        let existing_delete_marker = ReplicateObjectInfo {
-            bucket: "bucket-a".to_string(),
-            name: "existing-delete-marker-a".to_string(),
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Completed,
-            existing_obj_resync,
-            ..Default::default()
-        };
+        let existing_delete_marker = ReplicationHealObject::new("bucket-a", "existing-delete-marker-a")
+            .with_delete_marker()
+            .with_existing_object_resync();
         assert_eq!(
             scanner_replication_repair_kind(&existing_delete_marker),
             Some(ScannerReplicationRepairKind::BucketExistingObject)
         );
 
-        assert_eq!(scanner_replication_repair_kind(&ReplicateObjectInfo::default()), None);
+        assert_eq!(scanner_replication_repair_kind(&ReplicationHealObject::default()), None);
     }
 
     #[tokio::test]

@@ -12,6 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use std::collections::HashMap;
+use std::sync::Arc;
+
+use rustfs_filemeta::{ReplicateObjectInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+use serde::{Deserialize, Serialize};
+
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc as EcstoreLcEventSrc;
 pub(crate) use rustfs_ecstore::api::bucket::lifecycle::bucket_lifecycle_ops::{
@@ -31,6 +37,7 @@ pub(crate) use rustfs_ecstore::api::bucket::replication::{
     ReplicationHealQueueResult as EcstoreReplicationHealQueueResult,
     ReplicationQueueAdmission as EcstoreReplicationQueueAdmission, ReplicationScannerBridge as EcstoreReplicationScannerBridge,
 };
+pub(crate) use rustfs_ecstore::api::bucket::target::BucketTargets as EcstoreBucketTargets;
 pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi as EcstoreVersioningApi;
 pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys as EcstoreBucketVersioningSys;
 pub(crate) use rustfs_ecstore::api::cache::{
@@ -81,19 +88,154 @@ pub(crate) mod owner {
         ECSTORE_STORAGECLASS_STANDARD, ECSTORE_TRANSITION_COMPLETE, EcstoreBucketTargetSys, EcstoreBucketVersioningSys,
         EcstoreDisk, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskInfo, EcstoreDiskInfoOptions,
         EcstoreDiskLocation, EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc,
-        EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfig,
-        EcstoreReplicationConfigurationExt, EcstoreReplicationHealQueueResult, EcstoreReplicationQueueAdmission,
+        EcstoreLifecycle, EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfigurationExt,
         EcstoreReplicationScannerBridge, EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore,
-        EcstoreTierConfig, EcstoreVersioningApi, ecstore_apply_expiry_rule, ecstore_apply_transition_rule,
+        EcstoreTierConfig, EcstoreVersioningApi, ScannerReplicationConfig, ScannerReplicationHealObject,
+        ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule,
         ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
         ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd,
         ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_path2_bucket_object,
         ecstore_path2_bucket_object_with_base_path, ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info,
-        ecstore_resolve_object_store_handle, ecstore_save_config,
+        ecstore_resolve_object_store_handle, ecstore_save_config, scanner_replication_config_for_lifecycle_eval,
     };
 
     #[cfg(test)]
     pub(crate) use super::{EcstoreDiskOption, EcstoreDiskStore, EcstoreEndpoint, ecstore_config_init, ecstore_new_disk};
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ScannerReplicationConfig(EcstoreReplicationConfig);
+
+impl ScannerReplicationConfig {
+    pub(crate) fn new(config: Option<s3s::dto::ReplicationConfiguration>, remotes: Option<EcstoreBucketTargets>) -> Self {
+        Self(EcstoreReplicationConfig::new(config, remotes))
+    }
+
+    pub(crate) fn has_active_rules(&self, prefix: &str, recursive: bool) -> bool {
+        !self.0.is_empty()
+            && self
+                .0
+                .config
+                .as_ref()
+                .is_some_and(|config| EcstoreReplicationConfigurationExt::has_active_rules(config, prefix, recursive))
+    }
+
+    pub(crate) fn into_ecstore(self) -> EcstoreReplicationConfig {
+        self.0
+    }
+}
+
+pub(crate) fn scanner_replication_config_for_lifecycle_eval(
+    config: Option<Arc<ScannerReplicationConfig>>,
+) -> Option<Arc<EcstoreReplicationConfig>> {
+    config.map(|config| Arc::new(config.0.clone()))
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ScannerReplicationQueueAdmission {
+    #[default]
+    Skipped,
+    Queued,
+    Missed,
+}
+
+impl From<EcstoreReplicationQueueAdmission> for ScannerReplicationQueueAdmission {
+    fn from(admission: EcstoreReplicationQueueAdmission) -> Self {
+        match admission {
+            EcstoreReplicationQueueAdmission::Skipped => Self::Skipped,
+            EcstoreReplicationQueueAdmission::Queued => Self::Queued,
+            EcstoreReplicationQueueAdmission::Missed => Self::Missed,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScannerReplicationHealObject {
+    pub(crate) bucket: String,
+    pub(crate) name: String,
+    pub(crate) size: i64,
+    pub(crate) delete_marker: bool,
+    pub(crate) target_statuses: HashMap<String, ReplicationStatusType>,
+    version_purge_status: VersionPurgeStatusType,
+    existing_object: bool,
+    existing_object_resync: bool,
+}
+
+impl ScannerReplicationHealObject {
+    #[cfg(test)]
+    pub(crate) fn new(bucket: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            bucket: bucket.into(),
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
+    pub(crate) fn is_empty_identity(&self) -> bool {
+        self.bucket.is_empty() && self.name.is_empty()
+    }
+
+    pub(crate) fn is_existing_object_repair(&self) -> bool {
+        self.existing_object || self.existing_object_resync
+    }
+
+    pub(crate) fn has_version_purge_status(&self) -> bool {
+        !self.version_purge_status.is_empty()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_delete_marker(mut self) -> Self {
+        self.delete_marker = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_pending_version_purge(mut self) -> Self {
+        self.version_purge_status = VersionPurgeStatusType::Pending;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_existing_object(mut self) -> Self {
+        self.existing_object = true;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_existing_object_resync(mut self) -> Self {
+        self.existing_object_resync = true;
+        self
+    }
+}
+
+impl From<ReplicateObjectInfo> for ScannerReplicationHealObject {
+    fn from(object: ReplicateObjectInfo) -> Self {
+        Self {
+            bucket: object.bucket,
+            name: object.name,
+            size: object.size,
+            delete_marker: object.delete_marker,
+            target_statuses: object.target_statuses,
+            version_purge_status: object.version_purge_status,
+            existing_object: object.op_type == ReplicationType::ExistingObject,
+            existing_object_resync: object.existing_obj_resync.must_resync(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct ScannerReplicationHealResult {
+    pub(crate) object_info: ScannerReplicationHealObject,
+    pub(crate) admission: ScannerReplicationQueueAdmission,
+}
+
+impl From<EcstoreReplicationHealQueueResult> for ScannerReplicationHealResult {
+    fn from(result: EcstoreReplicationHealQueueResult) -> Self {
+        Self {
+            object_info: result.object_info.into(),
+            admission: result.admission.into(),
+        }
+    }
 }
 
 pub(crate) mod scan {
