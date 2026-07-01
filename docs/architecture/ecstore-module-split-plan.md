@@ -104,7 +104,8 @@ Current coupling:
 - replication workers depend on `ReplicationStorage`, ECStore object APIs and
   storage-api contracts through the replication storage boundary, bucket target
   clients, bucket metadata, file metadata replication state through the
-  filemeta boundary, scanner repair
+  filemeta boundary, config-derived storage class labels through the config
+  store, scanner repair
   classification, runtime replication pool/stat handles, bucket monitor and
   bandwidth reader access through local boundaries, local node names, and
   notification events;
@@ -131,6 +132,10 @@ Required contracts before crate movement:
   MRF/resync state, and status persistence. Metadata sys access and replication
   metadata path constants are concentrated in
   `crates/ecstore/src/bucket/replication/replication_metadata_boundary.rs`.
+- `ReplicationConfigStore`: replication config persistence and config-derived
+  labels used by target options. Config read/save helpers and storage class
+  labels are concentrated in
+  `crates/ecstore/src/bucket/replication/replication_config_store.rs`.
 - `ReplicationFileMeta`: replication status, decisions, MRF entries, resync
   decisions, and target reset helpers. `rustfs_filemeta` replication contracts
   are concentrated in
