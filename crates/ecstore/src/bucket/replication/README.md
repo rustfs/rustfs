@@ -14,6 +14,8 @@ and lifecycle/heal scheduling paths.
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, metadata paths, and file metadata replication contracts through local boundaries, config storage, storage contracts through the replication storage boundary, runtime sources, and notification state. |
 | `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
 | `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources, file metadata replication contracts, error contracts, and bucket monitor handles through local boundaries, and owns shared replication pool/stat state. |
+| `replication_lifecycle_bridge.rs` | Lifecycle-originated delete replication admission and version-purge state construction. | Depends on replication config/rule matching, delete-replication decisions, and replication delete scheduling through a local contract type. |
+| `replication_scanner_bridge.rs` | Scanner-originated replication heal admission. | Keeps scanner-facing heal queueing behind a local contract type instead of exporting the internal queue function directly. |
 | `rule.rs` | Rule evaluation helpers for object replication options. | Depends on ECStore replication object option types. |
 | `mod.rs` | Compatibility re-export facade for the current ECStore owner. | Must stay stable until downstream scanner, lifecycle, heal, and metrics paths compile through replacement contracts. |
 
@@ -35,7 +37,8 @@ and lifecycle/heal scheduling paths.
 | `ReplicationLockTiming` | Namespace lock timing for replication resync, object replication, and delete replication locks. | SetDisks lock timeout access is exposed through the contract type in `replication_lock_boundary.rs`. |
 | `ReplicationMsgpCodec` | MessagePack time encode/decode and unknown value skipping for persisted resync/MRF state. | Bucket MessagePack helpers are exposed through the contract type in `replication_msgp_boundary.rs`. |
 | `ReplicationTagFilter` | Decode object tag strings for rule and metadata replication decisions. | Bucket tagging helper access is exposed through the contract type in `replication_tagging_boundary.rs`. |
-| `ReplicationLifecycleBridge` | Lifecycle-originated delete and version-purge scheduling. | Direct coupling between lifecycle worker paths and replication delete scheduling. |
+| `ReplicationLifecycleBridge` | Lifecycle-originated delete and version-purge scheduling. | Lifecycle delete paths call the bridge contract in `replication_lifecycle_bridge.rs` instead of constructing replication delete work directly. |
+| `ReplicationScannerBridge` | Scanner-originated replication heal scheduling. | Scanner heal paths call the bridge contract in `replication_scanner_bridge.rs` instead of importing the internal queue function directly. |
 
 ## Migration Rules
 

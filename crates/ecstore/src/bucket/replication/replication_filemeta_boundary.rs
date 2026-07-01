@@ -14,8 +14,8 @@
 
 pub(crate) use rustfs_filemeta::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE,
-    ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
-    ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
-    VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
-    version_purge_statuses_map,
+    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType,
+    ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state,
+    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };

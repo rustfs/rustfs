@@ -1528,7 +1528,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
 
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
 /// an ongoing resync operation or via existing objects replication configuration setting.
-pub async fn queue_replication_heal_internal(
+pub(crate) async fn queue_replication_heal_internal(
     _bucket: &str,
     oi: ObjectInfo,
     rcfg: ReplicationConfig,

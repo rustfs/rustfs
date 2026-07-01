@@ -57,7 +57,7 @@ use crate::{
     ReplicationConfig, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
     ScannerReplicationConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
     enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
-    path2_bucket_object_with_base_path, queue_replication_heal_internal, scanner_is_erasure,
+    path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
@@ -1009,7 +1009,7 @@ impl ScannerItem {
         };
 
         let done_replication = Metrics::time(Metric::CheckReplication);
-        let replication_result = queue_replication_heal_internal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
+        let replication_result = queue_replication_heal(&oi.bucket, oi.clone(), (*replication).clone(), 0).await;
         done_replication();
         let roi = replication_result.object_info;
         record_scanner_replication_admission(global_metrics(), &roi, replication_result.admission);
