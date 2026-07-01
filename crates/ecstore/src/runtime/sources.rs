@@ -23,7 +23,10 @@ use crate::disk::endpoint::Endpoint;
 use crate::{
     bucket::lifecycle::bucket_lifecycle_ops::{ExpiryState, GLOBAL_EXPIRY_STATE, GLOBAL_TRANSITION_STATE, TransitionState},
     bucket::metadata_sys::{BucketMetadataSys, get_global_bucket_metadata_sys},
-    bucket::replication::{DynReplicationPool, GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS, ReplicationStats},
+    bucket::replication::{
+        DynReplicationPool, ReplicationStats,
+        replication_pool::{GLOBAL_REPLICATION_POOL, GLOBAL_REPLICATION_STATS},
+    },
     config::{get_global_storage_class, set_global_storage_class, storageclass},
     disk::{DiskAPI, DiskOption, DiskStore, new_disk},
     error::Result,
