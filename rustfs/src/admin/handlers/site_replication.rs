@@ -2395,7 +2395,7 @@ async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
         return SRMetricsSummary::default();
     };
 
-    let node = stats.get_sr_metrics_for_node().await;
+    let node = stats.site_metrics_snapshot().await;
     let mut metrics = BTreeMap::new();
     metrics.insert(
         local_peer.deployment_id.clone(),
@@ -2412,25 +2412,25 @@ async fn build_metrics_summary(local_peer: &PeerInfo) -> SRMetricsSummary {
 
     SRMetricsSummary {
         active_workers: WorkerStat {
-            curr: node.active_workers.curr,
-            avg: node.active_workers.avg,
-            max: node.active_workers.max,
+            curr: node.active_workers_curr,
+            avg: node.active_workers_avg,
+            max: node.active_workers_max,
         },
         replica_size: node.replica_size,
         replica_count: node.replica_count,
         queued: InQueueMetric {
-            curr: qstat(node.queued.curr.count, node.queued.curr.bytes),
-            avg: qstat(node.queued.avg.count, node.queued.avg.bytes),
-            max: qstat(node.queued.max.count, node.queued.max.bytes),
+            curr: qstat(node.queued_curr_count, node.queued_curr_bytes),
+            avg: qstat(node.queued_avg_count, node.queued_avg_bytes),
+            max: qstat(node.queued_max_count, node.queued_max_bytes),
         },
         in_progress: InProgressMetric::default(),
         proxied: ReplProxyMetric {
-            get_total: non_negative_u64(node.proxied.get_total),
-            head_total: non_negative_u64(node.proxied.head_total),
-            get_failed_total: non_negative_u64(node.proxied.get_failed),
-            head_failed_total: non_negative_u64(node.proxied.head_failed),
-            put_tag_total: non_negative_u64(node.proxied.put_tag_total),
-            put_tag_failed_total: non_negative_u64(node.proxied.put_tag_failed),
+            get_total: non_negative_u64(node.proxy_get_total),
+            head_total: non_negative_u64(node.proxy_head_total),
+            get_failed_total: non_negative_u64(node.proxy_get_failed),
+            head_failed_total: non_negative_u64(node.proxy_head_failed),
+            put_tag_total: non_negative_u64(node.proxy_put_tag_total),
+            put_tag_failed_total: non_negative_u64(node.proxy_put_tag_failed),
             ..Default::default()
         },
         metrics,
