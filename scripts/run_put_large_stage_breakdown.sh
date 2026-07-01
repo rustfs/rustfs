@@ -25,7 +25,7 @@ DURATION="120s"
 ROUNDS=3
 RETRY_PER_ROUND=1
 RETRY_SLEEP_SECS=2
-COOLDOWN_SECS=0
+COOLDOWN_SECS=20
 WARP_BIN="${WARP_BIN:-warp}"
 OUT_DIR=""
 BASELINE_ROOT=""
@@ -75,7 +75,8 @@ Core options:
   --rounds <n>                        Rounds per size (default: 3)
   --retry-per-round <n>               Retries per failed round (default: 1)
   --retry-sleep-secs <n>              Sleep between retries (default: 2)
-  --cooldown-secs <n>                 Sleep between rounds/sizes (default: 0)
+  --cooldown-secs <n>                 Sleep between rounds/sizes/concurrency runs (default: 20)
+  --round-cooldown-secs <n>           Compatibility alias for --cooldown-secs
   --out-dir <dir>                     Output root (default: target/bench/put-large-stage-breakdown-<timestamp>)
   --baseline-root <dir>               Existing root from a previous run of this script
   --extra-args "<args>"               Extra args passed to run_object_batch_bench_enhanced.sh
@@ -168,7 +169,7 @@ parse_args() {
       --rounds) ROUNDS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --retry-sleep-secs) RETRY_SLEEP_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
-      --cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --cooldown-secs|--round-cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --baseline-root) BASELINE_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --extra-args) EXTRA_ARGS="$(arg_value_allow_option "$1" "${2:-}")"; shift 2 ;;

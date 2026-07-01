@@ -36,7 +36,7 @@ SAMPLES=20000
 ROUNDS=3
 RETRY_PER_ROUND=2
 RETRY_SLEEP_SECS=2
-COOLDOWN_SECS=0
+COOLDOWN_SECS=20
 BASELINE_CSV=""
 EXTRA_ARGS=()
 FAILED_FINAL_ROUNDS=0
@@ -91,7 +91,7 @@ Enhanced options:
   --rounds                     Benchmark rounds per size (default: 3)
   --retry-per-round            Retry count per failed round (default: 2)
   --retry-sleep-secs           Sleep seconds between retries (default: 2)
-  --cooldown-secs              Sleep seconds between rounds/sizes (default: 0)
+  --cooldown-secs              Sleep seconds between rounds/sizes (default: 20)
   --round-cooldown-secs        Compatibility alias for --cooldown-secs
   --baseline-csv               Baseline median CSV to compare
   --extra-args                 Extra args appended to tool command, quoted as one string
