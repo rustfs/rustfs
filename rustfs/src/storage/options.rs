@@ -20,7 +20,7 @@ use rustfs_filemeta::ReplicationStatusType;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
-    insert_header_map, is_encryption_metadata_key, is_internal_key,
+    insert_header_map,
     metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
