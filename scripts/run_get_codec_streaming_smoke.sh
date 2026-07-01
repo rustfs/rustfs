@@ -48,6 +48,9 @@ DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
 DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-codec}"
 DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS:-5}"
 DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS:-1}"
+DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS:-2}"
+DIAGNOSTIC_METRICS_MAX_TIME_SECS="${RUSTFS_DIAGNOSTIC_METRICS_MAX_TIME_SECS:-15}"
+DIAGNOSTIC_METRICS_FILTER_REGEX="${RUSTFS_DIAGNOSTIC_METRICS_FILTER_REGEX:-rustfs_io_get_object_}"
 SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
 COMPRESSED_FALLBACK_PROBE=false
 COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
@@ -113,6 +116,15 @@ Core options:
   --diagnostic-metrics-capture-retry-secs <n>
                                  Sleep seconds between failed direct /metrics scrape attempts
                                  (default: 1)
+  --diagnostic-metrics-connect-timeout-secs <n>
+                                 Curl connect timeout for each direct /metrics scrape
+                                 (default: 2)
+  --diagnostic-metrics-max-time-secs <n>
+                                 Curl max time for each direct /metrics scrape
+                                 (default: 15)
+  --diagnostic-metrics-filter-regex <regex>
+                                 Regex for retained direct /metrics lines
+                                 (default: rustfs_io_get_object_)
   --diagnostic-obs-endpoint <url>
                                  RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
   --diagnostic-obs-metric-endpoint <url>
@@ -267,6 +279,9 @@ parse_args() {
       --diagnostic-metrics-settle-secs) DIAGNOSTIC_METRICS_SETTLE_SECS="$2"; shift 2 ;;
       --diagnostic-metrics-capture-attempts) DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
       --diagnostic-metrics-capture-retry-secs) DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-connect-timeout-secs) DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-max-time-secs) DIAGNOSTIC_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-filter-regex) DIAGNOSTIC_METRICS_FILTER_REGEX="$2"; shift 2 ;;
       --diagnostic-obs-endpoint) DIAGNOSTIC_OBS_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
@@ -385,6 +400,8 @@ validate_args() {
   validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
   validate_positive_int "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS" "--diagnostic-metrics-capture-attempts"
   validate_non_negative_int "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS" "--diagnostic-metrics-capture-retry-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS" "--diagnostic-metrics-connect-timeout-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" "--diagnostic-metrics-max-time-secs"
   validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
   [[ -n "$DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX" ]] || die "--diagnostic-obs-service-name-prefix must not be empty"
@@ -660,6 +677,11 @@ diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
 diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
 diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_metrics_capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
+diagnostic_metrics_capture_retry_secs=${DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS}
+diagnostic_metrics_connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+diagnostic_metrics_max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+diagnostic_metrics_filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
 diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
 diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
@@ -852,6 +874,11 @@ diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
 diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
 diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_metrics_capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
+diagnostic_metrics_capture_retry_secs=${DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS}
+diagnostic_metrics_connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+diagnostic_metrics_max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+diagnostic_metrics_filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
@@ -1095,6 +1122,9 @@ run_bench() {
       --service-metrics-dir "${profile_dir}/service-metrics/rounds"
       --service-metrics-attempts "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS"
       --service-metrics-retry-secs "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
+      --service-metrics-connect-timeout-secs "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS"
+      --service-metrics-max-time-secs "$DIAGNOSTIC_METRICS_MAX_TIME_SECS"
+      --service-metrics-filter-regex "$DIAGNOSTIC_METRICS_FILTER_REGEX"
     )
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
@@ -1204,6 +1234,23 @@ write_status("ok")
 PY
 }
 
+filter_diagnostic_metrics_snapshot() {
+  local input_file="$1"
+  local output_file="$2"
+
+  if [[ -z "$DIAGNOSTIC_METRICS_FILTER_REGEX" ]]; then
+    mv "$input_file" "$output_file"
+    return 0
+  fi
+
+  awk -v pattern="$DIAGNOSTIC_METRICS_FILTER_REGEX" '$0 ~ pattern { print }' "$input_file" >"$output_file"
+  if [[ ! -s "$output_file" ]]; then
+    mv "$input_file" "$output_file"
+  else
+    rm -f "$input_file"
+  fi
+}
+
 capture_service_metrics_snapshot() {
   local profile="$1"
   local phase="$2"
@@ -1224,6 +1271,7 @@ capture_service_metrics_snapshot() {
 phase=${phase}
 status=not_run_dry_run
 url=${DIAGNOSTIC_METRICS_URL}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 EOF
     return 0
   fi
@@ -1233,23 +1281,31 @@ EOF
     return 0
   fi
 
-  local tmp_file capture_attempt
+  local tmp_file filtered_file capture_attempt
   tmp_file="${snapshot_file}.tmp"
+  filtered_file="${snapshot_file}.filtered.tmp"
   for ((capture_attempt=1; capture_attempt<=DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
-    if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$tmp_file"; then
+    if curl -fsS --noproxy '*' \
+      --connect-timeout "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS" \
+      --max-time "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" \
+      "$DIAGNOSTIC_METRICS_URL" >"$tmp_file"; then
       if [[ -s "$tmp_file" ]]; then
-        mv "$tmp_file" "$snapshot_file"
+        filter_diagnostic_metrics_snapshot "$tmp_file" "$filtered_file"
+        mv "$filtered_file" "$snapshot_file"
         cat >"$status_file" <<EOF
 phase=${phase}
 status=ok
 capture_attempt=${capture_attempt}
 url=${DIAGNOSTIC_METRICS_URL}
+connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 EOF
         return 0
       fi
     fi
 
-    rm -f "$tmp_file"
+    rm -f "$tmp_file" "$filtered_file"
     if (( capture_attempt < DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS && DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS > 0 )); then
       sleep "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
     fi
@@ -1261,6 +1317,9 @@ phase=${phase}
 status=capture_failed
 capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
 url=${DIAGNOSTIC_METRICS_URL}
+connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 EOF
   log "WARN: failed to capture service metrics profile=${profile} phase=${phase} attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}"
 }
@@ -1456,6 +1515,7 @@ distribution_path = pathlib.Path(distribution_raw)
 percentiles_path = pathlib.Path(percentiles_raw)
 
 TARGET_STAGES = [
+    "request_ingress_to_context",
     "store_reader_setup",
     "reader_open_mmap_copy_success",
     "reader_mmap_blocking_wait",
@@ -1465,6 +1525,7 @@ TARGET_STAGES = [
     "body_build",
     "body_memory_blob",
     "response_handoff",
+    "first_byte",
 ]
 DISTRIBUTION_STAGES = {
     "reader_mmap_blocking_wait",

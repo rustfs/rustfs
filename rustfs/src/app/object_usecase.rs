@@ -192,6 +192,7 @@ const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_sl
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
 const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
+const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
 const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
 const GET_OBJECT_STAGE_BODY_BUILD: &str = "body_build";
 const GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ: &str = "body_encrypted_buffer_read";
@@ -485,6 +486,7 @@ pin_project! {
     struct MemoryTrackedBytesStream {
         bytes: Bytes,
         emitted: bool,
+        started: std::time::Instant,
         source: &'static str,
         _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     }
@@ -536,6 +538,7 @@ impl MemoryTrackedBytesStream {
         Self {
             bytes,
             emitted: false,
+            started: std::time::Instant::now(),
             source,
             _guard: guard,
         }
@@ -579,7 +582,11 @@ impl futures::Stream for MemoryTrackedBytesStream {
             return Poll::Ready(None);
         }
 
+        let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
         *this.emitted = true;
+        if let Some(elapsed) = first_byte_elapsed {
+            rustfs_io_metrics::record_get_object_first_byte_latency(GET_OBJECT_STAGE_PATH_S3_HANDLER, elapsed.as_secs_f64());
+        }
         if let Some(poll_start) = poll_start {
             rustfs_io_metrics::record_get_object_memory_body_stream_poll(
                 this.source,
@@ -729,6 +736,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     if !self.first_byte_reported {
                         self.first_byte_reported = true;
                         let elapsed = self.elapsed();
+                        rustfs_io_metrics::record_get_object_first_byte_latency(
+                            GET_OBJECT_STAGE_PATH_S3_HANDLER,
+                            elapsed.as_secs_f64(),
+                        );
                         if elapsed >= GET_OBJECT_STREAM_WARN_THRESHOLD {
                             warn!(
                                 event = EVENT_GET_OBJECT_STREAM_BODY,
@@ -2068,8 +2079,9 @@ impl DefaultObjectUsecase {
         _optimal_buffer_size: usize,
         source: &'static str,
     ) -> Option<StreamingBlob> {
-        let memory_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let handoff_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
+        let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let memory_blob_start = get_stage_metrics_enabled.then(std::time::Instant::now);
+        let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
         let bytes_len = bytes.len();
         let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
         let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
@@ -3594,11 +3606,19 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_id = req
-            .extensions
-            .get::<request_context::RequestContext>()
+        let inbound_request_context = req.extensions.get::<request_context::RequestContext>();
+        let request_id = inbound_request_context
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
+        if rustfs_io_metrics::get_stage_metrics_enabled()
+            && let Some(context) = inbound_request_context
+        {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                GET_OBJECT_STAGE_PATH_S3_HANDLER,
+                GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT,
+                context.start_time.elapsed().as_secs_f64(),
+            );
+        }
         let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;

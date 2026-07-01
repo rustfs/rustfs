@@ -43,7 +43,8 @@ SERVICE_METRICS_DIR=""
 SERVICE_METRICS_CAPTURE_ATTEMPTS=3
 SERVICE_METRICS_CAPTURE_RETRY_SECS=1
 SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
-SERVICE_METRICS_MAX_TIME_SECS=5
+SERVICE_METRICS_MAX_TIME_SECS=15
+SERVICE_METRICS_FILTER_REGEX="rustfs_io_get_object_"
 
 usage() {
   cat <<'USAGE'
@@ -87,6 +88,13 @@ Enhanced options:
   --service-metrics-dir        Output directory for per-round service metric snapshots
   --service-metrics-attempts   Capture attempts for each snapshot (default: 3)
   --service-metrics-retry-secs Sleep seconds between failed capture attempts (default: 1)
+  --service-metrics-connect-timeout-secs
+                               Curl connect timeout for each metrics capture (default: 2)
+  --service-metrics-max-time-secs
+                               Curl max time for each metrics capture (default: 15)
+  --service-metrics-filter-regex
+                               Regex for retained metrics lines after scrape
+                               (default: rustfs_io_get_object_)
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
@@ -149,6 +157,9 @@ parse_args() {
       --service-metrics-dir) SERVICE_METRICS_DIR="$2"; shift 2 ;;
       --service-metrics-attempts) SERVICE_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
       --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
+      --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
+      --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
+      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -210,6 +221,8 @@ validate_args() {
   validate_nonnegative_int "$COOLDOWN_SECS" "--cooldown-secs"
   validate_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" "--service-metrics-attempts"
   validate_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" "--service-metrics-retry-secs"
+  validate_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" "--service-metrics-connect-timeout-secs"
+  validate_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" "--service-metrics-max-time-secs"
   if [[ -n "$SERVICE_METRICS_URL" && -z "$SERVICE_METRICS_DIR" ]]; then
     echo "ERROR: --service-metrics-dir is required when --service-metrics-url is set" >&2
     exit 1
@@ -370,6 +383,23 @@ metric_snapshot_token() {
   printf '%s_%s_r%s_a%s' "$TOOL" "$safe_size" "$round" "$attempt"
 }
 
+filter_service_metrics_snapshot() {
+  local input_file="$1"
+  local output_file="$2"
+
+  if [[ -z "$SERVICE_METRICS_FILTER_REGEX" ]]; then
+    mv "$input_file" "$output_file"
+    return 0
+  fi
+
+  awk -v pattern="$SERVICE_METRICS_FILTER_REGEX" '$0 ~ pattern { print }' "$input_file" >"$output_file"
+  if [[ ! -s "$output_file" ]]; then
+    mv "$input_file" "$output_file"
+  else
+    rm -f "$input_file"
+  fi
+}
+
 capture_round_service_metrics() {
   local size="$1"
   local round="$2"
@@ -380,11 +410,12 @@ capture_round_service_metrics() {
     return 0
   fi
 
-  local token snapshot_file status_file tmp_file capture_attempt
+  local token snapshot_file status_file tmp_file filtered_file capture_attempt
   token="$(metric_snapshot_token "$size" "$round" "$attempt")"
   snapshot_file="${SERVICE_METRICS_DIR}/${token}_${phase}.prom"
   status_file="${SERVICE_METRICS_DIR}/${token}_${phase}.status"
   tmp_file="${snapshot_file}.tmp"
+  filtered_file="${snapshot_file}.filtered.tmp"
 
   if [[ "$DRY_RUN" == "true" ]]; then
     : >"$snapshot_file"
@@ -395,6 +426,7 @@ attempt=${attempt}
 phase=${phase}
 status=not_run_dry_run
 url=${SERVICE_METRICS_URL}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 EOF
     return 0
   fi
@@ -405,7 +437,8 @@ EOF
       --max-time "$SERVICE_METRICS_MAX_TIME_SECS" \
       "$SERVICE_METRICS_URL" >"$tmp_file"; then
       if [[ -s "$tmp_file" ]]; then
-        mv "$tmp_file" "$snapshot_file"
+        filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
+        mv "$filtered_file" "$snapshot_file"
         cat >"$status_file" <<EOF
 size=${size}
 round=${round}
@@ -414,12 +447,15 @@ phase=${phase}
 status=ok
 capture_attempt=${capture_attempt}
 url=${SERVICE_METRICS_URL}
+connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 EOF
         return 0
       fi
     fi
 
-    rm -f "$tmp_file"
+    rm -f "$tmp_file" "$filtered_file"
     if (( capture_attempt < SERVICE_METRICS_CAPTURE_ATTEMPTS && SERVICE_METRICS_CAPTURE_RETRY_SECS > 0 )); then
       sleep "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
     fi
@@ -434,6 +470,9 @@ phase=${phase}
 status=capture_failed
 capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
 url=${SERVICE_METRICS_URL}
+connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 EOF
   echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
 }
