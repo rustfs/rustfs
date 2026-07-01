@@ -123,6 +123,9 @@ Current coupling:
 - admin replication extension target filtering and resync request construction
   stay behind the admin storage boundary instead of exposing replication work
   DTO construction to handlers;
+- app object and multipart writes call object-replication boundary helpers
+  instead of constructing replication work DTOs or choosing object replication
+  operation types at the use-case layer;
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
