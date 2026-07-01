@@ -11679,9 +11679,9 @@ dependencies = [
 
 [[package]]
 name = "time"
-version = "0.3.52"
+version = "0.3.53"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e48db7b415311b615f910b3dcaa4557bcd4bf1982379c95c223fd8c2a20e210"
+checksum = "18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"
 dependencies = [
  "deranged",
  "js-sys",
@@ -13078,9 +13078,9 @@ dependencies = [
 
 [[package]]
 name = "xxhash-rust"
-version = "0.8.15"
+version = "0.8.16"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"
+checksum = "4d93c89cdc2d3a63c3ec48ffe926931bdc069eafa8e4402fe6d8f790c9d1e576"
 
 [[package]]
 name = "yansi"
