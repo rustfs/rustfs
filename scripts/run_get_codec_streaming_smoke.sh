@@ -1268,7 +1268,9 @@ if payload.get("status") != "success":
 samples = [
     sample
     for sample in payload.get("data", {}).get("result", [])
-    if not service_name or sample.get("metric", {}).get("service.name") == service_name
+    if not service_name
+    or sample.get("metric", {}).get("service.name") == service_name
+    or sample.get("metric", {}).get("service_name") == service_name
 ]
 lines = [line for sample in samples if (line := sample_to_line(sample))]
 if not lines:
