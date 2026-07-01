@@ -15,7 +15,7 @@
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use super::storage_api::bucket::metadata_sys;
-use super::storage_api::bucket::replication::{BucketReplicationResyncStatus, BucketStats, ObjectOpts, ResyncOpts};
+use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
@@ -59,7 +59,7 @@ use rustfs_config::{
     ENABLE_KEY, WEBHOOK_AUTH_TOKEN, WEBHOOK_CLIENT_CA, WEBHOOK_CLIENT_CERT, WEBHOOK_CLIENT_KEY, WEBHOOK_ENDPOINT,
     WEBHOOK_SKIP_TLS_VERIFY,
 };
-use rustfs_filemeta::{ReplicationStatusType, ReplicationType};
+use rustfs_filemeta::ReplicationStatusType;
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
@@ -1807,10 +1807,7 @@ fn validate_replication_check_config_targets(
 
 fn filter_replication_check_targets(targets: BucketTargets, config: &s3s::dto::ReplicationConfiguration) -> Vec<BucketTarget> {
     let referenced_arns = config
-        .filter_target_arns(&ObjectOpts {
-            op_type: ReplicationType::All,
-            ..Default::default()
-        })
+        .filter_all_replication_target_arns()
         .into_iter()
         .collect::<HashSet<_>>();
 
@@ -2158,12 +2155,12 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
         return Err(s3_error!(InternalError, "replication pool is not initialized"));
     };
 
-    pool.start_bucket_resync(ResyncOpts {
-        bucket: bucket.to_string(),
-        arn: resolved_arn.clone(),
-        resync_id: reset.reset_id.clone(),
-        resync_before: reset.reset_before,
-    })
+    pool.start_bucket_resync(replication::resync_opts(
+        bucket,
+        resolved_arn.clone(),
+        &reset.reset_id,
+        reset.reset_before,
+    ))
     .await
     .map_err(|e| s3_error!(InternalError, "{e}"))?;
 
