@@ -14,6 +14,7 @@ ENDPOINT=""
 ACCESS_KEY=""
 SECRET_KEY=""
 BUCKET="rustfs-bench"
+BUCKET_SIZE_SUFFIX=false
 REGION="us-east-1"
 CONCURRENCY=128
 SIZES="$DEFAULT_SIZES"
@@ -60,6 +61,8 @@ Required:
 
 Core options:
   --bucket                     Bucket name (default: rustfs-bench)
+  --bucket-size-suffix         Append a sanitized object size suffix to the
+                               bucket for each size
   --region                     Region (default: us-east-1)
   --concurrency                Concurrency for all sizes (default: 128)
   --sizes                      Comma-separated sizes (default: 1KiB..10MiB matrix)
@@ -136,6 +139,7 @@ parse_args() {
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
+      --bucket-size-suffix) BUCKET_SIZE_SUFFIX=true; shift ;;
       --region) REGION="$2"; shift 2 ;;
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
@@ -266,6 +270,19 @@ setup_output() {
 
 trim() {
   echo "$1" | awk '{$1=$1;print}'
+}
+
+sanitize_bucket_suffix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-'
+}
+
+bucket_for_size() {
+  local size="$1"
+  if [[ "$BUCKET_SIZE_SUFFIX" != "true" ]]; then
+    echo "$BUCKET"
+    return
+  fi
+  echo "${BUCKET}-$(sanitize_bucket_suffix "$size")"
 }
 
 to_bps() {
@@ -515,14 +532,15 @@ run_one_attempt() {
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
-    local warp_host
+    local warp_host bucket
     warp_host="$(normalize_warp_host "$ENDPOINT")"
+    bucket="$(bucket_for_size "$size")"
     local cmd=(
       "$WARP_BIN" "$WARP_MODE"
       "--host" "$warp_host"
       "--access-key" "$ACCESS_KEY"
       "--secret-key" "$SECRET_KEY"
-      "--bucket" "$BUCKET"
+      "--bucket" "$bucket"
       "--obj.size" "$size"
       "--concurrent" "$CONCURRENCY"
       "--duration" "$DURATION"
@@ -548,11 +566,13 @@ run_one_attempt() {
       fi
     fi
   else
+    local bucket
+    bucket="$(bucket_for_size "$size")"
     local cmd=(
       "$S3BENCH_BIN"
       "-accessKey=$ACCESS_KEY"
       "-secretKey=$SECRET_KEY"
-      "-bucket=$BUCKET"
+      "-bucket=$bucket"
       "-endpoint=$ENDPOINT"
       "-region=$REGION"
       "-numClients=$CONCURRENCY"

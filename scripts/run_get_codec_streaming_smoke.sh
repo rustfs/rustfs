@@ -399,11 +399,6 @@ validate_args() {
     per-round|prepare-once|existing-only) ;;
     *) die "--warp-object-lifecycle must be per-round, prepare-once, or existing-only" ;;
   esac
-  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
-    local size_count
-    size_count="$(printf '%s\n' "$SIZES" | awk -F',' '{ count=0; for (i=1; i<=NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") count++ } print count }')"
-    [[ "$size_count" -eq 1 ]] || die "--warp-object-lifecycle=${WARP_OBJECT_LIFECYCLE} currently requires a single --sizes value to avoid mixing object sizes in one bucket"
-  fi
   if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
     validate_positive_int "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" "--metadata-cache-max-entries"
   fi
@@ -845,6 +840,36 @@ single_benchmark_size() {
   }'
 }
 
+benchmark_sizes() {
+  printf '%s\n' "$SIZES" | awk -F',' '{
+    for (i=1; i<=NF; i++) {
+      gsub(/^[ \t]+|[ \t]+$/, "", $i)
+      if ($i != "") {
+        print $i
+      }
+    }
+  }'
+}
+
+benchmark_size_count() {
+  benchmark_sizes | awk 'END { print NR + 0 }'
+}
+
+sanitize_bucket_suffix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-'
+}
+
+bucket_for_size() {
+  local size="$1"
+  local size_count
+  size_count="$(benchmark_size_count)"
+  if [[ "$WARP_OBJECT_LIFECYCLE" == "per-round" || "$size_count" -le 1 ]]; then
+    echo "$BUCKET"
+    return
+  fi
+  echo "${BUCKET}-$(sanitize_bucket_suffix "$size")"
+}
+
 write_manifest() {
   local profile="$1"
   local profile_dir="$2"
@@ -1078,8 +1103,6 @@ prepare_warp_existing_objects() {
   local profile="$1"
   local profile_dir="${OUT_DIR}/${profile}"
   local prepare_dir="${profile_dir}/warp_prepare"
-  local size
-  size="$(single_benchmark_size)"
 
   if [[ "$WARP_OBJECT_LIFECYCLE" != "prepare-once" ]]; then
     return 0
@@ -1087,43 +1110,50 @@ prepare_warp_existing_objects() {
 
   mkdir -p "$prepare_dir"
 
-  local cmd=(
-    "$WARP_BIN" get
-    --host "$ADDRESS"
-    --access-key "$ACCESS_KEY"
-    --secret-key "$SECRET_KEY"
-    --bucket "$BUCKET"
-    --obj.size "$size"
-    --concurrent "$CONCURRENCY"
-    --duration "$WARP_PREPARE_DURATION"
-    --region "$REGION"
-    --noclear
-  )
-  if [[ -n "$WARP_OBJECTS" ]]; then
-    cmd+=(--objects "$WARP_OBJECTS")
-  fi
+  local size bucket size_slug
+  while IFS= read -r size; do
+    [[ -n "$size" ]] || continue
+    bucket="$(bucket_for_size "$size")"
+    size_slug="$(sanitize_bucket_suffix "$size")"
 
-  {
-    printf 'profile=%s\n' "$profile"
-    printf 'mode=prepare-once\n'
-    printf 'size=%s\n' "$size"
-    printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
-    printf 'bucket=%s\n' "$BUCKET"
-    printf 'command='
-    printf '%q ' "${cmd[@]}"
-    printf '\n'
-  } >"${prepare_dir}/manifest.env"
+    local cmd=(
+      "$WARP_BIN" get
+      --host "$ADDRESS"
+      --access-key "$ACCESS_KEY"
+      --secret-key "$SECRET_KEY"
+      --bucket "$bucket"
+      --obj.size "$size"
+      --concurrent "$CONCURRENCY"
+      --duration "$WARP_PREPARE_DURATION"
+      --region "$REGION"
+      --noclear
+    )
+    if [[ -n "$WARP_OBJECTS" ]]; then
+      cmd+=(--objects "$WARP_OBJECTS")
+    fi
 
-  if [[ "$DRY_RUN" == "true" ]]; then
-    log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size}"
-    printf '[DRY-RUN] ' >"${prepare_dir}/prepare.log"
-    printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare.log"
-    printf '\n' >>"${prepare_dir}/prepare.log"
-    return 0
-  fi
+    {
+      printf 'profile=%s\n' "$profile"
+      printf 'mode=prepare-once\n'
+      printf 'size=%s\n' "$size"
+      printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
+      printf 'bucket=%s\n' "$bucket"
+      printf 'command='
+      printf '%q ' "${cmd[@]}"
+      printf '\n'
+    } >"${prepare_dir}/manifest-${size_slug}.env"
 
-  log "Preparing existing warp objects profile=${profile} size=${size} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
-  "${cmd[@]}" >"${prepare_dir}/prepare.log" 2>&1
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size} bucket=${bucket}"
+      printf '[DRY-RUN] ' >"${prepare_dir}/prepare-${size_slug}.log"
+      printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare-${size_slug}.log"
+      printf '\n' >>"${prepare_dir}/prepare-${size_slug}.log"
+      continue
+    fi
+
+    log "Preparing existing warp objects profile=${profile} size=${size} bucket=${bucket} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
+    "${cmd[@]}" >"${prepare_dir}/prepare-${size_slug}.log" 2>&1
+  done < <(benchmark_sizes)
 }
 
 run_bench() {
@@ -1162,6 +1192,9 @@ run_bench() {
       lifecycle_args="${lifecycle_args} --objects ${WARP_OBJECTS}"
     fi
     cmd+=(--extra-args "$lifecycle_args")
+    if [[ "$(benchmark_size_count)" -gt 1 ]]; then
+      cmd+=(--bucket-size-suffix)
+    fi
   fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
     cmd+=(
