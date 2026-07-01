@@ -98,7 +98,9 @@ Focused verification for the first code-bearing lifecycle PR:
 
 ## Replication Candidate
 
-`bucket/replication` is not ready for a standalone crate yet.
+`rustfs-replication` now owns the resync status contracts and persisted resync
+status wire format. The remaining `bucket/replication` worker runtime is not
+ready for a full standalone crate yet.
 
 Current coupling:
 
@@ -120,6 +122,9 @@ Current coupling:
 - bucket metadata migration and bucket target removal checks use local
   replication bridges instead of importing resyncer codec or config helper
   internals;
+- resync options, bucket/target resync status DTOs, status display labels, and
+  the persisted resync status wire format live in `crates/replication`, with
+  ECStore retaining only error mapping and MRF persistence locally;
 - admin replication extension target filtering and resync request construction
   stay behind the admin storage boundary instead of exposing replication work
   DTO construction to handlers;
@@ -189,6 +194,8 @@ Required contracts before crate movement:
 - `ReplicationMigrationBridge`: persisted resync status decode/encode access
   for bucket metadata migration is exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_migration_bridge.rs`.
+- `ReplicationResyncContracts`: resync options, target/bucket resync status,
+  status labels, and persisted status encoding live in `crates/replication`.
 - `ReplicationObjectBridge`: app and SetDisks object write/delete replication
   decisions and scheduling are exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_object_bridge.rs`.

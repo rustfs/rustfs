@@ -1,18 +1,19 @@
 # ECStore Replication Split Inventory
 
-This directory still belongs to ECStore. It is not ready to become a standalone
-crate because replication workers currently depend on ECStore object IO, bucket
-target clients, bucket metadata systems, runtime state, notification events,
-and lifecycle/heal scheduling paths.
+This directory still owns the ECStore replication workers. The resync status
+contracts and wire format now live in `rustfs-replication`, while worker runtime
+code still depends on ECStore object IO, bucket target clients, bucket metadata
+systems, runtime state, notification events, and lifecycle/heal scheduling
+paths.
 
 ## Current Modules
 
 | Module | Current role | Split blocker |
 |---|---|---|
 | `config.rs` | Replication config helpers, rule matching, and tag filtering. | Uses replication-local filemeta/tagging boundaries and S3 DTOs directly. |
-| `datatypes.rs` | Replication status and operation DTOs. | Explicitly re-exported through the ECStore replication facade. |
+| `datatypes.rs` | ECStore compatibility re-export for resync status enums. | Re-exports `rustfs-replication` contracts while downstream facade consumers migrate. |
 | `replication_pool.rs` | Replication queue, worker pool, MRF persistence, bucket stats, and delete/object scheduling. | Depends on bucket target sys, bucket metadata sys, metadata paths, and file metadata replication contracts through local boundaries, config storage, storage contracts through the replication storage boundary, runtime sources, and notification state. |
-| `replication_resyncer.rs` | Object replication, delete replication, resync, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
+| `replication_resyncer.rs` | Object replication, delete replication, resync execution, MRF encode/decode, target calls, and multipart target upload paths. | Depends on target calls and target config types through the replication target boundary, metadata paths and metadata systems through the replication metadata boundary, file metadata replication contracts through the filemeta boundary, error contracts through the error boundary, versioning systems, storage contracts through the replication storage boundary, config-derived storage class labels through the config store, runtime sources, notification events and local event host selection through the event sink, bandwidth reader wrapping, and SetDisks lock timing. |
 | `replication_state.rs` | Replication queue/stat state and worker accounting. | Reads runtime sources, file metadata replication contracts, error contracts, and bucket monitor handles through local boundaries, and owns shared replication pool/stat state. |
 | `replication_lifecycle_bridge.rs` | Lifecycle-originated delete replication admission and version-purge state construction. | Depends on replication config/rule matching, delete-replication decisions, and replication delete scheduling through a local contract type. |
 | `replication_migration_bridge.rs` | Bucket migration access to persisted replication resync codec helpers. | Keeps migration normalization behind a bridge instead of re-exporting resyncer codec helpers. |
@@ -29,6 +30,7 @@ and lifecycle/heal scheduling paths.
 | `ReplicationObjectIO` | Object read/write primitives used by config, MRF, resync status, and multipart replication paths. | ECStore object API reader/writer types and storage-api object IO contracts are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationStorage` | Object read/write/delete, object walk, metadata update, and target object IO. | ECStore object API, storage-api contracts, and read option types are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Metadata sys access and replication metadata path constants are exposed through the contract type in `replication_metadata_boundary.rs`; versioning sys and config storage imports remain separate contracts. |
+| `ReplicationResyncContracts` | Resync options, target status, bucket status, status enum, and persisted resync status wire format. | Owned by `crates/replication`; ECStore maps its error type at the resyncer boundary. |
 | `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
 | `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
 | `ReplicationErrorBoundary` | ECStore error/result contracts and replication-specific error classifiers. | `crate::error` imports are concentrated in `replication_error_boundary.rs`. |
