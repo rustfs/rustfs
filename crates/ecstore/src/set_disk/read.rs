@@ -955,6 +955,14 @@ impl BitrotReaderSetup {
         }
     }
 
+    fn scheduling_target(&self, data_shards: usize, parity_shards: usize, mode: BitrotReaderSetupMode) -> usize {
+        match mode {
+            BitrotReaderSetupMode::ReadQuorum => data_shards,
+            BitrotReaderSetupMode::VerifyReconstruction if !self.data_shards_attempted(data_shards) => data_shards,
+            BitrotReaderSetupMode::VerifyReconstruction => self.reconstruction_verification_target(data_shards, parity_shards),
+        }
+    }
+
     fn deferred_shards(&self) -> usize {
         self.deferred_count
     }
@@ -1300,31 +1308,12 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
 
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
-    for idx in 0..data_shards.min(total_shards) {
+    let initial_target = setup.setup_target(data_shards, parity_shards, mode);
+    for idx in 0..initial_target.min(data_shards).min(total_shards) {
         schedule_bitrot_reader_task(
             &mut reader_tasks,
             &mut setup,
             idx,
-            files,
-            disks,
-            bucket,
-            object,
-            part_number,
-            read_offset,
-            read_length,
-            shard_size,
-            checksum_algo.clone(),
-            skip_verify_bitrot,
-            use_mmap_read,
-            stage_metrics,
-        );
-    }
-
-    if data_shards < total_shards {
-        schedule_bitrot_reader_task(
-            &mut reader_tasks,
-            &mut setup,
-            data_shards,
             files,
             disks,
             bucket,
@@ -1351,7 +1340,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             break;
         }
 
-        let target = setup.setup_target(data_shards, parity_shards, mode);
+        let target = setup.scheduling_target(data_shards, parity_shards, mode);
         while setup.available_shards().saturating_add(setup.pending_scheduled_shards()) < target {
             let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) else {
                 break;
@@ -4655,7 +4644,7 @@ mod tests {
 
         assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
         assert_eq!(setup.available_shards(), 2);
-        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.scheduled_shards(), 2);
         assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
 
         let fallback_index = setup
@@ -4689,7 +4678,7 @@ mod tests {
 
         assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
         assert_eq!(setup.available_shards(), 2);
-        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.scheduled_shards(), 2);
         assert_eq!(setup.deferred_shards(), 2);
     }
 
@@ -4707,6 +4696,7 @@ mod tests {
         assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.completed_failed_shards(), 1);
+        assert_eq!(setup.scheduled_shards(), 3);
         assert!(setup.ready.iter().skip(2).any(|ready| *ready));
     }
 
@@ -4739,7 +4729,7 @@ mod tests {
 
         assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
         assert_eq!(setup.available_data_shards(2), 2);
-        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.scheduled_shards(), 2);
     }
 
     #[tokio::test]
@@ -4758,6 +4748,7 @@ mod tests {
         assert_eq!(setup.available_data_shards(2), 1);
         assert!(setup.data_shards_attempted(2));
         assert_eq!(setup.completed_failed_shards(), 1);
+        assert_eq!(setup.scheduled_shards(), 4);
     }
 
     #[tokio::test]
