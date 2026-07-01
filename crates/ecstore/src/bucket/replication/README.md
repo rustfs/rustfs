@@ -46,7 +46,9 @@ and lifecycle/heal scheduling paths.
    only after call sites prove a narrower object read/write/delete/walk shape.
 4. Preserve `rustfs_ecstore::api::bucket::replication` compatibility until
    lifecycle, scanner, OBS, heal, and tests compile through replacement paths.
-5. Move at most one contract boundary per code-bearing PR and verify it with
+5. Keep imports between modules in this directory relative to the local
+   replication module, not `crate::bucket::replication::*` self paths.
+6. Move at most one contract boundary per code-bearing PR and verify it with
    focused replication tests before broad gates.
 
 ## First Code-Bearing Step

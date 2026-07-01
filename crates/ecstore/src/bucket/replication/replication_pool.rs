@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::datatypes::ResyncStatusType;
 use super::replication_config_store as config_store;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
@@ -20,19 +21,15 @@ use super::replication_filemeta_boundary::{
     ResyncDecision, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use super::replication_metadata_boundary as metadata_boundary;
+use super::replication_resyncer::{
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer, ResyncOpts,
+    TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
+    replicate_delete, replicate_object, save_resync_status,
+};
+use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
 use super::replication_target_boundary as target_boundary;
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::replication::ResyncOpts;
-use crate::bucket::replication::ResyncStatusType;
-use crate::bucket::replication::replicate_delete;
-use crate::bucket::replication::replicate_object;
-use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
-    TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
-    save_resync_status,
-};
-use crate::bucket::replication::replication_state::ReplicationStats;
 use lazy_static::lazy_static;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
@@ -1692,8 +1689,8 @@ async fn queue_replicate_deletes_wrapper(
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_resyncer::{decode_mrf_file, encode_mrf_file};
     use super::*;
-    use crate::bucket::replication::replication_resyncer::{decode_mrf_file, encode_mrf_file};
     use uuid::Uuid;
 
     #[test]

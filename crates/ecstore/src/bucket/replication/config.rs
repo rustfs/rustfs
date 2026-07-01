@@ -14,7 +14,7 @@
 
 use super::replication_filemeta_boundary::ReplicationType;
 use super::replication_tagging_boundary as tagging_boundary;
-use crate::bucket::replication::ReplicationRuleExt as _;
+use super::rule::ReplicationRuleExt as _;
 use s3s::dto::DeleteMarkerReplicationStatus;
 use s3s::dto::DeleteReplicationStatus;
 use s3s::dto::Destination;

@@ -115,7 +115,9 @@ Current coupling:
 - lifecycle and heal paths schedule replication work through the current ECStore
   module;
 - global replication pool/stat initialization still lives with ECStore runtime
-  compatibility state.
+  compatibility state;
+- modules inside `bucket/replication` use local relative paths rather than the
+  ECStore owner path for replication self-imports.
 
 Required contracts before crate movement:
 

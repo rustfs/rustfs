@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
+use super::datatypes::ResyncStatusType;
 use super::replication_bandwidth_boundary;
 use super::replication_config_store as config_store;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
@@ -36,8 +38,6 @@ use super::replication_target_boundary::{
 };
 use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
-use crate::bucket::replication::ResyncStatusType;
-use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
