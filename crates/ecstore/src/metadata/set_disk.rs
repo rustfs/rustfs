@@ -716,7 +716,6 @@ impl SetDisks {
         }
 
         let mut meta_hashes = vec![None; metas.len()];
-        let mut hasher = Sha256::new();
 
         for (i, meta) in metas.iter().enumerate() {
             if !meta.is_valid() {
@@ -748,8 +747,6 @@ impl SetDisks {
             let mod_valid = mod_time == &meta.mod_time;
 
             if etag_only || mod_valid {
-                Self::update_file_info_quorum_hash(&mut hasher, meta);
-
                 if meta.is_remote() {
                     // TODO:
                 }
@@ -758,9 +755,7 @@ impl SetDisks {
 
                 // TODO: IsCompressed
 
-                meta_hashes[i] = Some(hex(hasher.clone().finalize().as_slice()));
-
-                hasher.reset();
+                meta_hashes[i] = Some(Self::file_info_quorum_hash(meta));
             } else {
                 debug!(
                     index = i,
@@ -773,7 +768,7 @@ impl SetDisks {
 
         let mut count_map = HashMap::new();
 
-        for hash in meta_hashes.iter().flatten() {
+        for hash in meta_hashes.iter().flatten().copied() {
             *count_map.entry(hash).or_insert(0) += 1;
         }
 
@@ -806,7 +801,7 @@ impl SetDisks {
         for (i, op_hash) in meta_hashes.iter().enumerate() {
             if let Some(hash) = op_hash
                 && let Some(max_hash) = max_val
-                && hash == max_hash
+                && *hash == max_hash
                 && metas[i].is_valid()
             {
                 if !found {
