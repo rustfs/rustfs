@@ -2553,7 +2553,7 @@ fi
   cd "$ROOT_DIR"
   find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
     xargs -0 perl -0ne '
-      while (/(?:crate::error::|use\s+crate::error\b|use\s+crate::\{[^;]*\berror::)/sg) {
+      while (/(?:crate::error::|use\s+crate::error\b|use\s+crate::\{[^;]*\berror\b)/sg) {
         my $prefix = substr($_, 0, $-[0]);
         my $line = ($prefix =~ tr/\n//) + 1;
         my $match = $&;
