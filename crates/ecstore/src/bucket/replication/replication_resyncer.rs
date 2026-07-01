@@ -20,9 +20,9 @@ use super::replication_error_boundary::{Error, Result, is_err_object_not_found, 
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
-    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType,
-    ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType,
-    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType,
+    ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state,
+    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_metadata_boundary::ReplicationMetadataStore;
@@ -53,18 +53,19 @@ use headers::{
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
-use regex::Regex;
+#[cfg(test)]
+use rmp_serde;
 use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
     SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_RESET_ARN_PREFIX,
-    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
+    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP,
+    headers,
 };
 use rustfs_utils::http::{
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
-    has_internal_suffix, insert_header_map, insert_str, internal_key_strip_suffix_prefix, is_internal_key,
+    has_internal_suffix, insert_header_map, insert_str, is_internal_key,
 };
 use rustfs_utils::string::strings_has_prefix_fold;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
@@ -1357,48 +1358,6 @@ fn is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
     user_defined.contains_key(SSEC_ALGORITHM_HEADER)
         || user_defined.contains_key(SSEC_KEY_HEADER)
         || user_defined.contains_key(SSEC_KEY_MD5_HEADER)
-}
-
-/// Extension trait for ObjectInfo to add replication-related methods
-pub trait ObjectInfoExt {
-    fn target_replication_status(&self, arn: &str) -> ReplicationStatusType;
-    fn replication_state(&self) -> ReplicationState;
-}
-
-impl ObjectInfoExt for ObjectInfo {
-    /// Returns replication status of a target
-    fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
-        lazy_static::lazy_static! {
-            static ref REPL_STATUS_REGEX: Regex = Regex::new(r"([^=].*?)=([^,].*?);").unwrap();
-        }
-
-        let binding = self.replication_status_internal.clone().unwrap_or_default();
-        let captures = REPL_STATUS_REGEX.captures_iter(&binding);
-        for cap in captures {
-            if cap.len() == 3 && &cap[1] == arn {
-                return ReplicationStatusType::from(&cap[2]);
-            }
-        }
-        ReplicationStatusType::default()
-    }
-
-    fn replication_state(&self) -> ReplicationState {
-        ReplicationState {
-            replication_status_internal: self.replication_status_internal.clone(),
-            version_purge_status_internal: self.version_purge_status_internal.clone(),
-            replicate_decision_str: self.replication_decision.clone(),
-            targets: replication_statuses_map(&self.replication_status_internal.clone().unwrap_or_default()),
-            purge_targets: version_purge_statuses_map(&self.version_purge_status_internal.clone().unwrap_or_default()),
-            reset_statuses_map: self
-                .user_defined
-                .iter()
-                .filter_map(|(k, v)| {
-                    internal_key_strip_suffix_prefix(k, SUFFIX_REPLICATION_RESET_ARN_PREFIX).map(|arn| (arn, v.clone()))
-                })
-                .collect(),
-            ..Default::default()
-        }
-    }
 }
 
 pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
