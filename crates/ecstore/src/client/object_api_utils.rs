@@ -149,6 +149,7 @@ pub fn new_getobjectreader<'a>(
             let r = GetObjectReader {
                 object_info: oi.clone(),
                 stream: Box::new(input_reader),
+                buffered_body: None,
             };
             r
             //})

@@ -332,8 +332,8 @@ impl ECStore {
             pool_meta: RwLock::new(pool_meta),
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
-            start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(()),
+            start_gate: Mutex::new(()),
+            pool_meta_save_gate: Mutex::new(()),
         });
 
         // Only set it when the global deployment ID is not yet configured
@@ -545,6 +545,7 @@ mod tests {
             Ok(GetObjectReader {
                 stream: Box::new(Cursor::new(self.read_payload.clone())),
                 object_info: self.object_info(bucket, object, self.read_payload.len()),
+                buffered_body: None,
             })
         }
 

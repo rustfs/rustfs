@@ -1149,6 +1149,7 @@ mod tests {
         let rd = GetObjectReader {
             stream: Box::new(Cursor::new(raw_payload.clone())),
             object_info: object_info.clone(),
+            buffered_body: None,
         };
 
         let mut data = data_movement_put_object_reader("bucket-a", &object_info, rd, "test_migration")

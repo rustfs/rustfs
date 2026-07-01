@@ -23,9 +23,18 @@ DURATION="30s"
 ROUNDS=3
 RETRY_PER_ROUND=1
 ROUND_COOLDOWN_SECS=20
+WARP_OBJECTS=""
+WARP_OBJECT_LIFECYCLE="per-round"
+WARP_PREPARE_DURATION="1s"
+GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
+GET_SMALL_OBJECT_DIRECT_MEMORY=""
+GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
+LOCAL_READ_COPY_METHOD=""
 MODE="both"
+PROFILE_ORDER="normal"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+CODEC_READER_SETUP="all_shards"
 CODEC_MULTIPART="off"
 CODEC_MULTIPART_MAX_PARTS=256
 METADATA_EARLY_STOP="off"
@@ -40,6 +49,11 @@ DIAGNOSTIC_OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
 DIAGNOSTIC_OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
 DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-get-codec}"
+DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS:-5}"
+DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS:-1}"
+DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS="${RUSTFS_DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS:-2}"
+DIAGNOSTIC_METRICS_MAX_TIME_SECS="${RUSTFS_DIAGNOSTIC_METRICS_MAX_TIME_SECS:-15}"
+DIAGNOSTIC_METRICS_FILTER_REGEX="${RUSTFS_DIAGNOSTIC_METRICS_FILTER_REGEX:-rustfs_io_get_object_}"
 SERVICE_METRIC_PREFIX="rustfs_io_get_object_"
 COMPRESSED_FALLBACK_PROBE=false
 COMPRESSED_PROBE_EXTENSION=".compressed-probe.txt"
@@ -53,8 +67,12 @@ RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
 COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
 COMPAT_OBJECT_SIZE=65536
+SKIP_COMPAT_PROBE=false
+RESOURCE_SAMPLE_INTERVAL_SECS="${RUSTFS_GET_BENCH_RESOURCE_SAMPLE_INTERVAL_SECS:-5}"
 DRY_RUN=false
 SKIP_BUILD=false
+DETACH=false
+DETACH_LOG=""
 PROFILE_FAILURES=0
 declare -a ORIGINAL_ARGS=()
 
@@ -73,11 +91,17 @@ Purpose:
 
 Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
+  --profile-order <normal|reverse>
+                                 Profile execution order after --mode expansion
+                                 (default: normal)
   --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
   --metadata-early-stop <on|off> Enable metadata early-stop observe/opt-in env (default: off)
   --shard-locality-preference <on|off>
                                  Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
+  --codec-reader-setup <all_shards|data_blocks_first>
+                                 RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
+                                 for codec verify reader setup (default: all_shards)
   --codec-multipart <on|off>     Enable multipart codec streaming opt-in for codec profiles
                                  (default: off)
   --codec-multipart-max-parts <n>
@@ -96,6 +120,20 @@ Core options:
   --diagnostic-metrics-settle-secs <n>
                                  Seconds to wait before the after snapshot so OTLP periodic
                                  metrics can export probe counters (default: 2)
+  --diagnostic-metrics-capture-attempts <n>
+                                 Retry attempts for each direct /metrics scrape (default: 5)
+  --diagnostic-metrics-capture-retry-secs <n>
+                                 Sleep seconds between failed direct /metrics scrape attempts
+                                 (default: 1)
+  --diagnostic-metrics-connect-timeout-secs <n>
+                                 Curl connect timeout for each direct /metrics scrape
+                                 (default: 2)
+  --diagnostic-metrics-max-time-secs <n>
+                                 Curl max time for each direct /metrics scrape
+                                 (default: 15)
+  --diagnostic-metrics-filter-regex <regex>
+                                 Regex for retained direct /metrics lines
+                                 (default: rustfs_io_get_object_)
   --diagnostic-obs-endpoint <url>
                                  RUSTFS_OBS_ENDPOINT passed to RustFS during diagnostic runs
   --diagnostic-obs-metric-endpoint <url>
@@ -111,6 +149,20 @@ Core options:
   --sizes <csv>                  Object sizes (default: 1MiB,4MiB,10MiB)
   --concurrency <n>              warp concurrency (default: 16)
   --duration <duration>          warp duration per round (default: 30s)
+  --warp-objects <n>             Number of objects prepared by warp for each size
+                                 (default: warp default)
+  --warp-object-lifecycle <mode> Object lifecycle mode for warp GET:
+                                 per-round|prepare-once|existing-only
+                                 (default: per-round)
+  --warp-prepare-duration <dur>  Duration used by the prepare-once warmup
+                                 warp GET run (default: 1s)
+  --metadata-cache-max-entries <n>
+                                 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES for RustFS
+  --direct-memory <on|off>       RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY for RustFS
+  --direct-memory-threshold <bytes>
+                                 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD for RustFS
+  --local-read-copy-method <mmap_copy|direct_read_copy>
+                                 RUSTFS_OBJECT_MMAP_READ_METHOD for RustFS
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
   --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 20)
@@ -123,7 +175,14 @@ Binary/options:
   --codec-min-size <bytes>       RUSTFS_GET_CODEC_STREAMING_MIN_SIZE (default: 1)
   --compat-object-key <key>      Object key used by the compatibility probe
   --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
+  --skip-compat-probe            skip post-benchmark compatibility/fallback probes
+  --resource-sample-interval-secs <n>
+                                 Process resource sampler interval (default: 5)
   --skip-build                   do not run cargo build --release -p rustfs
+  --detach                       start this script under nohup and exit after
+                                 writing detached pid/log metadata
+  --detach-log <path>            log file used with --detach
+                                 (default: <out-dir>/detached.log)
   --dry-run                      print benchmark commands without starting RustFS
 
 Credentials:
@@ -147,6 +206,11 @@ Output:
   <out-dir>/compat_summary.csv                  when legacy and codec profiles both run
   <out-dir>/metrics_summary.csv
   <out-dir>/service_metrics_summary.csv         when --diagnostic-metrics is set
+  <out-dir>/service_metrics_round_summary.csv   per-round stage/page-fault deltas when direct --diagnostic-metrics is set
+  <out-dir>/service_metrics_stage_distribution.csv
+                                                per-round stage histogram bucket deltas when direct --diagnostic-metrics is set
+  <out-dir>/service_metrics_round_percentiles.csv
+                                                per-round request/stage histogram percentile bucket upper bounds
   <out-dir>/service_metrics_acceptance.csv      when --diagnostic-metrics is set
   <out-dir>/fallback_probe_summary.csv
   <out-dir>/body_sha256_legacy.txt              when legacy profile runs
@@ -158,7 +222,12 @@ Output:
   <out-dir>/<profile>/manifest.env
   <out-dir>/<profile>/metrics_summary.csv
   <out-dir>/<profile>/service_metrics_summary.csv
+  <out-dir>/<profile>/service_metrics_round_summary.csv
+  <out-dir>/<profile>/service_metrics_stage_distribution.csv
+  <out-dir>/<profile>/service_metrics_round_percentiles.csv
   <out-dir>/<profile>/service-metrics/*.prom     before/after snapshots when --diagnostic-metrics is set
+  <out-dir>/<profile>/service-metrics/rounds/*.prom
+                                                  per-round snapshots when direct --diagnostic-metrics is set
   <out-dir>/<profile>/compat/compat_summary.csv
   <out-dir>/<profile>/compat/fallback_probe_summary.csv
   <out-dir>/<profile>/compat/response_headers.json
@@ -207,10 +276,12 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode) MODE="$2"; shift 2 ;;
+      --profile-order) PROFILE_ORDER="$2"; shift 2 ;;
       --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
       --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
+      --codec-reader-setup) CODEC_READER_SETUP="$2"; shift 2 ;;
       --codec-multipart) CODEC_MULTIPART="$2"; shift 2 ;;
       --codec-multipart-max-parts) CODEC_MULTIPART_MAX_PARTS="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
@@ -219,6 +290,11 @@ parse_args() {
       --diagnostic-prometheus-query-url) DIAGNOSTIC_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
       --diagnostic-prometheus-query) DIAGNOSTIC_PROMETHEUS_QUERY="$2"; shift 2 ;;
       --diagnostic-metrics-settle-secs) DIAGNOSTIC_METRICS_SETTLE_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-capture-attempts) DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
+      --diagnostic-metrics-capture-retry-secs) DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-connect-timeout-secs) DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-max-time-secs) DIAGNOSTIC_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
+      --diagnostic-metrics-filter-regex) DIAGNOSTIC_METRICS_FILTER_REGEX="$2"; shift 2 ;;
       --diagnostic-obs-endpoint) DIAGNOSTIC_OBS_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-metric-endpoint) DIAGNOSTIC_OBS_METRIC_ENDPOINT="$2"; shift 2 ;;
       --diagnostic-obs-meter-interval) DIAGNOSTIC_OBS_METER_INTERVAL="$2"; shift 2 ;;
@@ -229,6 +305,13 @@ parse_args() {
       --sizes) SIZES="$2"; shift 2 ;;
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
+      --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
+      --warp-object-lifecycle) WARP_OBJECT_LIFECYCLE="$2"; shift 2 ;;
+      --warp-prepare-duration) WARP_PREPARE_DURATION="$2"; shift 2 ;;
+      --metadata-cache-max-entries) GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$2"; shift 2 ;;
+      --direct-memory) GET_SMALL_OBJECT_DIRECT_MEMORY="$2"; shift 2 ;;
+      --direct-memory-threshold) GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$2"; shift 2 ;;
+      --local-read-copy-method) LOCAL_READ_COPY_METHOD="$2"; shift 2 ;;
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
@@ -239,10 +322,14 @@ parse_args() {
       --codec-min-size) CODEC_MIN_SIZE="$2"; shift 2 ;;
       --compat-object-key) COMPAT_OBJECT_KEY="$2"; shift 2 ;;
       --compat-object-size) COMPAT_OBJECT_SIZE="$2"; shift 2 ;;
+      --skip-compat-probe) SKIP_COMPAT_PROBE=true; shift ;;
+      --resource-sample-interval-secs) RESOURCE_SAMPLE_INTERVAL_SECS="$2"; shift 2 ;;
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --region) REGION="$2"; shift 2 ;;
       --skip-build) SKIP_BUILD=true; shift ;;
+      --detach) DETACH=true; shift ;;
+      --detach-log) DETACH_LOG="$2"; shift 2 ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help) usage; exit 0 ;;
       *)
@@ -257,6 +344,11 @@ validate_args() {
   case "$MODE" in
     legacy|codec|both) ;;
     *) die "--mode must be legacy, codec, or both" ;;
+  esac
+
+  case "$PROFILE_ORDER" in
+    normal|reverse) ;;
+    *) die "--profile-order must be normal or reverse" ;;
   esac
 
   case "$METADATA_EARLY_STOP" in
@@ -292,14 +384,53 @@ validate_args() {
   [[ -n "$SIZES" ]] || die "--sizes must not be empty"
   validate_positive_int "$CONCURRENCY" "--concurrency"
   validate_positive_int "$CODEC_MAX_INFLIGHT" "--codec-max-inflight"
+  case "$CODEC_READER_SETUP" in
+    all_shards|data_blocks_first) ;;
+    *) die "--codec-reader-setup must be all_shards or data_blocks_first" ;;
+  esac
   validate_positive_int "$CODEC_MULTIPART_MAX_PARTS" "--codec-multipart-max-parts"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
+  if [[ -n "$WARP_OBJECTS" ]]; then
+    validate_positive_int "$WARP_OBJECTS" "--warp-objects"
+  fi
+  case "$WARP_OBJECT_LIFECYCLE" in
+    per-round|prepare-once|existing-only) ;;
+    *) die "--warp-object-lifecycle must be per-round, prepare-once, or existing-only" ;;
+  esac
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
+    local size_count
+    size_count="$(printf '%s\n' "$SIZES" | awk -F',' '{ count=0; for (i=1; i<=NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") count++ } print count }')"
+    [[ "$size_count" -eq 1 ]] || die "--warp-object-lifecycle=${WARP_OBJECT_LIFECYCLE} currently requires a single --sizes value to avoid mixing object sizes in one bucket"
+  fi
+  if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
+    validate_positive_int "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" "--metadata-cache-max-entries"
+  fi
+  if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY" ]]; then
+    case "$GET_SMALL_OBJECT_DIRECT_MEMORY" in
+      on|off) ;;
+      *) die "--direct-memory must be on or off" ;;
+    esac
+  fi
+  if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
+    validate_positive_int "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" "--direct-memory-threshold"
+  fi
+  if [[ -n "$LOCAL_READ_COPY_METHOD" ]]; then
+    case "$LOCAL_READ_COPY_METHOD" in
+      mmap_copy|direct_read_copy) ;;
+      *) die "--local-read-copy-method must be mmap_copy or direct_read_copy" ;;
+    esac
+  fi
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
+  validate_positive_int "$RESOURCE_SAMPLE_INTERVAL_SECS" "--resource-sample-interval-secs"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
   validate_non_negative_int "$DIAGNOSTIC_METRICS_SETTLE_SECS" "--diagnostic-metrics-settle-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS" "--diagnostic-metrics-capture-attempts"
+  validate_non_negative_int "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS" "--diagnostic-metrics-capture-retry-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS" "--diagnostic-metrics-connect-timeout-secs"
+  validate_positive_int "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" "--diagnostic-metrics-max-time-secs"
   validate_positive_int "$DIAGNOSTIC_OBS_METER_INTERVAL" "--diagnostic-obs-meter-interval"
   [[ -n "$COMPAT_OBJECT_KEY" ]] || die "--compat-object-key must not be empty"
   [[ -n "$DIAGNOSTIC_OBS_SERVICE_NAME_PREFIX" ]] || die "--diagnostic-obs-service-name-prefix must not be empty"
@@ -312,6 +443,9 @@ validate_args() {
   if [[ "$DRY_RUN" != "true" ]]; then
     require_cmd cargo
     require_cmd "$PYTHON_BIN"
+  fi
+  if [[ "$DETACH" == "true" && "$DRY_RUN" != "true" ]]; then
+    require_cmd nohup
   fi
 }
 
@@ -330,6 +464,14 @@ bool_from_on_off() {
   esac
 }
 
+codec_reader_setup_data_blocks_first() {
+  case "$CODEC_READER_SETUP" in
+    all_shards) echo "false" ;;
+    data_blocks_first) echo "true" ;;
+    *) die "expected codec reader setup strategy, got: $CODEC_READER_SETUP" ;;
+  esac
+}
+
 dry_run_multipart_expected_reason() {
   if [[ "$CODEC_MULTIPART" != "on" ]]; then
     echo "multipart"
@@ -342,6 +484,71 @@ dry_run_multipart_expected_reason() {
 
 command_line_string() {
   printf '%q ' "${BASH_SOURCE[0]}" "${ORIGINAL_ARGS[@]}"
+}
+
+detached_child_args() {
+  local skip_next=false
+  local arg
+
+  for arg in "${ORIGINAL_ARGS[@]}"; do
+    if [[ "$skip_next" == "true" ]]; then
+      skip_next=false
+      continue
+    fi
+
+    case "$arg" in
+      --detach)
+        ;;
+      --detach-log)
+        skip_next=true
+        ;;
+      *)
+        printf '%s\0' "$arg"
+        ;;
+    esac
+  done
+}
+
+run_detached_if_requested() {
+  if [[ "$DETACH" != "true" ]]; then
+    return 0
+  fi
+
+  if [[ -z "$DETACH_LOG" ]]; then
+    DETACH_LOG="${OUT_DIR}/detached.log"
+  fi
+
+  local script_path="${PROJECT_ROOT}/scripts/run_get_codec_streaming_smoke.sh"
+  local pid_file="${OUT_DIR}/detached.pid"
+  local command_file="${OUT_DIR}/detached_command.txt"
+  local -a child_args=()
+
+  while IFS= read -r -d '' arg; do
+    child_args+=("$arg")
+  done < <(detached_child_args)
+
+  {
+    printf '%q ' "$script_path" "${child_args[@]}"
+    printf '\n'
+  } >"$command_file"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] detach requested"
+    log "[DRY-RUN] detached log: ${DETACH_LOG}"
+    log "[DRY-RUN] detached command: ${command_file}"
+    return 0
+  fi
+
+  nohup "$script_path" "${child_args[@]}" >"$DETACH_LOG" 2>&1 < /dev/null &
+  local detached_pid="$!"
+  printf '%s\n' "$detached_pid" >"$pid_file"
+
+  log "Detached GET codec streaming smoke started."
+  log "PID: ${detached_pid}"
+  log "Output dir: ${OUT_DIR}"
+  log "Log: ${DETACH_LOG}"
+  log "Command: ${command_file}"
+  exit 0
 }
 
 sanitize_metric_label_value() {
@@ -492,10 +699,12 @@ git_head=${git_head}
 git_dirty_count=${git_dirty_count}
 profiles=${profiles_csv}
 mode=${MODE}
+profile_order=${PROFILE_ORDER}
 codec_engines=${CODEC_ENGINES}
 metadata_early_stop=${METADATA_EARLY_STOP}
 shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
 codec_max_inflight=${CODEC_MAX_INFLIGHT}
+codec_reader_setup=${CODEC_READER_SETUP}
 codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
@@ -507,6 +716,11 @@ diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
 diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
 diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_metrics_capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
+diagnostic_metrics_capture_retry_secs=${DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS}
+diagnostic_metrics_connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+diagnostic_metrics_max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+diagnostic_metrics_filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 diagnostic_obs_endpoint=${DIAGNOSTIC_OBS_ENDPOINT}
 diagnostic_obs_metric_endpoint=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
 diagnostic_obs_meter_interval=${DIAGNOSTIC_OBS_METER_INTERVAL}
@@ -524,6 +738,11 @@ duration=${DURATION}
 rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
+warp_objects=${WARP_OBJECTS}
+RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
+RUSTFS_OBJECT_MMAP_READ_METHOD=${LOCAL_READ_COPY_METHOD}
 skip_build=${SKIP_BUILD}
 dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
@@ -614,6 +833,18 @@ endpoint_url() {
   echo "http://${ADDRESS}"
 }
 
+single_benchmark_size() {
+  printf '%s\n' "$SIZES" | awk -F',' '{
+    for (i=1; i<=NF; i++) {
+      gsub(/^[ \t]+|[ \t]+$/, "", $i)
+      if ($i != "") {
+        print $i
+        exit
+      }
+    }
+  }'
+}
+
 write_manifest() {
   local profile="$1"
   local profile_dir="$2"
@@ -645,6 +876,9 @@ duration=${DURATION}
 rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
+warp_objects=${WARP_OBJECTS}
+warp_object_lifecycle=${WARP_OBJECT_LIFECYCLE}
+warp_prepare_duration=${WARP_PREPARE_DURATION}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 python_bin=${PYTHON_BIN}
@@ -660,10 +894,15 @@ RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=${header_compat_confirmed}
 RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
+RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP=$(codec_reader_setup_data_blocks_first)
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
 RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
+RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
+RUSTFS_OBJECT_MMAP_READ_METHOD=${LOCAL_READ_COPY_METHOD}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
 RUSTFS_OBS_ENDPOINT=${DIAGNOSTIC_OBS_ENDPOINT}
 RUSTFS_OBS_METRIC_ENDPOINT=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
@@ -677,6 +916,11 @@ diagnostic_metrics_url=${DIAGNOSTIC_METRICS_URL}
 diagnostic_prometheus_query_url=${DIAGNOSTIC_PROMETHEUS_QUERY_URL}
 diagnostic_prometheus_query=${DIAGNOSTIC_PROMETHEUS_QUERY}
 diagnostic_metrics_settle_secs=${DIAGNOSTIC_METRICS_SETTLE_SECS}
+diagnostic_metrics_capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
+diagnostic_metrics_capture_retry_secs=${DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS}
+diagnostic_metrics_connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+diagnostic_metrics_max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+diagnostic_metrics_filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 service_metric_prefix=${SERVICE_METRIC_PREFIX}
 metrics_path=${metrics_path}
 RUSTFS_SCANNER_ENABLED=false
@@ -684,6 +928,8 @@ RUSTFS_SCANNER_START_DELAY_SECS=3600
 RUSTFS_SCANNER_CYCLE=3600
 RUSTFS_CONSOLE_ENABLE=false
 RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true
+resource_sample_interval_secs=${RESOURCE_SAMPLE_INTERVAL_SECS}
+skip_compat_probe=${SKIP_COMPAT_PROBE}
 EOF
 }
 
@@ -774,13 +1020,31 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_ROLLOUT="$rollout_target"
     export RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED="$body_compat_confirmed"
     export RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED="$header_compat_confirmed"
-    export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
-    export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
+    RUSTFS_GET_METADATA_EARLY_STOP_ENABLE="$(bool_from_on_off "$METADATA_EARLY_STOP")"
+    export RUSTFS_GET_METADATA_EARLY_STOP_ENABLE
+    RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
+    export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
-    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
+    RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP="$(codec_reader_setup_data_blocks_first)"
+    export RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
+    RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
+    export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
     export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
+      export RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES"
+    fi
+    if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY" ]]; then
+      RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY="$(bool_from_on_off "$GET_SMALL_OBJECT_DIRECT_MEMORY")"
+      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY
+    fi
+    if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
+      export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD"
+    fi
+    if [[ -n "$LOCAL_READ_COPY_METHOD" ]]; then
+      export RUSTFS_OBJECT_MMAP_READ_METHOD="$LOCAL_READ_COPY_METHOD"
+    fi
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
     if [[ "$DIAGNOSTIC_METRICS" == "true" ]]; then
       export RUSTFS_OBS_METER_INTERVAL="$DIAGNOSTIC_OBS_METER_INTERVAL"
@@ -810,6 +1074,58 @@ start_server() {
   wait_for_health "$profile" "$rustfs_log"
 }
 
+prepare_warp_existing_objects() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local prepare_dir="${profile_dir}/warp_prepare"
+  local size
+  size="$(single_benchmark_size)"
+
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "prepare-once" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$prepare_dir"
+
+  local cmd=(
+    "$WARP_BIN" get
+    --host "$ADDRESS"
+    --access-key "$ACCESS_KEY"
+    --secret-key "$SECRET_KEY"
+    --bucket "$BUCKET"
+    --obj.size "$size"
+    --concurrent "$CONCURRENCY"
+    --duration "$WARP_PREPARE_DURATION"
+    --region "$REGION"
+    --noclear
+  )
+  if [[ -n "$WARP_OBJECTS" ]]; then
+    cmd+=(--objects "$WARP_OBJECTS")
+  fi
+
+  {
+    printf 'profile=%s\n' "$profile"
+    printf 'mode=prepare-once\n'
+    printf 'size=%s\n' "$size"
+    printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
+    printf 'bucket=%s\n' "$BUCKET"
+    printf 'command='
+    printf '%q ' "${cmd[@]}"
+    printf '\n'
+  } >"${prepare_dir}/manifest.env"
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size}"
+    printf '[DRY-RUN] ' >"${prepare_dir}/prepare.log"
+    printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare.log"
+    printf '\n' >>"${prepare_dir}/prepare.log"
+    return 0
+  fi
+
+  log "Preparing existing warp objects profile=${profile} size=${size} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
+  "${cmd[@]}" >"${prepare_dir}/prepare.log" 2>&1
+}
+
 run_bench() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -836,6 +1152,27 @@ run_bench() {
 
   if [[ -n "$baseline_csv" ]]; then
     cmd+=(--baseline-csv "$baseline_csv")
+  fi
+  if [[ "$WARP_OBJECT_LIFECYCLE" == "per-round" && -n "$WARP_OBJECTS" ]]; then
+    cmd+=(--extra-args "--objects ${WARP_OBJECTS}")
+  fi
+  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
+    local lifecycle_args="--list-existing --noclear"
+    if [[ -n "$WARP_OBJECTS" ]]; then
+      lifecycle_args="${lifecycle_args} --objects ${WARP_OBJECTS}"
+    fi
+    cmd+=(--extra-args "$lifecycle_args")
+  fi
+  if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    cmd+=(
+      --service-metrics-url "$DIAGNOSTIC_METRICS_URL"
+      --service-metrics-dir "${profile_dir}/service-metrics/rounds"
+      --service-metrics-attempts "$DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS"
+      --service-metrics-retry-secs "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
+      --service-metrics-connect-timeout-secs "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS"
+      --service-metrics-max-time-secs "$DIAGNOSTIC_METRICS_MAX_TIME_SECS"
+      --service-metrics-filter-regex "$DIAGNOSTIC_METRICS_FILTER_REGEX"
+    )
   fi
   if [[ "$DRY_RUN" == "true" ]]; then
     cmd+=(--dry-run)
@@ -944,6 +1281,23 @@ write_status("ok")
 PY
 }
 
+filter_diagnostic_metrics_snapshot() {
+  local input_file="$1"
+  local output_file="$2"
+
+  if [[ -z "$DIAGNOSTIC_METRICS_FILTER_REGEX" ]]; then
+    mv "$input_file" "$output_file"
+    return 0
+  fi
+
+  awk -v pattern="$DIAGNOSTIC_METRICS_FILTER_REGEX" '$0 ~ pattern { print }' "$input_file" >"$output_file"
+  if [[ ! -s "$output_file" ]]; then
+    mv "$input_file" "$output_file"
+  else
+    rm -f "$input_file"
+  fi
+}
+
 capture_service_metrics_snapshot() {
   local profile="$1"
   local phase="$2"
@@ -964,6 +1318,7 @@ capture_service_metrics_snapshot() {
 phase=${phase}
 status=not_run_dry_run
 url=${DIAGNOSTIC_METRICS_URL}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 EOF
     return 0
   fi
@@ -973,30 +1328,51 @@ EOF
     return 0
   fi
 
-  if curl -fsS --noproxy '*' --connect-timeout 2 --max-time 5 "$DIAGNOSTIC_METRICS_URL" >"$snapshot_file"; then
-    if [[ ! -s "$snapshot_file" ]]; then
-      cat >"$status_file" <<EOF
-phase=${phase}
-status=empty_response
-url=${DIAGNOSTIC_METRICS_URL}
-EOF
-      log "WARN: captured empty service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
-      return 0
-    fi
-    cat >"$status_file" <<EOF
+  local tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes
+  tmp_file="${snapshot_file}.tmp"
+  filtered_file="${snapshot_file}.filtered.tmp"
+  for ((capture_attempt=1; capture_attempt<=DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+    if curl -fsS --noproxy '*' \
+      --connect-timeout "$DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS" \
+      --max-time "$DIAGNOSTIC_METRICS_MAX_TIME_SECS" \
+      "$DIAGNOSTIC_METRICS_URL" >"$tmp_file"; then
+      if [[ -s "$tmp_file" ]]; then
+        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
+        filter_diagnostic_metrics_snapshot "$tmp_file" "$filtered_file"
+        mv "$filtered_file" "$snapshot_file"
+        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
+        cat >"$status_file" <<EOF
 phase=${phase}
 status=ok
+capture_attempt=${capture_attempt}
 url=${DIAGNOSTIC_METRICS_URL}
+connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
+raw_bytes=${raw_bytes}
+snapshot_bytes=${snapshot_bytes}
 EOF
-  else
-    : >"$snapshot_file"
-    cat >"$status_file" <<EOF
+        return 0
+      fi
+    fi
+
+    rm -f "$tmp_file" "$filtered_file"
+    if (( capture_attempt < DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS && DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS > 0 )); then
+      sleep "$DIAGNOSTIC_METRICS_CAPTURE_RETRY_SECS"
+    fi
+  done
+
+  : >"$snapshot_file"
+  cat >"$status_file" <<EOF
 phase=${phase}
 status=capture_failed
+capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
 url=${DIAGNOSTIC_METRICS_URL}
+connect_timeout_secs=${DIAGNOSTIC_METRICS_CONNECT_TIMEOUT_SECS}
+max_time_secs=${DIAGNOSTIC_METRICS_MAX_TIME_SECS}
+filter_regex=${DIAGNOSTIC_METRICS_FILTER_REGEX}
 EOF
-    log "WARN: failed to capture service metrics profile=${profile} phase=${phase} url=${DIAGNOSTIC_METRICS_URL}"
-  fi
+  log "WARN: failed to capture service metrics profile=${profile} phase=${phase} attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}"
 }
 
 write_profile_service_metrics_summary() {
@@ -1030,20 +1406,21 @@ EOF
     return
   fi
 
-  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" <<'PY'
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$before_file" "$after_file" "$out_csv" "$(diagnostic_service_name "$profile")" <<'PY'
 import csv
 import pathlib
 import re
 import sys
 
-profile, metric_prefix, before_raw, after_raw, out_raw = sys.argv[1:]
+profile, metric_prefix, before_raw, after_raw, out_raw, service_name = sys.argv[1:]
 before_path = pathlib.Path(before_raw)
 after_path = pathlib.Path(after_raw)
 out_path = pathlib.Path(out_raw)
 
 LINE = re.compile(
     r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
-    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)\s*$'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'(?:\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)?\s*$'
 )
 
 
@@ -1083,6 +1460,9 @@ def read_metrics(path):
         if not metric.startswith(metric_prefix):
             continue
         labels = labels or ""
+        if service_name and f'service_name="{service_name}"' not in labels \
+                and f'service.name="{service_name}"' not in labels:
+            continue
         rows[(metric, labels)] = float(value)
     return rows
 
@@ -1114,6 +1494,396 @@ with out_path.open("w", encoding="utf-8", newline="") as handle:
 PY
 }
 
+write_profile_service_metrics_round_breakdown() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local round_csv="${profile_dir}/warp/round_results.csv"
+  local round_metrics_dir="${profile_dir}/service-metrics/rounds"
+  local out_summary="${profile_dir}/service_metrics_round_summary.csv"
+  local out_distribution="${profile_dir}/service_metrics_stage_distribution.csv"
+  local out_percentiles="${profile_dir}/service_metrics_round_percentiles.csv"
+
+  if [[ "$DIAGNOSTIC_METRICS" != "true" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,disabled,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,diagnostic_metrics_disabled,diagnostic_metrics_disabled,diagnostic_metrics_disabled
+EOF
+    return
+  fi
+
+  if [[ "$DRY_RUN" == "true" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run
+EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,not_run_dry_run,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,not_run_dry_run,not_run_dry_run,not_run_dry_run
+EOF
+    return
+  fi
+
+  if [[ -n "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
+    cat >"$out_summary" <<EOF
+profile,size,tool,round,attempt,round_status,stage,count_delta,sum_delta,avg_ms,minor_fault_delta,major_fault_delta,minor_faults_per_call,major_faults_per_call,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,prometheus_query,prometheus_query
+EOF
+    cat >"$out_distribution" <<EOF
+profile,size,tool,round,attempt,round_status,path,stage,le,bucket_delta,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,prometheus_query,prometheus_query
+EOF
+    cat >"$out_percentiles" <<EOF
+profile,size,tool,round,attempt,round_status,target,path,stage,count_delta,sum_delta,avg_ms,p50_le_seconds,p90_le_seconds,p99_le_seconds,bucket_resolution_note,before_status,after_status
+${profile},N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,prometheus_query_round_breakdown_unsupported,prometheus_query,prometheus_query
+EOF
+    return
+  fi
+
+  "$PYTHON_BIN" - "$profile" "$SERVICE_METRIC_PREFIX" "$round_csv" "$round_metrics_dir" \
+    "$out_summary" "$out_distribution" "$out_percentiles" "$(diagnostic_service_name "$profile")" <<'PY'
+import csv
+import pathlib
+import re
+import sys
+
+profile, metric_prefix, round_raw, metrics_dir_raw, summary_raw, distribution_raw, percentiles_raw, service_name = sys.argv[1:]
+round_path = pathlib.Path(round_raw)
+metrics_dir = pathlib.Path(metrics_dir_raw)
+summary_path = pathlib.Path(summary_raw)
+distribution_path = pathlib.Path(distribution_raw)
+percentiles_path = pathlib.Path(percentiles_raw)
+
+TARGET_STAGES = [
+    "request_ingress_to_context",
+    "store_reader_setup",
+    "metadata_cache_lookup",
+    "metadata_fanout",
+    "metadata_resolve",
+    "metadata",
+    "object_info",
+    "path_decision",
+    "reader_setup",
+    "reader_setup_schedule",
+    "reader_setup_wait_quorum",
+    "reader_setup_drop_pending",
+    "reader_task_reader_construction",
+    "reader_task_file_open",
+    "reader_task_bitrot_reader_init",
+    "reader_open_mmap_copy_success",
+    "reader_open_mmap_copy_fallback",
+    "reader_open_stream",
+    "reader_mmap_blocking_wait",
+    "reader_mmap_blocking_task",
+    "reader_mmap_copy_buffer",
+    "reader_mmap_direct_read_copy",
+    "reader_mmap_file_open",
+    "reader_mmap_map",
+    "reader_stream_first_read",
+    "decode",
+    "body_build",
+    "body_memory_blob",
+    "response_handoff",
+    "first_byte",
+]
+DISTRIBUTION_STAGES = {
+    "reader_mmap_blocking_wait",
+    "reader_mmap_blocking_task",
+    "reader_mmap_copy_buffer",
+    "reader_mmap_direct_read_copy",
+    "reader_open_mmap_copy_success",
+    "reader_setup",
+    "reader_setup_wait_quorum",
+    "reader_task_file_open",
+    "first_byte",
+}
+LINE = re.compile(
+    r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
+    r'([-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)'
+    r'(?:\s+[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?)?\s*$'
+)
+
+
+def snapshot_token(tool, size, round_id, attempt):
+    safe_size = re.sub(r"[^A-Za-z0-9_.-]", "_", size)
+    return f"{tool}_{safe_size}_r{round_id}_a{attempt}"
+
+
+def status_for(path):
+    if not path.exists():
+        return "missing"
+    values = {}
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if "=" in raw:
+            key, value = raw.split("=", 1)
+            values[key] = value
+    return values.get("status", "unknown")
+
+
+def label_value(labels, key):
+    match = re.search(rf'(?:^|,){re.escape(key)}="((?:\\.|[^"\\])*)"', labels)
+    if match is None:
+        return ""
+    return match.group(1).replace(r'\"', '"').replace(r"\\", "\\")
+
+
+def read_metrics(path):
+    rows = {}
+    if not path.exists() or path.stat().st_size == 0:
+        return rows
+    for raw in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        if not raw or raw.startswith("#"):
+            continue
+        match = LINE.match(raw)
+        if match is None:
+            continue
+        metric, labels, value = match.groups()
+        if not metric.startswith(metric_prefix):
+            continue
+        labels = labels or ""
+        if service_name and f'service_name="{service_name}"' not in labels \
+                and f'service.name="{service_name}"' not in labels:
+            continue
+        rows[(metric, labels)] = float(value)
+    return rows
+
+
+def metric_delta(before, after, metric_name, stage, suffix):
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != f"{metric_name}_{suffix}":
+            continue
+        if label_value(labels, "stage") != stage:
+            continue
+        total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return total
+
+
+def fault_delta(before, after, kind):
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != "rustfs_io_get_object_mmap_page_faults_total":
+            continue
+        if label_value(labels, "stage") != "reader_mmap_copy_buffer":
+            continue
+        if label_value(labels, "kind") != kind:
+            continue
+        total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return total
+
+
+def histogram_bucket_deltas(before, after, metric_name, path="", stage="", status=""):
+    buckets = {}
+    for metric, labels in sorted(set(before) | set(after)):
+        if metric != f"{metric_name}_bucket":
+            continue
+        if path and label_value(labels, "path") != path:
+            continue
+        if stage and label_value(labels, "stage") != stage:
+            continue
+        if status and label_value(labels, "status") != status:
+            continue
+        le = label_value(labels, "le")
+        if not le:
+            continue
+        buckets[le] = buckets.get(le, 0.0) + after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return buckets
+
+
+def bucket_sort_key(le):
+    return float("inf") if le == "+Inf" else float(le)
+
+
+def percentile_bucket_upper_bound(buckets, quantile):
+    if not buckets:
+        return "N/A"
+    finite_or_inf = sorted(buckets.items(), key=lambda item: bucket_sort_key(item[0]))
+    total = buckets.get("+Inf", finite_or_inf[-1][1])
+    if total <= 0:
+        return "N/A"
+    threshold = total * quantile
+    for le, cumulative in finite_or_inf:
+        if cumulative >= threshold:
+            return le
+    return finite_or_inf[-1][0]
+
+
+def metric_count_sum(before, after, metric_name, path="", stage="", status=""):
+    count = 0.0
+    total = 0.0
+    for metric, labels in sorted(set(before) | set(after)):
+        if path and label_value(labels, "path") != path:
+            continue
+        if stage and label_value(labels, "stage") != stage:
+            continue
+        if status and label_value(labels, "status") != status:
+            continue
+        if metric == f"{metric_name}_count":
+            count += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+        elif metric == f"{metric_name}_sum":
+            total += after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+    return count, total
+
+
+PERCENTILE_TARGETS = [
+    ("request_duration_ok", "rustfs_io_get_object_request_duration_seconds", "", "", "ok"),
+    ("total_duration", "rustfs_io_get_object_total_duration_seconds", "", "", ""),
+    ("request_context", "rustfs_io_get_object_stage_duration_seconds", "s3_handler", "request_context", ""),
+]
+for stage_name in TARGET_STAGES:
+    PERCENTILE_TARGETS.append((stage_name, "rustfs_io_get_object_stage_duration_seconds", "", stage_name, ""))
+
+
+with summary_path.open("w", encoding="utf-8", newline="") as summary_handle, \
+        distribution_path.open("w", encoding="utf-8", newline="") as distribution_handle, \
+        percentiles_path.open("w", encoding="utf-8", newline="") as percentiles_handle:
+    summary_writer = csv.writer(summary_handle)
+    distribution_writer = csv.writer(distribution_handle)
+    percentiles_writer = csv.writer(percentiles_handle)
+    summary_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "stage",
+        "count_delta", "sum_delta", "avg_ms", "minor_fault_delta", "major_fault_delta",
+        "minor_faults_per_call", "major_faults_per_call", "before_status", "after_status",
+    ])
+    distribution_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "path", "stage",
+        "le", "bucket_delta", "before_status", "after_status",
+    ])
+    percentiles_writer.writerow([
+        "profile", "size", "tool", "round", "attempt", "round_status", "target",
+        "path", "stage", "count_delta", "sum_delta", "avg_ms",
+        "p50_le_seconds", "p90_le_seconds", "p99_le_seconds", "bucket_resolution_note",
+        "before_status", "after_status",
+    ])
+
+    if not round_path.exists() or not metrics_dir.exists():
+        summary_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "missing", "missing",
+        ])
+        distribution_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "missing", "missing",
+        ])
+        percentiles_writer.writerow([
+            profile, "N/A", "N/A", "N/A", "N/A", "snapshot_missing", "N/A",
+            "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A", "N/A",
+            "snapshot_missing", "missing", "missing",
+        ])
+        raise SystemExit(0)
+
+    for round_row in csv.DictReader(round_path.open(encoding="utf-8", newline="")):
+        size = round_row["size"]
+        tool = round_row["tool"]
+        round_id = round_row["round"]
+        attempt = round_row["attempt"]
+        round_status = round_row["status"]
+        token = snapshot_token(tool, size, round_id, attempt)
+        before_path = metrics_dir / f"{token}_before.prom"
+        after_path = metrics_dir / f"{token}_after.prom"
+        before_status = status_for(metrics_dir / f"{token}_before.status")
+        after_status = status_for(metrics_dir / f"{token}_after.status")
+        before = read_metrics(before_path)
+        after = read_metrics(after_path)
+
+        minor_faults = fault_delta(before, after, "minor")
+        major_faults = fault_delta(before, after, "major")
+        for stage in TARGET_STAGES:
+            count_delta = metric_delta(before, after, "rustfs_io_get_object_stage_duration_seconds", stage, "count")
+            sum_delta = metric_delta(before, after, "rustfs_io_get_object_stage_duration_seconds", stage, "sum")
+            avg_ms = (sum_delta / count_delta * 1000.0) if count_delta else 0.0
+            stage_minor_faults = minor_faults if stage == "reader_mmap_copy_buffer" else 0.0
+            stage_major_faults = major_faults if stage == "reader_mmap_copy_buffer" else 0.0
+            summary_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                stage,
+                f"{count_delta:.12g}",
+                f"{sum_delta:.12g}",
+                f"{avg_ms:.6f}",
+                f"{stage_minor_faults:.12g}",
+                f"{stage_major_faults:.12g}",
+                f"{(stage_minor_faults / count_delta) if count_delta else 0.0:.6f}",
+                f"{(stage_major_faults / count_delta) if count_delta else 0.0:.6f}",
+                before_status,
+                after_status,
+            ])
+
+        for target, metric_name, path_label, stage_label, status_label in PERCENTILE_TARGETS:
+            buckets = histogram_bucket_deltas(before, after, metric_name, path_label, stage_label, status_label)
+            count_delta, sum_delta = metric_count_sum(before, after, metric_name, path_label, stage_label, status_label)
+            avg_ms = (sum_delta / count_delta * 1000.0) if count_delta else 0.0
+            p50 = percentile_bucket_upper_bound(buckets, 0.50)
+            p90 = percentile_bucket_upper_bound(buckets, 0.90)
+            p99 = percentile_bucket_upper_bound(buckets, 0.99)
+            if not buckets:
+                note = "no_buckets"
+            elif p50 == p90 == p99 and p99 not in {"N/A", "+Inf"} and bucket_sort_key(p99) >= 1.0 and avg_ms < 1000.0:
+                note = "coarse_seconds_buckets"
+            else:
+                note = "bucket_upper_bound"
+            percentiles_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                target,
+                path_label or "N/A",
+                stage_label or "N/A",
+                f"{count_delta:.12g}",
+                f"{sum_delta:.12g}",
+                f"{avg_ms:.6f}",
+                p50,
+                p90,
+                p99,
+                note,
+                before_status,
+                after_status,
+            ])
+
+        for metric, labels in sorted(set(before) | set(after)):
+            if metric != "rustfs_io_get_object_stage_duration_seconds_bucket":
+                continue
+            stage = label_value(labels, "stage")
+            if stage not in DISTRIBUTION_STAGES:
+                continue
+            bucket_delta = after.get((metric, labels), 0.0) - before.get((metric, labels), 0.0)
+            if bucket_delta == 0:
+                continue
+            distribution_writer.writerow([
+                profile,
+                size,
+                tool,
+                round_id,
+                attempt,
+                round_status,
+                label_value(labels, "path"),
+                stage,
+                label_value(labels, "le"),
+                f"{bucket_delta:.12g}",
+                before_status,
+                after_status,
+            ])
+PY
+}
+
 write_root_service_metrics_summary() {
   local out_csv="${OUT_DIR}/service_metrics_summary.csv"
   local profile summary wrote_header=false
@@ -1134,6 +1904,32 @@ write_root_service_metrics_summary() {
     cat >"$out_csv" <<'EOF'
 profile,status,metric,labels,before,after,delta,classification
 N/A,missing,N/A,N/A,N/A,N/A,N/A,no_profile_service_metrics_summary
+EOF
+  fi
+}
+
+write_root_profile_csv() {
+  local basename="$1"
+  shift
+  local out_csv="${OUT_DIR}/${basename}"
+  local profile summary wrote_header=false
+  : >"$out_csv"
+
+  for profile in "$@"; do
+    summary="${OUT_DIR}/${profile}/${basename}"
+    [[ -f "$summary" ]] || continue
+    if [[ "$wrote_header" == "false" ]]; then
+      cat "$summary" >>"$out_csv"
+      wrote_header=true
+    else
+      tail -n +2 "$summary" >>"$out_csv"
+    fi
+  done
+
+  if [[ "$wrote_header" == "false" ]]; then
+    cat >"$out_csv" <<'EOF'
+profile,status,note
+N/A,missing,no_profile_csv
 EOF
   fi
 }
@@ -1475,22 +2271,75 @@ start_server_sampler() {
 
   if [[ "$DRY_RUN" == "true" ]]; then
     cat >"$SERVER_SAMPLER_LOG" <<'EOF'
-timestamp_utc,rss_kib,cpu_pct
-DRY_RUN,N/A,N/A
+timestamp_utc,rss_kib,cpu_pct,threads,fd_count,vm_hwm_kib,vm_data_kib,voluntary_ctxt_switches,nonvoluntary_ctxt_switches,sched_runtime_ns,sched_wait_ns,sched_timeslices
+DRY_RUN,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A,N/A
 EOF
     return
   fi
 
-  echo "timestamp_utc,rss_kib,cpu_pct" >"$SERVER_SAMPLER_LOG"
+  echo "timestamp_utc,rss_kib,cpu_pct,threads,fd_count,vm_hwm_kib,vm_data_kib,voluntary_ctxt_switches,nonvoluntary_ctxt_switches,sched_runtime_ns,sched_wait_ns,sched_timeslices" >"$SERVER_SAMPLER_LOG"
   (
     while kill -0 "$pid" >/dev/null 2>&1; do
-      local timestamp sample
+      local timestamp sample rss_cpu threads fd_count vm_hwm vm_data voluntary_ctxt nonvoluntary_ctxt sched_runtime sched_wait sched_slices
       timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-      sample="$(ps -o rss= -o %cpu= -p "$pid" 2>/dev/null | awk 'NF >= 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }')"
-      if [[ -n "$sample" ]]; then
-        echo "${timestamp},${sample}" >>"$SERVER_SAMPLER_LOG"
+      rss_cpu="$(ps -o rss= -o %cpu= -p "$pid" 2>/dev/null | awk 'NF >= 2 { gsub(/^[ \t]+|[ \t]+$/, "", $1); gsub(/^[ \t]+|[ \t]+$/, "", $2); print $1 "," $2; exit }')"
+      if [[ -z "$rss_cpu" ]]; then
+        sleep "$RESOURCE_SAMPLE_INTERVAL_SECS"
+        continue
       fi
-      sleep 5
+
+      threads="N/A"
+      fd_count="N/A"
+      vm_hwm="N/A"
+      vm_data="N/A"
+      voluntary_ctxt="N/A"
+      nonvoluntary_ctxt="N/A"
+      sched_runtime="N/A"
+      sched_wait="N/A"
+      sched_slices="N/A"
+
+      if [[ -r "/proc/${pid}/status" ]]; then
+        sample="$(awk '
+          /^Threads:/ { threads=$2 }
+          /^VmHWM:/ { vm_hwm=$2 }
+          /^VmData:/ { vm_data=$2 }
+          /^voluntary_ctxt_switches:/ { voluntary=$2 }
+          /^nonvoluntary_ctxt_switches:/ { nonvoluntary=$2 }
+          END {
+            printf "%s,%s,%s,%s,%s",
+              threads ? threads : "N/A",
+              vm_hwm ? vm_hwm : "N/A",
+              vm_data ? vm_data : "N/A",
+              voluntary ? voluntary : "N/A",
+              nonvoluntary ? nonvoluntary : "N/A"
+          }
+        ' "/proc/${pid}/status")"
+        IFS=',' read -r threads vm_hwm vm_data voluntary_ctxt nonvoluntary_ctxt <<<"$sample"
+      fi
+      if [[ -d "/proc/${pid}/fd" ]]; then
+        fd_count="$(find "/proc/${pid}/fd" -maxdepth 1 -type l 2>/dev/null | awk 'END { print NR + 0 }')"
+      fi
+      if [[ -d "/proc/${pid}/task" ]]; then
+        sample="$(awk '
+          {
+            runtime += $1
+            wait += $2
+            slices += $3
+            seen = 1
+          }
+          END {
+            if (seen) {
+              printf "%.0f %.0f %.0f", runtime, wait, slices
+            }
+          }
+        ' /proc/"${pid}"/task/*/schedstat 2>/dev/null || true)"
+        if [[ -n "$sample" ]]; then
+          read -r sched_runtime sched_wait sched_slices <<<"$sample"
+        fi
+      fi
+
+      echo "${timestamp},${rss_cpu},${threads},${fd_count},${vm_hwm},${vm_data},${voluntary_ctxt},${nonvoluntary_ctxt},${sched_runtime},${sched_wait},${sched_slices}" >>"$SERVER_SAMPLER_LOG"
+      sleep "$RESOURCE_SAMPLE_INTERVAL_SECS"
     done
   ) &
   SERVER_SAMPLER_PID="$!"
@@ -1527,8 +2376,26 @@ EOF
     $2 != "N/A" && $2 != "" {
       rss = $2 + 0
       cpu = $3 + 0
+      threads = ($4 != "N/A" && $4 != "") ? $4 + 0 : 0
+      fd_count = ($5 != "N/A" && $5 != "") ? $5 + 0 : 0
+      vm_hwm = ($6 != "N/A" && $6 != "") ? $6 + 0 : 0
+      vm_data = ($7 != "N/A" && $7 != "") ? $7 + 0 : 0
+      voluntary = ($8 != "N/A" && $8 != "") ? $8 + 0 : -1
+      nonvoluntary = ($9 != "N/A" && $9 != "") ? $9 + 0 : -1
       if (count == 0 || rss > max_rss) max_rss = rss
       if (count == 0 || cpu > max_cpu) max_cpu = cpu
+      if (threads > max_threads) max_threads = threads
+      if (fd_count > max_fd_count) max_fd_count = fd_count
+      if (vm_hwm > max_vm_hwm) max_vm_hwm = vm_hwm
+      if (vm_data > max_vm_data) max_vm_data = vm_data
+      if (voluntary >= 0) {
+        if (!seen_voluntary) { first_voluntary = voluntary; seen_voluntary = 1 }
+        last_voluntary = voluntary
+      }
+      if (nonvoluntary >= 0) {
+        if (!seen_nonvoluntary) { first_nonvoluntary = nonvoluntary; seen_nonvoluntary = 1 }
+        last_nonvoluntary = nonvoluntary
+      }
       cpu_sum += cpu
       count++
     }
@@ -1545,11 +2412,41 @@ EOF
         printf "max_rss_kib=%.0f\n", max_rss
         printf "max_cpu_pct=%.2f\n", max_cpu
         printf "avg_cpu_pct=%.2f\n", cpu_sum / count
+        printf "max_threads=%.0f\n", max_threads
+        printf "max_fd_count=%.0f\n", max_fd_count
+        printf "max_vm_hwm_kib=%.0f\n", max_vm_hwm
+        printf "max_vm_data_kib=%.0f\n", max_vm_data
+        if (seen_voluntary) {
+          printf "voluntary_ctxt_switches_delta=%.0f\n", last_voluntary - first_voluntary
+        } else {
+          print "voluntary_ctxt_switches_delta=unknown"
+        }
+        if (seen_nonvoluntary) {
+          printf "nonvoluntary_ctxt_switches_delta=%.0f\n", last_nonvoluntary - first_nonvoluntary
+        } else {
+          print "nonvoluntary_ctxt_switches_delta=unknown"
+        }
         print "cpu_rss_acceptability=manual_review_required"
-        print "note=Harness captured runtime samples but does not impose a hard pass/fail threshold."
+        print "note=Harness captured runtime/resource samples but does not impose a hard pass/fail threshold."
       }
     }
   ' "$sample_csv" >"$notes_file"
+}
+
+write_skipped_compat_probe() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local compat_dir="${profile_dir}/compat"
+
+  mkdir -p "$compat_dir"
+  cat >"${compat_dir}/compat_summary.csv" <<EOF
+size,path,body_sha256_match,content_length_match,etag_match,content_range_match,checksum_headers_match,sse_headers_match,status_code_match,error_count,body_sha256,status_code,content_length,etag
+${COMPAT_OBJECT_SIZE},${profile},skipped,skipped,skipped,skipped,skipped,skipped,skipped,0,SKIPPED,N/A,N/A,SKIPPED
+EOF
+  cat >"${compat_dir}/fallback_probe_summary.csv" <<EOF
+profile,probe,object_key,status,status_code,body_len,expected_runtime_fallback_reason,note
+${profile},all,${COMPAT_OBJECT_KEY},skipped,N/A,N/A,N/A,skipped by --skip-compat-probe
+EOF
 }
 
 run_compat_probe() {
@@ -2440,6 +3337,8 @@ for profile_dir in profile_dirs:
                 "metadata_early_stop": manifest.get("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", ""),
                 "shard_locality_preference": manifest.get("RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE", ""),
                 "codec_max_inflight": manifest.get("RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT", ""),
+                "codec_reader_setup": manifest.get("RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP", ""),
+                "local_read_copy_method": manifest.get("RUSTFS_OBJECT_MMAP_READ_METHOD", ""),
                 "output_handoff_attribution": manifest.get("RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE", ""),
                 "round_cooldown_secs": manifest.get("round_cooldown_secs", ""),
                 "duration": manifest.get("duration", ""),
@@ -2487,6 +3386,8 @@ fieldnames = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "codec_reader_setup",
+    "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
     "duration",
@@ -2521,6 +3422,8 @@ baseline_fields = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "codec_reader_setup",
+    "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
     "duration",
@@ -2563,6 +3466,8 @@ for row in rows:
             "metadata_early_stop": row["metadata_early_stop"],
             "shard_locality_preference": row["shard_locality_preference"],
             "codec_max_inflight": row["codec_max_inflight"],
+            "codec_reader_setup": row["codec_reader_setup"],
+            "local_read_copy_method": row["local_read_copy_method"],
             "output_handoff_attribution": row["output_handoff_attribution"],
             "round_cooldown_secs": row["round_cooldown_secs"],
             "duration": row["duration"],
@@ -2727,14 +3632,33 @@ write_root_cpu_rss_notes() {
 
 write_raw_output_paths() {
   local out_file="${OUT_DIR}/raw_output_paths.txt"
-  {
-    for profile_dir in "${OUT_DIR}"/*; do
-      [[ -d "$profile_dir" ]] || continue
-      if [[ -d "${profile_dir}/warp/logs" ]]; then
-        find "${profile_dir}/warp/logs" -type f | sort
-      fi
-    done
-  } >"$out_file"
+	  {
+	    find "$OUT_DIR" -maxdepth 1 -type f \
+	      \( -name 'metrics_summary.csv' \
+	        -o -name 'service_metrics_summary.csv' \
+	        -o -name 'service_metrics_round_summary.csv' \
+	        -o -name 'service_metrics_stage_distribution.csv' \
+	        -o -name 'service_metrics_round_percentiles.csv' \
+	        -o -name 'service_metrics_acceptance.csv' \) | sort
+	    for profile_dir in "${OUT_DIR}"/*; do
+	      [[ -d "$profile_dir" ]] || continue
+	      find "$profile_dir" -maxdepth 1 -type f \
+	        \( -name 'metrics_summary.csv' \
+	          -o -name 'service_metrics_summary.csv' \
+	          -o -name 'service_metrics_round_summary.csv' \
+	          -o -name 'service_metrics_stage_distribution.csv' \
+	          -o -name 'service_metrics_round_percentiles.csv' \) | sort
+	      if [[ -d "${profile_dir}/service-metrics" ]]; then
+	        find "${profile_dir}/service-metrics" -type f | sort
+	      fi
+	      if [[ -d "${profile_dir}/warp/logs" ]]; then
+	        find "${profile_dir}/warp/logs" -type f | sort
+	      fi
+	      if [[ -d "${profile_dir}/warp_prepare" ]]; then
+	        find "${profile_dir}/warp_prepare" -type f | sort
+	      fi
+	    done
+	  } >"$out_file"
 }
 
 write_default_switch_readiness_report() {
@@ -2748,7 +3672,7 @@ write_default_switch_readiness_report() {
 
   local stable not_worse improved_over_five two_sizes_gt_five
   local headers_compatible p95_p99_ok cpu_rss_ok runtime_metrics_ok fallback_proven kill_switch_verified correctness_matrix_ok
-  local all_pass decision
+  local decision
 
   if [[ -f "$baseline_compare_path" ]]; then
     read -r stable not_worse improved_over_five < <(
@@ -2851,10 +3775,8 @@ PY
      && "$headers_compatible" == "pass" \
      && "$fallback_proven" == "pass" \
      && "$kill_switch_verified" == "pass" ]]; then
-    all_pass="pass"
     decision="Default enablement prerequisites passed; scoped default enablement may be considered."
   else
-    all_pass="fail"
     decision="Default enablement is not ready; keep opt-in only."
   fi
 
@@ -2908,6 +3830,7 @@ run_profile() {
 
   stop_server
   start_server "$profile"
+  prepare_warp_existing_objects "$profile"
   capture_service_metrics_snapshot "$profile" before
   if run_bench "$profile" "$baseline_csv"; then
     :
@@ -2915,18 +3838,27 @@ run_profile() {
     bench_rc=$?
   fi
   write_metrics_summary "$profile"
-  run_compat_probe "$profile"
+  if [[ "$SKIP_COMPAT_PROBE" == "true" ]]; then
+    log "Skipping compatibility probe for profile=${profile}"
+    write_skipped_compat_probe "$profile"
+  else
+    run_compat_probe "$profile"
+  fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && "$DIAGNOSTIC_METRICS_SETTLE_SECS" -gt 0 ]]; then
     sleep "$DIAGNOSTIC_METRICS_SETTLE_SECS"
   fi
   capture_service_metrics_snapshot "$profile" after
   write_profile_service_metrics_summary "$profile"
+  write_profile_service_metrics_round_breakdown "$profile"
   stop_server
   write_profile_cpu_rss_notes "$profile"
 
   log "Median summary: ${OUT_DIR}/${profile}/warp/median_summary.csv"
   log "Metrics summary: ${OUT_DIR}/${profile}/metrics_summary.csv"
   log "Service metrics summary: ${OUT_DIR}/${profile}/service_metrics_summary.csv"
+  log "Service metrics round summary: ${OUT_DIR}/${profile}/service_metrics_round_summary.csv"
+  log "Service metrics stage distribution: ${OUT_DIR}/${profile}/service_metrics_stage_distribution.csv"
+  log "Service metrics round percentiles: ${OUT_DIR}/${profile}/service_metrics_round_percentiles.csv"
   log "Compatibility summary: ${OUT_DIR}/${profile}/compat/compat_summary.csv"
   if [[ -f "${OUT_DIR}/${profile}/warp/baseline_compare.csv" ]]; then
     log "Baseline compare: ${OUT_DIR}/${profile}/warp/baseline_compare.csv"
@@ -2940,6 +3872,7 @@ main() {
   parse_args "$@"
   validate_args
   setup_output
+  run_detached_if_requested
   local codec_profiles=()
   local profiles=()
   local profiles_csv=""
@@ -2963,6 +3896,14 @@ main() {
       profiles=("legacy" "${codec_profiles[@]}")
       ;;
   esac
+  if [[ "$PROFILE_ORDER" == "reverse" ]]; then
+    local reversed_profiles=()
+    local profile_index
+    for ((profile_index=${#profiles[@]} - 1; profile_index >= 0; profile_index--)); do
+      reversed_profiles+=("${profiles[$profile_index]}")
+    done
+    profiles=("${reversed_profiles[@]}")
+  fi
   profiles_csv="$(IFS=,; echo "${profiles[*]}")"
 
   write_root_environment
@@ -2992,6 +3933,9 @@ main() {
 
   write_root_metrics_summary "${profiles[@]}"
   write_root_service_metrics_summary "${profiles[@]}"
+  write_root_profile_csv service_metrics_round_summary.csv "${profiles[@]}"
+  write_root_profile_csv service_metrics_stage_distribution.csv "${profiles[@]}"
+  write_root_profile_csv service_metrics_round_percentiles.csv "${profiles[@]}"
   write_service_metrics_acceptance
   write_root_compat_summary "${profiles[@]}"
   write_root_fallback_probe_summary "${profiles[@]}"

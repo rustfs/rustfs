@@ -14,6 +14,14 @@
 
 use super::*;
 use crate::diagnostics::get::{
+    GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
+    GET_METADATA_CACHE_DECISION_MISS, GET_METADATA_CACHE_DECISION_REJECT, GET_METADATA_CACHE_DECISION_SKIP,
+    GET_METADATA_CACHE_REASON_DATA_MOVEMENT, GET_METADATA_CACHE_REASON_DELETE_MARKER, GET_METADATA_CACHE_REASON_DIST_ERASURE,
+    GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS, GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
+    GET_METADATA_CACHE_REASON_META_BUCKET, GET_METADATA_CACHE_REASON_NO_LOCK, GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
+    GET_METADATA_CACHE_REASON_NOT_READ_DATA, GET_METADATA_CACHE_REASON_PART_NUMBER,
+    GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ, GET_METADATA_CACHE_REASON_USABLE, GET_METADATA_CACHE_REASON_VERSION_ID,
+    GET_METADATA_CACHE_REASON_VERSION_SUSPENDED, GET_METADATA_CACHE_REASON_VERSIONED,
     GET_METADATA_EARLY_STOP_REASON_CONFLICTING_METADATA, GET_METADATA_EARLY_STOP_REASON_DELETE_MARKER,
     GET_METADATA_EARLY_STOP_REASON_ERROR, GET_METADATA_EARLY_STOP_REASON_INSUFFICIENT_QUORUM,
     GET_METADATA_EARLY_STOP_REASON_NOT_FOUND, GET_METADATA_EARLY_STOP_REASON_UNSAFE_REQUEST,
@@ -21,12 +29,17 @@ use crate::diagnostics::get::{
     GET_METADATA_EARLY_STOP_REASON_VERSION_NOT_FOUND, GET_METADATA_RESPONSE_CORRUPT, GET_METADATA_RESPONSE_DISK_NOT_FOUND,
     GET_METADATA_RESPONSE_ERROR, GET_METADATA_RESPONSE_IGNORED, GET_METADATA_RESPONSE_NOT_FOUND, GET_METADATA_RESPONSE_TIMEOUT,
     GET_METADATA_RESPONSE_VALID, GET_METADATA_RESPONSE_VERSION_NOT_FOUND, GET_OBJECT_PATH_CODEC_STREAMING,
-    GET_OBJECT_PATH_LEGACY_DUPLEX, GET_STAGE_DECODE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP, GetObjectFailureReason,
-    classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
+    GET_OBJECT_PATH_DIRECT_MEMORY, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE,
+    GET_STAGE_METADATA_CACHE_LOOKUP, GET_STAGE_METADATA_RESOLVE, GET_STAGE_RANGE, GET_STAGE_READER_SETUP,
+    GET_STAGE_READER_SETUP_DROP_PENDING, GET_STAGE_READER_SETUP_SCHEDULE, GET_STAGE_READER_SETUP_WAIT_QUORUM,
+    GET_STAGE_READER_TASK_BITROT_READER_INIT, GET_STAGE_READER_TASK_FILE_OPEN, GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    GetObjectFailureReason, classify_disk_error, get_stage_timer_if_enabled, record_get_object_pipeline_failure,
     record_get_object_pipeline_failure_for_path, record_get_stage_duration_if_enabled,
 };
 use crate::erasure::coding::BitrotReader;
-use crate::io_support::bitrot::{create_deferred_bitrot_reader, object_mmap_read_enabled};
+use crate::io_support::bitrot::{
+    BitrotReaderStageMetrics, create_bitrot_reader_with_stage_metrics, create_deferred_bitrot_reader, object_mmap_read_enabled,
+};
 use crate::set_disk::shard_source::ShardReadCost;
 use futures::stream::{FuturesUnordered, StreamExt};
 use metrics::counter;
@@ -43,6 +56,9 @@ use tokio::sync::RwLock;
 use tokio::task::JoinSet;
 
 const EVENT_SET_DISK_READ: &str = "set_disk_read";
+const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: &str =
+    "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP";
 const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
 const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
@@ -426,6 +442,13 @@ impl MetadataQuorumAccumulator {
     }
 }
 
+#[derive(Clone, Debug)]
+enum MetadataCacheLookup {
+    Hit(Arc<GetObjectMetadataCacheEntry>),
+    Miss,
+    RejectedInsufficientQuorum,
+}
+
 fn metadata_early_stop_candidate_matches(left: &FileInfo, right: &FileInfo) -> bool {
     left.volume == right.volume
         && left.name == right.name
@@ -797,12 +820,27 @@ async fn submit_read_repair_heal_with_submitter(
 }
 
 type ObjectBitrotReader = BitrotReader<Box<dyn AsyncRead + Send + Sync + Unpin>>;
+type BitrotReaderTask<'a> =
+    Pin<Box<dyn Future<Output = (usize, std::result::Result<Option<ObjectBitrotReader>, DiskError>)> + Send + 'a>>;
+
+const DIRECT_MEMORY_BITROT_READER_STAGE_METRICS: BitrotReaderStageMetrics = BitrotReaderStageMetrics {
+    path: GET_OBJECT_PATH_DIRECT_MEMORY,
+    reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+    file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+    bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+};
 
 struct BitrotReaderSetup {
     readers: Vec<Option<ObjectBitrotReader>>,
     errors: Vec<Option<DiskError>>,
+    scheduled: Vec<bool>,
     attempted: Vec<bool>,
     ready: Vec<bool>,
+    scheduled_count: usize,
+    attempted_count: usize,
+    ready_count: usize,
+    failed_count: usize,
+    deferred_count: usize,
 }
 
 #[derive(Clone, Copy)]
@@ -811,9 +849,78 @@ enum BitrotReaderSetupMode {
     VerifyReconstruction,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BitrotReaderSetupStrategy {
+    AllShards,
+    DataBlocksFirst,
+    DataBlocksOnly,
+}
+
+impl BitrotReaderSetupMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            BitrotReaderSetupMode::ReadQuorum => "read_quorum",
+            BitrotReaderSetupMode::VerifyReconstruction => "verify_reconstruction",
+        }
+    }
+}
+
+impl BitrotReaderSetupStrategy {
+    fn as_str(self) -> &'static str {
+        match self {
+            BitrotReaderSetupStrategy::AllShards => "all_shards",
+            BitrotReaderSetupStrategy::DataBlocksFirst => "data_blocks_first",
+            BitrotReaderSetupStrategy::DataBlocksOnly => "data_blocks_only",
+        }
+    }
+}
+
+fn get_bitrot_reader_setup_strategy(mode: BitrotReaderSetupMode, prefer_data_blocks_first: bool) -> BitrotReaderSetupStrategy {
+    match mode {
+        BitrotReaderSetupMode::ReadQuorum
+            if prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+        {
+            BitrotReaderSetupStrategy::DataBlocksFirst
+        }
+        BitrotReaderSetupMode::VerifyReconstruction
+            if rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+        {
+            BitrotReaderSetupStrategy::DataBlocksFirst
+        }
+        _ => BitrotReaderSetupStrategy::AllShards,
+    }
+}
+
 impl BitrotReaderSetup {
+    fn new(shards: usize) -> Self {
+        Self {
+            readers: (0..shards).map(|_| None).collect(),
+            errors: vec![Some(DiskError::DiskNotFound); shards],
+            scheduled: vec![false; shards],
+            attempted: vec![false; shards],
+            ready: vec![false; shards],
+            scheduled_count: 0,
+            attempted_count: 0,
+            ready_count: 0,
+            failed_count: 0,
+            deferred_count: 0,
+        }
+    }
+
+    fn scheduled_shards(&self) -> usize {
+        self.scheduled_count
+    }
+
+    fn attempted_shards(&self) -> usize {
+        self.attempted_count
+    }
+
+    fn pending_scheduled_shards(&self) -> usize {
+        self.scheduled_count.saturating_sub(self.attempted_count)
+    }
+
     fn available_shards(&self) -> usize {
-        self.ready.iter().filter(|ready| **ready).count()
+        self.ready_count
     }
 
     fn available_data_shards(&self, data_shards: usize) -> usize {
@@ -821,11 +928,7 @@ impl BitrotReaderSetup {
     }
 
     fn completed_failed_shards(&self) -> usize {
-        self.attempted
-            .iter()
-            .zip(&self.errors)
-            .filter(|(attempted, err)| **attempted && err.is_some())
-            .count()
+        self.failed_count
     }
 
     fn data_shards_attempted(&self, data_shards: usize) -> bool {
@@ -842,12 +945,271 @@ impl BitrotReaderSetup {
     }
 
     fn has_setup_quorum(&self, data_shards: usize, parity_shards: usize, mode: BitrotReaderSetupMode) -> bool {
-        let target = match mode {
+        self.available_shards() >= self.setup_target(data_shards, parity_shards, mode)
+    }
+
+    fn setup_target(&self, data_shards: usize, parity_shards: usize, mode: BitrotReaderSetupMode) -> usize {
+        match mode {
             BitrotReaderSetupMode::ReadQuorum => data_shards,
             BitrotReaderSetupMode::VerifyReconstruction => self.reconstruction_verification_target(data_shards, parity_shards),
-        };
-        self.available_shards() >= target
+        }
     }
+
+    fn deferred_shards(&self) -> usize {
+        self.deferred_count
+    }
+
+    fn mark_scheduled(&mut self, idx: usize) -> bool {
+        if self.scheduled[idx] {
+            return false;
+        }
+        self.scheduled[idx] = true;
+        self.scheduled_count = self.scheduled_count.saturating_add(1);
+        true
+    }
+
+    fn apply_reader_result(&mut self, idx: usize, result: std::result::Result<Option<ObjectBitrotReader>, DiskError>) {
+        self.attempted[idx] = true;
+        self.attempted_count = self.attempted_count.saturating_add(1);
+        match result {
+            Ok(Some(reader)) => {
+                self.readers[idx] = Some(reader);
+                self.errors[idx] = None;
+                self.ready[idx] = true;
+                self.ready_count = self.ready_count.saturating_add(1);
+            }
+            Ok(None) => {
+                self.readers[idx] = None;
+                self.errors[idx] = Some(DiskError::DiskNotFound);
+                self.ready[idx] = false;
+                self.failed_count = self.failed_count.saturating_add(1);
+            }
+            Err(e) => {
+                self.readers[idx] = None;
+                self.errors[idx] = Some(e);
+                self.ready[idx] = false;
+                self.failed_count = self.failed_count.saturating_add(1);
+            }
+        }
+    }
+
+    fn retain_deferred_reader(&mut self, idx: usize, reader: ObjectBitrotReader) {
+        self.readers[idx] = Some(reader);
+        self.errors[idx] = None;
+        self.deferred_count = self.deferred_count.saturating_add(1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn schedule_bitrot_reader_task<'a>(
+    reader_tasks: &mut FuturesUnordered<BitrotReaderTask<'a>>,
+    setup: &mut BitrotReaderSetup,
+    idx: usize,
+    files: &'a [FileInfo],
+    disks: &'a [Option<DiskStore>],
+    bucket: &'a str,
+    object: &'a str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) {
+    if idx >= disks.len() || !setup.mark_scheduled(idx) {
+        return;
+    }
+
+    let inline_data = files[idx].data.as_deref();
+    let data_dir = files[idx].data_dir.unwrap_or_default();
+    let disk = disks[idx].as_ref();
+    let path = format!("{object}/{data_dir}/part.{part_number}");
+
+    reader_tasks.push(Box::pin(async move {
+        let result = create_bitrot_reader_with_stage_metrics(
+            inline_data,
+            disk,
+            bucket,
+            &path,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            stage_metrics,
+        )
+        .await;
+        (idx, result)
+    }));
+}
+
+fn next_unscheduled_reader_index(setup: &BitrotReaderSetup, total_shards: usize, data_shards: usize) -> Option<usize> {
+    (data_shards..total_shards)
+        .chain(0..data_shards.min(total_shards))
+        .find(|idx| !setup.scheduled[*idx])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn fill_deferred_bitrot_readers(
+    setup: &mut BitrotReaderSetup,
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+) {
+    if !setup.has_setup_quorum(data_shards, parity_shards, mode) {
+        return;
+    }
+
+    for idx in 0..disks.len() {
+        if setup.attempted[idx] {
+            continue;
+        }
+
+        let inline_data = files[idx].data.clone();
+        let disk = disks[idx].clone();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        setup.retain_deferred_reader(
+            idx,
+            create_deferred_bitrot_reader(
+                inline_data,
+                disk,
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo.clone(),
+                skip_verify_bitrot,
+                use_mmap_read,
+            ),
+        );
+    }
+}
+
+fn record_bitrot_reader_setup_fanout(
+    strategy: BitrotReaderSetupStrategy,
+    mode: BitrotReaderSetupMode,
+    setup: &BitrotReaderSetup,
+) {
+    rustfs_io_metrics::record_get_object_reader_setup_fanout(
+        strategy.as_str(),
+        mode.as_str(),
+        setup.scheduled_shards(),
+        setup.attempted_shards(),
+        setup.available_shards(),
+        setup.completed_failed_shards(),
+        setup.deferred_shards(),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_bitrot_readers_until_quorum_all_shards(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> BitrotReaderSetup {
+    let strategy = BitrotReaderSetupStrategy::AllShards;
+    let mut setup = BitrotReaderSetup::new(disks.len());
+    let mut reader_tasks = FuturesUnordered::new();
+    let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+
+    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
+
+    let schedule_stage_start = stage_metrics.map(|_| Instant::now());
+    for (idx, disk_op) in disks.iter().enumerate() {
+        setup.mark_scheduled(idx);
+        let inline_data = files[idx].data.as_deref();
+        let data_dir = files[idx].data_dir.unwrap_or_default();
+        let disk = disk_op.as_ref();
+        let path = format!("{object}/{data_dir}/part.{part_number}");
+        let checksum_algo = checksum_algo.clone();
+
+        reader_tasks.push(async move {
+            let result = create_bitrot_reader_with_stage_metrics(
+                inline_data,
+                disk,
+                bucket,
+                &path,
+                read_offset,
+                read_length,
+                shard_size,
+                checksum_algo,
+                skip_verify_bitrot,
+                use_mmap_read,
+                stage_metrics,
+            )
+            .await;
+            (idx, result)
+        });
+    }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
+    }
+
+    let wait_quorum_stage_start = stage_metrics.map(|_| Instant::now());
+    while let Some((idx, result)) = reader_tasks.next().await {
+        setup.apply_reader_result(idx, result);
+
+        if setup.has_setup_quorum(data_shards, parity_shards, mode) {
+            break;
+        }
+    }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
+    }
+
+    fill_deferred_bitrot_readers(
+        &mut setup,
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+    );
+    let drop_pending_stage_start = stage_metrics.map(|_| Instant::now());
+    drop(reader_tasks);
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
+    }
+    record_bitrot_reader_setup_fanout(strategy, mode, &setup);
+
+    setup
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -866,91 +1228,254 @@ async fn create_bitrot_readers_until_quorum(
     data_shards: usize,
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> BitrotReaderSetup {
-    let mut setup = BitrotReaderSetup {
-        readers: (0..disks.len()).map(|_| None).collect(),
-        errors: vec![Some(DiskError::DiskNotFound); disks.len()],
-        attempted: vec![false; disks.len()],
-        ready: vec![false; disks.len()],
-    };
-    let mut reader_tasks = FuturesUnordered::new();
+    create_bitrot_readers_until_quorum_with_preference(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        false,
+        stage_metrics,
+    )
+    .await
+}
 
-    for (idx, disk_op) in disks.iter().enumerate() {
-        let inline_data = files[idx].data.as_deref();
-        let data_dir = files[idx].data_dir.unwrap_or_default();
-        let disk = disk_op.as_ref();
-        let path = format!("{object}/{data_dir}/part.{part_number}");
-        let checksum_algo = checksum_algo.clone();
-
-        reader_tasks.push(async move {
-            let result = create_bitrot_reader(
-                inline_data,
-                disk,
-                bucket,
-                &path,
-                read_offset,
-                read_length,
-                shard_size,
-                checksum_algo,
-                skip_verify_bitrot,
-                use_mmap_read,
-            )
-            .await;
-            (idx, result)
-        });
+#[allow(clippy::too_many_arguments)]
+async fn create_bitrot_readers_until_quorum_with_preference(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    prefer_data_blocks_first: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) -> BitrotReaderSetup {
+    let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
+    if strategy == BitrotReaderSetupStrategy::AllShards {
+        return create_bitrot_readers_until_quorum_all_shards(
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            data_shards,
+            parity_shards,
+            mode,
+            stage_metrics,
+        )
+        .await;
     }
 
+    let mut setup = BitrotReaderSetup::new(disks.len());
+    let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
+    let total_shards = disks.len();
+    let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
+
+    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
+
+    let schedule_stage_start = stage_metrics.map(|_| Instant::now());
+    for idx in 0..data_shards.min(total_shards) {
+        schedule_bitrot_reader_task(
+            &mut reader_tasks,
+            &mut setup,
+            idx,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+            stage_metrics,
+        );
+    }
+
+    if data_shards < total_shards {
+        schedule_bitrot_reader_task(
+            &mut reader_tasks,
+            &mut setup,
+            data_shards,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+            stage_metrics,
+        );
+    }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
+    }
+
+    let wait_quorum_stage_start = stage_metrics.map(|_| Instant::now());
     while let Some((idx, result)) = reader_tasks.next().await {
-        setup.attempted[idx] = true;
-        match result {
-            Ok(Some(reader)) => {
-                setup.readers[idx] = Some(reader);
-                setup.errors[idx] = None;
-                setup.ready[idx] = true;
-            }
-            Ok(None) => {
-                setup.readers[idx] = None;
-                setup.errors[idx] = Some(DiskError::DiskNotFound);
-                setup.ready[idx] = false;
-            }
-            Err(e) => {
-                setup.readers[idx] = None;
-                setup.errors[idx] = Some(e);
-                setup.ready[idx] = false;
-            }
-        }
+        setup.apply_reader_result(idx, result);
 
         if setup.has_setup_quorum(data_shards, parity_shards, mode) {
             break;
         }
-    }
 
-    if setup.has_setup_quorum(data_shards, parity_shards, mode) {
-        for idx in 0..disks.len() {
-            if setup.attempted[idx] {
-                continue;
-            }
-
-            let inline_data = files[idx].data.clone();
-            let disk = disks[idx].clone();
-            let data_dir = files[idx].data_dir.unwrap_or_default();
-            let path = format!("{object}/{data_dir}/part.{part_number}");
-            setup.readers[idx] = Some(create_deferred_bitrot_reader(
-                inline_data,
-                disk,
+        let target = setup.setup_target(data_shards, parity_shards, mode);
+        while setup.available_shards().saturating_add(setup.pending_scheduled_shards()) < target {
+            let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) else {
+                break;
+            };
+            schedule_bitrot_reader_task(
+                &mut reader_tasks,
+                &mut setup,
+                next_idx,
+                files,
+                disks,
                 bucket,
-                &path,
+                object,
+                part_number,
                 read_offset,
                 read_length,
                 shard_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
-            ));
-            setup.errors[idx] = None;
+                stage_metrics,
+            );
         }
     }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
+    }
+
+    fill_deferred_bitrot_readers(
+        &mut setup,
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+    );
+    let drop_pending_stage_start = stage_metrics.map(|_| Instant::now());
     drop(reader_tasks);
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
+    }
+    record_bitrot_reader_setup_fanout(strategy, mode, &setup);
+
+    setup
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn create_data_block_bitrot_readers(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+) -> BitrotReaderSetup {
+    let strategy = BitrotReaderSetupStrategy::DataBlocksOnly;
+    let total_shards = disks.len().min(files.len());
+    let mut setup = BitrotReaderSetup::new(total_shards);
+    let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
+    let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+    let reader_stage_metrics = stage_metrics_enabled.then_some(DIRECT_MEMORY_BITROT_READER_STAGE_METRICS);
+
+    rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), BitrotReaderSetupMode::ReadQuorum.as_str());
+
+    let schedule_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    for idx in 0..data_shards.min(total_shards) {
+        schedule_bitrot_reader_task(
+            &mut reader_tasks,
+            &mut setup,
+            idx,
+            files,
+            disks,
+            bucket,
+            object,
+            part_number,
+            read_offset,
+            read_length,
+            shard_size,
+            checksum_algo.clone(),
+            skip_verify_bitrot,
+            use_mmap_read,
+            reader_stage_metrics,
+        );
+    }
+    record_get_stage_duration_if_enabled(GET_OBJECT_PATH_DIRECT_MEMORY, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
+
+    let wait_quorum_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    while let Some((idx, result)) = reader_tasks.next().await {
+        setup.apply_reader_result(idx, result);
+        if setup.available_data_shards(data_shards) >= data_shards {
+            break;
+        }
+    }
+    record_get_stage_duration_if_enabled(
+        GET_OBJECT_PATH_DIRECT_MEMORY,
+        GET_STAGE_READER_SETUP_WAIT_QUORUM,
+        wait_quorum_stage_start,
+    );
+
+    let drop_pending_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+    drop(reader_tasks);
+    record_get_stage_duration_if_enabled(
+        GET_OBJECT_PATH_DIRECT_MEMORY,
+        GET_STAGE_READER_SETUP_DROP_PENDING,
+        drop_pending_stage_start,
+    );
+
+    // The direct-memory path only consumes the data shard readers. If one of
+    // them is missing, the caller falls back to the regular GET path.
+    record_bitrot_reader_setup_fanout(strategy, BitrotReaderSetupMode::ReadQuorum, &setup);
 
     setup
 }
@@ -1036,17 +1561,37 @@ where
 }
 
 impl SetDisks {
-    async fn is_get_object_metadata_cache_enabled(&self, bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-        is_get_object_metadata_cache_request_eligible(bucket, opts, read_data) && !runtime_sources::setup_is_dist_erasure().await
+    async fn get_object_metadata_cache_bypass_reason(
+        bucket: &str,
+        opts: &ObjectOptions,
+        read_data: bool,
+    ) -> Option<&'static str> {
+        if let Some(reason) = get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data) {
+            return Some(reason);
+        }
+        runtime_sources::setup_is_dist_erasure()
+            .await
+            .then_some(GET_METADATA_CACHE_REASON_DIST_ERASURE)
     }
 
     async fn cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> Option<GetObjectMetadataCacheEntry> {
+        match self.lookup_cached_get_object_fileinfo(bucket, object).await {
+            MetadataCacheLookup::Hit(entry) => Some((*entry).clone()),
+            MetadataCacheLookup::Miss | MetadataCacheLookup::RejectedInsufficientQuorum => None,
+        }
+    }
+
+    async fn lookup_cached_get_object_fileinfo(&self, bucket: &str, object: &str) -> MetadataCacheLookup {
         let key = GetObjectMetadataCacheKey::new(bucket, object);
         // moka handles TTL expiry automatically; no is_fresh() check needed
-        self.get_object_metadata_cache
-            .get(&key)
-            .await
-            .filter(|entry| entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum)
+        let Some(entry) = self.get_object_metadata_cache.get(&key).await else {
+            return MetadataCacheLookup::Miss;
+        };
+        if entry.online_disks.iter().filter(|disk| disk.is_some()).count() >= entry.read_quorum {
+            MetadataCacheLookup::Hit(entry)
+        } else {
+            MetadataCacheLookup::RejectedInsufficientQuorum
+        }
     }
 
     async fn cache_get_object_fileinfo(
@@ -1067,13 +1612,13 @@ impl SetDisks {
         self.get_object_metadata_cache
             .insert(
                 key,
-                GetObjectMetadataCacheEntry {
+                Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
                     fi: fi.clone(),
                     parts_metadata: parts_metadata.to_vec(),
                     online_disks: online_disks.to_vec(),
                     read_quorum,
-                },
+                }),
             )
             .await;
     }
@@ -1199,10 +1744,8 @@ impl SetDisks {
         observe: bool,
         default_parity_count: usize,
     ) -> disk::error::Result<(Vec<FileInfo>, Vec<Option<DiskError>>, MetadataFanoutDiagnostics)> {
-        let early_stop_enabled = observe && is_get_metadata_early_stop_enabled();
-        let allow_early_stop = observe
-            && ((is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
-                || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing));
+        let early_stop_enabled = observe && (is_get_metadata_early_stop_enabled() || is_version_early_stop_enabled());
+        let allow_early_stop = observe && should_allow_metadata_early_stop(read_data, version_id, healing, incl_free_versions);
         if allow_early_stop {
             return Self::read_all_fileinfo_early_stop(
                 disks,
@@ -1403,6 +1946,7 @@ impl SetDisks {
                     GET_OBJECT_PATH_LEGACY_DUPLEX,
                     saved_responses,
                 );
+                while join_set.join_next().await.is_some() {}
                 let diagnostics = MetadataFanoutDiagnostics::new(fanout_start.elapsed(), observations);
                 return Ok((ress, errors, diagnostics));
             }
@@ -1745,14 +2289,53 @@ impl SetDisks {
         read_data: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>, Vec<Option<DiskStore>>)> {
         let vid = opts.version_id.clone().unwrap_or_default();
+        let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
 
-        let use_metadata_cache = self.is_get_object_metadata_cache_enabled(bucket, opts, read_data).await;
-        if use_metadata_cache
-            && vid.is_empty()
-            && let Some(cached) = self.cached_get_object_fileinfo(bucket, object).await
-        {
-            return Ok((cached.fi, cached.parts_metadata, cached.online_disks));
+        let metadata_cache_lookup_start = get_stage_timer_if_enabled(stage_metrics_enabled);
+        let cache_bypass_reason = Self::get_object_metadata_cache_bypass_reason(bucket, opts, read_data).await;
+        let use_metadata_cache = cache_bypass_reason.is_none();
+        if let Some(reason) = cache_bypass_reason {
+            rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_METADATA_CACHE_DECISION_SKIP,
+                reason,
+            );
+        } else if vid.is_empty() {
+            match self.lookup_cached_get_object_fileinfo(bucket, object).await {
+                MetadataCacheLookup::Hit(cached) => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_HIT,
+                        GET_METADATA_CACHE_REASON_USABLE,
+                    );
+                    record_get_stage_duration_if_enabled(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_STAGE_METADATA_CACHE_LOOKUP,
+                        metadata_cache_lookup_start,
+                    );
+                    return Ok((cached.fi.clone(), cached.parts_metadata.clone(), cached.online_disks.clone()));
+                }
+                MetadataCacheLookup::Miss => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_MISS,
+                        GET_METADATA_CACHE_REASON_NOT_FOUND_OR_EXPIRED,
+                    );
+                }
+                MetadataCacheLookup::RejectedInsufficientQuorum => {
+                    rustfs_io_metrics::record_get_object_metadata_cache_decision(
+                        GET_OBJECT_PATH_SET_DISK,
+                        GET_METADATA_CACHE_DECISION_REJECT,
+                        GET_METADATA_CACHE_REASON_INSUFFICIENT_CACHED_QUORUM,
+                    );
+                }
+            }
         }
+        record_get_stage_duration_if_enabled(
+            GET_OBJECT_PATH_SET_DISK,
+            GET_STAGE_METADATA_CACHE_LOOKUP,
+            metadata_cache_lookup_start,
+        );
 
         let disks = self.disks.read().await;
 
@@ -1772,17 +2355,24 @@ impl SetDisks {
         )
         .await?;
         metadata_fanout_diagnostics.record(GET_OBJECT_PATH_LEGACY_DUPLEX);
+        let metadata_fanout_complete = metadata_fanout_diagnostics.total_responses() >= disks.len();
         // warn!("get_object_fileinfo parts_metadata {:?}", &parts_metadata);
         // warn!("get_object_fileinfo {}/{} errs {:?}", bucket, object, &errs);
 
         let _min_disks = self.set_drive_count - self.default_parity_count;
 
+        let metadata_resolve_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let (read_quorum, _) = match Self::object_quorum_from_meta(&parts_metadata, &errs, self.default_parity_count)
             .map_err(|err| to_object_err(err.into(), vec![bucket, object]))
         {
             Ok(v) => v,
             Err(e) => {
                 // error!("Self::object_quorum_from_meta: {:?}, bucket: {}, object: {}", &e, bucket, object);
+                record_get_stage_duration_if_enabled(
+                    GET_OBJECT_PATH_SET_DISK,
+                    GET_STAGE_METADATA_RESOLVE,
+                    metadata_resolve_stage_start,
+                );
                 return Err(e);
             }
         };
@@ -1792,6 +2382,11 @@ impl SetDisks {
 
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             error!("reduce_read_quorum_errs: {:?}, bucket: {}, object: {}", &err, bucket, object);
+            record_get_stage_duration_if_enabled(
+                GET_OBJECT_PATH_SET_DISK,
+                GET_STAGE_METADATA_RESOLVE,
+                metadata_resolve_stage_start,
+            );
             return Err(to_object_err(err.into(), vec![bucket, object]));
         }
 
@@ -1810,10 +2405,11 @@ impl SetDisks {
                 "metadata_read_error",
             )
             .await;
-        } else if use_metadata_cache {
+        } else if use_metadata_cache && metadata_fanout_complete {
             self.cache_get_object_fileinfo(bucket, object, &fi, &parts_metadata, &op_online_disks, read_quorum)
                 .await;
         }
+        record_get_stage_duration_if_enabled(GET_OBJECT_PATH_SET_DISK, GET_STAGE_METADATA_RESOLVE, metadata_resolve_stage_start);
         // debug!("get_object_fileinfo pick fi {:?}", &fi);
 
         // let online_disks: Vec<Option<DiskStore>> = op_online_disks.iter().filter(|v| v.is_some()).cloned().collect();
@@ -1863,6 +2459,156 @@ impl SetDisks {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_get_object_direct_data_shards_with_fileinfo(
+        bucket: &str,
+        object: &str,
+        fi: &FileInfo,
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        skip_verify_bitrot: bool,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
+    ) -> Result<Option<Bytes>> {
+        if fi.parts.len() != 1 || !object_fits_single_block(fi.size, fi.erasure.block_size) {
+            return Ok(None);
+        }
+
+        let object_size = usize::try_from(fi.size)
+            .map_err(|_| to_object_err(Error::other("direct-memory GET object size is invalid"), vec![bucket, object]))?;
+        let Some(part) = fi.parts.first() else {
+            return Ok(None);
+        };
+        if part.size != object_size {
+            return Ok(None);
+        }
+
+        let erasure = coding::Erasure::new_with_options(
+            fi.erasure.data_blocks,
+            fi.erasure.parity_blocks,
+            fi.erasure.block_size,
+            fi.uses_legacy_checksum,
+        );
+        if erasure.data_shards == 0 {
+            return Ok(None);
+        }
+
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
+        let checksum_info = fi.erasure.get_checksum_info(part.number);
+        let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
+            HashAlgorithm::HighwayHash256SLegacy
+        } else {
+            checksum_info.algorithm
+        };
+        let read_length = erasure.shard_file_offset(0, object_size, object_size);
+
+        if fi.data.is_some() {
+            let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, fi, erasure.data_shards, |index| {
+                disks.get(index).is_some_and(Option::is_some)
+            }) else {
+                return Ok(None);
+            };
+
+            let reader_setup_stage_start = Instant::now();
+            let mut readers = build_inline_bitrot_readers_from_refs(
+                &data_files,
+                bucket,
+                object,
+                read_length,
+                erasure.shard_size(),
+                &checksum_algo,
+                skip_verify_bitrot,
+            )
+            .await?;
+            let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_DIRECT_MEMORY,
+                GET_STAGE_READER_SETUP,
+                metrics_object_class,
+                metrics_size_bucket,
+                reader_setup_elapsed.as_secs_f64(),
+            );
+
+            let decode_stage_start = Instant::now();
+            let body = try_read_inline_data_shards_direct(&mut readers, erasure.data_shards, read_length, object_size).await;
+            let decode_elapsed = decode_stage_start.elapsed();
+            rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                GET_OBJECT_PATH_DIRECT_MEMORY,
+                GET_STAGE_DECODE,
+                metrics_object_class,
+                metrics_size_bucket,
+                decode_elapsed.as_secs_f64(),
+            );
+
+            if body.is_some() {
+                rustfs_io_metrics::record_get_object_direct_memory_subpath(
+                    GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED,
+                    metrics_object_class,
+                    metrics_size_bucket,
+                );
+            }
+
+            return Ok(body);
+        }
+
+        let use_mmap_read = object_mmap_read_enabled();
+
+        let reader_setup_stage_start = Instant::now();
+        let mut reader_setup = create_data_block_bitrot_readers(
+            &files,
+            &disks,
+            bucket,
+            object,
+            part.number,
+            0,
+            read_length,
+            erasure.shard_size(),
+            checksum_algo,
+            skip_verify_bitrot,
+            use_mmap_read,
+            erasure.data_shards,
+        )
+        .await;
+        let reader_setup_elapsed = reader_setup_stage_start.elapsed();
+        rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+            GET_OBJECT_PATH_DIRECT_MEMORY,
+            GET_STAGE_READER_SETUP,
+            metrics_object_class,
+            metrics_size_bucket,
+            reader_setup_elapsed.as_secs_f64(),
+        );
+
+        if reader_setup.available_data_shards(erasure.data_shards) < erasure.data_shards {
+            return Ok(None);
+        }
+
+        let decode_stage_start = Instant::now();
+        let body =
+            try_read_inline_data_shards_direct(&mut reader_setup.readers, erasure.data_shards, read_length, object_size).await;
+        let decode_elapsed = decode_stage_start.elapsed();
+        rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+        rustfs_io_metrics::record_get_object_stage_duration_by_size(
+            GET_OBJECT_PATH_DIRECT_MEMORY,
+            GET_STAGE_DECODE,
+            metrics_object_class,
+            metrics_size_bucket,
+            decode_elapsed.as_secs_f64(),
+        );
+
+        if body.is_some() {
+            rustfs_io_metrics::record_get_object_direct_memory_subpath(
+                GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS,
+                metrics_object_class,
+                metrics_size_bucket,
+            );
+        }
+
+        Ok(body)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn get_object_with_fileinfo<W>(
         // &self,
         bucket: &str,
@@ -1876,6 +2622,10 @@ impl SetDisks {
         set_index: usize,
         pool_index: usize,
         skip_verify_bitrot: bool,
+        prefer_data_blocks_first_reader_setup: bool,
+        metrics_path: &'static str,
+        metrics_object_class: &'static str,
+        metrics_size_bucket: &'static str,
     ) -> Result<()>
     where
         W: AsyncWrite + Send + Sync + Unpin + 'static,
@@ -2019,7 +2769,7 @@ impl SetDisks {
                 .iter()
                 .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
                 .collect::<Vec<_>>();
-            let reader_setup = create_bitrot_readers_until_quorum(
+            let reader_setup = create_bitrot_readers_until_quorum_with_preference(
                 &files,
                 &disks,
                 bucket,
@@ -2034,10 +2784,19 @@ impl SetDisks {
                 erasure.data_shards,
                 erasure.parity_shards,
                 BitrotReaderSetupMode::ReadQuorum,
+                prefer_data_blocks_first_reader_setup,
+                None,
             )
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_shard_reader_setup_duration(reader_setup_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                metrics_path,
+                GET_STAGE_READER_SETUP,
+                metrics_object_class,
+                metrics_size_bucket,
+                reader_setup_elapsed.as_secs_f64(),
+            );
             let setup_available_readers = reader_setup.available_shards();
             if reader_setup_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD {
                 warn!(
@@ -2172,6 +2931,13 @@ impl SetDisks {
                 .await;
             let decode_elapsed = decode_stage_start.elapsed();
             rustfs_io_metrics::record_get_object_decode_duration(decode_elapsed.as_secs_f64());
+            rustfs_io_metrics::record_get_object_stage_duration_by_size(
+                metrics_path,
+                GET_STAGE_DECODE,
+                metrics_object_class,
+                metrics_size_bucket,
+                decode_elapsed.as_secs_f64(),
+            );
             if decode_elapsed >= SLOW_OBJECT_READ_LOG_THRESHOLD || err.is_some() {
                 warn!(
                     event = EVENT_SET_DISK_READ,
@@ -2399,6 +3165,13 @@ impl SetDisks {
         let read_length = till_offset.saturating_sub(read_offset);
 
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let metrics_path = get_codec_streaming_metrics_path();
+        let reader_stage_metrics = stage_metrics_enabled.then_some(BitrotReaderStageMetrics {
+            path: metrics_path,
+            reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+            file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+            bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+        });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = disks
             .iter()
@@ -2419,9 +3192,9 @@ impl SetDisks {
             erasure.data_shards,
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
+            reader_stage_metrics,
         )
         .await;
-        let metrics_path = get_codec_streaming_metrics_path();
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
@@ -2458,18 +3231,53 @@ impl SetDisks {
     }
 }
 
+fn should_allow_metadata_early_stop(read_data: bool, version_id: &str, healing: bool, incl_free_versions: bool) -> bool {
+    if read_data {
+        return false;
+    }
+
+    (is_get_metadata_early_stop_enabled() && version_id.is_empty() && !healing && !incl_free_versions)
+        || (is_version_early_stop_enabled() && !version_id.is_empty() && !healing)
+}
+
+fn get_object_metadata_cache_request_bypass_reason(bucket: &str, opts: &ObjectOptions, read_data: bool) -> Option<&'static str> {
+    if !read_data {
+        return Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA);
+    }
+    if opts.no_lock && !opts.metadata_cache_safe {
+        return Some(GET_METADATA_CACHE_REASON_NO_LOCK);
+    }
+    if opts.version_id.is_some() {
+        return Some(GET_METADATA_CACHE_REASON_VERSION_ID);
+    }
+    if opts.versioned {
+        return Some(GET_METADATA_CACHE_REASON_VERSIONED);
+    }
+    if opts.version_suspended {
+        return Some(GET_METADATA_CACHE_REASON_VERSION_SUSPENDED);
+    }
+    if opts.incl_free_versions {
+        return Some(GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS);
+    }
+    if opts.delete_marker {
+        return Some(GET_METADATA_CACHE_REASON_DELETE_MARKER);
+    }
+    if opts.part_number.is_some() {
+        return Some(GET_METADATA_CACHE_REASON_PART_NUMBER);
+    }
+    if opts.data_movement {
+        return Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT);
+    }
+    if opts.raw_data_movement_read {
+        return Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ);
+    }
+    bucket
+        .starts_with(RUSTFS_META_BUCKET)
+        .then_some(GET_METADATA_CACHE_REASON_META_BUCKET)
+}
+
 fn is_get_object_metadata_cache_request_eligible(bucket: &str, opts: &ObjectOptions, read_data: bool) -> bool {
-    read_data
-        && !opts.no_lock
-        && opts.version_id.is_none()
-        && !opts.versioned
-        && !opts.version_suspended
-        && !opts.incl_free_versions
-        && !opts.delete_marker
-        && opts.part_number.is_none()
-        && !opts.data_movement
-        && !opts.raw_data_movement_read
-        && !bucket.starts_with(RUSTFS_META_BUCKET)
+    get_object_metadata_cache_request_bypass_reason(bucket, opts, read_data).is_none()
 }
 
 #[cfg(test)]
@@ -2524,6 +3332,22 @@ mod metadata_cache_tests {
         .await
     }
 
+    #[test]
+    #[serial]
+    fn get_object_metadata_cache_capacity_uses_default_and_env_override() {
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, None::<&str>, || {
+            assert_eq!(get_object_metadata_cache_max_entries(), DEFAULT_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, Some("16384"), || {
+            assert_eq!(get_object_metadata_cache_max_entries(), 16_384);
+        });
+
+        temp_env::with_var(ENV_RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES, Some("0"), || {
+            assert_eq!(get_object_metadata_cache_max_entries(), 1);
+        });
+    }
+
     fn valid_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);
         fi.volume = "bucket".to_string();
@@ -2538,62 +3362,110 @@ mod metadata_cache_tests {
     fn get_object_metadata_cache_request_eligibility_is_conservative() {
         let opts = ObjectOptions::default();
         assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(get_object_metadata_cache_request_bypass_reason("bucket", &opts, true), None);
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, false));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, false),
+            Some(GET_METADATA_CACHE_REASON_NOT_READ_DATA)
+        );
         assert!(!is_get_object_metadata_cache_request_eligible(RUSTFS_META_BUCKET, &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason(RUSTFS_META_BUCKET, &opts, true),
+            Some(GET_METADATA_CACHE_REASON_META_BUCKET)
+        );
 
         let mut opts = ObjectOptions {
             no_lock: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_NO_LOCK)
+        );
+        opts.metadata_cache_safe = true;
+        assert!(is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(get_object_metadata_cache_request_bypass_reason("bucket", &opts, true), None);
 
         opts = ObjectOptions {
             version_id: Some("version".to_string()),
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSION_ID)
+        );
 
         opts = ObjectOptions {
             versioned: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSIONED)
+        );
 
         opts = ObjectOptions {
             version_suspended: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_VERSION_SUSPENDED)
+        );
 
         opts = ObjectOptions {
             incl_free_versions: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_INCL_FREE_VERSIONS)
+        );
 
         opts = ObjectOptions {
             delete_marker: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_DELETE_MARKER)
+        );
 
         opts = ObjectOptions {
             part_number: Some(1),
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_PART_NUMBER)
+        );
 
         opts = ObjectOptions {
             data_movement: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_DATA_MOVEMENT)
+        );
 
         opts = ObjectOptions {
             raw_data_movement_read: true,
             ..Default::default()
         };
         assert!(!is_get_object_metadata_cache_request_eligible("bucket", &opts, true));
+        assert_eq!(
+            get_object_metadata_cache_request_bypass_reason("bucket", &opts, true),
+            Some(GET_METADATA_CACHE_REASON_RAW_DATA_MOVEMENT_READ)
+        );
     }
 
     #[tokio::test]
@@ -2794,13 +3666,13 @@ mod metadata_cache_tests {
         set.get_object_metadata_cache
             .insert(
                 GetObjectMetadataCacheKey::new("bucket", "object"),
-                GetObjectMetadataCacheEntry {
+                Arc::new(GetObjectMetadataCacheEntry {
                     created_at: Instant::now(),
                     fi: fi.clone(),
                     parts_metadata: vec![fi],
                     online_disks: vec![None],
                     read_quorum: 1,
-                },
+                }),
             )
             .await;
 
@@ -2845,7 +3717,7 @@ mod metadata_cache_tests {
 
     #[tokio::test]
     async fn get_object_metadata_cache_prunes_when_capacity_is_reached() {
-        // moka handles capacity eviction automatically via max_capacity(1024).
+        // moka handles capacity eviction automatically via the configured max_capacity.
         // This test verifies that the cache can hold entries and that insertion works.
         let set = new_metadata_cache_test_set().await;
         let fresh_fi = valid_test_fileinfo("fresh-object");
@@ -3343,6 +4215,22 @@ mod tests {
     }
 
     #[test]
+    fn metadata_early_stop_rejects_data_reads() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, Some("true")),
+            ],
+            || {
+                assert!(!should_allow_metadata_early_stop(true, "", false, false));
+                assert!(!should_allow_metadata_early_stop(true, "version-id", false, false));
+                assert!(should_allow_metadata_early_stop(false, "", false, false));
+                assert!(should_allow_metadata_early_stop(false, "version-id", false, false));
+            },
+        );
+    }
+
+    #[test]
     fn version_early_stop_gate_defaults_to_disabled() {
         temp_env::with_var(ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE, None::<&str>, || {
             assert!(!is_version_early_stop_enabled());
@@ -3608,10 +4496,84 @@ mod tests {
         parity_shards: usize,
         mode: BitrotReaderSetupMode,
     ) -> BitrotReaderSetup {
+        setup_inline_bitrot_readers_with_env(data, data_shards, parity_shards, mode, false).await
+    }
+
+    async fn setup_inline_bitrot_readers_with_env(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
+        setup_inline_bitrot_readers_with_reader_setup_env(data, data_shards, parity_shards, mode, data_blocks_first, false).await
+    }
+
+    async fn setup_inline_bitrot_readers_with_codec_reader_setup_env(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        codec_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
+        setup_inline_bitrot_readers_with_reader_setup_env(data, data_shards, parity_shards, mode, false, codec_data_blocks_first)
+            .await
+    }
+
+    async fn setup_inline_bitrot_readers_with_reader_setup_env(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        data_blocks_first: bool,
+        codec_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
         let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
         let disks = vec![None; files.len()];
 
-        create_bitrot_readers_until_quorum(
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true")),
+                (
+                    ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
+                    codec_data_blocks_first.then_some("true"),
+                ),
+            ],
+            async {
+                create_bitrot_readers_until_quorum(
+                    &files,
+                    &disks,
+                    "bucket",
+                    "object",
+                    1,
+                    0,
+                    4,
+                    4,
+                    HashAlgorithm::None,
+                    false,
+                    false,
+                    data_shards,
+                    parity_shards,
+                    mode,
+                    None,
+                )
+                .await
+            },
+        )
+        .await
+    }
+
+    async fn setup_inline_bitrot_readers_with_preference(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        prefer_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
+        let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
+        let disks = vec![None; files.len()];
+
+        create_bitrot_readers_until_quorum_with_preference(
             &files,
             &disks,
             "bucket",
@@ -3626,6 +4588,8 @@ mod tests {
             data_shards,
             parity_shards,
             mode,
+            prefer_data_blocks_first,
+            None,
         )
         .await
     }
@@ -3676,6 +4640,124 @@ mod tests {
 
         assert_eq!(n, 4);
         assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_data_blocks_first_keeps_deferred_fallback_readers() {
+        let mut setup = setup_inline_bitrot_readers_with_env(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(setup.available_shards(), 2);
+        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.readers.iter().filter(|reader| reader.is_some()).count(), 4);
+
+        let fallback_index = setup
+            .attempted
+            .iter()
+            .position(|attempted| !*attempted)
+            .expect("data-blocks-first setup should leave at least one deferred fallback");
+        let mut fallback = setup.readers[fallback_index]
+            .take()
+            .expect("deferred fallback reader should be retained");
+        let mut out = [0u8; 4];
+        let n = fallback
+            .read(&mut out)
+            .await
+            .expect("deferred fallback reader should open on read");
+
+        assert_eq!(n, 4);
+        assert_eq!(&out[..n], [b"aaaa", b"bbbb", b"cccc", b"dddd"][fallback_index]);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_preference_uses_data_blocks_first_without_env() {
+        let setup = setup_inline_bitrot_readers_with_preference(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(setup.available_shards(), 2);
+        assert!(setup.scheduled_shards() < 4);
+        assert_eq!(setup.deferred_shards(), 2);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_data_blocks_first_schedules_parity_after_missing_data() {
+        let setup = setup_inline_bitrot_readers_with_env(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::ReadQuorum,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.completed_failed_shards(), 1);
+        assert!(setup.ready.iter().skip(2).any(|ready| *ready));
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_data_blocks_first_does_not_apply_to_verify_mode() {
+        let setup = setup_inline_bitrot_readers_with_env(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.scheduled_shards(), 4);
+        assert_eq!(setup.completed_failed_shards(), 1);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_codec_data_blocks_first_can_apply_to_verify_mode() {
+        let setup = setup_inline_bitrot_readers_with_codec_reader_setup_env(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.available_data_shards(2), 2);
+        assert!(setup.scheduled_shards() < 4);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_codec_data_blocks_first_collects_extra_source_for_reconstruction() {
+        let setup = setup_inline_bitrot_readers_with_codec_reader_setup_env(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert!(setup.data_shards_attempted(2));
+        assert_eq!(setup.completed_failed_shards(), 1);
     }
 
     #[tokio::test]
