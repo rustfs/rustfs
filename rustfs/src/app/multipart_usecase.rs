@@ -21,7 +21,7 @@ use super::storage_api::multipart_usecase::bucket::{
     lifecycle::{bucket_lifecycle_audit::LcEventSrc, bucket_lifecycle_ops::enqueue_transition_immediate},
     metadata_sys,
     quota::QuotaOperation,
-    replication::{get_must_replicate_options, must_replicate, schedule_replication},
+    replication::{must_replicate_object, schedule_object_replication},
     versioning_sys::BucketVersioningSys,
 };
 use super::storage_api::multipart_usecase::compression::is_disk_compressible;
@@ -63,7 +63,6 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, Uri};
-use rustfs_filemeta::ReplicationType;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -560,18 +559,13 @@ impl DefaultMultipartUsecase {
             ..Default::default()
         };
         let mt2 = obj_info.user_defined.clone();
-        let replicate_options = get_must_replicate_options(
-            &mt2,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            ReplicationType::Object,
-            opts.clone(),
-        );
-        let dsc = must_replicate(&bucket, &key, replicate_options).await;
+        let dsc =
+            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                .await;
 
         if dsc.replicate_any() {
             warn!("need multipart replication");
-            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
+            schedule_object_replication(obj_info.clone(), store, dsc).await;
         }
 
         // Set object info for event notification
@@ -699,14 +693,9 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let replicate_options = get_must_replicate_options(
-            &mt2,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            ReplicationType::Object,
-            opts.clone(),
-        );
-        let dsc = must_replicate(&bucket, &key, replicate_options).await;
+        let dsc =
+            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                .await;
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
             insert_str(
