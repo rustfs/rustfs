@@ -29,6 +29,7 @@ WARP_PREPARE_DURATION="1s"
 GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
 GET_SMALL_OBJECT_DIRECT_MEMORY=""
 GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
+LOCAL_READ_COPY_METHOD=""
 MODE="both"
 PROFILE_ORDER="normal"
 CODEC_ENGINES="legacy"
@@ -156,6 +157,8 @@ Core options:
   --direct-memory <on|off>       RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY for RustFS
   --direct-memory-threshold <bytes>
                                  RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD for RustFS
+  --local-read-copy-method <mmap_copy|direct_read_copy>
+                                 RUSTFS_OBJECT_MMAP_READ_METHOD for RustFS
   --rounds <n>                   rounds per size (default: 3)
   --retry-per-round <n>          failed-attempt retries per round (default: 1)
   --round-cooldown-secs <n>      cooldown seconds after each completed round (default: 20)
@@ -303,6 +306,7 @@ parse_args() {
       --metadata-cache-max-entries) GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$2"; shift 2 ;;
       --direct-memory) GET_SMALL_OBJECT_DIRECT_MEMORY="$2"; shift 2 ;;
       --direct-memory-threshold) GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$2"; shift 2 ;;
+      --local-read-copy-method) LOCAL_READ_COPY_METHOD="$2"; shift 2 ;;
       --rounds) ROUNDS="$2"; shift 2 ;;
       --retry-per-round) RETRY_PER_ROUND="$2"; shift 2 ;;
       --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
@@ -402,6 +406,12 @@ validate_args() {
   fi
   if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
     validate_positive_int "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" "--direct-memory-threshold"
+  fi
+  if [[ -n "$LOCAL_READ_COPY_METHOD" ]]; then
+    case "$LOCAL_READ_COPY_METHOD" in
+      mmap_copy|direct_read_copy) ;;
+      *) die "--local-read-copy-method must be mmap_copy or direct_read_copy" ;;
+    esac
   fi
   validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
@@ -714,6 +724,7 @@ warp_objects=${WARP_OBJECTS}
 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
+RUSTFS_OBJECT_MMAP_READ_METHOD=${LOCAL_READ_COPY_METHOD}
 skip_build=${SKIP_BUILD}
 dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
@@ -872,6 +883,7 @@ RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
+RUSTFS_OBJECT_MMAP_READ_METHOD=${LOCAL_READ_COPY_METHOD}
 RUSTFS_OBS_METRICS_EXPORT_ENABLED=${DIAGNOSTIC_METRICS}
 RUSTFS_OBS_ENDPOINT=${DIAGNOSTIC_OBS_ENDPOINT}
 RUSTFS_OBS_METRIC_ENDPOINT=${DIAGNOSTIC_OBS_METRIC_ENDPOINT}
@@ -1008,6 +1020,9 @@ start_server() {
     fi
     if [[ -n "$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD" ]]; then
       export RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD="$GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD"
+    fi
+    if [[ -n "$LOCAL_READ_COPY_METHOD" ]]; then
+      export RUSTFS_OBJECT_MMAP_READ_METHOD="$LOCAL_READ_COPY_METHOD"
     fi
     export RUSTFS_OBS_METRICS_EXPORT_ENABLED="$DIAGNOSTIC_METRICS"
     if [[ "$DIAGNOSTIC_METRICS" == "true" ]]; then
@@ -1551,6 +1566,8 @@ TARGET_STAGES = [
     "reader_mmap_blocking_wait",
     "reader_mmap_blocking_task",
     "reader_mmap_copy_buffer",
+    "reader_mmap_direct_read_copy",
+    "reader_mmap_file_open",
     "reader_mmap_map",
     "reader_stream_first_read",
     "decode",
@@ -1563,6 +1580,7 @@ DISTRIBUTION_STAGES = {
     "reader_mmap_blocking_wait",
     "reader_mmap_blocking_task",
     "reader_mmap_copy_buffer",
+    "reader_mmap_direct_read_copy",
     "reader_open_mmap_copy_success",
     "reader_setup",
     "reader_setup_wait_quorum",
@@ -3298,6 +3316,7 @@ for profile_dir in profile_dirs:
                 "metadata_early_stop": manifest.get("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", ""),
                 "shard_locality_preference": manifest.get("RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE", ""),
                 "codec_max_inflight": manifest.get("RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT", ""),
+                "local_read_copy_method": manifest.get("RUSTFS_OBJECT_MMAP_READ_METHOD", ""),
                 "output_handoff_attribution": manifest.get("RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE", ""),
                 "round_cooldown_secs": manifest.get("round_cooldown_secs", ""),
                 "duration": manifest.get("duration", ""),
@@ -3345,6 +3364,7 @@ fieldnames = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
     "duration",
@@ -3379,6 +3399,7 @@ baseline_fields = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
     "duration",
