@@ -20,7 +20,7 @@
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
-use crate::bucket::replication::check_replicate_delete;
+use crate::bucket::replication::ReplicationObjectBridge;
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
@@ -3916,7 +3916,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let dsc = if should_preserve_delete_replication_state(&opts) {
             ReplicateDecision::default()
         } else {
-            check_replicate_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
+            ReplicationObjectBridge::check_delete(bucket, &otd, &goi, &opts, gerr.map(|e| e.to_string())).await
         };
 
         if dsc.replicate_any() {

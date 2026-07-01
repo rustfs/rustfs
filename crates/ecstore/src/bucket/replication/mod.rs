@@ -23,6 +23,7 @@ mod replication_lifecycle_bridge;
 mod replication_lock_boundary;
 mod replication_metadata_boundary;
 mod replication_msgp_boundary;
+mod replication_object_bridge;
 pub(crate) mod replication_pool;
 mod replication_resyncer;
 mod replication_scanner_bridge;
@@ -37,13 +38,14 @@ mod runtime_boundary;
 pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use datatypes::ResyncStatusType;
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
+pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_pool::{
     DynReplicationPool, ReplicationHealQueueResult, ReplicationPoolTrait, ReplicationQueueAdmission, get_global_replication_pool,
-    get_global_replication_stats, init_background_replication, schedule_replication, schedule_replication_delete,
+    get_global_replication_stats, init_background_replication,
 };
 pub use replication_resyncer::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationConfig, ResyncOpts,
-    TargetReplicationResyncStatus, check_replicate_delete, get_must_replicate_options, must_replicate,
+    TargetReplicationResyncStatus,
 };
 pub(crate) use replication_resyncer::{decode_resync_file, encode_resync_file};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
