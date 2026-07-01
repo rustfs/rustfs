@@ -20,6 +20,7 @@ use rustfs_madmin::{ITEM_OFFLINE, InfoMessage, StorageInfo};
 use rustfs_signer::constants::UNSIGNED_PAYLOAD;
 use rustfs_signer::sign_v4;
 use s3s::Body;
+use serde::Deserialize;
 use serial_test::serial;
 use std::error::Error;
 use std::process::Command;
@@ -27,6 +28,11 @@ use tokio::time::{Duration, sleep, timeout};
 use uuid::Uuid;
 
 const BUCKET: &str = "issue-2525-admin-timeout";
+
+#[derive(Deserialize)]
+struct StorageInfoResponse {
+    info: StorageInfo,
+}
 
 async fn signed_admin_get(
     url: &str,
@@ -60,7 +66,8 @@ async fn fetch_info(cluster: &RustFSTestClusterEnvironment) -> Result<InfoMessag
 async fn fetch_storage_info(cluster: &RustFSTestClusterEnvironment) -> Result<StorageInfo, Box<dyn Error + Send + Sync>> {
     let url = format!("{}/rustfs/admin/v3/storageinfo", cluster.nodes[0].url);
     let response = signed_admin_get(&url, &cluster.access_key, &cluster.secret_key).await?;
-    parse_json_response(response, "storage info").await
+    let wrapper: StorageInfoResponse = parse_json_response(response, "storage info").await?;
+    Ok(wrapper.info)
 }
 
 async fn parse_json_response<T: serde::de::DeserializeOwned>(
