@@ -1125,13 +1125,16 @@ async fn create_bitrot_readers_until_quorum_all_shards(
     data_shards: usize,
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> BitrotReaderSetup {
     let strategy = BitrotReaderSetupStrategy::AllShards;
     let mut setup = BitrotReaderSetup::new(disks.len());
     let mut reader_tasks = FuturesUnordered::new();
+    let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
 
     rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
 
+    let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     for (idx, disk_op) in disks.iter().enumerate() {
         setup.mark_scheduled(idx);
         let inline_data = files[idx].data.as_deref();
@@ -1141,7 +1144,7 @@ async fn create_bitrot_readers_until_quorum_all_shards(
         let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
-            let result = create_bitrot_reader(
+            let result = create_bitrot_reader_with_stage_metrics(
                 inline_data,
                 disk,
                 bucket,
@@ -1152,18 +1155,26 @@ async fn create_bitrot_readers_until_quorum_all_shards(
                 checksum_algo,
                 skip_verify_bitrot,
                 use_mmap_read,
+                stage_metrics,
             )
             .await;
             (idx, result)
         });
     }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
+    }
 
+    let wait_quorum_stage_start = stage_metrics.map(|_| Instant::now());
     while let Some((idx, result)) = reader_tasks.next().await {
         setup.apply_reader_result(idx, result);
 
         if setup.has_setup_quorum(data_shards, parity_shards, mode) {
             break;
         }
+    }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
     }
 
     fill_deferred_bitrot_readers(
@@ -1183,7 +1194,11 @@ async fn create_bitrot_readers_until_quorum_all_shards(
         parity_shards,
         mode,
     );
+    let drop_pending_stage_start = stage_metrics.map(|_| Instant::now());
     drop(reader_tasks);
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
+    }
     record_bitrot_reader_setup_fanout(strategy, mode, &setup);
 
     setup
@@ -1205,6 +1220,7 @@ async fn create_bitrot_readers_until_quorum(
     data_shards: usize,
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> BitrotReaderSetup {
     create_bitrot_readers_until_quorum_with_preference(
         files,
@@ -1222,6 +1238,7 @@ async fn create_bitrot_readers_until_quorum(
         parity_shards,
         mode,
         false,
+        stage_metrics,
     )
     .await
 }
@@ -1243,6 +1260,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     parity_shards: usize,
     mode: BitrotReaderSetupMode,
     prefer_data_blocks_first: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
     if strategy == BitrotReaderSetupStrategy::AllShards {
@@ -1261,6 +1279,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             data_shards,
             parity_shards,
             mode,
+            stage_metrics,
         )
         .await;
     }
@@ -1287,7 +1306,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-            None,
+            stage_metrics,
         );
     }
 
@@ -1307,7 +1326,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
-            None,
+            stage_metrics,
         );
     }
 
@@ -1338,7 +1357,7 @@ async fn create_bitrot_readers_until_quorum_with_preference(
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
-                None,
+                stage_metrics,
             );
         }
     }
@@ -2745,6 +2764,7 @@ impl SetDisks {
                 erasure.parity_shards,
                 BitrotReaderSetupMode::ReadQuorum,
                 prefer_data_blocks_first_reader_setup,
+                None,
             )
             .await;
             let reader_setup_elapsed = reader_setup_stage_start.elapsed();
@@ -3124,6 +3144,13 @@ impl SetDisks {
         let read_length = till_offset.saturating_sub(read_offset);
 
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let metrics_path = get_codec_streaming_metrics_path();
+        let reader_stage_metrics = stage_metrics_enabled.then_some(BitrotReaderStageMetrics {
+            path: metrics_path,
+            reader_construction_stage: GET_STAGE_READER_TASK_READER_CONSTRUCTION,
+            file_open_stage: GET_STAGE_READER_TASK_FILE_OPEN,
+            bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
+        });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
         let read_costs = disks
             .iter()
@@ -3144,9 +3171,9 @@ impl SetDisks {
             erasure.data_shards,
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
+            reader_stage_metrics,
         )
         .await;
-        let metrics_path = get_codec_streaming_metrics_path();
         record_get_stage_duration_if_enabled(metrics_path, GET_STAGE_READER_SETUP, reader_setup_stage_start);
 
         let available_shards = reader_setup.available_shards();
@@ -4479,6 +4506,7 @@ mod tests {
                     data_shards,
                     parity_shards,
                     mode,
+                    None,
                 )
                 .await
             },
@@ -4512,6 +4540,7 @@ mod tests {
             parity_shards,
             mode,
             prefer_data_blocks_first,
+            None,
         )
         .await
     }
