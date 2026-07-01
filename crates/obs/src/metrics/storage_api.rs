@@ -112,19 +112,19 @@ pub(crate) async fn obs_bucket_replication_stats_snapshot() -> Vec<ObsBucketRepl
         let mut targets = Vec::with_capacity(bucket_stats.stats.len());
 
         for (target_arn, target_stats) in bucket_stats.stats {
-            total_failed_bytes += i64_to_u64_floor_zero(target_stats.fail_stats.size);
-            total_failed_count += i64_to_u64_floor_zero(target_stats.fail_stats.count);
+            total_failed_bytes = total_failed_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.size));
+            total_failed_count = total_failed_count.saturating_add(i64_to_u64_floor_zero(target_stats.fail_stats.count));
 
             let last_min = target_stats.fail_stats.recent_since(Duration::from_secs(60));
-            last_min_failed_bytes += i64_to_u64_floor_zero(last_min.size);
-            last_min_failed_count += i64_to_u64_floor_zero(last_min.count);
+            last_min_failed_bytes = last_min_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_min.size));
+            last_min_failed_count = last_min_failed_count.saturating_add(i64_to_u64_floor_zero(last_min.count));
 
             let last_hour = target_stats.fail_stats.recent_since(Duration::from_secs(60 * 60));
-            last_hour_failed_bytes += i64_to_u64_floor_zero(last_hour.size);
-            last_hour_failed_count += i64_to_u64_floor_zero(last_hour.count);
+            last_hour_failed_bytes = last_hour_failed_bytes.saturating_add(i64_to_u64_floor_zero(last_hour.size));
+            last_hour_failed_count = last_hour_failed_count.saturating_add(i64_to_u64_floor_zero(last_hour.count));
 
-            sent_bytes += i64_to_u64_floor_zero(target_stats.replicated_size);
-            sent_count += i64_to_u64_floor_zero(target_stats.replicated_count);
+            sent_bytes = sent_bytes.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_size));
+            sent_count = sent_count.saturating_add(i64_to_u64_floor_zero(target_stats.replicated_count));
 
             targets.push(ObsBucketReplicationTargetStatsSnapshot {
                 target_arn,
@@ -170,6 +170,7 @@ pub(crate) async fn obs_replication_site_stats_snapshot(current_data_transfer_ra
 
     let site_metrics = stats.get_sr_metrics_for_node().await;
     let all_bucket_stats = stats.get_all().await;
+    // These fields keep the existing metric semantics: cluster-wide sums across bucket targets.
     let average_data_transfer_rate = all_bucket_stats
         .values()
         .flat_map(|bucket| bucket.stats.values())
