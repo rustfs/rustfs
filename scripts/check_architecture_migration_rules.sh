@@ -199,6 +199,7 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
+ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_boundary_bypass_hits.txt"
@@ -2515,6 +2516,28 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE" ]]; then
   report_failure "replication facade must use explicit compatibility exports instead of wildcard re-exports: $(paste -sd '; ' "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename '\b(ObjectOpts|ResyncOpts)\s*\{' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+    rg -n -U --with-filename 'use\s+(?:crate::admin::storage_api::bucket::replication|super::storage_api::bucket::replication)::\{[^}]*\b(ObjectOpts|ResyncOpts)\b' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+    rg -n --with-filename '(?:crate::admin::storage_api::bucket::replication|super::storage_api::bucket::replication|replication)::(?:ObjectOpts|ResyncOpts)\b' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+  }
+) >"$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "admin replication ObjectOpts/ResyncOpts construction must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

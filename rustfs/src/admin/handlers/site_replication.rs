@@ -28,7 +28,7 @@ use crate::admin::storage_api::bucket::metadata::{
     BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG, BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG, OBJECT_LOCK_CONFIG,
 };
 use crate::admin::storage_api::bucket::metadata_sys;
-use crate::admin::storage_api::bucket::replication::ResyncOpts;
+use crate::admin::storage_api::bucket::replication;
 use crate::admin::storage_api::bucket::target::{ARN, BucketTarget, BucketTargetType, BucketTargets, Credentials};
 use crate::admin::storage_api::bucket::target_sys::BucketTargetSys;
 use crate::admin::storage_api::bucket::utils::{deserialize, serialize};
@@ -4289,12 +4289,7 @@ async fn start_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &str
     };
 
     if let Err(err) = pool
-        .start_bucket_resync(ResyncOpts {
-            bucket: bucket.to_string(),
-            arn: target_arn,
-            resync_id: resync_id.to_string(),
-            resync_before: reset_before,
-        })
+        .start_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, reset_before))
         .await
     {
         bucket_status.status = "failed".to_string();
@@ -4357,12 +4352,7 @@ async fn cancel_site_bucket_resync(bucket: &str, peer: &PeerInfo, resync_id: &st
     };
 
     if let Err(err) = pool
-        .cancel_bucket_resync(ResyncOpts {
-            bucket: bucket.to_string(),
-            arn: target_arn,
-            resync_id: resync_id.to_string(),
-            resync_before: None,
-        })
+        .cancel_bucket_resync(replication::resync_opts(bucket, target_arn, resync_id, None))
         .await
     {
         bucket_status.status = "failed".to_string();
