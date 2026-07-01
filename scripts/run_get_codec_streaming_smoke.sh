@@ -34,6 +34,7 @@ MODE="both"
 PROFILE_ORDER="normal"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
+CODEC_READER_SETUP="all_shards"
 CODEC_MULTIPART="off"
 CODEC_MULTIPART_MAX_PARTS=256
 METADATA_EARLY_STOP="off"
@@ -98,6 +99,9 @@ Core options:
   --shard-locality-preference <on|off>
                                  Enable shard locality preference env (default: off)
   --codec-max-inflight <n>       RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT (default: 1)
+  --codec-reader-setup <all_shards|data_blocks_first>
+                                 RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
+                                 for codec verify reader setup (default: all_shards)
   --codec-multipart <on|off>     Enable multipart codec streaming opt-in for codec profiles
                                  (default: off)
   --codec-multipart-max-parts <n>
@@ -277,6 +281,7 @@ parse_args() {
       --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
+      --codec-reader-setup) CODEC_READER_SETUP="$2"; shift 2 ;;
       --codec-multipart) CODEC_MULTIPART="$2"; shift 2 ;;
       --codec-multipart-max-parts) CODEC_MULTIPART_MAX_PARTS="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
@@ -379,6 +384,10 @@ validate_args() {
   [[ -n "$SIZES" ]] || die "--sizes must not be empty"
   validate_positive_int "$CONCURRENCY" "--concurrency"
   validate_positive_int "$CODEC_MAX_INFLIGHT" "--codec-max-inflight"
+  case "$CODEC_READER_SETUP" in
+    all_shards|data_blocks_first) ;;
+    *) die "--codec-reader-setup must be all_shards or data_blocks_first" ;;
+  esac
   validate_positive_int "$CODEC_MULTIPART_MAX_PARTS" "--codec-multipart-max-parts"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
@@ -452,6 +461,14 @@ bool_from_on_off() {
     on) echo "true" ;;
     off) echo "false" ;;
     *) die "expected on/off value, got: $1" ;;
+  esac
+}
+
+codec_reader_setup_data_blocks_first() {
+  case "$CODEC_READER_SETUP" in
+    all_shards) echo "false" ;;
+    data_blocks_first) echo "true" ;;
+    *) die "expected codec reader setup strategy, got: $CODEC_READER_SETUP" ;;
   esac
 }
 
@@ -687,6 +704,7 @@ codec_engines=${CODEC_ENGINES}
 metadata_early_stop=${METADATA_EARLY_STOP}
 shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
 codec_max_inflight=${CODEC_MAX_INFLIGHT}
+codec_reader_setup=${CODEC_READER_SETUP}
 codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
@@ -876,6 +894,7 @@ RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED=${header_compat_confirmed}
 RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
+RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP=$(codec_reader_setup_data_blocks_first)
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
@@ -1006,6 +1025,8 @@ start_server() {
     RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE="$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")"
     export RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
+    RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP="$(codec_reader_setup_data_blocks_first)"
+    export RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
     RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
@@ -3316,6 +3337,7 @@ for profile_dir in profile_dirs:
                 "metadata_early_stop": manifest.get("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", ""),
                 "shard_locality_preference": manifest.get("RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE", ""),
                 "codec_max_inflight": manifest.get("RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT", ""),
+                "codec_reader_setup": manifest.get("RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP", ""),
                 "local_read_copy_method": manifest.get("RUSTFS_OBJECT_MMAP_READ_METHOD", ""),
                 "output_handoff_attribution": manifest.get("RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE", ""),
                 "round_cooldown_secs": manifest.get("round_cooldown_secs", ""),
@@ -3364,6 +3386,7 @@ fieldnames = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "codec_reader_setup",
     "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
@@ -3399,6 +3422,7 @@ baseline_fields = [
     "metadata_early_stop",
     "shard_locality_preference",
     "codec_max_inflight",
+    "codec_reader_setup",
     "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
@@ -3442,6 +3466,8 @@ for row in rows:
             "metadata_early_stop": row["metadata_early_stop"],
             "shard_locality_preference": row["shard_locality_preference"],
             "codec_max_inflight": row["codec_max_inflight"],
+            "codec_reader_setup": row["codec_reader_setup"],
+            "local_read_copy_method": row["local_read_copy_method"],
             "output_handoff_attribution": row["output_handoff_attribution"],
             "round_cooldown_secs": row["round_cooldown_secs"],
             "duration": row["duration"],

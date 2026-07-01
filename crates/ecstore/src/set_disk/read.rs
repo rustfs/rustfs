@@ -57,6 +57,8 @@ use tokio::task::JoinSet;
 
 const EVENT_SET_DISK_READ: &str = "set_disk_read";
 const ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP: &str = "RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP";
+const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP: &str =
+    "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP";
 const SLOW_OBJECT_READ_LOG_THRESHOLD: Duration = Duration::from_secs(5);
 const READ_REPAIR_HEAL_DEDUP_TTL: Duration = Duration::from_secs(60);
 const READ_REPAIR_HEAL_DEDUP_MAX_ENTRIES: usize = 4096;
@@ -874,12 +876,18 @@ impl BitrotReaderSetupStrategy {
 }
 
 fn get_bitrot_reader_setup_strategy(mode: BitrotReaderSetupMode, prefer_data_blocks_first: bool) -> BitrotReaderSetupStrategy {
-    if matches!(mode, BitrotReaderSetupMode::ReadQuorum)
-        && (prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false))
-    {
-        BitrotReaderSetupStrategy::DataBlocksFirst
-    } else {
-        BitrotReaderSetupStrategy::AllShards
+    match mode {
+        BitrotReaderSetupMode::ReadQuorum
+            if prefer_data_blocks_first || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+        {
+            BitrotReaderSetupStrategy::DataBlocksFirst
+        }
+        BitrotReaderSetupMode::VerifyReconstruction
+            if rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+        {
+            BitrotReaderSetupStrategy::DataBlocksFirst
+        }
+        _ => BitrotReaderSetupStrategy::AllShards,
     }
 }
 
@@ -4485,11 +4493,39 @@ mod tests {
         mode: BitrotReaderSetupMode,
         data_blocks_first: bool,
     ) -> BitrotReaderSetup {
+        setup_inline_bitrot_readers_with_reader_setup_env(data, data_shards, parity_shards, mode, data_blocks_first, false).await
+    }
+
+    async fn setup_inline_bitrot_readers_with_codec_reader_setup_env(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        codec_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
+        setup_inline_bitrot_readers_with_reader_setup_env(data, data_shards, parity_shards, mode, false, codec_data_blocks_first)
+            .await
+    }
+
+    async fn setup_inline_bitrot_readers_with_reader_setup_env(
+        data: Vec<Option<&'static [u8]>>,
+        data_shards: usize,
+        parity_shards: usize,
+        mode: BitrotReaderSetupMode,
+        data_blocks_first: bool,
+        codec_data_blocks_first: bool,
+    ) -> BitrotReaderSetup {
         let files = data.into_iter().map(inline_reader_setup_fileinfo).collect::<Vec<_>>();
         let disks = vec![None; files.len()];
 
         temp_env::async_with_vars(
-            [(ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true"))],
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, data_blocks_first.then_some("true")),
+                (
+                    ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP,
+                    codec_data_blocks_first.then_some("true"),
+                ),
+            ],
             async {
                 create_bitrot_readers_until_quorum(
                     &files,
@@ -4674,6 +4710,40 @@ mod tests {
 
         assert_eq!(setup.available_shards(), 3);
         assert_eq!(setup.scheduled_shards(), 4);
+        assert_eq!(setup.completed_failed_shards(), 1);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_codec_data_blocks_first_can_apply_to_verify_mode() {
+        let setup = setup_inline_bitrot_readers_with_codec_reader_setup_env(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.available_data_shards(2), 2);
+        assert!(setup.scheduled_shards() < 4);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_codec_data_blocks_first_collects_extra_source_for_reconstruction() {
+        let setup = setup_inline_bitrot_readers_with_codec_reader_setup_env(
+            vec![None, Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert!(setup.data_shards_attempted(2));
         assert_eq!(setup.completed_failed_shards(), 1);
     }
 
