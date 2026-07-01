@@ -190,6 +190,9 @@ pub const GET_OBJECT_SIZE_BUCKET_LE_4_KIB: &str = "le_4kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_16_KIB: &str = "le_16kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_64_KIB: &str = "le_64kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_128_KIB: &str = "le_128kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_192_KIB: &str = "le_192kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_256_KIB: &str = "le_256kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_512_KIB: &str = "le_512kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_1_MIB: &str = "le_1mib";
 pub const GET_OBJECT_SIZE_BUCKET_GT_1_MIB: &str = "gt_1mib";
 
@@ -201,7 +204,10 @@ pub const fn get_object_size_bucket(size_bytes: i64) -> &'static str {
         4_097..=16_384 => GET_OBJECT_SIZE_BUCKET_LE_16_KIB,
         16_385..=65_536 => GET_OBJECT_SIZE_BUCKET_LE_64_KIB,
         65_537..=131_072 => GET_OBJECT_SIZE_BUCKET_LE_128_KIB,
-        131_073..=1_048_576 => GET_OBJECT_SIZE_BUCKET_LE_1_MIB,
+        131_073..=196_608 => GET_OBJECT_SIZE_BUCKET_LE_192_KIB,
+        196_609..=262_144 => GET_OBJECT_SIZE_BUCKET_LE_256_KIB,
+        262_145..=524_288 => GET_OBJECT_SIZE_BUCKET_LE_512_KIB,
+        524_289..=1_048_576 => GET_OBJECT_SIZE_BUCKET_LE_1_MIB,
         _ => GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
     }
 }
@@ -2284,7 +2290,13 @@ mod tests {
         assert_eq!(get_object_size_bucket((16 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_64_KIB);
         assert_eq!(get_object_size_bucket(100 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
         assert_eq!(get_object_size_bucket(128 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
-        assert_eq!(get_object_size_bucket((128 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
+        assert_eq!(get_object_size_bucket((128 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_192_KIB);
+        assert_eq!(get_object_size_bucket(192 * 1024), GET_OBJECT_SIZE_BUCKET_LE_192_KIB);
+        assert_eq!(get_object_size_bucket((192 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_256_KIB);
+        assert_eq!(get_object_size_bucket(256 * 1024), GET_OBJECT_SIZE_BUCKET_LE_256_KIB);
+        assert_eq!(get_object_size_bucket((256 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_512_KIB);
+        assert_eq!(get_object_size_bucket(512 * 1024), GET_OBJECT_SIZE_BUCKET_LE_512_KIB);
+        assert_eq!(get_object_size_bucket((512 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
         assert_eq!(get_object_size_bucket(1024 * 1024), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
         assert_eq!(get_object_size_bucket((1024 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_GT_1_MIB);
     }
