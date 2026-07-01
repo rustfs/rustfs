@@ -453,8 +453,8 @@ fn skip_msgp_value<R: Read>(rd: &mut R) -> Result<()> {
         Marker::FixExt8 => 8,
         Marker::FixExt16 => 16,
         Marker::Ext8 => 1 + read_skip_len(rd, 1)?,
-        Marker::Ext16 => 2 + read_skip_len(rd, 2)?,
-        Marker::Ext32 => 4 + read_skip_len(rd, 4)?,
+        Marker::Ext16 => 1 + read_skip_len(rd, 2)?,
+        Marker::Ext32 => 1 + read_skip_len(rd, 4)?,
         Marker::Reserved => 0,
     };
     if skip_len > 0 {
@@ -532,5 +532,16 @@ mod tests {
         assert_eq!(got.targets_map["arn:replication:a"].resync_id, "rid-1");
         assert_eq!(got.targets_map["arn:replication:a"].resync_status, ResyncStatusType::ResyncStarted);
         assert_eq!(got.targets_map["arn:replication:a"].replicated_count, 7);
+    }
+
+    #[test]
+    fn skip_msgp_value_consumes_ext_type_and_payload() {
+        let mut ext16 = Cursor::new(vec![0xc8, 0, 2, MSGP_TIME_EXT_TYPE as u8, 0xaa, 0xbb, 0x01]);
+        skip_msgp_value(&mut ext16).expect("ext16 should skip");
+        assert!(matches!(rmp::decode::read_marker(&mut ext16), Ok(Marker::FixPos(1))));
+
+        let mut ext32 = Cursor::new(vec![0xc9, 0, 0, 0, 2, MSGP_TIME_EXT_TYPE as u8, 0xaa, 0xbb, 0x01]);
+        skip_msgp_value(&mut ext32).expect("ext32 should skip");
+        assert!(matches!(rmp::decode::read_marker(&mut ext32), Ok(Marker::FixPos(1))));
     }
 }
