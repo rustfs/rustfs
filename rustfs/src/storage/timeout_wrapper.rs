@@ -53,6 +53,7 @@
 //! }
 //! ```
 
+#[cfg(not(test))]
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
@@ -120,9 +121,16 @@ impl GetObjectTimeoutPolicy {
     }
 
     /// Load the process-wide GetObject timeout policy once for hot request paths.
+    #[cfg(not(test))]
     pub fn cached_from_env() -> Self {
         static POLICY: OnceLock<GetObjectTimeoutPolicy> = OnceLock::new();
         POLICY.get_or_init(Self::from_env).clone()
+    }
+
+    /// Load the GetObject timeout policy from the current test environment.
+    #[cfg(test)]
+    pub fn cached_from_env() -> Self {
+        Self::from_env()
     }
 
     /// Check if timeout is enabled (timeout > 0).
@@ -492,6 +500,16 @@ mod tests {
         assert_eq!(first.bytes_per_second, second.bytes_per_second);
         assert_eq!(first.min_timeout, second.min_timeout);
         assert_eq!(first.max_timeout, second.max_timeout);
+    }
+
+    #[test]
+    fn test_cached_timeout_config_honors_test_env_overrides() {
+        temp_env::with_var(rustfs_config::ENV_OBJECT_GET_TIMEOUT, Some("7"), || {
+            assert_eq!(GetObjectTimeoutPolicy::cached_from_env().get_object_timeout, Duration::from_secs(7));
+        });
+        temp_env::with_var(rustfs_config::ENV_OBJECT_GET_TIMEOUT, Some("11"), || {
+            assert_eq!(GetObjectTimeoutPolicy::cached_from_env().get_object_timeout, Duration::from_secs(11));
+        });
     }
 
     #[test]
