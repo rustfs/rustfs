@@ -1409,7 +1409,7 @@ pub fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
     runtime_sources::replication_stats()
 }
 
-pub async fn schedule_replication<S: ReplicationStorage>(
+pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     oi: ObjectInfo,
     o: Arc<S>,
     dsc: ReplicateDecision,
@@ -1461,7 +1461,7 @@ pub async fn schedule_replication<S: ReplicationStorage>(
     }
 }
 
-pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
+pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
     if let Some(pool) = runtime_sources::replication_pool() {
         let _ = pool.queue_replica_delete_task(dv.clone()).await;
     }
