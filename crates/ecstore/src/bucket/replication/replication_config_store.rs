@@ -15,6 +15,7 @@
 use super::replication_error_boundary::Result;
 use super::replication_storage_boundary::ReplicationObjectIO;
 use crate::config::com;
+pub(crate) use crate::config::storageclass::{RRS, STANDARD};
 use std::sync::Arc;
 
 pub(crate) async fn read<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>

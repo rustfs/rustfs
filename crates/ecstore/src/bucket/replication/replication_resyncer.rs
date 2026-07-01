@@ -3663,7 +3663,6 @@ fn is_valid_sse_header(k: &str) -> Option<&str> {
 }
 
 fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
-    use crate::config::storageclass::{RRS, STANDARD};
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
     use rustfs_utils::http::{
         AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
@@ -3730,7 +3729,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     // Handle storage class default
     let storage_class = if sc.is_empty() {
         let obj_sc = object_info.storage_class.as_deref().unwrap_or_default();
-        if obj_sc == STANDARD || obj_sc == RRS {
+        if obj_sc == config_store::STANDARD || obj_sc == config_store::RRS {
             obj_sc.to_string()
         } else {
             sc.to_string()

@@ -2539,14 +2539,56 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::config::com::\{[^}]*\b(read_config|save_config)\b|crate::config::com::(read_config|save_config)|\b(read_config|save_config)\(' \
-    crates/ecstore/src/bucket/replication \
-    --glob '*.rs' |
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      sub emit_match {
+        my ($pos, $match) = @_;
+        my $prefix = substr($_, 0, $pos);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+
+      while (/(?:crate::config::|use\s+crate::config\b)/sg) {
+        emit_match($-[0], $&);
+      }
+
+      while (/use\s+crate::\{([^;]*)/sg) {
+        my ($pos, $end, $body) = ($-[0], $+[0], $1);
+        my ($depth, $token) = (0, "");
+        my $matched = 0;
+
+        for my $ch (split //, $body) {
+          if ($ch eq "{") {
+            $depth++;
+            next;
+          }
+          if ($ch eq "}") {
+            $depth-- if $depth > 0;
+            next;
+          }
+          if ($depth == 0 && $ch eq ",") {
+            if ($token =~ /^\s*config\b/s) {
+              emit_match($pos, substr($_, $pos, $end - $pos));
+              $matched = 1;
+              last;
+            }
+            $token = "";
+            next;
+          }
+          $token .= $ch if $depth == 0;
+        }
+
+        if (!$matched && $token =~ /^\s*config\b/s) {
+          emit_match($pos, substr($_, $pos, $end - $pos));
+        }
+      }
+    ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_config_store\.rs:' || true
 ) >"$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication config persistence must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
+  report_failure "replication config access must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
 fi
 
 (
