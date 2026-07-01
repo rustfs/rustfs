@@ -31,9 +31,9 @@ use storage_api::owner::{
     EcstoreDiskResult, EcstoreErrorType, EcstoreEvaluator, EcstoreEvent, EcstoreLcEventSrc, EcstoreLifecycle,
     EcstoreListPathRawOptions, EcstoreObjectOpts, EcstoreReplicationConfigurationExt, EcstoreReplicationScannerBridge,
     EcstoreResultType, EcstoreScanGuard, EcstoreSetDisks, EcstoreStorageError, EcstoreStore, EcstoreTierConfig,
-    EcstoreVersioningApi, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, ScannerReplicationConfig,
-    ScannerReplicationHealObject, ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule,
-    ecstore_apply_transition_rule, ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
+    EcstoreVersioningApi, HTTPRangeSpec, ObjectIO, ObjectOperations, ObjectToDelete, ScannerReplicationHealObject,
+    ScannerReplicationHealResult, ScannerReplicationQueueAdmission, ecstore_apply_expiry_rule, ecstore_apply_transition_rule,
+    ecstore_expiry_state_handle, ecstore_get_global_tier_config_mgr, ecstore_get_lifecycle_config,
     ecstore_get_object_lock_config, ecstore_get_replication_config, ecstore_is_erasure, ecstore_is_erasure_sd,
     ecstore_is_reserved_or_invalid_bucket, ecstore_list_path_raw, ecstore_path2_bucket_object,
     ecstore_path2_bucket_object_with_base_path, ecstore_read_config, ecstore_replace_bucket_usage_memory_from_info,
@@ -61,6 +61,7 @@ pub use scanner::init_data_scanner;
 pub use scanner_io::{clear_dirty_usage_bucket, record_dirty_usage_bucket};
 pub use sleeper::{DynamicSleeper, SCANNER_IDLE_MODE, SCANNER_SLEEPER};
 use std::sync::atomic::{AtomicU64, Ordering};
+pub use storage_api::ScannerReplicationConfig as ReplicationConfig;
 
 static SCANNER_ACTIVE_WORK_UNITS: AtomicU64 = AtomicU64::new(0);
 static SCANNER_FOREGROUND_READ_ACTIVITY: AtomicU64 = AtomicU64::new(0);
@@ -150,7 +151,6 @@ pub(crate) type Evaluator = EcstoreEvaluator;
 pub(crate) type Event = EcstoreEvent;
 pub(crate) type LcEventSrc = EcstoreLcEventSrc;
 pub(crate) type ObjectOpts = EcstoreObjectOpts;
-pub(crate) type ReplicationConfig = ScannerReplicationConfig;
 pub(crate) type ReplicationHealObject = ScannerReplicationHealObject;
 pub(crate) type ReplicationHealQueueResult = ScannerReplicationHealResult;
 pub(crate) type ReplicationQueueAdmission = ScannerReplicationQueueAdmission;
