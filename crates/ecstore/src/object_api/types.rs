@@ -748,9 +748,14 @@ impl ObjectInfo {
     }
 
     pub fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
-        replication_statuses_map(self.replication_status_internal.as_deref().unwrap_or_default())
-            .get(arn)
-            .cloned()
+        self.replication_status_internal
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .find_map(|entry| {
+                let (target_arn, status) = entry.split_once('=')?;
+                (!target_arn.is_empty() && target_arn == arn).then(|| ReplicationStatusType::from(status))
+            })
             .unwrap_or_default()
     }
 
@@ -843,6 +848,7 @@ mod tests {
         let state = object.replication_state();
 
         assert_eq!(object.target_replication_status("arn:target-a"), ReplicationStatusType::Completed);
+        assert_eq!(object.target_replication_status("arn:target-b"), ReplicationStatusType::Failed);
         assert_eq!(object.target_replication_status("arn:missing"), ReplicationStatusType::Empty);
         assert_eq!(state.targets.get("arn:target-b"), Some(&ReplicationStatusType::Failed));
         assert_eq!(state.purge_targets.get("arn:target-a"), Some(&VersionPurgeStatusType::Pending));
