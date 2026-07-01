@@ -2627,21 +2627,25 @@ fi
       $source = blank_block_comments($source);
       $source =~ s{//[^\n]*}{blank($&)}eg;
 
-      for my $statement (split /;/, $source) {
+      while ($source =~ /([^;]+)(?:;|$)/g) {
+        my $statement_start = $-[1];
+        my $statement = $1;
         my $normalized = $statement;
         $normalized =~ s/\s+//g;
 
         my $hits_ecstore =
-          $normalized =~ /\bECStore\b/
-          && $normalized =~ /crate::(?:store(?:::|::\{)|\{.*store(?:::|::\{))/s;
+          $normalized =~ /\bECStore(?:\b|as)/
+          && $normalized =~ /crate::(?:store::\{?|\{.*store::\{?)/s;
         my $hits_monitor =
-          $normalized =~ /\bMonitor\b/
-          && $normalized =~ /crate::(?:bucket(?:::|::\{)|\{.*bucket(?:::|::\{))/s
-          && $normalized =~ /bucket(?:::|::\{).*bandwidth(?:::|::\{).*monitor(?:::|::\{)/s;
+          $normalized =~ /\bMonitor(?:\b|as)/
+          && $normalized =~ /crate::(?:bucket::\{?|\{.*bucket::\{?)/s
+          && $normalized =~ /bucket::\{?.*bandwidth::\{?.*monitor::\{?/s;
 
         if ($hits_ecstore || $hits_monitor) {
-          my $prefix = substr($source, 0, index($source, $statement));
-          my $line = ($prefix =~ tr/\n//) + 1;
+          my $leading = $statement;
+          $leading =~ s/^(\s*).*$/$1/s;
+          my $prefix = substr($source, 0, $statement_start);
+          my $line = ($prefix =~ tr/\n//) + ($leading =~ tr/\n//) + 1;
           $normalized =~ s/\s+/ /g;
           print "$ARGV:$line:$normalized\n";
         }
