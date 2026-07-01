@@ -890,7 +890,8 @@ fn get_bitrot_reader_setup_strategy(mode: BitrotReaderSetupMode, prefer_data_blo
             BitrotReaderSetupStrategy::DataBlocksFirst
         }
         BitrotReaderSetupMode::VerifyReconstruction
-            if rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
+            if prefer_data_blocks_first
+                || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, false) =>
         {
             BitrotReaderSetupStrategy::DataBlocksFirst
         }
@@ -3103,6 +3104,7 @@ impl SetDisks {
         skip_verify_bitrot: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
 
@@ -3131,6 +3133,7 @@ impl SetDisks {
                 skip_verify_bitrot,
                 metrics_object_class,
                 metrics_size_bucket,
+                prefer_data_blocks_first_reader_setup,
             )
             .await;
         }
@@ -3172,6 +3175,7 @@ impl SetDisks {
                 skip_verify_bitrot,
                 metrics_object_class,
                 metrics_size_bucket,
+                false,
             )
             .await?
             {
@@ -3202,6 +3206,7 @@ impl SetDisks {
         skip_verify_bitrot: bool,
         metrics_object_class: &'static str,
         metrics_size_bucket: &'static str,
+        prefer_data_blocks_first_reader_setup: bool,
     ) -> Result<GetCodecStreamingReaderBuildOutcome> {
         if part_length > part_size {
             return Err(Error::other("codec streaming reader part length exceeds part size"));
@@ -3232,7 +3237,7 @@ impl SetDisks {
                 .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
                 .collect::<Vec<_>>()
         });
-        let reader_setup = create_bitrot_readers_until_quorum(
+        let reader_setup = create_bitrot_readers_until_quorum_with_preference(
             files,
             disks,
             bucket,
@@ -3247,6 +3252,7 @@ impl SetDisks {
             erasure.data_shards,
             erasure.parity_shards,
             BitrotReaderSetupMode::VerifyReconstruction,
+            prefer_data_blocks_first_reader_setup,
             reader_stage_metrics,
             Some(BitrotReaderSetupAttribution {
                 path: metrics_path,
@@ -3805,7 +3811,8 @@ mod metadata_cache_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use crate::erasure::coding::BitrotWriter;
+    use std::io::{Cursor, ErrorKind};
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -4666,6 +4673,105 @@ mod tests {
         .await
     }
 
+    fn encoded_reader_setup_fileinfo(data: Option<Vec<u8>>) -> FileInfo {
+        let mut fi = FileInfo::new("object", 2, 2);
+        fi.volume = "bucket".to_string();
+        fi.name = "object".to_string();
+        fi.size = data
+            .as_ref()
+            .map_or(0, |data| i64::try_from(data.len()).expect("test data length should fit i64"));
+        fi.data = data.map(Bytes::from);
+        fi
+    }
+
+    async fn setup_codec_data_blocks_first_encoded_bitrot_readers(
+        erasure: &coding::Erasure,
+        data: &[u8],
+        missing_indexes: &[usize],
+        bitrot_corrupt_indexes: &[usize],
+        inconsistent_source_indexes: &[usize],
+        hash_algo: HashAlgorithm,
+    ) -> BitrotReaderSetup {
+        let shard_size = erasure.shard_size();
+        let encoded_shards = erasure.encode_data(data).expect("test stripe should encode");
+        let mut files = Vec::with_capacity(encoded_shards.len());
+        for (index, shard) in encoded_shards.into_iter().enumerate() {
+            if missing_indexes.contains(&index) {
+                files.push(encoded_reader_setup_fileinfo(None));
+                continue;
+            }
+
+            let mut shard = shard.to_vec();
+            if inconsistent_source_indexes.contains(&index)
+                && let Some(byte) = shard.first_mut()
+            {
+                *byte ^= 0x80;
+            }
+
+            let mut writer = BitrotWriter::new(Cursor::new(Vec::new()), shard_size, hash_algo.clone());
+            writer.write(&shard).await.expect("test shard should write with bitrot hash");
+            let mut encoded = writer.into_inner().into_inner();
+            if bitrot_corrupt_indexes.contains(&index) {
+                let data_offset = hash_algo.size();
+                let byte = encoded
+                    .get_mut(data_offset)
+                    .expect("encoded test shard should contain payload bytes");
+                *byte ^= 0x80;
+            }
+
+            files.push(encoded_reader_setup_fileinfo(Some(encoded)));
+        }
+        let disks = vec![None; files.len()];
+
+        temp_env::async_with_vars([(ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, Some("true"))], async {
+            create_bitrot_readers_until_quorum(
+                &files,
+                &disks,
+                "bucket",
+                "object",
+                1,
+                0,
+                shard_size,
+                shard_size,
+                hash_algo,
+                false,
+                false,
+                erasure.data_shards,
+                erasure.parity_shards,
+                BitrotReaderSetupMode::VerifyReconstruction,
+                None,
+                None,
+            )
+            .await
+        })
+        .await
+    }
+
+    async fn decode_codec_data_blocks_first_setup(
+        erasure: coding::Erasure,
+        data: &[u8],
+        readers: Vec<Option<ObjectBitrotReader>>,
+    ) -> std::io::Result<Vec<u8>> {
+        let source = coding::decode::ParallelReader::new_with_metrics_path_and_reconstruction_verification(
+            readers,
+            erasure.clone(),
+            0,
+            data.len(),
+            Some(GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE),
+        );
+        let engine = CodecStreamingDecodeEngine::rustfs(&erasure).expect("rustfs codec engine should be created");
+        let mut reader = coding::decode_reader::ErasureDecodeReader::new_with_metrics_path(
+            source,
+            engine,
+            data.len(),
+            GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE,
+        )
+        .expect("codec streaming reader should be constructed");
+        let mut decoded = Vec::new();
+        reader.read_to_end(&mut decoded).await?;
+        Ok(decoded)
+    }
+
     #[tokio::test]
     async fn bitrot_reader_setup_stops_at_read_quorum() {
         let setup = setup_inline_bitrot_readers(
@@ -4762,6 +4868,24 @@ mod tests {
         assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::ReadQuorum));
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.scheduled_shards(), 2);
+        assert_eq!(setup.deferred_shards(), 2);
+    }
+
+    #[tokio::test]
+    async fn bitrot_reader_setup_preference_can_apply_to_verify_mode() {
+        let setup = setup_inline_bitrot_readers_with_preference(
+            vec![Some(b"aaaa"), Some(b"bbbb"), Some(b"cccc"), Some(b"dddd")],
+            2,
+            2,
+            BitrotReaderSetupMode::VerifyReconstruction,
+            true,
+        )
+        .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.available_data_shards(2), 2);
+        assert_eq!(setup.scheduled_shards(), 2);
+        assert_eq!(setup.attempted_shards(), 2);
         assert_eq!(setup.deferred_shards(), 2);
     }
 
@@ -4878,6 +5002,69 @@ mod tests {
         assert_eq!(setup.available_shards(), 2);
         assert_eq!(setup.available_data_shards(2), 1);
         assert_eq!(setup.completed_failed_shards(), 1);
+    }
+
+    #[tokio::test]
+    async fn codec_data_blocks_first_recovers_corrupt_data_with_deferred_parity() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).collect::<Vec<_>>();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[], HashAlgorithm::HighwayHash256)
+                .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.scheduled_shards(), 2);
+        assert_eq!(setup.attempted_shards(), 2);
+        assert_eq!(setup.available_shards(), 2);
+        assert_eq!(setup.deferred_shards(), 2);
+
+        let decoded = decode_codec_data_blocks_first_setup(erasure, &data, setup.readers)
+            .await
+            .expect("deferred parity should recover the corrupt data shard");
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn codec_data_blocks_first_reconstructs_missing_data_shard() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).rev().collect::<Vec<_>>();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[0], &[], &[], HashAlgorithm::HighwayHash256)
+                .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.scheduled_shards(), 4);
+        assert_eq!(setup.available_shards(), 3);
+        assert_eq!(setup.available_data_shards(2), 1);
+        assert_eq!(setup.completed_failed_shards(), 1);
+
+        let decoded = decode_codec_data_blocks_first_setup(erasure, &data, setup.readers)
+            .await
+            .expect("parity shards should reconstruct the missing data shard");
+
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
+    async fn codec_data_blocks_first_rejects_inconsistent_deferred_reconstruction_source() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).map(|value| value.wrapping_mul(3)).collect::<Vec<_>>();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[], &[0], &[2], HashAlgorithm::HighwayHash256)
+                .await;
+
+        assert!(setup.has_setup_quorum(2, 2, BitrotReaderSetupMode::VerifyReconstruction));
+        assert_eq!(setup.scheduled_shards(), 2);
+        assert_eq!(setup.attempted_shards(), 2);
+        assert_eq!(setup.deferred_shards(), 2);
+
+        let err = decode_codec_data_blocks_first_setup(erasure, &data, setup.readers)
+            .await
+            .expect_err("inconsistent deferred parity source must fail reconstruction verification");
+
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(err.to_string().contains("inconsistent read source shards"));
     }
 
     #[test]
@@ -5020,6 +5207,89 @@ mod tests {
                     codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true).decision,
                     GetCodecStreamingDecision::Use
                 );
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_data_blocks_first_gate_defaults_to_off() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE, None::<&str>),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(512 * 1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.decision, GetCodecStreamingDecision::Use);
+                assert!(!gate.prefer_data_blocks_first_reader_setup);
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_data_blocks_first_gate_allows_small_plain_single_part() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE, Some("524288")),
+            ],
+            || {
+                let fi = codec_streaming_test_fileinfo(512 * 1024, 1);
+                let object_info = codec_streaming_test_object_info(&fi);
+                let gate = codec_streaming_reader_gate_for_test(&None, &object_info, &fi, true);
+
+                assert_eq!(gate.decision, GetCodecStreamingDecision::Use);
+                assert!(gate.prefer_data_blocks_first_reader_setup);
+            },
+        );
+    }
+
+    #[test]
+    fn codec_streaming_data_blocks_first_gate_rejects_large_and_non_plain_objects() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE, Some(GET_CODEC_STREAMING_ENGINE_RUSTFS)),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_ROLLOUT, Some("benchmark")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, Some("1")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE, Some("true")),
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE, Some("524288")),
+            ],
+            || {
+                let large_fi = codec_streaming_test_fileinfo(768 * 1024, 1);
+                let large_object_info = codec_streaming_test_object_info(&large_fi);
+                let large_gate = codec_streaming_reader_gate_for_test(&None, &large_object_info, &large_fi, true);
+                assert_eq!(large_gate.decision, GetCodecStreamingDecision::Use);
+                assert!(!large_gate.prefer_data_blocks_first_reader_setup);
+
+                let multipart_fi = codec_streaming_test_fileinfo(512 * 1024, 2);
+                let multipart_object_info = codec_streaming_test_object_info(&multipart_fi);
+                let multipart_gate = codec_streaming_reader_gate_for_test(&None, &multipart_object_info, &multipart_fi, true);
+                assert!(!multipart_gate.prefer_data_blocks_first_reader_setup);
+
+                let range = Some(HTTPRangeSpec {
+                    is_suffix_length: false,
+                    start: 0,
+                    end: 1,
+                });
+                let range_gate = codec_streaming_reader_gate_for_test(&range, &large_object_info, &large_fi, true);
+                assert!(!range_gate.prefer_data_blocks_first_reader_setup);
             },
         );
     }
