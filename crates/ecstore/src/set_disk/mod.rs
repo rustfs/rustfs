@@ -539,25 +539,48 @@ fn get_codec_streaming_multipart_max_parts() -> usize {
 }
 
 /// Check if metadata early-stop is enabled (base flag).
+///
+/// **Note**: Cached via `OnceLock` in production. In test builds the env var
+/// is read directly so that `temp_env` overrides take effect.
 fn is_get_metadata_early_stop_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE)
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(ENV_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE, DEFAULT_RUSTFS_GET_METADATA_EARLY_STOP_ENABLE)
+        })
+    }
 }
 
 /// Check if version-aware early-stop is enabled.
 ///
 /// When enabled, versioned requests can early-stop when the requested
 /// version_id reaches quorum across disks.
+///
+/// **Note**: Cached via `OnceLock` in production. In test builds the env var
+/// is read directly so that `temp_env` overrides take effect.
 fn is_version_early_stop_enabled() -> bool {
-    static CACHED: OnceLock<bool> = OnceLock::new();
-    *CACHED.get_or_init(|| {
+    #[cfg(test)]
+    {
         rustfs_utils::get_env_bool(
             ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
             DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
         )
-    })
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+                DEFAULT_RUSTFS_GET_METADATA_VERSION_EARLY_STOP_ENABLE,
+            )
+        })
+    }
 }
 
 // --- Rollout Percentage Functions ---
