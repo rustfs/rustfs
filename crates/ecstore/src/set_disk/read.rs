@@ -1295,9 +1295,11 @@ async fn create_bitrot_readers_until_quorum_with_preference(
     let mut setup = BitrotReaderSetup::new(disks.len());
     let mut reader_tasks: FuturesUnordered<BitrotReaderTask<'_>> = FuturesUnordered::new();
     let total_shards = disks.len();
+    let stage_metrics = stage_metrics.filter(|_| rustfs_io_metrics::get_stage_metrics_enabled());
 
     rustfs_io_metrics::record_get_object_reader_setup_strategy(strategy.as_str(), mode.as_str());
 
+    let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     for idx in 0..data_shards.min(total_shards) {
         schedule_bitrot_reader_task(
             &mut reader_tasks,
@@ -1337,7 +1339,11 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             stage_metrics,
         );
     }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_SCHEDULE, schedule_stage_start);
+    }
 
+    let wait_quorum_stage_start = stage_metrics.map(|_| Instant::now());
     while let Some((idx, result)) = reader_tasks.next().await {
         setup.apply_reader_result(idx, result);
 
@@ -1369,6 +1375,9 @@ async fn create_bitrot_readers_until_quorum_with_preference(
             );
         }
     }
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
+    }
 
     fill_deferred_bitrot_readers(
         &mut setup,
@@ -1387,7 +1396,11 @@ async fn create_bitrot_readers_until_quorum_with_preference(
         parity_shards,
         mode,
     );
+    let drop_pending_stage_start = stage_metrics.map(|_| Instant::now());
     drop(reader_tasks);
+    if let Some(stage_metrics) = stage_metrics {
+        record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_DROP_PENDING, drop_pending_stage_start);
+    }
     record_bitrot_reader_setup_fanout(strategy, mode, &setup);
 
     setup
