@@ -237,25 +237,6 @@ pub(crate) mod bucket {
         }
     }
 
-    pub(crate) trait ReplicationConfigExt {
-        fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String>;
-        fn replicate(&self, opts: &replication::ObjectOpts) -> bool;
-    }
-
-    impl ReplicationConfigExt for s3s::dto::ReplicationConfiguration {
-        fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String> {
-            <s3s::dto::ReplicationConfiguration as crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
-                self, obj,
-            )
-        }
-
-        fn replicate(&self, opts: &replication::ObjectOpts) -> bool {
-            <s3s::dto::ReplicationConfiguration as crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt>::replicate(
-                self, opts,
-            )
-        }
-    }
-
     pub(crate) trait VersioningConfigExt {
         fn enabled(&self) -> bool;
         fn prefix_enabled(&self, prefix: &str) -> bool;
@@ -625,13 +606,12 @@ pub(crate) mod bucket {
     pub(crate) mod replication {
         use std::collections::HashMap;
         use std::sync::Arc;
+        use uuid::Uuid;
 
         pub(crate) type DeletedObjectReplicationInfo =
             crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
-        pub(crate) type MustReplicateOptions = crate::storage::storage_api::ecstore_bucket::replication::MustReplicateOptions;
-        pub(crate) type ObjectOpts = crate::storage::storage_api::ecstore_bucket::replication::ObjectOpts;
-        pub(crate) type ReplicationObjectBridge =
-            crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
+        type ObjectOpts = crate::storage::storage_api::ecstore_bucket::replication::ObjectOpts;
+        type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type ReplicateDecision = rustfs_filemeta::ReplicateDecision;
 
         pub(crate) async fn check_replicate_delete(
@@ -644,31 +624,86 @@ pub(crate) mod bucket {
             ReplicationObjectBridge::check_delete(bucket, dobj, oi, del_opts, gerr).await
         }
 
-        pub(crate) fn get_must_replicate_options(
+        pub(crate) async fn must_replicate_object(
+            bucket: &str,
+            object: &str,
             user_defined: &HashMap<String, String>,
             user_tags: String,
             status: rustfs_filemeta::ReplicationStatusType,
-            op_type: rustfs_filemeta::ReplicationType,
             opts: crate::storage::storage_api::StorageObjectOptions,
-        ) -> MustReplicateOptions {
-            ReplicationObjectBridge::must_replicate_options(user_defined, user_tags, status, op_type, opts)
-        }
-
-        pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
+        ) -> ReplicateDecision {
+            let mopts = ReplicationObjectBridge::must_replicate_options(
+                user_defined,
+                user_tags,
+                status,
+                rustfs_filemeta::ReplicationType::Object,
+                opts,
+            );
             ReplicationObjectBridge::must_replicate(bucket, object, mopts).await
         }
 
-        pub(crate) async fn schedule_replication(
+        pub(crate) async fn schedule_object_replication(
             oi: crate::storage::storage_api::StorageObjectInfo,
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
-            op_type: rustfs_filemeta::ReplicationType,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, op_type).await;
+            ReplicationObjectBridge::schedule_object(oi, store, dsc, rustfs_filemeta::ReplicationType::Object).await;
         }
 
         pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
             ReplicationObjectBridge::schedule_delete(dv).await;
+        }
+
+        pub(crate) fn delete_replication_state_from_config(
+            config: &s3s::dto::ReplicationConfiguration,
+            obj_info: &crate::storage::storage_api::StorageObjectInfo,
+            version_id: Option<Uuid>,
+            replica: bool,
+        ) -> Option<rustfs_filemeta::ReplicationState> {
+            let opts = ObjectOpts {
+                name: obj_info.name.clone(),
+                user_tags: (*obj_info.user_tags).clone(),
+                version_id,
+                delete_marker: obj_info.delete_marker,
+                op_type: rustfs_filemeta::ReplicationType::Delete,
+                replica,
+                ..Default::default()
+            };
+            let target_arns =
+                crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt::filter_target_arns(
+                    config, &opts,
+                );
+            if target_arns.is_empty() {
+                return None;
+            }
+
+            let mut decision = ReplicateDecision::new();
+            for target_arn in target_arns {
+                let mut target_opts = opts.clone();
+                target_opts.target_arn = target_arn.clone();
+                let replicate = crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt::replicate(
+                    config,
+                    &target_opts,
+                );
+                decision.set(rustfs_filemeta::ReplicateTargetDecision::new(target_arn, replicate, false));
+            }
+            if !decision.replicate_any() {
+                return None;
+            }
+
+            let pending_status = decision.pending_status();
+            let mut state = rustfs_filemeta::ReplicationState {
+                replicate_decision_str: decision.to_string(),
+                ..Default::default()
+            };
+            if version_id.is_some() {
+                state.version_purge_status_internal = pending_status.clone();
+                state.purge_targets = rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+            } else {
+                state.replication_status_internal = pending_status.clone();
+                state.targets = rustfs_filemeta::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+            }
+            Some(state)
         }
     }
 

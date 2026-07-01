@@ -23,7 +23,7 @@ use super::storage_api::object_usecase::access::{
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
 use super::storage_api::object_usecase::bucket::{
-    ReplicationConfigExt as _, VersioningConfigExt as _,
+    VersioningConfigExt as _,
     lifecycle::{
         bucket_lifecycle_audit::LcEventSrc,
         bucket_lifecycle_ops::{enqueue_transition_immediate, post_restore_opts},
@@ -38,8 +38,8 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, ObjectOpts as ReplicationObjectOpts, check_replicate_delete, get_must_replicate_options,
-        must_replicate, schedule_replication, schedule_replication_delete,
+        DeletedObjectReplicationInfo, check_replicate_delete, delete_replication_state_from_config, must_replicate_object,
+        schedule_object_replication, schedule_replication_delete,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -72,6 +72,7 @@ use super::storage_api::object_usecase::object_utils::to_s3s_etag;
 use super::storage_api::object_usecase::options::{
     copy_dst_opts, copy_src_opts, del_opts, extract_metadata, extract_metadata_from_mime_with_object_name,
     filter_object_metadata, get_content_sha256_with_query, get_opts, normalize_content_encoding_for_storage, put_opts,
+    validate_archive_content_encoding,
 };
 use super::storage_api::object_usecase::request_context::{self, spawn_traced};
 use super::storage_api::object_usecase::s3_api::multipart::parse_list_parts_params;
@@ -109,10 +110,10 @@ use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateTargetDecision, ReplicationState, ReplicationStatusType,
-    ReplicationType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
-    version_purge_statuses_map,
+    REPLICATE_INCOMING_DELETE, ReplicationStatusType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status,
 };
+#[cfg(test)]
+use rustfs_filemeta::{ReplicationState, replication_statuses_map};
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
@@ -147,9 +148,9 @@ use s3s::dto::{
     DeleteObjectsOutput, DeletedObject, ETag, GetObjectAttributesInput, GetObjectAttributesOutput, GetObjectAttributesParts,
     GetObjectInput, GetObjectOutput, HeadObjectInput, HeadObjectOutput, MetadataDirective, ObjectAttributes, ObjectLockLegalHold,
     ObjectLockLegalHoldStatus, ObjectLockMode, ObjectLockRetention, ObjectLockRetentionMode, ObjectPart, PutObjectInput,
-    PutObjectOutput, Range, ReplicationConfiguration, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus,
-    SSECustomerAlgorithm, SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput,
-    ServerSideEncryption, StorageClass, StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
+    PutObjectOutput, Range, RequestCharged, RestoreObjectInput, RestoreObjectOutput, RestoreStatus, SSECustomerAlgorithm,
+    SSECustomerKeyMD5, SSEKMSKeyId, SelectObjectContentInput, SelectObjectContentOutput, ServerSideEncryption, StorageClass,
+    StreamingBlob, TaggingHeader, Timestamp, TimestampFormat, WebsiteRedirectLocation,
 };
 use s3s::header::{X_AMZ_RESTORE, X_AMZ_RESTORE_OUTPUT_PATH};
 use s3s::stream::{ByteStream, RemainingLength};
@@ -1456,51 +1457,6 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
 
     let expiry_date = expire_time.format(&Rfc3339).ok()?;
     Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
-}
-
-fn delete_replication_state_from_config(
-    config: &ReplicationConfiguration,
-    obj_info: &ObjectInfo,
-    version_id: Option<Uuid>,
-    replica: bool,
-) -> Option<ReplicationState> {
-    let opts = ReplicationObjectOpts {
-        name: obj_info.name.clone(),
-        user_tags: (*obj_info.user_tags).clone(),
-        version_id,
-        delete_marker: obj_info.delete_marker,
-        op_type: ReplicationType::Delete,
-        replica,
-        ..Default::default()
-    };
-    let target_arns = config.filter_target_arns(&opts);
-    if target_arns.is_empty() {
-        return None;
-    }
-
-    let mut decision = ReplicateDecision::new();
-    for target_arn in target_arns {
-        let mut target_opts = opts.clone();
-        target_opts.target_arn = target_arn.clone();
-        decision.set(ReplicateTargetDecision::new(target_arn, config.replicate(&target_opts), false));
-    }
-    if !decision.replicate_any() {
-        return None;
-    }
-
-    let pending_status = decision.pending_status();
-    let mut state = ReplicationState {
-        replicate_decision_str: decision.to_string(),
-        ..Default::default()
-    };
-    if version_id.is_some() {
-        state.version_purge_status_internal = pending_status.clone();
-        state.purge_targets = version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
-    } else {
-        state.replication_status_internal = pending_status.clone();
-        state.targets = replication_statuses_map(pending_status.as_deref().unwrap_or_default());
-    }
-    Some(state)
 }
 
 async fn enrich_delete_replication_state_if_needed(
@@ -2915,6 +2871,13 @@ impl DefaultObjectUsecase {
         validate_object_key(&key, request_method_name)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
+        // Validate archive content encoding (reject when strict mode is enabled)
+        validate_archive_content_encoding(
+            &key,
+            req.headers.get("content-type").and_then(|value| value.to_str().ok()),
+            req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
+        )?;
+
         if let Some(size) = content_length {
             self.check_bucket_quota(&bucket, quota_operation, size as u64).await?;
         }
@@ -3232,14 +3195,9 @@ impl DefaultObjectUsecase {
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
 
-        let repoptions = get_must_replicate_options(
-            &mt2,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            ReplicationType::Object,
-            opts.clone(),
-        );
-        let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let dsc =
+            must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts.clone())
+                .await;
 
         if dsc.replicate_any() {
             insert_str(&mut opts.user_defined, SUFFIX_REPLICATION_TIMESTAMP, jiff::Zoned::now().to_string());
@@ -3348,19 +3306,11 @@ impl DefaultObjectUsecase {
 
         let e_tag = obj_info.etag.clone().map(|etag| to_s3s_etag(&etag));
 
-        let repoptions = get_must_replicate_options(
-            &mt2,
-            "".to_string(),
-            opts.delete_marker_replication_status(),
-            ReplicationType::Object,
-            opts,
-        );
-
-        let dsc = must_replicate(&bucket, &key, repoptions).await;
+        let dsc = must_replicate_object(&bucket, &key, &mt2, "".to_string(), opts.delete_marker_replication_status(), opts).await;
         let expiration = resolve_put_object_expiration(&bucket, &obj_info).await;
 
         if dsc.replicate_any() {
-            schedule_replication(obj_info.clone(), store, dsc, ReplicationType::Object).await;
+            schedule_object_replication(obj_info.clone(), store, dsc).await;
         }
 
         let mut checksums = PutObjectChecksums {

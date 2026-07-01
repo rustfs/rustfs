@@ -200,6 +200,8 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
+APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
+OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/obs_replication_stats_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
 REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_boundary_bypass_hits.txt"
@@ -2510,6 +2512,24 @@ fi
 
 (
   cd "$ROOT_DIR"
+  {
+    rg -n --with-filename '\b(ObsReplicationStats|obs_get_global_replication_stats|replication_stats_handle|get_sr_metrics_for_node|get_proxy_stats|mrf_stats)\b' \
+      crates/obs/src/metrics \
+      --glob '*.rs' \
+      --glob '!crates/obs/src/metrics/storage_api.rs' || true
+    rg -n --with-filename 'rustfs_ecstore::api::bucket::replication' \
+      crates/obs/src/metrics \
+      --glob '*.rs' \
+      --glob '!crates/obs/src/metrics/storage_api.rs' || true
+  }
+) >"$OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "obs replication stats access must stay behind crates/obs/src/metrics/storage_api.rs snapshot helpers: $(paste -sd '; ' "$OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename 'pub(?:\(crate\))?\s+use\s+(?:config|datatypes|replication_pool|replication_resyncer|replication_state|rule)::\*;' \
     crates/ecstore/src/bucket/replication/mod.rs || true
 ) >"$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE"
@@ -2553,6 +2573,24 @@ fi
 
 if [[ -s "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE" ]]; then
   report_failure "object replication work entry points must stay behind ReplicationObjectBridge: $(paste -sd '; ' "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename '\b(get_must_replicate_options|must_replicate|schedule_replication|MustReplicateOptions|ReplicationObjectBridge|ReplicationObjectOpts)\b|ObjectOpts as ReplicationObjectOpts|ReplicationType::Object' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!rustfs/src/app/storage_api.rs' || true
+    rg -n --with-filename '(?:ecstore_bucket::replication|crate::storage::storage_api::ecstore_bucket::replication)::(?:ObjectOpts|MustReplicateOptions|ReplicationObjectBridge|ReplicationConfigurationExt)' \
+      rustfs/src/app \
+      --glob '*.rs' \
+      --glob '!rustfs/src/app/storage_api.rs' || true
+  }
+) >"$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "app replication ObjectOpts/MustReplicateOptions/bridge access must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
