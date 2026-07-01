@@ -134,11 +134,11 @@ Required contracts before crate movement:
   `crates/ecstore/src/bucket/replication/replication_storage_boundary.rs`.
 - `ReplicationMetadataStore`: replication config, target reset headers,
   MRF/resync state, and status persistence. Metadata sys access and replication
-  metadata path constants are concentrated in
+  metadata path constants are exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_metadata_boundary.rs`.
 - `ReplicationConfigStore`: replication config persistence and config-derived
   labels used by target options. Config read/save helpers and storage class
-  labels are concentrated in
+  labels are exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_config_store.rs`.
 - `ReplicationFileMeta`: replication status, decisions, MRF entries, resync
   decisions, and target reset helpers. `rustfs_filemeta` replication contracts
@@ -153,13 +153,17 @@ Required contracts before crate movement:
 - `ReplicationTargetStore`: bucket target listing, target client lookup,
   target offline checks, target config types, and target operation option
   types. Bucket target sys access, `BucketTargets`, and target operation types
-  are concentrated in
+  are exposed through the contract type in
   `crates/ecstore/src/bucket/replication/replication_target_boundary.rs`.
 - `ReplicationRuntime`: pool, stats, worker admission, bucket monitor, local
   node identity, cancellation, and queue sizing. Concrete ECStore object store
   and bucket monitor types stay behind local storage/bandwidth boundaries.
 - `ReplicationBandwidthLimiter`: target reader wrapping for replication
   bandwidth accounting and throttling.
+- `ReplicationVersioningStore`, `ReplicationLockTiming`, `ReplicationMsgpCodec`,
+  and `ReplicationTagFilter`: smaller state/codec/filter contracts that keep
+  bucket versioning, SetDisks lock timing, MessagePack helpers, and bucket
+  tagging helper access behind local replication boundary types.
 - `ReplicationEventSink`: notification/audit events for skipped, failed, and
   completed replication operations, including local event host selection.
 - `ReplicationLifecycleBridge`: lifecycle-originated delete and version-purge
