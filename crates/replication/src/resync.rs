@@ -447,19 +447,28 @@ fn skip_msgp_value<R: Read>(rd: &mut R) -> Result<()> {
             }
             return Ok(());
         }
-        Marker::FixExt1 => 1,
-        Marker::FixExt2 => 2,
-        Marker::FixExt4 => 4,
-        Marker::FixExt8 => 8,
-        Marker::FixExt16 => 16,
+        Marker::FixExt1 => 1 + 1,
+        Marker::FixExt2 => 1 + 2,
+        Marker::FixExt4 => 1 + 4,
+        Marker::FixExt8 => 1 + 8,
+        Marker::FixExt16 => 1 + 16,
         Marker::Ext8 => 1 + read_skip_len(rd, 1)?,
         Marker::Ext16 => 1 + read_skip_len(rd, 2)?,
         Marker::Ext32 => 1 + read_skip_len(rd, 4)?,
         Marker::Reserved => 0,
     };
     if skip_len > 0 {
-        let mut buf = vec![0u8; skip_len];
-        rd.read_exact(&mut buf)?;
+        skip_exact(rd, skip_len)?;
+    }
+    Ok(())
+}
+
+fn skip_exact<R: Read>(rd: &mut R, mut len: usize) -> Result<()> {
+    let mut buf = [0u8; 1024];
+    while len > 0 {
+        let take = len.min(buf.len());
+        rd.read_exact(&mut buf[..take])?;
+        len -= take;
     }
     Ok(())
 }
@@ -543,5 +552,18 @@ mod tests {
         let mut ext32 = Cursor::new(vec![0xc9, 0, 0, 0, 2, MSGP_TIME_EXT_TYPE as u8, 0xaa, 0xbb, 0x01]);
         skip_msgp_value(&mut ext32).expect("ext32 should skip");
         assert!(matches!(rmp::decode::read_marker(&mut ext32), Ok(Marker::FixPos(1))));
+    }
+
+    #[test]
+    fn skip_msgp_value_consumes_fixext_type_and_payload() {
+        for (marker, payload_len) in [(0xd4, 1), (0xd5, 2), (0xd6, 4), (0xd7, 8), (0xd8, 16)] {
+            let mut data = vec![marker, MSGP_TIME_EXT_TYPE as u8];
+            data.extend(std::iter::repeat(0xaa).take(payload_len));
+            data.push(0x01);
+
+            let mut cursor = Cursor::new(data);
+            skip_msgp_value(&mut cursor).expect("fixext should skip");
+            assert!(matches!(rmp::decode::read_marker(&mut cursor), Ok(Marker::FixPos(1))));
+        }
     }
 }
