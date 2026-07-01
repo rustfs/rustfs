@@ -16,8 +16,8 @@ mod storage_api;
 
 use s3s::dto::ReplicationConfiguration;
 use storage_api::replication_compat::{
-    BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, ReplicationConfigurationExt, ReplicationStats,
-    ResyncStatusType,
+    BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, ReplicationConfigurationExt,
+    ReplicationObjectBridge, ReplicationStats, ResyncStatusType,
 };
 
 fn type_name<T>() -> &'static str {
@@ -52,5 +52,6 @@ fn replication_facade_exports_runtime_and_dto_types() {
     assert!(type_name::<ReplicationStats>().contains("ReplicationStats"));
     assert!(type_name::<BucketStats>().contains("BucketStats"));
     assert!(type_name::<DeletedObjectReplicationInfo>().contains("DeletedObjectReplicationInfo"));
+    assert!(type_name::<ReplicationObjectBridge>().contains("ReplicationObjectBridge"));
     assert!(type_name_unsized::<DynReplicationPool>().contains("ReplicationPoolTrait"));
 }

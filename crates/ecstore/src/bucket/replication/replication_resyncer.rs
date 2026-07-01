@@ -1506,7 +1506,7 @@ impl MustReplicateOptions {
     }
 }
 
-pub fn get_must_replicate_options(
+pub(crate) fn get_must_replicate_options(
     user_defined: &HashMap<String, String>,
     user_tags: String,
     status: ReplicationStatusType,
@@ -1517,7 +1517,7 @@ pub fn get_must_replicate_options(
 }
 
 /// Returns whether object version is a delete marker and if object qualifies for replication
-pub async fn check_replicate_delete(
+pub(crate) async fn check_replicate_delete(
     bucket: &str,
     dobj: &ObjectToDelete,
     oi: &ObjectInfo,
@@ -1668,7 +1668,7 @@ impl ObjectInfoExt for ObjectInfo {
     }
 }
 
-pub async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
+pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
     if runtime_sources::object_store_handle().is_none() {
         return ReplicateDecision::default();
     }

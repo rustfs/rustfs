@@ -210,6 +210,7 @@ REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
+REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_object_bridge_bypass_hits.txt"
 REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_scanner_bridge_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
@@ -2513,6 +2514,21 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE" ]]; then
   report_failure "replication facade must use explicit compatibility exports instead of wildcard re-exports: $(paste -sd '; ' "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'ecstore_bucket::replication::(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)|crate::bucket::replication::(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)' \
+      rustfs/src crates/ecstore/src \
+      --glob '*.rs'
+    rg -n --with-filename '\b(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)\b' \
+      crates/ecstore/src/bucket/replication/mod.rs
+  } || true
+) >"$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "object replication work entry points must stay behind ReplicationObjectBridge: $(paste -sd '; ' "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE")"
 fi
 
 (
