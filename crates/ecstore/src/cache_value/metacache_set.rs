@@ -19,7 +19,7 @@ use futures::future::join_all;
 use metrics::counter;
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetacacheReader, is_io_eof};
 use std::{
-    collections::VecDeque,
+    collections::{HashSet, VecDeque},
     future::Future,
     pin::Pin,
     sync::{Arc, OnceLock},
@@ -40,6 +40,33 @@ pub type AgreedFn = Box<dyn Fn(MetaCacheEntry) -> Pin<Box<dyn Future<Output = ()
 pub type PartialFn =
     Box<dyn Fn(MetaCacheEntries, &[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
 type FinishedFn = Box<dyn Fn(&[Option<DiskError>]) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + 'static>;
+
+#[derive(Clone, Default)]
+pub(crate) struct FallbackClaimTracker {
+    claimed: Arc<TokioMutex<HashSet<String>>>,
+}
+
+impl FallbackClaimTracker {
+    pub(crate) async fn claim_disk(&self, disk: &DiskStore) {
+        self.claimed.lock().await.insert(disk.endpoint().to_string());
+    }
+
+    pub(crate) async fn claimed_keys(&self) -> HashSet<String> {
+        self.claimed.lock().await.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn claim_test_fallback(&self) {
+        let mut claimed = self.claimed.lock().await;
+        let key = format!("test-fallback-{}", claimed.len());
+        claimed.insert(key);
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn contains_key(&self, key: &str) -> bool {
+        self.claimed.lock().await.contains(key)
+    }
+}
 
 #[derive(Debug)]
 enum PeekOutcome {
@@ -129,7 +156,26 @@ impl Clone for ListPathRawOptions {
 }
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
+    list_path_raw_inner(rx, opts, None).await
+}
+
+pub(crate) async fn list_path_raw_with_claim_tracker(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+    claim_tracker: FallbackClaimTracker,
+) -> disk::error::Result<()> {
+    list_path_raw_inner(rx, opts, Some(claim_tracker)).await
+}
+
+async fn list_path_raw_inner(
+    rx: CancellationToken,
+    opts: ListPathRawOptions,
+    fallback_claim_tracker: Option<FallbackClaimTracker>,
+) -> disk::error::Result<()> {
     if opts.disks.is_empty() {
+        return Err(DiskError::ErasureReadQuorum);
+    }
+    if opts.min_disks > opts.disks.len() {
         return Err(DiskError::ErasureReadQuorum);
     }
 
@@ -151,6 +197,7 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
     for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
         let opts_clone = opts.clone();
+        let fallback_claim_tracker = fallback_claim_tracker.clone();
         let fds_clone = fds.clone();
         #[cfg(test)]
         let test_fallbacks_clone = test_fallbacks.clone();
@@ -276,6 +323,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
             while need_fallback {
                 #[cfg(test)]
                 if let Some(behavior) = take_fallback_candidate(&test_fallbacks_clone).await {
+                    if let Some(claim_tracker) = fallback_claim_tracker.as_ref() {
+                        claim_tracker.claim_test_fallback().await;
+                    }
                     match behavior {
                         TestReaderBehavior::Eof => {
                             need_fallback = false;
@@ -341,6 +391,9 @@ pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> d
                     record_producer_error(&producer_errs_clone, disk_idx, &err);
                     return Err(err);
                 };
+                if let Some(claim_tracker) = fallback_claim_tracker.as_ref() {
+                    claim_tracker.claim_disk(&disk).await;
+                }
 
                 let fallback_walk_started = std::time::Instant::now();
                 match disk
@@ -797,6 +850,22 @@ mod tests {
         assert_eq!(err, DiskError::ErasureReadQuorum);
     }
 
+    #[tokio::test]
+    async fn list_path_raw_rejects_impossible_min_disks() {
+        let err = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None, None],
+                min_disks: 3,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("impossible listing quorum should fail before producing partial results");
+
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
     #[test]
     fn missing_path_error_classification_excludes_actionable_failures() {
         assert!(is_missing_path_error(&DiskError::FileNotFound));
@@ -887,6 +956,27 @@ mod tests {
         .expect("distinct fallback producers should restore listing quorum");
 
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &[2]);
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_records_claimed_fallback_candidates() {
+        let claim_tracker = FallbackClaimTracker::default();
+
+        list_path_raw_with_claim_tracker(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::PrimaryErrorThenFallback(DiskError::DiskNotFound)],
+                test_fallback_reader_behaviors: vec![TestReaderBehavior::Entries(vec![fallback_test_entry()])],
+                ..Default::default()
+            },
+            claim_tracker.clone(),
+        )
+        .await
+        .expect("fallback producer should restore the single logical reader");
+
+        assert!(claim_tracker.contains_key("test-fallback-0").await);
     }
 
     #[tokio::test]
