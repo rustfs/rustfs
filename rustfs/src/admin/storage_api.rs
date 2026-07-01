@@ -16,6 +16,7 @@ use std::ops::Deref;
 use std::sync::Arc;
 
 use rustfs_storage_api as storage_contracts;
+use time::OffsetDateTime;
 
 mod ecstore_bucket {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::{
@@ -142,14 +143,18 @@ pub(crate) fn encode_rebalance_stop_propagation_record(record: &RebalanceStopPro
 }
 
 pub(crate) trait AdminReplicationConfigExt {
-    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String>;
+    fn filter_all_replication_target_arns(&self) -> Vec<String>;
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool);
 }
 
 impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
-    fn filter_target_arns(&self, obj: &replication::ObjectOpts) -> Vec<String> {
+    fn filter_all_replication_target_arns(&self) -> Vec<String> {
+        let obj = ecstore_bucket::replication::ObjectOpts {
+            op_type: rustfs_filemeta::ReplicationType::All,
+            ..Default::default()
+        };
         <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
-            self, obj,
+            self, &obj,
         )
     }
 
@@ -304,12 +309,25 @@ pub(crate) mod quota {
 pub(crate) mod replication {
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
-    pub(crate) type ObjectOpts = super::ecstore_bucket::replication::ObjectOpts;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;
     #[cfg(test)]
     pub(crate) type TargetReplicationResyncStatus = super::ecstore_bucket::replication::TargetReplicationResyncStatus;
+
+    pub(crate) fn resync_opts(
+        bucket: &str,
+        arn: String,
+        resync_id: &str,
+        resync_before: Option<super::OffsetDateTime>,
+    ) -> ResyncOpts {
+        ResyncOpts {
+            bucket: bucket.to_string(),
+            arn,
+            resync_id: resync_id.to_string(),
+            resync_before,
+        }
+    }
 }
 
 pub(crate) mod target {
@@ -319,6 +337,7 @@ pub(crate) mod target {
     pub(crate) type BucketTargetType = super::ecstore_bucket::target::BucketTargetType;
     pub(crate) type BucketTargets = super::ecstore_bucket::target::BucketTargets;
     pub(crate) type Credentials = super::ecstore_bucket::target::Credentials;
+    pub(crate) type LatencyStat = super::ecstore_bucket::target::LatencyStat;
 }
 
 pub(crate) mod ecstore_utils {

@@ -148,6 +148,7 @@ impl MigrationBackendSpy {
         GetObjectReader {
             stream: Box::new(Cursor::new(vec![0_u8; 3])),
             object_info: ObjectInfo::default(),
+            buffered_body: None,
         }
     }
 }

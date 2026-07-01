@@ -20,7 +20,8 @@ use rustfs_filemeta::ReplicationStatusType;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
-    insert_header_map, is_encryption_metadata_key, is_internal_key,
+    insert_header_map,
+    metadata_compat::{MINIO_INTERNAL_PREFIX, RUSTFS_INTERNAL_PREFIX},
 };
 use rustfs_utils::http::{
     AMZ_META_UNENCRYPTED_CONTENT_LENGTH, AMZ_META_UNENCRYPTED_CONTENT_MD5, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
@@ -493,6 +494,49 @@ pub fn extract_metadata_from_mime_with_object_name(
     }
 }
 
+fn starts_with_ignore_ascii_case(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(prefix))
+}
+
+fn should_skip_object_metadata_key(key: &str, value: &str, excluded_headers: &[&str]) -> bool {
+    const MINIO_ENCRYPTION_PREFIX: &str = "x-minio-encryption-";
+    const RUSTFS_ENCRYPTION_PREFIX: &str = "x-rustfs-encryption-";
+    const X_AMZ_PREFIX: &str = "x-amz-";
+
+    // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
+    if starts_with_ignore_ascii_case(key, RUSTFS_INTERNAL_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_INTERNAL_PREFIX) {
+        return true;
+    }
+
+    // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
+    if starts_with_ignore_ascii_case(key, RUSTFS_ENCRYPTION_PREFIX) || starts_with_ignore_ascii_case(key, MINIO_ENCRYPTION_PREFIX)
+    {
+        return true;
+    }
+
+    // Skip empty object lock values
+    if value.is_empty()
+        && (key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_MODE.as_str())
+            || key.eq_ignore_ascii_case(X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.as_str()))
+    {
+        return true;
+    }
+
+    if key.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_MD5) || key.eq_ignore_ascii_case(AMZ_META_UNENCRYPTED_CONTENT_LENGTH)
+    {
+        return true;
+    }
+
+    if excluded_headers.iter().any(|excluded| key.eq_ignore_ascii_case(excluded)) {
+        return true;
+    }
+
+    // User metadata is stored without the x-amz-meta- prefix by extract_metadata_from_mime.
+    starts_with_ignore_ascii_case(key, X_AMZ_PREFIX)
+}
+
 pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Option<HashMap<String, String>> {
     // HTTP headers that should NOT be returned in the Metadata field.
     // These headers are returned as separate response headers, not user metadata.
@@ -513,48 +557,19 @@ pub(crate) fn filter_object_metadata(metadata: &HashMap<String, String>) -> Opti
         "x-amz-server-side-encryption-aws-kms-key-id",
     ];
 
-    let mut filtered_metadata = HashMap::new();
+    let mut filtered_metadata = None;
     for (k, v) in metadata {
-        let lower_key = k.to_ascii_lowercase();
-        // Skip internal/reserved metadata (x-rustfs-internal-* or x-minio-internal-*)
-        if is_internal_key(&lower_key) {
-            continue;
-        }
-
-        // Skip internal encryption metadata (x-rustfs-encryption-* or x-minio-encryption-*)
-        if is_encryption_metadata_key(&lower_key) {
-            continue;
-        }
-
-        // Skip empty object lock values
-        if v.is_empty() && (k == &X_AMZ_OBJECT_LOCK_MODE.to_string() || k == &X_AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string()) {
-            continue;
-        }
-
-        // Skip UNENCRYPTED metadata placeholders
-        if k == AMZ_META_UNENCRYPTED_CONTENT_MD5 || k == AMZ_META_UNENCRYPTED_CONTENT_LENGTH {
-            continue;
-        }
-
-        // Skip excluded HTTP headers (they are returned as separate headers, not metadata)
-        if EXCLUDED_HEADERS.contains(&lower_key.as_str()) {
-            continue;
-        }
-
-        // Skip any x-amz-* headers that are not user metadata
-        // User metadata was stored WITHOUT the x-amz-meta- prefix by extract_metadata_from_mime
-        if lower_key.starts_with("x-amz-") {
+        if should_skip_object_metadata_key(k, v, EXCLUDED_HEADERS) {
             continue;
         }
 
         // Include user-defined metadata (keys like "meta1", "custom-key", etc.)
-        filtered_metadata.insert(k.clone(), v.clone());
+        filtered_metadata
+            .get_or_insert_with(HashMap::new)
+            .insert(k.clone(), v.clone());
     }
-    if filtered_metadata.is_empty() {
-        None
-    } else {
-        Some(filtered_metadata)
-    }
+
+    filtered_metadata
 }
 
 /// Detects content type from object name based on file extension.
@@ -1502,6 +1517,21 @@ mod tests {
 
         let filtered = filter_object_metadata(&metadata);
         assert!(filtered.is_none(), "content-type must not be exposed as user metadata");
+    }
+
+    #[test]
+    fn test_filter_object_metadata_excludes_case_insensitive_system_headers() {
+        let mut metadata = HashMap::new();
+        metadata.insert("Content-Type".to_string(), "application/octet-stream".to_string());
+        metadata.insert("X-Amz-Storage-Class".to_string(), "STANDARD".to_string());
+        metadata.insert("X-RustFS-Internal-Healing".to_string(), "true".to_string());
+        metadata.insert("X-Minio-Encryption-Iv".to_string(), "secret".to_string());
+        metadata.insert("custom-key".to_string(), "custom-value".to_string());
+
+        let filtered = filter_object_metadata(&metadata).expect("user metadata should remain");
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered.get("custom-key"), Some(&"custom-value".to_string()));
     }
 
     #[test]

@@ -12,21 +12,28 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_error_boundary::Result;
 use super::replication_storage_boundary::ReplicationObjectIO;
-use crate::config::com;
-use crate::error::Result;
+use crate::config::{com, storageclass};
 use std::sync::Arc;
 
-pub(crate) async fn read<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
-where
-    S: ReplicationObjectIO,
-{
-    com::read_config(api, file).await
-}
+pub(crate) struct ReplicationConfigStore;
 
-pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
-where
-    S: ReplicationObjectIO,
-{
-    com::save_config(api, file, data).await
+impl ReplicationConfigStore {
+    pub(crate) const RRS: &'static str = storageclass::RRS;
+    pub(crate) const STANDARD: &'static str = storageclass::STANDARD;
+
+    pub(crate) async fn read<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::read_config(api, file).await
+    }
+
+    pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
+    where
+        S: ReplicationObjectIO,
+    {
+        com::save_config(api, file, data).await
+    }
 }

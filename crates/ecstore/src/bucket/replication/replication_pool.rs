@@ -12,36 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::replication_config_store as config_store;
-use super::replication_metadata_boundary as metadata_boundary;
-use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
-use super::replication_target_boundary as target_boundary;
-use super::runtime_boundary as runtime_sources;
-use crate::bucket::replication::ResyncOpts;
-use crate::bucket::replication::ResyncStatusType;
-use crate::bucket::replication::replicate_delete;
-use crate::bucket::replication::replicate_object;
-use crate::bucket::replication::replication_resyncer::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer,
-    TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
-    save_resync_status,
+use super::datatypes::ResyncStatusType;
+use super::replication_config_store::ReplicationConfigStore;
+use super::replication_error_boundary::Error as EcstoreError;
+use super::replication_filemeta_boundary::{
+    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
+    ReplicateObjectInfo, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+    ResyncDecision, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
-use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::error::Error as EcstoreError;
+use super::replication_metadata_boundary::ReplicationMetadataStore;
+use super::replication_resyncer::{
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer, ResyncOpts,
+    TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
+    replicate_delete, replicate_object, save_resync_status,
+};
+use super::replication_state::ReplicationStats;
+use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
+use super::replication_target_boundary::ReplicationTargetStore;
+use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
-use rustfs_filemeta::MrfOpKind;
-use rustfs_filemeta::MrfReplicateEntry;
-use rustfs_filemeta::ReplicateDecision;
-use rustfs_filemeta::ReplicateObjectInfo;
-use rustfs_filemeta::ReplicatedTargetInfo;
-use rustfs_filemeta::ReplicationStatusType;
-use rustfs_filemeta::ReplicationType;
-use rustfs_filemeta::ReplicationWorkerOperation;
-use rustfs_filemeta::ResyncDecision;
-use rustfs_filemeta::VersionPurgeStatusType;
-use rustfs_filemeta::replication_statuses_map;
-use rustfs_filemeta::version_purge_statuses_map;
-use rustfs_filemeta::{REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;
@@ -799,7 +788,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         let storage = self.storage.clone();
 
         let handle = tokio::spawn(async move {
-            let data = match config_store::read(storage.clone(), metadata_boundary::MRF_REPLICATION_FILE).await {
+            let data = match ReplicationConfigStore::read(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE).await {
                 Ok(d) => d,
                 Err(EcstoreError::ConfigNotFound) => return, // no file yet — normal on first start
                 Err(e) => {
@@ -823,9 +812,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         "Failed to decode MRF recovery file — discarding corrupt data"
                     );
                     // Overwrite the corrupt file so we don't fail again on next restart.
-                    let _ = config_store::save(
+                    let _ = ReplicationConfigStore::save(
                         storage,
-                        metadata_boundary::MRF_REPLICATION_FILE,
+                        ReplicationMetadataStore::MRF_REPLICATION_FILE,
                         encode_mrf_file(&[]).unwrap_or_default(),
                     )
                     .await;
@@ -887,9 +876,12 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
             // Clear AFTER all entries are processed so a crash mid-replay causes at-most-twice
             // delivery (idempotent) rather than entry loss.
-            if let Err(e) =
-                config_store::save(storage, metadata_boundary::MRF_REPLICATION_FILE, encode_mrf_file(&[]).unwrap_or_default())
-                    .await
+            if let Err(e) = ReplicationConfigStore::save(
+                storage,
+                ReplicationMetadataStore::MRF_REPLICATION_FILE,
+                encode_mrf_file(&[]).unwrap_or_default(),
+            )
+            .await
             {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
@@ -1262,7 +1254,9 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 async fn flush_mrf_to_disk<S: ReplicationObjectIO>(entries: &[MrfReplicateEntry], storage: &Arc<S>) -> bool {
     match encode_mrf_file(entries) {
         Ok(data) => {
-            if let Err(e) = config_store::save(storage.clone(), metadata_boundary::MRF_REPLICATION_FILE, data).await {
+            if let Err(e) =
+                ReplicationConfigStore::save(storage.clone(), ReplicationMetadataStore::MRF_REPLICATION_FILE, data).await
+            {
                 warn!(
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REPLICATION,
@@ -1294,9 +1288,9 @@ async fn load_bucket_resync_metadata<S: ReplicationObjectIO>(
 ) -> Result<BucketReplicationResyncStatus, EcstoreError> {
     let mut brs = BucketReplicationResyncStatus::new();
 
-    let resync_file_path = metadata_boundary::bucket_resync_file_path(bucket);
+    let resync_file_path = ReplicationMetadataStore::bucket_resync_file_path(bucket);
 
-    let data = match config_store::read(obj_api, &resync_file_path).await {
+    let data = match ReplicationConfigStore::read(obj_api, &resync_file_path).await {
         Ok(data) => data,
         Err(EcstoreError::ConfigNotFound) => return Ok(brs),
         Err(err) => return Err(err),
@@ -1415,7 +1409,7 @@ pub fn get_global_replication_stats() -> Option<Arc<ReplicationStats>> {
     runtime_sources::replication_stats()
 }
 
-pub async fn schedule_replication<S: ReplicationStorage>(
+pub(crate) async fn schedule_replication<S: ReplicationStorage>(
     oi: ObjectInfo,
     o: Arc<S>,
     dsc: ReplicateDecision,
@@ -1467,7 +1461,7 @@ pub async fn schedule_replication<S: ReplicationStorage>(
     }
 }
 
-pub async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
+pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
     if let Some(pool) = runtime_sources::replication_pool() {
         let _ = pool.queue_replica_delete_task(dv.clone()).await;
     }
@@ -1495,7 +1489,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         return;
     }
 
-    let rcfg = match metadata_boundary::replication_config(bucket).await {
+    let rcfg = match ReplicationMetadataStore::replication_config(bucket).await {
         Ok((config, _)) => config,
         Err(err) => {
             debug!(
@@ -1512,7 +1506,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
         }
     };
 
-    let tgts = match target_boundary::list_bucket_targets(bucket).await {
+    let tgts = match ReplicationTargetStore::list_bucket_targets(bucket).await {
         Ok(targets) => Some(targets),
         Err(err) => {
             debug!(
@@ -1534,7 +1528,7 @@ pub async fn queue_replication_heal(bucket: &str, oi: ObjectInfo, retry_count: u
 
 /// queue_replication_heal_internal enqueues objects that failed replication OR eligible for resyncing through
 /// an ongoing resync operation or via existing objects replication configuration setting.
-pub async fn queue_replication_heal_internal(
+pub(crate) async fn queue_replication_heal_internal(
     _bucket: &str,
     oi: ObjectInfo,
     rcfg: ReplicationConfig,
@@ -1700,8 +1694,8 @@ async fn queue_replicate_deletes_wrapper(
 
 #[cfg(test)]
 mod tests {
+    use super::super::replication_resyncer::{decode_mrf_file, encode_mrf_file};
     use super::*;
-    use crate::bucket::replication::replication_resyncer::{decode_mrf_file, encode_mrf_file};
     use uuid::Uuid;
 
     #[test]

@@ -14,6 +14,13 @@
 
 pub(crate) use crate::services::event_notification::EventArgs;
 
+use super::runtime_boundary;
+
 pub(crate) fn send_event(args: EventArgs) {
     crate::services::event_notification::send_event(args);
+}
+
+pub(crate) fn send_local_event(mut args: EventArgs) {
+    args.host = runtime_boundary::default_local_node_name();
+    send_event(args);
 }

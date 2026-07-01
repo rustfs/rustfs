@@ -201,7 +201,7 @@ jobs:
     name: Build RustFS
     needs: [ build-check, prepare-platform-matrix ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ matrix.platform == 'linux' && fromJSON('["self-hosted","linux","compile"]') || matrix.os }}
     timeout-minutes: 90
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -465,79 +465,47 @@ jobs:
           path: "rustfs-*.zip"
           retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
 
-      - name: Upload to Aliyun OSS
-        if: env.OSS_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
+      - name: Upload to Cloudflare R2
+        if: env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
         env:
-          OSS_ACCESS_KEY_ID: ${{ secrets.ALICLOUDOSS_KEY_ID }}
-          OSS_ACCESS_KEY_SECRET: ${{ secrets.ALICLOUDOSS_KEY_SECRET }}
-          OSS_REGION: cn-beijing
-          OSS_ENDPOINT: https://oss-accelerate.aliyuncs.com
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+          R2_BUCKET: ${{ secrets.R2_BUCKET }}
+          AWS_EC2_METADATA_DISABLED: true
         shell: bash
         run: |
           BUILD_TYPE="${{ needs.build-check.outputs.build_type }}"
 
-          # Install ossutil (platform-specific)
-          OSSUTIL_VERSION="2.1.1"
-          case "${{ matrix.platform }}" in
-            linux)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-linux-${ARCH}"
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "⚠️ R2 credentials or endpoint missing, skipping artifact upload"
+            exit 0
+          fi
 
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            macos)
-              if [[ "$(uname -m)" == "arm64" ]]; then
-                ARCH="arm64"
-              else
-                ARCH="amd64"
-              fi
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-mac-${ARCH}"
+          if ! command -v aws >/dev/null 2>&1; then
+            echo "❌ aws CLI not found on runner; cannot upload to R2"
+            exit 1
+          fi
 
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil" /usr/local/bin/
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              chmod +x /usr/local/bin/ossutil
-              OSSUTIL_BIN=ossutil
-              ;;
-            windows)
-              OSSUTIL_ZIP="ossutil-${OSSUTIL_VERSION}-windows-amd64.zip"
-              OSSUTIL_DIR="ossutil-${OSSUTIL_VERSION}-windows-amd64"
-
-              curl -o "$OSSUTIL_ZIP" "https://gosspublic.alicdn.com/ossutil/v2/${OSSUTIL_VERSION}/${OSSUTIL_ZIP}"
-              unzip "$OSSUTIL_ZIP"
-              mv "${OSSUTIL_DIR}/ossutil.exe" ./ossutil.exe
-              rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
-              OSSUTIL_BIN=./ossutil.exe
-              ;;
-          esac
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
 
           # Determine upload path based on build type
           if [[ "$BUILD_TYPE" == "development" ]]; then
-            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/dev/"
-            echo "📤 Uploading development build to OSS dev directory"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/dev/"
+            echo "📤 Uploading development build to R2 dev directory"
           else
-            OSS_PATH="oss://rustfs-artifacts/artifacts/rustfs/release/"
-            echo "📤 Uploading release build to OSS release directory"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"
+            echo "📤 Uploading release build to R2 release directory"
           fi
 
-          # Upload all rustfs zip files to OSS using glob pattern
-          echo "📤 Uploading all rustfs-*.zip files to $OSS_PATH..."
+          # Upload all rustfs zip files to R2 using S3-compatible API
+          echo "📤 Uploading all rustfs-*.zip files to $R2_PATH..."
           for zip_file in rustfs-*.zip; do
             if [[ -f "$zip_file" ]]; then
-              echo "Uploading: $zip_file to $OSS_PATH..."
-              $OSSUTIL_BIN cp "$zip_file" "$OSS_PATH" --force
+              echo "Uploading: $zip_file to $R2_PATH..."
+              aws s3 cp "$zip_file" "$R2_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
               echo "✅ Uploaded: $zip_file"
             fi
           done

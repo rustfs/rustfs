@@ -19,9 +19,11 @@ use tokio::io::AsyncRead;
 use crate::bucket::bandwidth::monitor::Monitor;
 use crate::bucket::bandwidth::reader::{BucketOptions, MonitorReaderOptions, MonitoredReader};
 
+pub(crate) type ReplicationBucketMonitor = Monitor;
+
 pub(crate) fn wrap_reader(
     stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
-    monitor: Arc<Monitor>,
+    monitor: Arc<ReplicationBucketMonitor>,
     bucket: &str,
     arn: &str,
     header_size: usize,

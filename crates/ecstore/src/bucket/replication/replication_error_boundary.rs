@@ -12,12 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::time::Duration;
-
-pub(crate) struct ReplicationLockTiming;
-
-impl ReplicationLockTiming {
-    pub(crate) fn acquire_timeout() -> Duration {
-        crate::set_disk::get_lock_acquire_timeout()
-    }
-}
+pub(crate) use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};

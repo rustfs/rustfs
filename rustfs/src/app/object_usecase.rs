@@ -191,9 +191,31 @@ const LOG_SUBSYSTEM_OBJECT: &str = "object";
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
 const EVENT_GET_OBJECT_STREAM_BODY: &str = "get_object_stream_body";
+const GET_OBJECT_STAGE_PATH_S3_HANDLER: &str = "s3_handler";
+const GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT: &str = "request_ingress_to_context";
+const GET_OBJECT_STAGE_OUTPUT_STRATEGY: &str = "output_strategy";
+const GET_OBJECT_STAGE_BODY_BUILD: &str = "body_build";
+const GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ: &str = "body_encrypted_buffer_read";
+const GET_OBJECT_STAGE_BODY_MEMORY_BLOB: &str = "body_memory_blob";
+const GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ: &str = "body_seek_buffer_read";
+const GET_OBJECT_STAGE_BODY_STREAM_STRATEGY: &str = "body_stream_strategy";
+const GET_OBJECT_STAGE_BODY_STREAMING_BLOB: &str = "body_streaming_blob";
+const GET_OBJECT_STAGE_CHECKSUM_HEADERS: &str = "checksum_headers";
+const GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION: &str = "lifecycle_expiration";
+const GET_OBJECT_STAGE_METADATA_FILTER: &str = "metadata_filter";
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 const GET_OBJECT_STREAM_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static GET_OBJECT_BUFFER_THRESHOLD_WARNED: AtomicBool = AtomicBool::new(false);
+
+fn record_get_object_s3_handler_stage_duration(stage: &'static str, start: Option<std::time::Instant>) {
+    if let Some(start) = start {
+        rustfs_io_metrics::record_get_object_stage_duration(
+            GET_OBJECT_STAGE_PATH_S3_HANDLER,
+            stage,
+            start.elapsed().as_secs_f64(),
+        );
+    }
+}
 
 fn decoded_content_length_from_headers(headers: &HeaderMap) -> S3Result<Option<i64>> {
     let Some(val) = headers.get(AMZ_DECODED_CONTENT_LENGTH) else {
@@ -235,6 +257,23 @@ impl DeadlockRequestGuard {
             request_id,
         }
     }
+
+    fn register_if_enabled<F>(
+        deadlock_detector: Arc<deadlock_detector::DeadlockDetector>,
+        request_id: &str,
+        description: F,
+    ) -> Option<Self>
+    where
+        F: FnOnce() -> String,
+    {
+        if !deadlock_detector.is_enabled() {
+            return None;
+        }
+
+        let request_id = request_id.to_string();
+        deadlock_detector.register_request(&request_id, description());
+        Some(Self::new(deadlock_detector, request_id))
+    }
 }
 
 impl Drop for DeadlockRequestGuard {
@@ -248,7 +287,7 @@ struct GetObjectBootstrap {
     wrapper: RequestTimeoutWrapper,
     request_start: std::time::Instant,
     request_guard: GetObjectGuard,
-    _deadlock_request_guard: DeadlockRequestGuard,
+    _deadlock_request_guard: Option<DeadlockRequestGuard>,
     concurrent_requests: usize,
 }
 
@@ -273,6 +312,7 @@ struct GetObjectReadSetup {
     info: ObjectInfo,
     event_info: ObjectInfo,
     final_stream: DynReader,
+    buffered_body: Option<Bytes>,
     rs: Option<HTTPRangeSpec>,
     content_type: Option<ContentType>,
     last_modified: Option<Timestamp>,
@@ -332,6 +372,7 @@ const LARGE_SEQUENTIAL_GET_STREAM_BUFFER_CAP_BYTES: usize = 4 * MI_B;
 const LARGE_SEQUENTIAL_GET_READAHEAD_MULTIPLIER: usize = 2;
 const LARGE_BODY_READER_STREAM_BUFFER_FLOOR_BYTES: usize = MI_B;
 const LARGE_BODY_READER_STREAM_BUFFER_THRESHOLD_BYTES: i64 = 4 * MI_B as i64;
+const ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE: &str = "RUSTFS_GET_SEEK_BUFFER_ENABLE";
 const ENV_RUSTFS_GET_READER_STREAM_BUFFER_SIZE: &str = "RUSTFS_GET_READER_STREAM_BUFFER_SIZE";
 const ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE: &str = "RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE";
 const GET_READER_STREAM_BUFFER_SOURCE_SELECTED: &str = "selected";
@@ -340,6 +381,9 @@ const GET_READER_STREAM_POLL_PENDING: &str = "pending";
 const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
+const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
+const GET_MEMORY_BODY_SOURCE_SEEK_BUFFER: &str = "seek_buffer";
+const GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER: &str = "encrypted_buffer";
 
 fn get_reader_stream_buffer_size_override() -> Option<usize> {
     static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -354,6 +398,11 @@ fn get_reader_stream_buffer_size_override() -> Option<usize> {
 fn is_get_output_handoff_attribution_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE, false))
+}
+
+fn is_get_seek_buffer_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SEEK_BUFFER_ENABLE, false))
 }
 
 fn resolve_reader_stream_buffer_size(selected_size: usize, override_size: Option<usize>) -> (usize, &'static str) {
@@ -437,6 +486,8 @@ pin_project! {
     struct MemoryTrackedBytesStream {
         bytes: Bytes,
         emitted: bool,
+        started: std::time::Instant,
+        source: &'static str,
         _guard: Option<rustfs_io_metrics::MemoryGaugeGuard>,
     }
 }
@@ -483,10 +534,12 @@ pin_project! {
 }
 
 impl MemoryTrackedBytesStream {
-    fn new(bytes: Bytes, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
+    fn new(bytes: Bytes, source: &'static str, guard: Option<rustfs_io_metrics::MemoryGaugeGuard>) -> Self {
         Self {
             bytes,
             emitted: false,
+            started: std::time::Instant::now(),
+            source,
             _guard: guard,
         }
     }
@@ -516,11 +569,32 @@ impl futures::Stream for MemoryTrackedBytesStream {
 
     fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.project();
+        let poll_start = is_get_output_handoff_attribution_enabled().then(std::time::Instant::now);
         if *this.emitted {
+            if let Some(poll_start) = poll_start {
+                rustfs_io_metrics::record_get_object_memory_body_stream_poll(
+                    this.source,
+                    GET_READER_STREAM_POLL_READY_EMPTY,
+                    0,
+                    poll_start.elapsed().as_secs_f64(),
+                );
+            }
             return Poll::Ready(None);
         }
 
+        let first_byte_elapsed = (!this.bytes.is_empty()).then(|| this.started.elapsed());
         *this.emitted = true;
+        if let Some(elapsed) = first_byte_elapsed {
+            rustfs_io_metrics::record_get_object_first_byte_latency(GET_OBJECT_STAGE_PATH_S3_HANDLER, elapsed.as_secs_f64());
+        }
+        if let Some(poll_start) = poll_start {
+            rustfs_io_metrics::record_get_object_memory_body_stream_poll(
+                this.source,
+                GET_READER_STREAM_POLL_READY_DATA,
+                this.bytes.len(),
+                poll_start.elapsed().as_secs_f64(),
+            );
+        }
         Poll::Ready(Some(Ok(this.bytes.clone())))
     }
 }
@@ -662,6 +736,10 @@ impl<R: AsyncRead + Unpin> AsyncRead for GetObjectStreamingReader<R> {
                     if !self.first_byte_reported {
                         self.first_byte_reported = true;
                         let elapsed = self.elapsed();
+                        rustfs_io_metrics::record_get_object_first_byte_latency(
+                            GET_OBJECT_STAGE_PATH_S3_HANDLER,
+                            elapsed.as_secs_f64(),
+                        );
                         if elapsed >= GET_OBJECT_STREAM_WARN_THRESHOLD {
                             warn!(
                                 event = EVENT_GET_OBJECT_STREAM_BODY,
@@ -1149,6 +1227,7 @@ fn should_buffer_get_object_in_memory(
         has_range,
         configured_threshold,
         concurrent_requests,
+        is_get_seek_buffer_enabled(),
     )
 }
 
@@ -1159,8 +1238,12 @@ fn should_buffer_get_object_in_memory_with_threshold(
     has_range: bool,
     configured_threshold: i64,
     concurrent_requests: usize,
+    seek_buffer_enabled: bool,
 ) -> bool {
-    if part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
+    if !seek_buffer_enabled || part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
+        return false;
+    }
+    if usize::try_from(response_content_length).is_err() {
         return false;
     }
 
@@ -1188,6 +1271,8 @@ fn should_buffer_get_object_in_memory_with_threshold(
 mod deadlock_request_guard_tests {
     use super::DeadlockRequestGuard;
     use crate::app::storage_api::object_usecase::deadlock_detector::{DeadlockDetector, RequestHangDetectionPolicy};
+    use std::cell::Cell;
+    use std::rc::Rc;
     use std::sync::Arc;
 
     #[test]
@@ -1207,6 +1292,24 @@ mod deadlock_request_guard_tests {
         }
 
         assert_eq!(detector.tracked_count(), 0);
+    }
+
+    #[test]
+    fn deadlock_request_guard_skips_disabled_detector() {
+        let detector = Arc::new(DeadlockDetector::new(RequestHangDetectionPolicy {
+            enabled: false,
+            ..RequestHangDetectionPolicy::default()
+        }));
+        let description_built = Rc::new(Cell::new(false));
+        let description_built_for_closure = Rc::clone(&description_built);
+
+        let guard = DeadlockRequestGuard::register_if_enabled(detector, "test-request-id", || {
+            description_built_for_closure.set(true);
+            "test request".to_string()
+        });
+
+        assert!(guard.is_none());
+        assert!(!description_built.get());
     }
 }
 
@@ -1970,13 +2073,39 @@ impl DefaultObjectUsecase {
         }
     }
 
-    fn build_memory_blob(buf: Vec<u8>, response_content_length: i64, _optimal_buffer_size: usize) -> Option<StreamingBlob> {
-        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(buf.len());
-        let bytes = Bytes::from(buf);
-        Some(StreamingBlob::wrap(bytes_stream(
-            MemoryTrackedBytesStream::new(bytes, guard),
-            response_content_length as usize,
-        )))
+    fn build_memory_bytes_blob(
+        bytes: Bytes,
+        response_content_length: i64,
+        _optimal_buffer_size: usize,
+        source: &'static str,
+    ) -> Option<StreamingBlob> {
+        let get_stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
+        let memory_blob_start = get_stage_metrics_enabled.then(std::time::Instant::now);
+        let handoff_start = get_stage_metrics_enabled.then(std::time::Instant::now);
+        let bytes_len = bytes.len();
+        let guard = rustfs_io_metrics::track_get_object_buffered_bytes(bytes_len);
+        let remaining = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let blob = StreamingBlob::wrap(bytes_stream(MemoryTrackedBytesStream::new(bytes, source, guard), remaining));
+        if let Some(handoff_start) = handoff_start {
+            rustfs_io_metrics::record_get_object_response_handoff(
+                "single_chunk",
+                source,
+                bytes_len,
+                response_content_length,
+                handoff_start.elapsed().as_secs_f64(),
+            );
+        }
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_MEMORY_BLOB, memory_blob_start);
+        Some(blob)
+    }
+
+    fn build_memory_blob(
+        buf: Vec<u8>,
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        source: &'static str,
+    ) -> Option<StreamingBlob> {
+        Self::build_memory_bytes_blob(Bytes::from(buf), response_content_length, optimal_buffer_size, source)
     }
 
     fn select_stream_buffer_strategy(
@@ -2007,6 +2136,7 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
+        let streaming_blob_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expected = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
         let tuned_stream_buffer_size =
             tune_reader_stream_buffer_size(stream_buffer_size, response_content_length, stream_strategy);
@@ -2033,20 +2163,21 @@ impl DefaultObjectUsecase {
                 handoff_start.elapsed().as_secs_f64(),
             );
         }
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAMING_BLOB, streaming_blob_start);
         Some(blob)
     }
 
     fn init_get_object_bootstrap(bucket: &str, key: &str, request_id: &str) -> S3Result<GetObjectBootstrap> {
-        let timeout_config = GetObjectTimeoutPolicy::from_env();
+        let timeout_config = GetObjectTimeoutPolicy::cached_from_env();
         let wrapper = RequestTimeoutWrapper::with_request_id(timeout_config.clone(), request_id.to_string());
         let request_start = std::time::Instant::now();
         let request_guard = ConcurrencyManager::track_request();
         let concurrent_requests = GetObjectGuard::concurrent_requests();
 
         let deadlock_detector = deadlock_detector::get_deadlock_detector();
-        let request_id = wrapper.request_id().to_string();
-        deadlock_detector.register_request(&request_id, format!("GetObject {bucket}/{key}"));
-        let deadlock_request_guard = DeadlockRequestGuard::new(deadlock_detector, request_id);
+        let deadlock_request_guard = DeadlockRequestGuard::register_if_enabled(deadlock_detector, wrapper.request_id(), || {
+            format!("GetObject {bucket}/{key}")
+        });
 
         Self::ensure_get_object_not_timed_out(&wrapper, &timeout_config, bucket, key, GetObjectTimeoutStage::BeforeProcessing)?;
 
@@ -2255,6 +2386,8 @@ impl DefaultObjectUsecase {
         }
 
         let info = reader.object_info;
+        let stream = reader.stream;
+        let buffered_body = reader.buffered_body;
 
         let read_duration = read_start.elapsed();
 
@@ -2342,6 +2475,7 @@ impl DefaultObjectUsecase {
             ssekms_key_id,
             encryption_applied,
             final_stream,
+            buffered_body,
         ) = match sse_decryption(decryption_request).await? {
             Some(material) => {
                 let server_side_encryption = Some(material.server_side_encryption.clone());
@@ -2353,10 +2487,11 @@ impl DefaultObjectUsecase {
                     sse_customer_key_md5,
                     material.kms_key_id,
                     true,
-                    wrap_reader(reader.stream),
+                    wrap_reader(stream),
+                    None,
                 )
             }
-            None => (None, None, None, None, false, wrap_reader(reader.stream)),
+            None => (None, None, None, None, false, wrap_reader(stream), buffered_body),
         };
 
         // Detect inline fast path: data is in memory, no disk I/O semaphore needed.
@@ -2367,6 +2502,7 @@ impl DefaultObjectUsecase {
             info,
             event_info,
             final_stream,
+            buffered_body,
             rs,
             content_type,
             last_modified,
@@ -2536,6 +2672,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         has_range: bool,
         encryption_applied: bool,
+        buffered_body: Option<Bytes>,
         bucket: &str,
         key: &str,
     ) -> S3Result<Option<StreamingBlob>>
@@ -2548,7 +2685,10 @@ impl DefaultObjectUsecase {
 
             if should_buffer_encrypted_object {
                 let mut buf = Vec::with_capacity(response_content_length as usize);
-                if let Err(e) = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+                let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+                let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+                record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_ENCRYPTED_BUFFER_READ, buffer_read_start);
+                if let Err(e) = read_result {
                     error!(error = %e, "GetObject decrypted object buffering failed");
                     return Err(ApiError::from(StorageError::other(format!("Failed to read decrypted object: {e}"))).into());
                 }
@@ -2561,12 +2701,19 @@ impl DefaultObjectUsecase {
                     );
                 }
 
-                return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
+                return Ok(Self::build_memory_blob(
+                    buf,
+                    response_content_length,
+                    optimal_buffer_size,
+                    GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER,
+                ));
             }
 
             debug!(buffer_size = optimal_buffer_size, "Encrypted object uses streaming decrypt path");
+            let stream_strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             let (stream_buffer_size, stream_strategy) =
                 Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
             return Ok(Self::build_reader_blob(
                 final_stream,
                 response_content_length,
@@ -2577,12 +2724,32 @@ impl DefaultObjectUsecase {
             ));
         }
 
+        if let Some(buffered_body) = buffered_body {
+            if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
+                warn!(
+                    expected = response_content_length,
+                    actual = buffered_body.len(),
+                    "Buffered GetObject body size mismatch"
+                );
+            }
+
+            return Ok(Self::build_memory_bytes_blob(
+                buffered_body,
+                response_content_length,
+                optimal_buffer_size,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            ));
+        }
+
         let should_provide_seek_support =
             should_buffer_get_object_in_memory(info, response_content_length, part_number, has_range, concurrent_requests);
 
         if should_provide_seek_support {
             let mut buf = Vec::with_capacity(response_content_length as usize);
-            match tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await {
+            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ, buffer_read_start);
+            match read_result {
                 Ok(_) => {
                     if buf.len() != response_content_length as usize {
                         warn!(
@@ -2592,7 +2759,12 @@ impl DefaultObjectUsecase {
                         );
                     }
 
-                    return Ok(Self::build_memory_blob(buf, response_content_length, optimal_buffer_size));
+                    return Ok(Self::build_memory_blob(
+                        buf,
+                        response_content_length,
+                        optimal_buffer_size,
+                        GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
+                    ));
                 }
                 Err(e) => {
                     error!(error = %e, "GetObject seek-support buffering failed");
@@ -2600,8 +2772,10 @@ impl DefaultObjectUsecase {
             }
         }
 
+        let stream_strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let (stream_buffer_size, stream_strategy) =
             Self::select_stream_buffer_strategy(response_content_length, optimal_buffer_size, enable_readahead, has_range);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_STREAM_STRATEGY, stream_strategy_start);
         Ok(Self::build_reader_blob(
             final_stream,
             response_content_length,
@@ -3297,6 +3471,7 @@ impl DefaultObjectUsecase {
         info: ObjectInfo,
         event_info: ObjectInfo,
         final_stream: DynReader,
+        buffered_body: Option<Bytes>,
         rs: Option<HTTPRangeSpec>,
         content_type: Option<ContentType>,
         last_modified: Option<Timestamp>,
@@ -3314,6 +3489,7 @@ impl DefaultObjectUsecase {
         part_number: Option<usize>,
         versioned: bool,
     ) -> S3Result<GetObjectOutputContext> {
+        let strategy_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let strategy = self.finalize_get_object_strategy(
             manager,
             bucket,
@@ -3326,12 +3502,14 @@ impl DefaultObjectUsecase {
             queue_status,
             concurrent_requests,
         );
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_OUTPUT_STRATEGY, strategy_start);
         let GetObjectStrategyContext {
             io_strategy: _,
             optimal_buffer_size,
             enable_readahead,
         } = strategy;
 
+        let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let body = Self::build_get_object_body(
             final_stream,
             &info,
@@ -3342,12 +3520,16 @@ impl DefaultObjectUsecase {
             part_number,
             rs.is_some(),
             encryption_applied,
+            buffered_body,
             bucket,
             key,
         )
         .await?;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_BUILD, body_build_start);
 
+        let checksum_headers_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let checksums = Self::build_get_object_checksums(&info, &req.headers, part_number, rs.as_ref())?;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_CHECKSUM_HEADERS, checksum_headers_start);
 
         let output_version_id = if versioned {
             info.version_id.map(|vid| {
@@ -3368,9 +3550,15 @@ impl DefaultObjectUsecase {
         });
 
         // x-amz-expiration: predict from lifecycle configuration
+        let lifecycle_expiration_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let expiration = resolve_put_object_expiration(bucket, &info).await;
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_LIFECYCLE_EXPIRATION, lifecycle_expiration_start);
         let storage_class = response_storage_class(&info, &info.user_defined);
         let content_disposition = info.user_defined.get("content-disposition").cloned();
+
+        let metadata_filter_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+        let metadata = filter_object_metadata(&info.user_defined);
+        record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_METADATA_FILTER, metadata_filter_start);
 
         let output = GetObjectOutput {
             body,
@@ -3382,7 +3570,7 @@ impl DefaultObjectUsecase {
             accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
             content_range,
             e_tag: info.etag.map(|etag| to_s3s_etag(&etag)),
-            metadata: filter_object_metadata(&info.user_defined),
+            metadata,
             server_side_encryption,
             sse_customer_algorithm,
             sse_customer_key_md5,
@@ -3418,11 +3606,19 @@ impl DefaultObjectUsecase {
             let _ = context.object_store();
         }
 
-        let request_id = req
-            .extensions
-            .get::<request_context::RequestContext>()
+        let inbound_request_context = req.extensions.get::<request_context::RequestContext>();
+        let request_id = inbound_request_context
             .map(|ctx| ctx.request_id.clone())
             .unwrap_or_else(|| request_context::RequestContext::fallback().request_id);
+        if rustfs_io_metrics::get_stage_metrics_enabled()
+            && let Some(context) = inbound_request_context
+        {
+            rustfs_io_metrics::record_get_object_stage_duration(
+                GET_OBJECT_STAGE_PATH_S3_HANDLER,
+                GET_OBJECT_STAGE_REQUEST_INGRESS_TO_CONTEXT,
+                context.start_time.elapsed().as_secs_f64(),
+            );
+        }
         let bootstrap = Self::init_get_object_bootstrap(&req.input.bucket, &req.input.key, &request_id)?;
         let timeout_config = bootstrap.timeout_config;
         let wrapper = bootstrap.wrapper;
@@ -3477,6 +3673,7 @@ impl DefaultObjectUsecase {
             info,
             event_info,
             final_stream,
+            buffered_body,
             rs,
             content_type,
             last_modified,
@@ -3495,15 +3692,6 @@ impl DefaultObjectUsecase {
             final_stream
         };
 
-        let versioning_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
-        if let Some(versioning_start) = versioning_start {
-            rustfs_io_metrics::record_get_object_stage_duration(
-                "s3_handler",
-                "versioning_lookup",
-                versioning_start.elapsed().as_secs_f64(),
-            );
-        }
         let output_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output_context = self
             .build_get_object_output_context(
@@ -3514,6 +3702,7 @@ impl DefaultObjectUsecase {
                 info,
                 event_info,
                 final_stream,
+                buffered_body,
                 rs,
                 content_type,
                 last_modified,
@@ -3529,7 +3718,7 @@ impl DefaultObjectUsecase {
                 &queue_status,
                 concurrent_requests,
                 part_number,
-                versioned,
+                opts.versioned,
             )
             .await?;
         if let Some(output_build_start) = output_build_start {
@@ -6007,7 +6196,7 @@ mod tests {
         let configured_threshold = 20_i64 * 1024 * 1024 * 1024;
         let response_len = 80_i64 * 1024 * 1024;
         let should_buffer =
-            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold, 1);
+            should_buffer_get_object_in_memory_with_threshold(&info, response_len, None, false, configured_threshold, 1, true);
 
         assert!(
             !should_buffer,
@@ -6026,7 +6215,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6034,7 +6224,8 @@ mod tests {
             Some(1),
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6042,7 +6233,24 @@ mod tests {
             None,
             true,
             configured_threshold,
-            1
+            1,
+            true
+        ));
+    }
+
+    #[test]
+    fn should_buffer_get_object_in_memory_requires_seek_buffer_opt_in() {
+        let info = ObjectInfo::default();
+        let configured_threshold = 10_i64 * 1024 * 1024;
+
+        assert!(!should_buffer_get_object_in_memory_with_threshold(
+            &info,
+            1024,
+            None,
+            false,
+            configured_threshold,
+            1,
+            false
         ));
     }
 
@@ -6057,7 +6265,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6065,7 +6274,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
     }
 
@@ -6080,7 +6290,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6088,9 +6299,10 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
-        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0, 1));
+        assert!(!should_buffer_get_object_in_memory_with_threshold(&info, 1024, None, false, 0, 1, true));
     }
 
     #[test]
@@ -6104,7 +6316,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            1
+            1,
+            true
         ));
         assert!(!should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6112,7 +6325,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            32
+            32,
+            true
         ));
         assert!(should_buffer_get_object_in_memory_with_threshold(
             &info,
@@ -6120,7 +6334,8 @@ mod tests {
             None,
             false,
             configured_threshold,
-            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD
+            rustfs_config::DEFAULT_OBJECT_HIGH_CONCURRENCY_THRESHOLD,
+            true
         ));
     }
 
@@ -6194,6 +6409,7 @@ mod tests {
             None,
             false,
             false,
+            None,
             "test-bucket",
             "large-object",
         )
@@ -6229,6 +6445,7 @@ mod tests {
             None,
             false,
             true,
+            None,
             "test-bucket",
             "large-encrypted-object",
         )
@@ -6240,6 +6457,78 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             0,
             "large encrypted object response construction should not pre-read object data"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_uses_buffered_body_without_reader_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 4,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            4,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"test")),
+            "test-bucket",
+            "direct-memory-object",
+        )
+        .await
+        .expect("build_get_object_body should consume buffered body");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered GetObject body must not be read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_keeps_small_plain_objects_on_streaming_path_by_default() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 4,
+            ..Default::default()
+        };
+
+        let body = DefaultObjectUsecase::build_get_object_body(
+            reader,
+            &info,
+            4,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "small-plain-object",
+        )
+        .await
+        .expect("build_get_object_body should keep small plain object on streaming path");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "default GetObject response construction should not pre-read small plain object data"
         );
     }
 
@@ -6884,6 +7173,7 @@ mod tests {
                 info.clone(),
                 info,
                 wrap_reader(tokio::io::empty()),
+                None,
                 None,
                 None,
                 None,

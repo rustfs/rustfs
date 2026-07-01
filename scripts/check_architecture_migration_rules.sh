@@ -198,12 +198,22 @@ EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/external_test_ecstore_
 FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits.txt"
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
+REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
+ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
+REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_boundary_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
+REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
+REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
+REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_local_path_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
+REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE="${TMP_DIR}/replication_runtime_type_bypass_hits.txt"
+REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_ecstore_owner_bridge_bypass_hits.txt"
+REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_object_bridge_bypass_hits.txt"
+REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE="${TMP_DIR}/replication_scanner_bridge_bypass_hits.txt"
 REPLICATION_STORAGE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_storage_boundary_bypass_hits.txt"
 REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_target_boundary_bypass_hits.txt"
 REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_tagging_boundary_bypass_hits.txt"
@@ -2500,6 +2510,227 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename 'pub(?:\(crate\))?\s+use\s+(?:config|datatypes|replication_pool|replication_resyncer|replication_state|rule)::\*;' \
+    crates/ecstore/src/bucket/replication/mod.rs || true
+) >"$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE"
+
+if [[ -s "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE" ]]; then
+  report_failure "replication facade must use explicit compatibility exports instead of wildcard re-exports: $(paste -sd '; ' "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename '\b(ObjectOpts|ResyncOpts)\s*\{' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+    rg -n -U --with-filename 'use\s+(?:crate::admin::storage_api::bucket::replication|super::storage_api::bucket::replication)::\{[^}]*\b(ObjectOpts|ResyncOpts)\b' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+    rg -n --with-filename '(?:crate::admin::storage_api::bucket::replication|super::storage_api::bucket::replication|replication)::(?:ObjectOpts|ResyncOpts)\b' \
+      rustfs/src/admin \
+      --glob '*.rs' \
+      --glob '!rustfs/src/admin/storage_api.rs' || true
+  }
+) >"$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "admin replication ObjectOpts/ResyncOpts construction must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'ecstore_bucket::replication::(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)|crate::bucket::replication::(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)' \
+      rustfs/src crates/ecstore/src \
+      --glob '*.rs'
+    rg -n --with-filename '\b(check_replicate_delete|get_must_replicate_options|must_replicate|schedule_replication|schedule_replication_delete)\b' \
+      crates/ecstore/src/bucket/replication/mod.rs
+  } || true
+) >"$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "object replication work entry points must stay behind ReplicationObjectBridge: $(paste -sd '; ' "$REPLICATION_OBJECT_BRIDGE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'crate::bucket::replication::(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'use\s+crate::bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+    rg -n -U --with-filename 'crate::\{[^;]*bucket::replication::\{[^}]*\b(decode_resync_file|encode_resync_file|ObjectOpts|ReplicationConfigurationExt)\b' \
+      crates/ecstore/src \
+      --glob '*.rs'
+  } |
+    rg -v '^crates/ecstore/src/bucket/replication/' || true
+) >"$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "ECStore owner modules must use replication bridge contracts instead of internal replication helpers: $(paste -sd '; ' "$REPLICATION_ECSTORE_OWNER_BRIDGE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      sub blank {
+        my ($text) = @_;
+        $text =~ s/[^\n]/ /g;
+        return $text;
+      }
+
+      sub blank_block_comments {
+        my ($text) = @_;
+        my $out = $text;
+        my $len = length($text);
+        my $i = 0;
+
+        while ($i < $len) {
+          if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+            my $start = $i;
+            my $depth = 0;
+
+            while ($i < $len) {
+              if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+                $depth++;
+                $i += 2;
+                next;
+              }
+              if ($i + 1 < $len && substr($text, $i, 2) eq "*/") {
+                $depth--;
+                $i += 2;
+                last if $depth == 0;
+                next;
+              }
+              $i++;
+            }
+
+            substr($out, $start, $i - $start) = blank(substr($text, $start, $i - $start));
+            next;
+          }
+
+          $i++;
+        }
+
+        return $out;
+      }
+
+      my $source = $_;
+      my $hash = chr(35);
+      $source =~ s{b?r(${hash}*)".*?"\1}{blank($&)}egs;
+      $source =~ s{b?"(?:\\.|[^"\\])*"}{blank($&)}egs;
+      $source =~ s{'\''(?:\\.|[^'\''\\])+'\''}{blank($&)}egs;
+      $source = blank_block_comments($source);
+      $source =~ s{//[^\n]*}{blank($&)}eg;
+
+      while ($source =~ /(?:crate::bucket::replication\b|crate::bucket::\{[^;]*\breplication\b|crate::\{[^;]*\bbucket::replication\b|crate::\{[^;]*\bbucket::\{[^;]*\breplication\b)/sg) {
+        my $prefix = substr($source, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' || true
+) >"$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication modules must use local relative paths instead of crate-qualified replication self paths: $(paste -sd '; ' "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      next if $ARGV =~ m{replication_(storage|bandwidth)_boundary\.rs$};
+
+      sub blank {
+        my ($text) = @_;
+        $text =~ s/[^\n]/ /g;
+        return $text;
+      }
+
+      sub blank_block_comments {
+        my ($text) = @_;
+        my $out = $text;
+        my $len = length($text);
+        my $i = 0;
+
+        while ($i < $len) {
+          if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+            my $start = $i;
+            my $depth = 0;
+
+            while ($i < $len) {
+              if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+                $depth++;
+                $i += 2;
+                next;
+              }
+              if ($i + 1 < $len && substr($text, $i, 2) eq "*/") {
+                $depth--;
+                $i += 2;
+                last if $depth == 0;
+                next;
+              }
+              $i++;
+            }
+
+            substr($out, $start, $i - $start) = blank(substr($text, $start, $i - $start));
+            next;
+          }
+
+          $i++;
+        }
+
+        return $out;
+      }
+
+      my $source = $_;
+      my $hash = chr(35);
+      $source =~ s{b?r(${hash}*)".*?"\1}{blank($&)}egs;
+      $source =~ s{b?"(?:\\.|[^"\\])*"}{blank($&)}egs;
+      $source =~ s{'\''(?:\\.|[^'\''\\])+'\''}{blank($&)}egs;
+      $source = blank_block_comments($source);
+      $source =~ s{//[^\n]*}{blank($&)}eg;
+
+      while ($source =~ /([^;]+)(?:;|$)/g) {
+        my $statement_start = $-[1];
+        my $statement = $1;
+        my $normalized = $statement;
+        $normalized =~ s/\s+//g;
+
+        my $hits_ecstore =
+          $normalized =~ /\bECStore(?:\b|as)/
+          && $normalized =~ /crate::(?:store::\{?|\{.*store::\{?)/s;
+        my $hits_monitor =
+          $normalized =~ /\bMonitor(?:\b|as)/
+          && $normalized =~ /crate::(?:bucket::\{?|\{.*bucket::\{?)/s
+          && $normalized =~ /bucket::\{?.*bandwidth::\{?.*monitor::\{?/s;
+
+        if ($hits_ecstore || $hits_monitor) {
+          my $leading = $statement;
+          $leading =~ s/^(\s*).*$/$1/s;
+          my $prefix = substr($source, 0, $statement_start);
+          my $line = ($prefix =~ tr/\n//) + ($leading =~ tr/\n//) + 1;
+          $normalized =~ s/\s+/ /g;
+          print "$ARGV:$line:$normalized\n";
+        }
+      }
+    ' || true
+) >"$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication runtime concrete types must stay behind local storage or bandwidth boundaries: $(paste -sd '; ' "$REPLICATION_RUNTIME_TYPE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   rg -n --with-filename 'crate::runtime::sources(\s+as\s+runtime_sources|::)' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' |
@@ -2508,6 +2739,17 @@ fi
 
 if [[ -s "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication runtime-source access must stay behind replication runtime boundary: $(paste -sd '; ' "$REPLICATION_RUNTIME_SOURCE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'queue_replication_heal_internal' \
+    crates/scanner/src crates/scanner/tests \
+    --glob '*.rs' || true
+) >"$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication heal queueing must stay behind ReplicationScannerBridge: $(paste -sd '; ' "$REPLICATION_SCANNER_BRIDGE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2524,14 +2766,87 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'crate::config::com::\{[^}]*\b(read_config|save_config)\b|crate::config::com::(read_config|save_config)|\b(read_config|save_config)\(' \
+  rg -n --with-filename '\b(runtime_sources|runtime_boundary)::default_local_node_name\(\)' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_event_sink\.rs:' || true
+) >"$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication event host selection must stay behind replication event sink: $(paste -sd '; ' "$REPLICATION_EVENT_HOST_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      sub emit_match {
+        my ($pos, $match) = @_;
+        my $prefix = substr($_, 0, $pos);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+
+      while (/(?:crate::config::|use\s+crate::config\b)/sg) {
+        emit_match($-[0], $&);
+      }
+
+      while (/use\s+crate::\{([^;]*)/sg) {
+        my ($pos, $end, $body) = ($-[0], $+[0], $1);
+        my ($depth, $token) = (0, "");
+        my $matched = 0;
+
+        for my $ch (split //, $body) {
+          if ($ch eq "{") {
+            $depth++;
+            next;
+          }
+          if ($ch eq "}") {
+            $depth-- if $depth > 0;
+            next;
+          }
+          if ($depth == 0 && $ch eq ",") {
+            if ($token =~ /^\s*config\b/s) {
+              emit_match($pos, substr($_, $pos, $end - $pos));
+              $matched = 1;
+              last;
+            }
+            $token = "";
+            next;
+          }
+          $token .= $ch if $depth == 0;
+        }
+
+        if (!$matched && $token =~ /^\s*config\b/s) {
+          emit_match($pos, substr($_, $pos, $end - $pos));
+        }
+      }
+    ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_config_store\.rs:' || true
 ) >"$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication config persistence must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
+  report_failure "replication config access must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/(?:crate::error::|use\s+crate::error\b|use\s+crate::\{[^;]*\berror\b)/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_error_boundary\.rs:' || true
+) >"$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication error contracts must stay behind replication error boundary: $(paste -sd '; ' "$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2606,6 +2921,17 @@ fi
 
 if [[ -s "$REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication tag decoding must stay behind replication tagging boundary: $(paste -sd '; ' "$REPLICATION_TAGGING_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_filemeta::' crates/ecstore/src/bucket/replication --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_filemeta_boundary\.rs:' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_storage_boundary\.rs:' || true
+) >"$REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication filemeta contracts must stay behind replication filemeta boundary: $(paste -sd '; ' "$REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

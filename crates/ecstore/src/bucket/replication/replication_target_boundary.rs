@@ -21,14 +21,18 @@ pub(crate) use crate::bucket::bucket_target_sys::{
 };
 pub(crate) use crate::bucket::target::BucketTargets;
 
-pub(crate) async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets, BucketTargetError> {
-    BucketTargetSys::get().list_bucket_targets(bucket).await
-}
+pub(crate) struct ReplicationTargetStore;
 
-pub(crate) async fn remote_target_client(bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
-    BucketTargetSys::get().get_remote_target_client(bucket, arn).await
-}
+impl ReplicationTargetStore {
+    pub(crate) async fn list_bucket_targets(bucket: &str) -> Result<BucketTargets, BucketTargetError> {
+        BucketTargetSys::get().list_bucket_targets(bucket).await
+    }
 
-pub(crate) async fn target_is_offline(target_client: &TargetClient) -> bool {
-    BucketTargetSys::get().is_offline(&target_client.to_url()).await
+    pub(crate) async fn remote_target_client(bucket: &str, arn: &str) -> Option<Arc<TargetClient>> {
+        BucketTargetSys::get().get_remote_target_client(bucket, arn).await
+    }
+
+    pub(crate) async fn target_is_offline(target_client: &TargetClient) -> bool {
+        BucketTargetSys::get().is_offline(&target_client.to_url()).await
+    }
 }

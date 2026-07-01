@@ -12,25 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::io::{Read, Write};
-
-use time::OffsetDateTime;
-
 use super::replication_error_boundary::Result;
-use crate::bucket::msgp_decode;
+use super::replication_resyncer::{BucketReplicationResyncStatus, decode_resync_file, encode_resync_file};
 
-pub(crate) struct ReplicationMsgpCodec;
+pub(crate) struct ReplicationMigrationBridge;
 
-impl ReplicationMsgpCodec {
-    pub(crate) fn read_ext8_time<R: Read>(rd: &mut R) -> Result<OffsetDateTime> {
-        msgp_decode::read_msgp_ext8_time(rd)
+impl ReplicationMigrationBridge {
+    pub(crate) fn decode_resync_status(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
+        decode_resync_file(data)
     }
 
-    pub(crate) fn skip_value<R: Read>(rd: &mut R) -> Result<()> {
-        msgp_decode::skip_msgp_value(rd)
-    }
-
-    pub(crate) fn write_time<W: Write>(wr: &mut W, time: OffsetDateTime) -> Result<()> {
-        msgp_decode::write_msgp_time(wr, time)
+    pub(crate) fn encode_resync_status(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
+        encode_resync_file(status)
     }
 }

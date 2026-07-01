@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::replication_error_boundary::Error;
+use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use super::runtime_boundary as runtime_sources;
-use crate::error::Error;
-use rustfs_filemeta::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
@@ -990,7 +990,7 @@ impl ReplicationStats {
                     ri.op_type,
                     ri.endpoint.clone(),
                     ri.secure,
-                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
                 );
             }
             ReplicationStatusType::Completed if ri.op_type.is_data_replication() => {
@@ -1002,7 +1002,7 @@ impl ReplicationStats {
                     ri.op_type,
                     ri.endpoint.clone(),
                     ri.secure,
-                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
                 );
             }
             ReplicationStatusType::Failed
@@ -1016,7 +1016,7 @@ impl ReplicationStats {
                     ri.op_type,
                     ri.endpoint.clone(),
                     ri.secure,
-                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
                 );
             }
             ReplicationStatusType::Replica if ri.op_type == ReplicationType::Object => {
@@ -1028,7 +1028,7 @@ impl ReplicationStats {
                     ri.op_type,
                     String::new(),
                     false,
-                    ri.error.as_ref().map(|e| crate::error::Error::other(e.clone())),
+                    ri.error.as_ref().map(|e| Error::other(e.clone())),
                 );
             }
             _ => {}
