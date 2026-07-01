@@ -141,6 +141,16 @@ arg_value() {
   printf '%s\n' "$value"
 }
 
+arg_value_allow_option() {
+  local flag="$1"
+  local value="${2:-}"
+  if [[ -z "$value" ]]; then
+    echo "ERROR: missing value for $flag" >&2
+    exit 1
+  fi
+  printf '%s\n' "$value"
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -158,7 +168,7 @@ parse_args() {
       --cooldown-secs) COOLDOWN_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --baseline-root) BASELINE_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
-      --extra-args) EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --extra-args) EXTRA_ARGS="$(arg_value_allow_option "$1" "${2:-}")"; shift 2 ;;
       --warp-bin) WARP_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --python-bin) PYTHON_BIN="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --service-metrics-url) SERVICE_METRICS_URL="$(arg_value "$1" "${2:-}")"; shift 2 ;;
