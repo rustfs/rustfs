@@ -11,6 +11,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENHANCED_BENCH_SCRIPT="${PROJECT_ROOT}/scripts/run_object_batch_bench_enhanced.sh"
+SERVICE_METRICS_DELTA_SCRIPT="${PROJECT_ROOT}/scripts/analyze_put_service_metrics_deltas.py"
 
 TOOL="warp"
 ENDPOINT=""
@@ -260,6 +261,9 @@ setup_output() {
   AGG_MEDIAN_CSV="${OUT_DIR}/aggregate_median_summary.csv"
   AGG_COMPARE_CSV="${OUT_DIR}/aggregate_baseline_compare.csv"
   AGG_SERVICE_METRICS_CSV="${OUT_DIR}/aggregate_service_metrics_captures.csv"
+  AGG_SERVICE_METRICS_DELTAS_CSV="${OUT_DIR}/aggregate_service_metrics_deltas.csv"
+  AGG_SERVICE_METRICS_PATH_SUMMARY_CSV="${OUT_DIR}/aggregate_service_metrics_path_summary.csv"
+  AGG_SERVICE_METRICS_STAGE_SUMMARY_CSV="${OUT_DIR}/aggregate_service_metrics_stage_summary.csv"
   RUN_MATRIX_CSV="${OUT_DIR}/run_matrix.csv"
   mkdir -p "$RUNS_DIR"
 
@@ -344,6 +348,9 @@ Top-level artifacts:
 - aggregate_median_summary.csv: merged median_summary rows from every concurrency run
 - aggregate_baseline_compare.csv: merged baseline_compare rows when a matching baseline exists
 - aggregate_service_metrics_captures.csv: merged service metrics capture status from every concurrency run
+- aggregate_service_metrics_deltas.csv: per-round before/after service metric deltas
+- aggregate_service_metrics_path_summary.csv: per-round PUT path deltas
+- aggregate_service_metrics_stage_summary.csv: per-round PUT stage duration averages from deltas
 - runs/cXX/: direct output directory of scripts/run_object_batch_bench_enhanced.sh
 
 Per-concurrency directory:
@@ -418,6 +425,25 @@ append_aggregate_rows() {
   if [[ -f "$service_metrics_csv" ]]; then
     awk -F',' -v c="$concurrency" -v rd="$run_dir" 'NR>1 {print c "," rd "," $0}' "$service_metrics_csv" >> "$AGG_SERVICE_METRICS_CSV"
   fi
+}
+
+analyze_service_metric_deltas() {
+  if [[ ! -s "$AGG_SERVICE_METRICS_CSV" ]]; then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$SERVICE_METRICS_DELTA_SCRIPT" ]]; then
+    echo "ERROR: missing service metrics delta script: $SERVICE_METRICS_DELTA_SCRIPT" >&2
+    exit 1
+  fi
+
+  "$PYTHON_BIN" "$SERVICE_METRICS_DELTA_SCRIPT" \
+    --capture-csv "$AGG_SERVICE_METRICS_CSV" \
+    --delta-csv "$AGG_SERVICE_METRICS_DELTAS_CSV" \
+    --path-summary-csv "$AGG_SERVICE_METRICS_PATH_SUMMARY_CSV" \
+    --stage-summary-csv "$AGG_SERVICE_METRICS_STAGE_SUMMARY_CSV"
 }
 
 run_concurrency() {
@@ -550,6 +576,8 @@ main() {
     fi
   done < <(csv_to_lines "$CONCURRENCIES")
 
+  analyze_service_metric_deltas
+
   echo
   echo "Stage-breakdown run finished."
   echo "Artifacts written to: $OUT_DIR"
@@ -558,6 +586,11 @@ main() {
   echo "  - $AGG_MEDIAN_CSV"
   if [[ -s "$AGG_SERVICE_METRICS_CSV" ]]; then
     echo "  - $AGG_SERVICE_METRICS_CSV"
+  fi
+  if [[ -s "$AGG_SERVICE_METRICS_DELTAS_CSV" ]]; then
+    echo "  - $AGG_SERVICE_METRICS_DELTAS_CSV"
+    echo "  - $AGG_SERVICE_METRICS_PATH_SUMMARY_CSV"
+    echo "  - $AGG_SERVICE_METRICS_STAGE_SUMMARY_CSV"
   fi
   if [[ -s "$AGG_COMPARE_CSV" ]]; then
     echo "  - $AGG_COMPARE_CSV"
