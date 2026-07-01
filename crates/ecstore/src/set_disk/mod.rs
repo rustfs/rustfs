@@ -1705,6 +1705,10 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
     }
 }
 
+fn known_put_object_size(data_size: i64, actual_size: i64) -> i64 {
+    if data_size >= 0 { data_size } else { actual_size }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers(
     files: &[FileInfo],
@@ -2463,10 +2467,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
+            let put_object_size = known_put_object_size(data.size(), data.actual_size());
             let is_inline_buffer =
-                runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
+                runtime_sources::storage_class_should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
-            let shard_file_size = erasure.shard_file_size(data.size());
+            let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
             let writer_setup_stage_start = Instant::now();
             let writer_futs: Vec<_> = shuffle_disks
@@ -2544,7 +2549,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_put_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
             let encode_stage_start = Instant::now();
@@ -9560,9 +9565,19 @@ mod tests {
             SmallWritePath::Pipeline
         ));
         assert!(matches!(
+            classify_put_write_path(false, 31 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
             classify_put_write_path(true, 64 * 1024 * 1024, 1024 * 1024),
             SmallWritePath::Pipeline
         ));
+    }
+
+    #[test]
+    fn put_object_classification_size_falls_back_to_actual_size() {
+        assert_eq!(known_put_object_size(42, 100), 42);
+        assert_eq!(known_put_object_size(-1, 33 * 1024 * 1024), 33 * 1024 * 1024);
     }
 
     #[test]
