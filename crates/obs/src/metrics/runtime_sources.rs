@@ -13,13 +13,10 @@
 // limitations under the License.
 
 use crate::metrics::{
-    ObsBucketBandwidthMonitor, ObsReplicationStats, obs_expiry_state_handle, obs_get_global_bucket_monitor,
-    obs_get_global_replication_stats, obs_transition_state_handle,
+    ObsBucketBandwidthMonitor, obs_expiry_state_handle, obs_get_global_bucket_monitor, obs_transition_state_handle,
 };
 use rustfs_iam::{get_global_iam_sys, oidc::oidc_plugin_authn_metrics_snapshot};
 use std::sync::Arc;
-
-pub(crate) type ObsReplicationStatsHandle = Arc<ObsReplicationStats>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ObsIlmRuntimeSnapshot {
@@ -61,10 +58,6 @@ pub(crate) fn bucket_monitor_handle() -> Option<Arc<ObsBucketBandwidthMonitor>> 
 
 pub(crate) fn bucket_monitor_available() -> bool {
     bucket_monitor_handle().is_some()
-}
-
-pub(crate) fn replication_stats_handle() -> Option<ObsReplicationStatsHandle> {
-    obs_get_global_replication_stats()
 }
 
 pub(crate) async fn ilm_runtime_snapshot() -> ObsIlmRuntimeSnapshot {
