@@ -12,9 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod mrf;
 pub mod resync;
 
+pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use resync::{
-    BucketReplicationResyncStatus, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus, decode_resync_file,
-    encode_resync_file,
+    BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
+    decode_resync_file, encode_resync_file,
 };
