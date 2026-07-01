@@ -558,7 +558,7 @@ mod tests {
     fn skip_msgp_value_consumes_fixext_type_and_payload() {
         for (marker, payload_len) in [(0xd4, 1), (0xd5, 2), (0xd6, 4), (0xd7, 8), (0xd8, 16)] {
             let mut data = vec![marker, MSGP_TIME_EXT_TYPE as u8];
-            data.extend(std::iter::repeat(0xaa).take(payload_len));
+            data.resize(data.len() + payload_len, 0xaa);
             data.push(0x01);
 
             let mut cursor = Cursor::new(data);
