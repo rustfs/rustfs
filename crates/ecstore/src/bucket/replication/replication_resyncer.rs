@@ -14,6 +14,7 @@
 
 use super::replication_bandwidth_boundary;
 use super::replication_config_store as config_store;
+use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
@@ -37,7 +38,6 @@ use super::replication_versioning_boundary as versioning_boundary;
 use super::runtime_boundary as runtime_sources;
 use crate::bucket::replication::ResyncStatusType;
 use crate::bucket::replication::{ObjectOpts, ReplicationConfigurationExt as _};
-use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;

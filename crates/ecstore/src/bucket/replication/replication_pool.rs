@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use super::replication_config_store as config_store;
+use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
     ReplicateObjectInfo, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
@@ -32,7 +33,6 @@ use crate::bucket::replication::replication_resyncer::{
     save_resync_status,
 };
 use crate::bucket::replication::replication_state::ReplicationStats;
-use crate::error::Error as EcstoreError;
 use lazy_static::lazy_static;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
