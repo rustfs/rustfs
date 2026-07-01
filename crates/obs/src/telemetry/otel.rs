@@ -54,7 +54,7 @@ use opentelemetry_otlp::{Compression, Protocol, WithExportConfig, WithHttpConfig
 use opentelemetry_sdk::propagation::{BaggagePropagator, TraceContextPropagator};
 use opentelemetry_sdk::{
     logs::SdkLoggerProvider,
-    metrics::{PeriodicReader, SdkMeterProvider},
+    metrics::{Aggregation, Instrument, PeriodicReader, SdkMeterProvider, Stream},
     trace::{RandomIdGenerator, Sampler, SdkTracerProvider},
 };
 use percent_encoding::percent_decode_str;
@@ -69,6 +69,19 @@ use tracing::info;
 use tracing_error::ErrorLayer;
 use tracing_opentelemetry::{MetricsLayer, OpenTelemetryLayer};
 use tracing_subscriber::{Layer, fmt::format::FmtSpan, layer::SubscriberExt, util::SubscriberInitExt};
+
+const GET_OBJECT_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_io_get_object_request_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds",
+    "rustfs_io_get_object_total_duration_seconds_with_path",
+    "rustfs_io_get_object_stage_duration_seconds",
+    "rustfs_io_get_object_stage_duration_seconds_by_size",
+];
+
+const GET_OBJECT_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
 
 /// Initialize the full OpenTelemetry HTTP pipeline (traces + metrics + logs).
 ///
@@ -418,11 +431,14 @@ fn build_meter_provider(
 
     let (provider, recorder) = Recorder::builder(service_name.to_string())
         .with_meter_provider(|b: opentelemetry_sdk::metrics::MeterProviderBuilder| {
-            let b = b.with_resource(res).with_reader(
-                PeriodicReader::builder(exporter)
-                    .with_interval(Duration::from_secs(meter_interval))
-                    .build(),
-            );
+            let b = b
+                .with_resource(res)
+                .with_reader(
+                    PeriodicReader::builder(exporter)
+                        .with_interval(Duration::from_secs(meter_interval))
+                        .build(),
+                )
+                .with_view(get_object_duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -435,6 +451,24 @@ fn build_meter_provider(
     metrics::set_global_recorder(recorder).map_err(|e| TelemetryError::InstallMetricsRecorder(e.to_string()))?;
     set_observability_metric_enabled(true);
     Ok(Some(provider))
+}
+
+fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    if !is_get_object_duration_histogram_metric(instrument.name()) {
+        return None;
+    }
+
+    Stream::builder()
+        .with_aggregation(Aggregation::ExplicitBucketHistogram {
+            boundaries: GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.to_vec(),
+            record_min_max: true,
+        })
+        .build()
+        .ok()
+}
+
+fn is_get_object_duration_histogram_metric(name: &str) -> bool {
+    GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name)
 }
 
 /// Build an optional [`SdkLoggerProvider`] for the given log endpoint.
@@ -686,5 +720,20 @@ mod tests {
         assert_eq!(resolve_signal_timeout(None, None), None);
         assert_eq!(resolve_signal_timeout(Some(0), None), None);
         assert_eq!(resolve_signal_timeout(None, Some(0)), None);
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_metric_match_is_scoped() {
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_stage_duration_seconds"));
+        assert!(is_get_object_duration_histogram_metric("rustfs_io_get_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_put_object_request_duration_seconds"));
+        assert!(!is_get_object_duration_histogram_metric("rustfs_io_get_object_response_size_bytes"));
+    }
+
+    #[test]
+    fn test_get_object_duration_histogram_buckets_are_sorted() {
+        assert!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.first(), Some(&0.0001));
+        assert_eq!(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS.last(), Some(&10.0));
     }
 }
