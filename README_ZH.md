@@ -123,10 +123,10 @@ mkdir -p certs
 chown -R 10001:10001 certs
 ```
 
-您也可以使用 Docker Compose。使用根目录下的 `docker-compose.yml` 文件：
+您也可以使用 Docker Compose。使用根目录下的 `docker-compose-simple.yml` 文件：
 
 ```bash
-docker compose --profile observability up -d
+docker compose -f docker-compose-simple.yml up -d
 ```
 
 在使用 Compose 且包含宿主机绑定挂载时，请先确认：
@@ -134,9 +134,7 @@ docker compose --profile observability up -d
 - 所有挂载到容器内的宿主机路径都对 `10001:10001` 可写。
 - 如果启用了 TLS，挂载到 `/opt/tls` 的证书目录也需要对 `10001:10001` 可读。
 - 如果不方便调整宿主机目录归属，可以为 `rustfs` 服务显式设置 `user: "<host-uid>:<host-gid>"`。
-- `docker-compose-simple.yml` 为命名 volume 提供了 `volume-permission-helper` 服务；`docker-compose.yml` 使用宿主机绑定挂载，因此需要您在启动前自行准备目录权限。
-
-**注意**: 我们建议您在运行前查看 `docker-compose.yml` 文件。该文件定义了包括 Grafana、Prometheus 和 Jaeger 在内的多个服务，有助于 RustFS 的可观测性监控。如果您还想启动 Redis 或 Nginx 容器，可以指定相应的 profile。
+- `docker-compose-simple.yml` 为命名 volume 提供了 `volume-permission-helper` 服务；`docker-compose-simple.yml` 使用宿主机绑定挂载，因此需要您在启动前自行准备目录权限。
 
 ### 3\. 源码编译 (选项 3) - 进阶用户
 
