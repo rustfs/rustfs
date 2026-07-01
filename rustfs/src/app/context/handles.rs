@@ -452,11 +452,11 @@ pub fn default_bucket_monitor_interface() -> Arc<dyn BucketMonitorInterface> {
     Arc::new(BucketMonitorHandle)
 }
 
-pub fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
+pub(crate) fn default_replication_pool_interface() -> Arc<dyn ReplicationPoolInterface> {
     Arc::new(ReplicationPoolHandle)
 }
 
-pub fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
+pub(crate) fn default_replication_stats_interface() -> Arc<dyn ReplicationStatsInterface> {
     Arc::new(ReplicationStatsHandle)
 }
 
