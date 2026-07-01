@@ -62,7 +62,7 @@ OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
-CODEC_MIN_SIZE=1
+CODEC_MIN_SIZE=""
 RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
 COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
@@ -172,7 +172,8 @@ Binary/options:
   --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
   --warp-bin <path>              warp binary (default: warp)
   --python-bin <path>            Python binary for SigV4 compatibility probe (default: python3)
-  --codec-min-size <bytes>       RUSTFS_GET_CODEC_STREAMING_MIN_SIZE (default: 1)
+  --codec-min-size <bytes>       Override RUSTFS_GET_CODEC_STREAMING_MIN_SIZE
+                                 (default: unset, use server size-aware default)
   --compat-object-key <key>      Object key used by the compatibility probe
   --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
   --skip-compat-probe            skip post-benchmark compatibility/fallback probes
@@ -417,7 +418,9 @@ validate_args() {
       *) die "--local-read-copy-method must be mmap_copy or direct_read_copy" ;;
     esac
   fi
-  validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
+  if [[ -n "$CODEC_MIN_SIZE" ]]; then
+    validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
+  fi
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$RESOURCE_SAMPLE_INTERVAL_SECS" "--resource-sample-interval-secs"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
@@ -743,7 +746,7 @@ dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 python_bin=${PYTHON_BIN}
-codec_min_size=${CODEC_MIN_SIZE}
+codec_min_size=${CODEC_MIN_SIZE:-server-default}
 compat_object_key=${COMPAT_OBJECT_KEY}
 compat_object_size=${COMPAT_OBJECT_SIZE}
 command_line=${command_line% }
@@ -923,7 +926,7 @@ RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP=$(codec_reader_setup_d
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
-RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE:-server-default}
 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
@@ -1056,7 +1059,11 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
-    export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    if [[ -n "$CODEC_MIN_SIZE" ]]; then
+      export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    else
+      unset RUSTFS_GET_CODEC_STREAMING_MIN_SIZE
+    fi
     if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
       export RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES"
     fi
@@ -2543,7 +2550,7 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" \
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "${CODEC_MIN_SIZE:-0}" "$compat_dir" "$profile" \
     "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" \
     "$CODEC_MULTIPART" "$CODEC_MULTIPART_MAX_PARTS" <<'PY'
 import base64

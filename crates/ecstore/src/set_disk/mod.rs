@@ -346,6 +346,8 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false; // Disabled until
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+const ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = 512 * 1024;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
@@ -647,7 +649,17 @@ pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
 }
 
 fn get_codec_streaming_min_size() -> usize {
-    rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+    if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
+        return rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE);
+    }
+
+    match get_codec_streaming_engine() {
+        GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+        ),
+        GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+    }
 }
 
 fn get_object_metadata_cache_max_entries() -> usize {
