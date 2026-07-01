@@ -136,10 +136,10 @@ mkdir -p certs
 chown -R 10001:10001 certs
 ```
 
-You can also use Docker Compose. Using the `docker-compose.yml` file in the root directory:
+You can also use Docker Compose. Using the `docker-compose-simple.yml` file in the root directory:
 
 ```bash
-docker compose --profile observability up -d
+docker compose -f docker-compose-simple.yml up -d
 ```
 
 Before running Compose with host bind mounts:
@@ -147,12 +147,12 @@ Before running Compose with host bind mounts:
 - Ensure every mounted host path is writable by `10001:10001`.
 - If you enable TLS, ensure the certificate mount for `/opt/tls` is also readable by `10001:10001`.
 - If matching host ownership is not practical, run the `rustfs` service with `user: "<host-uid>:<host-gid>"` instead.
-- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose.yml` relies on you to prepare bind-mounted host paths in advance.
+- `docker-compose-simple.yml` includes a `volume-permission-helper` service for named volumes. `docker-compose-simple.yml` relies on you to prepare bind-mounted host paths in advance.
 
 Similarly, you can run the command with podman
 
 ```bash
-podman compose --profile observability up -d
+podman compose -f docker-compose-simple.yml up -d
 ```
 
 Webhook notification quick start (Docker):
