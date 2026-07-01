@@ -204,6 +204,7 @@ REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_bounda
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
 REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
+REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_local_path_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
 REPLICATION_MSGP_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_msgp_boundary_bypass_hits.txt"
@@ -2499,6 +2500,74 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication facade imports must stay in local storage_api boundaries: $(paste -sd '; ' "$REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      sub blank {
+        my ($text) = @_;
+        $text =~ s/[^\n]/ /g;
+        return $text;
+      }
+
+      sub blank_block_comments {
+        my ($text) = @_;
+        my $out = $text;
+        my $len = length($text);
+        my $i = 0;
+
+        while ($i < $len) {
+          if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+            my $start = $i;
+            my $depth = 0;
+
+            while ($i < $len) {
+              if ($i + 1 < $len && substr($text, $i, 2) eq "/*") {
+                $depth++;
+                $i += 2;
+                next;
+              }
+              if ($i + 1 < $len && substr($text, $i, 2) eq "*/") {
+                $depth--;
+                $i += 2;
+                last if $depth == 0;
+                next;
+              }
+              $i++;
+            }
+
+            substr($out, $start, $i - $start) = blank(substr($text, $start, $i - $start));
+            next;
+          }
+
+          $i++;
+        }
+
+        return $out;
+      }
+
+      my $source = $_;
+      my $hash = chr(35);
+      $source =~ s{b?r(${hash}*)".*?"\1}{blank($&)}egs;
+      $source =~ s{b?"(?:\\.|[^"\\])*"}{blank($&)}egs;
+      $source =~ s{'\''(?:\\.|[^'\''\\])+'\''}{blank($&)}egs;
+      $source = blank_block_comments($source);
+      $source =~ s{//[^\n]*}{blank($&)}eg;
+
+      while ($source =~ /(?:crate::bucket::replication\b|crate::bucket::\{[^;]*\breplication\b|crate::\{[^;]*\bbucket::replication\b|crate::\{[^;]*\bbucket::\{[^;]*\breplication\b)/sg) {
+        my $prefix = substr($source, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' || true
+) >"$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication modules must use local relative paths instead of crate-qualified replication self paths: $(paste -sd '; ' "$REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE")"
 fi
 
 (

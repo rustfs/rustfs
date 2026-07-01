@@ -14,9 +14,9 @@
 
 use std::sync::Arc;
 
+use super::replication_pool::DynReplicationPool;
+use super::replication_state::ReplicationStats;
 use crate::bucket::bandwidth::monitor::Monitor;
-use crate::bucket::replication::replication_pool::DynReplicationPool;
-use crate::bucket::replication::replication_state::ReplicationStats;
 use crate::runtime::sources;
 use crate::store::ECStore;
 
