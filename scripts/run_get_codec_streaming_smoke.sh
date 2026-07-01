@@ -30,6 +30,7 @@ GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
 GET_SMALL_OBJECT_DIRECT_MEMORY=""
 GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
 MODE="both"
+PROFILE_ORDER="normal"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
 CODEC_MULTIPART="off"
@@ -88,6 +89,9 @@ Purpose:
 
 Core options:
   --mode <legacy|codec|both>     Which profile(s) to run (default: both)
+  --profile-order <normal|reverse>
+                                 Profile execution order after --mode expansion
+                                 (default: normal)
   --codec-engine <csv>           Codec engine(s) for codec profiles (default: legacy)
   --metadata-early-stop <on|off> Enable metadata early-stop observe/opt-in env (default: off)
   --shard-locality-preference <on|off>
@@ -265,6 +269,7 @@ parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --mode) MODE="$2"; shift 2 ;;
+      --profile-order) PROFILE_ORDER="$2"; shift 2 ;;
       --codec-engine) CODEC_ENGINES="$2"; shift 2 ;;
       --metadata-early-stop) METADATA_EARLY_STOP="$2"; shift 2 ;;
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
@@ -330,6 +335,11 @@ validate_args() {
   case "$MODE" in
     legacy|codec|both) ;;
     *) die "--mode must be legacy, codec, or both" ;;
+  esac
+
+  case "$PROFILE_ORDER" in
+    normal|reverse) ;;
+    *) die "--profile-order must be normal or reverse" ;;
   esac
 
   case "$METADATA_EARLY_STOP" in
@@ -662,6 +672,7 @@ git_head=${git_head}
 git_dirty_count=${git_dirty_count}
 profiles=${profiles_csv}
 mode=${MODE}
+profile_order=${PROFILE_ORDER}
 codec_engines=${CODEC_ENGINES}
 metadata_early_stop=${METADATA_EARLY_STOP}
 shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
@@ -3817,6 +3828,14 @@ main() {
       profiles=("legacy" "${codec_profiles[@]}")
       ;;
   esac
+  if [[ "$PROFILE_ORDER" == "reverse" ]]; then
+    local reversed_profiles=()
+    local profile_index
+    for ((profile_index=${#profiles[@]} - 1; profile_index >= 0; profile_index--)); do
+      reversed_profiles+=("${profiles[$profile_index]}")
+    done
+    profiles=("${reversed_profiles[@]}")
+  fi
   profiles_csv="$(IFS=,; echo "${profiles[*]}")"
 
   write_root_environment
