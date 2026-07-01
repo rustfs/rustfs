@@ -1262,7 +1262,7 @@ status=capture_failed
 capture_attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}
 url=${DIAGNOSTIC_METRICS_URL}
 EOF
-  log "WARN: failed to capture service metrics profile=${profile} phase=${phase} attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS} url=${DIAGNOSTIC_METRICS_URL}"
+  log "WARN: failed to capture service metrics profile=${profile} phase=${phase} attempts=${DIAGNOSTIC_METRICS_CAPTURE_ATTEMPTS}"
 }
 
 write_profile_service_metrics_summary() {
@@ -1288,7 +1288,7 @@ EOF
     return
   fi
 
-  if [[ ! -s "$after_file" ]]; then
+  if [[ ! -s "$before_file" || ! -s "$after_file" ]]; then
     cat >"$out_csv" <<EOF
 profile,status,metric,labels,before,after,delta,classification
 ${profile},snapshot_missing,N/A,N/A,N/A,N/A,N/A,service_metrics_snapshot_missing

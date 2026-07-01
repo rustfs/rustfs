@@ -214,6 +214,9 @@ validate_args() {
     echo "ERROR: --service-metrics-dir is required when --service-metrics-url is set" >&2
     exit 1
   fi
+  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+    require_cmd curl
+  fi
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
   fi
@@ -432,7 +435,7 @@ status=capture_failed
 capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
 url=${SERVICE_METRICS_URL}
 EOF
-  echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase} url=${SERVICE_METRICS_URL}" >&2
+  echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
 }
 
 median_from_numbers() {

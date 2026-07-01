@@ -1924,7 +1924,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let metadata_elapsed = metadata_stage_start.elapsed().as_secs_f64();
         rustfs_io_metrics::record_get_object_metadata_phase_duration(metadata_elapsed);
         rustfs_io_metrics::record_get_object_stage_duration_by_size(
-            GET_OBJECT_PATH_LEGACY_DUPLEX,
+            GET_OBJECT_PATH_SET_DISK,
             GET_STAGE_METADATA,
             object_class.as_str(),
             size_bucket,

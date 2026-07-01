@@ -1232,6 +1232,9 @@ fn should_buffer_get_object_in_memory_with_threshold(
     if !seek_buffer_enabled || part_number.is_some() || has_range || response_content_length <= 0 || configured_threshold <= 0 {
         return false;
     }
+    if usize::try_from(response_content_length).is_err() {
+        return false;
+    }
 
     let effective_threshold = concurrency_aware_seek_support_threshold(configured_threshold, concurrent_requests);
     if configured_threshold > MAX_GET_OBJECT_MEMORY_BUFFER_BYTES

@@ -70,9 +70,9 @@ fn should_auto_start_rebalance_after_recovered_meta(pool_meta: &PoolMeta, rebala
 }
 
 async fn wait_for_local_decommission_resume_delay(rx: &CancellationToken, delay: Duration) -> bool {
-    select! {
+    tokio::select! {
         _ = rx.cancelled() => false,
-        _ = sleep(delay) => true,
+        _ = tokio::time::sleep(delay) => true,
     }
 }
 
@@ -140,9 +140,9 @@ async fn resume_local_decommission_after_init(store: Arc<ECStore>, rx: Cancellat
                     error = %err,
                     "Retrying decommission resume after missing config"
                 );
-                select! {
+                tokio::select! {
                     _ = rx.cancelled() => return,
-                    _ = sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
+                    _ = tokio::time::sleep(LOCAL_DECOMMISSION_RESUME_RETRY_DELAY) => {}
                 }
             }
             Err(err) => {
