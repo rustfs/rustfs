@@ -156,6 +156,14 @@ use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
+const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
+const PUT_EAGER_STATUS_EXTRACT: &str = "extract";
+const PUT_EAGER_STATUS_COMPRESSED: &str = "compressed";
+const PUT_EAGER_STATUS_ENCRYPTED: &str = "encrypted";
+const PUT_EAGER_STATUS_INVALID_SIZE: &str = "invalid_size";
+const PUT_EAGER_STATUS_ABOVE_EAGER_MAX: &str = "above_eager_max";
+const PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE: &str = "zero_copy_ineligible";
+const PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH: &str = "aws_chunked_missing_decoded_length";
 use std::collections::HashMap;
 use std::ops::Add;
 use std::path::Path;
@@ -1006,6 +1014,7 @@ fn should_use_zero_copy(size: i64, headers: &HeaderMap) -> bool {
     true
 }
 
+#[cfg(test)]
 fn should_use_zero_copy_eager_put_path(
     size: i64,
     headers: &HeaderMap,
@@ -1013,25 +1022,45 @@ fn should_use_zero_copy_eager_put_path(
     should_compress: bool,
     is_extract: bool,
 ) -> bool {
+    zero_copy_eager_put_path_status(size, headers, server_side_encryption_requested, should_compress, is_extract)
+        == PUT_EAGER_STATUS_ELIGIBLE
+}
+
+fn zero_copy_eager_put_path_status(
+    size: i64,
+    headers: &HeaderMap,
+    server_side_encryption_requested: bool,
+    should_compress: bool,
+    is_extract: bool,
+) -> &'static str {
     const ZERO_COPY_EAGER_PUT_MAX_SIZE: i64 = 32 * 1024 * 1024;
 
-    if is_extract || should_compress || server_side_encryption_requested {
-        return false;
+    if is_extract {
+        return PUT_EAGER_STATUS_EXTRACT;
+    }
+    if should_compress {
+        return PUT_EAGER_STATUS_COMPRESSED;
+    }
+    if server_side_encryption_requested {
+        return PUT_EAGER_STATUS_ENCRYPTED;
     }
 
-    if size <= 0 || size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
-        return false;
+    if size <= 0 {
+        return PUT_EAGER_STATUS_INVALID_SIZE;
+    }
+    if size > ZERO_COPY_EAGER_PUT_MAX_SIZE {
+        return PUT_EAGER_STATUS_ABOVE_EAGER_MAX;
     }
 
     if !should_use_zero_copy(size, headers) {
-        return false;
+        return PUT_EAGER_STATUS_ZERO_COPY_INELIGIBLE;
     }
 
     if request_uses_aws_chunked(headers) && decoded_content_length_from_headers(headers).ok().flatten().is_none() {
-        return false;
+        return PUT_EAGER_STATUS_AWS_CHUNKED_MISSING_DECODED_LENGTH;
     }
 
-    true
+    PUT_EAGER_STATUS_ELIGIBLE
 }
 
 fn has_put_sse_request_headers(headers: &HeaderMap) -> bool {
@@ -2891,7 +2920,8 @@ impl DefaultObjectUsecase {
         // Buffer sizes range from 32KB to 4MB depending on file size and configured workload profile.
         // Concurrency-aware adjustment reduces buffer size under high PUT concurrency to lower memory pressure.
         let base_buffer_size = get_buffer_size_opt_in(size);
-        let buffer_size = if Self::should_use_large_put_concurrency_tuning(size) {
+        let use_large_put_concurrency_tuning = Self::should_use_large_put_concurrency_tuning(size);
+        let buffer_size = if use_large_put_concurrency_tuning {
             get_put_concurrency_aware_buffer_size(size, base_buffer_size)
         } else {
             base_buffer_size
@@ -2910,8 +2940,9 @@ impl DefaultObjectUsecase {
 
         let use_small_eager_put_path =
             should_use_small_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
-        let use_zero_copy_eager_put_path =
-            should_use_zero_copy_eager_put_path(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let zero_copy_eager_put_path_status =
+            zero_copy_eager_put_path_status(size, &req.headers, server_side_encryption_requested, should_compress, false);
+        let use_zero_copy_eager_put_path = zero_copy_eager_put_path_status == PUT_EAGER_STATUS_ELIGIBLE;
         if use_zero_copy_eager_put_path {
             counter!(buffered_write::ATTEMPTS_TOTAL).increment(1);
             histogram!(buffered_write::ATTEMPT_SIZE_BYTES).record(size as f64);
@@ -2925,6 +2956,13 @@ impl DefaultObjectUsecase {
         } else {
             "streaming"
         };
+        rustfs_io_metrics::record_put_object_diagnostics(
+            put_path,
+            zero_copy_eager_put_path_status,
+            size,
+            buffer_size,
+            use_large_put_concurrency_tuning,
+        );
 
         let store = get_validated_store(&bucket).await?;
 
@@ -6671,6 +6709,14 @@ mod tests {
         assert!(should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, false));
         assert!(should_use_zero_copy_eager_put_path(32 * 1024 * 1024, &headers, false, false, false));
         assert!(!should_use_zero_copy_eager_put_path(32 * 1024 * 1024 + 1, &headers, false, false, false));
+        assert_eq!(
+            zero_copy_eager_put_path_status(32 * 1024 * 1024, &headers, false, false, false),
+            PUT_EAGER_STATUS_ELIGIBLE
+        );
+        assert_eq!(
+            zero_copy_eager_put_path_status(32 * 1024 * 1024 + 1, &headers, false, false, false),
+            PUT_EAGER_STATUS_ABOVE_EAGER_MAX
+        );
     }
 
     #[test]
@@ -6680,6 +6726,18 @@ mod tests {
         assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, true, false, false));
         assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, true, false));
         assert!(!should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, true));
+        assert_eq!(
+            zero_copy_eager_put_path_status(2 * 1024 * 1024, &headers, true, false, false),
+            PUT_EAGER_STATUS_ENCRYPTED
+        );
+        assert_eq!(
+            zero_copy_eager_put_path_status(2 * 1024 * 1024, &headers, false, true, false),
+            PUT_EAGER_STATUS_COMPRESSED
+        );
+        assert_eq!(
+            zero_copy_eager_put_path_status(2 * 1024 * 1024, &headers, false, false, true),
+            PUT_EAGER_STATUS_EXTRACT
+        );
     }
 
     #[tokio::test]

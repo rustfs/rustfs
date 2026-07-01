@@ -1459,6 +1459,72 @@ pub fn record_put_object_path(path: &'static str) {
 }
 
 #[inline(always)]
+fn put_object_size_bucket(size_bytes: i64) -> &'static str {
+    const MI_B: i64 = 1024 * 1024;
+
+    match size_bytes {
+        i64::MIN..=0 => "unknown",
+        1..=MI_B => "le_1mib",
+        _ if size_bytes <= 10 * MI_B => "le_10mib",
+        _ if size_bytes <= 16 * MI_B => "le_16mib",
+        _ if size_bytes <= 32 * MI_B => "le_32mib",
+        _ if size_bytes <= 64 * MI_B => "le_64mib",
+        _ => "gt_64mib",
+    }
+}
+
+#[inline(always)]
+fn put_object_buffer_bucket(buffer_size: usize) -> &'static str {
+    const KI_B: usize = 1024;
+    const MI_B: usize = 1024 * 1024;
+
+    match buffer_size {
+        0..=65536 => "le_64kib",
+        _ if buffer_size <= 128 * KI_B => "le_128kib",
+        _ if buffer_size <= 256 * KI_B => "le_256kib",
+        _ if buffer_size <= 512 * KI_B => "le_512kib",
+        _ if buffer_size <= MI_B => "le_1mib",
+        _ => "gt_1mib",
+    }
+}
+
+#[inline(always)]
+fn bool_label(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+#[inline(always)]
+pub fn record_put_object_diagnostics(
+    path: &'static str,
+    eager_status: &'static str,
+    size_bytes: i64,
+    buffer_size: usize,
+    large_concurrency_tuning: bool,
+) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+
+    let size_bucket = put_object_size_bucket(size_bytes);
+    let buffer_bucket = put_object_buffer_bucket(buffer_size);
+    counter!(
+        "rustfs_s3_put_object_diagnostics_total",
+        "path" => path,
+        "eager_status" => eager_status,
+        "size_bucket" => size_bucket,
+        "buffer_bucket" => buffer_bucket,
+        "large_concurrency_tuning" => bool_label(large_concurrency_tuning),
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_s3_put_object_selected_buffer_size_bytes",
+        "path" => path,
+        "size_bucket" => size_bucket,
+    )
+    .record(buffer_size as f64);
+}
+
+#[inline(always)]
 pub fn record_put_object_stage_duration(stage: &'static str, duration_ms: f64) {
     if !put_stage_metrics_enabled() {
         return;
@@ -1977,7 +2043,20 @@ mod tests {
         record_put_object_path("write_inline");
         record_put_object_stage_duration("ingress_prepare", 12.5);
         record_put_object_stage_duration("set_disk_encode", 8.0);
+        record_put_object_diagnostics("zero_copy_eager", "eligible", 32 * 1024 * 1024, 256 * 1024, true);
+        assert!(put_stage_metrics_enabled());
         set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_put_object_diagnostic_buckets() {
+        assert_eq!(put_object_size_bucket(0), "unknown");
+        assert_eq!(put_object_size_bucket(10 * 1024 * 1024), "le_10mib");
+        assert_eq!(put_object_size_bucket(32 * 1024 * 1024), "le_32mib");
+        assert_eq!(put_object_size_bucket(32 * 1024 * 1024 + 1), "le_64mib");
+        assert_eq!(put_object_buffer_bucket(64 * 1024), "le_64kib");
+        assert_eq!(put_object_buffer_bucket(256 * 1024), "le_256kib");
+        assert_eq!(put_object_buffer_bucket(2 * 1024 * 1024), "gt_1mib");
     }
 
     #[test]
