@@ -200,6 +200,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
+REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_boundary_bypass_hits.txt"
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
 REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
@@ -2546,6 +2547,25 @@ fi
 
 if [[ -s "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE" ]]; then
   report_failure "replication config persistence must stay behind replication config store: $(paste -sd '; ' "$REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  find crates/ecstore/src/bucket/replication -type f -name '*.rs' -print0 |
+    xargs -0 perl -0ne '
+      while (/(?:crate::error::|use\s+crate::error\b|use\s+crate::\{[^;]*\berror\b)/sg) {
+        my $prefix = substr($_, 0, $-[0]);
+        my $line = ($prefix =~ tr/\n//) + 1;
+        my $match = $&;
+        $match =~ s/\s+/ /g;
+        print "$ARGV:$line:$match\n";
+      }
+    ' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_error_boundary\.rs:' || true
+) >"$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication error contracts must stay behind replication error boundary: $(paste -sd '; ' "$REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

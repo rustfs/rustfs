@@ -12,21 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::replication_error_boundary::Result;
-use super::replication_storage_boundary::ReplicationObjectIO;
-use crate::config::com;
-use std::sync::Arc;
-
-pub(crate) async fn read<S>(api: Arc<S>, file: &str) -> Result<Vec<u8>>
-where
-    S: ReplicationObjectIO,
-{
-    com::read_config(api, file).await
-}
-
-pub(crate) async fn save<S>(api: Arc<S>, file: &str, data: Vec<u8>) -> Result<()>
-where
-    S: ReplicationObjectIO,
-{
-    com::save_config(api, file, data).await
-}
+pub(crate) use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};

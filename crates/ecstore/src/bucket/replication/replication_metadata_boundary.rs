@@ -14,10 +14,11 @@
 
 use crate::bucket::metadata_sys;
 use crate::disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
-use crate::error::{Error, Result};
 use rustfs_utils::path::path_join_buf;
 use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
+
+use super::replication_error_boundary::{Error, Result};
 
 pub(crate) const REPLICATION_DIR: &str = ".replication";
 pub(crate) const RESYNC_FILE_NAME: &str = "resync.bin";

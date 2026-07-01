@@ -137,6 +137,10 @@ Required contracts before crate movement:
   `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`,
   while `FileInfo` remains in the storage boundary for storage trait bindings
   and walk options.
+- `ReplicationErrorBoundary`: ECStore error/result contracts and
+  replication-specific error classifiers. `crate::error` imports are
+  concentrated in
+  `crates/ecstore/src/bucket/replication/replication_error_boundary.rs`.
 - `ReplicationTargetStore`: bucket target listing, target client lookup,
   target offline checks, target config types, and target operation option
   types. Bucket target sys access, `BucketTargets`, and target operation types
