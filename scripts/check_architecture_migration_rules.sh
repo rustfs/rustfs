@@ -2543,7 +2543,7 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'pub\s+(?:struct|enum)\s+(ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)\b' \
+  rg -n --with-filename 'pub\s+(struct|enum)\s+(ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' || true
 ) >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE"
