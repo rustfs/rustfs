@@ -200,6 +200,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
+REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
@@ -2543,13 +2544,24 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'pub\s+(?:struct|enum)\s+(ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)\b' \
+  rg -n --with-filename 'pub\s+(struct|enum)\s+(ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' || true
 ) >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE"
 
 if [[ -s "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "resync DTO contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rmp_serde::(to_vec_named|from_slice)|LittleEndian::(write_u16|read_u16)|const\s+MRF_META_(FORMAT|VERSION):\s+u16\s*=\s*1\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' || true
+) >"$REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE"
+
+if [[ -s "$REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "MRF wire format must stay in crates/replication with only ECStore error-mapping wrappers: $(paste -sd '; ' "$REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE")"
 fi
 
 (

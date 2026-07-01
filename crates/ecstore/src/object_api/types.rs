@@ -747,6 +747,18 @@ impl ObjectInfo {
         }
     }
 
+    pub fn target_replication_status(&self, arn: &str) -> ReplicationStatusType {
+        self.replication_status_internal
+            .as_deref()
+            .unwrap_or_default()
+            .split(';')
+            .find_map(|entry| {
+                let (target_arn, status) = entry.split_once('=')?;
+                (!target_arn.is_empty() && target_arn == arn).then(|| ReplicationStatusType::from(status))
+            })
+            .unwrap_or_default()
+    }
+
     pub fn decrypt_checksums(&self, part: usize, _headers: &HeaderMap) -> Result<(HashMap<String, String>, bool)> {
         if part > 0
             && let Some(checksums) = self.parts.iter().find(|p| p.number == part).and_then(|p| p.checksums.clone())
@@ -821,6 +833,26 @@ mod tests {
         let state = opts.put_replication_state();
 
         assert_eq!(state.composite_replication_status(), ReplicationStatusType::Replica);
+    }
+
+    #[test]
+    fn object_info_replication_helpers_parse_target_status_and_reset_headers() {
+        let reset_key = rustfs_utils::http::internal_key_rustfs("replication-reset-arn:target-a");
+        let object = ObjectInfo {
+            replication_status_internal: Some("arn:target-a=COMPLETED;arn:target-b=FAILED;".to_string()),
+            version_purge_status_internal: Some("arn:target-a=PENDING;".to_string()),
+            user_defined: Arc::new(HashMap::from([(reset_key, "reset-id".to_string())])),
+            ..Default::default()
+        };
+
+        let state = object.replication_state();
+
+        assert_eq!(object.target_replication_status("arn:target-a"), ReplicationStatusType::Completed);
+        assert_eq!(object.target_replication_status("arn:target-b"), ReplicationStatusType::Failed);
+        assert_eq!(object.target_replication_status("arn:missing"), ReplicationStatusType::Empty);
+        assert_eq!(state.targets.get("arn:target-b"), Some(&ReplicationStatusType::Failed));
+        assert_eq!(state.purge_targets.get("arn:target-a"), Some(&VersionPurgeStatusType::Pending));
+        assert_eq!(state.reset_statuses_map.get("arn:target-a"), Some(&"reset-id".to_string()));
     }
 
     #[test]
