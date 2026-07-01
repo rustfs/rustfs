@@ -46,6 +46,7 @@ SERVICE_METRICS_CAPTURE_ATTEMPTS=3
 SERVICE_METRICS_CAPTURE_RETRY_SECS=1
 SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
 SERVICE_METRICS_MAX_TIME_SECS=15
+SERVICE_METRICS_SETTLE_SECS=0
 SERVICE_METRICS_FILTER_REGEX=""
 SERVICE_METRICS_FILTER_REGEX_EXPLICIT=false
 SERVICE_PROMETHEUS_QUERY_URL=""
@@ -108,6 +109,8 @@ Enhanced options:
                                Curl connect timeout for each metrics capture (default: 2)
   --service-metrics-max-time-secs
                                Curl max time for each metrics capture (default: 15)
+  --service-metrics-settle-secs
+                               Sleep seconds before after-snapshot capture (default: 0)
   --service-metrics-filter-regex
                                Regex for retained metrics lines after scrape
                                (default: auto by tool/mode)
@@ -180,6 +183,7 @@ parse_args() {
       --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
       --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
       --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
+      --service-metrics-settle-secs) SERVICE_METRICS_SETTLE_SECS="$2"; shift 2 ;;
       --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; SERVICE_METRICS_FILTER_REGEX_EXPLICIT=true; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
@@ -286,6 +290,7 @@ validate_args() {
   validate_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" "--service-metrics-retry-secs"
   validate_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" "--service-metrics-connect-timeout-secs"
   validate_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" "--service-metrics-max-time-secs"
+  validate_nonnegative_int "$SERVICE_METRICS_SETTLE_SECS" "--service-metrics-settle-secs"
   if [[ -n "$SERVICE_METRICS_URL" && -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
     exit 1
@@ -399,6 +404,7 @@ service_metrics_capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
 service_metrics_retry_secs=${SERVICE_METRICS_CAPTURE_RETRY_SECS}
 service_metrics_connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+service_metrics_settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 dry_run=${DRY_RUN}
 EOF
 }
@@ -574,19 +580,30 @@ filter_service_metrics_snapshot() {
   fi
 }
 
+settle_before_after_metrics_capture() {
+  if (( SERVICE_METRICS_SETTLE_SECS <= 0 )); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY-RUN] sleep ${SERVICE_METRICS_SETTLE_SECS}"
+  else
+    sleep "$SERVICE_METRICS_SETTLE_SECS"
+  fi
+}
+
 capture_prometheus_query_snapshot() {
   local phase="$1"
   local snapshot_file="$2"
   local status_file="$3"
 
-  "$PYTHON_BIN" - "$SERVICE_PROMETHEUS_QUERY_URL" "$SERVICE_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$SERVICE_METRICS_SERVICE_NAME" <<'PY'
+  "$PYTHON_BIN" - "$SERVICE_PROMETHEUS_QUERY_URL" "$SERVICE_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$SERVICE_METRICS_SERVICE_NAME" "$SERVICE_METRICS_SETTLE_SECS" <<'PY'
 import json
 import pathlib
 import sys
 import urllib.parse
 import urllib.request
 
-query_url, query, phase, snapshot_raw, status_raw, service_name = sys.argv[1:]
+query_url, query, phase, snapshot_raw, status_raw, service_name, settle_secs = sys.argv[1:]
 snapshot_path = pathlib.Path(snapshot_raw)
 status_path = pathlib.Path(status_raw)
 
@@ -600,6 +617,7 @@ def write_status(status):
                 f"url={query_url}",
                 f"query={query}",
                 f"service_name={service_name}",
+                f"settle_secs={settle_secs}",
                 "",
             ]
         ),
@@ -688,6 +706,7 @@ url=${SERVICE_METRICS_URL}
 prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 prometheus_query=${SERVICE_PROMETHEUS_QUERY}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
     echo "$size,$TOOL,$round,$attempt,$phase,dry_run,not_run_dry_run,0,0,0,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
     return 0
@@ -724,6 +743,7 @@ max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 raw_bytes=${raw_bytes}
 snapshot_bytes=${snapshot_bytes}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
         echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
         return 0
@@ -748,6 +768,7 @@ url=${SERVICE_METRICS_URL}
 connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
   echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
   echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
@@ -855,6 +876,7 @@ run_one_attempt() {
     fi
   fi
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  settle_before_after_metrics_capture
   capture_round_service_metrics "$size" "$round" "$attempt" after
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms

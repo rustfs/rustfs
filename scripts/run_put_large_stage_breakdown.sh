@@ -41,6 +41,7 @@ SERVICE_METRICS_CAPTURE_ATTEMPTS=3
 SERVICE_METRICS_CAPTURE_RETRY_SECS=1
 SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
 SERVICE_METRICS_MAX_TIME_SECS=15
+SERVICE_METRICS_SETTLE_SECS=0
 
 TOPOLOGY_NODES=""
 TOPOLOGY_DISKS_PER_NODE=""
@@ -94,6 +95,7 @@ Core options:
   --service-metrics-connect-timeout-secs <n>
                                       Curl connect timeout for direct scrape (default: 2)
   --service-metrics-max-time-secs <n> Curl max time for direct scrape (default: 15)
+  --service-metrics-settle-secs <n>   Sleep before after-snapshot capture (default: 0)
 
 Topology metadata (optional but recommended):
   --nodes <n>
@@ -180,6 +182,7 @@ parse_args() {
       --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --service-metrics-settle-secs) SERVICE_METRICS_SETTLE_SECS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --nodes) TOPOLOGY_NODES="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --disks-per-node) TOPOLOGY_DISKS_PER_NODE="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --total-disks) TOPOLOGY_TOTAL_DISKS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
@@ -243,8 +246,8 @@ validate_args() {
     echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
     exit 1
   fi
-  if ! is_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" || ! is_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" || ! is_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" || ! is_positive_int "$SERVICE_METRICS_MAX_TIME_SECS"; then
-    echo "ERROR: service metrics attempt/timeout options must be valid integers" >&2
+  if ! is_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" || ! is_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" || ! is_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" || ! is_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" || ! is_nonnegative_int "$SERVICE_METRICS_SETTLE_SECS"; then
+    echo "ERROR: service metrics attempt/timeout/settle options must be valid integers" >&2
     exit 1
   fi
 }
@@ -317,6 +320,7 @@ write_manifest() {
     echo "service_metrics_retry_secs=${SERVICE_METRICS_CAPTURE_RETRY_SECS}"
     echo "service_metrics_connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}"
     echo "service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}"
+    echo "service_metrics_settle_secs=${SERVICE_METRICS_SETTLE_SECS}"
     echo "workload_label=${WORKLOAD_LABEL}"
     echo "nodes=${TOPOLOGY_NODES:-N/A}"
     echo "disks_per_node=${TOPOLOGY_DISKS_PER_NODE:-N/A}"
@@ -477,6 +481,7 @@ run_concurrency() {
     --service-metrics-retry-secs "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
     --service-metrics-connect-timeout-secs "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS"
     --service-metrics-max-time-secs "$SERVICE_METRICS_MAX_TIME_SECS"
+    --service-metrics-settle-secs "$SERVICE_METRICS_SETTLE_SECS"
   )
   if [[ "$DRY_RUN" == "true" ]]; then
     cmd+=(--dry-run)
