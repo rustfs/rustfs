@@ -158,7 +158,7 @@ use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 const DEFAULT_PUT_LARGE_CONCURRENCY_TUNING_MIN_SIZE_BYTES: i64 = 32 * 1024 * 1024;
 const ENV_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: &str = "RUSTFS_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES";
-const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 32 * 1024 * 1024;
+const DEFAULT_ZERO_COPY_EAGER_PUT_MAX_SIZE_BYTES: usize = 16 * 1024 * 1024;
 const PUT_EAGER_STATUS_ELIGIBLE: &str = "eligible";
 const PUT_EAGER_STATUS_EXTRACT: &str = "extract";
 const PUT_EAGER_STATUS_COMPRESSED: &str = "compressed";
@@ -6683,14 +6683,14 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert!(should_use_zero_copy_eager_put_path(2 * 1024 * 1024, &headers, false, false, false));
-        assert!(should_use_zero_copy_eager_put_path(32 * 1024 * 1024, &headers, false, false, false));
-        assert!(!should_use_zero_copy_eager_put_path(32 * 1024 * 1024 + 1, &headers, false, false, false));
+        assert!(should_use_zero_copy_eager_put_path(16 * 1024 * 1024, &headers, false, false, false));
+        assert!(!should_use_zero_copy_eager_put_path(16 * 1024 * 1024 + 1, &headers, false, false, false));
         assert_eq!(
-            zero_copy_eager_put_path_status(32 * 1024 * 1024, &headers, false, false, false),
+            zero_copy_eager_put_path_status(16 * 1024 * 1024, &headers, false, false, false),
             PUT_EAGER_STATUS_ELIGIBLE
         );
         assert_eq!(
-            zero_copy_eager_put_path_status(32 * 1024 * 1024 + 1, &headers, false, false, false),
+            zero_copy_eager_put_path_status(16 * 1024 * 1024 + 1, &headers, false, false, false),
             PUT_EAGER_STATUS_ABOVE_EAGER_MAX
         );
     }
