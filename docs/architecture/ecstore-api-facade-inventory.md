@@ -20,7 +20,7 @@ External `rustfs_ecstore::api` imports must stay in these local boundary files:
 
 | Boundary file | Current facade families |
 |---|---|
-| `rustfs/src/storage/storage_api.rs` | Broad RustFS storage owner bridge for admin, bucket, capacity, client, compression, cluster, config, data usage, disk, error, event, global bootstrap controls, runtime-source getters, layout, metrics, notification, rebalance, rio, rpc, set disk, storage, and tier. |
+| `rustfs/src/storage/storage_api.rs` | Broad RustFS storage owner bridge for admin, bucket, capacity, client, compression, cluster, config, data usage, disk, error, event, global bootstrap controls, runtime-source getters, layout, metrics, notification, rebalance, rio, rpc, set disk, storage, and tier. Replication pool/stat handles are projected into RustFS-local wrapper types here. |
 | `crates/scanner/src/storage_api.rs` | Scanner bridge for bucket lifecycle, replication, metadata, capacity, config, data usage, disk, error, runtime, set disk, storage, and tier. Replication queue config, admission, and heal object DTOs are projected into scanner-local types here. |
 | `crates/obs/src/metrics/storage_api.rs` | Metrics bridge for bucket bandwidth, lifecycle, replication, quota, capacity, data usage, error, runtime, and storage. |
 | `crates/iam/src/storage_api.rs` | IAM bridge for config, error, notification, runtime, and storage. |
