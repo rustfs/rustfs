@@ -120,6 +120,9 @@ Current coupling:
 - bucket metadata migration and bucket target removal checks use local
   replication bridges instead of importing resyncer codec or config helper
   internals;
+- admin replication extension target filtering and resync request construction
+  stay behind the admin storage boundary instead of exposing replication work
+  DTO construction to handlers;
 - global replication pool/stat initialization still lives with ECStore runtime
   compatibility state;
 - modules inside `bucket/replication` use local relative paths rather than the
