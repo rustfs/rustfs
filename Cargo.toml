@@ -202,7 +202,7 @@ zeroize = { version = "1.9.0", features = ["derive"] }
 chrono = { version = "0.4.45", features = ["serde"] }
 humantime = "2.3.0"
 jiff = { version = "0.2.31", features = ["serde"] }
-time = { version = "0.3.52", features = ["std", "parsing", "formatting", "macros", "serde"] }
+time = { version = "0.3.53", features = ["std", "parsing", "formatting", "macros", "serde"] }
 
 # Database
 deadpool-postgres = { version = "0.14", features = ["rt_tokio_1"] }
@@ -305,7 +305,7 @@ vaultrs = { version = "0.8.0" }
 walkdir = "2.5.0"
 wildmatch = { version = "2.6.1", features = ["serde"] }
 windows = { version = "0.62.2" }
-xxhash-rust = { version = "0.8.15", features = ["xxh64", "xxh3"] }
+xxhash-rust = { version = "0.8.16", features = ["xxh64", "xxh3"] }
 zip = "8.6.0"
 zstd = "0.13.3"
 
