@@ -189,8 +189,8 @@ fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
 
 fn map_replication_error(err: rustfs_replication::Error) -> Error {
     match err {
-        rustfs_replication::resync::Error::CorruptedFormat => Error::CorruptedFormat,
-        rustfs_replication::resync::Error::Other(err) => Error::other(err),
+        rustfs_replication::Error::CorruptedFormat => Error::CorruptedFormat,
+        rustfs_replication::Error::Other(err) => Error::other(err),
     }
 }
 
