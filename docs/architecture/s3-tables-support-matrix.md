@@ -87,6 +87,7 @@ catalog extension.
 | Snapshot expiration commit | Preview / controlled | Can manually commit safe snapshot expiration through the catalog. Stale plans fail closed. |
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
 | Maintenance worker run endpoint | Preview / controlled | Supports run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
+| Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
 | Compaction planning | Preview / controlled | Plans partition-local binpack candidates for Parquet files and does not mix data files from different partition directories in one rewrite group. |
 | Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog. |
 | Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
@@ -158,7 +159,7 @@ RustFS does not currently claim:
 - full MinIO AIStor Tables private extension parity
 - full Cloudflare R2 Data Catalog interoperability
 - full Alibaba OSS Tables interoperability
-- built-in periodic maintenance scheduling
+- built-in periodic maintenance scheduling; external schedulers can inspect scheduler guardrails, but RustFS does not claim a continuous in-process scheduler
 - active-active multi-region table writes
 - multi-table transactions
 - no-long-term-data-credential table bootstrap
