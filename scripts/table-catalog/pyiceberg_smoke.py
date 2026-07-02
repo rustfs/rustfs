@@ -201,7 +201,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "compaction-rewrite",
         "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local and sort-order-preserving Parquet rewrite through the catalog; built-in periodic scheduling, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
         "capability": "row-level-delete-update-merge",
