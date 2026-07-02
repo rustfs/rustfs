@@ -22,7 +22,7 @@ use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
 };
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use rustfs_utils::get_env_opt_str;
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize};
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
 use std::io::{self, Error};
@@ -212,19 +212,187 @@ fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[
 #[derive(Clone)]
 struct CachedClients {
     generation: u64,
+    tuning: InternodeHttpClientTuning,
     client: Client,
-    local_client: Client,
+    no_proxy_client: Client,
 }
 
 static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
 
-async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> Client {
+const INTERNODE_HTTP_PROFILE_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROFILE_BALANCED: &str = "balanced";
+const INTERNODE_HTTP_PROFILE_THROUGHPUT: &str = "throughput";
+const INTERNODE_HTTP_PROXY_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROXY_OFF: &str = "off";
+const INTERNODE_HTTP_PROXY_SYSTEM: &str = "system";
+const INTERNODE_HTTP2_WINDOW_MIN: u32 = 65_535;
+const INTERNODE_HTTP2_WINDOW_MAX: u32 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpTuningProfile {
+    Legacy,
+    Balanced,
+    Throughput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpProxyMode {
+    Legacy,
+    NoProxy,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InternodeHttpClientTuning {
+    profile: InternodeHttpTuningProfile,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout_secs: Option<u64>,
+    http2_initial_stream_window_size: Option<u32>,
+    http2_initial_connection_window_size: Option<u32>,
+    http2_adaptive_window: bool,
+    proxy_mode: InternodeHttpProxyMode,
+}
+
+impl InternodeHttpClientTuning {
+    fn from_env() -> Self {
+        let profile =
+            parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
+        Self::from_values(
+            profile,
+            get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE),
+            get_env_bool(
+                rustfs_config::ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW,
+                profile.default_http2_adaptive_window(),
+            ),
+            get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
+        )
+    }
+
+    fn from_values(
+        profile: InternodeHttpTuningProfile,
+        pool_max_idle_per_host: Option<usize>,
+        pool_idle_timeout_secs: Option<u64>,
+        stream_window_size: Option<u64>,
+        connection_window_size: Option<u64>,
+        http2_adaptive_window: bool,
+        proxy_mode: Option<&str>,
+    ) -> Self {
+        Self {
+            profile,
+            pool_max_idle_per_host: pool_max_idle_per_host.or_else(|| profile.default_pool_max_idle_per_host()),
+            pool_idle_timeout_secs: pool_idle_timeout_secs.or_else(|| profile.default_pool_idle_timeout_secs()),
+            http2_initial_stream_window_size: clamp_http2_window(
+                stream_window_size.or_else(|| profile.default_stream_window_size()),
+            ),
+            http2_initial_connection_window_size: clamp_http2_window(
+                connection_window_size.or_else(|| profile.default_connection_window_size()),
+            ),
+            http2_adaptive_window,
+            proxy_mode: parse_internode_http_proxy_mode(proxy_mode, profile),
+        }
+    }
+}
+
+impl InternodeHttpTuningProfile {
+    fn default_pool_max_idle_per_host(self) -> Option<usize> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(64),
+            Self::Throughput => Some(256),
+        }
+    }
+
+    fn default_pool_idle_timeout_secs(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(120),
+            Self::Throughput => Some(300),
+        }
+    }
+
+    fn default_stream_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(1024 * 1024),
+            Self::Throughput => Some(4 * 1024 * 1024),
+        }
+    }
+
+    fn default_connection_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(4 * 1024 * 1024),
+            Self::Throughput => Some(16 * 1024 * 1024),
+        }
+    }
+
+    fn default_http2_adaptive_window(self) -> bool {
+        matches!(self, Self::Throughput)
+    }
+}
+
+fn parse_internode_http_tuning_profile(value: Option<&str>) -> InternodeHttpTuningProfile {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROFILE_LEGACY => InternodeHttpTuningProfile::Legacy,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_BALANCED => InternodeHttpTuningProfile::Balanced,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_THROUGHPUT => InternodeHttpTuningProfile::Throughput,
+        _ => InternodeHttpTuningProfile::Legacy,
+    }
+}
+
+fn parse_internode_http_proxy_mode(value: Option<&str>, profile: InternodeHttpTuningProfile) -> InternodeHttpProxyMode {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROXY_SYSTEM => InternodeHttpProxyMode::System,
+        Some(value) if value == INTERNODE_HTTP_PROXY_LEGACY => InternodeHttpProxyMode::Legacy,
+        Some(value) if matches!(value.as_str(), INTERNODE_HTTP_PROXY_OFF | "none" | "no_proxy" | "disabled") => {
+            InternodeHttpProxyMode::NoProxy
+        }
+        Some(_) | None if matches!(profile, InternodeHttpTuningProfile::Legacy) => InternodeHttpProxyMode::Legacy,
+        Some(_) | None => InternodeHttpProxyMode::NoProxy,
+    }
+}
+
+fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
+    let value = value?;
+    let value = value.clamp(u64::from(INTERNODE_HTTP2_WINDOW_MIN), u64::from(INTERNODE_HTTP2_WINDOW_MAX));
+    u32::try_from(value).ok()
+}
+
+fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
+    if let Some(pool_max_idle_per_host) = tuning.pool_max_idle_per_host {
+        builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
+    }
+    if let Some(pool_idle_timeout_secs) = tuning.pool_idle_timeout_secs {
+        builder = builder.pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs));
+    }
+    if tuning.http2_adaptive_window {
+        builder = builder.http2_adaptive_window(true);
+    } else {
+        if let Some(stream_window_size) = tuning.http2_initial_stream_window_size {
+            builder = builder.http2_initial_stream_window_size(stream_window_size);
+        }
+        if let Some(connection_window_size) = tuning.http2_initial_connection_window_size {
+            builder = builder.http2_initial_connection_window_size(connection_window_size);
+        }
+    }
+    builder
+}
+
+async fn build_http_client(
+    disable_proxy: bool,
+    tuning: InternodeHttpClientTuning,
+    outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
+) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_keepalive(std::time::Duration::from_secs(10))
         .http2_keep_alive_interval(std::time::Duration::from_secs(5))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
         .http2_keep_alive_while_idle(true);
+    builder = apply_http_client_tuning(builder, tuning);
 
     if disable_proxy {
         builder = builder.no_proxy();
@@ -292,10 +460,19 @@ fn should_bypass_proxy_for_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
+fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) -> bool {
+    match tuning.proxy_mode {
+        InternodeHttpProxyMode::System => false,
+        InternodeHttpProxyMode::NoProxy => true,
+        InternodeHttpProxyMode::Legacy => should_bypass_proxy_for_url(url),
+    }
+}
+
 async fn get_http_client(url: &str) -> Client {
-    // Reuse HTTP connection pools while keeping loopback traffic away from
-    // system proxies so local RPC/tests do not leak to proxy listeners.
-    let disable_proxy = should_bypass_proxy_for_url(url);
+    let tuning = InternodeHttpClientTuning::from_env();
+    // Reuse HTTP connection pools while honoring the configured internode proxy
+    // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
+    let disable_proxy = should_disable_proxy_for_url(url, tuning);
 
     // Fast path: check generation first (cheap atomic read) to avoid cloning
     // the full PEM + identity bytes when the TLS state hasn't changed.
@@ -303,9 +480,9 @@ async fn get_http_client(url: &str) -> Client {
 
     let guard = CLIENT_CACHE.lock().await;
     if let Some(cached) = guard.as_ref() {
-        if cached.generation == generation {
+        if cached.generation == generation && cached.tuning == tuning {
             return if disable_proxy {
-                cached.local_client.clone()
+                cached.no_proxy_client.clone()
             } else {
                 cached.client.clone()
             };
@@ -317,16 +494,17 @@ async fn get_http_client(url: &str) -> Client {
     // Cache miss or stale generation — load full outbound TLS state.
     let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
-    let client = build_http_client(false, &outbound_tls).await;
-    let local_client = build_http_client(true, &outbound_tls).await;
+    let client = build_http_client(false, tuning, &outbound_tls).await;
+    let no_proxy_client = build_http_client(true, tuning, &outbound_tls).await;
     let cached = CachedClients {
         generation,
+        tuning,
         client,
-        local_client,
+        no_proxy_client,
     };
 
     let return_client = if disable_proxy {
-        cached.local_client.clone()
+        cached.no_proxy_client.clone()
     } else {
         cached.client.clone()
     };
@@ -1320,5 +1498,127 @@ mod tests {
         assert!(!should_bypass_proxy_for_url("http://192.168.1.10:9000/stream"));
         assert!(!should_bypass_proxy_for_url("http://example.com/stream"));
         assert!(!should_bypass_proxy_for_url("not-a-url"));
+    }
+
+    #[test]
+    fn internode_http_tuning_profile_parses_known_values_and_falls_back_to_legacy() {
+        assert_eq!(parse_internode_http_tuning_profile(None), InternodeHttpTuningProfile::Legacy);
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("balanced")),
+            InternodeHttpTuningProfile::Balanced
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some(" THROUGHput ")),
+            InternodeHttpTuningProfile::Throughput
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("aggressive")),
+            InternodeHttpTuningProfile::Legacy
+        );
+    }
+
+    #[test]
+    fn legacy_internode_http_tuning_keeps_existing_defaults() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Legacy.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, None);
+        assert_eq!(tuning.pool_idle_timeout_secs, None);
+        assert_eq!(tuning.http2_initial_stream_window_size, None);
+        assert_eq!(tuning.http2_initial_connection_window_size, None);
+        assert!(!tuning.http2_adaptive_window);
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::Legacy);
+    }
+
+    #[test]
+    fn balanced_and_throughput_profiles_apply_conservative_defaults() {
+        let balanced = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Balanced.default_http2_adaptive_window(),
+            None,
+        );
+        let throughput = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Throughput.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(balanced.pool_max_idle_per_host, Some(64));
+        assert_eq!(balanced.pool_idle_timeout_secs, Some(120));
+        assert_eq!(balanced.http2_initial_stream_window_size, Some(1024 * 1024));
+        assert_eq!(balanced.http2_initial_connection_window_size, Some(4 * 1024 * 1024));
+        assert!(!balanced.http2_adaptive_window);
+        assert_eq!(balanced.proxy_mode, InternodeHttpProxyMode::NoProxy);
+
+        assert_eq!(throughput.pool_max_idle_per_host, Some(256));
+        assert_eq!(throughput.pool_idle_timeout_secs, Some(300));
+        assert!(throughput.http2_adaptive_window);
+        assert_eq!(throughput.proxy_mode, InternodeHttpProxyMode::NoProxy);
+    }
+
+    #[test]
+    fn internode_http_tuning_overrides_are_clamped() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            Some(8),
+            Some(30),
+            Some(1),
+            Some(u64::MAX),
+            false,
+            Some("system"),
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, Some(8));
+        assert_eq!(tuning.pool_idle_timeout_secs, Some(30));
+        assert_eq!(tuning.http2_initial_stream_window_size, Some(INTERNODE_HTTP2_WINDOW_MIN));
+        assert_eq!(tuning.http2_initial_connection_window_size, Some(INTERNODE_HTTP2_WINDOW_MAX));
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::System);
+    }
+
+    #[test]
+    fn internode_http_proxy_policy_matches_profile_and_overrides() {
+        let legacy =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Legacy, None, None, None, None, false, None);
+        let balanced =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Balanced, None, None, None, None, false, None);
+        let system_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("system"),
+        );
+        let no_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("off"),
+        );
+
+        assert!(should_disable_proxy_for_url("http://127.0.0.1:9000/stream", legacy));
+        assert!(!should_disable_proxy_for_url("http://192.168.1.10:9000/stream", legacy));
+        assert!(should_disable_proxy_for_url("http://192.168.1.10:9000/stream", balanced));
+        assert!(!should_disable_proxy_for_url("http://127.0.0.1:9000/stream", system_proxy));
+        assert!(should_disable_proxy_for_url("http://example.com/stream", no_proxy));
     }
 }
