@@ -3544,6 +3544,76 @@ mod tests {
     }
 
     #[test]
+    fn version_header_sorts_before_prefers_object_over_delete_marker_on_equal_mod_time() {
+        let object = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(sample_mod_time()),
+            version_type: VersionType::Object,
+            ..Default::default()
+        };
+        let delete_marker = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(2)),
+            version_type: VersionType::Delete,
+            ..object
+        };
+
+        // With equal mod_time the tie is broken by "prefer lower types":
+        // Object (1) sorts before Delete (2), regardless of version_id.
+        assert!(object.sorts_before(&delete_marker));
+        assert!(!delete_marker.sorts_before(&object));
+    }
+
+    #[test]
+    fn version_header_sorts_before_equal_mod_time_is_deterministic_and_antisymmetric() {
+        let a = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(1)),
+            mod_time: Some(sample_mod_time()),
+            version_type: VersionType::Object,
+            ..Default::default()
+        };
+        let b = FileMetaVersionHeader {
+            version_id: Some(Uuid::from_u128(2)),
+            ..a.clone()
+        };
+
+        // Equal mod_time and version_type: the higher version_id sorts first,
+        // and exactly one of the two orderings holds so merge sees a stable
+        // total order for distinct headers.
+        assert!(b.sorts_before(&a));
+        assert!(!a.sorts_before(&b));
+        assert_ne!(a.sorts_before(&b), b.sorts_before(&a));
+
+        // A header never sorts before an identical header.
+        assert!(!a.sorts_before(&a.clone()));
+    }
+
+    #[test]
+    fn merge_file_meta_versions_survives_garbage_header_stream() {
+        let valid = FileMetaShallowVersion {
+            header: sample_header(),
+            meta: Vec::new(),
+        };
+        let garbage = FileMetaShallowVersion {
+            header: FileMetaVersionHeader {
+                version_id: None,
+                mod_time: None,
+                signature: [0xde, 0xad, 0xbe, 0xef],
+                version_type: VersionType::Invalid,
+                flags: 0xff,
+                ec_n: 0,
+                ec_m: 0,
+            },
+            meta: b"not-a-valid-msgpack-version".to_vec(),
+        };
+
+        // One disk returns a garbage header alongside two healthy streams:
+        // merge must not panic and must still return the quorum version.
+        let merged = merge_file_meta_versions(2, true, 0, &[vec![valid.clone()], vec![valid.clone()], vec![garbage]]);
+
+        assert_eq!(merged, vec![valid]);
+    }
+
+    #[test]
     fn meta_object_init_free_version_rejects_invalid_tier_free_version_id() {
         let mut sys = HashMap::new();
         insert_bytes(&mut sys, SUFFIX_TRANSITION_STATUS, TRANSITION_COMPLETE.as_bytes().to_vec());

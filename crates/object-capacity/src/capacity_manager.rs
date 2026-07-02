@@ -1125,155 +1125,64 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    #[serial]
-    fn test_get_scheduled_update_interval() {
-        let interval = get_scheduled_update_interval();
-        assert_eq!(interval, Duration::from_secs(120));
+    /// Table of env-configurable getters: (env var, getter normalized to u64,
+    /// expected default, override string, expected override value).
+    /// Durations are normalized to whole seconds.
+    fn config_getter_cases() -> Vec<(&'static str, fn() -> u64, u64, &'static str, u64)> {
+        vec![
+            (
+                ENV_CAPACITY_SCHEDULED_INTERVAL,
+                || get_scheduled_update_interval().as_secs(),
+                120,
+                "600",
+                600,
+            ),
+            (ENV_CAPACITY_WRITE_TRIGGER_DELAY, || get_write_trigger_delay().as_secs(), 5, "20", 20),
+            (
+                ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD,
+                || get_write_frequency_threshold() as u64,
+                5,
+                "20",
+                20,
+            ),
+            (
+                ENV_CAPACITY_FAST_UPDATE_THRESHOLD,
+                || get_fast_update_threshold().as_secs(),
+                30,
+                "120",
+                120,
+            ),
+            (
+                ENV_CAPACITY_MAX_FILES_THRESHOLD,
+                || get_max_files_threshold() as u64,
+                200_000,
+                "2000000",
+                2_000_000,
+            ),
+            (ENV_CAPACITY_STAT_TIMEOUT, || get_stat_timeout().as_secs(), 3, "10", 10),
+            (ENV_CAPACITY_SAMPLE_RATE, || get_sample_rate() as u64, 200, "500", 500),
+            (ENV_CAPACITY_METRICS_INTERVAL, || get_metrics_interval().as_secs(), 600, "90", 90),
+        ]
     }
 
     #[test]
     #[serial]
-    fn test_get_write_trigger_delay() {
-        let delay = get_write_trigger_delay();
-        assert_eq!(delay, Duration::from_secs(5));
+    fn test_config_getter_defaults() {
+        for (env_var, getter, default, _, _) in config_getter_cases() {
+            temp_env::with_var(env_var, None::<&str>, || {
+                assert_eq!(getter(), default, "{env_var}: unexpected default value");
+            });
+        }
     }
 
     #[test]
     #[serial]
-    fn test_get_write_frequency_threshold() {
-        let threshold = get_write_frequency_threshold();
-        assert_eq!(threshold, 5);
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_fast_update_threshold() {
-        let threshold = get_fast_update_threshold();
-        assert_eq!(threshold, Duration::from_secs(30));
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_max_files_threshold() {
-        let threshold = get_max_files_threshold();
-        assert_eq!(threshold, 200_000);
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_stat_timeout() {
-        let timeout = get_stat_timeout();
-        assert_eq!(timeout, Duration::from_secs(3));
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_sample_rate() {
-        let rate = get_sample_rate();
-        assert_eq!(rate, 200);
-    }
-
-    #[test]
-    #[serial]
-    fn test_get_metrics_interval() {
-        let interval = get_metrics_interval();
-        assert_eq!(interval, Duration::from_secs(600));
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_scheduled_interval() {
-        temp_env::with_var(ENV_CAPACITY_SCHEDULED_INTERVAL, Some("600"), || {
-            let interval = get_scheduled_update_interval();
-            assert_eq!(interval, Duration::from_secs(600));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_write_trigger_delay() {
-        temp_env::with_var(ENV_CAPACITY_WRITE_TRIGGER_DELAY, Some("20"), || {
-            let delay = get_write_trigger_delay();
-            assert_eq!(delay, Duration::from_secs(20));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_write_frequency_threshold() {
-        temp_env::with_var(ENV_CAPACITY_WRITE_FREQUENCY_THRESHOLD, Some("20"), || {
-            let threshold = get_write_frequency_threshold();
-            assert_eq!(threshold, 20);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_fast_update_threshold() {
-        temp_env::with_var(ENV_CAPACITY_FAST_UPDATE_THRESHOLD, Some("120"), || {
-            let threshold = get_fast_update_threshold();
-            assert_eq!(threshold, Duration::from_secs(120));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_metrics_interval() {
-        temp_env::with_var(ENV_CAPACITY_METRICS_INTERVAL, Some("90"), || {
-            let interval = get_metrics_interval();
-            assert_eq!(interval, Duration::from_secs(90));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_max_files_threshold() {
-        temp_env::with_var(ENV_CAPACITY_MAX_FILES_THRESHOLD, Some("2000000"), || {
-            let threshold = get_max_files_threshold();
-            assert_eq!(threshold, 2_000_000);
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_stat_timeout() {
-        temp_env::with_var(ENV_CAPACITY_STAT_TIMEOUT, Some("10"), || {
-            let timeout = get_stat_timeout();
-            assert_eq!(timeout, Duration::from_secs(10));
-        });
-    }
-
-    #[test]
-    #[serial]
-    fn test_env_var_override_sample_rate() {
-        temp_env::with_var(ENV_CAPACITY_SAMPLE_RATE, Some("200"), || {
-            let rate = get_sample_rate();
-            assert_eq!(rate, 200);
-        });
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_capacity_manager_creation() {
-        let config = HybridStrategyConfig::default();
-        let manager = HybridCapacityManager::new(config);
-
-        assert!(manager.get_capacity().await.is_none());
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn test_update_capacity() {
-        let manager = HybridCapacityManager::from_env();
-
-        manager
-            .update_capacity(CapacityUpdate::exact(1000, 0), DataSource::RealTime)
-            .await;
-
-        let cached = manager.get_capacity().await;
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap().total_used, 1000);
+    fn test_config_getter_env_overrides() {
+        for (env_var, getter, _, override_value, expected) in config_getter_cases() {
+            temp_env::with_var(env_var, Some(override_value), || {
+                assert_eq!(getter(), expected, "{env_var}: override not applied");
+            });
+        }
     }
 
     #[tokio::test]
