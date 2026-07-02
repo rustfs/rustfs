@@ -772,6 +772,13 @@ fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -
 }
 
 impl HttpWriter {
+    fn take_background_error(&mut self) -> io::Result<()> {
+        match self.err_rx.try_recv() {
+            Ok(err) => Err(err),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty | tokio::sync::oneshot::error::TryRecvError::Closed) => Ok(()),
+        }
+    }
+
     fn poll_send_pending_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.pending_chunk.is_empty() {
             return Poll::Ready(Ok(()));
@@ -799,11 +806,10 @@ impl AsyncWrite for HttpWriter {
         //     self.method,
         //     buf.len()
         // );
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
-        }
-
         let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
 
         if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
             match this.poll_send_pending_chunk(cx) {
@@ -832,15 +838,19 @@ impl AsyncWrite for HttpWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.as_mut().get_mut().poll_send_pending_chunk(cx)
+        let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
+
+        this.poll_send_pending_chunk(cx)
     }
 
     fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
-        }
-
         let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
 
         if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
             match this.poll_send_pending_chunk(cx) {
@@ -883,6 +893,10 @@ impl AsyncWrite for HttpWriter {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        if let Err(err) = self.as_mut().get_mut().take_background_error() {
+            return Poll::Ready(Err(err));
+        }
+
         match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
             Poll::Ready(Ok(())) => {}
             Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -912,13 +926,14 @@ impl AsyncWrite for HttpWriter {
         // Wait for the HTTP request to complete
         use futures::FutureExt;
         match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
-            Poll::Ready(Ok(_)) => {
+            Poll::Ready(Ok(Ok(()))) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
                 //     url,
                 //     method
                 // );
             }
+            Poll::Ready(Ok(Err(err))) => return Poll::Ready(Err(err)),
             Poll::Ready(Err(e)) => {
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
                 return Poll::Ready(Err(Error::other(format!("HTTP request failed: {e}"))));
@@ -992,6 +1007,13 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn reject_put(State(state): State<TestState>, body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        state.put_bodies.lock().await.push(bytes.to_vec());
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
     async fn start_test_server(state: TestState) -> Option<(String, tokio::task::JoinHandle<()>)> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -1001,6 +1023,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
             .route("/delayed-first", get(get_delayed_first_chunk))
             .with_state(state);
@@ -1170,6 +1193,37 @@ mod tests {
 
         assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
         assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"hello world".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn http_writer_shutdown_reports_http_status_error() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/reject-put");
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        let err = writer
+            .shutdown()
+            .await
+            .expect_err("shutdown should report the HTTP response failure");
+
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected shutdown error to carry InternodeHttpError source");
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains("/reject-put"));
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
 
         handle.abort();
     }
