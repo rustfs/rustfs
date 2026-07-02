@@ -1817,6 +1817,22 @@ pub async fn run_stale_multipart_upload_cleanup_once(api: Arc<ECStore>) -> usize
     cleanup_stale_multipart_uploads_once_at(api, OffsetDateTime::now_utc(), stale_uploads_expiry()).await
 }
 
+pub fn schedule_stale_multipart_upload_cleanup_once(api: Arc<ECStore>) {
+    tokio::spawn(async move {
+        let deleted = run_stale_multipart_upload_cleanup_once(api).await;
+        if deleted > 0 {
+            debug!(
+                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                deleted,
+                trigger = "on_demand",
+                "Completed stale multipart cleanup pass"
+            );
+        }
+    });
+}
+
 pub fn init_background_stale_multipart_upload_cleanup(api: Arc<ECStore>) {
     let cleanup_interval = stale_uploads_cleanup_interval();
     let default_expiry = stale_uploads_expiry();
