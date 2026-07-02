@@ -2598,7 +2598,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_queue_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:enum\s+ReplicationQueueAdmission|struct\s+ReplicationHealQueueResult|enum\s+ReplicationPriority|enum\s+ReplicationOperation)\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:enum)\s+(?:ReplicationQueueAdmission|ReplicationHealQueueAction|ReplicationPriority|ReplicationOperation)|(?:struct)\s+(?:ReplicationHealQueueResult|ReplicationHealResyncDeletes)|fn\s+(?:replication_heal_queue_action|heal_deleted_object_replication_info|is_pending_or_failed_object_heal|is_pending_or_failed_version_purge))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE" || replication_queue_status=$?
   if [[ "$replication_queue_status" -ne 0 && "$replication_queue_status" -ne 1 ]]; then
@@ -2643,7 +2643,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_resync_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct|enum)\s+(?:ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)|fn\s+(?:resync_state_accepts_update|should_count_head_proxy_failure|is_version_id_mismatch))\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct|enum)\s+(?:ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)|fn\s+(?:resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" || replication_resync_status=$?
   if [[ "$replication_resync_status" -ne 0 && "$replication_resync_status" -ne 1 ]]; then
