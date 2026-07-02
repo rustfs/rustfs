@@ -82,16 +82,9 @@ pub(crate) fn build_get_object_body_cache_plan(
     }
 }
 
-/// Returns true when the current GET request can use the object body cache.
-pub(crate) fn is_get_object_body_cacheable(adapter: &ObjectDataCacheAdapter, request: GetObjectBodyCacheRequest<'_>) -> bool {
-    matches!(build_get_object_body_cache_plan(adapter, request), GetObjectBodyCachePlan::Cacheable(_))
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{
-        GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan, is_get_object_body_cacheable,
-    };
+    use super::{GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan};
     use crate::app::object_data_cache::ObjectDataCacheAdapter;
     use rustfs_object_data_cache::{ObjectDataCacheConfig, ObjectDataCacheMode};
 
@@ -202,40 +195,5 @@ mod tests {
         );
 
         assert!(matches!(plan, GetObjectBodyCachePlan::Cacheable(_)));
-    }
-
-    #[test]
-    fn cacheability_helper_reuses_planner_decision() {
-        let adapter = enabled_adapter();
-        let info = crate::storage::storage_api::StorageObjectInfo {
-            etag: Some("etag".to_string()),
-            size: 4,
-            ..Default::default()
-        };
-
-        assert!(is_get_object_body_cacheable(
-            &adapter,
-            GetObjectBodyCacheRequest {
-                bucket: "bucket",
-                key: "object",
-                info: &info,
-                response_content_length: 4,
-                has_range: false,
-                part_number: None,
-                encryption_applied: false,
-            },
-        ));
-        assert!(!is_get_object_body_cacheable(
-            &adapter,
-            GetObjectBodyCacheRequest {
-                bucket: "bucket",
-                key: "object",
-                info: &info,
-                response_content_length: 4,
-                has_range: true,
-                part_number: None,
-                encryption_applied: false,
-            },
-        ));
     }
 }

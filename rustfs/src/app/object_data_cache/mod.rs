@@ -26,8 +26,8 @@ pub(crate) use body::{
 };
 pub(crate) use invalidation::{
     invalidate_object_data_cache_after_complete_multipart_success, invalidate_object_data_cache_after_copy_success,
-    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_hit_size_mismatch,
-    invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
-    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
+    invalidate_object_data_cache_objects_before_mutation,
 };
-pub(crate) use planner::{GetObjectBodyCacheRequest, is_get_object_body_cacheable};
+pub(crate) use planner::{GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan};

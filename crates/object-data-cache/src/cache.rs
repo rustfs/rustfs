@@ -310,8 +310,6 @@ pub enum ObjectDataCacheInvalidationReason {
     AfterCopySuccess,
     /// Invalidation after a successful complete multipart upload.
     AfterCompleteMultipartSuccess,
-    /// Invalidation after a cached body fails app-layer response validation.
-    CacheHitSizeMismatch,
     /// Manual invalidation requested by the caller.
     Manual,
 }
@@ -324,7 +322,6 @@ impl ObjectDataCacheInvalidationReason {
             Self::AfterDeleteSuccess => "after_delete_success",
             Self::AfterCopySuccess => "after_copy_success",
             Self::AfterCompleteMultipartSuccess => "after_complete_multipart_success",
-            Self::CacheHitSizeMismatch => "cache_hit_size_mismatch",
             Self::Manual => "manual",
         }
     }

@@ -190,12 +190,12 @@ use super::storage_api::object_usecase::{
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 use crate::app::object_data_cache::{
-    GetObjectBodyCacheLookup, GetObjectBodyCacheRequest, ObjectDataCacheAdapter, fill_get_object_body_cache_from_buffered_body,
+    GetObjectBodyCacheLookup, GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter,
+    build_get_object_body_cache_plan, fill_get_object_body_cache_from_buffered_body,
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
-    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_hit_size_mismatch,
-    invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
-    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
-    is_get_object_body_cacheable, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
+    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -2858,40 +2858,22 @@ impl DefaultObjectUsecase {
             part_number,
             encryption_applied,
         };
-        let expected_body_len = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
+        let cache_plan = build_get_object_body_cache_plan(cache_adapter, cache_request);
 
-        match lookup_get_object_body_cache_hit(cache_adapter, cache_request).await {
+        match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
             GetObjectBodyCacheLookup::Hit(bytes) => {
-                if bytes.len() != expected_body_len {
-                    warn!(
-                        expected = response_content_length,
-                        actual = bytes.len(),
-                        "Cached GetObject body size mismatch"
-                    );
-                    let _ = invalidate_object_data_cache_after_hit_size_mismatch(cache_adapter, bucket, key).await;
-                } else {
-                    return Ok(Self::build_memory_bytes_blob(
-                        bytes,
-                        response_content_length,
-                        optimal_buffer_size,
-                        GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
-                    ));
-                }
+                return Ok(Self::build_memory_bytes_blob(
+                    bytes,
+                    response_content_length,
+                    optimal_buffer_size,
+                    GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                ));
             }
             GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
         }
 
         if let Some(buffered_body) = buffered_body {
-            if buffered_body.len() != expected_body_len {
-                warn!(
-                    expected = response_content_length,
-                    actual = buffered_body.len(),
-                    "Buffered GetObject body size mismatch"
-                );
-            } else {
-                let _fill_result =
-                    fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
-            }
+            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
 
             return Ok(Self::build_memory_bytes_blob(
                 buffered_body,
@@ -2902,7 +2884,7 @@ impl DefaultObjectUsecase {
         }
 
         let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
-            && is_get_object_body_cacheable(cache_adapter, cache_request)
+            && matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_))
             && should_materialize_get_object_body_for_cache(
                 info,
                 response_content_length,
@@ -2941,16 +2923,8 @@ impl DefaultObjectUsecase {
             match read_result {
                 Ok(_) => {
                     let bytes = Bytes::from(buf);
-                    if bytes.len() != expected_body_len {
-                        warn!(
-                            expected = response_content_length,
-                            actual = bytes.len(),
-                            "Materialized GetObject body size mismatch"
-                        );
-                    } else {
-                        let _fill_result =
-                            fill_get_object_body_cache_from_materialized_body(cache_adapter, cache_request, &bytes).await;
-                    }
+                    let _fill_result =
+                        fill_get_object_body_cache_from_materialized_body(cache_adapter, &cache_plan, &bytes).await;
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,

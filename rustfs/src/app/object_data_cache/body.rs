@@ -15,9 +15,7 @@
 //! Body handoff glue for the object data cache adapter.
 
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
-use crate::app::object_data_cache::planner::{
-    GetObjectBodyCachePlan, GetObjectBodyCacheRequest, build_get_object_body_cache_plan,
-};
+use crate::app::object_data_cache::planner::GetObjectBodyCachePlan;
 use bytes::Bytes;
 use rustfs_object_data_cache::{ObjectDataCacheFillResult, ObjectDataCacheLookup};
 
@@ -33,12 +31,12 @@ pub(crate) enum GetObjectBodyCacheLookup {
 /// Attempts a conservative cache lookup for the GET response body.
 pub(crate) async fn lookup_get_object_body_cache_hit(
     adapter: &ObjectDataCacheAdapter,
-    request: GetObjectBodyCacheRequest<'_>,
+    plan: &GetObjectBodyCachePlan,
 ) -> GetObjectBodyCacheLookup {
-    match build_get_object_body_cache_plan(adapter, request) {
+    match plan {
         GetObjectBodyCachePlan::Disabled => GetObjectBodyCacheLookup::Disabled,
         GetObjectBodyCachePlan::Skip => GetObjectBodyCacheLookup::Skip,
-        GetObjectBodyCachePlan::Cacheable(plan) => match adapter.lookup_body(&plan).await {
+        GetObjectBodyCachePlan::Cacheable(plan) => match adapter.lookup_body(plan).await {
             ObjectDataCacheLookup::Hit(bytes) => GetObjectBodyCacheLookup::Hit(bytes),
             ObjectDataCacheLookup::Miss => GetObjectBodyCacheLookup::Miss,
             ObjectDataCacheLookup::SkipDisabled => GetObjectBodyCacheLookup::Disabled,
@@ -50,30 +48,30 @@ pub(crate) async fn lookup_get_object_body_cache_hit(
 /// Attempts a conservative cache fill from an already buffered full object body.
 pub(crate) async fn fill_get_object_body_cache_from_buffered_body(
     adapter: &ObjectDataCacheAdapter,
-    request: GetObjectBodyCacheRequest<'_>,
+    plan: &GetObjectBodyCachePlan,
     buffered_body: &Bytes,
 ) -> ObjectDataCacheFillResult {
-    fill_get_object_body_cache_from_bytes(adapter, request, buffered_body).await
+    fill_get_object_body_cache_from_bytes(adapter, plan, buffered_body).await
 }
 
 /// Attempts a conservative cache fill from an already materialized full object body.
 pub(crate) async fn fill_get_object_body_cache_from_materialized_body(
     adapter: &ObjectDataCacheAdapter,
-    request: GetObjectBodyCacheRequest<'_>,
+    plan: &GetObjectBodyCachePlan,
     materialized_body: &Bytes,
 ) -> ObjectDataCacheFillResult {
-    fill_get_object_body_cache_from_bytes(adapter, request, materialized_body).await
+    fill_get_object_body_cache_from_bytes(adapter, plan, materialized_body).await
 }
 
 async fn fill_get_object_body_cache_from_bytes(
     adapter: &ObjectDataCacheAdapter,
-    request: GetObjectBodyCacheRequest<'_>,
+    plan: &GetObjectBodyCachePlan,
     body: &Bytes,
 ) -> ObjectDataCacheFillResult {
-    match build_get_object_body_cache_plan(adapter, request) {
+    match plan {
         GetObjectBodyCachePlan::Disabled => ObjectDataCacheFillResult::SkippedDisabled,
         GetObjectBodyCachePlan::Skip => ObjectDataCacheFillResult::SkippedNotCacheable,
-        GetObjectBodyCachePlan::Cacheable(plan) => adapter.fill_body(&plan, body.clone()).await,
+        GetObjectBodyCachePlan::Cacheable(plan) => adapter.fill_body(plan, body.clone()).await,
     }
 }
 
@@ -84,7 +82,7 @@ mod tests {
         fill_get_object_body_cache_from_materialized_body, lookup_get_object_body_cache_hit,
     };
     use crate::app::object_data_cache::ObjectDataCacheAdapter;
-    use crate::app::object_data_cache::planner::GetObjectBodyCacheRequest;
+    use crate::app::object_data_cache::planner::{GetObjectBodyCacheRequest, build_get_object_body_cache_plan};
     use bytes::Bytes;
     use rustfs_object_data_cache::{
         ObjectDataCacheBodyVariant, ObjectDataCacheConfig, ObjectDataCacheFillResult, ObjectDataCacheMode,
@@ -116,6 +114,7 @@ mod tests {
             part_number: None,
             encryption_applied: false,
         };
+        let cache_plan = build_get_object_body_cache_plan(&adapter, request);
 
         let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
             bucket: "bucket",
@@ -126,7 +125,7 @@ mod tests {
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"hello")).await;
-        let lookup = lookup_get_object_body_cache_hit(&adapter, request).await;
+        let lookup = lookup_get_object_body_cache_hit(&adapter, &cache_plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
         assert!(matches!(lookup, GetObjectBodyCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
@@ -141,19 +140,17 @@ mod tests {
             ..Default::default()
         };
 
-        let lookup = lookup_get_object_body_cache_hit(
-            &adapter,
-            GetObjectBodyCacheRequest {
-                bucket: "bucket",
-                key: "object",
-                info: &info,
-                response_content_length: 5,
-                has_range: false,
-                part_number: Some(1),
-                encryption_applied: false,
-            },
-        )
-        .await;
+        let request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: 5,
+            has_range: false,
+            part_number: Some(1),
+            encryption_applied: false,
+        };
+        let cache_plan = build_get_object_body_cache_plan(&adapter, request);
+        let lookup = lookup_get_object_body_cache_hit(&adapter, &cache_plan).await;
 
         assert!(matches!(lookup, GetObjectBodyCacheLookup::Skip));
     }
@@ -175,12 +172,39 @@ mod tests {
             part_number: None,
             encryption_applied: false,
         };
+        let cache_plan = build_get_object_body_cache_plan(&adapter, request);
 
-        let fill = fill_get_object_body_cache_from_buffered_body(&adapter, request, &Bytes::from_static(b"hello")).await;
-        let lookup = lookup_get_object_body_cache_hit(&adapter, request).await;
+        let fill = fill_get_object_body_cache_from_buffered_body(&adapter, &cache_plan, &Bytes::from_static(b"hello")).await;
+        let lookup = lookup_get_object_body_cache_hit(&adapter, &cache_plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
         assert!(matches!(lookup, GetObjectBodyCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
+    }
+
+    #[tokio::test]
+    async fn buffered_body_fill_rejects_size_mismatch() {
+        let adapter = enabled_fill_adapter();
+        let info = crate::storage::storage_api::StorageObjectInfo {
+            etag: Some("etag".to_string()),
+            size: 5,
+            ..Default::default()
+        };
+        let request = GetObjectBodyCacheRequest {
+            bucket: "bucket",
+            key: "object",
+            info: &info,
+            response_content_length: 5,
+            has_range: false,
+            part_number: None,
+            encryption_applied: false,
+        };
+        let cache_plan = build_get_object_body_cache_plan(&adapter, request);
+
+        let fill = fill_get_object_body_cache_from_buffered_body(&adapter, &cache_plan, &Bytes::from_static(b"oops")).await;
+        let lookup = lookup_get_object_body_cache_hit(&adapter, &cache_plan).await;
+
+        assert_eq!(fill, ObjectDataCacheFillResult::SkippedSizeMismatch);
+        assert!(matches!(lookup, GetObjectBodyCacheLookup::Miss));
     }
 
     #[tokio::test]
@@ -200,9 +224,10 @@ mod tests {
             part_number: None,
             encryption_applied: false,
         };
+        let cache_plan = build_get_object_body_cache_plan(&adapter, request);
 
-        let fill = fill_get_object_body_cache_from_materialized_body(&adapter, request, &Bytes::from_static(b"hello")).await;
-        let lookup = lookup_get_object_body_cache_hit(&adapter, request).await;
+        let fill = fill_get_object_body_cache_from_materialized_body(&adapter, &cache_plan, &Bytes::from_static(b"hello")).await;
+        let lookup = lookup_get_object_body_cache_hit(&adapter, &cache_plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
         assert!(matches!(lookup, GetObjectBodyCacheLookup::Hit(ref bytes) if bytes.as_ref() == b"hello"));
