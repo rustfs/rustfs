@@ -3288,10 +3288,14 @@ fi
       }
     ' |
     rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
+  rg -n -U --with-filename 'rustfs_replication::\{[^;]*\bReplication(?:Source|Target)Object\b|rustfs_replication::Replication(?:Source|Target)Object\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_target_boundary\.rs:' || true
 ) >"$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication bucket-target access and types must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
+  report_failure "replication bucket-target access, types, and target comparison DTO adapters must stay behind replication target boundary: $(paste -sd '; ' "$REPLICATION_TARGET_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

@@ -16,8 +16,13 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
+use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
+use rustfs_replication::{
+    ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
+    target_is_newer_than_source_null_version,
+};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
     AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
@@ -35,7 +40,7 @@ pub(crate) use crate::bucket::target::BucketTargets;
 
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result};
-use super::replication_filemeta_boundary::ReplicationStatusType;
+use super::replication_filemeta_boundary::{ReplicationAction, ReplicationStatusType, ReplicationType};
 use super::replication_storage_boundary::ObjectInfo;
 use super::replication_tagging_boundary::ReplicationTagFilter;
 
@@ -246,6 +251,51 @@ pub(crate) fn replication_put_object_header_size(put_options: &PutObjectOptions)
         .sum()
 }
 
+fn replication_source_object(object_info: &ObjectInfo) -> ReplicationSourceObject<'_> {
+    ReplicationSourceObject {
+        mod_time: object_info.mod_time,
+        version_id: object_info.version_id.map(|version_id| version_id.to_string()),
+        etag: object_info.etag.as_deref(),
+        actual_size: object_info.get_actual_size().unwrap_or_default(),
+        delete_marker: object_info.delete_marker,
+        content_type: object_info.content_type.as_deref(),
+        content_encoding: object_info.content_encoding.as_deref(),
+        user_tags: object_info.user_tags.as_str(),
+        user_defined: object_info.user_defined.as_ref(),
+    }
+}
+
+fn replication_target_last_modified(target: &HeadObjectOutput) -> Option<OffsetDateTime> {
+    target
+        .last_modified
+        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+}
+
+fn replication_target_object(target: &HeadObjectOutput) -> ReplicationTargetObject<'_> {
+    ReplicationTargetObject {
+        last_modified: replication_target_last_modified(target),
+        version_id: target.version_id.as_deref(),
+        etag: target.e_tag.as_deref(),
+        content_length: target.content_length.unwrap_or_default(),
+        delete_marker: target.delete_marker.unwrap_or_default(),
+        content_type: target.content_type.as_deref(),
+        metadata: target.metadata.as_ref(),
+        tag_count: target.tag_count.unwrap_or_default(),
+    }
+}
+
+pub(crate) fn replication_action_for_target_head(
+    object_info: &ObjectInfo,
+    target: &HeadObjectOutput,
+    op_type: ReplicationType,
+) -> ReplicationAction {
+    replication_action_for_target(&replication_source_object(object_info), &replication_target_object(target), op_type)
+}
+
+pub(crate) fn replication_target_head_is_newer_null_version(object_info: &ObjectInfo, target: &HeadObjectOutput) -> bool {
+    target_is_newer_than_source_null_version(&replication_source_object(object_info), &replication_target_object(target))
+}
+
 pub(crate) fn replication_delete_remove_options(
     delete_marker: bool,
     replication_mtime: Option<OffsetDateTime>,
@@ -314,12 +364,96 @@ fn valid_sse_replication_header(key: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aws_smithy_types::DateTime;
     use rustfs_utils::http::{
         SSEC_ALGORITHM_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_header_map,
     };
     use std::sync::Arc;
     use time::Duration;
     use uuid::Uuid;
+
+    #[test]
+    fn replication_action_for_target_head_existing_object_source_newer_null_version_requires_replication() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(10)).build();
+
+        assert_eq!(
+            replication_action_for_target_head(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::All,
+            "a newer source null version must not be skipped during existing-object replication"
+        );
+    }
+
+    #[test]
+    fn replication_action_for_target_head_existing_object_target_newer_null_version_skips() {
+        let source = ObjectInfo {
+            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
+            version_id: None,
+            ..Default::default()
+        };
+        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(20)).build();
+
+        assert_eq!(
+            replication_action_for_target_head(&source, &target, ReplicationType::ExistingObject),
+            ReplicationAction::None,
+            "a newer target null-version object should not be overwritten by existing-object replication"
+        );
+        assert!(replication_target_head_is_newer_null_version(&source, &target));
+    }
+
+    #[test]
+    fn replication_target_head_content_matches_compare_etag_only() {
+        let source = ObjectInfo {
+            etag: Some("\"abc123\"".to_string()),
+            ..Default::default()
+        };
+
+        let target_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
+        assert!(
+            content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_match)),
+            "identical ETags must match"
+        );
+
+        let target_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
+        assert!(
+            content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_unquoted_match)),
+            "quoted and unquoted ETags with identical values must match"
+        );
+
+        let target_different_version = HeadObjectOutput::builder()
+            .e_tag("\"abc123\"")
+            .version_id("aws-alphanumeric-id")
+            .build();
+        assert!(
+            content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_different_version)),
+            "matching ETags with different version IDs must still match"
+        );
+
+        let target_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_different_content)),
+            "different ETags must not match"
+        );
+
+        let source_no_etag = ObjectInfo {
+            etag: None,
+            ..Default::default()
+        };
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&source_no_etag), &replication_target_object(&target_match)),
+            "missing source ETag must not match"
+        );
+
+        let target_no_etag = HeadObjectOutput::builder().build();
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&source), &replication_target_object(&target_no_etag)),
+            "missing target ETag must not match"
+        );
+    }
 
     #[test]
     fn replication_remove_options_mark_replication_requests() {
