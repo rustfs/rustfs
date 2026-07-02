@@ -98,10 +98,8 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
     for (key, value) in object_info.user_defined.iter() {
         let has_valid_sse_header = valid_sse_replication_header(key).is_some();
 
-        if !is_ssec || !has_valid_sse_header {
-            if is_internal_key(key) || is_standard_header(key) {
-                continue;
-            }
+        if (!is_ssec || !has_valid_sse_header) && (is_internal_key(key) || is_standard_header(key)) {
+            continue;
         }
 
         if let Some(replication_header) = valid_sse_replication_header(key) {
