@@ -90,7 +90,7 @@ impl ReplicationTargetStore {
 
 pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
     use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID};
+    use rustfs_utils::http::{AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT};
 
     let mut meta = HashMap::new();
     let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
@@ -221,12 +221,6 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             };
     }
 
-    let _is_sse_s3 = object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .is_some_and(|value| value.eq_ignore_ascii_case("AES256"));
-    let _has_sse_kms = object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
-
     Ok((put_options, is_multipart))
 }
 
@@ -323,6 +317,13 @@ mod tests {
         assert_eq!(delete.replication_mtime, Some(mtime));
         assert_eq!(delete.replication_status, ReplicationStatusType::Replica);
         assert!(delete.replication_request);
+
+        let purge = replication_delete_marker_purge_remove_options(Some(mtime));
+        assert!(!purge.force_delete);
+        assert!(!purge.replication_delete_marker);
+        assert_eq!(purge.replication_mtime, Some(mtime));
+        assert_eq!(purge.replication_status, ReplicationStatusType::Replica);
+        assert!(purge.replication_request);
 
         let force = replication_force_delete_remove_options();
         assert!(force.force_delete);
