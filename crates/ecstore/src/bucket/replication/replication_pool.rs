@@ -61,7 +61,7 @@ const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
-const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
+const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
 
 /// Main replication pool structure
 #[derive(Debug)]
@@ -415,28 +415,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 if let Some(worker) = lrg_workers.get(index)
                     && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
                 {
-                    // Queue to MRF if worker is busy
-                    let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
-                        ReplicationQueueAdmission::Queued
-                    } else {
-                        warn!(
-                            event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_REPLICATION,
-                            bucket = %ri.bucket,
-                            object = %ri.name,
-                            "MRF queue full — large-worker replication failure entry dropped and will not be retried"
-                        );
-                        ReplicationQueueAdmission::Missed
-                    };
-
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
+                    drop(lrg_workers);
+
+                    // Queue to MRF if worker is busy.
+                    let admission =
+                        queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "large_object")
+                            .await;
+
                     if should_grow_large_workers(self.active_lrg_workers(), max_l_workers) {
                         let workers = next_large_worker_count(existing, max_l_workers);
 
-                        drop(lrg_workers);
                         self.resize_lrg_workers(workers, existing).await;
                     }
                     return admission;
@@ -462,20 +453,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Queued;
         }
 
-        // Queue to MRF if all workers are busy
-        let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
-            ReplicationQueueAdmission::Queued
-        } else {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                bucket = %ri.bucket,
-                object = %ri.name,
-                "MRF queue full — replication failure entry dropped and will not be retried"
-            );
-            ReplicationQueueAdmission::Missed
-        };
+        // Queue to MRF if all workers are busy.
+        let admission = queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "object").await;
 
         // Try to scale up workers based on priority
         let priority = self.priority.read().await.clone();
@@ -538,19 +517,14 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Queued;
         }
 
-        let admission = if self.mrf_save_tx.try_send(doi.to_mrf_entry()).is_ok() {
-            ReplicationQueueAdmission::Queued
-        } else {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                bucket = %doi.bucket,
-                object = %doi.delete_object.object_name,
-                "MRF queue full — delete replication failure entry dropped and will not be retried"
-            );
-            ReplicationQueueAdmission::Missed
-        };
+        let admission = queue_mrf_save_admission(
+            &self.mrf_save_tx,
+            doi.to_mrf_entry(),
+            &doi.bucket,
+            &doi.delete_object.object_name,
+            "delete",
+        )
+        .await;
 
         let priority = self.priority.read().await.clone();
         let max_workers = *self.max_workers.read().await;
@@ -593,14 +567,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        if self.mrf_save_tx.try_send(entry).is_err() {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                "MRF queue full — replication failure entry dropped and will not be retried"
-            );
-        }
+        let _ = queue_mrf_save_admission(&self.mrf_save_tx, entry, "", "", "mrf_worker").await;
     }
 
     /// Starts the MRF processor — one-shot at startup.
@@ -1072,6 +1039,29 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
+async fn queue_mrf_save_admission(
+    tx: &Sender<MrfReplicateEntry>,
+    entry: MrfReplicateEntry,
+    bucket: &str,
+    object: &str,
+    queue_type: &'static str,
+) -> ReplicationQueueAdmission {
+    if tx.send(entry).await.is_ok() {
+        return ReplicationQueueAdmission::Queued;
+    }
+
+    warn!(
+        event = EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION,
+        bucket = %bucket,
+        object = %object,
+        queue_type = queue_type,
+        "MRF save channel unavailable — replication failure entry could not be persisted for retry"
+    );
+    ReplicationQueueAdmission::Missed
+}
+
 /// Encodes `entries` and overwrites the MRF persistence file.
 /// Returns `true` on success; on failure logs the error and returns `false`.
 /// Callers must NOT clear their in-memory buffer on `false` so the next tick
@@ -1444,6 +1434,59 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[tokio::test]
+    async fn mrf_save_admission_waits_for_capacity_instead_of_dropping() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = MrfReplicateEntry {
+            bucket: "bucket".to_string(),
+            object: "first".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+        let second = MrfReplicateEntry {
+            object: "second".to_string(),
+            ..first.clone()
+        };
+
+        tx.try_send(first).expect("first MRF entry should fill the test channel");
+
+        let admission = queue_mrf_save_admission(&tx, second, "bucket", "second", "test");
+        tokio::pin!(admission);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut admission).await.is_err(),
+            "full MRF channel should apply backpressure instead of returning Missed"
+        );
+
+        let received = rx.recv().await.expect("first MRF entry should still be queued");
+        assert_eq!(received.object, "first");
+
+        let admission = tokio::time::timeout(Duration::from_secs(1), &mut admission)
+            .await
+            .expect("MRF admission should finish once capacity is available");
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+
+        let received = rx
+            .recv()
+            .await
+            .expect("second MRF entry should be queued after capacity opens");
+        assert_eq!(received.object, "second");
+    }
+
+    #[test]
+    fn auto_resume_resync_only_for_inflight_states() {
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 
     // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────
