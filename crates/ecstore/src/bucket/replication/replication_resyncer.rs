@@ -21,8 +21,8 @@ use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
     MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType,
-    ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
-    replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ResyncDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map,
+    target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_metadata_boundary::ReplicationMetadataStore;
@@ -55,12 +55,15 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
+#[cfg(test)]
+use rustfs_replication::content_matches_by_etag;
 use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
-    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, content_matches_by_etag,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationDeleteSource,
+    ReplicationResyncTargetObject, ReplicationSourceObject, ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus,
+    delete_replication_missing_source_decision, delete_replication_object_opts, heal_uses_delete_replication_path,
     is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    replication_action_for_target, resync_state_accepts_update, should_count_head_proxy_failure,
-    should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
+    replication_action_for_target, replication_etags_match, resync_state_accepts_update, resync_target_for_object,
+    should_count_head_proxy_failure, should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -69,8 +72,8 @@ use rustfs_utils::http::{
     SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
 };
 use rustfs_utils::http::{
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
-    has_internal_suffix, insert_header_map, insert_str, is_internal_key,
+    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_str, has_internal_suffix, insert_header_map,
+    insert_str, is_internal_key,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
@@ -860,10 +863,6 @@ impl ReplicationResyncer {
     }
 }
 
-fn heal_should_use_check_replicate_delete(oi: &ObjectInfo) -> bool {
-    oi.delete_marker || !oi.version_purge_status.is_empty()
-}
-
 pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationConfig) -> ReplicateObjectInfo {
     let mut oi = oi.clone();
     let mut user_defined = (*oi.user_defined).clone();
@@ -891,7 +890,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if heal_should_use_check_replicate_delete(&oi) {
+    let dsc = if heal_uses_delete_replication_path(oi.delete_marker, oi.version_purge_status.clone()) {
         check_replicate_delete(
             oi.bucket.as_str(),
             &ObjectToDelete {
@@ -1064,8 +1063,11 @@ impl ReplicationConfig {
             {
                 resync_decision.targets.insert(
                     decision.arn.clone(),
-                    resync_target(
-                        &oi,
+                    resync_target_for_object(
+                        &ReplicationResyncTargetObject {
+                            mod_time: oi.mod_time,
+                            user_defined: oi.user_defined.as_ref(),
+                        },
                         &target.arn,
                         &target.reset_id,
                         target.reset_before_date,
@@ -1077,59 +1079,6 @@ impl ReplicationConfig {
 
         resync_decision
     }
-}
-
-pub fn resync_target(
-    oi: &ObjectInfo,
-    arn: &str,
-    reset_id: &str,
-    reset_before_date: Option<OffsetDateTime>,
-    status: ReplicationStatusType,
-) -> ResyncTargetDecision {
-    let rs = oi
-        .user_defined
-        .get(target_reset_header(arn).as_str())
-        .cloned()
-        .or_else(|| get_header_map(&oi.user_defined, SUFFIX_REPLICATION_RESET_STATUS));
-
-    let mut dec = ResyncTargetDecision::default();
-
-    let mod_time = oi.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-
-    if rs.is_none() {
-        let reset_before_date = reset_before_date.unwrap_or(OffsetDateTime::UNIX_EPOCH);
-        if !reset_id.is_empty() && mod_time <= reset_before_date {
-            dec.replicate = true;
-            return dec;
-        }
-
-        dec.replicate = status == ReplicationStatusType::Empty;
-
-        return dec;
-    }
-
-    if reset_id.is_empty() || reset_before_date.is_none() {
-        return dec;
-    }
-
-    let rs = rs.unwrap();
-    let reset_before_date = reset_before_date.unwrap();
-
-    let parts: Vec<&str> = rs.splitn(2, ';').collect();
-
-    if parts.len() != 2 {
-        return dec;
-    }
-
-    let new_reset = parts[1] != reset_id;
-
-    if !new_reset && status == ReplicationStatusType::Completed {
-        return dec;
-    }
-
-    dec.replicate = new_reset && mod_time <= reset_before_date;
-
-    dec
 }
 
 pub(crate) fn get_must_replicate_options(
@@ -1180,7 +1129,15 @@ pub(crate) async fn check_replicate_delete(
         return ReplicateDecision::default();
     }
 
-    let opts = delete_replication_object_opts(dobj, oi);
+    let opts = delete_replication_object_opts(
+        dobj,
+        &ReplicationDeleteSource {
+            user_defined: oi.user_defined.as_ref(),
+            user_tags: oi.user_tags.as_str(),
+            delete_marker: oi.delete_marker,
+            replication_status: oi.replication_status.clone(),
+        },
+    );
 
     let tgt_arns = rcfg.filter_target_arns(&opts);
     let mut dsc = ReplicateDecision::new();
@@ -1198,21 +1155,12 @@ pub(crate) async fn check_replicate_delete(
         // When incoming delete is removal of a delete marker (a.k.a versioned delete),
         // GetObjectInfo returns extra information even though it returns errFileNotFound
         if gerr.is_some() {
-            let valid_repl_status = matches!(
+            if let Some(replicate) = delete_replication_missing_source_decision(
+                oi.delete_marker,
                 oi.target_replication_status(&tgt_arn),
-                ReplicationStatusType::Pending | ReplicationStatusType::Completed | ReplicationStatusType::Failed
-            );
-
-            if oi.delete_marker && (valid_repl_status || replicate) {
-                dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
-                continue;
-            }
-
-            // Can be the case that other cluster is down and duplicate `mc rm --vid`
-            // is issued - this still needs to be replicated back to the other target
-            if oi.version_purge_status != VersionPurgeStatusType::default() {
-                let replicate = oi.version_purge_status == VersionPurgeStatusType::Pending
-                    || oi.version_purge_status == VersionPurgeStatusType::Failed;
+                replicate,
+                oi.version_purge_status.clone(),
+            ) {
                 dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
             }
             continue;
@@ -1230,19 +1178,6 @@ pub(crate) async fn check_replicate_delete(
     }
 
     dsc
-}
-
-fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
-    ObjectOpts {
-        name: dobj.object_name.clone(),
-        ssec: rustfs_replication::is_ssec_encrypted(&oi.user_defined),
-        user_tags: (*oi.user_tags).clone(),
-        delete_marker: oi.delete_marker,
-        version_id: dobj.version_id,
-        op_type: ReplicationType::Delete,
-        replica: oi.replication_status == ReplicationStatusType::Replica,
-        ..Default::default()
-    }
 }
 
 pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
@@ -2601,12 +2536,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
-                        Ok(Some(oi))
-                            if content_matches_by_etag(
-                                &replication_source_object(&object_info),
-                                &replication_target_object(&oi),
-                            ) =>
-                        {
+                        Ok(Some(oi)) if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) => {
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
@@ -2973,10 +2903,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
                         Ok(Some(oi)) => {
-                            replication_action = if content_matches_by_etag(
-                                &replication_source_object(&object_info),
-                                &replication_target_object(&oi),
-                            ) {
+                            replication_action = if replication_etags_match(object_info.etag.as_deref(), oi.e_tag.as_deref()) {
                                 ReplicationAction::None
                             } else {
                                 ReplicationAction::All
@@ -3758,81 +3685,6 @@ mod tests {
     }
 
     #[test]
-    fn test_heal_should_use_check_replicate_delete_failed_non_delete_marker() {
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            delete_marker: false,
-            replication_status: ReplicationStatusType::Failed,
-            ..Default::default()
-        };
-        assert!(
-            !heal_should_use_check_replicate_delete(&oi),
-            "Failed non-delete-marker object must use must_replicate path so it can be re-queued for heal"
-        );
-    }
-
-    #[test]
-    fn test_heal_should_use_check_replicate_delete_pending_non_delete_marker_uses_must_replicate_path() {
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            delete_marker: false,
-            replication_status: ReplicationStatusType::Pending,
-            ..Default::default()
-        };
-        assert!(
-            !heal_should_use_check_replicate_delete(&oi),
-            "Pending non-delete-marker object must use must_replicate path to evaluate current target set"
-        );
-    }
-
-    #[test]
-    fn test_heal_should_use_check_replicate_delete_delete_marker() {
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            delete_marker: true,
-            replication_status: ReplicationStatusType::Failed,
-            ..Default::default()
-        };
-        assert!(
-            heal_should_use_check_replicate_delete(&oi),
-            "Delete marker always uses check_replicate_delete path"
-        );
-    }
-
-    #[test]
-    fn test_heal_should_use_check_replicate_delete_version_purge_status_uses_delete_path() {
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            delete_marker: false,
-            version_purge_status: VersionPurgeStatusType::Pending,
-            ..Default::default()
-        };
-        assert!(
-            heal_should_use_check_replicate_delete(&oi),
-            "Version purge entries must use check_replicate_delete path"
-        );
-    }
-
-    #[test]
-    fn test_heal_should_use_check_replicate_delete_completed_non_delete_marker_uses_must_replicate_path() {
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            delete_marker: false,
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-        assert!(
-            !heal_should_use_check_replicate_delete(&oi),
-            "Completed non-delete-marker object must use must_replicate path so new targets can be evaluated"
-        );
-    }
-
-    #[test]
     fn test_get_replication_action_existing_object_source_newer_null_version_requires_replication() {
         let source = ObjectInfo {
             mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
@@ -3873,56 +3725,6 @@ mod tests {
     }
 
     #[test]
-    fn test_resync_target_includes_object_at_reset_before_boundary() {
-        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
-        let oi = ObjectInfo {
-            mod_time: Some(reset_before),
-            ..Default::default()
-        };
-
-        let decision = resync_target(&oi, "arn:target", "reset-1", Some(reset_before), ReplicationStatusType::Completed);
-
-        assert!(
-            decision.replicate,
-            "objects whose mod_time equals reset_before must be included in the reset window"
-        );
-    }
-
-    #[test]
-    fn test_resync_target_replicates_when_reset_id_changes() {
-        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
-        let oi = ObjectInfo {
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
-            user_defined: Arc::new(HashMap::from([(
-                target_reset_header("arn:target"),
-                "1970-01-01T00:00:20Z;old-reset".to_string(),
-            )])),
-            ..Default::default()
-        };
-
-        let decision = resync_target(&oi, "arn:target", "new-reset", Some(reset_before), ReplicationStatusType::Completed);
-
-        assert!(decision.replicate, "a new reset id must resync objects marked by an older reset");
-    }
-
-    #[test]
-    fn test_resync_target_skips_completed_object_for_same_reset_id() {
-        let reset_before = OffsetDateTime::UNIX_EPOCH + Duration::seconds(30);
-        let oi = ObjectInfo {
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
-            user_defined: Arc::new(HashMap::from([(
-                target_reset_header("arn:target"),
-                "1970-01-01T00:00:20Z;same-reset".to_string(),
-            )])),
-            ..Default::default()
-        };
-
-        let decision = resync_target(&oi, "arn:target", "same-reset", Some(reset_before), ReplicationStatusType::Completed);
-
-        assert!(!decision.replicate, "the same completed reset id must not resync again");
-    }
-
-    #[test]
     fn test_replicate_object_info_to_object_info_preserves_delete_marker_flag() {
         let live = ReplicateObjectInfo {
             bucket: "source".to_string(),
@@ -3939,49 +3741,6 @@ mod tests {
 
         assert!(!live.to_object_info().delete_marker);
         assert!(delete_marker.to_object_info().delete_marker);
-    }
-
-    #[test]
-    fn test_delete_replication_object_opts_marks_replica_deletes() {
-        let dobj = ObjectToDelete {
-            object_name: "obj".to_string(),
-            version_id: Some(Uuid::new_v4()),
-            ..Default::default()
-        };
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            replication_status: ReplicationStatusType::Replica,
-            ..Default::default()
-        };
-
-        let opts = delete_replication_object_opts(&dobj, &oi);
-
-        assert!(
-            opts.replica,
-            "replica deletes must preserve replica status for downstream ReplicaModifications rules"
-        );
-        assert_eq!(opts.version_id, dobj.version_id);
-        assert_eq!(opts.name, dobj.object_name);
-        assert_eq!(opts.op_type, ReplicationType::Delete);
-    }
-
-    #[test]
-    fn test_delete_replication_object_opts_keeps_non_replica_deletes_local() {
-        let dobj = ObjectToDelete {
-            object_name: "obj".to_string(),
-            ..Default::default()
-        };
-        let oi = ObjectInfo {
-            bucket: "b".to_string(),
-            name: "obj".to_string(),
-            replication_status: ReplicationStatusType::Completed,
-            ..Default::default()
-        };
-
-        let opts = delete_replication_object_opts(&dobj, &oi);
-
-        assert!(!opts.replica, "source-originated deletes should not be treated as replica modifications");
     }
 
     #[test]

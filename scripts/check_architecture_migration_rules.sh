@@ -2568,7 +2568,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_operation_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+MustReplicateOptions|fn\s+is_ssec_encrypted)\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:MustReplicateOptions|ReplicationDeleteSource|ReplicationResyncTargetObject)|fn\s+(?:is_ssec_encrypted|delete_replication_object_opts|heal_uses_delete_replication_path|delete_replication_missing_source_decision|resync_target_for_object|resync_target))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE" || replication_operation_status=$?
   if [[ "$replication_operation_status" -ne 0 && "$replication_operation_status" -ne 1 ]]; then
@@ -2658,7 +2658,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_object_compare_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:ReplicationSourceObject|ReplicationTargetObject)|fn\s+(?:content_matches_by_etag|content_matches|target_is_newer_than_source_null_version|replication_action_for_target|get_replication_action))\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:ReplicationSourceObject|ReplicationTargetObject)|fn\s+(?:replication_etags_match|content_matches_by_etag|content_matches|target_is_newer_than_source_null_version|replication_action_for_target|get_replication_action))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE" || replication_object_compare_status=$?
   if [[ "$replication_object_compare_status" -ne 0 && "$replication_object_compare_status" -ne 1 ]]; then
