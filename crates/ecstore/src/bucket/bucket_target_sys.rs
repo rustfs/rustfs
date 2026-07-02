@@ -1331,7 +1331,7 @@ impl PutObjectOptions {
         if !self.internal.source_version_id.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
-        if self.internal.source_etag.is_empty() {
+        if !self.internal.source_etag.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
@@ -1923,6 +1923,24 @@ mod tests {
         assert!(
             rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
             "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
+
+    #[test]
+    fn put_object_headers_include_non_empty_source_etag_only() {
+        let mut opts = PutObjectOptions::default();
+
+        assert!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).is_none(),
+            "empty source etag must not be sent to replication targets"
+        );
+
+        opts.internal.source_etag = "etag-1".to_string();
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).as_deref(),
+            Some("etag-1"),
+            "replication targets need the source etag for idempotency checks"
         );
     }
 
