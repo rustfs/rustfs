@@ -32,24 +32,20 @@ use super::replication_storage_boundary::{
     AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
     ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
-use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::replication_target_boundary::{
-    AdvancedPutOptions, BucketTargets, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, ReplicationTargetStore,
-    TargetClient,
+    BucketTargets, PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient,
+    replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
+    replication_force_delete_remove_options, replication_put_object_header_size, replication_put_object_options,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
+use aws_sdk_s3::types::CompletedPart;
 use aws_smithy_types::body::SdkBody;
 use futures::future::join_all;
 use futures::stream::StreamExt;
-use headers::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
-    AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LANGUAGE, CONTENT_TYPE,
-};
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
@@ -67,13 +63,8 @@ use rustfs_replication::{
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET,
-    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
-};
-use rustfs_utils::http::{
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_str, has_internal_suffix, insert_header_map,
-    insert_str, is_internal_key,
+    AMZ_BUCKET_REPLICATION_STATUS, AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS,
+    has_internal_suffix, insert_str,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
@@ -1726,15 +1717,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
                 Some(delete_marker_version_id.to_string()),
-                RemoveObjectOptions {
-                    force_delete: false,
-                    governance_bypass: false,
-                    replication_delete_marker: false,
-                    replication_mtime: dobj.delete_object.delete_marker_mtime,
-                    replication_status: ReplicationStatusType::Replica,
-                    replication_request: true,
-                    replication_validity_check: false,
-                },
+                replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
             .await;
     }
@@ -1918,20 +1901,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             }
 
             if let Err(e) = tgt_client
-                .remove_object(
-                    &tgt_client.bucket,
-                    &object_name,
-                    None,
-                    RemoveObjectOptions {
-                        force_delete: true,
-                        governance_bypass: false,
-                        replication_delete_marker: false,
-                        replication_mtime: None,
-                        replication_status: ReplicationStatusType::Replica,
-                        replication_request: true,
-                        replication_validity_check: false,
-                    },
-                )
+                .remove_object(&tgt_client.bucket, &object_name, None, replication_force_delete_remove_options())
                 .await
             {
                 error!(
@@ -2055,15 +2025,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
             version_id.clone(),
-            RemoveObjectOptions {
-                force_delete: false,
-                governance_bypass: false,
-                replication_delete_marker: dobj.delete_object.delete_marker,
-                replication_mtime: dobj.delete_object.delete_marker_mtime,
-                replication_status: ReplicationStatusType::Replica,
-                replication_request: true,
-                replication_validity_check: false,
-            },
+            replication_delete_remove_options(dobj.delete_object.delete_marker, dobj.delete_object.delete_marker_mtime),
         )
         .await
     {
@@ -2581,7 +2543,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.size = size;
         rinfo.replication_action = replication_action;
 
-        let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+        let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
                 warn!(
@@ -2971,7 +2933,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         if replication_action != ReplicationAction::All {
             // TODO: copy object
         } else {
-            let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+            let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
                 Ok((put_opts, is_mp)) => (put_opts, is_mp),
                 Err(e) => {
                     rinfo.error = Some(e.to_string());
@@ -3074,34 +3036,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
     }
 }
 
-// Standard headers that needs to be extracted from User metadata.
-static STANDARD_HEADERS: &[&str] = &[
-    CONTENT_TYPE,
-    CACHE_CONTROL,
-    CONTENT_ENCODING,
-    CONTENT_LANGUAGE,
-    CONTENT_DISPOSITION,
-    AMZ_STORAGE_CLASS,
-    AMZ_OBJECT_TAGGING,
-    AMZ_BUCKET_REPLICATION_STATUS,
-    AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    AMZ_OBJECT_LOCK_LEGAL_HOLD,
-    AMZ_TAG_COUNT,
-    AMZ_SERVER_SIDE_ENCRYPTION,
-];
-
-fn calc_put_object_header_size(put_opts: &PutObjectOptions) -> usize {
-    let mut header_size: usize = 0;
-    for (key, value) in put_opts.header().iter() {
-        header_size += key.as_str().len();
-        header_size += value.as_bytes().len();
-        // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
-        header_size += 4;
-    }
-    header_size
-}
-
 fn wrap_with_bandwidth_monitor_with_header(
     stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     bucket: &str,
@@ -3130,7 +3064,7 @@ fn wrap_with_bandwidth_monitor(
     bucket: &str,
     arn: &str,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
-    let header_size = calc_put_object_header_size(put_opts);
+    let header_size = replication_put_object_header_size(put_opts);
     wrap_with_bandwidth_monitor_with_header(stream, bucket, arn, header_size)
 }
 
@@ -3140,219 +3074,6 @@ fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'stat
     let stream = ReaderStream::new(reader);
     let body = StreamBody::new(stream.map(|r| r.map(Frame::data)));
     ByteStream::new(SdkBody::from_body_1_x(body))
-}
-
-fn is_standard_header(k: &str) -> bool {
-    STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
-}
-
-// Valid SSE replication headers mapping from internal to replication headers
-static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key",
-        "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Seal-Algorithm",
-        "X-Rustfs-Replication-Server-Side-Encryption-Seal-Algorithm",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Iv",
-        "X-Rustfs-Replication-Server-Side-Encryption-Iv",
-    ),
-    ("X-Rustfs-Internal-Encrypted-Multipart", "X-Rustfs-Replication-Encrypted-Multipart"),
-    ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
-];
-
-fn is_valid_sse_header(k: &str) -> Option<&str> {
-    VALID_SSE_REPLICATION_HEADERS
-        .iter()
-        .find(|(internal, _)| k.eq_ignore_ascii_case(internal))
-        .map(|(_, replication)| *replication)
-}
-
-fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use rustfs_utils::http::{
-        AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
-    };
-
-    let mut meta = HashMap::new();
-    let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
-
-    // Process user-defined metadata
-    for (k, v) in object_info.user_defined.iter() {
-        let has_valid_sse_header = is_valid_sse_header(k).is_some();
-
-        // In case of SSE-C objects copy the allowed internal headers as well
-        if !is_ssec || !has_valid_sse_header {
-            if is_internal_key(k) {
-                continue;
-            }
-            if is_standard_header(k) {
-                continue;
-            }
-        }
-
-        if let Some(replication_header) = is_valid_sse_header(k) {
-            meta.insert(replication_header.to_string(), v.to_string());
-        } else {
-            meta.insert(k.to_string(), v.to_string());
-        }
-    }
-
-    let mut is_multipart = object_info.is_multipart();
-
-    // Handle checksum
-    if let Some(checksum_data) = &object_info.checksum
-        && !checksum_data.is_empty()
-    {
-        // Add encrypted CRC to metadata for SSE-C objects
-        if is_ssec {
-            let encoded = BASE64_STANDARD.encode(checksum_data);
-            insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
-        } else {
-            // Get checksum metadata for non-SSE-C objects
-            let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
-            is_multipart = is_mp;
-
-            // Set object checksum metadata
-            for (k, v) in cs_meta.iter() {
-                if k != AMZ_CHECKSUM_TYPE {
-                    meta.insert(k.clone(), v.clone());
-                }
-            }
-
-            // For objects where checksum is full object, use the cheaper PutObject replication
-            if !object_info.is_multipart()
-                && cs_meta
-                    .get(AMZ_CHECKSUM_TYPE)
-                    .map(|v| v.as_str() == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
-                    .unwrap_or(false)
-            {
-                is_multipart = false;
-            }
-        }
-    }
-
-    // Handle storage class default
-    let storage_class = if sc.is_empty() {
-        let obj_sc = object_info.storage_class.as_deref().unwrap_or_default();
-        if obj_sc == ReplicationConfigStore::STANDARD || obj_sc == ReplicationConfigStore::RRS {
-            obj_sc.to_string()
-        } else {
-            sc.to_string()
-        }
-    } else {
-        sc.to_string()
-    };
-
-    let mut put_op = PutObjectOptions {
-        user_metadata: meta,
-        content_type: object_info.content_type.clone().unwrap_or_default(),
-        content_encoding: object_info.content_encoding.clone().unwrap_or_default(),
-        expires: object_info.expires.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-        storage_class,
-        internal: AdvancedPutOptions {
-            source_version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
-            source_etag: object_info.etag.clone().unwrap_or_default(),
-            source_mtime: object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            replication_status: ReplicationStatusType::Replica, // Changed from Pending to Replica
-            replication_request: true, // always set this to distinguish between replication and normal PUT operation
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    if !object_info.user_tags.is_empty() {
-        let tags = ReplicationTagFilter::decode_tags_to_map(&object_info.user_tags);
-
-        if !tags.is_empty() {
-            put_op.user_tags = tags;
-            // set tag timestamp in opts
-            put_op.internal.tagging_timestamp = if let Some(ts) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
-                OffsetDateTime::parse(&ts, &Rfc3339)
-                    .map_err(|e| Error::other(format!("Failed to parse tagging timestamp: {}", e)))?
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-        }
-    }
-
-    // Use case-insensitive lookup for headers
-    let lk_map = &*object_info.user_defined;
-
-    if let Some(lang) = lk_map.lookup(CONTENT_LANGUAGE) {
-        put_op.content_language = lang.to_string();
-    }
-
-    if let Some(cd) = lk_map.lookup(CONTENT_DISPOSITION) {
-        put_op.content_disposition = cd.to_string();
-    }
-
-    if let Some(v) = lk_map.lookup(CACHE_CONTROL) {
-        put_op.cache_control = v.to_string();
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_MODE) {
-        let mode = v.to_string().to_uppercase();
-        put_op.mode = Some(aws_sdk_s3::types::ObjectLockRetentionMode::from(mode.as_str()));
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
-        put_op.retain_until_date =
-            OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
-        // set retention timestamp in opts
-        put_op.internal.retention_timestamp =
-            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP) {
-                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_LEGAL_HOLD) {
-        let hold = v.to_uppercase();
-        put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
-        // set legalhold timestamp in opts
-        put_op.internal.legalhold_timestamp =
-            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP) {
-                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-    }
-
-    // Handle SSE-S3 encryption
-    if object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .map(|v| v.eq_ignore_ascii_case("AES256"))
-        .unwrap_or(false)
-    {
-        // SSE-S3 detected - set ServerSideEncryption
-        // Note: This requires the PutObjectOptions to support SSE
-        // TODO: Implement SSE-S3 support in PutObjectOptions if not already present
-    }
-
-    // Handle SSE-KMS encryption
-    if object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID) {
-        // SSE-KMS detected
-        // If KMS key ID replication is enabled (as by default)
-        // we include the object's KMS key ID. In any case, we
-        // always set the SSE-KMS header. If no KMS key ID is
-        // specified, the server uses the default applicable
-        // config applies on the site or bucket.
-        // TODO: Implement SSE-KMS support with key ID replication
-        // let key_id = if kms::replicate_key_id() {
-        //     object_info.kms_key_id()
-        // } else {
-        //     None
-        // };
-        // TODO: Set SSE-KMS encryption in put_op
-    }
-
-    Ok((put_op, is_multipart))
 }
 
 fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Result<(HTTPRangeSpec, i64)> {
@@ -3423,9 +3144,11 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
-    let mut header_size = calc_put_object_header_size(&put_opts);
+    let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
+        let part_number = i32::try_from(part_info.number)
+            .map_err(|_| std::io::Error::other(format!("part number {} overflows i32", part_info.number)))?;
         let part_size = part_info.actual_size;
         let (range_spec, next_offset) = part_range_spec_from_actual_size(offset, part_size)?;
         offset = next_offset;
@@ -3444,7 +3167,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 dst_bucket,
                 object,
                 &upload_id,
-                part_info.number as i32,
+                part_number,
                 part_size,
                 byte_stream,
                 &PutObjectPartOptions { ..Default::default() },
@@ -3454,36 +3177,18 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
         let etag = object_part.e_tag.unwrap_or_default();
 
-        uploaded_parts.push(
-            CompletedPart::builder()
-                .part_number(part_info.number as i32)
-                .e_tag(etag)
-                .build(),
-        );
+        uploaded_parts.push(CompletedPart::builder().part_number(part_number).e_tag(etag).build());
     }
 
-    let mut user_metadata = HashMap::new();
-
-    insert_header_map(
-        &mut user_metadata,
-        SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
-        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default(),
-    );
+    let actual_size =
+        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default();
 
     cli.complete_multipart_upload(
         dst_bucket,
         object,
         &upload_id,
         uploaded_parts,
-        &PutObjectOptions {
-            user_metadata,
-            internal: AdvancedPutOptions {
-                replication_status: ReplicationStatusType::Replica,
-                replication_request: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        &replication_complete_multipart_options(actual_size),
     )
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?;
