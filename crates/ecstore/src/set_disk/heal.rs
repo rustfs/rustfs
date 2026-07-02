@@ -352,11 +352,26 @@ impl SetDisks {
 
                         // We write at temporary location and then rename to final location.
                         let tmp_id = Uuid::new_v4().to_string();
-                        // Delete markers and remote (transitioned) objects carry no data_dir;
-                        // both are skipped by the `!latest_meta.deleted && !latest_meta.is_remote()`
-                        // guard below, so the placeholder values are never used.
-                        let src_data_dir = latest_meta.data_dir.map(|d| d.to_string()).unwrap_or_default();
-                        let dst_data_dir = latest_meta.data_dir.unwrap_or_default();
+                        // Delete markers and remote (transitioned) objects carry no data_dir and
+                        // skip the data-heal block below, so a nil placeholder is safe for them.
+                        // For a regular object a missing data_dir means the latest metadata is
+                        // corrupt; fail this object's heal with a clear error instead of building
+                        // part paths under a nil UUID directory.
+                        let data_dir = match latest_meta.data_dir {
+                            Some(data_dir) => data_dir,
+                            None => {
+                                if !latest_meta.deleted && !latest_meta.is_remote() {
+                                    error!(
+                                        "heal: latest metadata for {}/{} has no data_dir, cannot heal object data",
+                                        bucket, object
+                                    );
+                                    return Err(DiskError::FileCorrupt);
+                                }
+                                Uuid::nil()
+                            }
+                        };
+                        let src_data_dir = data_dir.to_string();
+                        let dst_data_dir = data_dir;
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure.clone();
