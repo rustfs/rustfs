@@ -55,10 +55,11 @@ use rmp_serde;
 #[cfg(test)]
 use rustfs_replication::content_matches_by_etag;
 use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
-    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, heal_uses_delete_replication_path,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    replication_action_for_target, replication_etags_match, resync_state_accepts_update, should_count_head_proxy_failure,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationMultipartPartInput,
+    ReplicationSourceObject, ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus,
+    heal_uses_delete_replication_path, is_retryable_delete_replication_head_error, is_version_delete_replication,
+    is_version_id_mismatch, replication_action_for_target, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, resync_state_accepts_update, should_count_head_proxy_failure,
     should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
 };
 use rustfs_s3_types::EventName;
@@ -2885,29 +2886,6 @@ fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'stat
     ByteStream::new(SdkBody::from_body_1_x(body))
 }
 
-fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Result<(HTTPRangeSpec, i64)> {
-    if offset < 0 {
-        return Err(std::io::Error::other("invalid part offset"));
-    }
-    if part_size <= 0 {
-        return Err(std::io::Error::other(format!("invalid part size {part_size}")));
-    }
-    let end = offset
-        .checked_add(part_size - 1)
-        .ok_or_else(|| std::io::Error::other("part range overflow"))?;
-    let next_offset = end
-        .checked_add(1)
-        .ok_or_else(|| std::io::Error::other("part offset overflow"))?;
-    Ok((
-        HTTPRangeSpec {
-            is_suffix_length: false,
-            start: offset,
-            end,
-        },
-        next_offset,
-    ))
-}
-
 struct MultipartReplicationContext<'a, S: ReplicationObjectIO> {
     storage: Arc<S>,
     cli: Arc<TargetClient>,
@@ -2956,11 +2934,18 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
-        let part_number = i32::try_from(part_info.number)
-            .map_err(|_| std::io::Error::other(format!("part number {} overflows i32", part_info.number)))?;
-        let part_size = part_info.actual_size;
-        let (range_spec, next_offset) = part_range_spec_from_actual_size(offset, part_size)?;
-        offset = next_offset;
+        let part_plan = replication_multipart_part_plan(ReplicationMultipartPartInput {
+            offset,
+            part_number: part_info.number,
+            part_size: part_info.actual_size,
+        })
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: part_plan.range.start,
+            end: part_plan.range.end,
+        };
+        offset = part_plan.next_offset;
 
         let part_reader = storage
             .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
@@ -2976,8 +2961,8 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 dst_bucket,
                 object,
                 &upload_id,
-                part_number,
-                part_size,
+                part_plan.part_number,
+                part_plan.part_size,
                 byte_stream,
                 &PutObjectPartOptions { ..Default::default() },
             )
@@ -2986,11 +2971,15 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
         let etag = object_part.e_tag.unwrap_or_default();
 
-        uploaded_parts.push(CompletedPart::builder().part_number(part_number).e_tag(etag).build());
+        uploaded_parts.push(
+            CompletedPart::builder()
+                .part_number(part_plan.part_number)
+                .e_tag(etag)
+                .build(),
+        );
     }
 
-    let actual_size =
-        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default();
+    let actual_size = replication_multipart_complete_actual_size(&object_info.user_defined);
 
     cli.complete_multipart_upload(
         dst_bucket,
@@ -3012,20 +3001,6 @@ mod tests {
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
-
-    #[test]
-    fn test_part_range_spec_from_actual_size() {
-        let (rs, next) = part_range_spec_from_actual_size(0, 10).unwrap();
-        assert_eq!(rs.start, 0);
-        assert_eq!(rs.end, 9);
-        assert_eq!(next, 10);
-    }
-
-    #[test]
-    fn test_part_range_spec_rejects_non_positive() {
-        assert!(part_range_spec_from_actual_size(0, 0).is_err());
-        assert!(part_range_spec_from_actual_size(0, -1).is_err());
-    }
 
     #[test]
     fn test_unmarshal_resync_payload() {
