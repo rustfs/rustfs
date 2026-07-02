@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_common::metrics::IlmAction;
-use rustfs_filemeta::{ReplicateDecision, ReplicationStatusType};
+use rustfs_replication::{ReplicateDecision, ReplicationStatusType};
 
 use crate::bucket::lifecycle::lifecycle::ObjectOpts;
 use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
@@ -70,7 +70,7 @@ mod tests {
     use std::collections::HashMap;
 
     use rustfs_common::metrics::IlmAction;
-    use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
+    use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 
     use super::*;
 

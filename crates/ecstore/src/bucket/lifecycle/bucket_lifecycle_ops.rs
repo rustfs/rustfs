@@ -3001,7 +3001,7 @@ mod tests {
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
-    use rustfs_filemeta::{ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType};
+    use rustfs_replication::{ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
         RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,

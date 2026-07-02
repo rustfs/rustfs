@@ -85,6 +85,7 @@ rustfs-policy = { workspace = true }
 rustfs-protocols = { workspace = true }
 rustfs-protos = { workspace = true }
 rustfs-rio = { workspace = true }
+rustfs-replication = { workspace = true }
 rustfs-s3-types = { workspace = true }
 rustfs-s3-ops = { workspace = true }
 rustfs-security-governance = { workspace = true }

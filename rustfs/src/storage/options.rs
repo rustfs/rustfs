@@ -16,7 +16,7 @@ use super::{BucketVersioningSys, Result, StorageError};
 use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
-use rustfs_filemeta::ReplicationStatusType;
+use rustfs_replication::ReplicationStatusType;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_FORCE_DELETE, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
     SUFFIX_SOURCE_DELETEMARKER, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST, SUFFIX_SOURCE_VERSION_ID, get_header,
@@ -820,7 +820,7 @@ mod tests {
         get_default_opts, get_opts, parse_copy_source_range, put_opts, put_opts_from_headers, validate_archive_content_encoding,
     };
     use http::{HeaderMap, HeaderValue};
-    use rustfs_filemeta::ReplicationStatusType;
+    use rustfs_replication::ReplicationStatusType;
     use rustfs_utils::http::{
         AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER,
         AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER, SUFFIX_FORCE_DELETE, SUFFIX_SOURCE_MTIME, SUFFIX_SOURCE_REPLICATION_REQUEST,

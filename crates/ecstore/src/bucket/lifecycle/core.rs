@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use rustfs_config::{DEFAULT_ILM_PROCESS_TIME_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
-use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
+use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
     NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
