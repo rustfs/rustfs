@@ -218,7 +218,7 @@ jobs:
     name: Build RustFS Debug Binary
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -251,7 +251,7 @@ jobs:
     name: Build RustFS Debug Binary (rio-v2)
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 30
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -284,7 +284,7 @@ jobs:
     name: End-to-End Tests
     needs: [ skip-check, build-rustfs-debug-binary ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
@@ -334,7 +334,7 @@ jobs:
     name: End-to-End Tests (rio-v2)
     needs: [ skip-check, build-rustfs-debug-binary-rio-v2 ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-2
+    runs-on: sm-standard-2
     timeout-minutes: 30
     steps:
       - name: Checkout repository
