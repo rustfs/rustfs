@@ -7957,16 +7957,6 @@ checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quick-xml"
-version = "0.40.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2474bd2e5029e7ccb6abb2ba48cf2383a333851dedf495901544281590c7da7f"
-dependencies = [
- "memchr",
- "serde",
-]
-
-[[package]]
-name = "quick-xml"
 version = "0.41.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
@@ -9061,7 +9051,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "proptest",
- "quick-xml 0.41.0",
+ "quick-xml",
  "rand 0.10.1",
  "ratelimit",
  "rcgen",
@@ -9414,7 +9404,7 @@ dependencies = [
  "hashbrown 0.17.1",
  "metrics",
  "percent-encoding",
- "quick-xml 0.41.0",
+ "quick-xml",
  "rayon",
  "rustc-hash",
  "rustfs-config",
@@ -9552,7 +9542,7 @@ dependencies = [
  "md5",
  "percent-encoding",
  "proptest",
- "quick-xml 0.41.0",
+ "quick-xml",
  "regex",
  "russh",
  "russh-sftp",
@@ -10151,7 +10141,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.14.0"
-source = "git+https://github.com/rustfs/s3s?rev=300c657fb895b87e01e30b06e41a7996e57191f9#300c657fb895b87e01e30b06e41a7996e57191f9"
+source = "git+https://github.com/rustfs/s3s?rev=921e9c5911951ae9efb91dc237e11be9f2f10a14#921e9c5911951ae9efb91dc237e11be9f2f10a14"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -10178,7 +10168,7 @@ dependencies = [
  "nom 8.0.0",
  "numeric_cast",
  "pin-project-lite",
- "quick-xml 0.40.1",
+ "quick-xml",
  "serde",
  "serde_json",
  "serde_urlencoded",
