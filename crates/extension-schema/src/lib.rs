@@ -782,7 +782,7 @@ mod tests {
         let contract = OpsProfilerContract {
             mode: OpsProfilerContractMode::CapabilityDescription,
             backends: vec![
-                profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true),
                 profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, false),
                 profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
                 profiler_backend("future_kernel_profiler", OpsProfilerBackendStatus::Unknown, false),
@@ -803,7 +803,7 @@ mod tests {
     fn ops_profiler_schema_serializes_stable_json_shape() {
         let contract = OpsProfilerContract {
             mode: OpsProfilerContractMode::CapabilityDescription,
-            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
         };
 
         let value = serde_json::to_value(contract).expect("ops profiler schema should serialize");
@@ -813,7 +813,7 @@ mod tests {
             json!({
                 "mode": "capability_description",
                 "backends": [{
-                    "backend": "cpu_pprof",
+                    "backend": "pyroscope",
                     "status": "enabled",
                     "supports_profile_export": true,
                     "redaction_required": ["secret", "token", "local_path", "host"],
@@ -860,7 +860,7 @@ mod tests {
             contract: OpsProfilerContract {
                 mode: OpsProfilerContractMode::CapabilityDescription,
                 backends: vec![
-                    profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
+                    profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true),
                     profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, false),
                     profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
                 ],
@@ -898,7 +898,7 @@ mod tests {
             },
             contract: OpsProfilerContract {
                 mode: OpsProfilerContractMode::CapabilityDescription,
-                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+                backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
             },
         };
 
@@ -916,7 +916,7 @@ mod tests {
                 "contract": {
                     "mode": "capability_description",
                     "backends": [{
-                        "backend": "cpu_pprof",
+                        "backend": "pyroscope",
                         "status": "enabled",
                         "supports_profile_export": true,
                         "redaction_required": ["secret", "token", "local_path", "host"],
@@ -942,7 +942,7 @@ mod tests {
             },
             contract: OpsProfilerContract {
                 mode: OpsProfilerContractMode::CapabilityDescription,
-                backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+                backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
             },
         };
 
@@ -976,7 +976,7 @@ mod tests {
     fn rejects_ops_profiler_execution_requests_and_empty_backends() {
         let mut contract = OpsProfilerContract {
             mode: OpsProfilerContractMode::ExecutionRequest,
-            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
         };
 
         assert_eq!(
@@ -998,7 +998,7 @@ mod tests {
         let err = serde_json::from_value::<OpsProfilerContract>(json!({
             "mode": "capability_description",
             "backends": [{
-                "backend": "cpu_pprof",
+                "backend": "pyroscope",
                 "status": "enabled",
                 "supports_profile_export": true,
                 "redaction_required": ["local_path"]
@@ -1014,7 +1014,7 @@ mod tests {
         let err = serde_json::from_value::<OpsProfilerContract>(json!({
             "mode": "capability_description",
             "backends": [{
-                "backend": "cpu_pprof",
+                "backend": "pyroscope",
                 "status": "enabled",
                 "supports_profile_export": true,
                 "redaction_required": ["local_path"],
@@ -1035,7 +1035,7 @@ mod tests {
     fn rejects_ops_profiler_invalid_backend_and_redaction_shape() {
         let mut contract = OpsProfilerContract {
             mode: OpsProfilerContractMode::CapabilityDescription,
-            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
         };
         contract.backends[0].backend = OpsProfilerBackendName::new(" ");
 
@@ -1044,15 +1044,15 @@ mod tests {
             ExtensionContractError::EmptyOpsProfilerBackend
         );
 
-        contract.backends[0] = profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true);
+        contract.backends[0] = profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true);
         contract
             .backends
-            .push(profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Disabled, false));
+            .push(profiler_backend("pyroscope", OpsProfilerBackendStatus::Disabled, false));
 
         assert_eq!(
             validate_ops_profiler_contract(&contract).expect_err("duplicate backends should fail validation"),
             ExtensionContractError::DuplicateOpsProfilerBackend {
-                backend: "cpu_pprof".to_string()
+                backend: "pyroscope".to_string()
             }
         );
 
@@ -1062,7 +1062,7 @@ mod tests {
         assert_eq!(
             validate_ops_profiler_contract(&contract).expect_err("duplicate redaction fields should fail validation"),
             ExtensionContractError::DuplicateOpsProfilerRedactionField {
-                backend: "cpu_pprof".to_string(),
+                backend: "pyroscope".to_string(),
                 field: OpsProfilerRedactionField::Host
             }
         );
@@ -1072,7 +1072,7 @@ mod tests {
         assert_eq!(
             validate_ops_profiler_contract(&contract).expect_err("profile export requires local path redaction"),
             ExtensionContractError::OpsProfilerMissingLocalPathRedaction {
-                backend: "cpu_pprof".to_string()
+                backend: "pyroscope".to_string()
             }
         );
     }
@@ -1081,14 +1081,14 @@ mod tests {
     fn rejects_ops_profiler_missing_provenance_boundary() {
         let mut contract = OpsProfilerContract {
             mode: OpsProfilerContractMode::CapabilityDescription,
-            backends: vec![profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true)],
+            backends: vec![profiler_backend("pyroscope", OpsProfilerBackendStatus::Enabled, true)],
         };
         contract.backends[0].provenance.source = " ".to_string();
 
         assert_eq!(
             validate_ops_profiler_contract(&contract).expect_err("provenance source should be required"),
             ExtensionContractError::EmptyOpsProfilerProvenanceSource {
-                backend: "cpu_pprof".to_string()
+                backend: "pyroscope".to_string()
             }
         );
 
@@ -1098,7 +1098,7 @@ mod tests {
         assert_eq!(
             validate_ops_profiler_contract(&contract).expect_err("collection boundary should be required"),
             ExtensionContractError::EmptyOpsProfilerCollectionBoundary {
-                backend: "cpu_pprof".to_string()
+                backend: "pyroscope".to_string()
             }
         );
     }
