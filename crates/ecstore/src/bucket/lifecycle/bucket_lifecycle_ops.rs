@@ -1658,6 +1658,9 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
     let mut deleted = 0usize;
     let mut candidates = HashMap::new();
 
+    // Discovery is intentionally local-owner based: each server lists the disks
+    // it owns locally. Once a stale upload path is found, delete_all fans out
+    // idempotently across the set to remove matching shards on every disk.
     for disk in set.get_local_disks().await.into_iter().flatten() {
         if !disk.is_online().await {
             continue;
