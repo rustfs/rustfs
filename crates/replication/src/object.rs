@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use time::OffsetDateTime;
 
 const AMZ_META_PREFIX: &str = "X-Amz-Meta-";
+const CONTENT_ENCODING_LOWER: &str = "content-encoding";
 const REPLICATION_METADATA_COMPARE_KEYS: [&str; 9] = [
     EXPIRES,
     CACHE_CONTROL,
@@ -62,8 +63,12 @@ pub struct ReplicationTargetObject<'a> {
 }
 
 pub fn content_matches_by_etag(source: &ReplicationSourceObject<'_>, target: &ReplicationTargetObject<'_>) -> bool {
-    let source_etag = source.etag.map(trim_etag);
-    let target_etag = target.etag.map(trim_etag);
+    replication_etags_match(source.etag, target.etag)
+}
+
+pub fn replication_etags_match(source: Option<&str>, target: Option<&str>) -> bool {
+    let source_etag = source.map(trim_etag);
+    let target_etag = target.map(trim_etag);
     source_etag.is_some() && source_etag == target_etag
 }
 
@@ -121,7 +126,7 @@ fn content_encoding_differs(source: &ReplicationSourceObject<'_>, target: &Repli
             .and_then(|metadata| {
                 metadata
                     .get(CONTENT_ENCODING)
-                    .or_else(|| metadata.get(&CONTENT_ENCODING.to_lowercase()))
+                    .or_else(|| metadata.get(CONTENT_ENCODING_LOWER))
             })
             .is_none_or(|enc| enc != content_encoding);
     }
@@ -130,14 +135,11 @@ fn content_encoding_differs(source: &ReplicationSourceObject<'_>, target: &Repli
 
 fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &ReplicationTargetObject<'_>) -> bool {
     let source_tags = ReplicationTagFilter::decode_tags_to_map(source.user_tags);
-    let target_tags = ReplicationTagFilter::decode_tags_to_map(
-        target
-            .metadata
-            .and_then(|metadata| metadata.get(AMZ_OBJECT_TAGGING))
-            .cloned()
-            .unwrap_or_default()
-            .as_str(),
-    );
+    let target_tagging = target
+        .metadata
+        .and_then(|metadata| metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str))
+        .unwrap_or_default();
+    let target_tags = ReplicationTagFilter::decode_tags_to_map(target_tagging);
     let source_tag_count = match i32::try_from(source_tags.len()) {
         Ok(count) => count,
         Err(_) => i32::MAX,
@@ -163,7 +165,7 @@ fn comparable_metadata(metadata: Option<&HashMap<String, String>>) -> HashMap<St
 mod tests {
     use super::{
         ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
-        target_is_newer_than_source_null_version,
+        replication_etags_match, target_is_newer_than_source_null_version,
     };
     use rustfs_filemeta::{ReplicationAction, ReplicationType};
     use std::collections::HashMap;
@@ -214,6 +216,7 @@ mod tests {
         };
 
         assert!(content_matches_by_etag(&source, &target));
+        assert!(replication_etags_match(source.etag, target.etag));
     }
 
     #[test]
