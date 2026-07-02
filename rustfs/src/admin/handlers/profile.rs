@@ -54,14 +54,11 @@ impl Operation for TriggerProfileCPU {
 
         #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
         {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(
-                    crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0))
-                        .await
-                        .unwrap_err(),
-                ),
-            )));
+            let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
+                Ok(path) => path.display().to_string(),
+                Err(err) => err,
+            };
+            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))));
         }
 
         #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
@@ -86,25 +83,11 @@ impl Operation for TriggerProfileMemory {
         authorize_profile_request(&req).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(crate::profiling::dump_memory_pprof_now().await.unwrap_err()),
-            )));
-        }
-
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        {
-            match crate::profiling::dump_memory_pprof_now().await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
-            }
-        }
+        let message = match crate::profiling::dump_memory_pprof_now().await {
+            Ok(path) => path.display().to_string(),
+            Err(err) => err,
+        };
+        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
     }
 }
 

@@ -186,24 +186,18 @@ opentelemetry = { workspace = true }
 tracing-opentelemetry = { workspace = true }
 # Data structures
 hashbrown = { workspace = true }
+mimalloc = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libsystemd.workspace = true
 # io-uring is Linux-only. Scope the feature to Linux targets.
 tokio = { workspace = true, features = ["io-uring"] }
 
-[target.'cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
-mimalloc = { workspace = true }
+[target.'cfg(not(target_os = "windows"))'.dependencies]
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 pprof = { workspace = true }
-
-# jemalloc-based allocator and memory profiling are only enabled on validated linux-gnu-x86_64 targets.
-[target.'cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))'.dependencies]
-tikv-jemallocator = { workspace = true }
-tikv-jemalloc-ctl = { workspace = true }
-jemalloc_pprof = { workspace = true }
 
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }

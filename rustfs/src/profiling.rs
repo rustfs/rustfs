@@ -93,7 +93,6 @@ mod linux_impl {
     const LOG_COMPONENT_PROFILING: &str = "profiling";
     const LOG_SUBSYSTEM_CPU: &str = "cpu";
     const LOG_SUBSYSTEM_MEMORY: &str = "memory";
-    const LOG_SUBSYSTEM_JEMALLOC: &str = "jemalloc";
     const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 
     static CPU_CONT_GUARD: OnceLock<Arc<Mutex<Option<pprof::ProfilerGuard<'static>>>>> = OnceLock::new();
@@ -190,135 +189,18 @@ mod linux_impl {
         dump_cpu_with_guard(&guard).await
     }
 
-    // Public API: dump memory pprof now (jemalloc)
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
-        let out = output_dir().join(format!("mem_profile_{}.pb", ts()));
-        let mut f = File::create(&out).map_err(|e| format!("create file failed: {e}"))?;
-
-        let prof_ctl_cell = jemalloc_pprof::PROF_CTL
-            .as_ref()
-            .ok_or_else(|| "jemalloc profiling control not available".to_string())?;
-        let mut prof_ctl = prof_ctl_cell.lock().await;
-
-        if !prof_ctl.activated() {
-            return Err("jemalloc profiling is not active".to_string());
-        }
-
-        let bytes = prof_ctl.dump_pprof().map_err(|e| format!("dump pprof failed: {e}"))?;
-        f.write_all(&bytes).map_err(|e| format!("write file failed: {e}"))?;
-        info!(
-            component = LOG_COMPONENT_PROFILING,
-            subsystem = LOG_SUBSYSTEM_MEMORY,
-            event = "profiling_dump_exported",
-            profile_type = "memory",
-            path = %out.display(),
-            "Profiling dump exported"
-        );
-        Ok(out)
-    }
-
-    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
         Err(memory_profiling_unsupported_message())
     }
 
-    // Jemalloc status check (No forced placement, only status observation)
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    pub async fn check_jemalloc_profiling() {
-        use tikv_jemalloc_ctl::{config, epoch, stats};
-
-        if let Err(e) = epoch::advance() {
-            warn!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_epoch_advance_failed",
-                error = %e,
-                "Jemalloc profiling state changed"
-            );
-        }
-
-        match config::malloc_conf::read() {
-            Ok(conf) => debug!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_malloc_conf",
-                result = "ok",
-                malloc_conf = %conf,
-                "Jemalloc profiling state checked"
-            ),
-            Err(e) => debug!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_malloc_conf",
-                result = "read_failed",
-                error = %e,
-                "Jemalloc profiling state checked"
-            ),
-        }
-
-        match std::env::var("MALLOC_CONF") {
-            Ok(v) => debug!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_malloc_conf_env",
-                state = "set",
-                malloc_conf = %v,
-                "Jemalloc profiling state checked"
-            ),
-            Err(_) => debug!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_malloc_conf_env",
-                state = "unset",
-                "Jemalloc profiling state checked"
-            ),
-        }
-
-        if let Some(lock) = jemalloc_pprof::PROF_CTL.as_ref() {
-            let ctl = lock.lock().await;
-            info!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_profiling_status",
-                activated = ctl.activated(),
-                "Jemalloc profiling status checked"
-            );
-        } else {
-            debug!(
-                component = LOG_COMPONENT_PROFILING,
-                subsystem = LOG_SUBSYSTEM_JEMALLOC,
-                event = "jemalloc_profiling_status",
-                state = "unavailable",
-                "Jemalloc profiling status checked"
-            );
-        }
-
-        let _ = epoch::advance();
-        macro_rules! show {
-            ($name:literal, $reader:expr) => {
-                match $reader {
-                    Ok(v) => debug!(concat!($name, "={}"), v),
-                    Err(e) => debug!(concat!($name, " read failed: {}"), e),
-                }
-            };
-        }
-        show!("allocated", stats::allocated::read());
-        show!("resident", stats::resident::read());
-        show!("mapped", stats::mapped::read());
-        show!("metadata", stats::metadata::read());
-        show!("active", stats::active::read());
-    }
-
-    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-    pub async fn check_jemalloc_profiling() {
+    pub async fn check_memory_profiling() {
         debug!(
             component = LOG_COMPONENT_PROFILING,
-            subsystem = LOG_SUBSYSTEM_JEMALLOC,
-            event = "jemalloc_profiling_status",
+            subsystem = LOG_SUBSYSTEM_MEMORY,
+            event = "memory_profiling_status",
             result = "skipped",
-            reason = "unsupported_target",
-            "Jemalloc profiling status checked"
+            reason = "mimalloc_memory_pprof_unsupported",
+            "Memory profiling status checked"
         );
     }
 
@@ -470,121 +352,13 @@ mod linux_impl {
         });
     }
 
-    // Internal: start periodic memory dump when jemalloc profiling is active
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    async fn start_memory_periodic(interval: Duration, token: CancellationToken) {
-        info!(
-            component = LOG_COMPONENT_PROFILING,
-            subsystem = LOG_SUBSYSTEM_MEMORY,
-            event = "profiling_state",
-            profile_type = "memory_periodic",
-            state = "started",
-            ?interval,
-            "Periodic memory profiling started"
-        );
-        tokio::spawn(async move {
-            loop {
-                tokio::select! {
-                    _ = token.cancelled() => {
-                        info!(
-                            component = LOG_COMPONENT_PROFILING,
-                            subsystem = LOG_SUBSYSTEM_MEMORY,
-                            event = "profiling_state",
-                            profile_type = "memory_periodic",
-                            state = "cancelled",
-                            "Periodic memory profiling cancelled"
-                        );
-                        break;
-                    }
-                    _ = sleep(interval) => {}
-                }
-
-                let Some(lock) = jemalloc_pprof::PROF_CTL.as_ref() else {
-                    debug!(
-                        component = LOG_COMPONENT_PROFILING,
-                        subsystem = LOG_SUBSYSTEM_MEMORY,
-                        event = "profiling_dump_skipped",
-                        profile_type = "memory_periodic",
-                        reason = "prof_ctl_unavailable",
-                        "Profiling dump skipped"
-                    );
-                    continue;
-                };
-
-                let mut ctl = lock.lock().await;
-                if !ctl.activated() {
-                    debug!(
-                        component = LOG_COMPONENT_PROFILING,
-                        subsystem = LOG_SUBSYSTEM_MEMORY,
-                        event = "profiling_dump_skipped",
-                        profile_type = "memory_periodic",
-                        reason = "jemalloc_inactive",
-                        "Profiling dump skipped"
-                    );
-                    continue;
-                }
-                let out = output_dir().join(format!("mem_profile_periodic_{}.pb", ts()));
-                match File::create(&out) {
-                    Err(e) => {
-                        tracing::error!(
-                            component = LOG_COMPONENT_PROFILING,
-                            subsystem = LOG_SUBSYSTEM_MEMORY,
-                            event = "profiling_dump_failed",
-                            profile_type = "memory_periodic",
-                            stage = "create_file",
-                            path = %out.display(),
-                            error = %e,
-                            "Periodic memory dump file creation failed"
-                        );
-                        continue;
-                    }
-                    Ok(mut f) => match ctl.dump_pprof() {
-                        Ok(bytes) => {
-                            if let Err(e) = f.write_all(&bytes) {
-                                tracing::error!(
-                                    component = LOG_COMPONENT_PROFILING,
-                                    subsystem = LOG_SUBSYSTEM_MEMORY,
-                                    event = "profiling_dump_failed",
-                                    profile_type = "memory_periodic",
-                                    stage = "write_dump",
-                                    path = %out.display(),
-                                    error = %e,
-                                    "Periodic memory dump write failed"
-                                );
-                            } else {
-                                debug!(
-                                    component = LOG_COMPONENT_PROFILING,
-                                    subsystem = LOG_SUBSYSTEM_MEMORY,
-                                    event = "profiling_dump_exported",
-                                    profile_type = "memory_periodic",
-                                    path = %out.display(),
-                                    "Profiling dump exported"
-                                );
-                            }
-                        }
-                        Err(e) => tracing::error!(
-                            component = LOG_COMPONENT_PROFILING,
-                            subsystem = LOG_SUBSYSTEM_MEMORY,
-                            event = "profiling_dump_failed",
-                            profile_type = "memory_periodic",
-                            stage = "dump_pprof",
-                            error = %e,
-                            "Periodic memory dump export failed"
-                        ),
-                    },
-                }
-            }
-        });
-    }
-
-    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     async fn start_memory_periodic(_interval: Duration, _token: CancellationToken) {
         debug!(
             component = LOG_COMPONENT_PROFILING,
             subsystem = LOG_SUBSYSTEM_MEMORY,
             event = "profiling_runtime_skipped",
             profile_type = "memory_periodic",
-            reason = "unsupported_target",
+            reason = "mimalloc_memory_pprof_unsupported",
             "Profiling runtime skipped"
         );
     }
@@ -603,8 +377,8 @@ mod linux_impl {
             return;
         }
 
-        // Jemalloc state check once (no dump)
-        check_jemalloc_profiling().await;
+        // Memory pprof dumps are disabled while RustFS uses mimalloc.
+        check_memory_profiling().await;
 
         // Initialize cancellation token
         let token = PROFILING_CANCEL_TOKEN.get_or_init(CancellationToken::new).clone();
@@ -636,11 +410,10 @@ mod linux_impl {
         }
     }
 
-    #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
     fn memory_profiling_unsupported_message() -> String {
         let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
         format!(
-            "Memory profiling is only supported on linux x86_64 gnu. target_os={}, target_env={target_env}, target_arch={}",
+            "Memory pprof dumps are not supported with the mimalloc allocator. target_os={}, target_env={target_env}, target_arch={}",
             std::env::consts::OS,
             std::env::consts::ARCH
         )

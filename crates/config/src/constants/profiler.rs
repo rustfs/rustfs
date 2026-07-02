@@ -24,7 +24,7 @@ pub const ENV_CPU_INTERVAL_SECS: &str = "RUSTFS_PROF_CPU_INTERVAL_SECS";
 /// Duration of each CPU profiling session (for periodic mode)
 pub const ENV_CPU_DURATION_SECS: &str = "RUSTFS_PROF_CPU_DURATION_SECS";
 
-/// Memory profiling (jemalloc)
+/// Periodic memory pprof dumps (currently unsupported with mimalloc)
 pub const ENV_MEM_PERIODIC: &str = "RUSTFS_PROF_MEM_PERIODIC";
 /// Interval between memory profiling snapshots (for periodic mode)
 pub const ENV_MEM_INTERVAL_SECS: &str = "RUSTFS_PROF_MEM_INTERVAL_SECS";
@@ -42,7 +42,7 @@ pub const DEFAULT_CPU_FREQ: usize = 100;
 pub const DEFAULT_CPU_INTERVAL_SECS: u64 = 300;
 /// Duration of each CPU profiling session (for periodic mode)
 pub const DEFAULT_CPU_DURATION_SECS: u64 = 60;
-/// Memory profiling (jemalloc)
+/// Periodic memory pprof dumps (currently unsupported with mimalloc)
 pub const DEFAULT_MEM_PERIODIC: bool = false;
 /// Interval between memory profiling snapshots (for periodic mode)
 pub const DEFAULT_MEM_INTERVAL_SECS: u64 = 300;

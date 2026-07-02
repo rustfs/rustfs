@@ -167,11 +167,7 @@ fn numa_status() -> CapabilityStatus {
 }
 
 fn memory_profiling_status() -> CapabilityStatus {
-    if cfg!(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")) {
-        CapabilityStatus::supported().with_reason("jemalloc memory profiling target")
-    } else {
-        CapabilityStatus::unsupported().with_reason("memory profiling supports linux gnu x86_64 targets")
-    }
+    CapabilityStatus::unsupported().with_reason("memory pprof dumps are not supported with the mimalloc allocator")
 }
 
 fn cgroup_memory_status() -> CapabilityStatus {
