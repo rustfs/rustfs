@@ -12,28 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::profile::authorize_profile_request;
+use super::profile::{authorize_profile_request, profile_not_implemented_response};
 use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::server::ADMIN_PREFIX;
-use http::{HeaderMap, HeaderValue, Uri};
+use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result};
-use std::collections::HashMap;
+use serde::Serialize;
 use tracing::error;
 
-#[allow(dead_code)]
-fn extract_query_params(uri: &Uri) -> HashMap<String, String> {
-    let mut params = HashMap::new();
-
-    if let Some(query) = uri.query() {
-        for (key, value) in url::form_urlencoded::parse(query.as_bytes()) {
-            params.insert(key.into_owned(), value.into_owned());
-        }
-    }
-
-    params
+#[derive(Serialize)]
+struct ProfileStatus {
+    enabled: &'static str,
+    status: &'static str,
+    platform: &'static str,
+    message: &'static str,
 }
 
 pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
@@ -60,11 +55,11 @@ impl Operation for ProfileHandler {
         authorize_profile_request(&req).await?;
 
         let requested_url = req.uri.to_string();
-        let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
-            Ok(path) => path.display().to_string(),
-            Err(err) => format!("{err}; requested_url={requested_url}"),
-        };
-        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(format!(
+            "{}; requested_url={requested_url}",
+            crate::profiling::local_cpu_pprof_unsupported_message()
+        )))
     }
 }
 
@@ -75,13 +70,12 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        let message = "Local CPU pprof dumps are not supported; use Pyroscope export instead";
-        let status = HashMap::from([
-            ("enabled", "false"),
-            ("status", "not_supported"),
-            ("platform", std::env::consts::OS),
-            ("message", message),
-        ]);
+        let status = ProfileStatus {
+            enabled: "false",
+            status: "not_supported",
+            platform: std::env::consts::OS,
+            message: crate::profiling::LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY,
+        };
 
         match serde_json::to_string(&status) {
             Ok(json) => {
@@ -102,7 +96,7 @@ impl Operation for ProfileStatusHandler {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProfileHandler, ProfileStatusHandler, extract_query_params};
+    use super::{ProfileHandler, ProfileStatusHandler};
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
@@ -121,17 +115,6 @@ mod tests {
             service: None,
             trailing_headers: None,
         }
-    }
-
-    #[test]
-    fn test_extract_query_params_decodes_percent_encoded_values() {
-        let uri: Uri = "/rustfs/admin/debug/pprof/profile?format=flamegraph&note=a%2Bb+value"
-            .parse()
-            .expect("uri should parse");
-        let params = extract_query_params(&uri);
-
-        assert_eq!(params.get("format"), Some(&"flamegraph".to_string()));
-        assert_eq!(params.get("note"), Some(&"a+b value".to_string()));
     }
 
     #[tokio::test]

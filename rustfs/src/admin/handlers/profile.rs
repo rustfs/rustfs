@@ -41,6 +41,10 @@ pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result
     .await
 }
 
+pub(super) fn profile_not_implemented_response(message: String) -> S3Response<(StatusCode, Body)> {
+    S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message)))
+}
+
 pub struct TriggerProfileCPU {}
 #[async_trait::async_trait]
 impl Operation for TriggerProfileCPU {
@@ -48,11 +52,8 @@ impl Operation for TriggerProfileCPU {
         authorize_profile_request(&req).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
-            Ok(path) => path.display().to_string(),
-            Err(err) => err,
-        };
-        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::local_cpu_pprof_unsupported_message()))
     }
 }
 
@@ -63,11 +64,8 @@ impl Operation for TriggerProfileMemory {
         authorize_profile_request(&req).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        let message = match crate::profiling::dump_memory_pprof_now().await {
-            Ok(path) => path.display().to_string(),
-            Err(err) => err,
-        };
-        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
+        crate::profiling::log_memory_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::memory_pprof_unsupported_message()))
     }
 }
 

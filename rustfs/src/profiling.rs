@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::path::PathBuf;
-use std::time::Duration;
 use tracing::{debug, info};
 
 const LOG_COMPONENT_PROFILING: &str = "profiling";
@@ -22,6 +20,8 @@ const LOG_SUBSYSTEM_MEMORY: &str = "memory";
 const LOG_SUBSYSTEM_RUNTIME: &str = "runtime";
 const LOCAL_CPU_PPROF_UNSUPPORTED_REASON: &str = "local_cpu_pprof_unsupported";
 const MEMORY_PPROF_UNSUPPORTED_REASON: &str = "mimalloc_memory_pprof_unsupported";
+pub const LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY: &str = "local CPU pprof dumps are not supported; use Pyroscope export instead";
+pub const MEMORY_PPROF_UNSUPPORTED_SUMMARY: &str = "memory pprof dumps are not supported with the mimalloc allocator";
 
 pub async fn init_from_env() {
     info!(
@@ -49,7 +49,7 @@ pub fn shutdown_profiling() {
     );
 }
 
-pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> {
+pub fn log_cpu_pprof_dump_skipped() {
     debug!(
         component = LOG_COMPONENT_PROFILING,
         subsystem = LOG_SUBSYSTEM_CPU,
@@ -58,10 +58,9 @@ pub async fn dump_cpu_pprof_for(_duration: Duration) -> Result<PathBuf, String> 
         reason = LOCAL_CPU_PPROF_UNSUPPORTED_REASON,
         "Local CPU pprof dump skipped"
     );
-    Err(local_cpu_pprof_unsupported_message())
 }
 
-pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
+pub fn log_memory_pprof_dump_skipped() {
     debug!(
         component = LOG_COMPONENT_PROFILING,
         subsystem = LOG_SUBSYSTEM_MEMORY,
@@ -70,21 +69,19 @@ pub async fn dump_memory_pprof_now() -> Result<PathBuf, String> {
         reason = MEMORY_PPROF_UNSUPPORTED_REASON,
         "Memory pprof dump skipped"
     );
-    Err(memory_pprof_unsupported_message())
 }
 
-fn local_cpu_pprof_unsupported_message() -> String {
-    format!(
-        "Local CPU pprof dumps are not supported while RustFS uses Pyroscope 2.x profiling. Use Pyroscope export instead. target_os={}, target_env={}, target_arch={}",
-        std::env::consts::OS,
-        target_env(),
-        std::env::consts::ARCH
-    )
+pub fn local_cpu_pprof_unsupported_message() -> String {
+    unsupported_message(LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY)
 }
 
-fn memory_pprof_unsupported_message() -> String {
+pub fn memory_pprof_unsupported_message() -> String {
+    unsupported_message(MEMORY_PPROF_UNSUPPORTED_SUMMARY)
+}
+
+fn unsupported_message(summary: &str) -> String {
     format!(
-        "Memory pprof dumps are not supported with the mimalloc allocator. target_os={}, target_env={}, target_arch={}",
+        "{summary}. target_os={}, target_env={}, target_arch={}",
         std::env::consts::OS,
         target_env(),
         std::env::consts::ARCH

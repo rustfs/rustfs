@@ -143,7 +143,7 @@ fn target_env_name() -> Option<&'static str> {
 }
 
 fn cpu_profiling_status() -> CapabilityStatus {
-    CapabilityStatus::unsupported().with_reason("local CPU pprof dumps are not supported; use Pyroscope export instead")
+    CapabilityStatus::unsupported().with_reason(crate::profiling::LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY)
 }
 
 fn ebpf_status() -> CapabilityStatus {
@@ -163,7 +163,7 @@ fn numa_status() -> CapabilityStatus {
 }
 
 fn memory_profiling_status() -> CapabilityStatus {
-    CapabilityStatus::unsupported().with_reason("memory pprof dumps are not supported with the mimalloc allocator")
+    CapabilityStatus::unsupported().with_reason(crate::profiling::MEMORY_PPROF_UNSUPPORTED_SUMMARY)
 }
 
 fn cgroup_memory_status() -> CapabilityStatus {
