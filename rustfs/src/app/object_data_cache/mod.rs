@@ -30,4 +30,4 @@ pub(crate) use invalidation::{
     invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
     invalidate_object_data_cache_objects_before_mutation,
 };
-pub(crate) use planner::GetObjectBodyCacheRequest;
+pub(crate) use planner::{GetObjectBodyCacheRequest, is_get_object_body_cacheable};

@@ -194,7 +194,7 @@ use crate::app::object_data_cache::{
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
     invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
     invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_objects_before_mutation, is_get_object_body_cacheable, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -2898,6 +2898,7 @@ impl DefaultObjectUsecase {
         }
 
         let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
+            && is_get_object_body_cacheable(cache_adapter, cache_request)
             && should_materialize_get_object_body_for_cache(
                 info,
                 response_content_length,
@@ -2907,7 +2908,28 @@ impl DefaultObjectUsecase {
             );
 
         if should_materialize_for_cache {
-            let mut buf = Vec::with_capacity(response_content_length as usize);
+            let Ok(materialized_capacity) = usize::try_from(response_content_length) else {
+                warn!(
+                    expected = response_content_length,
+                    "GetObject materialize-fill skipped because content length is not representable"
+                );
+                return Self::build_get_object_body(
+                    final_stream,
+                    info,
+                    response_content_length,
+                    optimal_buffer_size,
+                    enable_readahead,
+                    concurrent_requests,
+                    part_number,
+                    has_range,
+                    encryption_applied,
+                    None,
+                    bucket,
+                    key,
+                )
+                .await;
+            };
+            let mut buf = Vec::with_capacity(materialized_capacity);
             let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
             record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
@@ -6924,6 +6946,53 @@ mod tests {
             second_reads.load(AtomicOrdering::Relaxed),
             0,
             "cache hit after materialize-fill must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_skips_materialize_when_too_large_for_cache() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hello".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                max_entry_bytes: 4,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "too-large-object",
+        )
+        .await
+        .expect("too-large cache candidate should use streaming fallback");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "too-large materialize-fill candidate must not pre-read the fallback reader"
         );
     }
 
