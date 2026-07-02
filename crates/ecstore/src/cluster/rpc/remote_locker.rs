@@ -249,6 +249,22 @@ impl RemoteClient {
             }
         }
     }
+
+    fn unknown_lock_info(lock_id: &LockId) -> LockInfo {
+        LockInfo {
+            id: lock_id.clone(),
+            resource: lock_id.resource.clone(),
+            lock_type: LockType::Exclusive,
+            status: LockStatus::Acquired,
+            owner: "unknown".to_string(),
+            acquired_at: std::time::SystemTime::now(),
+            expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
+            last_refreshed: std::time::SystemTime::now(),
+            metadata: LockMetadata::default(),
+            priority: LockPriority::Normal,
+            wait_start_time: None,
+        }
+    }
 }
 
 #[async_trait]
@@ -338,11 +354,11 @@ impl LockClient for RemoteClient {
         let request_string = serde_json::to_string(&unlock_request)
             .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
         let mut client = self.get_client().await?;
+        let resource_summary = unlock_request.resource.to_string();
         let req = Request::new(GenerallyLockRequest { args: request_string });
-        let resp = client
-            .un_lock(req)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
+        let resp = self
+            .execute_rpc("release", &resource_summary, client.un_lock(req))
+            .await?
             .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
@@ -351,21 +367,25 @@ impl LockClient for RemoteClient {
     }
 
     async fn release_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
+        if lock_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let unlock_requests = lock_ids.iter().map(Self::create_unlock_request).collect::<Vec<_>>();
         let mut client = self.get_client().await?;
+        let resource_summary = Self::summarize_resources(&unlock_requests);
         let req = Request::new(BatchGenerallyLockRequest {
-            args: lock_ids
+            args: unlock_requests
                 .iter()
-                .map(|lock_id| {
-                    serde_json::to_string(&Self::create_unlock_request(lock_id))
-                        .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
+                .map(|request| {
+                    serde_json::to_string(request).map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
                 })
                 .collect::<Result<Vec<_>>>()?,
         });
 
-        let resp = client
-            .un_lock_batch(req)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
+        let resp = self
+            .execute_rpc("release_batch", &resource_summary, client.un_lock_batch(req))
+            .await?
             .into_inner();
 
         Ok(lock_ids
@@ -379,14 +399,14 @@ impl LockClient for RemoteClient {
         info!("remote refresh for {}", lock_id);
         let refresh_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
+        let resource_summary = refresh_request.resource.to_string();
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&refresh_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        let resp = client
-            .refresh(req)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
+        let resp = self
+            .execute_rpc("refresh", &resource_summary, client.refresh(req))
+            .await?
             .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
@@ -398,14 +418,14 @@ impl LockClient for RemoteClient {
         info!("remote force_release for {}", lock_id);
         let force_request = Self::create_unlock_request(lock_id);
         let mut client = self.get_client().await?;
+        let resource_summary = force_request.resource.to_string();
         let req = Request::new(GenerallyLockRequest {
             args: serde_json::to_string(&force_request)
                 .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
         });
-        let resp = client
-            .force_un_lock(req)
-            .await
-            .map_err(|e| LockError::internal(e.to_string()))?
+        let resp = self
+            .execute_rpc("force_release", &resource_summary, client.force_un_lock(req))
+            .await?
             .into_inner();
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
@@ -419,6 +439,7 @@ impl LockClient for RemoteClient {
         // Since there's no direct status query in the gRPC service,
         // we attempt a non-blocking lock acquisition to check if the resource is available
         let status_request = Self::create_unlock_request(lock_id);
+        let resource_summary = status_request.resource.to_string();
         let mut client = self.get_client().await?;
 
         // Try to acquire a very short-lived lock to test availability
@@ -428,56 +449,27 @@ impl LockClient for RemoteClient {
         });
 
         // Try exclusive lock first with very short timeout
-        let resp = client.lock(req).await;
+        let resp = match self.execute_rpc("check_status", &resource_summary, client.lock(req)).await {
+            Ok(response) => response.into_inner(),
+            Err(_) => return Ok(Some(Self::unknown_lock_info(lock_id))),
+        };
 
-        match resp {
-            Ok(response) => {
-                let resp = response.into_inner();
-                if resp.success {
-                    // If we successfully acquired the lock, the resource was free
-                    // Immediately release it
-                    let release_req = Request::new(GenerallyLockRequest {
-                        args: serde_json::to_string(&status_request)
-                            .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
-                    });
-                    let _ = client.un_lock(release_req).await; // Best effort release
+        if resp.success {
+            // If we successfully acquired the lock, the resource was free.
+            // Immediately release it on a best-effort basis.
+            let release_req = Request::new(GenerallyLockRequest {
+                args: serde_json::to_string(&status_request)
+                    .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?,
+            });
+            let _ = self
+                .execute_rpc("check_status_release", &resource_summary, client.un_lock(release_req))
+                .await;
 
-                    // Return None since no one was holding the lock
-                    Ok(None)
-                } else {
-                    // Lock acquisition failed, meaning someone is holding it
-                    // We can't determine the exact details remotely, so return a generic status
-                    Ok(Some(LockInfo {
-                        id: lock_id.clone(),
-                        resource: lock_id.resource.clone(),
-                        lock_type: LockType::Exclusive, // We can't know the exact type
-                        status: LockStatus::Acquired,
-                        owner: "unknown".to_string(), // Remote client can't determine owner
-                        acquired_at: std::time::SystemTime::now(),
-                        expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
-                        last_refreshed: std::time::SystemTime::now(),
-                        metadata: LockMetadata::default(),
-                        priority: LockPriority::Normal,
-                        wait_start_time: None,
-                    }))
-                }
-            }
-            Err(_) => {
-                // Communication error or lock is held
-                Ok(Some(LockInfo {
-                    id: lock_id.clone(),
-                    resource: lock_id.resource.clone(),
-                    lock_type: LockType::Exclusive,
-                    status: LockStatus::Acquired,
-                    owner: "unknown".to_string(),
-                    acquired_at: std::time::SystemTime::now(),
-                    expires_at: std::time::SystemTime::now() + std::time::Duration::from_secs(3600),
-                    last_refreshed: std::time::SystemTime::now(),
-                    metadata: LockMetadata::default(),
-                    priority: LockPriority::Normal,
-                    wait_start_time: None,
-                }))
-            }
+            Ok(None)
+        } else {
+            // Lock acquisition failed, meaning someone is holding it.
+            // We can't determine the exact details remotely, so return a generic status.
+            Ok(Some(Self::unknown_lock_info(lock_id)))
         }
     }
 
@@ -556,6 +548,17 @@ mod tests {
             }
         });
         Some((addr, task))
+    }
+
+    async fn closed_listener_addr() -> Option<String> {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(listener) => listener,
+            Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => return None,
+            Err(err) => panic!("test listener should bind: {err}"),
+        };
+        let addr = format!("http://{}", listener.local_addr().expect("listener local address should be available"));
+        drop(listener);
+        Some(addr)
     }
 
     async fn cache_lazy_channel(addr: &str) {
@@ -657,6 +660,113 @@ mod tests {
             assert!(
                 !runtime_sources::test_node_channel_is_cached(&addr).await,
                 "batch transport timeout should evict cached connection"
+            );
+        })
+        .await;
+
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_remote_client_release_uses_rpc_timeout_and_evicts_connection() {
+        ensure_test_rpc_secret();
+        let Some((addr, accept_task)) = spawn_hanging_listener().await else {
+            return;
+        };
+        cache_lazy_channel(&addr).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
+
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"))], async {
+            let client = RemoteClient::new(addr.clone());
+            let request = test_lock_request(Duration::from_millis(5));
+            let started_at = tokio::time::Instant::now();
+
+            let err = client.release(&request.lock_id).await.expect_err("release should time out");
+            let elapsed = started_at.elapsed();
+
+            assert!(
+                elapsed >= Duration::from_millis(40),
+                "remote release RPC should use configured transport timeout, got {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "test RPC timeout should keep the test fast, got {elapsed:?}"
+            );
+            assert!(matches!(err, LockError::Timeout { .. }), "expected remote release timeout, got {err:?}");
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "release timeout should evict cached connection"
+            );
+        })
+        .await;
+
+        accept_task.abort();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_remote_client_refresh_tonic_error_evicts_connection() {
+        ensure_test_rpc_secret();
+        let Some(addr) = closed_listener_addr().await else {
+            return;
+        };
+        cache_lazy_channel(&addr).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
+
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("500"))], async {
+            let client = RemoteClient::new(addr.clone());
+            let request = test_lock_request(Duration::from_millis(5));
+
+            let err = client
+                .refresh(&request.lock_id)
+                .await
+                .expect_err("refresh should report tonic failure");
+
+            assert!(
+                err.to_string().contains("refresh RPC failed"),
+                "expected refresh RPC failure marker, got {err}"
+            );
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "refresh tonic error should evict cached connection"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn test_remote_client_check_status_timeout_evicts_connection_and_preserves_status_shape() {
+        ensure_test_rpc_secret();
+        let Some((addr, accept_task)) = spawn_hanging_listener().await else {
+            return;
+        };
+        cache_lazy_channel(&addr).await;
+        assert!(runtime_sources::test_node_channel_is_cached(&addr).await);
+
+        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_RPC_TIMEOUT_MS, Some("50"))], async {
+            let client = RemoteClient::new(addr.clone());
+            let request = test_lock_request(Duration::from_millis(5));
+            let started_at = tokio::time::Instant::now();
+
+            let status = client.check_status(&request.lock_id).await.unwrap();
+            let elapsed = started_at.elapsed();
+
+            assert!(
+                elapsed >= Duration::from_millis(40),
+                "remote check_status RPC should use configured transport timeout, got {elapsed:?}"
+            );
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "test RPC timeout should keep the test fast, got {elapsed:?}"
+            );
+            let info = status.expect("communication failure should preserve unknown lock status shape");
+            assert_eq!(info.id, request.lock_id);
+            assert_eq!(info.owner, "unknown");
+            assert!(
+                !runtime_sources::test_node_channel_is_cached(&addr).await,
+                "check_status timeout should evict cached connection"
             );
         })
         .await;
