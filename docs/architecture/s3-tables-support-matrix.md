@@ -42,11 +42,11 @@ catalog extension.
 |---|---|---|
 | PyIceberg | Automated | Creates namespace and table, appends rows, reloads, scans, probes metadata-location, refs, views, maintenance, diagnostics, and optional catalog-vended table credentials with an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | RustFS can generate pinned Spark/Iceberg package inputs, REST catalog properties, SQL, run commands, expected `row_count=2`, and a CI opt-in gate for namespace creation, table creation, append, refresh, count, and cleanup. Live Spark execution and commit-conflict probing are still manual validation items unless explicitly enabled in the runner. |
-| Trino Iceberg REST catalog | Documented, not automated | Read-path configuration reference only. Write compatibility is not claimed. |
-| DuckDB Iceberg | Documented, not automated | Read-path reference only. Write and commit compatibility are not claimed. |
+| Trino Iceberg REST catalog | Manual/live harness | RustFS can generate catalog properties and a read-only `SELECT COUNT(*)` command for a table created by PyIceberg or Spark. Write compatibility is not claimed. |
+| DuckDB Iceberg | Manual/live harness | RustFS can generate `httpfs` and `iceberg` SQL using an operator-supplied current metadata location. Write and commit compatibility are not claimed. |
 | StarRocks Iceberg REST catalog | Documented, not automated | External catalog read-path reference only. Write compatibility is not claimed. |
-| Databend | Documented, not automated | S3 data-plane reference only. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
-| Snowflake Open Catalog / Iceberg integrations | Reference only | Kept as a future integration reference until a repeatable harness exists. |
+| Databend | Manual/live harness | RustFS can generate an S3 stage read probe for table data files. RustFS does not claim Databend Iceberg REST Catalog integration yet. |
+| Snowflake Open Catalog / Iceberg integrations | Generated harness | RustFS can generate an operator-adapted external volume/catalog SQL template. Live RustFS interoperability is not claimed. |
 
 ## Catalog API Matrix
 
@@ -190,7 +190,10 @@ python3 scripts/table-catalog/engine_compatibility.py \
   --account-id 123456789012 \
   --table-bucket analytics \
   --print-spark-config
-python3 scripts/table-catalog/engine_compatibility.py --print-live-conformance --cleanup
+python3 scripts/table-catalog/engine_compatibility.py \
+  --metadata-location s3://rustfs-s3table-smoke/tables/table-id/metadata/v1.metadata.json \
+  --print-live-conformance \
+  --cleanup
 python3 scripts/table-catalog/failure_coverage.py \
   --warehouse rustfs-s3table-smoke \
   --namespace smoke \
@@ -212,9 +215,9 @@ Acceptable wording:
 
 > RustFS includes a core Iceberg REST Catalog-based S3 Tables implementation
 > with PyIceberg smoke coverage, table-aware S3 data-plane policy checks,
-> controlled maintenance, catalog recovery diagnostics, Spark manual/live
-> conformance input, production-failure probe harnesses, and disaster-recovery
-> rehearsal probes.
+> controlled maintenance, catalog recovery diagnostics, manual conformance
+> input for Spark, Trino, DuckDB, Databend, and Snowflake, production-failure
+> probe harnesses, and disaster-recovery rehearsal probes.
 
 Do not claim:
 
