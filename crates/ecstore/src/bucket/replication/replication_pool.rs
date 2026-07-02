@@ -22,8 +22,8 @@ use super::replication_filemeta_boundary::{
 };
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_resyncer::{
-    DeletedObjectReplicationInfo, ReplicationConfig, ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file,
-    get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
+    ReplicationConfig, ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
+    replicate_delete, replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
@@ -31,6 +31,7 @@ use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
+use rustfs_replication::DeletedObjectReplicationInfo;
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::any::Any;
 use std::sync::Arc;

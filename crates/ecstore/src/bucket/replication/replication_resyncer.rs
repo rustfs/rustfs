@@ -19,10 +19,10 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType,
-    ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state,
-    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
+    replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_metadata_boundary::ReplicationMetadataStore;
@@ -55,7 +55,9 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-use rustfs_replication::{BucketReplicationResyncStatus, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus};
+use rustfs_replication::{
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus,
+};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
@@ -71,7 +73,6 @@ use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
 use serde::Deserialize;
 use serde::Serialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -963,57 +964,6 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
 
 async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
     ReplicationMetadataStore::optional_replication_config(bucket).await
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DeletedObjectReplicationInfo {
-    pub delete_object: DeletedObject,
-    pub bucket: String,
-    pub event_type: String,
-    pub op_type: ReplicationType,
-    pub reset_id: String,
-    pub target_arn: String,
-}
-
-impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn to_mrf_entry(&self) -> MrfReplicateEntry {
-        MrfReplicateEntry {
-            bucket: self.bucket.clone(),
-            object: self.delete_object.object_name.clone(),
-            // version_id here is the version being purged (if any); the delete-marker
-            // version is stored separately in delete_marker_version_id.
-            version_id: self.delete_object.version_id,
-            retry_count: 0,
-            size: 0,
-            op: MrfOpKind::Delete,
-            delete_marker_version_id: self.delete_object.delete_marker_version_id,
-            delete_marker: self.delete_object.delete_marker,
-        }
-    }
-
-    fn get_bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    fn get_object(&self) -> &str {
-        &self.delete_object.object_name
-    }
-
-    fn get_size(&self) -> i64 {
-        0
-    }
-
-    fn is_delete_marker(&self) -> bool {
-        true
-    }
-
-    fn get_op_type(&self) -> ReplicationType {
-        self.op_type
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
