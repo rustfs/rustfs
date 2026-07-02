@@ -40,6 +40,27 @@ impl ReplicationQueueAdmission {
     }
 }
 
+pub fn mrf_save_admission(saved: bool) -> ReplicationQueueAdmission {
+    if saved {
+        ReplicationQueueAdmission::Queued
+    } else {
+        ReplicationQueueAdmission::Missed
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationWorkerQueue {
+    Regular,
+    Mrf,
+}
+
+pub fn worker_queue_for_replication_type(op_type: &ReplicationType) -> ReplicationWorkerQueue {
+    match op_type {
+        ReplicationType::Heal | ReplicationType::ExistingObject => ReplicationWorkerQueue::Mrf,
+        _ => ReplicationWorkerQueue::Regular,
+    }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ReplicationHealQueueResult {
     pub object_info: ReplicateObjectInfo,
@@ -247,11 +268,14 @@ mod tests {
     use rustfs_storage_api::DeletedObject;
     use uuid::Uuid;
 
-    use super::{ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
+    use super::{
+        ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue,
+    };
     use crate::{
         DeletedObjectReplicationInfo, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
         ReplicateObjectInfo, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
-        ResyncTargetDecision, VersionPurgeStatusType, replication_heal_queue_action,
+        ResyncTargetDecision, VersionPurgeStatusType, mrf_save_admission, replication_heal_queue_action,
+        worker_queue_for_replication_type,
     };
 
     #[test]
@@ -266,6 +290,29 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Skipped);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn mrf_save_admission_maps_send_result() {
+        assert_eq!(mrf_save_admission(true), ReplicationQueueAdmission::Queued);
+        assert_eq!(mrf_save_admission(false), ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn worker_queue_routes_heal_and_existing_objects_to_mrf() {
+        assert_eq!(worker_queue_for_replication_type(&ReplicationType::Heal), ReplicationWorkerQueue::Mrf);
+        assert_eq!(
+            worker_queue_for_replication_type(&ReplicationType::ExistingObject),
+            ReplicationWorkerQueue::Mrf
+        );
+        assert_eq!(
+            worker_queue_for_replication_type(&ReplicationType::Object),
+            ReplicationWorkerQueue::Regular
+        );
+        assert_eq!(
+            worker_queue_for_replication_type(&ReplicationType::Delete),
+            ReplicationWorkerQueue::Regular
+        );
     }
 
     #[test]

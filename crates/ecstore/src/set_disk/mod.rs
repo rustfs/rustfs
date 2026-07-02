@@ -132,7 +132,9 @@ use s3s::header::{X_AMZ_OBJECT_LOCK_LEGAL_HOLD, X_AMZ_OBJECT_LOCK_MODE, X_AMZ_OB
 use sha2::{Digest, Sha256};
 use std::hash::Hash;
 use std::mem::{self};
+use std::pin::Pin;
 use std::sync::OnceLock;
+use std::task::{Context, Poll};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::{
     collections::{HashMap, HashSet},
@@ -143,7 +145,7 @@ use std::{
 };
 use time::OffsetDateTime;
 use tokio::{
-    io::{AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader},
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     sync::{RwLock, broadcast},
 };
 use tokio::{
@@ -249,6 +251,44 @@ impl Drop for ObjectLockDiagGuard {
             );
         }
     }
+}
+
+struct SetDiskLockGuardedReader {
+    inner: Box<dyn AsyncRead + Unpin + Send + Sync>,
+    guard: Option<ObjectLockDiagGuard>,
+}
+
+impl AsyncRead for SetDiskLockGuardedReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        let had_capacity = buf.remaining() > 0;
+        let filled_before = buf.filled().len();
+        let poll = Pin::new(&mut self.inner).poll_read(cx, buf);
+        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
+            self.guard.take();
+        }
+        poll
+    }
+}
+
+fn attach_set_disk_read_lock_guard(mut reader: GetObjectReader, read_lock_guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
+    if let Some(guard) = read_lock_guard
+        && reader.buffered_body.is_none()
+    {
+        reader.stream = Box::new(SetDiskLockGuardedReader {
+            inner: reader.stream,
+            guard: Some(guard),
+        });
+    }
+    reader
+}
+
+fn release_materialized_read_lock(bucket: &str, object: &str, read_lock_guard: Option<ObjectLockDiagGuard>) {
+    if read_lock_guard.is_some() {
+        let lock_id = format!("{}:{}", bucket, object);
+        record_lock_release(bucket, object, &lock_id, "read");
+        metrics::counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
+    }
+    drop(read_lock_guard);
 }
 
 pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, String>) {
@@ -437,8 +477,8 @@ pub fn get_object_lock_diag_slow_hold_threshold() -> Duration {
 }
 
 /// Check if lock optimization is enabled.
-/// When enabled, read locks are released after metadata read instead of
-/// being held for the entire data transfer duration.
+/// When enabled, fully materialized reads may release the read lock before
+/// returning to the caller. Streaming reads keep the lock until EOF or drop.
 ///
 /// **Note**: Cached via `OnceLock` in production — env var changes require
 /// process restart. In test builds the env var is read directly so that
@@ -1999,12 +2039,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         opts: &ObjectOptions,
     ) -> Result<GetObjectReader> {
         let stage_metrics_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
-        // Check if lock optimization is enabled
-        // When enabled, read locks are released after metadata read
+        // Check if lock optimization is enabled for reads that are fully materialized in memory.
         let lock_optimization_enabled = is_lock_optimization_enabled();
 
         // Acquire a shared read-lock early to protect read consistency
-        let read_lock_guard = if !opts.no_lock {
+        let mut read_lock_guard = if !opts.no_lock {
             let acquire_start = Instant::now();
             let lock_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
 
@@ -2275,27 +2314,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 opts.part_number = Some(1);
             }
             let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
-            return Ok(gr);
+            return Ok(attach_set_disk_read_lock_guard(gr, read_lock_guard.take()));
         }
-
-        // Lock optimization: release read lock after metadata read if enabled
-        // This reduces lock contention by not holding the lock during data transfer
-        let read_lock_guard = if lock_optimization_enabled {
-            // Record lock release for deadlock detection
-            if read_lock_guard.is_some() {
-                let lock_id = format!("{}:{}", bucket, object);
-                record_lock_release(bucket, object, &lock_id, "read");
-
-                // Record early lock release statistics
-                metrics::counter!("rustfs.lock.release.early.total", "type" => "read").increment(1);
-            }
-            // Explicitly drop the lock guard to release the lock early
-            drop(read_lock_guard);
-            debug!(bucket, object, "Lock optimization: released read lock after metadata read");
-            None
-        } else {
-            read_lock_guard
-        };
 
         if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {
             let object_size = usize::try_from(object_info.size)
@@ -2325,6 +2345,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     object_info,
                     buffered_body: Some(body),
                 };
+                if lock_optimization_enabled {
+                    release_materialized_read_lock(bucket, object, read_lock_guard.take());
+                    debug!(bucket, object, "Lock optimization: released read lock after direct-memory read");
+                }
                 return Ok(reader);
             }
 
@@ -2362,6 +2386,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 object_info,
                 buffered_body: Some(body),
             };
+            if lock_optimization_enabled {
+                release_materialized_read_lock(bucket, object, read_lock_guard.take());
+                debug!(bucket, object, "Lock optimization: released read lock after direct-memory read");
+            }
             return Ok(reader);
         }
 
@@ -2390,7 +2418,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         );
                         record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
                         let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
-                        return Ok(reader);
+                        return Ok(attach_set_disk_read_lock_guard(reader, read_lock_guard.take()));
                     }
                     read::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -2426,11 +2454,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        // Move the read-lock guard into the task so it lives for the duration of the read
-        // Note: when lock optimization is enabled, read_lock_guard is None
-        // let _guard_to_hold = _read_lock_guard; // moved into closure below
+        // Move the read-lock guard into the task so it lives for the duration of the read.
+        // Fully materialized paths release it before returning; streaming paths keep it.
         tokio::spawn(async move {
-            let _guard = read_lock_guard; // keep guard alive until task ends (None if optimization enabled)
+            let _guard = read_lock_guard;
             let mut writer = wd;
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
             // `get_object_with_fileinfo` also waits on `writer`, so an outer timeout
@@ -4419,7 +4446,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Some(disk) = disk {
                 continue;
             }
-            let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
+            let _ = self
+                .add_partial(bucket, object, opts.version_id.as_deref().unwrap_or_default())
+                .await;
             break;
         }
 

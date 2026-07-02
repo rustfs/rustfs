@@ -1,3 +1,8 @@
+> **Archived implementation plan/tracker** — moved from `docs/architecture/` (2026-07).
+> Kept for history; not maintained. File paths inside may reflect the pre-#3929
+> module layout (e.g. `crates/ecstore/src/rebalance.rs` is now
+> `crates/ecstore/src/store/rebalance.rs`; `set_disk.rs` is now `set_disk/`).
+
 # Rebalance and Decommission Remediation Plan
 
 > This document turns `docs/architecture/expert-review-analysis.md` into an actionable remediation backlog. It is intentionally split into independent fix blocks so each item can be analyzed, assigned, implemented, and verified separately.

@@ -343,6 +343,13 @@ insta = { version = "1.48", features = ["yaml", "json"] }
 [workspace.metadata.cargo-shear]
 ignored = ["rustfs"]
 
+[profile.dev]
+# Full debuginfo roughly doubles compile+link time and produces multi-GB
+# target dirs (slow CI cache save/restore, slow artifact upload). Line tables
+# keep meaningful backtraces. For local debugging with full debuginfo, run:
+#   CARGO_PROFILE_DEV_DEBUG=full cargo build
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 

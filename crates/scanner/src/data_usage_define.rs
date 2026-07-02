@@ -680,7 +680,7 @@ impl DataUsageCache {
             versions_total_count: flat.versions as u64,
             delete_markers_total_count: flat.delete_markers as u64,
             objects_total_size: flat.size as u64,
-            buckets_count: e.children.len() as u64,
+            buckets_count: u64::try_from(buckets.len()).unwrap_or(u64::MAX),
             buckets_usage,
             ..Default::default()
         }
@@ -1499,6 +1499,34 @@ mod tests {
 
         assert!(cache.find_children_copy(missing_hash.clone()).is_empty());
         assert!(cache.cache.contains_key(&missing_hash.key()));
+    }
+
+    #[test]
+    fn test_dui_bucket_count_uses_bucket_list_after_compaction() {
+        let root_hash = hash_path("root");
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: "root".to_string(),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace_hashed(
+            &root_hash,
+            &None,
+            &DataUsageEntry {
+                compacted: true,
+                objects: 3,
+                ..Default::default()
+            },
+        );
+
+        let buckets = vec!["bucket-a".to_string(), "bucket-b".to_string()];
+        let info = cache.dui("root", &buckets);
+
+        assert_eq!(info.buckets_count, 2);
+        assert!(info.buckets_usage.is_empty());
+        assert_eq!(info.objects_total_count, 3);
     }
 
     #[test]

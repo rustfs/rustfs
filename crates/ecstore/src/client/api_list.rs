@@ -133,7 +133,7 @@ impl TransitionClient {
                 body_vec.extend_from_slice(data);
             }
         }
-        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8(body_vec).unwrap()) {
+        let mut list_bucket_result = match quick_xml::de::from_str::<ListBucketV2Result>(&String::from_utf8_lossy(&body_vec)) {
             Ok(result) => result,
             Err(err) => {
                 return Err(std::io::Error::other(err.to_string()));

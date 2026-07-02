@@ -1,3 +1,8 @@
+> **Archived implementation plan/tracker** — moved from `docs/architecture/` (2026-07).
+> Kept for history; not maintained. File paths inside may reflect the pre-#3929
+> module layout (e.g. `crates/ecstore/src/rebalance.rs` is now
+> `crates/ecstore/src/store/rebalance.rs`; `set_disk.rs` is now `set_disk/`).
+
 ## Related Issues
 
 N/A

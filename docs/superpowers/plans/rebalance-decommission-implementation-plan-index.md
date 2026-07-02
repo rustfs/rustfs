@@ -1,3 +1,8 @@
+> **Archived implementation plan/tracker** — moved from `docs/architecture/` (2026-07).
+> Kept for history; not maintained. File paths inside may reflect the pre-#3929
+> module layout (e.g. `crates/ecstore/src/rebalance.rs` is now
+> `crates/ecstore/src/store/rebalance.rs`; `set_disk.rs` is now `set_disk/`).
+
 # Rebalance and Decommission Implementation Plan Index
 
 > This index is based on `docs/architecture/rebalance-decommission-remediation-plan.md`. The remediation scope is intentionally split into smaller implementation plans because the fixes touch independent risk areas: object-version safety, distributed operation semantics, data movement internals, and operational hardening.

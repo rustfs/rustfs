@@ -480,7 +480,7 @@ async fn enqueue_transitioned_delete_cleanup(
 
     let expiry_state = current_expiry_state_handle();
     let mut expiry_state = expiry_state.write().await;
-    if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je).await {
+    if let Err(err) = expiry_state.enqueue_tier_journal_entry(&je) {
         warn!(
             bucket,
             object,

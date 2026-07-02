@@ -34,11 +34,12 @@ use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
 use rustfs_replication::{
-    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueAction, ReplicationHealQueueResult,
-    ReplicationHealResyncDeletes, ReplicationOperation, ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission,
-    WORKER_MAX_LIMIT, initial_worker_counts, mrf_worker_size_to_count, next_large_worker_count, next_mrf_worker_count,
-    next_regular_worker_count, replication_heal_queue_action, resized_worker_counts, should_auto_resume_resync,
-    should_grow_large_workers, should_queue_large_object,
+    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
+    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
+    ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, WORKER_MAX_LIMIT,
+    initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, replication_backpressure_recommendation,
+    replication_heal_queue_action, resized_worker_counts, should_auto_resume_resync, should_queue_large_object,
+    worker_queue_for_replication_type,
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::sync::Arc;
@@ -61,7 +62,7 @@ const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
-const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
+const EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE: &str = "replication_mrf_queue_unavailable";
 
 /// Main replication pool structure
 #[derive(Debug)]
@@ -396,6 +397,73 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         workers.get(index).cloned()
     }
 
+    async fn worker_queue_channel(
+        &self,
+        op_type: &ReplicationType,
+        bucket: &str,
+        object: &str,
+        size: i64,
+    ) -> Option<Sender<ReplicationOperation>> {
+        match worker_queue_for_replication_type(op_type) {
+            ReplicationWorkerQueue::Mrf => Some(self.mrf_replica_tx.clone()),
+            ReplicationWorkerQueue::Regular => self.get_worker_ch(bucket, object, size).await,
+        }
+    }
+
+    async fn apply_queue_backpressure(&self, queue_type: &'static str, include_mrf_workers: bool, message: &'static str) {
+        let priority = self.priority.read().await.clone();
+        let max_workers = *self.max_workers.read().await;
+        let current_workers = self.workers.read().await.len();
+        let current_mrf_workers = self.mrf_worker_size.load(Ordering::SeqCst);
+        let recommendation = replication_backpressure_recommendation(
+            &priority,
+            ReplicationBackpressureState {
+                current_workers,
+                active_workers: self.active_workers(),
+                current_mrf_workers,
+                active_mrf_workers: self.active_mrf_workers(),
+                max_workers,
+                include_mrf_workers,
+            },
+        );
+
+        match recommendation {
+            ReplicationBackpressureRecommendation::KeepFast => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type,
+                    priority = "fast",
+                    recommendation = "none",
+                    "{message}"
+                );
+            }
+            ReplicationBackpressureRecommendation::SetPriorityAuto => {
+                debug!(
+                    event = EVENT_REPLICATION_BACKPRESSURE,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION,
+                    queue_type,
+                    priority = "slow",
+                    recommendation = "set_priority_auto",
+                    "{message}"
+                );
+            }
+            ReplicationBackpressureRecommendation::Resize(resize) => {
+                if let Some(regular_workers) = resize.regular_workers {
+                    self.resize_workers(regular_workers.new_count, regular_workers.existing_count)
+                        .await;
+                }
+
+                if let Some(mrf_workers) = resize.mrf_workers {
+                    self.resize_failed_workers(mrf_workers).await;
+                }
+            }
+            ReplicationBackpressureRecommendation::Noop => {}
+        }
+    }
+
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
         // If object is large, queue it to a static set of large workers
@@ -415,29 +483,19 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 if let Some(worker) = lrg_workers.get(index)
                     && worker.try_send(ReplicationOperation::Object(Box::new(ri.clone()))).is_err()
                 {
-                    // Queue to MRF if worker is busy
-                    let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
-                        ReplicationQueueAdmission::Queued
-                    } else {
-                        warn!(
-                            event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_REPLICATION,
-                            bucket = %ri.bucket,
-                            object = %ri.name,
-                            "MRF queue full — large-worker replication failure entry dropped and will not be retried"
-                        );
-                        ReplicationQueueAdmission::Missed
-                    };
-
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
-                    if should_grow_large_workers(self.active_lrg_workers(), max_l_workers) {
-                        let workers = next_large_worker_count(existing, max_l_workers);
+                    let resize = large_worker_backpressure_resize(existing, self.active_lrg_workers(), max_l_workers);
+                    drop(lrg_workers);
 
-                        drop(lrg_workers);
-                        self.resize_lrg_workers(workers, existing).await;
+                    // Queue to MRF if worker is busy.
+                    let admission =
+                        queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "large_object")
+                            .await;
+
+                    if let Some(resize) = resize {
+                        self.resize_lrg_workers(resize.new_count, resize.existing_count).await;
                     }
                     return admission;
                 }
@@ -449,10 +507,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
         // Handle regular sized objects
 
-        let ch = match ri.op_type {
-            ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
-            _ => self.get_worker_ch(&ri.bucket, &ri.name, ri.size).await,
-        };
+        let ch = self.worker_queue_channel(&ri.op_type, &ri.bucket, &ri.name, ri.size).await;
 
         let Some(channel) = ch else {
             return ReplicationQueueAdmission::Missed;
@@ -462,73 +517,21 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Queued;
         }
 
-        // Queue to MRF if all workers are busy
-        let admission = if self.mrf_save_tx.try_send(ri.to_mrf_entry()).is_ok() {
-            ReplicationQueueAdmission::Queued
-        } else {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                bucket = %ri.bucket,
-                object = %ri.name,
-                "MRF queue full — replication failure entry dropped and will not be retried"
-            );
-            ReplicationQueueAdmission::Missed
-        };
+        // Queue to MRF if all workers are busy.
+        let admission = queue_mrf_save_admission(&self.mrf_save_tx, ri.to_mrf_entry(), &ri.bucket, &ri.name, "object").await;
 
         // Try to scale up workers based on priority
-        let priority = self.priority.read().await.clone();
-        let max_workers = *self.max_workers.read().await;
-
-        match priority {
-            ReplicationPriority::Fast => {
-                debug!(
-                    event = EVENT_REPLICATION_BACKPRESSURE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    queue_type = "object",
-                    priority = "fast",
-                    recommendation = "none",
-                    "Replication queue is backpressured"
-                );
-            }
-            ReplicationPriority::Slow => {
-                debug!(
-                    event = EVENT_REPLICATION_BACKPRESSURE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    queue_type = "object",
-                    priority = "slow",
-                    recommendation = "set_priority_auto",
-                    "Replication queue is backpressured"
-                );
-            }
-            ReplicationPriority::Auto => {
-                let workers = self.workers.read().await;
-                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
-                    let existing = workers.len();
-
-                    drop(workers);
-                    self.resize_workers(new_count, existing).await;
-                }
-
-                let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                if let Some(new_mrf) = next_mrf_worker_count(current_mrf, self.active_mrf_workers(), max_workers) {
-                    self.resize_failed_workers(new_mrf).await;
-                }
-            }
-        }
+        self.apply_queue_backpressure("object", true, "Replication queue is backpressured")
+            .await;
 
         admission
     }
 
     /// Queues a replica delete task
     pub async fn queue_replica_delete_task(&self, doi: DeletedObjectReplicationInfo) -> ReplicationQueueAdmission {
-        let ch = match doi.op_type {
-            ReplicationType::Heal | ReplicationType::ExistingObject => Some(self.mrf_replica_tx.clone()),
-            _ => self.get_worker_ch(&doi.bucket, &doi.delete_object.object_name, 0).await,
-        };
+        let ch = self
+            .worker_queue_channel(&doi.op_type, &doi.bucket, &doi.delete_object.object_name, 0)
+            .await;
 
         let Some(channel) = ch else {
             return ReplicationQueueAdmission::Missed;
@@ -538,69 +541,24 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
             return ReplicationQueueAdmission::Queued;
         }
 
-        let admission = if self.mrf_save_tx.try_send(doi.to_mrf_entry()).is_ok() {
-            ReplicationQueueAdmission::Queued
-        } else {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                bucket = %doi.bucket,
-                object = %doi.delete_object.object_name,
-                "MRF queue full — delete replication failure entry dropped and will not be retried"
-            );
-            ReplicationQueueAdmission::Missed
-        };
+        let admission = queue_mrf_save_admission(
+            &self.mrf_save_tx,
+            doi.to_mrf_entry(),
+            &doi.bucket,
+            &doi.delete_object.object_name,
+            "delete",
+        )
+        .await;
 
-        let priority = self.priority.read().await.clone();
-        let max_workers = *self.max_workers.read().await;
-
-        match priority {
-            ReplicationPriority::Fast => {
-                debug!(
-                    event = EVENT_REPLICATION_BACKPRESSURE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    queue_type = "delete",
-                    priority = "fast",
-                    recommendation = "none",
-                    "Replication delete queue is backpressured"
-                );
-            }
-            ReplicationPriority::Slow => {
-                debug!(
-                    event = EVENT_REPLICATION_BACKPRESSURE,
-                    component = LOG_COMPONENT_ECSTORE,
-                    subsystem = LOG_SUBSYSTEM_REPLICATION,
-                    queue_type = "delete",
-                    priority = "slow",
-                    recommendation = "set_priority_auto",
-                    "Replication delete queue is backpressured"
-                );
-            }
-            ReplicationPriority::Auto => {
-                let workers = self.workers.read().await;
-                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
-                    let existing = workers.len();
-                    drop(workers);
-                    self.resize_workers(new_count, existing).await;
-                }
-            }
-        }
+        self.apply_queue_backpressure("delete", false, "Replication delete queue is backpressured")
+            .await;
 
         admission
     }
 
     /// Queues an MRF save operation
     async fn queue_mrf_save(&self, entry: MrfReplicateEntry) {
-        if self.mrf_save_tx.try_send(entry).is_err() {
-            warn!(
-                event = EVENT_REPLICATION_MRF_QUEUE_OVERFLOW,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION,
-                "MRF queue full — replication failure entry dropped and will not be retried"
-            );
-        }
+        let _ = queue_mrf_save_admission(&self.mrf_save_tx, entry, "", "", "mrf_worker").await;
     }
 
     /// Starts the MRF processor — one-shot at startup.
@@ -1072,6 +1030,29 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     }
 }
 
+async fn queue_mrf_save_admission(
+    tx: &Sender<MrfReplicateEntry>,
+    entry: MrfReplicateEntry,
+    bucket: &str,
+    object: &str,
+    queue_type: &'static str,
+) -> ReplicationQueueAdmission {
+    if tx.send(entry).await.is_ok() {
+        return ReplicationQueueAdmission::Queued;
+    }
+
+    warn!(
+        event = EVENT_REPLICATION_MRF_QUEUE_UNAVAILABLE,
+        component = LOG_COMPONENT_ECSTORE,
+        subsystem = LOG_SUBSYSTEM_REPLICATION,
+        bucket = %bucket,
+        object = %object,
+        queue_type = queue_type,
+        "MRF save channel unavailable — replication failure entry could not be persisted for retry"
+    );
+    ReplicationQueueAdmission::Missed
+}
+
 /// Encodes `entries` and overwrites the MRF persistence file.
 /// Returns `true` on success; on failure logs the error and returns `false`.
 /// Callers must NOT clear their in-memory buffer on `false` so the next tick
@@ -1444,6 +1425,59 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[tokio::test]
+    async fn mrf_save_admission_waits_for_capacity_instead_of_dropping() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let first = MrfReplicateEntry {
+            bucket: "bucket".to_string(),
+            object: "first".to_string(),
+            version_id: None,
+            retry_count: 1,
+            size: 1,
+            op: MrfOpKind::Object,
+            delete_marker_version_id: None,
+            delete_marker: false,
+        };
+        let second = MrfReplicateEntry {
+            object: "second".to_string(),
+            ..first.clone()
+        };
+
+        tx.try_send(first).expect("first MRF entry should fill the test channel");
+
+        let admission = queue_mrf_save_admission(&tx, second, "bucket", "second", "test");
+        tokio::pin!(admission);
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(25), &mut admission).await.is_err(),
+            "full MRF channel should apply backpressure instead of returning Missed"
+        );
+
+        let received = rx.recv().await.expect("first MRF entry should still be queued");
+        assert_eq!(received.object, "first");
+
+        let admission = tokio::time::timeout(Duration::from_secs(1), &mut admission)
+            .await
+            .expect("MRF admission should finish once capacity is available");
+        assert_eq!(admission, ReplicationQueueAdmission::Queued);
+
+        let received = rx
+            .recv()
+            .await
+            .expect("second MRF entry should be queued after capacity opens");
+        assert_eq!(received.object, "second");
+    }
+
+    #[test]
+    fn auto_resume_resync_only_for_inflight_states() {
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 
     // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────

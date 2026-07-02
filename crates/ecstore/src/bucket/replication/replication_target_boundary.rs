@@ -20,10 +20,10 @@ use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION,
-    CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, HeaderExt as _, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC,
-    SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map, is_internal_key,
+    AMZ_OBJECT_TAGGING, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID, AMZ_STORAGE_CLASS, AMZ_TAG_COUNT,
+    CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, CONTENT_TYPE, HeaderExt as _,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
+    SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_TAGGING_TIMESTAMP, get_str, insert_header_map, is_internal_key,
 };
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -71,6 +71,8 @@ static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
     ("X-Rustfs-Internal-Encrypted-Multipart", "X-Rustfs-Replication-Encrypted-Multipart"),
     ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
 ];
+
+const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 
 pub(crate) struct ReplicationTargetStore;
 
@@ -217,6 +219,20 @@ pub(crate) fn replication_put_object_options(sc: &str, object_info: &ObjectInfo)
             } else {
                 object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
             };
+    }
+
+    let has_sse_s3 = object_info
+        .user_defined
+        .get(AMZ_SERVER_SIDE_ENCRYPTION)
+        .is_some_and(|value| value.eq_ignore_ascii_case("AES256"));
+    let has_sse_kms = object_info
+        .user_defined
+        .get(AMZ_SERVER_SIDE_ENCRYPTION)
+        .is_some_and(|value| value.eq_ignore_ascii_case("aws:kms"))
+        || object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
+
+    if has_sse_s3 || has_sse_kms {
+        return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 
     Ok((put_options, is_multipart))
@@ -393,5 +409,38 @@ mod tests {
         let (options, _) = replication_put_object_options("", &object_info).expect("build put options");
 
         assert!(get_header_map(&options.user_metadata, SUFFIX_REPLICATION_SSEC_CRC).is_some());
+    }
+
+    #[test]
+    fn replication_put_options_rejects_sse_s3_until_target_encryption_is_supported() {
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())])),
+            ..Default::default()
+        };
+
+        let err = match replication_put_object_options("", &object_info) {
+            Ok(_) => panic!("SSE-S3 replication should fail closed until target encryption headers are supported"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
+    }
+
+    #[test]
+    fn replication_put_options_rejects_sse_kms_until_target_encryption_is_supported() {
+        let object_info = ObjectInfo {
+            user_defined: Arc::new(HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+            ])),
+            ..Default::default()
+        };
+
+        let err = match replication_put_object_options("", &object_info) {
+            Ok(_) => panic!("SSE-KMS replication should fail closed until target encryption headers are supported"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 }
