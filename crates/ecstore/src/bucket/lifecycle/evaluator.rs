@@ -170,7 +170,7 @@ mod tests {
     use std::sync::Arc;
 
     use rustfs_common::metrics::IlmAction;
-    use rustfs_filemeta::{ReplicationStatusType, VersionPurgeStatusType};
+    use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Transition, TransitionStorageClass,
     };

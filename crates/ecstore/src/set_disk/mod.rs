@@ -6847,9 +6847,9 @@ mod tests {
     use rustfs_filemeta::ErasureInfo;
     use rustfs_filemeta::FileMeta;
     use rustfs_filemeta::MetaCacheEntry;
-    use rustfs_filemeta::ReplicationState;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
+    use rustfs_replication::ReplicationState;
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;

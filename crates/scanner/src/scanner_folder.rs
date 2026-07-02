@@ -41,7 +41,8 @@ use rustfs_common::metrics::{
     IlmAction, Metric, Metrics, ScannerReplicationRepairKind, ScannerSourceWorkUpdate, ScannerWorkSource, UpdateCurrentPathFn,
     current_path_updater, global_metrics,
 };
-use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ReplicationStatusType};
+use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
+use rustfs_replication::ReplicationStatusType;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use time::OffsetDateTime;
@@ -2836,7 +2837,8 @@ mod tests {
 
     use super::*;
     use crate::{DiskOption, Endpoint, new_disk};
-    use rustfs_filemeta::{FileInfo, FileMeta, VersionPurgeStatusType};
+    use rustfs_filemeta::{FileInfo, FileMeta};
+    use rustfs_replication::VersionPurgeStatusType;
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};

@@ -15,7 +15,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfs_filemeta::{ReplicateObjectInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
+use rustfs_replication::{ReplicateObjectInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;

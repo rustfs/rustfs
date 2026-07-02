@@ -109,17 +109,16 @@ use metrics::{counter, histogram};
 use pin_project_lite::pin_project;
 use rustfs_concurrency::GetObjectQueueSnapshot;
 use rustfs_config::MI_B;
-use rustfs_filemeta::{
-    REPLICATE_INCOMING_DELETE, ReplicationStatusType, RestoreStatusOps, VersionPurgeStatusType, parse_restore_obj_status,
-};
-#[cfg(test)]
-use rustfs_filemeta::{ReplicationState, replication_statuses_map};
+use rustfs_filemeta::{RestoreStatusOps, parse_restore_obj_status};
 use rustfs_io_core::{BytesPool, PooledBuffer};
 use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_replication::{REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType};
+#[cfg(test)]
+use rustfs_replication::{ReplicationState, replication_statuses_map};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{
