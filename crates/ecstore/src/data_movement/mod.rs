@@ -1348,9 +1348,9 @@ mod tests {
             storage_class: Some("STANDARD_IA".to_string()),
             checksum: Some(Bytes::from_static(b"object-checksum")),
             replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
-            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status: rustfs_replication::ReplicationStatusType::Completed,
             version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
-            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Pending,
+            version_purge_status: rustfs_replication::VersionPurgeStatusType::Pending,
             parts: Arc::new(vec![part]),
             ..Default::default()
         };
@@ -1607,9 +1607,9 @@ mod tests {
             expires: Some(OffsetDateTime::from_unix_timestamp(2_000).expect("valid expires timestamp")),
             storage_class: Some("STANDARD_IA".to_string()),
             replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
-            replication_status: rustfs_filemeta::ReplicationStatusType::Completed,
+            replication_status: rustfs_replication::ReplicationStatusType::Completed,
             version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
-            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Pending,
+            version_purge_status: rustfs_replication::VersionPurgeStatusType::Pending,
             parts: Arc::new(vec![part]),
             ..Default::default()
         }
@@ -1682,7 +1682,7 @@ mod tests {
         let source = overwrite_equivalence_source();
         let target = ObjectInfo {
             version_purge_status_internal: Some("arn:minio:replication:target=COMPLETE;".to_string()),
-            version_purge_status: rustfs_filemeta::VersionPurgeStatusType::Complete,
+            version_purge_status: rustfs_replication::VersionPurgeStatusType::Complete,
             ..source.clone()
         };
 
@@ -1694,7 +1694,7 @@ mod tests {
         let source = overwrite_equivalence_source();
         let target = ObjectInfo {
             replication_status_internal: Some("arn:minio:replication:target=FAILED;".to_string()),
-            replication_status: rustfs_filemeta::ReplicationStatusType::Failed,
+            replication_status: rustfs_replication::ReplicationStatusType::Failed,
             ..source.clone()
         };
 

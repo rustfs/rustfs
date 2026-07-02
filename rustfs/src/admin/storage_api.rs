@@ -150,7 +150,7 @@ pub(crate) trait AdminReplicationConfigExt {
 impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
     fn filter_all_replication_target_arns(&self) -> Vec<String> {
         let obj = ecstore_bucket::replication::ObjectOpts {
-            op_type: rustfs_filemeta::ReplicationType::All,
+            op_type: rustfs_replication::ReplicationType::All,
             ..Default::default()
         };
         <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(

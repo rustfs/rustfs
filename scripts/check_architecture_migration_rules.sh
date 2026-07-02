@@ -212,6 +212,7 @@ REPLICATION_ERROR_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_error_bounda
 REPLICATION_EVENT_SINK_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_sink_bypass_hits.txt"
 REPLICATION_EVENT_HOST_BYPASS_HITS_FILE="${TMP_DIR}/replication_event_host_bypass_hits.txt"
 REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_boundary_bypass_hits.txt"
+REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_filemeta_direct_path_bypass_hits.txt"
 REPLICATION_LOCAL_PATH_BYPASS_HITS_FILE="${TMP_DIR}/replication_local_path_bypass_hits.txt"
 REPLICATION_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_lock_boundary_bypass_hits.txt"
 REPLICATION_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_metadata_boundary_bypass_hits.txt"
@@ -3032,6 +3033,18 @@ fi
 
 if [[ -s "$REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "replication filemeta contracts must stay behind replication filemeta boundary: $(paste -sd '; ' "$REPLICATION_FILEMETA_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_filemeta::(Replicate|Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map|get_replication_state|parse_replicate_decision|target_reset_header|REPLICATE_)' \
+    crates/ecstore/src rustfs/src crates/scanner/src \
+    --glob '*.rs' |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_filemeta_boundary\.rs:' || true
+) >"$REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication filemeta fully-qualified paths must use rustfs_replication: $(paste -sd '; ' "$REPLICATION_FILEMETA_DIRECT_PATH_BYPASS_HITS_FILE")"
 fi
 
 (
