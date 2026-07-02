@@ -143,11 +143,7 @@ fn target_env_name() -> Option<&'static str> {
 }
 
 fn cpu_profiling_status() -> CapabilityStatus {
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
-        CapabilityStatus::supported()
-    } else {
-        CapabilityStatus::unsupported().with_reason("userspace CPU profiling supports linux and macos targets")
-    }
+    CapabilityStatus::unsupported().with_reason(crate::profiling::LOCAL_CPU_PPROF_UNSUPPORTED_SUMMARY)
 }
 
 fn ebpf_status() -> CapabilityStatus {
@@ -167,11 +163,7 @@ fn numa_status() -> CapabilityStatus {
 }
 
 fn memory_profiling_status() -> CapabilityStatus {
-    if cfg!(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")) {
-        CapabilityStatus::supported().with_reason("jemalloc memory profiling target")
-    } else {
-        CapabilityStatus::unsupported().with_reason("memory profiling supports linux gnu x86_64 targets")
-    }
+    CapabilityStatus::unsupported().with_reason(crate::profiling::MEMORY_PPROF_UNSUPPORTED_SUMMARY)
 }
 
 fn cgroup_memory_status() -> CapabilityStatus {

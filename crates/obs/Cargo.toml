@@ -28,7 +28,7 @@ documentation = "https://docs.rs/rustfs-obs/latest/rustfs_obs/"
 [features]
 default = []
 gpu = ["dep:nvml-wrapper"]
-pyroscope = ["dep:jemalloc_pprof", "dep:pyroscope"]
+pyroscope = ["dep:pyroscope"]
 
 [lints]
 workspace = true
@@ -83,7 +83,6 @@ nvml-wrapper = { workspace = true, optional = true }
 
 [target.'cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))'.dependencies]
 pyroscope = { workspace = true, features = ["backend-pprof-rs"], optional = true }
-jemalloc_pprof = { workspace = true, optional = true }
 
 
 [dev-dependencies]
