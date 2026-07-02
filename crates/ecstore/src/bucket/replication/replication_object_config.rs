@@ -28,15 +28,12 @@ use super::replication_error_boundary::Result;
 use super::replication_filemeta_boundary::{
     ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ResyncDecision,
 };
+use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete};
 use super::replication_target_boundary::{BucketTargets, ReplicationTargetStore};
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
-
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_REPLICATION_RESYNC: &str = "replication_resync";
-const EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED: &str = "replication_resync_config_lookup_skipped";
 
 pub(crate) async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
     ReplicationMetadataStore::optional_replication_config(bucket).await

@@ -20,6 +20,7 @@ use super::replication_filemeta_boundary::{
     ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
     version_purge_statuses_map,
 };
+use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_object_config::ReplicationConfig;
 use super::replication_resyncer::{
@@ -55,14 +56,11 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
 const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
-const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
 const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
 
 /// Main replication pool structure

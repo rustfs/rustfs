@@ -24,6 +24,7 @@ use super::replication_filemeta_boundary::{
     get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
+use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
@@ -80,10 +81,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_REPLICATION_RESYNC: &str = "replication_resync";
 const EVENT_RESYNC_STATUS_UPDATE_SKIPPED: &str = "replication_resync_status_update_skipped";
-const EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED: &str = "replication_resync_config_lookup_skipped";
 const EVENT_RESYNC_OBJECT_PROCESSED: &str = "replication_resync_object_processed";
 const EVENT_RESYNC_RUNTIME_SKIPPED: &str = "replication_resync_runtime_skipped";
 const EVENT_REPLICATION_DELETE_SKIPPED: &str = "replication_delete_skipped";

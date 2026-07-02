@@ -21,6 +21,7 @@ mod replication_event_sink;
 mod replication_filemeta_boundary;
 mod replication_lifecycle_bridge;
 mod replication_lock_boundary;
+mod replication_logging;
 mod replication_metadata_boundary;
 mod replication_migration_bridge;
 mod replication_msgp_boundary;
