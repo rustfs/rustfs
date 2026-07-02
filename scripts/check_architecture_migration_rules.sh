@@ -2582,7 +2582,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_delete_worker_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+DeletedObjectReplicationInfo\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+DeletedObjectReplicationInfo|fn\s+(?:is_version_delete_replication|should_retry_delete_marker_purge|is_retryable_delete_replication_head_error))\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE" || replication_delete_worker_status=$?
   if [[ "$replication_delete_worker_status" -ne 0 && "$replication_delete_worker_status" -ne 1 ]]; then
@@ -2627,7 +2627,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_runtime_status=0
-  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const\s+(?:WORKER_MAX_LIMIT|WORKER_MIN_LIMIT|WORKER_AUTO_DEFAULT|MRF_WORKER_MAX_LIMIT|MRF_WORKER_MIN_LIMIT|MRF_WORKER_AUTO_DEFAULT|LARGE_WORKER_COUNT|MIN_LARGE_OBJ_SIZE)\b)|(?:struct\s+(?:ReplicationPoolOpts|ReplicationWorkerCounts)\b)|(?:fn\s+(?:initial_worker_counts|resized_worker_counts|worker_counts_for_priority|should_queue_large_object|should_grow_large_workers|next_large_worker_count|next_regular_worker_count|next_mrf_worker_count)\b))' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const\s+(?:WORKER_MAX_LIMIT|WORKER_MIN_LIMIT|WORKER_AUTO_DEFAULT|MRF_WORKER_MAX_LIMIT|MRF_WORKER_MIN_LIMIT|MRF_WORKER_AUTO_DEFAULT|LARGE_WORKER_COUNT|MIN_LARGE_OBJ_SIZE)\b)|(?:struct\s+(?:ReplicationPoolOpts|ReplicationWorkerCounts)\b)|(?:fn\s+(?:initial_worker_counts|resized_worker_counts|mrf_worker_size_to_count|worker_counts_for_priority|should_queue_large_object|should_grow_large_workers|next_large_worker_count|next_regular_worker_count|next_mrf_worker_count)\b))' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE" || replication_runtime_status=$?
   if [[ "$replication_runtime_status" -ne 0 && "$replication_runtime_status" -ne 1 ]]; then
@@ -2641,10 +2641,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'pub\s+(struct|enum)\s+(ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)\b' \
+  replication_resync_status=0
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct|enum)\s+(?:ResyncOpts|TargetReplicationResyncStatus|BucketReplicationResyncStatus|ResyncStatusType)|fn\s+(?:resync_state_accepts_update|should_count_head_proxy_failure|is_version_id_mismatch))\b' \
     crates/ecstore/src/bucket/replication \
-    --glob '*.rs' || true
-) >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE"
+    --glob '*.rs' >"$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" || replication_resync_status=$?
+  if [[ "$replication_resync_status" -ne 0 && "$replication_resync_status" -ne 1 ]]; then
+    exit "$replication_resync_status"
+  fi
+)
 
 if [[ -s "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "resync DTO contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE")"

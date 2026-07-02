@@ -205,6 +205,27 @@ impl TargetReplicationResyncStatus {
     }
 }
 
+pub fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
+    state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
+pub fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
+    if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
+        return false;
+    }
+    if matches!(raw_status, Some(404 | 405)) {
+        return false;
+    }
+    !is_version_id_mismatch(code, raw_status)
+}
+
+pub fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bool {
+    match code {
+        Some(c) if !c.is_empty() => c == "InvalidArgument",
+        _ => matches!(raw_status, Some(400 | 403)),
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct BucketReplicationResyncStatus {
     pub version: u16,
@@ -517,6 +538,61 @@ mod tests {
         assert_eq!(ResyncStatusType::ResyncStarted.to_string(), "Ongoing");
         assert_eq!(ResyncStatusType::ResyncCompleted.to_string(), "Completed");
         assert_eq!(ResyncStatusType::NoResync.to_string(), "");
+    }
+
+    #[test]
+    fn resync_state_accepts_update_only_for_matching_run() {
+        let current = TargetReplicationResyncStatus {
+            resync_id: "run-new".to_string(),
+            ..Default::default()
+        };
+        let matching = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let stale = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-old".to_string(),
+            resync_before: None,
+        };
+
+        assert!(resync_state_accepts_update(&TargetReplicationResyncStatus::default(), &matching));
+        assert!(resync_state_accepts_update(&current, &matching));
+        assert!(!resync_state_accepts_update(&current, &stale));
+    }
+
+    #[test]
+    fn head_proxy_failure_ignores_expected_target_responses() {
+        assert!(!should_count_head_proxy_failure(true, Some("NoSuchKey"), Some(404)));
+        assert!(!should_count_head_proxy_failure(false, Some("MethodNotAllowed"), Some(405)));
+        assert!(!should_count_head_proxy_failure(false, Some("405"), Some(405)));
+        assert!(!should_count_head_proxy_failure(false, Some("InvalidArgument"), Some(400)));
+        assert!(!should_count_head_proxy_failure(false, None, Some(400)));
+        assert!(!should_count_head_proxy_failure(false, None, Some(403)));
+    }
+
+    #[test]
+    fn head_proxy_failure_counts_unexpected_errors() {
+        assert!(should_count_head_proxy_failure(false, Some("AccessDenied"), Some(403)));
+        assert!(should_count_head_proxy_failure(false, None, Some(500)));
+    }
+
+    #[test]
+    fn version_id_mismatch_detects_aws_rejections() {
+        assert!(is_version_id_mismatch(Some("InvalidArgument"), Some(400)));
+        assert!(is_version_id_mismatch(None, Some(400)));
+        assert!(is_version_id_mismatch(Some(""), Some(400)));
+        assert!(is_version_id_mismatch(None, Some(403)));
+        assert!(is_version_id_mismatch(Some(""), Some(403)));
+        assert!(!is_version_id_mismatch(Some("AccessDenied"), Some(403)));
+        assert!(!is_version_id_mismatch(Some("NoSuchKey"), Some(404)));
+        assert!(!is_version_id_mismatch(Some("MalformedXML"), Some(400)));
+        assert!(!is_version_id_mismatch(Some("EntityTooLarge"), Some(400)));
+        assert!(!is_version_id_mismatch(None, Some(500)));
+        assert!(!is_version_id_mismatch(None, Some(404)));
     }
 
     #[test]

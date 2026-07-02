@@ -57,6 +57,8 @@ use http_body_util::StreamBody;
 use rmp_serde;
 use rustfs_replication::{
     BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus,
+    is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
+    resync_state_accepts_update, should_count_head_proxy_failure, should_retry_delete_marker_purge,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -106,20 +108,6 @@ const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
 
-fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
-    state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
-}
-
-fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
-    if is_not_found || matches!(code, Some("MethodNotAllowed" | "405")) {
-        return false;
-    }
-    if matches!(raw_status, Some(404 | 405)) {
-        return false;
-    }
-    !is_version_id_mismatch(code, raw_status)
-}
-
 fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
     err.raw_response().is_some_and(|r| r.status().as_u16() == status)
 }
@@ -150,16 +138,6 @@ async fn head_object_with_proxy_stats(
     let is_err = result.as_ref().err().is_some_and(is_head_proxy_failure);
     record_proxy_request(source_bucket, "HeadObject", is_err).await;
     result
-}
-
-// AWS returns 400 for root callers and 403 for IAM users when a UUID version ID
-// is rejected. The 403 case is safe: a real auth failure also returns 403 on the
-// versionId-less fallback, propagating as a hard error instead of silently skipping.
-fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bool {
-    match code {
-        Some(c) if !c.is_empty() => c == "InvalidArgument",
-        _ => matches!(raw_status, Some(400) | Some(403)),
-    }
 }
 
 fn is_version_id_format_mismatch(err: &SdkError<HeadObjectError>) -> bool {
@@ -2036,18 +2014,6 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             );
         }
     }
-}
-
-fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
-    dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
-}
-
-fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
-    dobj.delete_marker_version_id.is_some()
-}
-
-fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
-    !is_not_found && !matches!(code, Some("MethodNotAllowed" | "405"))
 }
 
 async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_client: Arc<TargetClient>) -> ReplicatedTargetInfo {
