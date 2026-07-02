@@ -12,9 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
-
-fn main() {
-    rustfs::startup_entrypoint::run_process();
-}
+pub(crate) const LOG_COMPONENT_ECSTORE: &str = "ecstore";
+pub(crate) const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
+pub(crate) const LOG_SUBSYSTEM_REPLICATION_RESYNC: &str = "replication_resync";
+pub(crate) const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
+pub(crate) const EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED: &str = "replication_resync_config_lookup_skipped";

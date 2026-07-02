@@ -13,8 +13,8 @@
 // limitations under the License.
 
 use super::ReplicationHealQueueResult;
+use super::replication_object_config::ReplicationConfig;
 use super::replication_pool::queue_replication_heal_internal;
-use super::replication_resyncer::ReplicationConfig;
 use super::replication_storage_boundary::ObjectInfo;
 
 pub struct ReplicationScannerBridge;

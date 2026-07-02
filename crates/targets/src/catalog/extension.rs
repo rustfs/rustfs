@@ -123,8 +123,8 @@ pub fn builtin_ops_profiler_contract() -> OpsProfilerContract {
     OpsProfilerContract {
         mode: OpsProfilerContractMode::CapabilityDescription,
         backends: vec![
-            builtin_ops_profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
-            builtin_ops_profiler_backend("memory_pprof", OpsProfilerBackendStatus::Disabled, true),
+            builtin_ops_profiler_backend("cpu_pprof", OpsProfilerBackendStatus::Unsupported, false),
+            builtin_ops_profiler_backend("memory_pprof", OpsProfilerBackendStatus::Unsupported, false),
             builtin_ops_profiler_backend("ebpf", OpsProfilerBackendStatus::Unsupported, false),
         ],
     }
@@ -391,8 +391,8 @@ mod tests {
         assert_eq!(
             backends,
             vec![
-                ("cpu_pprof", OpsProfilerBackendStatus::Enabled, true),
-                ("memory_pprof", OpsProfilerBackendStatus::Disabled, true),
+                ("cpu_pprof", OpsProfilerBackendStatus::Unsupported, false),
+                ("memory_pprof", OpsProfilerBackendStatus::Unsupported, false),
                 ("ebpf", OpsProfilerBackendStatus::Unsupported, false),
             ]
         );

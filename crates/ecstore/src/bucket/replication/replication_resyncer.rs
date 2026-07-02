@@ -19,37 +19,34 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
-    ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType,
-    ResyncDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map,
-    target_reset_header, version_purge_statuses_map,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
+    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
+use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
+use super::replication_object_config::{ReplicationConfig, check_replicate_delete, get_replication_config, must_replicate};
 use super::replication_storage_boundary::{
     AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
     ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
-use super::replication_tagging_boundary::ReplicationTagFilter;
 use super::replication_target_boundary::{
-    AdvancedPutOptions, BucketTargets, PutObjectOptions, PutObjectPartOptions, RemoveObjectOptions, ReplicationTargetStore,
-    TargetClient,
+    PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_complete_multipart_options,
+    replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
+    replication_put_object_header_size, replication_put_object_options,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::head_object::{HeadObjectError, HeadObjectOutput};
 use aws_sdk_s3::primitives::ByteStream;
-use aws_sdk_s3::types::{CompletedPart, ObjectLockLegalHoldStatus};
+use aws_sdk_s3::types::CompletedPart;
 use aws_smithy_types::body::SdkBody;
 use futures::future::join_all;
 use futures::stream::StreamExt;
-use headers::{
-    AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_SERVER_SIDE_ENCRYPTION,
-    AMZ_STORAGE_CLASS, AMZ_TAG_COUNT, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LANGUAGE, CONTENT_TYPE,
-};
 use http::HeaderMap;
 use http_body::Frame;
 use http_body_util::StreamBody;
@@ -58,44 +55,33 @@ use rmp_serde;
 #[cfg(test)]
 use rustfs_replication::content_matches_by_etag;
 use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationDeleteSource,
-    ReplicationResyncTargetObject, ReplicationSourceObject, ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus,
-    delete_replication_missing_source_decision, delete_replication_object_opts, heal_uses_delete_replication_path,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
+    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, heal_uses_delete_replication_path,
     is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    replication_action_for_target, replication_etags_match, resync_state_accepts_update, resync_target_for_object,
-    should_count_head_proxy_failure, should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
+    replication_action_for_target, replication_etags_match, resync_state_accepts_update, should_count_head_proxy_failure,
+    should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
-    AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET,
-    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
-};
-use rustfs_utils::http::{
-    SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_str, has_internal_suffix, insert_header_map,
-    insert_str, is_internal_key,
+    AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
 };
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
+#[cfg(test)]
 use s3s::dto::ReplicationConfiguration;
-use serde::Deserialize;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, instrument, trace, warn};
 use uuid::Uuid;
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_REPLICATION_RESYNC: &str = "replication_resync";
 const EVENT_RESYNC_STATUS_UPDATE_SKIPPED: &str = "replication_resync_status_update_skipped";
-const EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED: &str = "replication_resync_config_lookup_skipped";
 const EVENT_RESYNC_OBJECT_PROCESSED: &str = "replication_resync_object_processed";
 const EVENT_RESYNC_RUNTIME_SKIPPED: &str = "replication_resync_runtime_skipped";
 const EVENT_REPLICATION_DELETE_SKIPPED: &str = "replication_delete_skipped";
@@ -104,7 +90,6 @@ const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
-const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
@@ -113,6 +98,40 @@ pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSI
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
+
+async fn finish_resync_workers(
+    worker_txs: Vec<tokio::sync::mpsc::Sender<ReplicateObjectInfo>>,
+    results_tx: tokio::sync::broadcast::Sender<TargetReplicationResyncStatus>,
+    futures: Vec<JoinHandle<()>>,
+    abort: bool,
+) -> bool {
+    drop(worker_txs);
+    drop(results_tx);
+
+    if abort {
+        for future in &futures {
+            future.abort();
+        }
+    }
+
+    let mut failed = false;
+    for result in join_all(futures).await {
+        if let Err(err) = result
+            && !(abort && err.is_cancelled())
+        {
+            failed = true;
+            error!(
+                event = EVENT_RESYNC_TASK_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                error = %err,
+                "Replication resync task failed"
+            );
+        }
+    }
+
+    failed
+}
 
 fn has_raw_status(err: &SdkError<HeadObjectError>, status: u16) -> bool {
     err.raw_response().is_some_and(|r| r.status().as_u16() == status)
@@ -377,6 +396,15 @@ impl ReplicationResyncer {
         bucket_status.last_update = Some(now);
     }
 
+    async fn target_has_resync_failures(&self, opts: &ResyncOpts) -> bool {
+        self.status_map
+            .read()
+            .await
+            .get(&opts.bucket)
+            .and_then(|status| status.targets_map.get(&opts.arn))
+            .is_some_and(|status| status.failed_count > 0)
+    }
+
     pub async fn persist_to_disk<S>(&self, cancel_token: CancellationToken, api: Arc<S>)
     where
         S: ReplicationObjectIO,
@@ -632,6 +660,7 @@ impl ReplicationResyncer {
                 .await;
             return;
         }
+        drop(tx);
 
         let status = {
             self.status_map
@@ -801,12 +830,25 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to receive resync object info"
                 );
+                let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+                if worker_failed {
+                    error!(
+                        event = EVENT_RESYNC_TASK_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        reason = "worker_join_failed_after_object_info_error",
+                        "Replication resync worker cleanup observed task failure"
+                    );
+                }
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
                     .await;
                 return;
             }
 
             if cancellation_token.is_cancelled() {
+                finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -830,6 +872,7 @@ impl ReplicationResyncer {
             }
 
             if cancellation_token.is_cancelled() {
+                finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -848,20 +891,33 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to send resync object to worker"
                 );
+                let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+                if worker_failed {
+                    error!(
+                        event = EVENT_RESYNC_TASK_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        reason = "worker_join_failed_after_queue_send_error",
+                        "Replication resync worker cleanup observed task failure"
+                    );
+                }
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
                     .await;
                 return;
             }
         }
 
-        for worker_tx in worker_txs {
-            drop(worker_tx);
-        }
+        let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+        let target_failed = self.target_has_resync_failures(&opts).await;
+        let status = if worker_failed || target_failed {
+            ResyncStatusType::ResyncFailed
+        } else {
+            ResyncStatusType::ResyncCompleted
+        };
 
-        join_all(futures).await;
-
-        self.resync_bucket_mark_status(ResyncStatusType::ResyncCompleted, opts.clone(), storage.clone())
-            .await;
+        self.resync_bucket_mark_status(status, opts.clone(), storage.clone()).await;
     }
 }
 
@@ -964,285 +1020,6 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
     ReplicationConfigStore::save(api, &config_file, data).await?;
 
     Ok(())
-}
-
-async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
-    ReplicationMetadataStore::optional_replication_config(bucket).await
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReplicationConfig {
-    pub config: Option<ReplicationConfiguration>,
-    pub remotes: Option<BucketTargets>,
-}
-
-impl ReplicationConfig {
-    pub fn new(config: Option<ReplicationConfiguration>, remotes: Option<BucketTargets>) -> Self {
-        Self { config, remotes }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.config.is_none()
-    }
-
-    pub fn replicate(&self, obj: &ObjectOpts) -> bool {
-        self.config.as_ref().is_some_and(|config| config.replicate(obj))
-    }
-
-    pub async fn resync(
-        &self,
-        oi: ObjectInfo,
-        dsc: ReplicateDecision,
-        status: &HashMap<String, ReplicationStatusType>,
-    ) -> ResyncDecision {
-        if self.is_empty() {
-            return ResyncDecision::default();
-        }
-
-        let mut dsc = dsc;
-
-        if oi.delete_marker {
-            let opts = ObjectOpts {
-                name: oi.name.clone(),
-                version_id: oi.version_id,
-                delete_marker: true,
-                op_type: ReplicationType::Delete,
-                existing_object: true,
-                ..Default::default()
-            };
-            let arns = self
-                .config
-                .as_ref()
-                .map(|config| config.filter_target_arns(&opts))
-                .unwrap_or_default();
-
-            if arns.is_empty() {
-                return ResyncDecision::default();
-            }
-
-            for arn in arns {
-                let mut opts = opts.clone();
-                opts.target_arn = arn;
-
-                dsc.set(ReplicateTargetDecision::new(opts.target_arn.clone(), self.replicate(&opts), false));
-            }
-
-            return self.resync_internal(oi, dsc, status);
-        }
-
-        let mut user_defined = (*oi.user_defined).clone();
-        user_defined.remove(AMZ_BUCKET_REPLICATION_STATUS);
-
-        let dsc = must_replicate(
-            oi.bucket.as_str(),
-            &oi.name,
-            MustReplicateOptions::new(&user_defined, (*oi.user_tags).clone(), ReplicationType::ExistingObject, false),
-        )
-        .await;
-
-        self.resync_internal(oi, dsc, status)
-    }
-
-    fn resync_internal(
-        &self,
-        oi: ObjectInfo,
-        dsc: ReplicateDecision,
-        status: &HashMap<String, ReplicationStatusType>,
-    ) -> ResyncDecision {
-        let Some(remotes) = self.remotes.as_ref() else {
-            return ResyncDecision::default();
-        };
-
-        if remotes.is_empty() {
-            return ResyncDecision::default();
-        }
-
-        let mut resync_decision = ResyncDecision::default();
-
-        for target in remotes.targets.iter() {
-            if let Some(decision) = dsc.targets_map.get(&target.arn)
-                && decision.replicate
-            {
-                resync_decision.targets.insert(
-                    decision.arn.clone(),
-                    resync_target_for_object(
-                        &ReplicationResyncTargetObject {
-                            mod_time: oi.mod_time,
-                            user_defined: oi.user_defined.as_ref(),
-                        },
-                        &target.arn,
-                        &target.reset_id,
-                        target.reset_before_date,
-                        status.get(&decision.arn).unwrap_or(&ReplicationStatusType::Empty).clone(),
-                    ),
-                );
-            }
-        }
-
-        resync_decision
-    }
-}
-
-pub(crate) fn get_must_replicate_options(
-    user_defined: &HashMap<String, String>,
-    user_tags: String,
-    _status: ReplicationStatusType,
-    op_type: ReplicationType,
-    opts: ObjectOptions,
-) -> MustReplicateOptions {
-    MustReplicateOptions::new(user_defined, user_tags, op_type, opts.replication_request)
-}
-
-/// Returns whether object version is a delete marker and if object qualifies for replication
-pub(crate) async fn check_replicate_delete(
-    bucket: &str,
-    dobj: &ObjectToDelete,
-    oi: &ObjectInfo,
-    del_opts: &ObjectOptions,
-    gerr: Option<String>,
-) -> ReplicateDecision {
-    let rcfg = match get_replication_config(bucket).await {
-        Ok(Some(config)) => config,
-        Ok(None) => {
-            // warn!("No replication config found for bucket: {}", bucket);
-            return ReplicateDecision::default();
-        }
-        Err(err) => {
-            error!(
-                event = EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                reason = "replication_config_lookup_failed",
-                error = %err,
-                "Failed to look up replication config for delete replication"
-            );
-            return ReplicateDecision::default();
-        }
-    };
-
-    // If incoming request is a replication request, it does not need to be re-replicated.
-    if del_opts.replication_request {
-        return ReplicateDecision::default();
-    }
-
-    // Skip replication if this object's prefix is excluded from being versioned.
-    if !del_opts.versioned {
-        return ReplicateDecision::default();
-    }
-
-    let opts = delete_replication_object_opts(
-        dobj,
-        &ReplicationDeleteSource {
-            user_defined: oi.user_defined.as_ref(),
-            user_tags: oi.user_tags.as_str(),
-            delete_marker: oi.delete_marker,
-            replication_status: oi.replication_status.clone(),
-        },
-    );
-
-    let tgt_arns = rcfg.filter_target_arns(&opts);
-    let mut dsc = ReplicateDecision::new();
-
-    if tgt_arns.is_empty() {
-        return dsc;
-    }
-
-    for tgt_arn in tgt_arns {
-        let mut opts = opts.clone();
-        opts.target_arn = tgt_arn.clone();
-        let replicate = rcfg.replicate(&opts);
-        let sync = false; // Default sync value
-
-        // When incoming delete is removal of a delete marker (a.k.a versioned delete),
-        // GetObjectInfo returns extra information even though it returns errFileNotFound
-        if gerr.is_some() {
-            if let Some(replicate) = delete_replication_missing_source_decision(
-                oi.delete_marker,
-                oi.target_replication_status(&tgt_arn),
-                replicate,
-                &oi.version_purge_status,
-            ) {
-                dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
-            }
-            continue;
-        }
-
-        let tgt = ReplicationTargetStore::remote_target_client(bucket, &tgt_arn).await;
-        // The target online status should not be used here while deciding
-        // whether to replicate deletes as the target could be temporarily down
-        let tgt_dsc = if let Some(tgt) = tgt {
-            ReplicateTargetDecision::new(tgt_arn, replicate, tgt.replicate_sync)
-        } else {
-            ReplicateTargetDecision::new(tgt_arn, false, false)
-        };
-        dsc.set(tgt_dsc);
-    }
-
-    dsc
-}
-
-pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
-    if runtime_sources::object_store_handle().is_none() {
-        return ReplicateDecision::default();
-    }
-
-    if !ReplicationVersioningStore::prefix_enabled(bucket, object).await {
-        return ReplicateDecision::default();
-    }
-
-    let replication_status = mopts.replication_status();
-
-    if replication_status == ReplicationStatusType::Replica && !mopts.is_metadata_replication() {
-        return ReplicateDecision::default();
-    }
-
-    if mopts.is_replication_request() {
-        return ReplicateDecision::default();
-    }
-
-    let cfg = match get_replication_config(bucket).await {
-        Ok(cfg) => {
-            if let Some(cfg) = cfg {
-                cfg
-            } else {
-                return ReplicateDecision::default();
-            }
-        }
-        Err(_err) => {
-            return ReplicateDecision::default();
-        }
-    };
-
-    let opts = ObjectOpts {
-        name: object.to_string(),
-        replica: replication_status == ReplicationStatusType::Replica,
-        existing_object: mopts.is_existing_object_replication(),
-        user_tags: mopts.user_tags().to_string(),
-        ..Default::default()
-    };
-
-    let arns = cfg.filter_target_arns(&opts);
-
-    if arns.is_empty() {
-        return ReplicateDecision::default();
-    }
-
-    let mut dsc = ReplicateDecision::default();
-
-    for arn in arns {
-        let cli = ReplicationTargetStore::remote_target_client(bucket, &arn).await;
-
-        let mut sopts = opts.clone();
-        sopts.target_arn = arn.clone();
-
-        let replicate = cfg.replicate(&sopts);
-        let synchronous = if let Some(cli) = cli { cli.replicate_sync } else { false };
-
-        dsc.set(ReplicateTargetDecision::new(arn, replicate, synchronous));
-    }
-
-    dsc
 }
 
 pub async fn replicate_delete<S: ReplicationStorage>(dobj: DeletedObjectReplicationInfo, storage: Arc<S>) {
@@ -1728,15 +1505,7 @@ async fn replicate_delete_marker_purge_to_targets(bucket: &str, dobj: &DeletedOb
                 &tgt_client.bucket,
                 &dobj.delete_object.object_name,
                 Some(delete_marker_version_id.to_string()),
-                RemoveObjectOptions {
-                    force_delete: false,
-                    governance_bypass: false,
-                    replication_delete_marker: false,
-                    replication_mtime: dobj.delete_object.delete_marker_mtime,
-                    replication_status: ReplicationStatusType::Replica,
-                    replication_request: true,
-                    replication_validity_check: false,
-                },
+                replication_delete_marker_purge_remove_options(dobj.delete_object.delete_marker_mtime),
             )
             .await;
     }
@@ -1920,20 +1689,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             }
 
             if let Err(e) = tgt_client
-                .remove_object(
-                    &tgt_client.bucket,
-                    &object_name,
-                    None,
-                    RemoveObjectOptions {
-                        force_delete: true,
-                        governance_bypass: false,
-                        replication_delete_marker: false,
-                        replication_mtime: None,
-                        replication_status: ReplicationStatusType::Replica,
-                        replication_request: true,
-                        replication_validity_check: false,
-                    },
-                )
+                .remove_object(&tgt_client.bucket, &object_name, None, replication_force_delete_remove_options())
                 .await
             {
                 error!(
@@ -2057,15 +1813,7 @@ async fn replicate_delete_to_target(dobj: &DeletedObjectReplicationInfo, tgt_cli
             &tgt_client.bucket,
             &dobj.delete_object.object_name,
             version_id.clone(),
-            RemoveObjectOptions {
-                force_delete: false,
-                governance_bypass: false,
-                replication_delete_marker: dobj.delete_object.delete_marker,
-                replication_mtime: dobj.delete_object.delete_marker_mtime,
-                replication_status: ReplicationStatusType::Replica,
-                replication_request: true,
-                replication_validity_check: false,
-            },
+            replication_delete_remove_options(dobj.delete_object.delete_marker, dobj.delete_object.delete_marker_mtime),
         )
         .await
     {
@@ -2583,7 +2331,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.size = size;
         rinfo.replication_action = replication_action;
 
-        let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+        let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
             Ok((put_opts, is_mp)) => (put_opts, is_mp),
             Err(e) => {
                 warn!(
@@ -2994,7 +2742,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
             rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
             return rinfo;
         } else {
-            let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
+            let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
                 Ok((put_opts, is_mp)) => (put_opts, is_mp),
                 Err(e) => {
                     rinfo.error = Some(e.to_string());
@@ -3097,34 +2845,6 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
     }
 }
 
-// Standard headers that needs to be extracted from User metadata.
-static STANDARD_HEADERS: &[&str] = &[
-    CONTENT_TYPE,
-    CACHE_CONTROL,
-    CONTENT_ENCODING,
-    CONTENT_LANGUAGE,
-    CONTENT_DISPOSITION,
-    AMZ_STORAGE_CLASS,
-    AMZ_OBJECT_TAGGING,
-    AMZ_BUCKET_REPLICATION_STATUS,
-    AMZ_OBJECT_LOCK_MODE,
-    AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-    AMZ_OBJECT_LOCK_LEGAL_HOLD,
-    AMZ_TAG_COUNT,
-    AMZ_SERVER_SIDE_ENCRYPTION,
-];
-
-fn calc_put_object_header_size(put_opts: &PutObjectOptions) -> usize {
-    let mut header_size: usize = 0;
-    for (key, value) in put_opts.header().iter() {
-        header_size += key.as_str().len();
-        header_size += value.as_bytes().len();
-        // Account for HTTP header formatting: ": " (2 bytes) and "\r\n" (2 bytes)
-        header_size += 4;
-    }
-    header_size
-}
-
 fn wrap_with_bandwidth_monitor_with_header(
     stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     bucket: &str,
@@ -3153,7 +2873,7 @@ fn wrap_with_bandwidth_monitor(
     bucket: &str,
     arn: &str,
 ) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
-    let header_size = calc_put_object_header_size(put_opts);
+    let header_size = replication_put_object_header_size(put_opts);
     wrap_with_bandwidth_monitor_with_header(stream, bucket, arn, header_size)
 }
 
@@ -3163,206 +2883,6 @@ fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'stat
     let stream = ReaderStream::new(reader);
     let body = StreamBody::new(stream.map(|r| r.map(Frame::data)));
     ByteStream::new(SdkBody::from_body_1_x(body))
-}
-
-fn is_standard_header(k: &str) -> bool {
-    STANDARD_HEADERS.iter().any(|h| h.eq_ignore_ascii_case(k))
-}
-
-// Valid SSE replication headers mapping from internal to replication headers
-static VALID_SSE_REPLICATION_HEADERS: &[(&str, &str)] = &[
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Sealed-Key",
-        "X-Rustfs-Replication-Server-Side-Encryption-Sealed-Key",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Seal-Algorithm",
-        "X-Rustfs-Replication-Server-Side-Encryption-Seal-Algorithm",
-    ),
-    (
-        "X-Rustfs-Internal-Server-Side-Encryption-Iv",
-        "X-Rustfs-Replication-Server-Side-Encryption-Iv",
-    ),
-    ("X-Rustfs-Internal-Encrypted-Multipart", "X-Rustfs-Replication-Encrypted-Multipart"),
-    ("X-Rustfs-Internal-Actual-Object-Size", "X-Rustfs-Replication-Actual-Object-Size"),
-];
-
-fn is_valid_sse_header(k: &str) -> Option<&str> {
-    VALID_SSE_REPLICATION_HEADERS
-        .iter()
-        .find(|(internal, _)| k.eq_ignore_ascii_case(internal))
-        .map(|(_, replication)| *replication)
-}
-
-fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObjectOptions, bool)> {
-    use base64::{Engine, engine::general_purpose::STANDARD as BASE64_STANDARD};
-    use rustfs_utils::http::{
-        AMZ_CHECKSUM_TYPE, AMZ_CHECKSUM_TYPE_FULL_OBJECT, AMZ_SERVER_SIDE_ENCRYPTION, AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID,
-    };
-
-    let mut meta = HashMap::new();
-    let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
-
-    // Process user-defined metadata
-    for (k, v) in object_info.user_defined.iter() {
-        let has_valid_sse_header = is_valid_sse_header(k).is_some();
-
-        // In case of SSE-C objects copy the allowed internal headers as well
-        if !is_ssec || !has_valid_sse_header {
-            if is_internal_key(k) {
-                continue;
-            }
-            if is_standard_header(k) {
-                continue;
-            }
-        }
-
-        if let Some(replication_header) = is_valid_sse_header(k) {
-            meta.insert(replication_header.to_string(), v.to_string());
-        } else {
-            meta.insert(k.to_string(), v.to_string());
-        }
-    }
-
-    let mut is_multipart = object_info.is_multipart();
-
-    // Handle checksum
-    if let Some(checksum_data) = &object_info.checksum
-        && !checksum_data.is_empty()
-    {
-        // Add encrypted CRC to metadata for SSE-C objects
-        if is_ssec {
-            let encoded = BASE64_STANDARD.encode(checksum_data);
-            insert_header_map(&mut meta, SUFFIX_REPLICATION_SSEC_CRC, encoded);
-        } else {
-            // Get checksum metadata for non-SSE-C objects
-            let (cs_meta, is_mp) = object_info.decrypt_checksums(0, &HeaderMap::new())?;
-            is_multipart = is_mp;
-
-            // Set object checksum metadata
-            for (k, v) in cs_meta.iter() {
-                if k != AMZ_CHECKSUM_TYPE {
-                    meta.insert(k.clone(), v.clone());
-                }
-            }
-
-            // For objects where checksum is full object, use the cheaper PutObject replication
-            if !object_info.is_multipart()
-                && cs_meta
-                    .get(AMZ_CHECKSUM_TYPE)
-                    .map(|v| v.as_str() == AMZ_CHECKSUM_TYPE_FULL_OBJECT)
-                    .unwrap_or(false)
-            {
-                is_multipart = false;
-            }
-        }
-    }
-
-    // Handle storage class default
-    let storage_class = if sc.is_empty() {
-        let obj_sc = object_info.storage_class.as_deref().unwrap_or_default();
-        if obj_sc == ReplicationConfigStore::STANDARD || obj_sc == ReplicationConfigStore::RRS {
-            obj_sc.to_string()
-        } else {
-            sc.to_string()
-        }
-    } else {
-        sc.to_string()
-    };
-
-    let mut put_op = PutObjectOptions {
-        user_metadata: meta,
-        content_type: object_info.content_type.clone().unwrap_or_default(),
-        content_encoding: object_info.content_encoding.clone().unwrap_or_default(),
-        expires: object_info.expires.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-        storage_class,
-        internal: AdvancedPutOptions {
-            source_version_id: object_info.version_id.map(|v| v.to_string()).unwrap_or_default(),
-            source_etag: object_info.etag.clone().unwrap_or_default(),
-            source_mtime: object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH),
-            replication_status: ReplicationStatusType::Replica, // Changed from Pending to Replica
-            replication_request: true, // always set this to distinguish between replication and normal PUT operation
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-
-    if !object_info.user_tags.is_empty() {
-        let tags = ReplicationTagFilter::decode_tags_to_map(&object_info.user_tags);
-
-        if !tags.is_empty() {
-            put_op.user_tags = tags;
-            // set tag timestamp in opts
-            put_op.internal.tagging_timestamp = if let Some(ts) = get_str(&object_info.user_defined, SUFFIX_TAGGING_TIMESTAMP) {
-                OffsetDateTime::parse(&ts, &Rfc3339)
-                    .map_err(|e| Error::other(format!("Failed to parse tagging timestamp: {}", e)))?
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-        }
-    }
-
-    // Use case-insensitive lookup for headers
-    let lk_map = &*object_info.user_defined;
-
-    if let Some(lang) = lk_map.lookup(CONTENT_LANGUAGE) {
-        put_op.content_language = lang.to_string();
-    }
-
-    if let Some(cd) = lk_map.lookup(CONTENT_DISPOSITION) {
-        put_op.content_disposition = cd.to_string();
-    }
-
-    if let Some(v) = lk_map.lookup(CACHE_CONTROL) {
-        put_op.cache_control = v.to_string();
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_MODE) {
-        let mode = v.to_string().to_uppercase();
-        put_op.mode = Some(aws_sdk_s3::types::ObjectLockRetentionMode::from(mode.as_str()));
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE) {
-        put_op.retain_until_date =
-            OffsetDateTime::parse(v, &Rfc3339).map_err(|e| Error::other(format!("Failed to parse retain until date: {}", e)))?;
-        // set retention timestamp in opts
-        put_op.internal.retention_timestamp =
-            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP) {
-                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-    }
-
-    if let Some(v) = lk_map.lookup(AMZ_OBJECT_LOCK_LEGAL_HOLD) {
-        let hold = v.to_uppercase();
-        put_op.legalhold = Some(ObjectLockLegalHoldStatus::from(hold.as_str()));
-        // set legalhold timestamp in opts
-        put_op.internal.legalhold_timestamp =
-            if let Some(v) = get_str(&object_info.user_defined, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP) {
-                OffsetDateTime::parse(&v, &Rfc3339).unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            } else {
-                object_info.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH)
-            };
-    }
-
-    let has_sse_s3 = object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .map(|v| v.eq_ignore_ascii_case("AES256"))
-        .unwrap_or(false);
-    let has_sse_kms = object_info
-        .user_defined
-        .get(AMZ_SERVER_SIDE_ENCRYPTION)
-        .map(|v| v.eq_ignore_ascii_case("aws:kms"))
-        .unwrap_or(false)
-        || object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
-
-    if has_sse_s3 || has_sse_kms {
-        return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
-    }
-
-    Ok((put_op, is_multipart))
 }
 
 fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Result<(HTTPRangeSpec, i64)> {
@@ -3433,9 +2953,11 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
     let mut uploaded_parts: Vec<CompletedPart> = Vec::new();
 
-    let mut header_size = calc_put_object_header_size(&put_opts);
+    let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
+        let part_number = i32::try_from(part_info.number)
+            .map_err(|_| std::io::Error::other(format!("part number {} overflows i32", part_info.number)))?;
         let part_size = part_info.actual_size;
         let (range_spec, next_offset) = part_range_spec_from_actual_size(offset, part_size)?;
         offset = next_offset;
@@ -3454,7 +2976,7 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 dst_bucket,
                 object,
                 &upload_id,
-                part_info.number as i32,
+                part_number,
                 part_size,
                 byte_stream,
                 &PutObjectPartOptions { ..Default::default() },
@@ -3464,36 +2986,18 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
         let etag = object_part.e_tag.unwrap_or_default();
 
-        uploaded_parts.push(
-            CompletedPart::builder()
-                .part_number(part_info.number as i32)
-                .e_tag(etag)
-                .build(),
-        );
+        uploaded_parts.push(CompletedPart::builder().part_number(part_number).e_tag(etag).build());
     }
 
-    let mut user_metadata = HashMap::new();
-
-    insert_header_map(
-        &mut user_metadata,
-        SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE,
-        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default(),
-    );
+    let actual_size =
+        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default();
 
     cli.complete_multipart_upload(
         dst_bucket,
         object,
         &upload_id,
         uploaded_parts,
-        &PutObjectOptions {
-            user_metadata,
-            internal: AdvancedPutOptions {
-                replication_status: ReplicationStatusType::Replica,
-                replication_request: true,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
+        &replication_complete_multipart_options(actual_size),
     )
     .await
     .map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -3751,42 +3255,6 @@ mod tests {
 
         assert!(!live.to_object_info().delete_marker);
         assert!(delete_marker.to_object_info().delete_marker);
-    }
-
-    #[test]
-    fn put_replication_opts_rejects_sse_s3_until_target_encryption_is_supported() {
-        let object_info = ObjectInfo {
-            user_defined: HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())]).into(),
-            ..Default::default()
-        };
-
-        let err = match put_replication_opts("", &object_info) {
-            Ok(_) => panic!("SSE-S3 replication should fail closed until target encryption headers are supported"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
-    }
-
-    #[test]
-    fn put_replication_opts_rejects_sse_kms_until_target_encryption_is_supported() {
-        use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID;
-
-        let object_info = ObjectInfo {
-            user_defined: HashMap::from([
-                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
-                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
-            ])
-            .into(),
-            ..Default::default()
-        };
-
-        let err = match put_replication_opts("", &object_info) {
-            Ok(_) => panic!("SSE-KMS replication should fail closed until target encryption headers are supported"),
-            Err(err) => err,
-        };
-
-        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 
     #[test]
@@ -4088,6 +3556,54 @@ mod tests {
 
         assert!(token_a.is_cancelled());
         assert!(!token_b.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_finish_resync_workers_closes_result_collector() {
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(1);
+        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let worker = tokio::spawn(async move { while worker_rx.recv().await.is_some() {} });
+        let collector = tokio::spawn(async move { while results_rx.recv().await.is_ok() {} });
+
+        let failed = tokio::time::timeout(
+            TokioDuration::from_secs(1),
+            finish_resync_workers(vec![worker_tx], results_tx, vec![worker, collector], false),
+        )
+        .await
+        .expect("resync worker cleanup should not hang after closing senders");
+
+        assert!(!failed);
+    }
+
+    #[tokio::test]
+    async fn test_finish_resync_workers_reports_join_failure() {
+        let (results_tx, _results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let failed_worker = tokio::spawn(async {
+            panic!("intentional resync worker failure");
+        });
+
+        let failed = finish_resync_workers(Vec::new(), results_tx, vec![failed_worker], false).await;
+
+        assert!(failed);
+    }
+
+    #[tokio::test]
+    async fn test_target_has_resync_failures_reads_accumulated_stats() {
+        let resyncer = ReplicationResyncer::new().await;
+        let opts = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let status = TargetReplicationResyncStatus {
+            failed_count: 1,
+            ..Default::default()
+        };
+
+        resyncer.inc_stats(&status, opts.clone()).await;
+
+        assert!(resyncer.target_has_resync_failures(&opts).await);
     }
 
     #[test]
