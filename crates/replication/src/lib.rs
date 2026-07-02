@@ -19,6 +19,7 @@ pub mod operation;
 pub mod queue;
 pub mod resync;
 pub mod rule;
+pub mod stats;
 pub mod tagging;
 
 pub use config::{ObjectOpts, ReplicationConfigurationExt};
@@ -37,5 +38,10 @@ pub use rustfs_filemeta::{
     ReplicationState, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision,
     VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
     version_purge_statuses_map,
+};
+pub use stats::{
+    ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, ExponentialMovingAverage, FailStats,
+    FailedMetric, InQueueMetric, InQueueStats, LatencyStats, ProxyMetric, ProxyStatsCache, QueueCache, QueueNode, QueueStats,
+    SRMetricsSummary, XferStats,
 };
 pub use tagging::{ReplicationTagFilter, decode_tags_to_map};

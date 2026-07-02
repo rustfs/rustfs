@@ -203,6 +203,7 @@ REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_con
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
+REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
@@ -2605,6 +2606,21 @@ fi
 
 if [[ -s "$REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication queue contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_stats_status=0
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+(?:ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample))\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' >"$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE" || replication_stats_status=$?
+  if [[ "$replication_stats_status" -ne 0 && "$replication_stats_status" -ne 1 ]]; then
+    exit "$replication_stats_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "replication stats contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE")"
 fi
 
 (

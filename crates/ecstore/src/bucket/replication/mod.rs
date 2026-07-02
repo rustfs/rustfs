@@ -47,10 +47,10 @@ pub use replication_pool::{
 };
 pub use replication_resyncer::ReplicationConfig;
 pub use replication_scanner_bridge::ReplicationScannerBridge;
-pub use replication_state::{BucketStats, ReplicationStats};
+pub use replication_state::ReplicationStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
 pub use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationHealQueueResult,
+    BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationHealQueueResult,
     ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ResyncOpts, TargetReplicationResyncStatus,
 };
