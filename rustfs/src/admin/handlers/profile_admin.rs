@@ -54,114 +54,17 @@ pub fn register_profiling_route(r: &mut S3Router<AdminOperation>) -> std::io::Re
 
 pub struct ProfileHandler {}
 
-#[allow(dead_code)]
-fn map_cpu_profile_collect_error_message(err: &str) -> (StatusCode, String) {
-    if err.contains("start running cpu profiler error") {
-        return (
-            StatusCode::CONFLICT,
-            "CPU profiler is already running. Disable RUSTFS_OBS_PROFILING_EXPORT_ENABLED or retry later.".to_string(),
-        );
-    }
-    (StatusCode::INTERNAL_SERVER_ERROR, format!("Failed to collect CPU profile: {err}"))
-}
-
 #[async_trait::async_trait]
 impl Operation for ProfileHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        {
-            let requested_url = req.uri.to_string();
-            let target_os = std::env::consts::OS;
-            let target_arch = std::env::consts::ARCH;
-            let target_env = option_env!("CARGO_CFG_TARGET_ENV").unwrap_or("unknown");
-            let msg = format!(
-                "CPU profiling is not supported on this platform. target_os={target_os}, target_env={target_env}, target_arch={target_arch}, requested_url={requested_url}"
-            );
-            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(msg))));
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            use rustfs_config::{DEFAULT_CPU_FREQ, ENV_CPU_FREQ};
-            use rustfs_utils::get_env_usize;
-
-            let queries = extract_query_params(&req.uri);
-            let seconds = queries.get("seconds").and_then(|s| s.parse::<u64>().ok()).unwrap_or(30);
-            let format = queries.get("format").cloned().unwrap_or_else(|| "protobuf".to_string());
-
-            if seconds > 300 {
-                return Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Profile duration cannot exceed 300 seconds".to_string()),
-                )));
-            }
-
-            match format.as_str() {
-                "protobuf" | "pb" => match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(seconds)).await {
-                    Ok(path) => match tokio::fs::read(&path).await {
-                        Ok(bytes) => {
-                            let mut headers = HeaderMap::new();
-                            headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
-                            Ok(S3Response::with_headers((StatusCode::OK, Body::from(bytes)), headers))
-                        }
-                        Err(e) => {
-                            error!("Failed to read profile file {}: {}", path.display(), e);
-                            Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to read profile file: {e}")),
-                            )))
-                        }
-                    },
-                    Err(e) => {
-                        let (status, message) = map_cpu_profile_collect_error_message(&e);
-                        error!("CPU protobuf profile collection failed: {}", e);
-                        Ok(S3Response::new((status, Body::from(message))))
-                    }
-                },
-                "flamegraph" | "svg" => {
-                    let freq = get_env_usize(ENV_CPU_FREQ, DEFAULT_CPU_FREQ) as i32;
-                    let guard = match pprof::ProfilerGuard::new(freq) {
-                        Ok(g) => g,
-                        Err(e) => {
-                            return Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to create profiler: {e}")),
-                            )));
-                        }
-                    };
-
-                    tokio::time::sleep(std::time::Duration::from_secs(seconds)).await;
-
-                    let report = match guard.report().build() {
-                        Ok(r) => r,
-                        Err(e) => {
-                            return Ok(S3Response::new((
-                                StatusCode::INTERNAL_SERVER_ERROR,
-                                Body::from(format!("Failed to build profile report: {e}")),
-                            )));
-                        }
-                    };
-
-                    let mut flamegraph_buf = Vec::new();
-                    if let Err(e) = report.flamegraph(&mut flamegraph_buf) {
-                        return Ok(S3Response::new((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Body::from(format!("Failed to generate flamegraph: {e}")),
-                        )));
-                    }
-
-                    let mut headers = HeaderMap::new();
-                    headers.insert(CONTENT_TYPE, HeaderValue::from_static("image/svg+xml"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(flamegraph_buf)), headers))
-                }
-                _ => Ok(S3Response::new((
-                    StatusCode::BAD_REQUEST,
-                    Body::from("Unsupported format. Use 'protobuf' or 'flamegraph'".to_string()),
-                ))),
-            }
-        }
+        let requested_url = req.uri.to_string();
+        let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
+            Ok(path) => path.display().to_string(),
+            Err(err) => format!("{err}; requested_url={requested_url}"),
+        };
+        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
     }
 }
 
@@ -172,38 +75,13 @@ impl Operation for ProfileStatusHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         authorize_profile_request(&req).await?;
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        let message = format!("CPU profiling is not supported on {} platform", std::env::consts::OS);
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
+        let message = "Local CPU pprof dumps are not supported; use Pyroscope export instead";
         let status = HashMap::from([
             ("enabled", "false"),
             ("status", "not_supported"),
             ("platform", std::env::consts::OS),
-            ("message", message.as_str()),
+            ("message", message),
         ]);
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        let status = {
-            use rustfs_config::{DEFAULT_ENABLE_PROFILING, ENV_ENABLE_PROFILING};
-            use rustfs_utils::get_env_bool;
-
-            let enabled = get_env_bool(ENV_ENABLE_PROFILING, DEFAULT_ENABLE_PROFILING);
-            if enabled {
-                HashMap::from([
-                    ("enabled", "true"),
-                    ("status", "running"),
-                    ("supported_formats", "protobuf, flamegraph"),
-                    ("max_duration_seconds", "300"),
-                    ("endpoint", "/rustfs/admin/debug/pprof/profile"),
-                ])
-            } else {
-                HashMap::from([
-                    ("enabled", "false"),
-                    ("status", "disabled"),
-                    ("message", "Set RUSTFS_ENABLE_PROFILING=true to enable profiling"),
-                ])
-            }
-        };
 
         match serde_json::to_string(&status) {
             Ok(json) => {
@@ -228,7 +106,6 @@ mod tests {
     use crate::admin::router::Operation;
     use http::{Extensions, HeaderMap, Uri};
     use hyper::Method;
-    use hyper::StatusCode;
     use matchit::Params;
     use s3s::{Body, S3ErrorCode, S3Request};
 
@@ -283,13 +160,5 @@ mod tests {
 
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some("Signature is required"));
-    }
-
-    #[test]
-    fn cpu_profile_collect_error_maps_profiler_conflict_to_409() {
-        let (status, message) =
-            super::map_cpu_profile_collect_error_message("create profiler failed: start running cpu profiler error");
-        assert_eq!(status, StatusCode::CONFLICT);
-        assert!(message.contains("CPU profiler is already running"));
     }
 }

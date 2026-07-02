@@ -143,11 +143,7 @@ fn target_env_name() -> Option<&'static str> {
 }
 
 fn cpu_profiling_status() -> CapabilityStatus {
-    if cfg!(any(target_os = "linux", target_os = "macos")) {
-        CapabilityStatus::supported()
-    } else {
-        CapabilityStatus::unsupported().with_reason("userspace CPU profiling supports linux and macos targets")
-    }
+    CapabilityStatus::unsupported().with_reason("local CPU pprof dumps are not supported; use Pyroscope export instead")
 }
 
 fn ebpf_status() -> CapabilityStatus {

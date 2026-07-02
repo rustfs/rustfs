@@ -15,7 +15,8 @@
 /// Profiler related environment variable names and default values
 pub const ENV_ENABLE_PROFILING: &str = "RUSTFS_ENABLE_PROFILING";
 
-// CPU profiling
+// Legacy local CPU pprof controls. Local pprof dumps are currently unsupported;
+// Pyroscope export is configured through observability settings.
 pub const ENV_CPU_MODE: &str = "RUSTFS_PROF_CPU_MODE"; // off|continuous|periodic
 /// Frequency of CPU profiling samples
 pub const ENV_CPU_FREQ: &str = "RUSTFS_PROF_CPU_FREQ";
@@ -34,7 +35,7 @@ pub const ENV_OUTPUT_DIR: &str = "RUSTFS_PROF_OUTPUT_DIR";
 
 /// Defaults for profiler settings
 pub const DEFAULT_ENABLE_PROFILING: bool = false;
-/// CPU profiling
+/// Legacy local CPU pprof mode
 pub const DEFAULT_CPU_MODE: &str = "off";
 /// Frequency of CPU profiling samples
 pub const DEFAULT_CPU_FREQ: usize = 100;

@@ -196,9 +196,6 @@ tokio = { workspace = true, features = ["io-uring"] }
 [target.'cfg(not(target_os = "windows"))'.dependencies]
 libmimalloc-sys = { version = "0.1.49", features = ["extended"] }
 
-[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-pprof = { workspace = true }
-
 [dev-dependencies]
 uuid = { workspace = true, features = ["v4"] }
 serial_test = { workspace = true }

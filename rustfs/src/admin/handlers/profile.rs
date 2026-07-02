@@ -15,11 +15,7 @@
 use crate::admin::{auth::validate_admin_request, router::Operation};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::HeaderMap;
 use http::StatusCode;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::header::CONTENT_TYPE;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -52,27 +48,11 @@ impl Operation for TriggerProfileCPU {
         authorize_profile_request(&req).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        {
-            let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
-                Ok(path) => path.display().to_string(),
-                Err(err) => err,
-            };
-            return Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))));
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            let dur = std::time::Duration::from_secs(60);
-            match crate::profiling::dump_cpu_pprof_for(dur).await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
-            }
-        }
+        let message = match crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0)).await {
+            Ok(path) => path.display().to_string(),
+            Err(err) => err,
+        };
+        Ok(S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message))))
     }
 }
 
