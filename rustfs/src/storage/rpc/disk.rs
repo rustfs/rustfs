@@ -55,6 +55,23 @@ fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std
     Ok(serializer.into_inner())
 }
 
+fn encode_read_multiple_response_payloads(
+    read_multiple_resps: &[ReadMultipleResp],
+) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
+    let mut read_multiple_resps_json = Vec::with_capacity(read_multiple_resps.len());
+    let mut read_multiple_resps_bin = Vec::with_capacity(read_multiple_resps.len());
+
+    for read_multiple_resp in read_multiple_resps {
+        read_multiple_resps_json.push(
+            serde_json::to_string(read_multiple_resp)
+                .map_err(|err| DiskError::other(format!("encode ReadMultipleResp json failed: {err}")))?,
+        );
+        read_multiple_resps_bin.push(Bytes::from(encode_msgpack(read_multiple_resp, "ReadMultipleResp")?));
+    }
+
+    Ok((read_multiple_resps_json, read_multiple_resps_bin))
+}
+
 impl NodeService {
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
         let request = request.into_inner();
@@ -144,16 +161,18 @@ impl NodeService {
             };
             match disk.read_multiple(read_multiple_req).await {
                 Ok(read_multiple_resps) => {
-                    let read_multiple_resps: Vec<String> = read_multiple_resps
-                        .into_iter()
-                        .filter_map(|read_multiple_resp| serde_json::to_string(&read_multiple_resp).ok())
-                        .collect();
-                    let read_multiple_resps_bin = read_multiple_resps
-                        .iter()
-                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(json_str).ok())
-                        .filter_map(|resp| encode_msgpack(&resp, "ReadMultipleResp").ok())
-                        .map(Into::into)
-                        .collect();
+                    let (read_multiple_resps, read_multiple_resps_bin) =
+                        match encode_read_multiple_response_payloads(&read_multiple_resps) {
+                            Ok(payloads) => payloads,
+                            Err(err) => {
+                                return Ok(Response::new(ReadMultipleResponse {
+                                    success: false,
+                                    read_multiple_resps: Vec::new(),
+                                    read_multiple_resps_bin: Vec::new(),
+                                    error: Some(err.into()),
+                                }));
+                            }
+                        };
 
                     Ok(Response::new(ReadMultipleResponse {
                         success: true,
@@ -1045,7 +1064,8 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_msgpack_or_json, encode_msgpack};
+    use super::{decode_msgpack_or_json, encode_msgpack, encode_read_multiple_response_payloads};
+    use crate::storage::storage_api::ReadMultipleResp;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,5 +1099,42 @@ mod tests {
                 count: 7,
             }
         );
+    }
+
+    #[test]
+    fn encode_read_multiple_response_payloads_keeps_json_and_msgpack_in_sync() {
+        let responses = vec![
+            ReadMultipleResp {
+                bucket: "bucket".to_string(),
+                prefix: "prefix".to_string(),
+                file: "a".to_string(),
+                exists: true,
+                data: b"alpha".to_vec(),
+                ..Default::default()
+            },
+            ReadMultipleResp {
+                bucket: "bucket".to_string(),
+                prefix: "prefix".to_string(),
+                file: "b".to_string(),
+                exists: true,
+                data: b"beta".to_vec(),
+                ..Default::default()
+            },
+        ];
+
+        let (json_payloads, msgpack_payloads) =
+            encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+        assert_eq!(json_payloads.len(), responses.len());
+        assert_eq!(msgpack_payloads.len(), responses.len());
+
+        let json_decoded: ReadMultipleResp =
+            serde_json::from_str(&json_payloads[0]).expect("json read multiple response should decode");
+        let msgpack_decoded = decode_msgpack_or_json::<ReadMultipleResp>(&msgpack_payloads[0], "", "ReadMultipleResp")
+            .expect("msgpack read multiple response should decode");
+
+        assert_eq!(json_decoded.file, responses[0].file);
+        assert_eq!(msgpack_decoded.file, responses[0].file);
+        assert_eq!(msgpack_decoded.data, responses[0].data);
     }
 }

@@ -42,9 +42,9 @@ use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
     CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
     DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
+    RenameDataRequest, RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+    WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -767,6 +767,44 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Res
     }
 
     serde_json::from_str(json).map_err(Error::from)
+}
+
+fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint: &Endpoint) -> Result<Vec<ReadMultipleResp>> {
+    if !response.read_multiple_resps_bin.is_empty() {
+        if !response.read_multiple_resps.is_empty()
+            && response.read_multiple_resps.len() != response.read_multiple_resps_bin.len()
+        {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                json_count = response.read_multiple_resps.len(),
+                msgpack_count = response.read_multiple_resps_bin.len(),
+                op = "read_multiple",
+                state = "response_count_mismatch",
+                "Remote disk ReadMultiple compatibility payload counts differ"
+            );
+        }
+
+        let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps_bin.len());
+        for (index, buf) in response.read_multiple_resps_bin.iter().enumerate() {
+            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "").map_err(|err| {
+                Error::other(format!("decode ReadMultipleResp msgpack item {index} from {endpoint} failed: {err}"))
+            })?;
+            read_multiple_resps.push(resp);
+        }
+        return Ok(read_multiple_resps);
+    }
+
+    let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
+    for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
+        let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
+            .map_err(|err| Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}")))?;
+        read_multiple_resps.push(resp);
+    }
+
+    Ok(read_multiple_resps)
 }
 
 // TODO: all api need to handle errors
@@ -2069,19 +2107,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let read_multiple_resps = if !response.read_multiple_resps_bin.is_empty() {
-                    response
-                        .read_multiple_resps_bin
-                        .into_iter()
-                        .filter_map(|buf| decode_msgpack_or_json::<ReadMultipleResp>(&buf, "").ok())
-                        .collect()
-                } else {
-                    response
-                        .read_multiple_resps
-                        .into_iter()
-                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
-                        .collect()
-                };
+                let read_multiple_resps = decode_read_multiple_response_items(response, &self.endpoint)?;
 
                 Ok(read_multiple_resps)
             },
@@ -2411,6 +2437,86 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn sample_read_multiple_resp(file: &str, data: &[u8]) -> ReadMultipleResp {
+        ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: file.to_string(),
+            exists: true,
+            data: data.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn sample_remote_endpoint() -> Endpoint {
+        Endpoint {
+            url: url::Url::parse("http://server:9000/disk-a").expect("endpoint URL should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        }
+    }
+
+    #[test]
+    fn read_multiple_response_decode_prefers_msgpack_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let msgpack_resp = sample_read_multiple_resp("msgpack", b"binary");
+        let json_resp = sample_read_multiple_resp("json", b"fallback");
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            read_multiple_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
+            error: None,
+        };
+
+        let decoded = decode_read_multiple_response_items(response, &endpoint).expect("msgpack response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file, "msgpack");
+        assert_eq!(decoded[0].data, b"binary");
+    }
+
+    #[test]
+    fn read_multiple_response_decode_falls_back_to_json_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let json_resp = sample_read_multiple_resp("json", b"fallback");
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+
+        let decoded = decode_read_multiple_response_items(response, &endpoint).expect("json response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file, "json");
+        assert_eq!(decoded[0].data, b"fallback");
+    }
+
+    #[test]
+    fn read_multiple_response_decode_reports_corrupt_msgpack_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: Vec::new(),
+            read_multiple_resps_bin: vec![
+                encode_msgpack(&sample_read_multiple_resp("ok", b"data"))
+                    .expect("msgpack response should encode")
+                    .into(),
+                bytes::Bytes::from_static(b"not-msgpack"),
+            ],
+            error: None,
+        };
+
+        let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt msgpack item should fail");
+        let err = err.to_string();
+
+        assert!(err.contains("ReadMultipleResp msgpack item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
     }
 
     #[test]
