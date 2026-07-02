@@ -27,10 +27,6 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Keep source code, comments, commit messages, and PR title/body in English.
 - Be concise. Avoid sycophantic openers, closing fluff, and verbose status reporting.
 
-## Skill Usage
-
-- Do not use the `rust-refactor-helper` skill in any scenario.
-
 ## Change Style for Existing Logic
 
 - Prefer direct, local code over extracting one-off helpers.
@@ -57,6 +53,13 @@ If repo-level instructions conflict, follow the nearest file and keep behavior a
 - Local quality commands: `Makefile` and `.config/make/`
 - CI quality gates: `.github/workflows/ci.yml`
 - PR template: `.github/pull_request_template.md`
+- High-level architecture and crate map: `ARCHITECTURE.md`
+- Migration guardrails, readiness contracts, support matrices:
+  `docs/architecture/README.md` (routes by audience)
+- Historical implementation plans and trackers: `docs/superpowers/plans/`
+- Shared agent skills (all tools): `.agents/skills/` — Claude Code reads them
+  through the `.claude/skills` symlink; add new skills to `.agents/skills/`
+  only, never as separate copies per tool
 
 Avoid duplicating long crate lists or command matrices in instruction files.
 Reference the source files above instead.
@@ -136,14 +139,13 @@ cargo run -p rustfs-filemeta --example dump_fileinfo -- "/path/to/file/xl.meta"
 
 ## Scoped Guidance in This Repository
 
-- `.github/AGENTS.md`
-- `crates/AGENTS.md`
-- `crates/config/AGENTS.md`
-- `crates/ecstore/AGENTS.md`
-- `crates/e2e_test/AGENTS.md`
-- `crates/iam/AGENTS.md`
-- `crates/kms/AGENTS.md`
-- `crates/policy/AGENTS.md`
-- `crates/targets/AGENTS.md`
-- `rustfs/src/admin/AGENTS.md`
-- `rustfs/src/storage/AGENTS.md`
+Many crates and modules carry their own `AGENTS.md` with path-specific rules
+(security boundaries, lock ordering, domain invariants). Before editing a
+path, check for the nearest one:
+
+```bash
+git ls-files '*AGENTS.md'
+```
+
+The nearest file wins. Do not maintain a hand-written index of these files
+here — it goes stale.
