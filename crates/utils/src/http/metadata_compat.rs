@@ -204,4 +204,39 @@ mod tests {
         assert!(!metadata.contains_key("X-Minio-Internal-compression"));
         assert!(contains_key_str(&metadata, SUFFIX_ACTUAL_SIZE));
     }
+
+    #[test]
+    fn test_str_prefers_rustfs_key_over_minio() {
+        let metadata = HashMap::from([
+            (internal_key_rustfs(SUFFIX_TRANSITION_TIER), "rustfs-tier".to_string()),
+            (format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITION_TIER}"), "minio-tier".to_string()),
+        ]);
+
+        assert_eq!(get_str(&metadata, SUFFIX_TRANSITION_TIER).as_deref(), Some("rustfs-tier"));
+    }
+
+    #[test]
+    fn test_bytes_lookup_falls_back_to_minio_key() {
+        let mut meta_sys =
+            HashMap::from([(format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}"), b"version-1".to_vec())]);
+
+        assert!(contains_key_bytes(&meta_sys, SUFFIX_TRANSITIONED_VERSION_ID));
+        assert_eq!(get_bytes(&meta_sys, SUFFIX_TRANSITIONED_VERSION_ID), Some(b"version-1".to_vec()));
+
+        remove_bytes(&mut meta_sys, SUFFIX_TRANSITIONED_VERSION_ID);
+        assert!(!contains_key_bytes(&meta_sys, SUFFIX_TRANSITIONED_VERSION_ID));
+    }
+
+    #[test]
+    fn test_bytes_prefers_rustfs_key_over_minio() {
+        let meta_sys = HashMap::from([
+            (internal_key_rustfs(SUFFIX_TRANSITIONED_VERSION_ID), b"rustfs-version".to_vec()),
+            (
+                format!("{MINIO_INTERNAL_PREFIX}{SUFFIX_TRANSITIONED_VERSION_ID}"),
+                b"minio-version".to_vec(),
+            ),
+        ]);
+
+        assert_eq!(get_bytes(&meta_sys, SUFFIX_TRANSITIONED_VERSION_ID), Some(b"rustfs-version".to_vec()));
+    }
 }
