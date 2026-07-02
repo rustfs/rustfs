@@ -56,9 +56,11 @@ use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
 use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
+    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, content_matches_by_etag,
     is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    resync_state_accepts_update, should_count_head_proxy_failure, should_retry_delete_marker_purge,
+    replication_action_for_target, resync_state_accepts_update, should_count_head_proxy_failure,
+    should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -70,7 +72,6 @@ use rustfs_utils::http::{
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
     has_internal_suffix, insert_header_map, insert_str, is_internal_key,
 };
-use rustfs_utils::string::strings_has_prefix_fold;
 use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
 use serde::Deserialize;
@@ -158,12 +159,36 @@ async fn head_object_fallback(
     }
 }
 
-// Version IDs differ by design on this path (RustFS UUID vs AWS alphanumeric), so
-// compare only ETags. Equal ETags mean identical content; version ID is irrelevant.
-fn content_matches(src: &ObjectInfo, tgt: &HeadObjectOutput) -> bool {
-    let src_etag = src.etag.as_deref().map(rustfs_utils::path::trim_etag);
-    let tgt_etag = tgt.e_tag.as_deref().map(rustfs_utils::path::trim_etag);
-    src_etag.is_some() && src_etag == tgt_etag
+fn head_object_last_modified(oi: &HeadObjectOutput) -> Option<OffsetDateTime> {
+    oi.last_modified
+        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
+}
+
+fn replication_source_object(oi: &ObjectInfo) -> ReplicationSourceObject<'_> {
+    ReplicationSourceObject {
+        mod_time: oi.mod_time,
+        version_id: oi.version_id.map(|version_id| version_id.to_string()),
+        etag: oi.etag.as_deref(),
+        actual_size: oi.get_actual_size().unwrap_or_default(),
+        delete_marker: oi.delete_marker,
+        content_type: oi.content_type.as_deref(),
+        content_encoding: oi.content_encoding.as_deref(),
+        user_tags: oi.user_tags.as_str(),
+        user_defined: oi.user_defined.as_ref(),
+    }
+}
+
+fn replication_target_object(oi: &HeadObjectOutput) -> ReplicationTargetObject<'_> {
+    ReplicationTargetObject {
+        last_modified: head_object_last_modified(oi),
+        version_id: oi.version_id.as_deref(),
+        etag: oi.e_tag.as_deref(),
+        content_length: oi.content_length.unwrap_or_default(),
+        delete_marker: oi.delete_marker.unwrap_or_default(),
+        content_type: oi.content_type.as_deref(),
+        metadata: oi.metadata.as_ref(),
+        tag_count: oi.tag_count.unwrap_or_default(),
+    }
 }
 
 fn map_replication_error(err: rustfs_replication::Error) -> Error {
@@ -2557,7 +2582,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             Ok(oi) => {
-                replication_action = get_replication_action(&object_info, &oi, self.op_type);
+                replication_action = replication_action_for_target(
+                    &replication_source_object(&object_info),
+                    &replication_target_object(&oi),
+                    self.op_type,
+                );
                 if replication_action == ReplicationAction::None {
                     rinfo.replication_status = ReplicationStatusType::Completed;
                     rinfo.replication_resynced = true;
@@ -2572,7 +2601,12 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                 } else if is_version_id_format_mismatch(&e) {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
-                        Ok(Some(oi)) if content_matches(&object_info, &oi) => {
+                        Ok(Some(oi))
+                            if content_matches_by_etag(
+                                &replication_source_object(&object_info),
+                                &replication_target_object(&oi),
+                            ) =>
+                        {
                             rinfo.replication_status = ReplicationStatusType::Completed;
                             rinfo.replication_resynced = true;
                             rinfo.replication_action = ReplicationAction::None;
@@ -2874,11 +2908,18 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             Ok(oi) => {
-                replication_action = get_replication_action(&object_info, &oi, self.op_type);
+                replication_action = replication_action_for_target(
+                    &replication_source_object(&object_info),
+                    &replication_target_object(&oi),
+                    self.op_type,
+                );
                 rinfo.replication_status = ReplicationStatusType::Completed;
                 if replication_action == ReplicationAction::None {
                     if self.op_type == ReplicationType::ExistingObject
-                        && target_is_newer_than_source_null_version(&object_info, &oi)
+                        && target_is_newer_than_source_null_version(
+                            &replication_source_object(&object_info),
+                            &replication_target_object(&oi),
+                        )
                     {
                         warn!(
                             event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -2932,7 +2973,10 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
                     // Version-ID format mismatch: retry without versionId and compare ETags.
                     match head_object_fallback(&bucket, &tgt_client, &object).await {
                         Ok(Some(oi)) => {
-                            replication_action = if content_matches(&object_info, &oi) {
+                            replication_action = if content_matches_by_etag(
+                                &replication_source_object(&object_info),
+                                &replication_target_object(&oi),
+                            ) {
                                 ReplicationAction::None
                             } else {
                                 ReplicationAction::All
@@ -3520,115 +3564,6 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     Ok(())
 }
 
-fn target_is_newer_than_source_null_version(oi1: &ObjectInfo, oi2: &HeadObjectOutput) -> bool {
-    oi2.last_modified
-        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-        .is_some_and(|target_mod_time| target_mod_time > oi1.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH))
-        && oi1.version_id.is_none()
-}
-
-fn get_replication_action(oi1: &ObjectInfo, oi2: &HeadObjectOutput, op_type: ReplicationType) -> ReplicationAction {
-    if op_type == ReplicationType::ExistingObject && target_is_newer_than_source_null_version(oi1, oi2) {
-        return ReplicationAction::None;
-    }
-
-    let size = oi1.get_actual_size().unwrap_or_default();
-
-    // Normalize ETags by removing quotes before comparison (PR #592 compatibility)
-    let oi1_etag = oi1.etag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
-    let oi2_etag = oi2.e_tag.as_ref().map(|e| rustfs_utils::path::trim_etag(e));
-
-    if oi1_etag != oi2_etag
-        || oi1.version_id.map(|v| v.to_string()) != oi2.version_id
-        || size != oi2.content_length.unwrap_or_default()
-        || oi1.delete_marker != oi2.delete_marker.unwrap_or_default()
-        || oi1.mod_time
-            != oi2
-                .last_modified
-                .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-    {
-        return ReplicationAction::All;
-    }
-
-    if oi1.content_type != oi2.content_type {
-        return ReplicationAction::Metadata;
-    }
-
-    let empty_metadata = HashMap::new();
-    let metadata = oi2.metadata.as_ref().unwrap_or(&empty_metadata);
-
-    if let Some(content_encoding) = &oi1.content_encoding {
-        if let Some(enc) = metadata
-            .get(CONTENT_ENCODING)
-            .or_else(|| metadata.get(&CONTENT_ENCODING.to_lowercase()))
-        {
-            if enc != content_encoding {
-                return ReplicationAction::Metadata;
-            }
-        } else {
-            return ReplicationAction::Metadata;
-        }
-    }
-
-    let oi1_tags = ReplicationTagFilter::decode_tags_to_map(&oi1.user_tags);
-    let oi2_tags =
-        ReplicationTagFilter::decode_tags_to_map(metadata.get(AMZ_OBJECT_TAGGING).cloned().unwrap_or_default().as_str());
-
-    if (oi2.tag_count.unwrap_or_default() > 0 && oi1_tags != oi2_tags)
-        || oi2.tag_count.unwrap_or_default() != oi1_tags.len() as i32
-    {
-        return ReplicationAction::Metadata;
-    }
-
-    // Compare only necessary headers
-    let compare_keys = vec![
-        "Expires",
-        "Cache-Control",
-        "Content-Language",
-        "Content-Disposition",
-        "X-Amz-Object-Lock-Mode",
-        "X-Amz-Object-Lock-Retain-Until-Date",
-        "X-Amz-Object-Lock-Legal-Hold",
-        "X-Amz-Website-Redirect-Location",
-        "X-Amz-Meta-",
-    ];
-
-    // compare metadata on both maps to see if meta is identical
-    let mut compare_meta1 = HashMap::new();
-    for (k, v) in oi1.user_defined.iter() {
-        let mut found = false;
-        for prefix in &compare_keys {
-            if strings_has_prefix_fold(k, prefix) {
-                found = true;
-                break;
-            }
-        }
-        if found {
-            compare_meta1.insert(k.to_lowercase(), v.clone());
-        }
-    }
-
-    let mut compare_meta2 = HashMap::new();
-    for (k, v) in metadata {
-        let mut found = false;
-        for prefix in &compare_keys {
-            if strings_has_prefix_fold(k.to_string().as_str(), prefix) {
-                found = true;
-                break;
-            }
-        }
-        if found {
-            compare_meta2.insert(k.to_lowercase(), v.clone());
-        }
-    }
-
-    if compare_meta1 != compare_meta2 {
-        return ReplicationAction::Metadata;
-    }
-
-    ReplicationAction::None
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3907,7 +3842,11 @@ mod tests {
         let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(10)).build();
 
         assert_eq!(
-            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            replication_action_for_target(
+                &replication_source_object(&source),
+                &replication_target_object(&target),
+                ReplicationType::ExistingObject,
+            ),
             ReplicationAction::All,
             "a newer source null version must not be skipped during existing-object replication"
         );
@@ -3923,7 +3862,11 @@ mod tests {
         let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(20)).build();
 
         assert_eq!(
-            get_replication_action(&source, &target, ReplicationType::ExistingObject),
+            replication_action_for_target(
+                &replication_source_object(&source),
+                &replication_target_object(&target),
+                ReplicationType::ExistingObject,
+            ),
             ReplicationAction::None,
             "a newer target null-version object should not be overwritten by existing-object replication"
         );
@@ -4213,11 +4156,14 @@ mod tests {
         };
 
         let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
-        assert!(content_matches(&src, &tgt_match), "identical ETags must match");
+        assert!(
+            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_match)),
+            "identical ETags must match"
+        );
 
         let tgt_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
         assert!(
-            content_matches(&src, &tgt_unquoted_match),
+            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_unquoted_match)),
             "quoted and unquoted ETags with identical values must match"
         );
 
@@ -4227,21 +4173,30 @@ mod tests {
             .version_id("aws-alphanumeric-id")
             .build();
         assert!(
-            content_matches(&src, &tgt_different_version),
+            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_different_version)),
             "matching ETags with different version IDs must still match"
         );
 
         let tgt_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
-        assert!(!content_matches(&src, &tgt_different_content), "different ETags must not match");
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_different_content)),
+            "different ETags must not match"
+        );
 
         let src_no_etag = ObjectInfo {
             etag: None,
             ..Default::default()
         };
-        assert!(!content_matches(&src_no_etag, &tgt_match), "missing source ETag must not match");
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&src_no_etag), &replication_target_object(&tgt_match)),
+            "missing source ETag must not match"
+        );
 
         let tgt_no_etag = HeadObjectOutput::builder().build();
-        assert!(!content_matches(&src, &tgt_no_etag), "missing target ETag must not match");
+        assert!(
+            !content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_no_etag)),
+            "missing target ETag must not match"
+        );
     }
 
     #[test]
