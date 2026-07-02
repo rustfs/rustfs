@@ -106,6 +106,10 @@ impl ResyncStatusType {
     }
 }
 
+pub fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
+    matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
+}
+
 impl fmt::Display for ResyncStatusType {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let s = match self {
@@ -541,6 +545,16 @@ mod tests {
         assert_eq!(ResyncStatusType::ResyncStarted.to_string(), "Ongoing");
         assert_eq!(ResyncStatusType::ResyncCompleted.to_string(), "Completed");
         assert_eq!(ResyncStatusType::NoResync.to_string(), "");
+    }
+
+    #[test]
+    fn auto_resume_resync_only_for_inflight_states() {
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
+        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
+        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 
     #[test]
