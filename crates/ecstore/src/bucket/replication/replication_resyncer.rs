@@ -79,7 +79,7 @@ use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::AsyncRead;
 use tokio::sync::RwLock;
-use tokio::task::JoinSet;
+use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Duration as TokioDuration;
 use tokio_util::io::ReaderStream;
 use tokio_util::sync::CancellationToken;
@@ -108,6 +108,40 @@ static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
 
 fn resync_state_accepts_update(state: &TargetReplicationResyncStatus, opts: &ResyncOpts) -> bool {
     state.resync_id.is_empty() || opts.resync_id.is_empty() || state.resync_id == opts.resync_id
+}
+
+async fn finish_resync_workers(
+    worker_txs: Vec<tokio::sync::mpsc::Sender<ReplicateObjectInfo>>,
+    results_tx: tokio::sync::broadcast::Sender<TargetReplicationResyncStatus>,
+    futures: Vec<JoinHandle<()>>,
+    abort: bool,
+) -> bool {
+    drop(worker_txs);
+    drop(results_tx);
+
+    if abort {
+        for future in &futures {
+            future.abort();
+        }
+    }
+
+    let mut failed = false;
+    for result in join_all(futures).await {
+        if let Err(err) = result
+            && !(abort && err.is_cancelled())
+        {
+            failed = true;
+            error!(
+                event = EVENT_RESYNC_TASK_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                error = %err,
+                "Replication resync task failed"
+            );
+        }
+    }
+
+    failed
 }
 
 fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, raw_status: Option<u16>) -> bool {
@@ -369,6 +403,15 @@ impl ReplicationResyncer {
         bucket_status.last_update = Some(now);
     }
 
+    async fn target_has_resync_failures(&self, opts: &ResyncOpts) -> bool {
+        self.status_map
+            .read()
+            .await
+            .get(&opts.bucket)
+            .and_then(|status| status.targets_map.get(&opts.arn))
+            .is_some_and(|status| status.failed_count > 0)
+    }
+
     pub async fn persist_to_disk<S>(&self, cancel_token: CancellationToken, api: Arc<S>)
     where
         S: ReplicationObjectIO,
@@ -624,6 +667,7 @@ impl ReplicationResyncer {
                 .await;
             return;
         }
+        drop(tx);
 
         let status = {
             self.status_map
@@ -793,12 +837,25 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to receive resync object info"
                 );
+                let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+                if worker_failed {
+                    error!(
+                        event = EVENT_RESYNC_TASK_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        reason = "worker_join_failed_after_object_info_error",
+                        "Replication resync worker cleanup observed task failure"
+                    );
+                }
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
                     .await;
                 return;
             }
 
             if cancellation_token.is_cancelled() {
+                finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -822,6 +879,7 @@ impl ReplicationResyncer {
             }
 
             if cancellation_token.is_cancelled() {
+                finish_resync_workers(worker_txs, results_tx, futures, true).await;
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncCanceled, opts.clone(), storage.clone())
                     .await;
                 return;
@@ -840,20 +898,33 @@ impl ReplicationResyncer {
                     error = %err,
                     "Failed to send resync object to worker"
                 );
+                let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+                if worker_failed {
+                    error!(
+                        event = EVENT_RESYNC_TASK_FAILED,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                        bucket = %opts.bucket,
+                        arn = %opts.arn,
+                        reason = "worker_join_failed_after_queue_send_error",
+                        "Replication resync worker cleanup observed task failure"
+                    );
+                }
                 self.resync_bucket_mark_status(ResyncStatusType::ResyncFailed, opts.clone(), storage.clone())
                     .await;
                 return;
             }
         }
 
-        for worker_tx in worker_txs {
-            drop(worker_tx);
-        }
+        let worker_failed = finish_resync_workers(worker_txs, results_tx, futures, false).await;
+        let target_failed = self.target_has_resync_failures(&opts).await;
+        let status = if worker_failed || target_failed {
+            ResyncStatusType::ResyncFailed
+        } else {
+            ResyncStatusType::ResyncCompleted
+        };
 
-        join_all(futures).await;
-
-        self.resync_bucket_mark_status(ResyncStatusType::ResyncCompleted, opts.clone(), storage.clone())
-            .await;
+        self.resync_bucket_mark_status(status, opts.clone(), storage.clone()).await;
     }
 }
 
@@ -4362,6 +4433,54 @@ mod tests {
 
         assert!(token_a.is_cancelled());
         assert!(!token_b.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn test_finish_resync_workers_closes_result_collector() {
+        let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(1);
+        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let worker = tokio::spawn(async move { while worker_rx.recv().await.is_some() {} });
+        let collector = tokio::spawn(async move { while results_rx.recv().await.is_ok() {} });
+
+        let failed = tokio::time::timeout(
+            TokioDuration::from_secs(1),
+            finish_resync_workers(vec![worker_tx], results_tx, vec![worker, collector], false),
+        )
+        .await
+        .expect("resync worker cleanup should not hang after closing senders");
+
+        assert!(!failed);
+    }
+
+    #[tokio::test]
+    async fn test_finish_resync_workers_reports_join_failure() {
+        let (results_tx, _results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let failed_worker = tokio::spawn(async {
+            panic!("intentional resync worker failure");
+        });
+
+        let failed = finish_resync_workers(Vec::new(), results_tx, vec![failed_worker], false).await;
+
+        assert!(failed);
+    }
+
+    #[tokio::test]
+    async fn test_target_has_resync_failures_reads_accumulated_stats() {
+        let resyncer = ReplicationResyncer::new().await;
+        let opts = ResyncOpts {
+            bucket: "bucket".to_string(),
+            arn: "arn:replication::dest".to_string(),
+            resync_id: "run-new".to_string(),
+            resync_before: None,
+        };
+        let status = TargetReplicationResyncStatus {
+            failed_count: 1,
+            ..Default::default()
+        };
+
+        resyncer.inc_stats(&status, opts.clone()).await;
+
+        assert!(resyncer.target_has_resync_failures(&opts).await);
     }
 
     #[test]
