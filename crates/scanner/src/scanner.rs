@@ -686,6 +686,48 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 }
 
+async fn persist_scanner_cycle_state(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &CurrentCycle) {
+    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+    buf.extend_from_slice(&cycle_info_buf);
+
+    if let Err(e) = save_config(storeapi, &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "failed",
+            error = %e,
+            "Scanner state persistence failed"
+        );
+    } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "saved",
+            "Scanner state saved"
+        );
+    }
+}
+
+async fn finalize_partial_scan_cycle(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &mut CurrentCycle) {
+    // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
+    // must still advance (and persist) because per-bucket next_cycle is stamped from
+    // it and compacted folders are only rescanned when their hash matches
+    // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
+    // expiry and usage refresh on every folder outside the stuck window.
+    cycle_info.next += 1;
+    persist_scanner_cycle_state(storeapi, cycle_info).await;
+    mark_scan_cycle_idle(cycle_info).await;
+}
+
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
@@ -785,7 +827,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 scan_cycle_partial_reason(budget_reason),
                 scan_cycle_partial_source(budget_reason),
             );
-            mark_scan_cycle_idle(cycle_info).await;
+            finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
             return;
         }
         error!(
@@ -829,7 +871,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
         return;
     }
     done_cycle();
@@ -860,34 +902,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
-    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
-
-    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-    buf.extend_from_slice(&cycle_info_buf);
-
-    if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-        error!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "failed",
-            error = %e,
-            "Scanner state persistence failed"
-        );
-    } else {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "saved",
-            "Scanner state saved"
-        );
-    }
+    persist_scanner_cycle_state(storeapi.clone(), cycle_info).await;
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
@@ -1450,6 +1465,37 @@ mod tests {
         assert_eq!(published.current, 0);
         assert_eq!(published.next, 13);
         assert_eq!(global_metrics().current_scan_mode(), HealScanMode::Unknown);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+
+        finalize_partial_scan_cycle(store.clone(), &mut cycle_info).await;
+
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(cycle_info.current, 0);
+        assert!(cycle_info.cycle_completed.is_empty());
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("cycle state should be persisted after a partial cycle");
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().expect("persisted state should start with the counter")),
+            13
+        );
+        let mut decoded = CurrentCycle::default();
+        decoded.unmarshal(&buf[8..]).expect("persisted cycle info should decode");
+        assert_eq!(decoded.next, 13);
 
         global_metrics().set_cycle(None).await;
     }
