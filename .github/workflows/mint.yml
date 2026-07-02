@@ -1,0 +1,209 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# MinIO Mint against RustFS: multi-SDK client compatibility.
+#
+# ceph/s3-tests (see e2e-s3tests.yml and the ci.yml PR gate) exercises the S3
+# API semantics through boto3 only. Mint complements it by running the
+# functional test suites of many REAL client SDKs and tools (awscli, mc,
+# aws-sdk-java/go/php/ruby, minio-go/java/js/py, s3cmd, ...), which catches
+# client-specific signing, encoding, and streaming edge cases a single client
+# cannot.
+#
+# This job is REPORT-ONLY for test failures: RustFS does not pass every mint
+# suite yet, so failures are inventoried in the job summary instead of turning
+# the run red. The job fails only when mint produces no results at all
+# (infrastructure error). Once a suite passes reliably, tightening this into a
+# baseline gate (like implemented_tests.txt for s3-tests) is the natural next
+# step.
+
+name: mint
+
+on:
+  workflow_dispatch:
+    inputs:
+      suites:
+        description: "Space-separated mint suites to run (empty = all, e.g. 'awscli mc minio-go')"
+        required: false
+        default: ""
+      mode:
+        description: "Mint mode: core (quick) or full"
+        required: true
+        type: choice
+        default: "core"
+        options:
+          - core
+          - full
+      mint-image:
+        description: "Mint image reference"
+        required: false
+        default: "minio/mint:edge"
+  schedule:
+    # Weekly, after the Sunday s3-tests full sweep.
+    - cron: "0 4 * * 0"
+
+env:
+  S3_ACCESS_KEY: rustfsadmin
+  S3_SECRET_KEY: rustfsadmin
+  S3_REGION: us-east-1
+
+  RUST_LOG: info
+  PLATFORM: linux/amd64
+  BUILDX_CACHE_SCOPE: rustfs-e2e-s3tests-source
+
+  MINT_SUITES: ${{ github.event.inputs.suites || '' }}
+  MINT_MODE: ${{ github.event.inputs.mode || 'core' }}
+  # NOTE: minio/mint:edge is a rolling tag. If sweeps get noisy from upstream
+  # mint changes, pin this to a digest known to work.
+  MINT_IMAGE: ${{ github.event.inputs.mint-image || 'minio/mint:edge' }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  mint:
+    runs-on: ubicloud-standard-4
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
+
+      - name: Enable buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build RustFS image (source, cached)
+        run: |
+          DOCKER_BUILDKIT=1 docker buildx build --load \
+            --platform ${PLATFORM} \
+            --cache-from type=gha,scope=${BUILDX_CACHE_SCOPE} \
+            --cache-to type=gha,mode=max,scope=${BUILDX_CACHE_SCOPE} \
+            -t rustfs-ci \
+            -f Dockerfile.source .
+
+      - name: Start RustFS
+        run: |
+          docker network inspect rustfs-net >/dev/null 2>&1 || docker network create rustfs-net
+          docker rm -f rustfs-mint >/dev/null 2>&1 || true
+          docker run -d --name rustfs-mint \
+            --network rustfs-net \
+            -p 9000:9000 \
+            -e RUSTFS_ADDRESS=0.0.0.0:9000 \
+            -e RUSTFS_ACCESS_KEY=${S3_ACCESS_KEY} \
+            -e RUSTFS_SECRET_KEY=${S3_SECRET_KEY} \
+            -e RUSTFS_VOLUMES="/data/rustfs{0...3}" \
+            -v /tmp/rustfs-mint:/data \
+            rustfs-ci
+
+      - name: Wait for RustFS ready
+        run: |
+          for i in {1..60}; do
+            if curl -sf http://127.0.0.1:9000/health >/dev/null 2>&1; then
+              echo "RustFS is ready"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' rustfs-mint 2>/dev/null)" != "true" ]; then
+              echo "RustFS container not running" >&2
+              docker logs rustfs-mint || true
+              exit 1
+            fi
+            sleep 2
+          done
+          echo "Health check timed out" >&2
+          docker logs rustfs-mint || true
+          exit 1
+
+      - name: Run mint
+        run: |
+          mkdir -p artifacts/mint-log
+          # Mint exits non-zero when any test fails; that is inventory here,
+          # not a gate (see header comment). Capture the exit code and let the
+          # summary step decide.
+          set +e
+          # shellcheck disable=SC2086  # MINT_SUITES is intentionally word-split
+          docker run --rm --network rustfs-net \
+            -e SERVER_ENDPOINT=rustfs-mint:9000 \
+            -e ACCESS_KEY=${S3_ACCESS_KEY} \
+            -e SECRET_KEY=${S3_SECRET_KEY} \
+            -e ENABLE_HTTPS=0 \
+            -e SERVER_REGION=${S3_REGION} \
+            -e MINT_MODE=${MINT_MODE} \
+            -v "${PWD}/artifacts/mint-log:/mint/log" \
+            "${MINT_IMAGE}" ${MINT_SUITES}
+          echo "MINT_RC=$?" >> "$GITHUB_ENV"
+
+      - name: Summarize results
+        run: |
+          python3 - <<'EOF'
+          import json, os, pathlib, sys
+          from collections import Counter
+
+          log = pathlib.Path("artifacts/mint-log/log.json")
+          if not log.is_file():
+              print("mint produced no log.json - infrastructure failure", file=sys.stderr)
+              sys.exit(int(os.environ.get("MINT_RC", "1")) or 1)
+
+          per_suite: dict[str, Counter] = {}
+          failures: list[tuple[str, str, str]] = []
+          for line in log.read_text(encoding="utf-8").splitlines():
+              line = line.strip()
+              if not line:
+                  continue
+              try:
+                  entry = json.loads(line)
+              except json.JSONDecodeError:
+                  continue
+              suite = entry.get("name", "unknown")
+              status = entry.get("status", "unknown").upper()
+              per_suite.setdefault(suite, Counter())[status] += 1
+              if status == "FAIL":
+                  failures.append((suite, entry.get("function", ""), entry.get("error") or entry.get("message") or ""))
+
+          lines = ["# Mint results", "", "| Suite | Pass | Fail | N/A |", "|-------|------|------|-----|"]
+          for suite in sorted(per_suite):
+              c = per_suite[suite]
+              lines.append(f"| {suite} | {c.get('PASS', 0)} | {c.get('FAIL', 0)} | {c.get('NA', 0)} |")
+          lines.append("")
+          if failures:
+              lines.append(f"## Failures ({len(failures)})")
+              lines.append("")
+              for suite, func, err in failures:
+                  first = err.strip().splitlines()[0] if err.strip() else ""
+                  lines.append(f"- `{suite}` / `{func}` {first}")
+              lines.append("")
+              lines.append("_Report-only: failures are inventory, not a gate (see workflow header)._")
+
+          report = "\n".join(lines)
+          print(report)
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary:
+              with open(summary, "a", encoding="utf-8") as fh:
+                  fh.write(report + "\n")
+          EOF
+
+      - name: Collect RustFS logs
+        if: always()
+        run: |
+          mkdir -p artifacts/rustfs-mint
+          docker logs rustfs-mint > artifacts/rustfs-mint/rustfs.log 2>&1 || true
+
+      - name: Upload artifacts
+        if: always() && env.ACT != 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: mint
+          path: artifacts/**
