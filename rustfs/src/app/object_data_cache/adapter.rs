@@ -130,6 +130,76 @@ impl Default for ObjectDataCacheAdapter {
     }
 }
 
+fn object_data_cache_config_from_env() -> ObjectDataCacheConfig {
+    object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+        mode: rustfs_utils::get_env_opt_str(rustfs_config::ENV_OBJECT_DATA_CACHE_MODE),
+        max_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES),
+        max_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT),
+        max_entry_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES),
+        ttl_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TTL_SECS),
+        time_to_idle_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TIME_TO_IDLE_SECS),
+        min_free_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT),
+        fill_concurrency_per_cpu: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU),
+        fill_concurrency_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX),
+        identity_keys_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX),
+    })
+}
+
+fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> ObjectDataCacheConfig {
+    let mut config = ObjectDataCacheConfig::default();
+
+    if let Some(mode) = values.mode {
+        config.mode = parse_object_data_cache_mode(&mode).unwrap_or_else(|| {
+            warn!(
+                value = %mode,
+                supported = "disabled,hit_only,fill_buffered_only,fill_materialize_enabled",
+                "invalid object data cache mode; cache remains disabled"
+            );
+            ObjectDataCacheMode::Disabled
+        });
+    }
+
+    if let Some(max_bytes) = values.max_bytes {
+        config.max_bytes = max_bytes;
+    }
+    if let Some(max_memory_percent) = values.max_memory_percent {
+        config.max_memory_percent = max_memory_percent;
+    }
+    if let Some(max_entry_bytes) = values.max_entry_bytes {
+        config.max_entry_bytes = max_entry_bytes;
+    }
+    if let Some(ttl_secs) = values.ttl_secs {
+        config.ttl = Duration::from_secs(ttl_secs);
+    }
+    if let Some(time_to_idle_secs) = values.time_to_idle_secs {
+        config.time_to_idle = Duration::from_secs(time_to_idle_secs);
+    }
+    if let Some(min_free_memory_percent) = values.min_free_memory_percent {
+        config.min_free_memory_percent = min_free_memory_percent;
+    }
+    if let Some(fill_concurrency_per_cpu) = values.fill_concurrency_per_cpu {
+        config.fill_concurrency_per_cpu = fill_concurrency_per_cpu;
+    }
+    if let Some(fill_concurrency_max) = values.fill_concurrency_max {
+        config.fill_concurrency_max = fill_concurrency_max;
+    }
+    if let Some(identity_keys_max) = values.identity_keys_max {
+        config.identity_keys_max = identity_keys_max;
+    }
+
+    config
+}
+
+fn parse_object_data_cache_mode(value: &str) -> Option<ObjectDataCacheMode> {
+    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "disabled" | "off" | "none" => Some(ObjectDataCacheMode::Disabled),
+        "hit_only" => Some(ObjectDataCacheMode::HitOnly),
+        "fill_buffered_only" => Some(ObjectDataCacheMode::FillBufferedOnly),
+        "fill_materialize_enabled" => Some(ObjectDataCacheMode::FillMaterializeEnabled),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -224,75 +294,5 @@ mod tests {
         );
 
         assert!(adapter.is_disabled());
-    }
-}
-
-fn object_data_cache_config_from_env() -> ObjectDataCacheConfig {
-    object_data_cache_config_from_values(ObjectDataCacheEnvValues {
-        mode: rustfs_utils::get_env_opt_str(rustfs_config::ENV_OBJECT_DATA_CACHE_MODE),
-        max_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES),
-        max_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT),
-        max_entry_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES),
-        ttl_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TTL_SECS),
-        time_to_idle_secs: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_TIME_TO_IDLE_SECS),
-        min_free_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MIN_FREE_MEMORY_PERCENT),
-        fill_concurrency_per_cpu: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_PER_CPU),
-        fill_concurrency_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_FILL_CONCURRENCY_MAX),
-        identity_keys_max: rustfs_utils::get_env_opt_u16(rustfs_config::ENV_OBJECT_DATA_CACHE_IDENTITY_KEYS_MAX),
-    })
-}
-
-fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> ObjectDataCacheConfig {
-    let mut config = ObjectDataCacheConfig::default();
-
-    if let Some(mode) = values.mode {
-        config.mode = parse_object_data_cache_mode(&mode).unwrap_or_else(|| {
-            warn!(
-                value = %mode,
-                supported = "disabled,hit_only,fill_buffered_only,fill_materialize_enabled",
-                "invalid object data cache mode; cache remains disabled"
-            );
-            ObjectDataCacheMode::Disabled
-        });
-    }
-
-    if let Some(max_bytes) = values.max_bytes {
-        config.max_bytes = max_bytes;
-    }
-    if let Some(max_memory_percent) = values.max_memory_percent {
-        config.max_memory_percent = max_memory_percent;
-    }
-    if let Some(max_entry_bytes) = values.max_entry_bytes {
-        config.max_entry_bytes = max_entry_bytes;
-    }
-    if let Some(ttl_secs) = values.ttl_secs {
-        config.ttl = Duration::from_secs(ttl_secs);
-    }
-    if let Some(time_to_idle_secs) = values.time_to_idle_secs {
-        config.time_to_idle = Duration::from_secs(time_to_idle_secs);
-    }
-    if let Some(min_free_memory_percent) = values.min_free_memory_percent {
-        config.min_free_memory_percent = min_free_memory_percent;
-    }
-    if let Some(fill_concurrency_per_cpu) = values.fill_concurrency_per_cpu {
-        config.fill_concurrency_per_cpu = fill_concurrency_per_cpu;
-    }
-    if let Some(fill_concurrency_max) = values.fill_concurrency_max {
-        config.fill_concurrency_max = fill_concurrency_max;
-    }
-    if let Some(identity_keys_max) = values.identity_keys_max {
-        config.identity_keys_max = identity_keys_max;
-    }
-
-    config
-}
-
-fn parse_object_data_cache_mode(value: &str) -> Option<ObjectDataCacheMode> {
-    match value.trim().to_ascii_lowercase().replace('-', "_").as_str() {
-        "disabled" | "off" | "none" => Some(ObjectDataCacheMode::Disabled),
-        "hit_only" => Some(ObjectDataCacheMode::HitOnly),
-        "fill_buffered_only" => Some(ObjectDataCacheMode::FillBufferedOnly),
-        "fill_materialize_enabled" => Some(ObjectDataCacheMode::FillMaterializeEnabled),
-        _ => None,
     }
 }
