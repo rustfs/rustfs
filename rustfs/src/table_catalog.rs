@@ -783,6 +783,8 @@ pub(crate) struct TableCompactionPlanningReport {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableCompactionRewriteGroup {
     pub group_id: String,
+    #[serde(default, rename = "sort-order-id", skip_serializing_if = "Option::is_none")]
+    pub sort_order_id: Option<i32>,
     #[serde(rename = "input-file-locations")]
     pub input_file_locations: Vec<String>,
     #[serde(rename = "input-file-count")]
@@ -4509,6 +4511,7 @@ where
             let output_file = format!("{output_prefix}/compaction-{compaction_id}-{}.parquet", rewrite_group.group_id);
             let output_file_path = table_object_s3_location(table_bucket, &output_file);
             let (partition_spec_id, partition) = compaction_rewrite_group_partition(&current_data_files_by_key, rewrite_group)?;
+            let sort_order_id = compaction_rewrite_group_sort_order(&current_data_files_by_key, rewrite_group)?;
             let mut input_files = Vec::with_capacity(rewrite_group.input_file_locations.len());
             for input_file in &rewrite_group.input_file_locations {
                 let Some(input_object) = self.backend.read_object(table_bucket, input_file).await? else {
@@ -4530,6 +4533,7 @@ where
                 record_count: compacted_file.record_count,
                 partition_spec_id,
                 partition,
+                sort_order_id,
                 status: 1,
                 snapshot_id,
                 sequence_number,
@@ -6995,6 +6999,7 @@ pub(crate) fn data_file_references_from_manifest_avro(data: &[u8]) -> TableCatal
             partition: avro_record_field(data_file, "partition")
                 .and_then(avro_record_value_fields)
                 .unwrap_or_default(),
+            sort_order_id: avro_record_field(data_file, "sort_order_id").and_then(avro_i32_value),
         });
     }
     Ok(files)
@@ -7604,6 +7609,7 @@ struct TableCompactionDataFileCandidate {
     location: String,
     size_bytes: u64,
     rewrite_prefix: String,
+    sort_order_id: Option<i32>,
 }
 
 struct CompactedParquetFile {
@@ -7619,6 +7625,7 @@ struct CompactedDataFile {
     record_count: u64,
     partition_spec_id: i32,
     partition: Vec<(String, apache_avro::types::Value)>,
+    sort_order_id: Option<i32>,
     status: i32,
     snapshot_id: i64,
     sequence_number: i64,
@@ -7636,6 +7643,7 @@ pub(crate) struct ManifestDataFileReference {
     pub record_count: Option<u64>,
     pub file_size_bytes: Option<u64>,
     pub partition: Vec<(String, apache_avro::types::Value)>,
+    pub sort_order_id: Option<i32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -7873,6 +7881,7 @@ where
                         .unwrap_or_else(|| data_key.clone()),
                     location: data_key,
                     size_bytes,
+                    sort_order_id: reference.sort_order_id,
                 });
             }
         }
@@ -7998,6 +8007,7 @@ where
                 },
                 partition_spec_id: manifest_reference.partition_spec_id.unwrap_or(0),
                 partition: reference.partition,
+                sort_order_id: reference.sort_order_id,
                 status: 0,
                 snapshot_id,
                 sequence_number,
@@ -8014,16 +8024,16 @@ fn compaction_rewrite_groups(
     config: &TableCompactionPlanningConfig,
 ) -> Vec<TableCompactionRewriteGroup> {
     let mut groups = Vec::new();
-    let mut candidates_by_prefix = BTreeMap::<&str, Vec<&TableCompactionDataFileCandidate>>::new();
+    let mut candidates_by_prefix = BTreeMap::<(&str, Option<i32>), Vec<&TableCompactionDataFileCandidate>>::new();
     for candidate in candidates {
         candidates_by_prefix
-            .entry(candidate.rewrite_prefix.as_str())
+            .entry((candidate.rewrite_prefix.as_str(), candidate.sort_order_id))
             .or_default()
             .push(candidate);
     }
 
-    for prefix_candidates in candidates_by_prefix.values() {
-        push_compaction_rewrite_groups_for_prefix(&mut groups, prefix_candidates, config);
+    for ((_, sort_order_id), prefix_candidates) in candidates_by_prefix {
+        push_compaction_rewrite_groups_for_prefix(&mut groups, prefix_candidates.as_slice(), sort_order_id, config);
     }
     groups
 }
@@ -8031,6 +8041,7 @@ fn compaction_rewrite_groups(
 fn push_compaction_rewrite_groups_for_prefix(
     groups: &mut Vec<TableCompactionRewriteGroup>,
     candidates: &[&TableCompactionDataFileCandidate],
+    sort_order_id: Option<i32>,
     config: &TableCompactionPlanningConfig,
 ) {
     let mut current_locations = Vec::new();
@@ -8038,12 +8049,12 @@ fn push_compaction_rewrite_groups_for_prefix(
     for candidate in candidates {
         let next_bytes = current_bytes.saturating_add(candidate.size_bytes);
         if !current_locations.is_empty() && next_bytes > config.max_rewrite_bytes_per_job {
-            push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, config);
+            push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, sort_order_id, config);
         }
         current_locations.push(candidate.location.clone());
         current_bytes = current_bytes.saturating_add(candidate.size_bytes);
     }
-    push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, config);
+    push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, sort_order_id, config);
 }
 
 fn compaction_data_file_rewrite_prefix(
@@ -8079,12 +8090,14 @@ fn push_compaction_rewrite_group(
     groups: &mut Vec<TableCompactionRewriteGroup>,
     current_locations: &mut Vec<String>,
     current_bytes: &mut u64,
+    sort_order_id: Option<i32>,
     config: &TableCompactionPlanningConfig,
 ) {
     if current_locations.len() >= config.min_input_files {
         let input_file_count = current_locations.len();
         groups.push(TableCompactionRewriteGroup {
             group_id: format!("{:04}", groups.len() + 1),
+            sort_order_id,
             input_file_locations: std::mem::take(current_locations),
             input_file_count,
             input_bytes: *current_bytes,
@@ -8124,6 +8137,35 @@ fn compaction_rewrite_group_partition(
         }
     }
     Ok((partition_spec_id.unwrap_or(0), partition.unwrap_or_default()))
+}
+
+fn compaction_rewrite_group_sort_order(
+    data_files_by_key: &BTreeMap<&str, &CompactedDataFile>,
+    rewrite_group: &TableCompactionRewriteGroup,
+) -> TableCatalogStoreResult<Option<i32>> {
+    let mut sort_order_id = None;
+    let mut initialized = false;
+    for input in &rewrite_group.input_file_locations {
+        let Some(data_file) = data_files_by_key.get(input.as_str()) else {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction rewrite input is missing from current manifest".to_string(),
+            ));
+        };
+        if !initialized {
+            sort_order_id = data_file.sort_order_id;
+            initialized = true;
+        } else if sort_order_id != data_file.sort_order_id {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction rewrite group must contain a single sort order".to_string(),
+            ));
+        }
+    }
+    if rewrite_group.sort_order_id != sort_order_id {
+        return Err(TableCatalogStoreError::Invalid(
+            "compaction rewrite group sort order changed after planning".to_string(),
+        ));
+    }
+    Ok(sort_order_id)
 }
 
 fn compaction_manifest_partition_spec_id(data_files: &[CompactedDataFile]) -> TableCatalogStoreResult<i32> {
@@ -8420,6 +8462,10 @@ fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatal
     let schema = compacted_manifest_avro_schema(data_files)?;
     let mut writer = apache_avro::Writer::new(&schema, Vec::new());
     for data_file in data_files {
+        let sort_order_id = match data_file.sort_order_id {
+            Some(sort_order_id) => apache_avro::types::Value::Union(1, Box::new(apache_avro::types::Value::Int(sort_order_id))),
+            None => apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
+        };
         writer
             .append(apache_avro::types::Value::Record(vec![
                 ("status".to_string(), apache_avro::types::Value::Int(data_file.status)),
@@ -8480,10 +8526,7 @@ fn compacted_manifest_avro_bytes(data_files: &[CompactedDataFile]) -> TableCatal
                             "equality_ids".to_string(),
                             apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
                         ),
-                        (
-                            "sort_order_id".to_string(),
-                            apache_avro::types::Value::Union(0, Box::new(apache_avro::types::Value::Null)),
-                        ),
+                        ("sort_order_id".to_string(), sort_order_id),
                     ]),
                 ),
             ]))
@@ -10478,6 +10521,63 @@ mod tests {
                 .expect("partitioned manifest record should append");
         }
         writer.into_inner().expect("partitioned manifest avro bytes should flush")
+    }
+
+    fn manifest_avro_bytes_with_sort_order(files: &[(&str, i32, i32)]) -> Vec<u8> {
+        let schema = apache_avro::Schema::parse_str(
+            r#"
+            {
+              "type": "record",
+              "name": "manifest_entry",
+              "fields": [
+                {"name": "status", "type": "int"},
+                {"name": "snapshot_id", "type": "long"},
+                {"name": "sequence_number", "type": "long"},
+                {"name": "file_sequence_number", "type": "long"},
+                {
+                  "name": "data_file",
+                  "type": {
+                    "type": "record",
+                    "name": "data_file",
+                    "fields": [
+                      {"name": "content", "type": "int"},
+                      {"name": "file_path", "type": "string"},
+                      {"name": "record_count", "type": "long"},
+                      {"name": "file_size_in_bytes", "type": "long"},
+                      {"name": "sort_order_id", "type": ["null", "int"], "default": null}
+                    ]
+                  }
+                }
+              ]
+            }
+            "#,
+        )
+        .expect("sort-order manifest avro schema should parse");
+        let mut writer = apache_avro::Writer::new(&schema, Vec::new());
+        for (file_path, content, sort_order_id) in files {
+            writer
+                .append(apache_avro::types::Value::Record(vec![
+                    ("status".to_string(), apache_avro::types::Value::Int(1)),
+                    ("snapshot_id".to_string(), apache_avro::types::Value::Long(20)),
+                    ("sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    ("file_sequence_number".to_string(), apache_avro::types::Value::Long(7)),
+                    (
+                        "data_file".to_string(),
+                        apache_avro::types::Value::Record(vec![
+                            ("content".to_string(), apache_avro::types::Value::Int(*content)),
+                            ("file_path".to_string(), apache_avro::types::Value::String((*file_path).to_string())),
+                            ("record_count".to_string(), apache_avro::types::Value::Long(1)),
+                            ("file_size_in_bytes".to_string(), apache_avro::types::Value::Long(1)),
+                            (
+                                "sort_order_id".to_string(),
+                                apache_avro::types::Value::Union(1, Box::new(apache_avro::types::Value::Int(*sort_order_id))),
+                            ),
+                        ]),
+                    ),
+                ]))
+                .expect("sort-order manifest record should append");
+        }
+        writer.into_inner().expect("sort-order manifest avro bytes should flush")
     }
 
     fn parquet_i32_bytes(values: &[i32]) -> Vec<u8> {
@@ -13970,6 +14070,149 @@ mod tests {
             retained_reference.partition,
             vec![("dt".to_string(), apache_avro::types::Value::String("2026-06-25".to_string()))]
         );
+    }
+
+    #[tokio::test]
+    async fn compaction_commit_preserves_sort_order_and_keeps_groups_isolated() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").unwrap();
+        let table = IdentifierSegment::parse("orders").unwrap();
+        let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+        let data_dir = default_table_data_dir_path(&namespace, &table);
+        let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+        let manifest_list = format!("{metadata_dir}/snap-20.avro");
+        let manifest = format!("{metadata_dir}/manifest-20.avro");
+        let left_data = format!("{data_dir}/part-left.parquet");
+        let right_data = format!("{data_dir}/part-right.parquet");
+        let other_sort_data = format!("{data_dir}/part-other-sort.parquet");
+        let left_parquet = parquet_i32_bytes(&[1, 2]);
+        let right_parquet = parquet_i32_bytes(&[3, 4]);
+        let other_sort_parquet = parquet_i32_bytes(&[5, 6]);
+        let small_file_threshold_bytes =
+            u64::try_from(left_parquet.len().max(right_parquet.len()).max(other_sort_parquet.len())).unwrap();
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[&manifest]))
+            .await;
+        backend
+            .seed_object(
+                bucket,
+                &manifest,
+                manifest_avro_bytes_with_sort_order(&[(&left_data, 0, 7), (&right_data, 0, 7), (&other_sort_data, 0, 8)]),
+            )
+            .await;
+        backend.seed_object(bucket, &left_data, left_parquet).await;
+        backend.seed_object(bucket, &right_data, right_parquet).await;
+        backend.seed_object(bucket, &other_sort_data, other_sort_parquet).await;
+        backend
+            .seed_object(
+                bucket,
+                &current,
+                serde_json::to_vec(&serde_json::json!({
+                    "format-version": 2,
+                    "table-uuid": "table-uuid",
+                    "location": "s3://analytics/tables/table-id",
+                    "last-sequence-number": 7,
+                    "last-updated-ms": 2000,
+                    "sort-orders": [
+                        {"order-id": 7, "fields": []},
+                        {"order-id": 8, "fields": []}
+                    ],
+                    "default-sort-order-id": 7,
+                    "metadata-log": [],
+                    "snapshots": [
+                        {
+                            "snapshot-id": 20,
+                            "sequence-number": 7,
+                            "timestamp-ms": 2000,
+                            "manifest-list": manifest_list,
+                            "summary": {
+                                "operation": "append"
+                            }
+                        }
+                    ],
+                    "current-snapshot-id": 20,
+                    "refs": {
+                        "main": {
+                            "snapshot-id": 20,
+                            "type": "branch"
+                        }
+                    }
+                }))
+                .unwrap(),
+            )
+            .await;
+
+        let report = store
+            .commit_table_compaction(
+                bucket,
+                "sales",
+                "orders",
+                TableCompactionPlanningConfig {
+                    target_file_size_bytes: 64 * 1024,
+                    small_file_threshold_bytes,
+                    min_input_files: 2,
+                    max_rewrite_bytes_per_job: 128 * 1024,
+                },
+            )
+            .await
+            .expect("sort-aware compaction rewrite should commit");
+
+        assert_eq!(report.status, TableCompactionPlanningStatus::Committed);
+        assert_eq!(report.candidate_file_count, 3);
+        assert_eq!(report.rewrite_group_count, 1);
+        let rewrite_group = report.rewrite_groups.first().expect("rewrite group should be reported");
+        assert_eq!(rewrite_group.sort_order_id, Some(7));
+        assert_eq!(rewrite_group.input_file_locations, vec![left_data.clone(), right_data.clone()]);
+        let output_file = rewrite_group
+            .output_file_location
+            .as_ref()
+            .expect("rewrite group should include output data file");
+
+        let table_entry = store
+            .load_table(bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .expect("table should still exist");
+        let metadata_object = backend
+            .read_object(bucket, &table_entry.metadata_location)
+            .await
+            .unwrap()
+            .expect("compaction metadata should be written");
+        let metadata = serde_json::from_slice::<serde_json::Value>(&metadata_object.data).unwrap();
+        let current_manifest_list = metadata
+            .get("snapshots")
+            .and_then(serde_json::Value::as_array)
+            .unwrap()
+            .last()
+            .and_then(|snapshot| snapshot.get("manifest-list"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap();
+        let manifest_list_object = backend
+            .read_object(bucket, current_manifest_list)
+            .await
+            .unwrap()
+            .expect("compaction manifest list should be written");
+        let manifest_references = manifest_list_references_from_manifest_list_avro(&manifest_list_object.data).unwrap();
+        let manifest_object = backend
+            .read_object(bucket, &manifest_references[0].manifest_path)
+            .await
+            .unwrap()
+            .expect("compaction manifest should be written");
+        let data_file_references = data_file_references_from_manifest_avro(&manifest_object.data).unwrap();
+        let output_reference = data_file_references
+            .iter()
+            .find(|reference| reference.location == *output_file)
+            .expect("compacted output should be present in the manifest");
+        assert_eq!(output_reference.sort_order_id, Some(7));
+        let retained_reference = data_file_references
+            .iter()
+            .find(|reference| reference.location == other_sort_data)
+            .expect("different sort order file should stay in the manifest");
+        assert_eq!(retained_reference.sort_order_id, Some(8));
     }
 
     #[tokio::test]
