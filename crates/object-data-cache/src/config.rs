@@ -123,10 +123,10 @@ impl ObjectDataCacheConfig {
 
     /// Validates the configuration for internal consistency.
     pub fn validate(&self) -> Result<(), ObjectDataCacheConfigError> {
-        if self.max_bytes == 0 {
-            if self.max_memory_percent == 0 || self.max_memory_percent > 100 {
-                return Err(ObjectDataCacheConfigError::InvalidMaxMemoryPercent);
-            }
+        if self.max_bytes == 0
+            && (self.max_memory_percent == 0 || self.max_memory_percent > 100)
+        {
+            return Err(ObjectDataCacheConfigError::InvalidMaxMemoryPercent);
         }
 
         if self.max_entry_bytes == 0 {

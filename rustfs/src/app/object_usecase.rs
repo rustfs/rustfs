@@ -2879,8 +2879,7 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            let _fill_result =
-                fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
+            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
 
             if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
                 warn!(

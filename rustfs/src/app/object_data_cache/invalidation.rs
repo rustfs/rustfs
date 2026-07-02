@@ -59,13 +59,8 @@ pub(crate) async fn invalidate_object_data_cache_after_complete_multipart_succes
     bucket: &str,
     key: &str,
 ) -> ObjectDataCacheInvalidationResult {
-    invalidate_object_data_cache_object(
-        adapter,
-        bucket,
-        key,
-        ObjectDataCacheInvalidationReason::AfterCompleteMultipartSuccess,
-    )
-    .await
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::AfterCompleteMultipartSuccess)
+        .await
 }
 
 /// Invalidates a single object identity through the app-layer cache adapter.

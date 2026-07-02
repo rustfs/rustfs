@@ -56,7 +56,7 @@ impl ObjectDataCache {
         let backend = if config.is_disabled() {
             ObjectDataCacheBackendKind::Noop(NoopBackend)
         } else {
-            ObjectDataCacheBackendKind::Moka(MokaBackend::new(&config, Arc::clone(&stats))?)
+            ObjectDataCacheBackendKind::Moka(Box::new(MokaBackend::new(&config, Arc::clone(&stats))?))
         };
 
         Ok(Self {

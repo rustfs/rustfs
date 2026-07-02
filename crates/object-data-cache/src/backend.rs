@@ -21,7 +21,7 @@ pub enum ObjectDataCacheBackendKind {
     /// No-op backend used while the feature is disabled.
     Noop(NoopBackend),
     /// Moka backend used when cache lookups are enabled.
-    Moka(MokaBackend),
+    Moka(Box<MokaBackend>),
 }
 
 impl Default for ObjectDataCacheBackendKind {
