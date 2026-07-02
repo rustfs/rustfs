@@ -123,9 +123,7 @@ impl ObjectDataCacheConfig {
 
     /// Validates the configuration for internal consistency.
     pub fn validate(&self) -> Result<(), ObjectDataCacheConfigError> {
-        if self.max_bytes == 0
-            && (self.max_memory_percent == 0 || self.max_memory_percent > 100)
-        {
+        if self.max_bytes == 0 && (self.max_memory_percent == 0 || self.max_memory_percent > 100) {
             return Err(ObjectDataCacheConfigError::InvalidMaxMemoryPercent);
         }
 
@@ -189,8 +187,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_memory_percent_when_capacity_is_derived() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.max_memory_percent = 0;
+        let config = ObjectDataCacheConfig {
+            max_memory_percent: 0,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let err = config
             .validate()
@@ -201,8 +201,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_entry_size() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.max_entry_bytes = 0;
+        let config = ObjectDataCacheConfig {
+            max_entry_bytes: 0,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let err = config.validate().expect_err("entry size must stay positive");
 
@@ -211,8 +213,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_ttl() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.ttl = Duration::ZERO;
+        let config = ObjectDataCacheConfig {
+            ttl: Duration::ZERO,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let err = config.validate().expect_err("ttl must stay positive");
 
@@ -221,8 +225,10 @@ mod tests {
 
     #[test]
     fn validate_rejects_zero_time_to_idle() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.time_to_idle = Duration::ZERO;
+        let config = ObjectDataCacheConfig {
+            time_to_idle: Duration::ZERO,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let err = config.validate().expect_err("time-to-idle must stay positive");
 
@@ -231,9 +237,11 @@ mod tests {
 
     #[test]
     fn validate_rejects_invalid_fill_concurrency_bounds() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.fill_concurrency_per_cpu = 2;
-        config.fill_concurrency_max = 1;
+        let config = ObjectDataCacheConfig {
+            fill_concurrency_per_cpu: 2,
+            fill_concurrency_max: 1,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let err = config
             .validate()
@@ -244,18 +252,22 @@ mod tests {
 
     #[test]
     fn validate_accepts_explicit_byte_cap() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.mode = ObjectDataCacheMode::HitOnly;
-        config.max_bytes = 4_194_304;
-        config.max_memory_percent = 0;
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::HitOnly,
+            max_bytes: 4_194_304,
+            max_memory_percent: 0,
+            ..ObjectDataCacheConfig::default()
+        };
 
         assert!(config.validate().is_ok());
     }
 
     #[test]
     fn resolved_max_bytes_prefers_explicit_cap() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.max_bytes = 4_194_304;
+        let config = ObjectDataCacheConfig {
+            max_bytes: 4_194_304,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let resolved = config
             .resolved_max_bytes()
@@ -266,10 +278,12 @@ mod tests {
 
     #[test]
     fn resolved_max_bytes_is_at_least_max_entry_bytes() {
-        let mut config = ObjectDataCacheConfig::default();
-        config.max_bytes = 0;
-        config.max_memory_percent = 1;
-        config.max_entry_bytes = 8_388_608;
+        let config = ObjectDataCacheConfig {
+            max_bytes: 0,
+            max_memory_percent: 1,
+            max_entry_bytes: 8_388_608,
+            ..ObjectDataCacheConfig::default()
+        };
 
         let resolved = config.resolved_max_bytes().expect("derived capacity should stay positive");
 

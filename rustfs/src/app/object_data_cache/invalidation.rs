@@ -176,7 +176,7 @@ mod tests {
         let _ = adapter.fill_body(&plan_a, Bytes::from_static(b"aaaaa")).await;
         let _ = adapter.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
 
-        let keys = vec!["a".to_string(), "b".to_string()];
+        let keys = ["a".to_string(), "b".to_string()];
         invalidate_object_data_cache_objects_before_mutation(&adapter, "bucket", keys.iter()).await;
 
         assert!(matches!(adapter.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
