@@ -612,7 +612,7 @@ pub(crate) mod bucket {
             crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
         type ObjectOpts = crate::storage::storage_api::ecstore_bucket::replication::ObjectOpts;
         type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
-        pub(crate) type ReplicateDecision = rustfs_filemeta::ReplicateDecision;
+        pub(crate) type ReplicateDecision = rustfs_replication::ReplicateDecision;
 
         pub(crate) async fn check_replicate_delete(
             bucket: &str,
@@ -629,14 +629,14 @@ pub(crate) mod bucket {
             object: &str,
             user_defined: &HashMap<String, String>,
             user_tags: String,
-            status: rustfs_filemeta::ReplicationStatusType,
+            status: rustfs_replication::ReplicationStatusType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> ReplicateDecision {
             let mopts = ReplicationObjectBridge::must_replicate_options(
                 user_defined,
                 user_tags,
                 status,
-                rustfs_filemeta::ReplicationType::Object,
+                rustfs_replication::ReplicationType::Object,
                 opts,
             );
             ReplicationObjectBridge::must_replicate(bucket, object, mopts).await
@@ -647,7 +647,7 @@ pub(crate) mod bucket {
             store: Arc<crate::storage::storage_api::ECStore>,
             dsc: ReplicateDecision,
         ) {
-            ReplicationObjectBridge::schedule_object(oi, store, dsc, rustfs_filemeta::ReplicationType::Object).await;
+            ReplicationObjectBridge::schedule_object(oi, store, dsc, rustfs_replication::ReplicationType::Object).await;
         }
 
         pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
@@ -659,13 +659,13 @@ pub(crate) mod bucket {
             obj_info: &crate::storage::storage_api::StorageObjectInfo,
             version_id: Option<Uuid>,
             replica: bool,
-        ) -> Option<rustfs_filemeta::ReplicationState> {
+        ) -> Option<rustfs_replication::ReplicationState> {
             let opts = ObjectOpts {
                 name: obj_info.name.clone(),
                 user_tags: (*obj_info.user_tags).clone(),
                 version_id,
                 delete_marker: obj_info.delete_marker,
-                op_type: rustfs_filemeta::ReplicationType::Delete,
+                op_type: rustfs_replication::ReplicationType::Delete,
                 replica,
                 ..Default::default()
             };
@@ -685,23 +685,24 @@ pub(crate) mod bucket {
                     config,
                     &target_opts,
                 );
-                decision.set(rustfs_filemeta::ReplicateTargetDecision::new(target_arn, replicate, false));
+                decision.set(rustfs_replication::ReplicateTargetDecision::new(target_arn, replicate, false));
             }
             if !decision.replicate_any() {
                 return None;
             }
 
             let pending_status = decision.pending_status();
-            let mut state = rustfs_filemeta::ReplicationState {
+            let mut state = rustfs_replication::ReplicationState {
                 replicate_decision_str: decision.to_string(),
                 ..Default::default()
             };
             if version_id.is_some() {
                 state.version_purge_status_internal = pending_status.clone();
-                state.purge_targets = rustfs_filemeta::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+                state.purge_targets =
+                    rustfs_replication::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
             } else {
                 state.replication_status_internal = pending_status.clone();
-                state.targets = rustfs_filemeta::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+                state.targets = rustfs_replication::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
             }
             Some(state)
         }

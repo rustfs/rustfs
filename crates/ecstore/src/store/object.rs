@@ -1466,11 +1466,11 @@ mod tests {
             transitioned_objname: "remote/object".to_string(),
             transition_tier: "WARM".to_string(),
             transition_version_id: Some(transition_version_id),
-            replication_state_internal: Some(rustfs_filemeta::ReplicationState {
+            replication_state_internal: Some(rustfs_replication::ReplicationState {
                 replication_status_internal: Some("arn:minio:replication:target=COMPLETED;".to_string()),
-                targets: rustfs_filemeta::replication_statuses_map("arn:minio:replication:target=COMPLETED;"),
+                targets: rustfs_replication::replication_statuses_map("arn:minio:replication:target=COMPLETED;"),
                 version_purge_status_internal: Some("arn:minio:replication:target=PENDING;".to_string()),
-                purge_targets: rustfs_filemeta::version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
+                purge_targets: rustfs_replication::version_purge_statuses_map("arn:minio:replication:target=PENDING;"),
                 ..Default::default()
             }),
             metadata: HashMap::from([
@@ -1527,7 +1527,7 @@ mod tests {
         let source = tiered_equivalence_source();
         let mut target = tiered_equivalence_target(&source);
         target.replication_status_internal = Some("arn:minio:replication:target=FAILED;".to_string());
-        target.replication_status = rustfs_filemeta::ReplicationStatusType::Failed;
+        target.replication_status = rustfs_replication::ReplicationStatusType::Failed;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }
@@ -1537,7 +1537,7 @@ mod tests {
         let source = tiered_equivalence_source();
         let mut target = tiered_equivalence_target(&source);
         target.version_purge_status_internal = Some("arn:minio:replication:target=COMPLETE;".to_string());
-        target.version_purge_status = rustfs_filemeta::VersionPurgeStatusType::Complete;
+        target.version_purge_status = rustfs_replication::VersionPurgeStatusType::Complete;
 
         assert!(!is_equivalent_data_movement_tiered_object(&source, &target));
     }

@@ -7407,7 +7407,7 @@ mod tests {
             delete_replication: Some(ReplicationState {
                 replicate_decision_str: "target=true;false;target;".to_string(),
                 replication_status_internal: Some("target=COMPLETED;".to_string()),
-                targets: rustfs_filemeta::replication_statuses_map("target=COMPLETED;"),
+                targets: rustfs_replication::replication_statuses_map("target=COMPLETED;"),
                 ..Default::default()
             }),
             ..Default::default()
@@ -7439,7 +7439,7 @@ mod tests {
             version_id: Some(Uuid::new_v4().to_string()),
             delete_replication: Some(ReplicationState {
                 version_purge_status_internal: Some("target=PENDING;".to_string()),
-                purge_targets: rustfs_filemeta::version_purge_statuses_map("target=PENDING;"),
+                purge_targets: rustfs_replication::version_purge_statuses_map("target=PENDING;"),
                 ..Default::default()
             }),
             ..Default::default()

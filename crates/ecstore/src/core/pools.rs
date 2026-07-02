@@ -4200,8 +4200,8 @@ mod tests {
         let mod_time = OffsetDateTime::now_utc();
         let version = rustfs_filemeta::FileInfo {
             mod_time: Some(mod_time),
-            replication_state_internal: Some(rustfs_filemeta::ReplicationState {
-                replica_status: rustfs_filemeta::ReplicationStatusType::Replica,
+            replication_state_internal: Some(rustfs_replication::ReplicationState {
+                replica_status: rustfs_replication::ReplicationStatusType::Replica,
                 delete_marker: true,
                 replicate_decision_str: "existing".to_string(),
                 ..Default::default()
@@ -4219,7 +4219,7 @@ mod tests {
         assert_eq!(opts.src_pool_idx, 7);
         assert_eq!(opts.version_id.as_deref(), Some("version-id"));
         assert_eq!(opts.mod_time, Some(mod_time));
-        assert_eq!(replication.replica_status, rustfs_filemeta::ReplicationStatusType::Replica);
+        assert_eq!(replication.replica_status, rustfs_replication::ReplicationStatusType::Replica);
         assert!(replication.delete_marker);
         assert_eq!(replication.replicate_decision_str, "existing");
     }
