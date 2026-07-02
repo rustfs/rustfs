@@ -17,7 +17,9 @@
 
 pub(crate) mod backpressure;
 
-use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
+use crate::error::{
+    Error, Result, is_err_data_movement_overwrite, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
+};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::{
@@ -37,11 +39,14 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
 };
 use std::task::{Context, Poll};
+use std::time::Duration as StdDuration;
 use time::format_description::well_known::Rfc3339;
 use tokio::io::{AsyncRead, BufReader, ReadBuf};
 use tracing::{error, info};
 
 type SharedDataMovementStream = Arc<Mutex<Box<dyn AsyncRead + Unpin + Send + Sync>>>;
+const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_ATTEMPTS: usize = 3;
+const DATA_MOVEMENT_MULTIPART_ABORT_RETRY_DELAY_SECS: u64 = 60;
 
 pub struct IndexedDataMovementReader<R> {
     inner: R,
@@ -280,6 +285,54 @@ fn resolve_data_movement_abort_result(
 
 fn data_movement_stage_error(op_label: &str, stage: &str, bucket: &str, object: &str, err: impl std::fmt::Display) -> Error {
     Error::other(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"))
+}
+
+fn schedule_data_movement_multipart_abort_cleanup(
+    store: Arc<ECStore>,
+    target_pool_idx: usize,
+    bucket: String,
+    object: String,
+    upload_id: String,
+    op_label: &str,
+) {
+    let op_label = op_label.to_string();
+    tokio::spawn(async move {
+        for attempt in 1..=DATA_MOVEMENT_MULTIPART_ABORT_RETRY_ATTEMPTS {
+            tokio::time::sleep(StdDuration::from_secs(DATA_MOVEMENT_MULTIPART_ABORT_RETRY_DELAY_SECS)).await;
+
+            let Some(pool) = store.pools.get(target_pool_idx).cloned() else {
+                error!(
+                    "{op_label}: background abort_multipart_upload cleanup skipped for {bucket}/{object} upload {upload_id}: target pool {target_pool_idx} is out of range"
+                );
+                return;
+            };
+
+            match pool
+                .abort_multipart_upload(&bucket, &object, &upload_id, &ObjectOptions::default())
+                .await
+            {
+                Ok(()) => {
+                    info!(
+                        "{op_label}: background abort_multipart_upload cleanup succeeded for {bucket}/{object} upload {upload_id} on attempt {attempt}"
+                    );
+                    return;
+                }
+                Err(err) if is_err_invalid_upload_id(&err) => {
+                    info!(
+                        "{op_label}: background abort_multipart_upload cleanup found {bucket}/{object} upload {upload_id} already removed"
+                    );
+                    return;
+                }
+                Err(err) => {
+                    error!(
+                        "{op_label}: background abort_multipart_upload cleanup attempt {attempt} failed for {bucket}/{object} upload {upload_id}: {err:?}"
+                    );
+                }
+            }
+        }
+
+        crate::bucket::lifecycle::bucket_lifecycle_ops::schedule_stale_multipart_upload_cleanup_once(store);
+    });
 }
 
 fn should_check_data_movement_overwrite_resume(err: &Error) -> bool {
@@ -779,6 +832,14 @@ pub(crate) async fn migrate_object(
                     Ok(()) => Err(primary_err),
                     Err(abort_err) => {
                         error!("{op_label}: abort_multipart_upload err {:?}", &abort_err);
+                        schedule_data_movement_multipart_abort_cleanup(
+                            store.clone(),
+                            target_pool_idx,
+                            bucket.clone(),
+                            object_info.name.clone(),
+                            res.upload_id.clone(),
+                            op_label,
+                        );
                         Err(resolve_data_movement_abort_result(
                             op_label,
                             bucket.as_str(),
