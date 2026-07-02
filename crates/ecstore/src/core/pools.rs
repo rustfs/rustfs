@@ -2952,17 +2952,6 @@ impl ECStore {
             )
             .await?;
 
-            data_movement::ensure_source_cleanup_versions_unchanged(
-                set.clone(),
-                bucket.as_str(),
-                entry.name.as_str(),
-                &fivs,
-                &cleanup_preflight_allowed_missing,
-                "decommission",
-            )
-            .await
-            .map_err(|err| with_decommission_entry_context("cleanup_preflight", bucket.as_str(), entry.name.as_str(), err))?;
-
             self.save_decommission_entry_progress_stage(
                 idx,
                 bucket.as_str(),
@@ -2971,18 +2960,15 @@ impl ECStore {
             )
             .await?;
 
-            let cleanup_result = set
-                .delete_object(
-                    bucket.as_str(),
-                    &encode_dir_object(&entry.name),
-                    ObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
-
-                        ..Default::default()
-                    },
-                )
-                .await;
+            let cleanup_result = data_movement::cleanup_source_entry_if_unchanged(
+                set.clone(),
+                bucket.as_str(),
+                entry.name.as_str(),
+                &fivs,
+                &cleanup_preflight_allowed_missing,
+                "decommission",
+            )
+            .await;
             resolve_decommission_entry_cleanup_delete_result(cleanup_result, bucket.as_str(), entry.name.as_str())?
         } else if decommissioned != fivs.versions.len() || expired > 0 {
             warn!(
