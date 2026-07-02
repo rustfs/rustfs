@@ -234,13 +234,17 @@ impl PutObjectOptions {
         }
 
         for (k, v) in &self.user_metadata {
+            let Ok(header_value) = HeaderValue::from_str(v) else {
+                warn!("skipping user metadata header with invalid value: {}", k);
+                continue;
+            };
             if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
             {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
-                    header.insert(header_name, HeaderValue::from_str(&v).expect("operation should succeed"));
+                    header.insert(header_name, header_value);
                 }
             } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{}", k).as_bytes()) {
-                header.insert(header_name, HeaderValue::from_str(&v).expect("operation should succeed"));
+                header.insert(header_name, header_value);
             }
         }
 

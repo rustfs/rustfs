@@ -4446,7 +4446,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if let Some(disk) = disk {
                 continue;
             }
-            let _ = self.add_partial(bucket, object, opts.version_id.as_ref().expect("err")).await;
+            let _ = self
+                .add_partial(bucket, object, opts.version_id.as_deref().unwrap_or_default())
+                .await;
             break;
         }
 

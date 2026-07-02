@@ -79,7 +79,9 @@ async fn is_server_resolvable(endpoint: &Endpoint) -> Result<()> {
         "{}://{}:{}",
         endpoint.url.scheme(),
         endpoint.url.host_str().expect("URL should have host"),
-        endpoint.url.port().expect("URL should have port")
+        // `Url::port()` is None when the URL uses the scheme's default port
+        // (e.g. http on 80 / https on 443); fall back to the scheme default.
+        endpoint.url.port_or_known_default().expect("URL should have port")
     );
 
     let ping_task = async {

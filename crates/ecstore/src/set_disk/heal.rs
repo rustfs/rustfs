@@ -352,8 +352,11 @@ impl SetDisks {
 
                         // We write at temporary location and then rename to final location.
                         let tmp_id = Uuid::new_v4().to_string();
-                        let src_data_dir = latest_meta.data_dir.expect("operation should succeed").to_string();
-                        let dst_data_dir = latest_meta.data_dir.expect("operation should succeed");
+                        // Delete markers and remote (transitioned) objects carry no data_dir;
+                        // both are skipped by the `!latest_meta.deleted && !latest_meta.is_remote()`
+                        // guard below, so the placeholder values are never used.
+                        let src_data_dir = latest_meta.data_dir.map(|d| d.to_string()).unwrap_or_default();
+                        let dst_data_dir = latest_meta.data_dir.unwrap_or_default();
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let erasure_info = latest_meta.erasure.clone();
