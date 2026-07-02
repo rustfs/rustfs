@@ -16,6 +16,9 @@ use crate::error::ObjectDataCacheConfigError;
 use std::time::Duration;
 use sysinfo::System;
 
+const DEFAULT_DERIVED_MAX_MEMORY_PERCENT_CAP: u64 = 10;
+const DEFAULT_DERIVED_MAX_BYTES_CAP: u64 = 64 * 1024 * 1024 * 1024;
+
 /// Runtime mode for the object data cache.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectDataCacheMode {
@@ -112,7 +115,7 @@ impl ObjectDataCacheConfig {
         system.refresh_memory();
         let total_memory = system.total_memory();
         let derived = total_memory.saturating_mul(u64::from(self.max_memory_percent)) / 100;
-        let resolved = derived.max(self.max_entry_bytes);
+        let resolved = clamp_derived_max_bytes(derived, total_memory, self.max_entry_bytes);
 
         if resolved == 0 {
             return Err(ObjectDataCacheConfigError::ZeroResolvedMaxBytes);
@@ -163,9 +166,16 @@ impl ObjectDataCacheConfig {
     }
 }
 
+fn clamp_derived_max_bytes(derived: u64, total_memory: u64, max_entry_bytes: u64) -> u64 {
+    let percent_cap = total_memory.saturating_mul(DEFAULT_DERIVED_MAX_MEMORY_PERCENT_CAP) / 100;
+    let safe_cap = percent_cap.min(DEFAULT_DERIVED_MAX_BYTES_CAP).max(max_entry_bytes);
+
+    derived.min(safe_cap).max(max_entry_bytes)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{ObjectDataCacheConfig, ObjectDataCacheMode};
+    use super::{DEFAULT_DERIVED_MAX_BYTES_CAP, ObjectDataCacheConfig, ObjectDataCacheMode, clamp_derived_max_bytes};
     use crate::error::ObjectDataCacheConfigError;
     use std::time::Duration;
 
@@ -288,5 +298,14 @@ mod tests {
         let resolved = config.resolved_max_bytes().expect("derived capacity should stay positive");
 
         assert!(resolved >= config.max_entry_bytes);
+    }
+
+    #[test]
+    fn derived_max_bytes_clamps_to_v3_safe_cap() {
+        let one_tib = 1024_u64 * 1024 * 1024 * 1024;
+        let derived = one_tib / 2;
+        let resolved = clamp_derived_max_bytes(derived, one_tib, 1_048_576);
+
+        assert_eq!(resolved, DEFAULT_DERIVED_MAX_BYTES_CAP);
     }
 }

@@ -23,6 +23,7 @@ use tracing::warn;
 
 #[derive(Debug, Default)]
 struct ObjectDataCacheEnvValues {
+    enabled: Option<bool>,
     mode: Option<String>,
     max_bytes: Option<u64>,
     max_memory_percent: Option<u8>,
@@ -132,6 +133,7 @@ impl Default for ObjectDataCacheAdapter {
 
 fn object_data_cache_config_from_env() -> ObjectDataCacheConfig {
     object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+        enabled: rustfs_utils::get_env_opt_bool(rustfs_config::ENV_OBJECT_DATA_CACHE_ENABLE),
         mode: rustfs_utils::get_env_opt_str(rustfs_config::ENV_OBJECT_DATA_CACHE_MODE),
         max_bytes: rustfs_utils::get_env_opt_u64(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_BYTES),
         max_memory_percent: rustfs_utils::get_env_opt_u8(rustfs_config::ENV_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT),
@@ -157,6 +159,9 @@ fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> Obj
             );
             ObjectDataCacheMode::Disabled
         });
+    }
+    if matches!(values.enabled, Some(false)) {
+        config.mode = ObjectDataCacheMode::Disabled;
     }
 
     if let Some(max_bytes) = values.max_bytes {
@@ -247,6 +252,7 @@ mod tests {
     #[test]
     fn object_data_cache_env_values_override_defaults() {
         let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+            enabled: Some(true),
             mode: Some("fill_materialize_enabled".to_string()),
             max_bytes: Some(8_388_608),
             max_memory_percent: Some(10),
@@ -275,6 +281,17 @@ mod tests {
     fn invalid_object_data_cache_mode_falls_back_to_disabled() {
         let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
             mode: Some("enabled".to_string()),
+            ..ObjectDataCacheEnvValues::default()
+        });
+
+        assert_eq!(config.mode, ObjectDataCacheMode::Disabled);
+    }
+
+    #[test]
+    fn object_data_cache_enable_false_overrides_mode() {
+        let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+            enabled: Some(false),
+            mode: Some("fill_materialize_enabled".to_string()),
             ..ObjectDataCacheEnvValues::default()
         });
 

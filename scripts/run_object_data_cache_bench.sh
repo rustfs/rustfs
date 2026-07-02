@@ -357,6 +357,7 @@ diagnostic_obs_metric_endpoint=${OBS_METRIC_ENDPOINT}
 diagnostic_obs_meter_interval=${OBS_METER_INTERVAL}
 diagnostic_obs_service_name_prefix=${OBS_SERVICE_NAME_PREFIX}
 allow_missing_cache_metrics=${ALLOW_MISSING_CACHE_METRICS}
+RUSTFS_OBJECT_DATA_CACHE_ENABLE=mode-derived
 RUSTFS_OBJECT_DATA_CACHE_MAX_BYTES=${OBJECT_CACHE_MAX_BYTES:-server-default}
 RUSTFS_OBJECT_DATA_CACHE_MAX_MEMORY_PERCENT=${OBJECT_CACHE_MAX_MEMORY_PERCENT:-server-default}
 RUSTFS_OBJECT_DATA_CACHE_MAX_ENTRY_BYTES=${OBJECT_CACHE_MAX_ENTRY_BYTES:-server-default}
@@ -496,6 +497,11 @@ run_mode() {
 
   log "==== object-cache mode=${mode} address=${address} ===="
   (
+    if [[ "$mode" == "disabled" ]]; then
+      export RUSTFS_OBJECT_DATA_CACHE_ENABLE=false
+    else
+      export RUSTFS_OBJECT_DATA_CACHE_ENABLE=true
+    fi
     export RUSTFS_OBJECT_DATA_CACHE_MODE="$mode"
     append_optional_object_cache_env
     "${cmd[@]}"
