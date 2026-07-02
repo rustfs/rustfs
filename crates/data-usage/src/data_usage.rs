@@ -475,20 +475,20 @@ impl DataUsageEntry {
 
         if let Some(o_rep) = &other.replication_stats {
             let s_rep = self.replication_stats.get_or_insert_with(ReplicationAllStats::default);
-            s_rep.targets.clear();
             s_rep.replica_size += o_rep.replica_size;
             s_rep.replica_count += o_rep.replica_count;
             for (arn, stat) in o_rep.targets.iter() {
                 let st = s_rep.targets.entry(arn.clone()).or_default();
-                *st = ReplicationStats {
-                    pending_size: stat.pending_size + st.pending_size,
-                    failed_size: stat.failed_size + st.failed_size,
-                    replicated_size: stat.replicated_size + st.replicated_size,
-                    pending_count: stat.pending_count + st.pending_count,
-                    failed_count: stat.failed_count + st.failed_count,
-                    replicated_count: stat.replicated_count + st.replicated_count,
-                    ..Default::default()
-                };
+                st.pending_size += stat.pending_size;
+                st.replicated_size += stat.replicated_size;
+                st.failed_size += stat.failed_size;
+                st.failed_count += stat.failed_count;
+                st.pending_count += stat.pending_count;
+                st.missed_threshold_size += stat.missed_threshold_size;
+                st.after_threshold_size += stat.after_threshold_size;
+                st.missed_threshold_count += stat.missed_threshold_count;
+                st.after_threshold_count += stat.after_threshold_count;
+                st.replicated_count += stat.replicated_count;
             }
         }
 
@@ -1399,6 +1399,80 @@ mod tests {
         assert_eq!(info.buckets_count, 2);
         assert!(info.buckets_usage.is_empty());
         assert_eq!(info.objects_total_count, 3);
+    }
+
+    #[test]
+    fn test_data_usage_entry_merge_preserves_replication_targets() {
+        let mut base = DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 10,
+                replica_count: 1,
+                targets: HashMap::from([
+                    (
+                        "arn:self-only".to_string(),
+                        ReplicationStats {
+                            pending_size: 7,
+                            pending_count: 1,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "arn:shared".to_string(),
+                        ReplicationStats {
+                            failed_size: 3,
+                            failed_count: 1,
+                            missed_threshold_size: 2,
+                            missed_threshold_count: 1,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+        let other = DataUsageEntry {
+            replication_stats: Some(ReplicationAllStats {
+                replica_size: 20,
+                replica_count: 2,
+                targets: HashMap::from([
+                    (
+                        "arn:shared".to_string(),
+                        ReplicationStats {
+                            failed_size: 5,
+                            failed_count: 2,
+                            after_threshold_size: 4,
+                            after_threshold_count: 2,
+                            ..Default::default()
+                        },
+                    ),
+                    (
+                        "arn:other-only".to_string(),
+                        ReplicationStats {
+                            replicated_size: 11,
+                            replicated_count: 3,
+                            ..Default::default()
+                        },
+                    ),
+                ]),
+            }),
+            ..Default::default()
+        };
+
+        base.merge(&other);
+
+        let stats = base.replication_stats.expect("replication stats should remain present");
+        assert_eq!(stats.replica_size, 30);
+        assert_eq!(stats.replica_count, 3);
+        assert_eq!(stats.targets["arn:self-only"].pending_size, 7);
+        assert_eq!(stats.targets["arn:self-only"].pending_count, 1);
+        assert_eq!(stats.targets["arn:shared"].failed_size, 8);
+        assert_eq!(stats.targets["arn:shared"].failed_count, 3);
+        assert_eq!(stats.targets["arn:shared"].missed_threshold_size, 2);
+        assert_eq!(stats.targets["arn:shared"].missed_threshold_count, 1);
+        assert_eq!(stats.targets["arn:shared"].after_threshold_size, 4);
+        assert_eq!(stats.targets["arn:shared"].after_threshold_count, 2);
+        assert_eq!(stats.targets["arn:other-only"].replicated_size, 11);
+        assert_eq!(stats.targets["arn:other-only"].replicated_count, 3);
     }
 
     // --- Tests for `add` and `reduce_children_of` (bug fixes) ---

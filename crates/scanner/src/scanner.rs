@@ -686,6 +686,48 @@ async fn mark_scan_cycle_idle(cycle_info: &mut CurrentCycle) {
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 }
 
+async fn persist_scanner_cycle_state(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &CurrentCycle) {
+    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
+
+    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
+    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
+    buf.extend_from_slice(&cycle_info_buf);
+
+    if let Err(e) = save_config(storeapi, &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "failed",
+            error = %e,
+            "Scanner state persistence failed"
+        );
+    } else {
+        debug!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
+            state = "saved",
+            "Scanner state saved"
+        );
+    }
+}
+
+async fn finalize_partial_scan_cycle(storeapi: Arc<impl ScannerObjectIO>, cycle_info: &mut CurrentCycle) {
+    // A budget-limited cycle is deliberate pacing, not a failure. The cycle counter
+    // must still advance (and persist) because per-bucket next_cycle is stamped from
+    // it and compacted folders are only rescanned when their hash matches
+    // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
+    // expiry and usage refresh on every folder outside the stuck window.
+    cycle_info.next += 1;
+    mark_scan_cycle_idle(cycle_info).await;
+    persist_scanner_cycle_state(storeapi, cycle_info).await;
+}
+
 #[instrument(skip_all)]
 async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>, cycle_info: &mut CurrentCycle) {
     let _activity_guard = ScannerActivityGuard::new();
@@ -785,7 +827,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
                 scan_cycle_partial_reason(budget_reason),
                 scan_cycle_partial_source(budget_reason),
             );
-            mark_scan_cycle_idle(cycle_info).await;
+            finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
             return;
         }
         error!(
@@ -829,7 +871,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
             scan_cycle_partial_reason(budget_reason),
             scan_cycle_partial_source(budget_reason),
         );
-        mark_scan_cycle_idle(cycle_info).await;
+        finalize_partial_scan_cycle(storeapi.clone(), cycle_info).await;
         return;
     }
     done_cycle();
@@ -860,34 +902,7 @@ async fn run_data_scanner_cycle(ctx: &CancellationToken, storeapi: &Arc<ECStore>
     retain_recent_cycle_completions(&mut cycle_info.cycle_completed);
     global_metrics().set_cycle(Some(cycle_info.clone())).await;
 
-    let cycle_info_buf = cycle_info.marshal().unwrap_or_default();
-
-    let mut buf = Vec::with_capacity(cycle_info_buf.len() + 8);
-    buf.extend_from_slice(&cycle_info.next.to_le_bytes());
-    buf.extend_from_slice(&cycle_info_buf);
-
-    if let Err(e) = save_config(storeapi.clone(), &DATA_USAGE_BLOOM_NAME_PATH, buf).await {
-        error!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "failed",
-            error = %e,
-            "Scanner state persistence failed"
-        );
-    } else {
-        debug!(
-            target: "rustfs::scanner",
-            event = EVENT_SCANNER_PERSIST_STATE,
-            component = LOG_COMPONENT_SCANNER,
-            subsystem = LOG_SUBSYSTEM_RUNTIME,
-            path = %&*DATA_USAGE_BLOOM_NAME_PATH,
-            state = "saved",
-            "Scanner state saved"
-        );
-    }
+    persist_scanner_cycle_state(storeapi.clone(), cycle_info).await;
 }
 
 pub async fn run_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) -> Result<(), ScannerError> {
@@ -1088,29 +1103,14 @@ pub async fn store_data_usage_in_backend(
             }
         };
 
-        // Save a backup every 10th update
-        if attempts > 10 {
-            let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
-            let done_save = Metrics::time(Metric::SaveUsage);
-            if let Err(e) = save_config(storeapi.clone(), &backup_path, data.clone()).await {
-                warn!(
-                    target: "rustfs::scanner",
-                    event = EVENT_SCANNER_PERSIST_STATE,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_RUNTIME,
-                    path = %backup_path,
-                    state = "backup_save_failed",
-                    error = %e,
-                    "Scanner data usage backup save failed"
-                );
-            }
-            done_save();
-            attempts = 1;
-        }
+        let backup_data = (attempts > 10).then(|| data.clone());
 
         // Save main configuration
         let done_save = Metrics::time(Metric::SaveUsage);
-        if let Err(e) = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await {
+        let save_result = save_config(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), data).await;
+        done_save();
+
+        if let Err(e) = save_result {
             error!(
                 target: "rustfs::scanner",
                 event = EVENT_SCANNER_PERSIST_STATE,
@@ -1125,8 +1125,27 @@ pub async fn store_data_usage_in_backend(
         } else {
             replace_bucket_usage_memory_from_info(&data_usage_info).await;
             global_metrics().record_scanner_usage_save_result(ScannerUsageSaveResult::Success);
+
+            // Save a backup only after the primary usage object is durable.
+            if let Some(data) = backup_data {
+                let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+                let done_save = Metrics::time(Metric::SaveUsage);
+                if let Err(e) = save_config(storeapi.clone(), &backup_path, data).await {
+                    warn!(
+                        target: "rustfs::scanner",
+                        event = EVENT_SCANNER_PERSIST_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_RUNTIME,
+                        path = %backup_path,
+                        state = "backup_save_failed",
+                        error = %e,
+                        "Scanner data usage backup save failed"
+                    );
+                }
+                done_save();
+                attempts = 1;
+            }
         }
-        done_save();
 
         attempts += 1;
     }
@@ -1182,6 +1201,8 @@ mod tests {
     #[derive(Debug, Default)]
     struct MemoryConfigStore {
         objects: Mutex<HashMap<String, Vec<u8>>>,
+        fail_put_number: Mutex<HashMap<String, usize>>,
+        put_counts: Mutex<HashMap<String, usize>>,
     }
 
     fn memory_config_key(bucket: &str, object: &str) -> String {
@@ -1228,7 +1249,19 @@ mod tests {
         ) -> EcstoreResult<ObjectInfo> {
             let mut buf = Vec::new();
             data.stream.read_to_end(&mut buf).await?;
-            self.objects.lock().await.insert(memory_config_key(bucket, object), buf);
+            let key = memory_config_key(bucket, object);
+            let put_count = {
+                let mut put_counts = self.put_counts.lock().await;
+                let put_count = put_counts.entry(key.clone()).or_insert(0);
+                *put_count += 1;
+                *put_count
+            };
+
+            if self.fail_put_number.lock().await.get(&key) == Some(&put_count) {
+                return Err(EcstoreError::other("injected put failure"));
+            }
+
+            self.objects.lock().await.insert(key, buf);
             Ok(ObjectInfo::default())
         }
     }
@@ -1455,6 +1488,38 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
+    async fn test_finalize_partial_scan_cycle_advances_and_persists_counter() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let mut cycle_info = CurrentCycle {
+            current: 12,
+            next: 12,
+            cycle_completed: vec![],
+            started: Utc::now(),
+        };
+
+        finalize_partial_scan_cycle(store.clone(), &mut cycle_info).await;
+
+        assert_eq!(cycle_info.next, 13);
+        assert_eq!(cycle_info.current, 0);
+        assert!(cycle_info.cycle_completed.is_empty());
+
+        let buf = read_config(store, &DATA_USAGE_BLOOM_NAME_PATH)
+            .await
+            .expect("cycle state should be persisted after a partial cycle");
+        assert_eq!(
+            u64::from_le_bytes(buf[0..8].try_into().expect("persisted state should start with the counter")),
+            13
+        );
+        let mut decoded = CurrentCycle::default();
+        decoded.unmarshal(&buf[8..]).expect("persisted cycle info should decode");
+        assert_eq!(decoded.next, 13);
+        assert_eq!(decoded.current, 0);
+
+        global_metrics().set_cycle(None).await;
+    }
+
+    #[tokio::test]
     async fn test_store_data_usage_in_backend_preserves_newer_snapshot() {
         let store = Arc::new(MemoryConfigStore::default());
         let (sender, receiver) = mpsc::channel(2);
@@ -1524,6 +1589,49 @@ mod tests {
 
         assert_eq!(saved.buckets_count, 2);
         assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(20)));
+    }
+
+    #[tokio::test]
+    async fn test_store_data_usage_in_backend_keeps_backup_when_primary_save_fails() {
+        let store = Arc::new(MemoryConfigStore::default());
+        let (sender, receiver) = mpsc::channel(11);
+        let ctx = CancellationToken::new();
+
+        let backup_path = format!("{}.bkp", DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let main_key = memory_config_key(RUSTFS_META_BUCKET, DATA_USAGE_OBJ_NAME_PATH.as_str());
+        let backup_key = memory_config_key(RUSTFS_META_BUCKET, &backup_path);
+        let old_backup = b"old-backup".to_vec();
+
+        store.objects.lock().await.insert(backup_key.clone(), old_backup.clone());
+        store.fail_put_number.lock().await.insert(main_key.clone(), 11);
+
+        for idx in 1_u64..=11 {
+            sender
+                .send(DataUsageInfo {
+                    last_update: Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(idx)),
+                    buckets_count: idx,
+                    ..Default::default()
+                })
+                .await
+                .expect("usage snapshot should enqueue");
+        }
+        drop(sender);
+
+        store_data_usage_in_backend(ctx, store.clone(), receiver).await;
+
+        let objects = store.objects.lock().await;
+        assert_eq!(
+            objects.get(&backup_key),
+            Some(&old_backup),
+            "primary save failure must not overwrite the previous backup"
+        );
+
+        let saved = objects
+            .get(&main_key)
+            .expect("last successful primary usage snapshot should remain saved");
+        let saved = serde_json::from_slice::<DataUsageInfo>(saved).expect("saved usage snapshot should decode");
+        assert_eq!(saved.buckets_count, 10);
+        assert_eq!(saved.last_update, Some(std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(10)));
     }
 
     #[test]

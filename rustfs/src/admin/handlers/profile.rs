@@ -15,11 +15,7 @@
 use crate::admin::{auth::validate_admin_request, router::Operation};
 use crate::auth::{check_key_valid, get_session_token};
 use crate::server::RemoteAddr;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::HeaderMap;
 use http::StatusCode;
-#[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-use http::header::CONTENT_TYPE;
 use matchit::Params;
 use rustfs_policy::policy::action::{Action, AdminAction};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -45,6 +41,10 @@ pub(super) async fn authorize_profile_request(req: &S3Request<Body>) -> S3Result
     .await
 }
 
+pub(super) fn profile_not_implemented_response(message: String) -> S3Response<(StatusCode, Body)> {
+    S3Response::new((StatusCode::NOT_IMPLEMENTED, Body::from(message)))
+}
+
 pub struct TriggerProfileCPU {}
 #[async_trait::async_trait]
 impl Operation for TriggerProfileCPU {
@@ -52,30 +52,8 @@ impl Operation for TriggerProfileCPU {
         authorize_profile_request(&req).await?;
         info!("Triggering CPU profile dump via S3 request...");
 
-        #[cfg(not(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))))]
-        {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(
-                    crate::profiling::dump_cpu_pprof_for(std::time::Duration::from_secs(0))
-                        .await
-                        .unwrap_err(),
-                ),
-            )));
-        }
-
-        #[cfg(any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            let dur = std::time::Duration::from_secs(60);
-            match crate::profiling::dump_cpu_pprof_for(dur).await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump CPU profile: {e}"))),
-            }
-        }
+        crate::profiling::log_cpu_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::local_cpu_pprof_unsupported_message()))
     }
 }
 
@@ -86,25 +64,8 @@ impl Operation for TriggerProfileMemory {
         authorize_profile_request(&req).await?;
         info!("Triggering Memory profile dump via S3 request...");
 
-        #[cfg(not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-        {
-            return Ok(S3Response::new((
-                StatusCode::NOT_IMPLEMENTED,
-                Body::from(crate::profiling::dump_memory_pprof_now().await.unwrap_err()),
-            )));
-        }
-
-        #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        {
-            match crate::profiling::dump_memory_pprof_now().await {
-                Ok(path) => {
-                    let mut header = HeaderMap::new();
-                    header.insert(CONTENT_TYPE, "text/html".parse().expect("operation should succeed"));
-                    Ok(S3Response::with_headers((StatusCode::OK, Body::from(path.display().to_string())), header))
-                }
-                Err(e) => Err(s3s::s3_error!(InternalError, "{}", format!("Failed to dump Memory profile: {e}"))),
-            }
-        }
+        crate::profiling::log_memory_pprof_dump_skipped();
+        Ok(profile_not_implemented_response(crate::profiling::memory_pprof_unsupported_message()))
     }
 }
 

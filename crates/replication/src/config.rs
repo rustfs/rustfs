@@ -45,6 +45,67 @@ pub trait ReplicationConfigurationExt {
     fn filter_target_arns(&self, obj: &ObjectOpts) -> Vec<String>;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationTargetValidationError {
+    RoleWithMultipleDestinations,
+    StaleTarget,
+}
+
+pub fn active_replication_rule_destination_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+    let mut arns = HashSet::new();
+
+    for rule in &config.rules {
+        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
+            continue;
+        }
+
+        let arn = rule.destination.bucket.trim();
+        if !arn.is_empty() {
+            arns.insert(arn.to_string());
+        }
+    }
+
+    arns
+}
+
+pub fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
+    let role = config.role.trim();
+    if !role.is_empty() {
+        return HashSet::from([role.to_string()]);
+    }
+
+    active_replication_rule_destination_arns(config)
+}
+
+pub fn validate_replication_config_target_arns<'a>(
+    configured_arns: impl IntoIterator<Item = &'a str>,
+    config: &ReplicationConfiguration,
+) -> std::result::Result<(), ReplicationTargetValidationError> {
+    let configured_arns = configured_arns.into_iter().collect::<HashSet<_>>();
+
+    let role = config.role.trim();
+    let destination_arns = active_replication_rule_destination_arns(config);
+    if !role.is_empty() && destination_arns.len() > 1 {
+        return Err(ReplicationTargetValidationError::RoleWithMultipleDestinations);
+    }
+
+    for configured_arn in replication_target_arns(config) {
+        if !configured_arns.contains(configured_arn.as_str()) {
+            return Err(ReplicationTargetValidationError::StaleTarget);
+        }
+    }
+
+    Ok(())
+}
+
+pub fn should_remove_replication_target(
+    target_arn: &str,
+    is_replication_target: bool,
+    config_target_arns: &HashSet<String>,
+) -> bool {
+    is_replication_target && config_target_arns.contains(target_arn)
+}
+
 impl ReplicationConfigurationExt for ReplicationConfiguration {
     /// Check whether any object-replication rules exist
     fn has_existing_object_replication(&self, arn: &str) -> (bool, bool) {
@@ -388,5 +449,106 @@ mod tests {
         );
         assert!(arns.contains(&"arn:target:enabled".to_string()));
         assert!(arns.contains(&"arn:target:disabled".to_string()));
+    }
+
+    #[test]
+    fn replication_target_arns_use_role_when_present() {
+        let role = "arn:rustfs:replication:us-east-1:source:bucket";
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: format!(" {role} "),
+            rules: vec![replication_rule("rule-1", destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(role));
+        assert!(!arns.contains(destination));
+    }
+
+    #[test]
+    fn replication_target_arns_use_rule_destinations_without_role() {
+        let destination = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule("rule-1", destination)],
+        };
+
+        let arns = replication_target_arns(&config);
+
+        assert!(arns.contains(destination));
+    }
+
+    #[test]
+    fn validate_replication_config_target_arns_accepts_matching_destination_arns() {
+        let arn = "arn:rustfs:replication:us-east-1:target:bucket";
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule("rule-1", arn)],
+        };
+
+        validate_replication_config_target_arns([arn], &config).expect("matching target should pass validation");
+    }
+
+    #[test]
+    fn validate_replication_config_target_arns_rejects_stale_destination_arns() {
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![replication_rule("rule-1", "arn:rustfs:replication:us-east-1:target-b:bucket")],
+        };
+
+        let err = validate_replication_config_target_arns(["arn:rustfs:replication:us-east-1:target-a:bucket"], &config)
+            .expect_err("stale target should fail validation");
+        assert_eq!(err, ReplicationTargetValidationError::StaleTarget);
+    }
+
+    #[test]
+    fn validate_replication_config_target_arns_rejects_role_with_multiple_destinations() {
+        let role = "arn:rustfs:replication:us-east-1:role-target:bucket";
+        let config = ReplicationConfiguration {
+            role: role.to_string(),
+            rules: vec![
+                replication_rule("rule-a", "arn:rustfs:replication:us-east-1:target-a:bucket"),
+                replication_rule("rule-b", "arn:rustfs:replication:us-east-1:target-b:bucket"),
+            ],
+        };
+
+        let err = validate_replication_config_target_arns([role], &config)
+            .expect_err("role plus multiple destinations should be rejected");
+        assert_eq!(err, ReplicationTargetValidationError::RoleWithMultipleDestinations);
+    }
+
+    #[test]
+    fn validate_replication_config_target_arns_ignores_disabled_rules() {
+        let mut rule = replication_rule("rule-1", "arn:rustfs:replication:us-east-1:stale:bucket");
+        rule.status = ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED);
+        let config = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![rule],
+        };
+
+        validate_replication_config_target_arns(std::iter::empty::<&str>(), &config)
+            .expect("disabled rules should not require live targets");
+    }
+
+    #[test]
+    fn should_remove_replication_target_only_matches_replication_target_arns() {
+        let target_arns = HashSet::from(["arn:rustfs:replication:us-east-1:removed:bucket".to_string()]);
+
+        assert!(should_remove_replication_target(
+            "arn:rustfs:replication:us-east-1:removed:bucket",
+            true,
+            &target_arns
+        ));
+        assert!(!should_remove_replication_target(
+            "arn:rustfs:replication:us-east-1:kept:bucket",
+            true,
+            &target_arns
+        ));
+        assert!(!should_remove_replication_target(
+            "arn:rustfs:replication:us-east-1:removed:bucket",
+            false,
+            &target_arns
+        ));
     }
 }
