@@ -9118,6 +9118,7 @@ dependencies = [
  "rustfs-madmin",
  "rustfs-notify",
  "rustfs-object-capacity",
+ "rustfs-object-data-cache",
  "rustfs-obs",
  "rustfs-policy",
  "rustfs-protocols",
@@ -9732,6 +9733,19 @@ dependencies = [
  "tracing",
  "uuid",
  "walkdir",
+]
+
+[[package]]
+name = "rustfs-object-data-cache"
+version = "1.0.0-beta.8"
+dependencies = [
+ "bytes",
+ "metrics",
+ "moka",
+ "starshard",
+ "sysinfo",
+ "thiserror 2.0.18",
+ "tokio",
 ]
 
 [[package]]
