@@ -128,13 +128,8 @@ impl ReplicationConfigurationExt for ReplicationConfiguration {
             self.rules[0].destination.clone()
         } else {
             Destination {
-                account: None,
-                bucket: "".to_string(),
-                encryption_configuration: None,
-                metrics: None,
-                replication_time: None,
-                access_control_translation: None,
-                storage_class: None,
+                bucket: String::new(),
+                ..Default::default()
             }
         }
     }

@@ -2547,7 +2547,7 @@ fi
 (
   cd "$ROOT_DIR"
   replication_config_rule_status=0
-  rg -n --with-filename '\b(pub struct ObjectOpts|trait ReplicationConfigurationExt|trait ReplicationRuleExt|struct ReplicationTagFilter|fn decode_tags_to_map)\b' \
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+ObjectOpts|trait\s+ReplicationConfigurationExt|trait\s+ReplicationRuleExt|struct\s+ReplicationTagFilter|fn\s+decode_tags_to_map)\b' \
     crates/ecstore/src/bucket/replication \
     --glob '*.rs' >"$REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE" || replication_config_rule_status=$?
   if [[ "$replication_config_rule_status" -ne 0 && "$replication_config_rule_status" -ne 1 ]]; then
