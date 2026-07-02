@@ -541,6 +541,8 @@ out_dir = pathlib.Path(sys.argv[1])
 modes = [mode.strip() for mode in sys.argv[2].split(",") if mode.strip()]
 strict = sys.argv[3] == "true"
 run_id = sys.argv[4] if len(sys.argv) > 4 else ""
+DEFAULT_ROLLOUT_REQUIRED_MODES = {"disabled", "hit_only", "fill_buffered_only"}
+EXPERIMENTAL_MODES = {"fill_materialize_enabled"}
 
 LINE = re.compile(
     r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
@@ -814,13 +816,28 @@ with (out_dir / "cache_metrics_acceptance.csv").open("w", encoding="utf-8", newl
         ])
 
 strict_failed = any(status == "fail" for _mode, status, _notes, _values in all_acceptance)
+default_required_under_test = [
+    (mode, status) for mode, status, _notes, _values in all_acceptance if mode in DEFAULT_ROLLOUT_REQUIRED_MODES
+]
+default_rollout_failed = any(status == "fail" for _mode, status in default_required_under_test)
+default_rollout_missing = sorted(DEFAULT_ROLLOUT_REQUIRED_MODES - set(modes))
+experimental_failed = any(status == "fail" for mode, status, _notes, _values in all_acceptance if mode in EXPERIMENTAL_MODES)
 overall_status = "skipped" if not strict else ("fail" if strict_failed else "pass")
+default_rollout_status = (
+    "skipped"
+    if not strict
+    else ("incomplete" if default_rollout_missing else ("fail" if default_rollout_failed else "pass"))
+)
 with (out_dir / "default_enablement_readiness.md").open("w", encoding="utf-8") as handle:
-    handle.write("# Object Data Cache Default Enablement Readiness\n\n")
+    handle.write("# Object Data Cache Rollout Readiness\n\n")
     handle.write(f"- strict_metrics_acceptance: {str(strict).lower()}\n")
-    handle.write(f"- overall_status: {overall_status}\n")
+    handle.write(f"- metrics_overall_status: {overall_status}\n")
+    handle.write(f"- default_buffered_rollout_status: {default_rollout_status}\n")
     handle.write(f"- modes_under_test: {', '.join(modes)}\n")
-    handle.write("- default_required_modes: disabled, hit_only, fill_buffered_only, fill_materialize_enabled\n")
+    handle.write("- default_required_modes: disabled, hit_only, fill_buffered_only\n")
+    handle.write("- experimental_modes: fill_materialize_enabled\n")
+    if default_rollout_missing:
+        handle.write(f"- missing_default_required_modes: {', '.join(default_rollout_missing)}\n")
     handle.write("- required_metrics: requests_total, fill_total, hit_bytes_total, weighted_bytes\n\n")
     handle.write("## Mode Acceptance\n\n")
     handle.write("| mode | status | requests | fill_inserted | hit_bytes | weighted_bytes | notes |\n")
@@ -833,11 +850,22 @@ with (out_dir / "default_enablement_readiness.md").open("w", encoding="utf-8") a
         )
     handle.write("\n")
     if strict_failed:
-        handle.write("Conclusion: do not enable object data cache by default.\n")
+        if default_rollout_failed or default_rollout_missing:
+            handle.write("Conclusion: do not advance the default buffered rollout.\n")
+        elif experimental_failed:
+            handle.write(
+                "Conclusion: default buffered rollout metrics passed, but experimental materialize metrics failed; "
+                "keep materialize disabled unless investigated separately.\n"
+            )
+        else:
+            handle.write("Conclusion: strict metrics gate failed; inspect per-mode failures before rollout.\n")
     elif strict:
-        handle.write("Conclusion: metrics gate passed; default enablement can move to the next rollout review.\n")
+        handle.write(
+            "Conclusion: default buffered rollout metrics passed. Keep fill_materialize_enabled as an explicit "
+            "experimental mode; metrics success alone is not sufficient for default materialize enablement.\n"
+        )
     else:
-        handle.write("Conclusion: perf-only run; default enablement remains blocked until strict metrics gate passes.\n")
+        handle.write("Conclusion: perf-only run; rollout remains blocked until strict metrics gate passes.\n")
 
 if strict_failed:
     raise SystemExit(2)
