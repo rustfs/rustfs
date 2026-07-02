@@ -84,10 +84,7 @@ pub fn resized_worker_counts(
 
 pub fn mrf_worker_size_to_count(size: i32) -> usize {
     let non_negative = size.max(0);
-    match usize::try_from(non_negative) {
-        Ok(size) => size,
-        Err(_) => 0,
-    }
+    usize::try_from(non_negative).unwrap_or_default()
 }
 
 pub fn worker_counts_for_priority(
@@ -145,10 +142,7 @@ fn auto_worker_count(current_workers: usize, auto_default: usize) -> usize {
 }
 
 fn usize_to_i32_saturating(value: usize) -> i32 {
-    match i32::try_from(value) {
-        Ok(value) => value,
-        Err(_) => i32::MAX,
-    }
+    i32::try_from(value).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
