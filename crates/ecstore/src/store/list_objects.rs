@@ -1883,7 +1883,14 @@ impl ECStore {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await }.instrument(tracing::Span::current()));
+        tokio::spawn(
+            async move {
+                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
+                    error!("merge_entry_channels err {:?}", err)
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
@@ -2952,7 +2959,14 @@ impl Sets {
             .instrument(tracing::Span::current()),
         );
 
-        tokio::spawn(async move { merge_entry_channels(rx, inputs, merge_tx, 1).await }.instrument(tracing::Span::current()));
+        tokio::spawn(
+            async move {
+                if let Err(err) = merge_entry_channels(rx, inputs, merge_tx, 1).await {
+                    error!("merge_entry_channels err {:?}", err)
+                }
+            }
+            .instrument(tracing::Span::current()),
+        );
 
         let walk_started = std::time::Instant::now();
         let walk_results = join_all(futures).await;
