@@ -204,6 +204,7 @@ REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_d
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
+REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
@@ -2621,6 +2622,21 @@ fi
 
 if [[ -s "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication stats contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_runtime_status=0
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const\s+(?:WORKER_MAX_LIMIT|WORKER_MIN_LIMIT|WORKER_AUTO_DEFAULT|MRF_WORKER_MAX_LIMIT|MRF_WORKER_MIN_LIMIT|MRF_WORKER_AUTO_DEFAULT|LARGE_WORKER_COUNT|MIN_LARGE_OBJ_SIZE)\b)|(?:struct\s+(?:ReplicationPoolOpts|ReplicationWorkerCounts)\b)|(?:fn\s+(?:initial_worker_counts|resized_worker_counts|worker_counts_for_priority|should_queue_large_object|should_grow_large_workers|next_large_worker_count|next_regular_worker_count|next_mrf_worker_count)\b))' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' >"$REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE" || replication_runtime_status=$?
+  if [[ "$replication_runtime_status" -ne 0 && "$replication_runtime_status" -ne 1 ]]; then
+    exit "$replication_runtime_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "replication runtime sizing contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE")"
 fi
 
 (

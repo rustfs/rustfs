@@ -32,8 +32,10 @@ use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
 use rustfs_replication::{
-    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
-    ReplicationQueueAdmission,
+    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueResult, ReplicationOperation, ReplicationPoolOpts,
+    ReplicationPriority, ReplicationQueueAdmission, WORKER_MAX_LIMIT, initial_worker_counts, next_large_worker_count,
+    next_mrf_worker_count, next_regular_worker_count, resized_worker_counts, should_grow_large_workers,
+    should_queue_large_object,
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::sync::Arc;
@@ -65,33 +67,6 @@ fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
     matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
 }
 
-// Worker limits
-pub const WORKER_MAX_LIMIT: usize = 500;
-pub const WORKER_MIN_LIMIT: usize = 50;
-pub const WORKER_AUTO_DEFAULT: usize = 100;
-pub const MRF_WORKER_MAX_LIMIT: usize = 8;
-pub const MRF_WORKER_MIN_LIMIT: usize = 2;
-pub const MRF_WORKER_AUTO_DEFAULT: usize = 4;
-pub const LARGE_WORKER_COUNT: usize = 10;
-pub const MIN_LARGE_OBJ_SIZE: i64 = 128 * 1024 * 1024; // 128MiB
-
-/// Replication pool options
-#[derive(Debug, Clone)]
-pub struct ReplicationPoolOpts {
-    pub priority: ReplicationPriority,
-    pub max_workers: Option<usize>,
-    pub max_l_workers: Option<usize>,
-}
-
-impl Default for ReplicationPoolOpts {
-    fn default() -> Self {
-        Self {
-            priority: ReplicationPriority::Auto,
-            max_workers: None,
-            max_l_workers: None,
-        }
-    }
-}
 /// Main replication pool structure
 #[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
@@ -138,23 +113,14 @@ pub struct ReplicationPool<S: ReplicationStorage> {
 impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
+        let worker_counts = initial_worker_counts(&opts);
         let max_workers = opts.max_workers.unwrap_or(WORKER_MAX_LIMIT);
-
-        let (workers, failed_workers) = match opts.priority {
-            ReplicationPriority::Fast => (WORKER_MAX_LIMIT, MRF_WORKER_MAX_LIMIT),
-            ReplicationPriority::Slow => (WORKER_MIN_LIMIT, MRF_WORKER_MIN_LIMIT),
-            ReplicationPriority::Auto => (WORKER_AUTO_DEFAULT, MRF_WORKER_AUTO_DEFAULT),
-        };
-
-        let workers = std::cmp::min(workers, max_workers);
-        let failed_workers = std::cmp::min(failed_workers, max_workers);
-
         let max_l_workers = opts.max_l_workers.unwrap_or(LARGE_WORKER_COUNT);
 
         // Create MRF channels
         let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(100000);
         let (mrf_save_tx, mrf_save_rx) = mpsc::channel(100000);
-        let (mrf_worker_kill_tx, _mrf_worker_kill_rx) = mpsc::channel(failed_workers);
+        let (mrf_worker_kill_tx, _mrf_worker_kill_rx) = mpsc::channel(worker_counts.mrf_workers);
         let (mrf_stop_tx, _mrf_stop_rx) = mpsc::channel(1);
 
         let pool = Arc::new(Self {
@@ -181,8 +147,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
         // Initialize workers
         pool.resize_lrg_workers(max_l_workers, 0).await;
-        pool.resize_workers(workers, 0).await;
-        pool.resize_failed_workers(failed_workers as i32).await;
+        pool.resize_workers(worker_counts.workers, 0).await;
+        pool.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
 
         // Start background tasks
         pool.start_mrf_processor().await;
@@ -399,39 +365,20 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         max_workers: Option<usize>,
         max_l_workers: Option<usize>,
     ) {
-        let (workers, mrf_workers) = match pri {
-            ReplicationPriority::Fast => (WORKER_MAX_LIMIT, MRF_WORKER_MAX_LIMIT),
-            ReplicationPriority::Slow => (WORKER_MIN_LIMIT, MRF_WORKER_MIN_LIMIT),
-            ReplicationPriority::Auto => {
-                let mut workers = WORKER_AUTO_DEFAULT;
-                let mut mrf_workers = MRF_WORKER_AUTO_DEFAULT;
+        let current_workers = self.workers.read().await.len();
+        let current_mrf = usize::try_from(self.mrf_worker_size.load(Ordering::SeqCst)).unwrap_or_default();
+        let worker_counts = resized_worker_counts(&pri, max_workers, current_workers, current_mrf);
 
-                let current_workers = self.workers.read().await.len();
-                if current_workers < WORKER_AUTO_DEFAULT {
-                    workers = std::cmp::min(current_workers + 1, WORKER_AUTO_DEFAULT);
-                }
-
-                let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst) as usize;
-                if current_mrf < MRF_WORKER_AUTO_DEFAULT {
-                    mrf_workers = std::cmp::min(current_mrf + 1, MRF_WORKER_AUTO_DEFAULT);
-                }
-                (workers, mrf_workers)
-            }
-        };
-
-        let (final_workers, final_mrf_workers) = if let Some(max_w) = max_workers {
+        if let Some(max_w) = max_workers {
             *self.max_workers.write().await = max_w;
-            (std::cmp::min(workers, max_w), std::cmp::min(mrf_workers, max_w))
-        } else {
-            (workers, mrf_workers)
-        };
+        }
 
         let max_l_workers_val = max_l_workers.unwrap_or(LARGE_WORKER_COUNT);
         *self.max_l_workers.write().await = max_l_workers_val;
         *self.priority.write().await = pri;
 
-        self.resize_workers(final_workers, 0).await;
-        self.resize_failed_workers(final_mrf_workers as i32).await;
+        self.resize_workers(worker_counts.workers, 0).await;
+        self.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
         self.resize_lrg_workers(max_l_workers_val, 0).await;
     }
 
@@ -456,7 +403,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
         // If object is large, queue it to a static set of large workers
-        if ri.size >= MIN_LARGE_OBJ_SIZE {
+        if should_queue_large_object(ri.size) {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
@@ -490,8 +437,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
-                    if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
-                        let workers = std::cmp::min(existing + 1, max_l_workers);
+                    if should_grow_large_workers(self.active_lrg_workers(), max_l_workers) {
+                        let workers = next_large_worker_count(existing, max_l_workers);
 
                         drop(lrg_workers);
                         self.resize_lrg_workers(workers, existing).await;
@@ -562,25 +509,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 );
             }
             ReplicationPriority::Auto => {
-                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                let active_workers = self.active_workers();
-
-                if active_workers < max_w as i32 {
-                    let workers = self.workers.read().await;
-                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                let workers = self.workers.read().await;
+                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
                     let existing = workers.len();
 
                     drop(workers);
                     self.resize_workers(new_count, existing).await;
                 }
 
-                let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                let active_mrf = self.active_mrf_workers();
-
-                if active_mrf < max_mrf_workers as i32 {
-                    let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                    let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
-
+                let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
+                if let Some(new_mrf) = next_mrf_worker_count(current_mrf, self.active_mrf_workers(), max_workers) {
                     self.resize_failed_workers(new_mrf).await;
                 }
             }
@@ -645,10 +583,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 );
             }
             ReplicationPriority::Auto => {
-                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                if self.active_workers() < max_w as i32 {
-                    let workers = self.workers.read().await;
-                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                let workers = self.workers.read().await;
+                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
                     let existing = workers.len();
                     drop(workers);
                     self.resize_workers(new_count, existing).await;
