@@ -31,7 +31,7 @@ rmp.workspace = true
 rmp-serde.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-storage-api.workspace = true
-rustfs-utils = { workspace = true, features = ["http"] }
+rustfs-utils = { workspace = true, features = ["http", "path", "string"] }
 s3s.workspace = true
 serde.workspace = true
 time.workspace = true

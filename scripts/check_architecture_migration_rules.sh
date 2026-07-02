@@ -206,6 +206,7 @@ REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_con
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
+REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_object_compare_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
@@ -2652,6 +2653,21 @@ fi
 
 if [[ -s "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "resync DTO contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_object_compare_status=0
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:struct)\s+(?:ReplicationSourceObject|ReplicationTargetObject)|fn\s+(?:content_matches_by_etag|content_matches|target_is_newer_than_source_null_version|replication_action_for_target|get_replication_action))\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' >"$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE" || replication_object_compare_status=$?
+  if [[ "$replication_object_compare_status" -ne 0 && "$replication_object_compare_status" -ne 1 ]]; then
+    exit "$replication_object_compare_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "replication object comparison contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE")"
 fi
 
 (
