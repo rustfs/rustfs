@@ -183,7 +183,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
-        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint and inspected through the scheduler status endpoint with disabled/paused state, current-job backpressure, retry deferral, quarantine boundary, audit timeline, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
+        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint and inspected through the scheduler status endpoint with disabled/paused state, current-job backpressure, retry deferral, quarantine boundary, audit timeline, lease expiry recovery, heartbeat updates, and operator quarantine inspect/release/retry/abandon actions; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
@@ -1066,6 +1066,15 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     if not isinstance(job, dict) or not job.get("job-id"):
         raise RuntimeError("maintenance metadata endpoint did not return a job id")
     signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    quarantine = signed_rest_request(
+        args,
+        deps,
+        "POST",
+        table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}/quarantine"),
+        {"action": "INSPECT"},
+    )
+    if quarantine.get("action") != "INSPECT" or not isinstance(quarantine.get("report"), dict):
+        raise RuntimeError("maintenance quarantine endpoint did not return an inspection report")
     scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
     expected_scheduler_statuses = {"READY", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
     if scheduler.get("status") not in expected_scheduler_statuses:

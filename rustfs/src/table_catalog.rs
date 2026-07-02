@@ -553,6 +553,30 @@ pub(crate) struct TableMaintenanceSchedulerQuarantineBoundary {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceQuarantineAction {
+    Inspect,
+    Release,
+    Retry,
+    Abandon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TableMaintenanceQuarantineOperationRequest {
+    pub action: TableMaintenanceQuarantineAction,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceQuarantineOperationResult {
+    pub action: TableMaintenanceQuarantineAction,
+    pub report: TableMetadataMaintenanceReport,
+    pub scheduler: TableMaintenanceSchedulerReport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct TableMaintenanceSchedulerJobSummary {
     pub job_id: String,
     pub operation: TableMetadataMaintenanceOperation,
@@ -3997,6 +4021,90 @@ where
         })
     }
 
+    pub(crate) async fn apply_table_maintenance_quarantine_operation(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        request: TableMaintenanceQuarantineOperationRequest,
+    ) -> TableCatalogStoreResult<TableMaintenanceQuarantineOperationResult> {
+        let action = request.action.clone();
+        let namespace = parse_namespace_for_store(namespace)?;
+        let table = parse_table_for_store(table)?;
+        let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
+        let namespace_name = namespace.public_name();
+        let table_name = table.as_str().to_string();
+
+        let report = if matches!(action, TableMaintenanceQuarantineAction::Inspect) {
+            self.get_table_metadata_maintenance_report(table_bucket, &namespace_name, &table_name, job_id)
+                .await?
+                .ok_or_else(|| {
+                    TableCatalogStoreError::NotFound(format!(
+                        "maintenance job {}/{}/{}/{}",
+                        table_bucket, namespace_name, table_name, job_id
+                    ))
+                })?
+        } else {
+            let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
+            let Some(mut report) = self
+                .get_table_metadata_maintenance_report(table_bucket, &namespace_name, &table_name, MAINTENANCE_JOB_ALIAS_CURRENT)
+                .await?
+            else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "maintenance job {}/{}/{}/{}",
+                    table_bucket, namespace_name, table_name, job_id
+                )));
+            };
+            if report.job.job_id != job_id {
+                return Err(TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
+            }
+            if !matches!(report.job.status, TableMetadataMaintenanceJobStatus::Failed) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance quarantine operation requires a failed job".to_string(),
+                ));
+            }
+            if !report.job.quarantine_enabled || report.job.quarantined_object_count == 0 {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance job has no active quarantine boundary".to_string(),
+                ));
+            }
+
+            report.job.quarantined_object_count = 0;
+            match &action {
+                TableMaintenanceQuarantineAction::Inspect => unreachable!("inspect branch handled before mutation"),
+                TableMaintenanceQuarantineAction::Release => {
+                    report.job.failure_reason =
+                        Some(table_maintenance_quarantine_operator_reason("released", request.reason.as_deref()));
+                }
+                TableMaintenanceQuarantineAction::Retry => {
+                    report.job.next_retry_after = None;
+                    report.job.failure_reason = Some(table_maintenance_quarantine_operator_reason(
+                        "released for retry",
+                        request.reason.as_deref(),
+                    ));
+                }
+                TableMaintenanceQuarantineAction::Abandon => {
+                    report.job.next_retry_after = None;
+                    report.job.failure_reason =
+                        Some(table_maintenance_quarantine_operator_reason("abandoned", request.reason.as_deref()));
+                }
+            }
+            refresh_table_maintenance_report_recommended_actions(&mut report);
+            self.put_table_metadata_maintenance_report(&report).await?;
+            report
+        };
+
+        let scheduler = self
+            .get_table_maintenance_scheduler_report(table_bucket, &namespace_name, &table_name)
+            .await?;
+        Ok(TableMaintenanceQuarantineOperationResult {
+            action,
+            report,
+            scheduler,
+        })
+    }
+
     async fn list_table_metadata_maintenance_audit_reports(
         &self,
         table_bucket: &str,
@@ -6251,6 +6359,24 @@ where
                     .await
             }
             Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance scheduler")),
+        }
+    }
+
+    pub(crate) async fn apply_table_maintenance_quarantine_operation(
+        &self,
+        table_bucket: &str,
+        namespace: &str,
+        table: &str,
+        job_id: &str,
+        request: TableMaintenanceQuarantineOperationRequest,
+    ) -> TableCatalogStoreResult<TableMaintenanceQuarantineOperationResult> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .apply_table_maintenance_quarantine_operation(table_bucket, namespace, table, job_id, request)
+                    .await
+            }
+            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("table maintenance quarantine")),
         }
     }
 
@@ -8815,6 +8941,14 @@ fn parse_maintenance_timestamp(timestamp: &str) -> Option<OffsetDateTime> {
     OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339).ok()
 }
 
+fn table_maintenance_quarantine_operator_reason(action: &str, reason: Option<&str>) -> String {
+    let reason = reason.map(str::trim).filter(|reason| !reason.is_empty());
+    match reason {
+        Some(reason) => format!("maintenance quarantine {action} by operator: {reason}"),
+        None => format!("maintenance quarantine {action} by operator"),
+    }
+}
+
 fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> Vec<TableMaintenanceRecommendedAction> {
     let mut actions = Vec::new();
     match job.status {
@@ -10842,6 +10976,58 @@ mod tests {
         store.backend.reset_call_counts().await;
     }
 
+    async fn seed_quarantined_table_maintenance(
+        store: &ObjectTableCatalogStore<TestCatalogObjectBackend>,
+        backend: &TestCatalogObjectBackend,
+        bucket: &str,
+        now: OffsetDateTime,
+        next_retry_after: Option<OffsetDateTime>,
+    ) -> (Namespace, IdentifierSegment, TableMetadataMaintenanceReport) {
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    max_retry_attempts: 2,
+                    retry_initial_backoff_seconds: 60,
+                    retry_max_backoff_seconds: 300,
+                    quarantine_enabled: true,
+                    quarantine_retention_seconds: 86_400,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+        let mut failed = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
+        failed.job.failure_reason = Some("quarantine retained failed cleanup candidates".to_string());
+        failed.job.max_retry_attempts = 2;
+        failed.job.next_retry_after = next_retry_after.map(maintenance_timestamp);
+        failed.job.quarantine_enabled = true;
+        failed.job.quarantine_retention_seconds = 86_400;
+        failed.job.quarantined_object_count = 2;
+        failed.job.finished_at = Some(maintenance_timestamp(now - Duration::seconds(10)));
+        store
+            .put_table_metadata_maintenance_report(&failed)
+            .await
+            .expect("failed maintenance report should be seeded");
+        (namespace, table, failed)
+    }
+
     #[tokio::test]
     async fn object_table_catalog_store_writes_catalog_entries_to_internal_meta_bucket() {
         let backend = TestCatalogObjectBackend::default();
@@ -12523,6 +12709,194 @@ mod tests {
                 .recommended_actions
                 .contains(&TableMaintenanceRecommendedAction::ReviewQuarantine)
         );
+    }
+
+    #[tokio::test]
+    async fn maintenance_quarantine_retry_clears_boundary_and_unblocks_scheduler() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let now = OffsetDateTime::now_utc();
+        let (_namespace, _table, failed) =
+            seed_quarantined_table_maintenance(&store, &backend, bucket, now, Some(now + Duration::seconds(300))).await;
+
+        let result = store
+            .apply_table_maintenance_quarantine_operation(
+                bucket,
+                "sales",
+                "orders",
+                &failed.job.job_id,
+                TableMaintenanceQuarantineOperationRequest {
+                    action: TableMaintenanceQuarantineAction::Retry,
+                    reason: Some("operator reviewed retained candidates".to_string()),
+                },
+            )
+            .await
+            .expect("quarantine retry should update the current maintenance job");
+
+        assert_eq!(result.action, TableMaintenanceQuarantineAction::Retry);
+        assert_eq!(result.report.job.job_id, failed.job.job_id);
+        assert_eq!(result.report.job.quarantined_object_count, 0);
+        assert!(result.report.job.next_retry_after.is_none());
+        assert!(
+            !result
+                .report
+                .job
+                .recommended_actions
+                .contains(&TableMaintenanceRecommendedAction::ReviewQuarantine)
+        );
+        assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::Ready);
+        assert!(!result.scheduler.quarantine.active);
+
+        let current_report = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .expect("current maintenance report should load")
+            .expect("current maintenance report should exist");
+        assert_eq!(current_report.job.job_id, failed.job.job_id);
+        assert_eq!(current_report.job.quarantined_object_count, 0);
+    }
+
+    #[tokio::test]
+    async fn maintenance_quarantine_inspect_reports_without_mutating_current_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let now = OffsetDateTime::now_utc();
+        let (_namespace, _table, failed) =
+            seed_quarantined_table_maintenance(&store, &backend, bucket, now, Some(now + Duration::seconds(300))).await;
+
+        let result = store
+            .apply_table_maintenance_quarantine_operation(
+                bucket,
+                "sales",
+                "orders",
+                &failed.job.job_id,
+                TableMaintenanceQuarantineOperationRequest {
+                    action: TableMaintenanceQuarantineAction::Inspect,
+                    reason: Some("ignored for inspect".to_string()),
+                },
+            )
+            .await
+            .expect("quarantine inspect should load the maintenance job");
+
+        assert_eq!(result.action, TableMaintenanceQuarantineAction::Inspect);
+        assert_eq!(result.report.job.job_id, failed.job.job_id);
+        assert_eq!(result.report.job.quarantined_object_count, 2);
+        let expected_retry_after = maintenance_timestamp(now + Duration::seconds(300));
+        assert_eq!(result.report.job.next_retry_after.as_deref(), Some(expected_retry_after.as_str()));
+        assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::RetryDeferred);
+
+        let current_report = store
+            .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
+            .await
+            .expect("current maintenance report should load")
+            .expect("current maintenance report should exist");
+        assert_eq!(current_report.job.quarantined_object_count, 2);
+    }
+
+    #[tokio::test]
+    async fn maintenance_quarantine_release_preserves_retry_deferral() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let now = OffsetDateTime::now_utc();
+        let (_namespace, _table, failed) =
+            seed_quarantined_table_maintenance(&store, &backend, bucket, now, Some(now + Duration::seconds(300))).await;
+
+        let result = store
+            .apply_table_maintenance_quarantine_operation(
+                bucket,
+                "sales",
+                "orders",
+                &failed.job.job_id,
+                TableMaintenanceQuarantineOperationRequest {
+                    action: TableMaintenanceQuarantineAction::Release,
+                    reason: Some("objects retained for later retry".to_string()),
+                },
+            )
+            .await
+            .expect("quarantine release should update the current maintenance job");
+
+        assert_eq!(result.action, TableMaintenanceQuarantineAction::Release);
+        assert_eq!(result.report.job.quarantined_object_count, 0);
+        let expected_retry_after = maintenance_timestamp(now + Duration::seconds(300));
+        assert_eq!(result.report.job.next_retry_after.as_deref(), Some(expected_retry_after.as_str()));
+        assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::RetryDeferred);
+        assert!(result.report.job.failure_reason.as_deref().is_some_and(|reason| {
+            reason.contains("maintenance quarantine released by operator") && reason.contains("objects retained for later retry")
+        }));
+    }
+
+    #[tokio::test]
+    async fn maintenance_quarantine_abandon_clears_boundary_and_retry() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let now = OffsetDateTime::now_utc();
+        let (_namespace, _table, failed) =
+            seed_quarantined_table_maintenance(&store, &backend, bucket, now, Some(now + Duration::seconds(300))).await;
+
+        let result = store
+            .apply_table_maintenance_quarantine_operation(
+                bucket,
+                "sales",
+                "orders",
+                &failed.job.job_id,
+                TableMaintenanceQuarantineOperationRequest {
+                    action: TableMaintenanceQuarantineAction::Abandon,
+                    reason: Some("operator accepted retained objects".to_string()),
+                },
+            )
+            .await
+            .expect("quarantine abandon should update the current maintenance job");
+
+        assert_eq!(result.action, TableMaintenanceQuarantineAction::Abandon);
+        assert_eq!(result.report.job.quarantined_object_count, 0);
+        assert!(result.report.job.next_retry_after.is_none());
+        assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::Ready);
+        assert!(result.report.job.failure_reason.as_deref().is_some_and(|reason| {
+            reason.contains("maintenance quarantine abandoned by operator")
+                && reason.contains("operator accepted retained objects")
+        }));
+    }
+
+    #[tokio::test]
+    async fn maintenance_quarantine_rejects_mutating_non_current_job() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let now = OffsetDateTime::now_utc();
+        let (_namespace, _table, old_failed) =
+            seed_quarantined_table_maintenance(&store, &backend, bucket, now, Some(now + Duration::seconds(300))).await;
+        let mut current_failed = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        current_failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
+        current_failed.job.quarantine_enabled = true;
+        current_failed.job.quarantine_retention_seconds = 86_400;
+        current_failed.job.quarantined_object_count = 1;
+        store
+            .put_table_metadata_maintenance_report(&current_failed)
+            .await
+            .expect("new current maintenance report should be seeded");
+
+        let error = store
+            .apply_table_maintenance_quarantine_operation(
+                bucket,
+                "sales",
+                "orders",
+                &old_failed.job.job_id,
+                TableMaintenanceQuarantineOperationRequest {
+                    action: TableMaintenanceQuarantineAction::Release,
+                    reason: None,
+                },
+            )
+            .await
+            .expect_err("mutating a non-current quarantine job should fail");
+
+        assert_eq!(error, TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
     }
 
     #[tokio::test]

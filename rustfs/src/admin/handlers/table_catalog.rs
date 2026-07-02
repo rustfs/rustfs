@@ -138,6 +138,7 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/worker/run",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
+    "POST /{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
     "POST /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/import",
     "GET /{warehouse}/namespaces/{namespace}/tables/{table}/catalog/external",
@@ -183,6 +184,7 @@ static GET_TABLE_MAINTENANCE_JOB_HANDLER: GetTableMaintenanceJobHandler = GetTab
 static GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER: GetTableMaintenanceSchedulerHandler = GetTableMaintenanceSchedulerHandler {};
 static RUN_TABLE_MAINTENANCE_WORKER_HANDLER: RunTableMaintenanceWorkerHandler = RunTableMaintenanceWorkerHandler {};
 static HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER: HeartbeatTableMaintenanceJobHandler = HeartbeatTableMaintenanceJobHandler {};
+static TABLE_MAINTENANCE_QUARANTINE_HANDLER: TableMaintenanceQuarantineHandler = TableMaintenanceQuarantineHandler {};
 static EXPORT_TABLE_CATALOG_HANDLER: ExportTableCatalogHandler = ExportTableCatalogHandler {};
 static IMPORT_TABLE_CATALOG_HANDLER: ImportTableCatalogHandler = ImportTableCatalogHandler {};
 static EXTERNAL_CATALOG_BRIDGE_HANDLER: ExternalCatalogBridgeHandler = ExternalCatalogBridgeHandler {};
@@ -958,6 +960,11 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
         Method::POST,
         format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/heartbeat").as_str(),
         AdminOperation(&HEARTBEAT_TABLE_MAINTENANCE_JOB_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/namespaces/{{namespace}}/tables/{{table}}/maintenance/jobs/{{job}}/quarantine").as_str(),
+        AdminOperation(&TABLE_MAINTENANCE_QUARANTINE_HANDLER),
     )?;
     r.insert(
         Method::GET,
@@ -5283,6 +5290,28 @@ impl Operation for HeartbeatTableMaintenanceJobHandler {
     }
 }
 
+pub struct TableMaintenanceQuarantineHandler {}
+
+#[async_trait::async_trait]
+impl Operation for TableMaintenanceQuarantineHandler {
+    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let namespace = namespace_from_params(&params)?;
+        let table = table_name_from_params(&params)?;
+        let job = job_id_from_params(&params)?;
+        let resource = TableCatalogResource::table(&warehouse, &namespace, &table);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::RunTableMaintenanceAction).await?;
+        ensure_table_bucket_enabled(&warehouse).await?;
+        let request = read_json_body::<crate::table_catalog::TableMaintenanceQuarantineOperationRequest>(req.input).await?;
+        let store = table_catalog_store()?;
+        let response = store
+            .apply_table_maintenance_quarantine_operation(&warehouse, &namespace.public_name(), &table, &job, request)
+            .await
+            .map_err(catalog_store_error)?;
+        build_json_response(StatusCode::OK, &response)
+    }
+}
+
 pub struct ExportTableCatalogHandler {}
 
 #[async_trait::async_trait]
@@ -5669,6 +5698,7 @@ mod tests {
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5723,6 +5753,7 @@ mod tests {
             ("PutTableMaintenanceConfigHandler", "AdminAction::SetTableLifecycleAction"),
             ("GetTableMaintenanceJobHandler", "AdminAction::GetTableLifecycleAction"),
             ("GetTableMaintenanceSchedulerHandler", "AdminAction::GetTableLifecycleAction"),
+            ("TableMaintenanceQuarantineHandler", "AdminAction::RunTableMaintenanceAction"),
             ("ExportTableCatalogHandler", "AdminAction::GetTableMetadataAction"),
             ("ImportTableCatalogHandler", "AdminAction::RegisterTableAction"),
             ("ExternalCatalogBridgeHandler", "AdminAction::GetTableMetadataAction"),
@@ -5781,6 +5812,7 @@ mod tests {
             "GetTableMaintenanceSchedulerHandler",
             "RunTableMaintenanceWorkerHandler",
             "HeartbeatTableMaintenanceJobHandler",
+            "TableMaintenanceQuarantineHandler",
             "ExportTableCatalogHandler",
             "ImportTableCatalogHandler",
             "ExternalCatalogBridgeHandler",
@@ -5888,6 +5920,7 @@ mod tests {
         let _: &PutTableMaintenanceConfigHandler = &PUT_TABLE_MAINTENANCE_CONFIG_HANDLER;
         let _: &GetTableMaintenanceJobHandler = &GET_TABLE_MAINTENANCE_JOB_HANDLER;
         let _: &GetTableMaintenanceSchedulerHandler = &GET_TABLE_MAINTENANCE_SCHEDULER_HANDLER;
+        let _: &TableMaintenanceQuarantineHandler = &TABLE_MAINTENANCE_QUARANTINE_HANDLER;
         let _: &ExportTableCatalogHandler = &EXPORT_TABLE_CATALOG_HANDLER;
         let _: &ImportTableCatalogHandler = &IMPORT_TABLE_CATALOG_HANDLER;
         let _: &ExternalCatalogBridgeHandler = &EXTERNAL_CATALOG_BRIDGE_HANDLER;
@@ -5928,6 +5961,7 @@ mod tests {
         assert_operation::<GetTableMaintenanceSchedulerHandler>();
         assert_operation::<RunTableMaintenanceWorkerHandler>();
         assert_operation::<HeartbeatTableMaintenanceJobHandler>();
+        assert_operation::<TableMaintenanceQuarantineHandler>();
         assert_operation::<ExportTableCatalogHandler>();
         assert_operation::<ImportTableCatalogHandler>();
         assert_operation::<ExternalCatalogBridgeHandler>();
