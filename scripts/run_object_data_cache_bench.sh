@@ -25,6 +25,7 @@ ROUND_COOLDOWN_SECS=5
 WARP_OBJECTS=128
 WARP_PREPARE_DURATION="3s"
 MODES="disabled,hit_only,fill_buffered_only,fill_materialize_enabled"
+BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD=1048576
 OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
@@ -87,6 +88,10 @@ Core options:
   --round-cooldown-secs <n>      cooldown after each round (default: 5)
   --warp-objects <n>             objects prepared and reused by warp (default: 128)
   --warp-prepare-duration <dur>  prepare-once warmup duration (default: 3s)
+  --buffered-fill-direct-memory-threshold <n>
+                                 Direct-memory threshold used only for
+                                 fill_buffered_only to force a buffered_body
+                                 producer (default: 1048576)
   --out-dir <path>               output directory
 
 Metrics gate options:
@@ -187,6 +192,7 @@ parse_args() {
       --round-cooldown-secs) ROUND_COOLDOWN_SECS="$2"; shift 2 ;;
       --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
       --warp-prepare-duration) WARP_PREPARE_DURATION="$2"; shift 2 ;;
+      --buffered-fill-direct-memory-threshold) BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD="$2"; shift 2 ;;
       --out-dir) OUT_DIR="$2"; shift 2 ;;
       --service-metrics-url) SERVICE_METRICS_URL="$2"; shift 2 ;;
       --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
@@ -244,6 +250,7 @@ validate_args() {
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
   validate_non_negative_int "$ROUND_COOLDOWN_SECS" "--round-cooldown-secs"
   validate_positive_int "$WARP_OBJECTS" "--warp-objects"
+  validate_positive_int "$BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD" "--buffered-fill-direct-memory-threshold"
   validate_positive_int "$SERVICE_METRICS_CAPTURE_ATTEMPTS" "--service-metrics-attempts"
   validate_non_negative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" "--service-metrics-retry-secs"
   validate_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" "--service-metrics-connect-timeout-secs"
@@ -347,6 +354,7 @@ retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 warp_objects=${WARP_OBJECTS}
 warp_prepare_duration=${WARP_PREPARE_DURATION}
+buffered_fill_direct_memory_threshold=${BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD}
 service_metrics_url=${SERVICE_METRICS_URL}
 service_prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL}
 service_prometheus_query=${SERVICE_PROMETHEUS_QUERY}
@@ -460,6 +468,13 @@ run_mode() {
     --region "$REGION"
   )
 
+  if [[ "$mode" == "fill_buffered_only" ]]; then
+    cmd+=(
+      --direct-memory on
+      --direct-memory-threshold "$BUFFERED_FILL_DIRECT_MEMORY_THRESHOLD"
+    )
+  fi
+
   if [[ "$SKIP_BUILD" == "true" || "$index" -gt 0 ]]; then
     cmd+=(--skip-build)
   fi
@@ -557,6 +572,23 @@ def labels_to_dict(labels):
     return result
 
 
+def sanitize_mode(mode):
+    return "".join(ch if ("a" <= ch <= "z" or "0" <= ch <= "9") else "-" for ch in mode.lower().replace("_", "-"))
+
+
+def labels_belong_to_mode(labels, mode):
+    label_map = labels_to_dict(labels)
+    if label_map.get("mode") == mode:
+        return True
+
+    mode_slug = sanitize_mode(mode)
+    for key in ("job", "service_name", "otel_scope_name"):
+        value = label_map.get(key, "")
+        if mode in value or mode_slug in value:
+            return True
+    return False
+
+
 def metric_matches(metric, expected):
     return metric == expected or metric == f"{expected}_total"
 
@@ -572,11 +604,13 @@ def sum_after(after, expected, **wanted_labels):
     return total
 
 
-def gauge_max(before, after, expected):
+def gauge_max(before, after, expected, mode):
     values = []
     for rows in (before, after):
-        for (metric, _labels), value in rows.items():
+        for (metric, labels), value in rows.items():
             if metric_matches(metric, expected):
+                if not labels_belong_to_mode(labels, mode):
+                    continue
                 values.append(value)
     return max(values) if values else 0.0
 
@@ -607,8 +641,8 @@ def mode_metrics(mode):
     hit_bytes = sum_after(after, "rustfs_object_data_cache_hit_bytes_total", mode=mode)
     fill_inserted = sum_after(after, "rustfs_object_data_cache_fill_total", mode=mode, result="inserted")
     fill_skipped_by_mode = sum_after(after, "rustfs_object_data_cache_fill_total", mode=mode, result="skipped_by_mode")
-    weighted_bytes = gauge_max(before, after, "rustfs_object_data_cache_weighted_bytes")
-    entries = gauge_max(before, after, "rustfs_object_data_cache_entries")
+    weighted_bytes = gauge_max(before, after, "rustfs_object_data_cache_weighted_bytes", mode)
+    entries = gauge_max(before, after, "rustfs_object_data_cache_entries", mode)
     return before, after, {
         "requests_total": requests,
         "misses": misses,
