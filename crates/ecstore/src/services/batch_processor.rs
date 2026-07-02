@@ -19,17 +19,179 @@
 
 use crate::disk::error::{Error, Result};
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::task::JoinSet;
+
+const BATCH_PROCESSOR_OPERATION_CUSTOM: &str = "custom";
+const BATCH_PROCESSOR_OPERATION_READ: &str = "read";
+const BATCH_PROCESSOR_OPERATION_WRITE: &str = "write";
+const BATCH_PROCESSOR_OPERATION_METADATA: &str = "metadata";
+const BATCH_SUGGESTION_REASON_IMPROVING: &str = "improving";
+const BATCH_SUGGESTION_REASON_DEGRADING: &str = "degrading";
+const BATCH_SUGGESTION_REASON_STABLE: &str = "stable";
+const BATCH_SUGGESTION_REASON_COOLDOWN: &str = "cooldown";
+const BATCH_OBSERVATION_IMPROVING_LATENCY: Duration = Duration::from_millis(50);
+const BATCH_OBSERVATION_DEGRADING_LATENCY: Duration = Duration::from_millis(250);
+const BATCH_OBSERVATION_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct BatchConcurrencySuggestion {
+    concurrency: usize,
+    reason: &'static str,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BatchObservation {
+    batch_size: usize,
+    success_count: usize,
+    error_count: usize,
+    timeout_count: usize,
+    max_queue_wait: Duration,
+    execution_latency: Duration,
+}
+
+#[derive(Debug)]
+struct BatchObservationState {
+    last_suggestion_at: Option<Instant>,
+    last_suggested_concurrency: usize,
+}
+
+impl BatchObservationState {
+    fn new(configured_concurrency: usize) -> Self {
+        Self {
+            last_suggestion_at: None,
+            last_suggested_concurrency: configured_concurrency,
+        }
+    }
+
+    fn suggest(
+        &mut self,
+        configured_concurrency: usize,
+        observation: BatchObservation,
+        now: Instant,
+    ) -> BatchConcurrencySuggestion {
+        let raw = calculate_batch_concurrency_suggestion(configured_concurrency, observation);
+        if raw.concurrency == configured_concurrency {
+            self.last_suggested_concurrency = configured_concurrency;
+            return raw;
+        }
+
+        if self
+            .last_suggestion_at
+            .is_some_and(|last_suggestion_at| now.duration_since(last_suggestion_at) < BATCH_OBSERVATION_COOLDOWN)
+        {
+            return BatchConcurrencySuggestion {
+                concurrency: self.last_suggested_concurrency,
+                reason: BATCH_SUGGESTION_REASON_COOLDOWN,
+            };
+        }
+
+        self.last_suggestion_at = Some(now);
+        self.last_suggested_concurrency = raw.concurrency;
+        raw
+    }
+}
+
+fn calculate_batch_concurrency_suggestion(
+    configured_concurrency: usize,
+    observation: BatchObservation,
+) -> BatchConcurrencySuggestion {
+    let configured_concurrency = configured_concurrency.max(1);
+
+    if observation.batch_size == 0 {
+        return BatchConcurrencySuggestion {
+            concurrency: configured_concurrency,
+            reason: BATCH_SUGGESTION_REASON_STABLE,
+        };
+    }
+
+    if observation.timeout_count > 0
+        || observation.error_count > 0
+        || (observation.batch_size >= configured_concurrency
+            && observation.execution_latency >= BATCH_OBSERVATION_DEGRADING_LATENCY)
+    {
+        return BatchConcurrencySuggestion {
+            concurrency: decrease_batch_concurrency(configured_concurrency),
+            reason: BATCH_SUGGESTION_REASON_DEGRADING,
+        };
+    }
+
+    if observation.success_count == observation.batch_size
+        && observation.batch_size >= configured_concurrency
+        && observation.execution_latency <= BATCH_OBSERVATION_IMPROVING_LATENCY
+    {
+        return BatchConcurrencySuggestion {
+            concurrency: increase_batch_concurrency(configured_concurrency, observation.batch_size),
+            reason: BATCH_SUGGESTION_REASON_IMPROVING,
+        };
+    }
+
+    BatchConcurrencySuggestion {
+        concurrency: configured_concurrency,
+        reason: BATCH_SUGGESTION_REASON_STABLE,
+    }
+}
+
+fn decrease_batch_concurrency(configured_concurrency: usize) -> usize {
+    (configured_concurrency.saturating_mul(3) / 4).max(1)
+}
+
+fn increase_batch_concurrency(configured_concurrency: usize, batch_size: usize) -> usize {
+    let step = (configured_concurrency / 4).max(1);
+    let upper_bound = configured_concurrency.saturating_mul(2).max(configured_concurrency);
+    configured_concurrency
+        .saturating_add(step)
+        .min(upper_bound)
+        .min(batch_size.max(configured_concurrency))
+}
+
+fn is_timeout_error(err: &Error) -> bool {
+    matches!(err, Error::Timeout | Error::SourceStalled)
+        || matches!(err, Error::Io(io_err) if io_err.kind() == std::io::ErrorKind::TimedOut)
+}
 
 /// Batch processor that executes tasks concurrently with a semaphore
 pub struct AsyncBatchProcessor {
     max_concurrent: usize,
+    operation: &'static str,
+    observation_state: Mutex<BatchObservationState>,
 }
 
 impl AsyncBatchProcessor {
     pub fn new(max_concurrent: usize) -> Self {
-        Self { max_concurrent }
+        Self::new_with_operation(max_concurrent, BATCH_PROCESSOR_OPERATION_CUSTOM)
+    }
+
+    fn new_with_operation(max_concurrent: usize, operation: &'static str) -> Self {
+        let max_concurrent = max_concurrent.max(1);
+        Self {
+            max_concurrent,
+            operation,
+            observation_state: Mutex::new(BatchObservationState::new(max_concurrent)),
+        }
+    }
+
+    fn observe_batch(&self, observation: BatchObservation) -> BatchConcurrencySuggestion {
+        let suggestion = match self.observation_state.lock() {
+            Ok(mut state) => state.suggest(self.max_concurrent, observation, Instant::now()),
+            Err(_) => calculate_batch_concurrency_suggestion(self.max_concurrent, observation),
+        };
+
+        rustfs_io_metrics::record_batch_processor_observation(
+            self.operation,
+            observation.batch_size,
+            self.max_concurrent,
+            observation.max_queue_wait.as_secs_f64(),
+            observation.execution_latency.as_secs_f64(),
+            observation.success_count,
+            observation.error_count,
+            observation.timeout_count,
+            suggestion.concurrency,
+            suggestion.reason,
+        );
+
+        suggestion
     }
 
     /// Execute a batch of tasks concurrently with concurrency control
@@ -42,27 +204,33 @@ impl AsyncBatchProcessor {
             return Vec::new();
         }
 
+        let batch_size = tasks.len();
+        let batch_started_at = Instant::now();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let mut join_set = JoinSet::new();
-        let mut results = Vec::with_capacity(tasks.len());
-        for _ in 0..tasks.len() {
+        let mut results = Vec::with_capacity(batch_size);
+        for _ in 0..batch_size {
             results.push(Err(Error::other("Not completed")));
         }
 
         // Spawn all tasks with semaphore control
         for (i, task) in tasks.into_iter().enumerate() {
             let sem = semaphore.clone();
+            let queued_at = Instant::now();
             join_set.spawn(async move {
                 let _permit = sem.acquire().await.map_err(|_| Error::other("Semaphore error"))?;
+                let queue_wait = queued_at.elapsed();
                 let result = task.await;
-                Ok::<(usize, Result<T>), Error>((i, result))
+                Ok::<(usize, Result<T>, Duration), Error>((i, result, queue_wait))
             });
         }
 
         // Collect results
+        let mut max_queue_wait = Duration::ZERO;
         while let Some(join_result) = join_set.join_next().await {
             match join_result {
-                Ok(Ok((index, task_result))) => {
+                Ok(Ok((index, task_result, queue_wait))) => {
+                    max_queue_wait = max_queue_wait.max(queue_wait);
                     if index < results.len() {
                         results[index] = task_result;
                     }
@@ -77,6 +245,25 @@ impl AsyncBatchProcessor {
                 }
             }
         }
+
+        let mut success_count = 0;
+        let mut error_count = 0;
+        let mut timeout_count = 0;
+        for result in &results {
+            match result {
+                Ok(_) => success_count += 1,
+                Err(err) if is_timeout_error(err) => timeout_count += 1,
+                Err(_) => error_count += 1,
+            }
+        }
+        self.observe_batch(BatchObservation {
+            batch_size,
+            success_count,
+            error_count,
+            timeout_count,
+            max_queue_wait,
+            execution_latency: batch_started_at.elapsed(),
+        });
 
         results
     }
@@ -97,17 +284,27 @@ impl AsyncBatchProcessor {
             )));
         }
 
+        let batch_size = tasks.len();
+        let batch_started_at = Instant::now();
         let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
         let mut join_set = JoinSet::new();
         let mut successes = Vec::new();
-        let mut pending_tasks = tasks.len();
+        let mut pending_tasks = batch_size;
         let mut first_error = None;
+        let mut error_count = 0;
+        let mut timeout_count = 0;
+        let mut max_queue_wait = Duration::ZERO;
 
         for task in tasks {
             let sem = semaphore.clone();
+            let queued_at = Instant::now();
             join_set.spawn(async move {
-                let _permit = sem.acquire().await.map_err(|_| Error::other("Semaphore error"))?;
-                task.await
+                let _permit = sem
+                    .acquire()
+                    .await
+                    .map_err(|_| (Error::other("Semaphore error"), queued_at.elapsed()))?;
+                let queue_wait = queued_at.elapsed();
+                task.await.map(|value| (value, queue_wait)).map_err(|err| (err, queue_wait))
             });
         }
 
@@ -115,18 +312,34 @@ impl AsyncBatchProcessor {
             pending_tasks = pending_tasks.saturating_sub(1);
 
             match join_result {
-                Ok(Ok(value)) => {
+                Ok(Ok((value, queue_wait))) => {
+                    max_queue_wait = max_queue_wait.max(queue_wait);
                     successes.push(value);
                     if successes.len() >= required_successes {
+                        self.observe_batch(BatchObservation {
+                            batch_size,
+                            success_count: successes.len(),
+                            error_count,
+                            timeout_count,
+                            max_queue_wait,
+                            execution_latency: batch_started_at.elapsed(),
+                        });
                         return Ok(successes);
                     }
                 }
-                Ok(Err(err)) => {
+                Ok(Err((err, queue_wait))) => {
+                    max_queue_wait = max_queue_wait.max(queue_wait);
+                    if is_timeout_error(&err) {
+                        timeout_count += 1;
+                    } else {
+                        error_count += 1;
+                    }
                     if first_error.is_none() {
                         first_error = Some(err);
                     }
                 }
                 Err(join_error) => {
+                    error_count += 1;
                     if first_error.is_none() {
                         first_error = Some(Error::other(format!("Task panicked in quorum batch processor: {join_error}")));
                     }
@@ -134,6 +347,14 @@ impl AsyncBatchProcessor {
             }
 
             if successes.len() + pending_tasks < required_successes {
+                self.observe_batch(BatchObservation {
+                    batch_size,
+                    success_count: successes.len(),
+                    error_count,
+                    timeout_count,
+                    max_queue_wait,
+                    execution_latency: batch_started_at.elapsed(),
+                });
                 return Err(first_error.unwrap_or_else(|| {
                     Error::other(format!(
                         "Insufficient successful results: got {}, needed {}",
@@ -144,6 +365,14 @@ impl AsyncBatchProcessor {
             }
         }
 
+        self.observe_batch(BatchObservation {
+            batch_size,
+            success_count: successes.len(),
+            error_count,
+            timeout_count,
+            max_queue_wait,
+            execution_latency: batch_started_at.elapsed(),
+        });
         Err(first_error.unwrap_or_else(|| {
             Error::other(format!(
                 "Insufficient successful results: got {}, needed {}",
@@ -164,9 +393,9 @@ pub struct GlobalBatchProcessors {
 impl GlobalBatchProcessors {
     pub fn new() -> Self {
         Self {
-            read_processor: AsyncBatchProcessor::new(16),     // Higher concurrency for reads
-            write_processor: AsyncBatchProcessor::new(8),     // Lower concurrency for writes
-            metadata_processor: AsyncBatchProcessor::new(12), // Medium concurrency for metadata
+            read_processor: AsyncBatchProcessor::new_with_operation(16, BATCH_PROCESSOR_OPERATION_READ),
+            write_processor: AsyncBatchProcessor::new_with_operation(8, BATCH_PROCESSOR_OPERATION_WRITE),
+            metadata_processor: AsyncBatchProcessor::new_with_operation(12, BATCH_PROCESSOR_OPERATION_METADATA),
         }
     }
 
@@ -320,5 +549,97 @@ mod tests {
 
         assert!(err.to_string().contains("first failure"));
         assert!(started.elapsed() < Duration::from_millis(120));
+    }
+
+    #[tokio::test]
+    async fn test_batch_processor_observe_only_keeps_configured_concurrency() {
+        let processor = AsyncBatchProcessor::new(2);
+
+        let tasks: Vec<_> = (0..4)
+            .map(|i| async move {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+                Ok::<i32, Error>(i)
+            })
+            .collect();
+
+        let results = processor.execute_batch(tasks).await;
+        assert_eq!(results.len(), 4);
+        assert_eq!(processor.max_concurrent, 2);
+    }
+
+    #[test]
+    fn batch_processor_suggestion_increases_for_fast_successful_batches() {
+        let suggestion = calculate_batch_concurrency_suggestion(
+            8,
+            BatchObservation {
+                batch_size: 16,
+                success_count: 16,
+                error_count: 0,
+                timeout_count: 0,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
+        assert!(suggestion.concurrency > 8);
+    }
+
+    #[test]
+    fn batch_processor_suggestion_decreases_for_timeout_batches() {
+        let suggestion = calculate_batch_concurrency_suggestion(
+            8,
+            BatchObservation {
+                batch_size: 16,
+                success_count: 14,
+                error_count: 0,
+                timeout_count: 2,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_DEGRADING);
+        assert!(suggestion.concurrency < 8);
+        assert!(suggestion.concurrency >= 1);
+    }
+
+    #[test]
+    fn batch_processor_suggestion_clamps_to_batch_size() {
+        let suggestion = calculate_batch_concurrency_suggestion(
+            64,
+            BatchObservation {
+                batch_size: 65,
+                success_count: 65,
+                error_count: 0,
+                timeout_count: 0,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            },
+        );
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
+        assert_eq!(suggestion.concurrency, 65);
+    }
+
+    #[test]
+    fn batch_processor_suggestion_cooldown_prevents_rapid_oscillation() {
+        let mut state = BatchObservationState::new(8);
+        let now = Instant::now();
+        let observation = BatchObservation {
+            batch_size: 16,
+            success_count: 16,
+            error_count: 0,
+            timeout_count: 0,
+            max_queue_wait: Duration::ZERO,
+            execution_latency: Duration::from_millis(20),
+        };
+
+        let first = state.suggest(8, observation, now);
+        let second = state.suggest(8, observation, now + Duration::from_secs(1));
+
+        assert_eq!(first.reason, BATCH_SUGGESTION_REASON_IMPROVING);
+        assert_eq!(second.reason, BATCH_SUGGESTION_REASON_COOLDOWN);
+        assert_eq!(second.concurrency, first.concurrency);
     }
 }

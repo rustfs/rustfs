@@ -1129,6 +1129,61 @@ pub fn record_get_object_shard_read_fanout(
     histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
 }
 
+fn batch_processor_count_to_f64(value: usize) -> f64 {
+    u64::try_from(value).unwrap_or(u64::MAX) as f64
+}
+
+fn batch_processor_count_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Record observe-only batch processor shape and adaptive-concurrency advice.
+#[inline(always)]
+pub fn record_batch_processor_observation(
+    operation: &'static str,
+    batch_size: usize,
+    configured_concurrency: usize,
+    max_queue_wait_secs: f64,
+    execution_latency_secs: f64,
+    successes: usize,
+    errors: usize,
+    timeouts: usize,
+    suggested_concurrency: usize,
+    suggestion_reason: &'static str,
+) {
+    histogram!("rustfs_ecstore_batch_processor_batch_size", "operation" => operation)
+        .record(batch_processor_count_to_f64(batch_size));
+    histogram!("rustfs_ecstore_batch_processor_configured_concurrency", "operation" => operation)
+        .record(batch_processor_count_to_f64(configured_concurrency));
+    histogram!("rustfs_ecstore_batch_processor_queue_wait_seconds", "operation" => operation).record(max_queue_wait_secs);
+    histogram!("rustfs_ecstore_batch_processor_execution_latency_seconds", "operation" => operation)
+        .record(execution_latency_secs);
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => operation,
+        "outcome" => "success"
+    )
+    .increment(batch_processor_count_to_u64(successes));
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => operation,
+        "outcome" => "error"
+    )
+    .increment(batch_processor_count_to_u64(errors));
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => operation,
+        "outcome" => "timeout"
+    )
+    .increment(batch_processor_count_to_u64(timeouts));
+    histogram!(
+        "rustfs_ecstore_batch_processor_suggested_concurrency",
+        "operation" => operation,
+        "reason" => suggestion_reason
+    )
+    .record(batch_processor_count_to_f64(suggested_concurrency));
+}
+
 /// Record the bitrot reader setup scheduling strategy selected for a GET read.
 #[inline(always)]
 pub fn record_get_object_reader_setup_strategy(strategy: &'static str, mode: &'static str) {
@@ -2047,6 +2102,11 @@ mod tests {
     }
 
     #[test]
+    fn test_record_batch_processor_observation() {
+        record_batch_processor_observation("read", 16, 8, 0.001, 0.025, 15, 1, 0, 10, "improving");
+    }
+
+    #[test]
     fn test_record_zero_copy_write() {
         record_zero_copy_write(1024, 10.5);
         record_zero_copy_write_fallback("test");
@@ -2129,6 +2189,7 @@ mod tests {
             0,
             2,
         );
+        record_batch_processor_observation("read", 16, 8, 0.001, 0.025, 15, 1, 0, 10, "improving");
 
         assert!(0.005_f64.is_sign_positive());
     }
