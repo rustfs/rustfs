@@ -38,10 +38,14 @@ pub use operation::{
     MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
     delete_replication_object_opts, heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
 };
-pub use queue::{ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
+pub use queue::{
+    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission, replication_heal_queue_action,
+};
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
-    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, should_count_head_proxy_failure,
+    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, should_auto_resume_resync,
+    should_count_head_proxy_failure,
 };
 pub use rule::ReplicationRuleExt;
 pub use runtime::{
