@@ -232,8 +232,10 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   drop routes with persisted view metadata and view-scoped authorization
 - metadata maintenance supports safe dry-run planning, controlled worker
   execution checks, and a scheduler status report with disabled, paused,
-  backpressure, retry, quarantine, and audit-timeline state; quarantined jobs
-  can be inspected, released, retried, or abandoned through an operator endpoint
+  backpressure, retry, quarantine, and audit-timeline state; job reports expose
+  structured audit events for planning, worker transitions, heartbeat updates,
+  lease expiry, and mutating quarantine operations; quarantined jobs can be
+  inspected, released, retried, or abandoned through an operator endpoint
 - catalog diagnostics exposes the table recovery and consistency state used by
   operators
 - catalog export and diagnostics expose the current catalog backing manifest,
@@ -336,7 +338,7 @@ Unsupported behavior is documented instead of hidden behind internal errors. The
 current unsupported inventory is:
 
 - credential vending: automated after table bootstrap with exact-prefix validation and a data-plane scope probe; full no-long-term-data-credential bootstrap is not claimed
-- background maintenance worker: controlled run-once, heartbeat, quarantine operation, and scheduler status endpoints are registered; disabled/paused/backpressure/retry/quarantine/audit-timeline state is machine-readable; continuous in-process scheduling is not claimed
+- background maintenance worker: controlled run-once, heartbeat, quarantine operation, and scheduler status endpoints are registered; disabled/paused/backpressure/retry/quarantine/audit-timeline state and per-job audit events are machine-readable; continuous in-process scheduling is not claimed
 - manifest/data reachability cleanup: metadata maintenance reads manifest-list and manifest Avro references, reports manifest/data/delete reachability, and deletes only unreferenced table objects that pass the safety window
 - snapshot expiration dry-run planning and manual catalog commit: supported through metadata maintenance reports
 - automatic maintenance scheduling: external scheduler hook supported through the worker run endpoint and scheduler status report; built-in periodic scheduling is not claimed

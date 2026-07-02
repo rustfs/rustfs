@@ -554,6 +554,48 @@ pub(crate) struct TableMaintenanceSchedulerQuarantineBoundary {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceAuditActor {
+    Scheduler,
+    Worker,
+    Operator,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableMaintenanceAuditAction {
+    Planned,
+    WorkerControl,
+    WorkerStarted,
+    WorkerHeartbeat,
+    WorkerLeaseExpired,
+    WorkerSucceeded,
+    WorkerFailed,
+    QuarantineRelease,
+    QuarantineRetry,
+    QuarantineAbandon,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct TableMaintenanceAuditEvent {
+    pub timestamp: String,
+    pub actor: TableMaintenanceAuditActor,
+    pub action: TableMaintenanceAuditAction,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default, rename = "before-status")]
+    pub before_status: Option<TableMetadataMaintenanceJobStatus>,
+    #[serde(default, rename = "after-status")]
+    pub after_status: Option<TableMetadataMaintenanceJobStatus>,
+    #[serde(default, rename = "before-quarantined-object-count")]
+    pub before_quarantined_object_count: Option<usize>,
+    #[serde(default, rename = "after-quarantined-object-count")]
+    pub after_quarantined_object_count: Option<usize>,
+    #[serde(default, rename = "recommended-actions")]
+    pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableMaintenanceQuarantineAction {
     Inspect,
     Release,
@@ -588,6 +630,8 @@ pub(crate) struct TableMaintenanceSchedulerJobSummary {
     pub heartbeat_at: Option<String>,
     pub next_retry_after: Option<String>,
     pub recommended_actions: Vec<TableMaintenanceRecommendedAction>,
+    #[serde(default, rename = "audit-events")]
+    pub audit_events: Vec<TableMaintenanceAuditEvent>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -677,6 +721,8 @@ pub(crate) struct TableMetadataMaintenanceReport {
     pub snapshot_expiration: Option<TableSnapshotExpirationReport>,
     #[serde(default)]
     pub compaction: Option<TableCompactionPlanningReport>,
+    #[serde(default, rename = "audit-events")]
+    pub audit_events: Vec<TableMaintenanceAuditEvent>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -4070,6 +4116,8 @@ where
                 ));
             }
 
+            let before_status = Some(report.job.status.clone());
+            let before_quarantined_object_count = Some(report.job.quarantined_object_count);
             report.job.quarantined_object_count = 0;
             match &action {
                 TableMaintenanceQuarantineAction::Inspect => unreachable!("inspect branch handled before mutation"),
@@ -4091,6 +4139,21 @@ where
                 }
             }
             refresh_table_maintenance_report_recommended_actions(&mut report);
+            let audit_action = match &action {
+                TableMaintenanceQuarantineAction::Inspect => unreachable!("inspect branch handled before mutation"),
+                TableMaintenanceQuarantineAction::Release => TableMaintenanceAuditAction::QuarantineRelease,
+                TableMaintenanceQuarantineAction::Retry => TableMaintenanceAuditAction::QuarantineRetry,
+                TableMaintenanceQuarantineAction::Abandon => TableMaintenanceAuditAction::QuarantineAbandon,
+            };
+            push_table_maintenance_audit_event(
+                &mut report,
+                OffsetDateTime::now_utc(),
+                TableMaintenanceAuditActor::Operator,
+                audit_action,
+                request.reason,
+                before_status,
+                before_quarantined_object_count,
+            );
             self.put_table_metadata_maintenance_report(&report).await?;
             report
         };
@@ -4228,6 +4291,15 @@ where
             report.job.started_at = Some(started_at);
             report.job.finished_at = None;
             refresh_table_maintenance_report_recommended_actions(&mut report);
+            push_table_maintenance_audit_event(
+                &mut report,
+                now,
+                TableMaintenanceAuditActor::Worker,
+                TableMaintenanceAuditAction::WorkerStarted,
+                None,
+                Some(TableMetadataMaintenanceJobStatus::Successful),
+                Some(0),
+            );
             self.put_table_metadata_maintenance_report(&report).await?;
 
             let delete = effective.config.delete_enabled;
@@ -4289,10 +4361,21 @@ where
                     return Ok(TableMaintenanceWorkerPreflight::Complete(Box::new(current)));
                 }
                 let mut expired = current;
+                let before_status = Some(expired.job.status.clone());
+                let before_quarantined_object_count = Some(expired.job.quarantined_object_count);
                 expired.job.status = TableMetadataMaintenanceJobStatus::Failed;
                 expired.job.failure_reason = Some("maintenance worker lease expired".to_string());
                 expired.job.finished_at = Some(maintenance_timestamp(now));
                 refresh_table_maintenance_report_recommended_actions(&mut expired);
+                push_table_maintenance_audit_event(
+                    &mut expired,
+                    now,
+                    TableMaintenanceAuditActor::Scheduler,
+                    TableMaintenanceAuditAction::WorkerLeaseExpired,
+                    Some("maintenance worker lease expired".to_string()),
+                    before_status,
+                    before_quarantined_object_count,
+                );
                 self.put_table_metadata_maintenance_report(&expired).await?;
             } else if table_maintenance_job_retry_is_pending(&current.job, now) {
                 return Ok(TableMaintenanceWorkerPreflight::Complete(Box::new(current)));
@@ -4365,6 +4448,17 @@ where
         }
 
         report.job.heartbeat_at = Some(maintenance_timestamp(now));
+        refresh_table_maintenance_report_recommended_actions(&mut report);
+        let before_quarantined_object_count = Some(report.job.quarantined_object_count);
+        push_table_maintenance_audit_event(
+            &mut report,
+            now,
+            TableMaintenanceAuditActor::Worker,
+            TableMaintenanceAuditAction::WorkerHeartbeat,
+            None,
+            Some(TableMetadataMaintenanceJobStatus::Running),
+            before_quarantined_object_count,
+        );
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -4438,8 +4532,18 @@ where
             reachability_graph: TableMaintenanceReachabilityGraphReport::default(),
             snapshot_expiration: None,
             compaction: None,
+            audit_events: Vec::new(),
         };
-        let report = table_maintenance_report_with_recommended_actions(report);
+        let mut report = table_maintenance_report_with_recommended_actions(report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            control.now,
+            TableMaintenanceAuditActor::Scheduler,
+            TableMaintenanceAuditAction::WorkerControl,
+            Some(control.reason.to_string()),
+            None,
+            None,
+        );
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -5134,7 +5238,7 @@ where
             )
             .await?;
 
-        Ok(table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
+        let mut report = table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
                 job_id: Uuid::new_v4().to_string(),
                 table_bucket: table_bucket.to_string(),
@@ -5185,7 +5289,18 @@ where
             reachability_graph,
             snapshot_expiration: None,
             compaction: None,
-        }))
+            audit_events: Vec::new(),
+        });
+        push_table_maintenance_audit_event(
+            &mut report,
+            now,
+            TableMaintenanceAuditActor::Scheduler,
+            TableMaintenanceAuditAction::Planned,
+            None,
+            None,
+            None,
+        );
+        Ok(report)
     }
 
     pub(crate) async fn delete_table_metadata_maintenance_candidates(
@@ -5247,7 +5362,8 @@ where
             .plan_table_metadata_maintenance(table_bucket, namespace, table, effective.config.retain_recent_metadata_files)
             .await?;
 
-        let started_at = maintenance_timestamp(OffsetDateTime::now_utc());
+        let started_at_time = OffsetDateTime::now_utc();
+        let started_at = maintenance_timestamp(started_at_time);
         report.job.operation = if delete {
             TableMetadataMaintenanceOperation::Delete
         } else {
@@ -5267,6 +5383,15 @@ where
         report.job.started_at = Some(started_at);
         report.job.finished_at = None;
         refresh_table_maintenance_report_recommended_actions(&mut report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            started_at_time,
+            TableMaintenanceAuditActor::Worker,
+            TableMaintenanceAuditAction::WorkerStarted,
+            None,
+            Some(TableMetadataMaintenanceJobStatus::Successful),
+            Some(0),
+        );
         self.put_table_metadata_maintenance_report(&report).await?;
 
         self.finish_table_metadata_maintenance_run(table_bucket, namespace, table, delete, &effective, report)
@@ -5283,11 +5408,23 @@ where
         mut report: TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         if delete && !effective.config.delete_enabled {
+            let finished_at = OffsetDateTime::now_utc();
+            let before_status = Some(report.job.status.clone());
+            let before_quarantined_object_count = Some(report.job.quarantined_object_count);
             report.job.status = TableMetadataMaintenanceJobStatus::Failed;
             report.job.failure_reason = Some(TABLE_MAINTENANCE_DELETE_DISABLED_REASON.to_string());
-            apply_maintenance_retry_after(&mut report.job, &effective.config, OffsetDateTime::now_utc());
-            report.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            apply_maintenance_retry_after(&mut report.job, &effective.config, finished_at);
+            report.job.finished_at = Some(maintenance_timestamp(finished_at));
             refresh_table_maintenance_report_recommended_actions(&mut report);
+            push_table_maintenance_audit_event(
+                &mut report,
+                finished_at,
+                TableMaintenanceAuditActor::Worker,
+                TableMaintenanceAuditAction::WorkerFailed,
+                Some(TABLE_MAINTENANCE_DELETE_DISABLED_REASON.to_string()),
+                before_status,
+                before_quarantined_object_count,
+            );
             self.put_table_metadata_maintenance_report(&report).await?;
             return Ok(report);
         }
@@ -5300,25 +5437,62 @@ where
             {
                 Ok(report) => report,
                 Err(err) => {
+                    let finished_at = OffsetDateTime::now_utc();
                     let mut failed = running_report;
+                    let before_status = Some(failed.job.status.clone());
+                    let before_quarantined_object_count = Some(failed.job.quarantined_object_count);
+                    let reason = err.to_string();
                     failed.job.status = TableMetadataMaintenanceJobStatus::Failed;
-                    failed.job.failure_reason = Some(err.to_string());
-                    apply_maintenance_retry_after(&mut failed.job, &effective.config, OffsetDateTime::now_utc());
-                    failed.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+                    failed.job.failure_reason = Some(reason.clone());
+                    apply_maintenance_retry_after(&mut failed.job, &effective.config, finished_at);
+                    failed.job.finished_at = Some(maintenance_timestamp(finished_at));
                     refresh_table_maintenance_report_recommended_actions(&mut failed);
+                    push_table_maintenance_audit_event(
+                        &mut failed,
+                        finished_at,
+                        TableMaintenanceAuditActor::Worker,
+                        TableMaintenanceAuditAction::WorkerFailed,
+                        Some(reason),
+                        before_status,
+                        before_quarantined_object_count,
+                    );
                     self.put_table_metadata_maintenance_report(&failed).await?;
                     return Err(err);
                 }
             };
-            deleted.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+            let finished_at = OffsetDateTime::now_utc();
+            let before_status = Some(TableMetadataMaintenanceJobStatus::Running);
+            let before_quarantined_object_count = Some(0);
+            deleted.job.finished_at = Some(maintenance_timestamp(finished_at));
             refresh_table_maintenance_report_recommended_actions(&mut deleted);
+            push_table_maintenance_audit_event(
+                &mut deleted,
+                finished_at,
+                TableMaintenanceAuditActor::Worker,
+                TableMaintenanceAuditAction::WorkerSucceeded,
+                None,
+                before_status,
+                before_quarantined_object_count,
+            );
             self.put_table_metadata_maintenance_report(&deleted).await?;
             return Ok(deleted);
         }
 
+        let finished_at = OffsetDateTime::now_utc();
+        let before_status = Some(report.job.status.clone());
+        let before_quarantined_object_count = Some(report.job.quarantined_object_count);
         report.job.status = TableMetadataMaintenanceJobStatus::Successful;
-        report.job.finished_at = Some(maintenance_timestamp(OffsetDateTime::now_utc()));
+        report.job.finished_at = Some(maintenance_timestamp(finished_at));
         refresh_table_maintenance_report_recommended_actions(&mut report);
+        push_table_maintenance_audit_event(
+            &mut report,
+            finished_at,
+            TableMaintenanceAuditActor::Worker,
+            TableMaintenanceAuditAction::WorkerSucceeded,
+            None,
+            before_status,
+            before_quarantined_object_count,
+        );
         self.put_table_metadata_maintenance_report(&report).await?;
         Ok(report)
     }
@@ -5509,6 +5683,7 @@ where
             reachability_graph: report.reachability_graph,
             snapshot_expiration: report.snapshot_expiration,
             compaction: report.compaction,
+            audit_events: report.audit_events,
         }))
     }
 }
@@ -8949,6 +9124,28 @@ fn table_maintenance_quarantine_operator_reason(action: &str, reason: Option<&st
     }
 }
 
+fn push_table_maintenance_audit_event(
+    report: &mut TableMetadataMaintenanceReport,
+    timestamp: OffsetDateTime,
+    actor: TableMaintenanceAuditActor,
+    action: TableMaintenanceAuditAction,
+    reason: Option<String>,
+    before_status: Option<TableMetadataMaintenanceJobStatus>,
+    before_quarantined_object_count: Option<usize>,
+) {
+    report.audit_events.push(TableMaintenanceAuditEvent {
+        timestamp: maintenance_timestamp(timestamp),
+        actor,
+        action,
+        reason,
+        before_status,
+        after_status: Some(report.job.status.clone()),
+        before_quarantined_object_count,
+        after_quarantined_object_count: Some(report.job.quarantined_object_count),
+        recommended_actions: report.job.recommended_actions.clone(),
+    });
+}
+
 fn table_maintenance_recommended_actions(job: &TableMetadataMaintenanceJob) -> Vec<TableMaintenanceRecommendedAction> {
     let mut actions = Vec::new();
     match job.status {
@@ -9024,6 +9221,7 @@ fn table_maintenance_scheduler_job_summary(report: &TableMetadataMaintenanceRepo
         heartbeat_at: report.job.heartbeat_at.clone(),
         next_retry_after: report.job.next_retry_after.clone(),
         recommended_actions: report.job.recommended_actions.clone(),
+        audit_events: report.audit_events.clone(),
     }
 }
 
@@ -12738,6 +12936,18 @@ mod tests {
         assert_eq!(result.report.job.job_id, failed.job.job_id);
         assert_eq!(result.report.job.quarantined_object_count, 0);
         assert!(result.report.job.next_retry_after.is_none());
+        let event = result
+            .report
+            .audit_events
+            .last()
+            .expect("quarantine retry should append an audit event");
+        assert_eq!(event.action, TableMaintenanceAuditAction::QuarantineRetry);
+        assert_eq!(event.actor, TableMaintenanceAuditActor::Operator);
+        assert_eq!(event.reason.as_deref(), Some("operator reviewed retained candidates"));
+        assert_eq!(event.before_status, Some(TableMetadataMaintenanceJobStatus::Failed));
+        assert_eq!(event.after_status, Some(TableMetadataMaintenanceJobStatus::Failed));
+        assert_eq!(event.before_quarantined_object_count, Some(2));
+        assert_eq!(event.after_quarantined_object_count, Some(0));
         assert!(
             !result
                 .report
@@ -12747,6 +12957,16 @@ mod tests {
         );
         assert_eq!(result.scheduler.status, TableMaintenanceSchedulerStatus::Ready);
         assert!(!result.scheduler.quarantine.active);
+        let summary = result
+            .scheduler
+            .audit_timeline
+            .iter()
+            .find(|summary| summary.job_id == failed.job.job_id)
+            .expect("scheduler timeline should include the retried job");
+        assert_eq!(
+            summary.audit_events.last().map(|event| event.action.clone()),
+            Some(TableMaintenanceAuditAction::QuarantineRetry)
+        );
 
         let current_report = store
             .get_table_metadata_maintenance_report(bucket, "sales", "orders", MAINTENANCE_JOB_ALIAS_CURRENT)
@@ -12793,6 +13013,7 @@ mod tests {
             .expect("current maintenance report should load")
             .expect("current maintenance report should exist");
         assert_eq!(current_report.job.quarantined_object_count, 2);
+        assert_eq!(current_report.audit_events, failed.audit_events);
     }
 
     #[tokio::test]
@@ -12897,6 +13118,113 @@ mod tests {
             .expect_err("mutating a non-current quarantine job should fail");
 
         assert_eq!(error, TableCatalogStoreError::Conflict("maintenance job is not current".to_string()));
+    }
+
+    #[tokio::test]
+    async fn maintenance_worker_run_records_audit_timeline_events() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        store
+            .put_table_maintenance_config(
+                bucket,
+                "sales",
+                "orders",
+                TableMaintenanceConfig {
+                    version: TABLE_MAINTENANCE_CONFIG_VERSION,
+                    background_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("background maintenance config should persist");
+
+        let report = store
+            .run_table_metadata_maintenance_worker_once(bucket, "sales", "orders", "worker-a".to_string())
+            .await
+            .expect("maintenance worker should finish");
+
+        let actions = report
+            .audit_events
+            .iter()
+            .map(|event| event.action.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                TableMaintenanceAuditAction::Planned,
+                TableMaintenanceAuditAction::WorkerStarted,
+                TableMaintenanceAuditAction::WorkerSucceeded,
+            ]
+        );
+        assert_eq!(report.audit_events[1].actor, TableMaintenanceAuditActor::Worker);
+        assert_eq!(report.audit_events[1].before_status, Some(TableMetadataMaintenanceJobStatus::Successful));
+        assert_eq!(report.audit_events[2].after_status, Some(TableMetadataMaintenanceJobStatus::Successful));
+
+        let scheduler = store
+            .get_table_maintenance_scheduler_report(bucket, "sales", "orders")
+            .await
+            .expect("scheduler report should load");
+        let summary = scheduler.current_job.expect("current job should be visible");
+        assert_eq!(summary.job_id, report.job.job_id);
+        assert_eq!(summary.audit_events, report.audit_events);
+    }
+
+    #[tokio::test]
+    async fn maintenance_heartbeat_appends_worker_audit_event() {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::seconds(100);
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+        backend
+            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+            .await;
+        let mut running = store
+            .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+            .await
+            .expect("maintenance report should be planned");
+        running.job.status = TableMetadataMaintenanceJobStatus::Running;
+        running.job.worker_id = Some("worker-a".to_string());
+        running.job.lease_id = "lease-a".to_string();
+        running.job.heartbeat_at = Some(maintenance_timestamp(now - Duration::seconds(10)));
+        store
+            .put_table_metadata_maintenance_report(&running)
+            .await
+            .expect("running maintenance report should be seeded");
+
+        let heartbeat = store
+            .heartbeat_table_metadata_maintenance_job_at(
+                TableMaintenanceHeartbeatRef {
+                    table_bucket: bucket,
+                    namespace: "sales",
+                    table: "orders",
+                    job_id: &running.job.job_id,
+                    lease_id: "lease-a",
+                    worker_id: "worker-a",
+                },
+                now,
+            )
+            .await
+            .expect("heartbeat should update the running job");
+
+        let event = heartbeat.audit_events.last().expect("heartbeat should append an audit event");
+        assert_eq!(event.action, TableMaintenanceAuditAction::WorkerHeartbeat);
+        assert_eq!(event.actor, TableMaintenanceAuditActor::Worker);
+        assert_eq!(event.before_status, Some(TableMetadataMaintenanceJobStatus::Running));
+        assert_eq!(event.after_status, Some(TableMetadataMaintenanceJobStatus::Running));
     }
 
     #[tokio::test]
@@ -13089,6 +13417,14 @@ mod tests {
             expired.job.recommended_actions,
             vec![TableMaintenanceRecommendedAction::InvestigateFailure]
         );
+        let event = expired
+            .audit_events
+            .last()
+            .expect("expired lease recovery should append an audit event");
+        assert_eq!(event.action, TableMaintenanceAuditAction::WorkerLeaseExpired);
+        assert_eq!(event.actor, TableMaintenanceAuditActor::Scheduler);
+        assert_eq!(event.before_status, Some(TableMetadataMaintenanceJobStatus::Running));
+        assert_eq!(event.after_status, Some(TableMetadataMaintenanceJobStatus::Failed));
     }
 
     #[tokio::test]
