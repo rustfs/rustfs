@@ -610,7 +610,6 @@ pub(crate) mod bucket {
 
         pub(crate) type DeletedObjectReplicationInfo =
             crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
-        type ObjectOpts = crate::storage::storage_api::ecstore_bucket::replication::ObjectOpts;
         type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type ReplicateDecision = rustfs_replication::ReplicateDecision;
 
@@ -660,51 +659,14 @@ pub(crate) mod bucket {
             version_id: Option<Uuid>,
             replica: bool,
         ) -> Option<rustfs_replication::ReplicationState> {
-            let opts = ObjectOpts {
+            let source = rustfs_replication::ReplicationDeleteStateSource {
                 name: obj_info.name.clone(),
                 user_tags: (*obj_info.user_tags).clone(),
                 version_id,
                 delete_marker: obj_info.delete_marker,
-                op_type: rustfs_replication::ReplicationType::Delete,
                 replica,
-                ..Default::default()
             };
-            let target_arns =
-                crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt::filter_target_arns(
-                    config, &opts,
-                );
-            if target_arns.is_empty() {
-                return None;
-            }
-
-            let mut decision = ReplicateDecision::new();
-            for target_arn in target_arns {
-                let mut target_opts = opts.clone();
-                target_opts.target_arn = target_arn.clone();
-                let replicate = crate::storage::storage_api::ecstore_bucket::replication::ReplicationConfigurationExt::replicate(
-                    config,
-                    &target_opts,
-                );
-                decision.set(rustfs_replication::ReplicateTargetDecision::new(target_arn, replicate, false));
-            }
-            if !decision.replicate_any() {
-                return None;
-            }
-
-            let pending_status = decision.pending_status();
-            let mut state = rustfs_replication::ReplicationState {
-                replicate_decision_str: decision.to_string(),
-                ..Default::default()
-            };
-            if version_id.is_some() {
-                state.version_purge_status_internal = pending_status.clone();
-                state.purge_targets =
-                    rustfs_replication::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
-            } else {
-                state.replication_status_internal = pending_status.clone();
-                state.targets = rustfs_replication::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
-            }
-            Some(state)
+            rustfs_replication::delete_replication_state_from_config(config, &source)
         }
     }
 
