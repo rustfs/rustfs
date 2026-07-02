@@ -43,6 +43,20 @@ S3_PORT="${S3_PORT:-9000}"
 TEST_MODE="${TEST_MODE:-single}"
 MAXFAIL="${MAXFAIL:-1}"
 XDIST="${XDIST:-0}"
+# Test scope:
+#   "implemented" (default) - run only the implemented_tests.txt whitelist (PR gate)
+#   "all"                   - run the entire upstream suite (scheduled full sweep)
+TEST_SCOPE="${TEST_SCOPE:-implemented}"
+if [[ "${TEST_SCOPE}" != "implemented" && "${TEST_SCOPE}" != "all" ]]; then
+    echo "[ERROR] Invalid TEST_SCOPE: ${TEST_SCOPE} (must be \"implemented\" or \"all\")" >&2
+    exit 1
+fi
+
+# Upstream ceph/s3-tests suite, pinned for reproducible runs.
+# Bump S3TESTS_REV deliberately: upstream changes can rename tests or change
+# assertions, so a bump usually requires reclassifying the test list files.
+S3TESTS_REPO="${S3TESTS_REPO:-https://github.com/ceph/s3-tests.git}"
+S3TESTS_REV="${S3TESTS_REV:-5522d1c351f75bc00ae0f64f742f3f095f5939d9}"
 
 # Compatibility default for the s3-tests harness:
 # this script provisions multiple local export directories on the same physical disk.
@@ -146,7 +160,12 @@ fi
 #   2. Easy maintenance - edit txt files to add/remove tests
 #   3. Separation of concerns - test classification vs test execution
 # =============================================================================
-if [[ -z "${TESTEXPR:-}" ]]; then
+TESTEXPR="${TESTEXPR:-}"
+if [[ -n "${TESTEXPR}" ]]; then
+    log_info "Using custom TESTEXPR selection: ${TESTEXPR}"
+elif [[ "${TEST_SCOPE}" == "all" ]]; then
+    log_info "TEST_SCOPE=all: running the entire upstream test suite (no whitelist)"
+else
     if [[ -f "${IMPLEMENTED_TESTS_FILE}" ]]; then
         log_info "Loading test list from: ${IMPLEMENTED_TESTS_FILE}"
         load_testnodes_from_file "${IMPLEMENTED_TESTS_FILE}"
@@ -240,8 +259,11 @@ Environment Variables:
   S3_ALT_ACCESS_KEY      - Alt user access key (default: rustfsalt)
   S3_ALT_SECRET_KEY      - Alt user secret key (default: rustfsalt)
   RUSTFS_SSE_S3_MASTER_KEY - Optional base64 32-byte key for local managed SSE fallback
-  MAXFAIL                - Stop after N failures (default: 1)
+  MAXFAIL                - Stop after N failures, 0 = never stop (default: 1)
   XDIST                  - Enable parallel execution with N workers (default: 0)
+  TEST_SCOPE             - "implemented" (whitelist, default) or "all" (entire upstream suite)
+  S3TESTS_REPO           - s3-tests repository URL (default: https://github.com/ceph/s3-tests.git)
+  S3TESTS_REV            - Pinned s3-tests commit; bump deliberately and reclassify test lists
   MARKEXPR               - pytest marker expression (default: no marker filtering)
   TESTEXPR               - pytest -k expression (overrides implemented_tests.txt node list)
   S3TESTS_CONF_TEMPLATE  - Path to s3tests config template (default: .github/s3tests/s3tests.conf)
@@ -819,14 +841,23 @@ awscurl \
 
 log_info "Alt user provisioned successfully"
 
-# Step 8: Prepare s3-tests
-log_info "Preparing s3-tests..."
-if [ ! -d "${PROJECT_ROOT}/s3-tests" ]; then
-    git clone --depth 1 https://github.com/ceph/s3-tests.git "${PROJECT_ROOT}/s3-tests" || {
-        log_error "Failed to clone s3-tests"
+# Step 8: Prepare s3-tests, pinned to S3TESTS_REV for reproducible runs
+log_info "Preparing s3-tests at ${S3TESTS_REV}..."
+if [ ! -d "${PROJECT_ROOT}/s3-tests/.git" ]; then
+    git init -q "${PROJECT_ROOT}/s3-tests"
+    git -C "${PROJECT_ROOT}/s3-tests" remote add origin "${S3TESTS_REPO}"
+fi
+if ! git -C "${PROJECT_ROOT}/s3-tests" cat-file -e "${S3TESTS_REV}^{commit}" 2>/dev/null; then
+    git -C "${PROJECT_ROOT}/s3-tests" fetch --depth 1 origin "${S3TESTS_REV}" || {
+        log_error "Failed to fetch s3-tests revision ${S3TESTS_REV} from ${S3TESTS_REPO}"
         exit 1
     }
 fi
+# -f discards local edits left by previous runs (e.g. pytest-xdist appended to requirements.txt)
+git -C "${PROJECT_ROOT}/s3-tests" checkout -qf --detach "${S3TESTS_REV}" || {
+    log_error "Failed to checkout s3-tests revision ${S3TESTS_REV}"
+    exit 1
+}
 
 cd "${PROJECT_ROOT}/s3-tests"
 
@@ -862,8 +893,11 @@ fi
 PYTEST_SELECTION_ARGS=()
 if [[ "${USE_FILE_TEST_NODES}" == "true" ]]; then
     PYTEST_SELECTION_ARGS=("${TEST_NODE_ARGS[@]}")
-else
+elif [[ -n "${TESTEXPR}" ]]; then
     PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}" -k "${TESTEXPR}")
+else
+    # TEST_SCOPE=all: the whole upstream suite
+    PYTEST_SELECTION_ARGS=("${S3_TEST_FILE}")
 fi
 
 # Run tests from s3tests/functional
@@ -892,6 +926,16 @@ elif [ "${DEPLOY_MODE}" = "build" ] || [ "${DEPLOY_MODE}" = "binary" ]; then
 elif [ "${DEPLOY_MODE}" = "existing" ]; then
     log_info "Skipping log collection for existing service"
     echo "{\"host\": \"${S3_HOST}\", \"port\": ${S3_PORT}, \"mode\": \"existing\"}" > "${ARTIFACTS_DIR}/rustfs-${TEST_MODE}/inspect.json" || true
+fi
+
+# Step 11: Classification report (informational, never fails the run)
+REPORT_SCRIPT="${SCRIPT_DIR}/report_compat.py"
+if [ -f "${REPORT_SCRIPT}" ] && [ -f "${ARTIFACTS_DIR}/junit.xml" ]; then
+    python3 "${REPORT_SCRIPT}" \
+        --junit "${ARTIFACTS_DIR}/junit.xml" \
+        --lists-dir "${SCRIPT_DIR}" \
+        --output "${ARTIFACTS_DIR}/compat-report.md" \
+        || log_warn "Compatibility report generation failed"
 fi
 
 # Summary

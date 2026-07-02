@@ -429,7 +429,8 @@ jobs:
           DEPLOY_MODE=binary \
           RUSTFS_BINARY=./target/debug/rustfs \
           TEST_MODE=single \
-          MAXFAIL=1 \
+          MAXFAIL=0 \
+          XDIST=4 \
           S3_PORT="${S3_PORT}" \
           DATA_ROOT="${RUN_ROOT}" \
           S3TESTS_CONF=artifacts/s3tests-single/s3tests.conf \
