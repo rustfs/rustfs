@@ -17,6 +17,57 @@
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use rustfs_object_data_cache::{ObjectDataCacheIdentity, ObjectDataCacheInvalidationReason, ObjectDataCacheInvalidationResult};
 
+/// Invalidates a single object before a mutating operation begins.
+pub(crate) async fn invalidate_object_data_cache_before_mutation(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::BeforeMutation).await
+}
+
+/// Invalidates a single object after a successful `PutObject`.
+pub(crate) async fn invalidate_object_data_cache_after_put_success(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::AfterPutSuccess).await
+}
+
+/// Invalidates a single object after a successful delete.
+pub(crate) async fn invalidate_object_data_cache_after_delete_success(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::AfterDeleteSuccess).await
+}
+
+/// Invalidates a single object after a successful copy destination write.
+pub(crate) async fn invalidate_object_data_cache_after_copy_success(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::AfterCopySuccess).await
+}
+
+/// Invalidates a single object after a successful multipart completion.
+pub(crate) async fn invalidate_object_data_cache_after_complete_multipart_success(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(
+        adapter,
+        bucket,
+        key,
+        ObjectDataCacheInvalidationReason::AfterCompleteMultipartSuccess,
+    )
+    .await
+}
+
 /// Invalidates a single object identity through the app-layer cache adapter.
 pub(crate) async fn invalidate_object_data_cache_object(
     adapter: &ObjectDataCacheAdapter,
@@ -27,6 +78,28 @@ pub(crate) async fn invalidate_object_data_cache_object(
     adapter
         .invalidate_object(ObjectDataCacheIdentity::new(bucket, key), reason)
         .await
+}
+
+/// Invalidates many object identities before a mutating operation begins.
+pub(crate) async fn invalidate_object_data_cache_objects_before_mutation<'a, I>(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    keys: I,
+) where
+    I: IntoIterator<Item = &'a String>,
+{
+    invalidate_object_data_cache_objects(adapter, bucket, keys, ObjectDataCacheInvalidationReason::BeforeMutation).await;
+}
+
+/// Invalidates many object identities after successful deletes.
+pub(crate) async fn invalidate_object_data_cache_objects_after_delete_success<'a, I>(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    keys: I,
+) where
+    I: IntoIterator<Item = &'a String>,
+{
+    invalidate_object_data_cache_objects(adapter, bucket, keys, ObjectDataCacheInvalidationReason::AfterDeleteSuccess).await;
 }
 
 /// Invalidates many object identities through the app-layer cache adapter.
@@ -45,12 +118,15 @@ pub(crate) async fn invalidate_object_data_cache_objects<'a, I>(
 
 #[cfg(test)]
 mod tests {
-    use super::{invalidate_object_data_cache_object, invalidate_object_data_cache_objects};
+    use super::{
+        invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
+        invalidate_object_data_cache_objects_before_mutation,
+    };
     use crate::app::object_data_cache::ObjectDataCacheAdapter;
     use bytes::Bytes;
     use rustfs_object_data_cache::{
-        ObjectDataCacheBodyVariant, ObjectDataCacheConfig, ObjectDataCacheFillResult, ObjectDataCacheInvalidationReason,
-        ObjectDataCacheInvalidationResult, ObjectDataCacheLookup, ObjectDataCacheMode,
+        ObjectDataCacheBodyVariant, ObjectDataCacheConfig, ObjectDataCacheFillResult, ObjectDataCacheInvalidationResult,
+        ObjectDataCacheLookup, ObjectDataCacheMode,
     };
 
     fn enabled_adapter() -> ObjectDataCacheAdapter {
@@ -74,13 +150,8 @@ mod tests {
             body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
         });
         let fill = adapter.fill_body(&plan, Bytes::from_static(b"hello")).await;
-        let invalidation = invalidate_object_data_cache_object(
-            &adapter,
-            "bucket",
-            "object",
-            ObjectDataCacheInvalidationReason::AfterDeleteSuccess,
-        )
-        .await;
+        let _ = invalidate_object_data_cache_before_mutation(&adapter, "bucket", "object").await;
+        let invalidation = invalidate_object_data_cache_after_delete_success(&adapter, "bucket", "object").await;
         let lookup = adapter.lookup_body(&plan).await;
 
         assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
@@ -111,8 +182,7 @@ mod tests {
         let _ = adapter.fill_body(&plan_b, Bytes::from_static(b"bbbbb")).await;
 
         let keys = vec!["a".to_string(), "b".to_string()];
-        invalidate_object_data_cache_objects(&adapter, "bucket", keys.iter(), ObjectDataCacheInvalidationReason::BeforeMutation)
-            .await;
+        invalidate_object_data_cache_objects_before_mutation(&adapter, "bucket", keys.iter()).await;
 
         assert!(matches!(adapter.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
         assert!(matches!(adapter.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));

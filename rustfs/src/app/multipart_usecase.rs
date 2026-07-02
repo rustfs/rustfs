@@ -55,7 +55,10 @@ use super::storage_api::multipart_usecase::sse::{
     mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
-use crate::app::object_data_cache::{ObjectDataCacheAdapter, invalidate_object_data_cache_object};
+use crate::app::object_data_cache::{
+    ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
+    invalidate_object_data_cache_before_mutation,
+};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
@@ -66,7 +69,6 @@ use crate::table_catalog;
 use bytes::Bytes;
 use futures::StreamExt;
 use http::{HeaderMap, Uri};
-use rustfs_object_data_cache::ObjectDataCacheInvalidationReason;
 use rustfs_s3_ops::S3Operation;
 use rustfs_targets::EventName;
 use rustfs_utils::CompressionAlgorithm;
@@ -456,9 +458,7 @@ impl DefaultMultipartUsecase {
             .await
             .map_err(ApiError::from)?;
         let cache_adapter = self.object_data_cache();
-        let _ =
-            invalidate_object_data_cache_object(&cache_adapter, &bucket, &key, ObjectDataCacheInvalidationReason::BeforeMutation)
-                .await;
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let server_side_encryption = multipart_info
             .user_defined
@@ -478,13 +478,7 @@ impl DefaultMultipartUsecase {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
-        let _ = invalidate_object_data_cache_object(
-            &cache_adapter,
-            &bucket,
-            &key,
-            ObjectDataCacheInvalidationReason::AfterCompleteMultipartSuccess,
-        )
-        .await;
+        let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
         // check quota after completing multipart upload

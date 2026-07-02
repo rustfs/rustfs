@@ -115,7 +115,6 @@ use rustfs_io_metrics;
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
-use rustfs_object_data_cache::ObjectDataCacheInvalidationReason;
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_replication::{REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType};
 #[cfg(test)]
@@ -192,8 +191,10 @@ use super::storage_api::object_usecase::{
 };
 use crate::app::object_data_cache::{
     GetObjectBodyCacheLookup, GetObjectBodyCacheRequest, ObjectDataCacheAdapter, fill_get_object_body_cache_from_buffered_body,
-    fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_object, invalidate_object_data_cache_objects,
-    lookup_get_object_body_cache_hit,
+    fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
+    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -400,8 +401,10 @@ const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
 const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
 const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE: &str = "object_data_cache";
+const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED: &str = "object_data_cache_materialized";
 const GET_MEMORY_BODY_SOURCE_SEEK_BUFFER: &str = "seek_buffer";
 const GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER: &str = "encrypted_buffer";
+const GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ: &str = "body_cache_materialize_read";
 
 fn get_reader_stream_buffer_size_override() -> Option<usize> {
     static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -2845,20 +2848,17 @@ impl DefaultObjectUsecase {
     where
         R: AsyncRead + Send + Sync + Unpin + 'static,
     {
-        match lookup_get_object_body_cache_hit(
-            cache_adapter,
-            GetObjectBodyCacheRequest {
-                bucket,
-                key,
-                info,
-                response_content_length,
-                has_range,
-                part_number,
-                encryption_applied,
-            },
-        )
-        .await
-        {
+        let cache_request = GetObjectBodyCacheRequest {
+            bucket,
+            key,
+            info,
+            response_content_length,
+            has_range,
+            part_number,
+            encryption_applied,
+        };
+
+        match lookup_get_object_body_cache_hit(cache_adapter, cache_request).await {
             GetObjectBodyCacheLookup::Hit(bytes) => {
                 if bytes.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
                     warn!(
@@ -2879,20 +2879,8 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            let _fill_result = fill_get_object_body_cache_from_buffered_body(
-                cache_adapter,
-                GetObjectBodyCacheRequest {
-                    bucket,
-                    key,
-                    info,
-                    response_content_length,
-                    has_range,
-                    part_number,
-                    encryption_applied,
-                },
-                &buffered_body,
-            )
-            .await;
+            let _fill_result =
+                fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
 
             if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
                 warn!(
@@ -2923,7 +2911,7 @@ impl DefaultObjectUsecase {
             let mut buf = Vec::with_capacity(response_content_length as usize);
             let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
-            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_SEEK_BUFFER_READ, buffer_read_start);
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
 
             match read_result {
                 Ok(_) => {
@@ -2935,27 +2923,15 @@ impl DefaultObjectUsecase {
                             "Materialized GetObject body size mismatch"
                         );
                     } else {
-                        let _fill_result = fill_get_object_body_cache_from_materialized_body(
-                            cache_adapter,
-                            GetObjectBodyCacheRequest {
-                                bucket,
-                                key,
-                                info,
-                                response_content_length,
-                                has_range,
-                                part_number,
-                                encryption_applied,
-                            },
-                            &bytes,
-                        )
-                        .await;
+                        let _fill_result =
+                            fill_get_object_body_cache_from_materialized_body(cache_adapter, cache_request, &bytes).await;
                     }
 
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
                         response_content_length,
                         optimal_buffer_size,
-                        GET_MEMORY_BODY_SOURCE_SEEK_BUFFER,
+                        GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED,
                     ));
                 }
                 Err(e) => {
@@ -3393,9 +3369,7 @@ impl DefaultObjectUsecase {
         }
 
         let cache_adapter = self.object_data_cache();
-        let _ =
-            invalidate_object_data_cache_object(&cache_adapter, &bucket, &key, ObjectDataCacheInvalidationReason::BeforeMutation)
-                .await;
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let store_put_watchdog = tokio_util::sync::CancellationToken::new();
         spawn_traced({
@@ -3475,13 +3449,7 @@ impl DefaultObjectUsecase {
         };
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
-        let _ = invalidate_object_data_cache_object(
-            &cache_adapter,
-            &bucket,
-            &key,
-            ObjectDataCacheInvalidationReason::AfterPutSuccess,
-        )
-        .await;
+        let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
 
         let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Fast in-memory update for immediate quota and admin usage consistency
@@ -4493,9 +4461,7 @@ impl DefaultObjectUsecase {
             .await?;
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
         let cache_adapter = self.object_data_cache();
-        let _ =
-            invalidate_object_data_cache_object(&cache_adapter, &bucket, &key, ObjectDataCacheInvalidationReason::BeforeMutation)
-                .await;
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -4503,13 +4469,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
-        let _ = invalidate_object_data_cache_object(
-            &cache_adapter,
-            &bucket,
-            &key,
-            ObjectDataCacheInvalidationReason::AfterCopySuccess,
-        )
-        .await;
+        let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
 
         let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Update quota tracking after successful copy
@@ -4737,13 +4697,7 @@ impl DefaultObjectUsecase {
             .iter()
             .map(|object| object.object_name.clone())
             .collect::<Vec<_>>();
-        let _ = invalidate_object_data_cache_objects(
-            &cache_adapter,
-            &bucket,
-            cache_keys_before_delete.iter(),
-            ObjectDataCacheInvalidationReason::BeforeMutation,
-        )
-        .await;
+        invalidate_object_data_cache_objects_before_mutation(&cache_adapter, &bucket, cache_keys_before_delete.iter()).await;
 
         let (mut dobjs, errs) = store
             .delete_objects(
@@ -4851,13 +4805,7 @@ impl DefaultObjectUsecase {
             .iter()
             .filter_map(|result| result.delete_object.as_ref().map(|deleted| deleted.object_name.clone()))
             .collect::<Vec<_>>();
-        let _ = invalidate_object_data_cache_objects(
-            &cache_adapter,
-            &bucket,
-            deleted_cache_keys.iter(),
-            ObjectDataCacheInvalidationReason::AfterDeleteSuccess,
-        )
-        .await;
+        invalidate_object_data_cache_objects_after_delete_success(&cache_adapter, &bucket, deleted_cache_keys.iter()).await;
 
         let errors = delete_results
             .iter()
@@ -5030,9 +4978,7 @@ impl DefaultObjectUsecase {
         };
 
         let cache_adapter = self.object_data_cache();
-        let _ =
-            invalidate_object_data_cache_object(&cache_adapter, &bucket, &key, ObjectDataCacheInvalidationReason::BeforeMutation)
-                .await;
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
@@ -5063,13 +5009,7 @@ impl DefaultObjectUsecase {
                 "failed to persist transitioned object cleanup journal"
             );
         }
-        let _ = invalidate_object_data_cache_object(
-            &cache_adapter,
-            &bucket,
-            &key,
-            ObjectDataCacheInvalidationReason::AfterDeleteSuccess,
-        )
-        .await;
+        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
         if delete_creates_delete_marker(&opts) {
@@ -6084,13 +6024,7 @@ impl DefaultObjectUsecase {
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
             let cache_adapter = self.object_data_cache();
-            let _ = invalidate_object_data_cache_object(
-                &cache_adapter,
-                &bucket,
-                &fpath,
-                ObjectDataCacheInvalidationReason::BeforeMutation,
-            )
-            .await;
+            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
             let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,
@@ -6102,13 +6036,7 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
-            let _ = invalidate_object_data_cache_object(
-                &cache_adapter,
-                &bucket,
-                &fpath,
-                ObjectDataCacheInvalidationReason::AfterPutSuccess,
-            )
-            .await;
+            let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
             if !wrote_any_entry {
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
                 wrote_any_entry = true;

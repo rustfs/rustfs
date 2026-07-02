@@ -24,5 +24,10 @@ pub(crate) use body::{
     GetObjectBodyCacheLookup, fill_get_object_body_cache_from_buffered_body, fill_get_object_body_cache_from_materialized_body,
     lookup_get_object_body_cache_hit,
 };
-pub(crate) use invalidation::{invalidate_object_data_cache_object, invalidate_object_data_cache_objects};
+pub(crate) use invalidation::{
+    invalidate_object_data_cache_after_complete_multipart_success, invalidate_object_data_cache_after_copy_success,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
+    invalidate_object_data_cache_objects_before_mutation,
+};
 pub(crate) use planner::GetObjectBodyCacheRequest;
