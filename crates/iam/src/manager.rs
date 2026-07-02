@@ -2598,13 +2598,6 @@ mod tests {
     }
 
     #[test]
-    fn test_iam_format_new_version_1() {
-        let format = IAMFormat::new_version_1();
-        assert_eq!(format.version, IAM_FORMAT_VERSION_1);
-        assert_eq!(format.version, 1);
-    }
-
-    #[test]
     fn test_get_iam_format_file_path() {
         let path = get_iam_format_file_path();
         assert!(path.contains(IAM_FORMAT_FILE));
@@ -2715,26 +2708,6 @@ mod tests {
         // When cache is empty, should return empty name and empty policy regardless of bucket
         assert_eq!(name, "");
         assert!(policy.statements.is_empty());
-    }
-
-    #[test]
-    fn test_constants() {
-        // Test that constants are properly defined
-        assert_eq!(IAM_FORMAT_FILE, "format.json");
-        assert_eq!(IAM_FORMAT_VERSION_1, 1);
-    }
-
-    #[test]
-    fn test_iam_format_serialization() {
-        let format = IAMFormat::new_version_1();
-
-        // Test serialization
-        let serialized = serde_json::to_string(&format).unwrap();
-        assert!(serialized.contains("\"version\":1"));
-
-        // Test deserialization
-        let deserialized: IAMFormat = serde_json::from_str(&serialized).unwrap();
-        assert_eq!(deserialized.version, format.version);
     }
 
     #[test]

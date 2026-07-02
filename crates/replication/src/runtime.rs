@@ -23,6 +23,36 @@ pub const MRF_WORKER_AUTO_DEFAULT: usize = 4;
 pub const LARGE_WORKER_COUNT: usize = 10;
 pub const MIN_LARGE_OBJ_SIZE: i64 = 128 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationWorkerResize {
+    pub new_count: usize,
+    pub existing_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationBackpressureState {
+    pub current_workers: usize,
+    pub active_workers: i32,
+    pub current_mrf_workers: i32,
+    pub active_mrf_workers: i32,
+    pub max_workers: usize,
+    pub include_mrf_workers: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationBackpressureResize {
+    pub regular_workers: Option<ReplicationWorkerResize>,
+    pub mrf_workers: Option<i32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicationBackpressureRecommendation {
+    KeepFast,
+    SetPriorityAuto,
+    Resize(ReplicationBackpressureResize),
+    Noop,
+}
+
 #[derive(Debug, Clone)]
 pub struct ReplicationPoolOpts {
     pub priority: ReplicationPriority,
@@ -133,6 +163,49 @@ pub fn next_mrf_worker_count(current_mrf_workers: i32, active_mrf_workers: i32, 
     }
 }
 
+pub fn large_worker_backpressure_resize(
+    existing_workers: usize,
+    active_lrg_workers: i32,
+    max_l_workers: usize,
+) -> Option<ReplicationWorkerResize> {
+    should_grow_large_workers(active_lrg_workers, max_l_workers).then_some(ReplicationWorkerResize {
+        new_count: next_large_worker_count(existing_workers, max_l_workers),
+        existing_count: existing_workers,
+    })
+}
+
+pub fn replication_backpressure_recommendation(
+    priority: &ReplicationPriority,
+    state: ReplicationBackpressureState,
+) -> ReplicationBackpressureRecommendation {
+    match priority {
+        ReplicationPriority::Fast => ReplicationBackpressureRecommendation::KeepFast,
+        ReplicationPriority::Slow => ReplicationBackpressureRecommendation::SetPriorityAuto,
+        ReplicationPriority::Auto => {
+            let regular_workers =
+                next_regular_worker_count(state.current_workers, state.active_workers, state.max_workers).map(|new_count| {
+                    ReplicationWorkerResize {
+                        new_count,
+                        existing_count: state.current_workers,
+                    }
+                });
+            let mrf_workers = state
+                .include_mrf_workers
+                .then(|| next_mrf_worker_count(state.current_mrf_workers, state.active_mrf_workers, state.max_workers))
+                .flatten();
+
+            if regular_workers.is_none() && mrf_workers.is_none() {
+                ReplicationBackpressureRecommendation::Noop
+            } else {
+                ReplicationBackpressureRecommendation::Resize(ReplicationBackpressureResize {
+                    regular_workers,
+                    mrf_workers,
+                })
+            }
+        }
+    }
+}
+
 fn auto_worker_count(current_workers: usize, auto_default: usize) -> usize {
     if current_workers < auto_default {
         current_workers.saturating_add(1).min(auto_default)
@@ -228,5 +301,75 @@ mod tests {
         assert!(!should_queue_large_object(MIN_LARGE_OBJ_SIZE - 1));
         assert!(should_grow_large_workers(1, LARGE_WORKER_COUNT));
         assert_eq!(next_large_worker_count(LARGE_WORKER_COUNT, LARGE_WORKER_COUNT), LARGE_WORKER_COUNT);
+    }
+
+    #[test]
+    fn large_worker_resize_recommendation_respects_growth_limit() {
+        assert_eq!(
+            large_worker_backpressure_resize(3, 2, LARGE_WORKER_COUNT),
+            Some(ReplicationWorkerResize {
+                new_count: 4,
+                existing_count: 3
+            })
+        );
+        assert_eq!(
+            large_worker_backpressure_resize(LARGE_WORKER_COUNT, usize_to_i32_saturating(LARGE_WORKER_COUNT), LARGE_WORKER_COUNT),
+            None
+        );
+    }
+
+    #[test]
+    fn queue_backpressure_recommendation_preserves_priority_semantics() {
+        let state = ReplicationBackpressureState {
+            current_workers: 4,
+            active_workers: 4,
+            current_mrf_workers: 2,
+            active_mrf_workers: 2,
+            max_workers: WORKER_MAX_LIMIT,
+            include_mrf_workers: true,
+        };
+
+        assert_eq!(
+            replication_backpressure_recommendation(&ReplicationPriority::Fast, state),
+            ReplicationBackpressureRecommendation::KeepFast
+        );
+        assert_eq!(
+            replication_backpressure_recommendation(&ReplicationPriority::Slow, state),
+            ReplicationBackpressureRecommendation::SetPriorityAuto
+        );
+
+        assert_eq!(
+            replication_backpressure_recommendation(&ReplicationPriority::Auto, state),
+            ReplicationBackpressureRecommendation::Resize(ReplicationBackpressureResize {
+                regular_workers: Some(ReplicationWorkerResize {
+                    new_count: 5,
+                    existing_count: 4
+                }),
+                mrf_workers: Some(3),
+            })
+        );
+    }
+
+    #[test]
+    fn delete_queue_backpressure_skips_mrf_growth() {
+        let state = ReplicationBackpressureState {
+            current_workers: 4,
+            active_workers: 4,
+            current_mrf_workers: 2,
+            active_mrf_workers: 2,
+            max_workers: WORKER_MAX_LIMIT,
+            include_mrf_workers: false,
+        };
+
+        assert_eq!(
+            replication_backpressure_recommendation(&ReplicationPriority::Auto, state),
+            ReplicationBackpressureRecommendation::Resize(ReplicationBackpressureResize {
+                regular_workers: Some(ReplicationWorkerResize {
+                    new_count: 5,
+                    existing_count: 4
+                }),
+                mrf_workers: None,
+            })
+        );
     }
 }

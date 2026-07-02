@@ -1,3 +1,8 @@
+> **Archived implementation plan/tracker** — moved from `docs/architecture/` (2026-07).
+> Kept for history; not maintained. File paths inside may reflect the pre-#3929
+> module layout (e.g. `crates/ecstore/src/rebalance.rs` is now
+> `crates/ecstore/src/store/rebalance.rs`; `set_disk.rs` is now `set_disk/`).
+
 # Rebalance and Decommission Phase 3 Hardening Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

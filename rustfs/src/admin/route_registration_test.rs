@@ -435,6 +435,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
         ),
         table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine",
+        ),
+        table_route_sample(
             Method::GET,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/catalog/export",
             "/analytics/namespaces/sales/tables/orders/catalog/export",
@@ -612,6 +617,11 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
             Method::POST,
             "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/heartbeat",
             "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat",
+        ),
+        compat_table_route_sample(
+            Method::POST,
+            "/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
+            "/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine",
         ),
         compat_table_route_sample(
             Method::GET,
@@ -866,6 +876,11 @@ fn test_register_routes_cover_representative_admin_paths() {
     );
     assert_route(
         &router,
+        Method::POST,
+        &table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine"),
+    );
+    assert_route(
+        &router,
         Method::GET,
         &table_catalog_path("/analytics/namespaces/sales/tables/orders/catalog/export"),
     );
@@ -1015,6 +1030,11 @@ fn test_register_routes_cover_representative_admin_paths() {
         &router,
         Method::POST,
         &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/heartbeat"),
+    );
+    assert_route(
+        &router,
+        Method::POST,
+        &compat_table_catalog_path("/analytics/namespaces/sales/tables/orders/maintenance/jobs/job-1/quarantine"),
     );
     assert_route(
         &router,

@@ -261,7 +261,7 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
                 }
                 rustfs_replication::ReplicationTargetValidationError::StaleTarget => "replication config has a stale target",
             };
-            Err(S3Error::with_message(S3ErrorCode::InvalidRequest, message.to_string()))
+            Err(S3Error::with_message(S3ErrorCode::InvalidRequest, message))
         }
     }
 }

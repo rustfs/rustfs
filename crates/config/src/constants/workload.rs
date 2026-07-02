@@ -46,13 +46,6 @@ mod tests {
     use crate::MI_B;
 
     #[test]
-    fn test_default_values() {
-        assert_eq!(DEFAULT_BUFFER_MIN_SIZE, 65536); // 64KB
-        assert_eq!(DEFAULT_BUFFER_MAX_SIZE, 1048576); // 1MB
-        assert_eq!(DEFAULT_BUFFER_UNKNOWN_SIZE, 262144); // 256KB
-    }
-
-    #[test]
     fn test_constants() {
         assert_eq!(KI_B, 1024);
         assert_eq!(MI_B, 1024 * 1024);

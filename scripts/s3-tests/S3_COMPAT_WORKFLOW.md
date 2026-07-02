@@ -21,18 +21,13 @@ git merge upstream/main
 
 ### Step 2: Select candidate tests
 
-Pick ~20 tests from `unimplemented_tests.txt` and write them to `selected_tests.txt`:
-
-```bash
-TESTEXPR=$(scripts/s3-tests/build_testexpr.sh selected_tests.txt) \
-  DEPLOY_MODE=build MAXFAIL=0 ./scripts/s3-tests/run.sh
-```
-
-Or run them directly:
+Pick candidate tests from `unimplemented_tests.txt` and run them via a pytest `-k` expression:
 
 ```bash
 TESTEXPR="test_foo or test_bar" DEPLOY_MODE=build MAXFAIL=0 ./scripts/s3-tests/run.sh
 ```
+
+Alternatively, check the latest weekly full-sweep report (the `e2e-s3tests` workflow's job summary, or `artifacts/s3tests-single/compat-report.md`) — its "promotion candidates" section lists tests that already pass and only need reclassification.
 
 Review `artifacts/s3tests-single/pytest.log` for results.
 

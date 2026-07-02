@@ -8,12 +8,6 @@ Applies to all paths under `crates/`.
 - Prefer `thiserror` for library-facing error types.
 - Do not use `unwrap()`, `expect()`, or panic-driven control flow outside tests.
 
-## Testing
-
-- Keep unit tests close to the module they test.
-- Keep integration tests under each crate's `tests/` directory.
-- Add regression tests for bug fixes and behavior changes.
-
 ## Error Type Design
 
 - Public API functions must return a typed error enum (preferably `thiserror`-derived), never `Result<_, String>`.

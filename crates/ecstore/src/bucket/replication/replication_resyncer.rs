@@ -89,6 +89,7 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
+const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
@@ -2718,7 +2719,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.replication_action = replication_action;
 
         if replication_action != ReplicationAction::All {
-            // TODO: copy object
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(ERR_REPLICATION_METADATA_COPY_UNSUPPORTED.to_string());
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                arn = %tgt_client.arn,
+                object = %object,
+                operation = "copy_object_metadata",
+                error = ERR_REPLICATION_METADATA_COPY_UNSUPPORTED,
+                "Replication target operation failed"
+            );
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: object_info,
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
         } else {
             let (put_opts, is_multipart) = match replication_put_object_options(&tgt_client.storage_class, &object_info) {
                 Ok((put_opts, is_mp)) => (put_opts, is_mp),

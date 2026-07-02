@@ -38,13 +38,16 @@ pub use object::{
     replication_etags_match, target_is_newer_than_source_null_version,
 };
 pub use operation::{
-    MustReplicateOptions, ReplicationDeleteSource, ReplicationDeleteStateSource, ReplicationResyncTargetObject,
-    delete_replication_missing_source_decision, delete_replication_object_opts, delete_replication_state_from_config,
-    heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
+    MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,
+    ReplicationResyncTargetObject, delete_replication_missing_source_decision, delete_replication_object_opts,
+    delete_replication_state_from_config, delete_replication_version_id, heal_uses_delete_replication_path, is_ssec_encrypted,
+    resync_target_for_object, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+    should_use_existing_delete_replication_source,
 };
 pub use queue::{
     ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
-    ReplicationPriority, ReplicationQueueAdmission, replication_heal_queue_action,
+    ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, mrf_save_admission, replication_heal_queue_action,
+    worker_queue_for_replication_type,
 };
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
@@ -54,8 +57,10 @@ pub use resync::{
 pub use rule::ReplicationRuleExt;
 pub use runtime::{
     LARGE_WORKER_COUNT, MIN_LARGE_OBJ_SIZE, MRF_WORKER_AUTO_DEFAULT, MRF_WORKER_MAX_LIMIT, MRF_WORKER_MIN_LIMIT,
-    ReplicationPoolOpts, ReplicationWorkerCounts, WORKER_AUTO_DEFAULT, WORKER_MAX_LIMIT, WORKER_MIN_LIMIT, initial_worker_counts,
-    mrf_worker_size_to_count, next_large_worker_count, next_mrf_worker_count, next_regular_worker_count, resized_worker_counts,
+    ReplicationBackpressureRecommendation, ReplicationBackpressureResize, ReplicationBackpressureState, ReplicationPoolOpts,
+    ReplicationWorkerCounts, ReplicationWorkerResize, WORKER_AUTO_DEFAULT, WORKER_MAX_LIMIT, WORKER_MIN_LIMIT,
+    initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, next_large_worker_count,
+    next_mrf_worker_count, next_regular_worker_count, replication_backpressure_recommendation, resized_worker_counts,
     should_grow_large_workers, should_queue_large_object, worker_counts_for_priority,
 };
 pub use rustfs_filemeta::{

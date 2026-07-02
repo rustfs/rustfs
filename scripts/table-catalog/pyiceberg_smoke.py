@@ -183,7 +183,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "status": "controlled-run-once-supported",
         "roadmap_area": "maintenance-worker",
         "catalog_endpoint": "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}/maintenance/scheduler",
-        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint and inspected through the scheduler status endpoint with disabled/paused state, current-job backpressure, retry deferral, quarantine boundary, audit timeline, lease expiry recovery, and heartbeat updates; built-in periodic scheduling is not claimed",
+        "expected_behavior": "background-enabled maintenance can be driven by the worker run endpoint and inspected through the scheduler status endpoint with disabled/paused state, current-job backpressure, retry deferral, quarantine boundary, audit timeline, per-job audit events, lease expiry recovery, heartbeat updates, and operator quarantine inspect/release/retry/abandon actions; built-in periodic scheduling is not claimed",
     },
     {
         "capability": "manifest-data-reachability-cleanup",
@@ -201,7 +201,7 @@ UNSUPPORTED_INVENTORY: list[dict[str, str]] = [
         "capability": "compaction-rewrite",
         "status": "controlled-run-once-supported",
         "roadmap_area": "snapshot-maintenance",
-        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local Parquet rewrite through the catalog; built-in periodic scheduling, sort compaction, delete-file rewrite, and row-level compaction are not claimed",
+        "expected_behavior": "metadata maintenance can plan binpack candidates and commit a safe partition-local and sort-order-preserving Parquet rewrite through the catalog; built-in periodic scheduling, delete-file rewrite, and row-level compaction are not claimed",
     },
     {
         "capability": "row-level-delete-update-merge",
@@ -1065,19 +1065,40 @@ def run_maintenance_probe(args: argparse.Namespace, deps: RuntimeDeps) -> None:
     job = report.get("job")
     if not isinstance(job, dict) or not job.get("job-id"):
         raise RuntimeError("maintenance metadata endpoint did not return a job id")
-    signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    audit_events = report.get("audit-events")
+    if not isinstance(audit_events, list) or not audit_events:
+        raise RuntimeError("maintenance metadata endpoint did not return audit events")
+    if not any(isinstance(event, dict) and event.get("action") == "PLANNED" for event in audit_events):
+        raise RuntimeError("maintenance metadata endpoint did not report a planning audit event")
+    job_report = signed_rest_request(args, deps, "GET", table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}"))
+    if not isinstance(job_report.get("audit-events"), list):
+        raise RuntimeError("maintenance job endpoint did not return audit events")
+    quarantine = signed_rest_request(
+        args,
+        deps,
+        "POST",
+        table_endpoint_path(args, f"/maintenance/jobs/{job['job-id']}/quarantine"),
+        {"action": "INSPECT"},
+    )
+    if quarantine.get("action") != "INSPECT" or not isinstance(quarantine.get("report"), dict):
+        raise RuntimeError("maintenance quarantine endpoint did not return an inspection report")
     scheduler = signed_rest_request(args, deps, "GET", scheduler_path)
     expected_scheduler_statuses = {"READY", "DISABLED", "PAUSED", "BACKPRESSURED", "RETRY_DEFERRED", "QUARANTINED"}
     if scheduler.get("status") not in expected_scheduler_statuses:
         raise RuntimeError("maintenance scheduler endpoint did not return a stable scheduler status")
-    if "audit_timeline" not in scheduler:
+    scheduler_timeline = scheduler.get("audit_timeline")
+    if not isinstance(scheduler_timeline, list):
         raise RuntimeError("maintenance scheduler endpoint did not return an audit timeline")
+    if scheduler_timeline and not isinstance(scheduler_timeline[0].get("audit-events"), list):
+        raise RuntimeError("maintenance scheduler audit timeline did not include job audit events")
 
     worker = signed_rest_request(args, deps, "POST", table_endpoint_path(args, "/maintenance/worker/run"), {})
     worker_job = worker.get("job")
     expected_statuses = {"DISABLED", "PAUSED", "FAILED", "SUCCESSFUL", "RUNNING"}
     if not isinstance(worker_job, dict) or worker_job.get("status") not in expected_statuses:
         raise RuntimeError("maintenance worker endpoint did not return a stable job status")
+    if not isinstance(worker.get("audit-events"), list):
+        raise RuntimeError("maintenance worker endpoint did not return audit events")
 
 
 def run_catalog_api_probes(args: argparse.Namespace, deps: RuntimeDeps) -> None:

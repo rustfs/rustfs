@@ -54,6 +54,18 @@ impl SetDisks {
             }
         }
 
+        let failed = errors.iter().filter(|err| err.is_some()).count();
+        if failed > 0 {
+            debug!(
+                bucket = %bucket,
+                prefix = %prefix,
+                failed,
+                total = errors.len(),
+                errors = ?errors,
+                "delete_all completed with disk errors"
+            );
+        }
+
         Ok(())
     }
 }

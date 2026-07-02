@@ -1254,6 +1254,17 @@ impl PutObjectOptions {
         }
     }
 
+    /// Insert `value` as header `name`, skipping values that are not valid
+    /// HTTP header values (with a warning) instead of panicking mid-replication.
+    fn insert_checked(header: &mut HeaderMap, name: &'static str, value: &str) {
+        match HeaderValue::from_str(value) {
+            Ok(v) => {
+                header.insert(name, v);
+            }
+            Err(_) => warn!("skipping header {} with invalid value", name),
+        }
+    }
+
     pub fn header(&self) -> HeaderMap {
         let mut header = HeaderMap::new();
 
@@ -1261,66 +1272,75 @@ impl PutObjectOptions {
         if content_type.is_empty() {
             content_type = "application/octet-stream".to_string();
         }
-        header.insert("Content-Type", HeaderValue::from_str(&content_type).expect("err"));
+        match HeaderValue::from_str(&content_type) {
+            Ok(v) => {
+                header.insert("Content-Type", v);
+            }
+            Err(_) => {
+                warn!("invalid Content-Type header value, falling back to application/octet-stream");
+                header.insert("Content-Type", HeaderValue::from_static("application/octet-stream"));
+            }
+        }
 
         if !self.content_encoding.is_empty() {
-            header.insert("Content-Encoding", HeaderValue::from_str(&self.content_encoding).expect("err"));
+            Self::insert_checked(&mut header, "Content-Encoding", &self.content_encoding);
         }
         if !self.content_disposition.is_empty() {
-            header.insert("Content-Disposition", HeaderValue::from_str(&self.content_disposition).expect("err"));
+            Self::insert_checked(&mut header, "Content-Disposition", &self.content_disposition);
         }
         if !self.content_language.is_empty() {
-            header.insert("Content-Language", HeaderValue::from_str(&self.content_language).expect("err"));
+            Self::insert_checked(&mut header, "Content-Language", &self.content_language);
         }
         if !self.cache_control.is_empty() {
-            header.insert("Cache-Control", HeaderValue::from_str(&self.cache_control).expect("err"));
+            Self::insert_checked(&mut header, "Cache-Control", &self.cache_control);
         }
 
         if self.expires.unix_timestamp() != 0 {
-            header.insert("Expires", HeaderValue::from_str(&self.expires.format(&Rfc3339).unwrap()).expect("err")); //rustfs invalid header
+            match self.expires.format(&Rfc3339) {
+                Ok(expires) => Self::insert_checked(&mut header, "Expires", &expires),
+                Err(err) => warn!("skipping Expires header, format failed: {}", err),
+            }
         }
 
         if let Some(mode) = &self.mode {
-            header.insert(AMZ_OBJECT_LOCK_MODE, HeaderValue::from_str(mode.as_str()).expect("err"));
+            Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_MODE, mode.as_str());
         }
 
         if self.retain_until_date.unix_timestamp() != 0 {
-            header.insert(
-                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
-                HeaderValue::from_str(&self.retain_until_date.format(&Rfc3339).unwrap()).expect("err"),
-            );
+            match self.retain_until_date.format(&Rfc3339) {
+                Ok(retain_until) => Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, &retain_until),
+                Err(err) => warn!("skipping object-lock retain-until-date header, format failed: {}", err),
+            }
         }
 
         if let Some(legalhold) = &self.legalhold {
-            header.insert(AMZ_OBJECT_LOCK_LEGAL_HOLD, HeaderValue::from_str(legalhold.as_str()).expect("err"));
+            Self::insert_checked(&mut header, AMZ_OBJECT_LOCK_LEGAL_HOLD, legalhold.as_str());
         }
 
         if !self.storage_class.is_empty() {
-            header.insert(AMZ_STORAGE_CLASS, HeaderValue::from_str(&self.storage_class).expect("err"));
+            Self::insert_checked(&mut header, AMZ_STORAGE_CLASS, &self.storage_class);
         }
 
         if !self.website_redirect_location.is_empty() {
-            header.insert(
-                AMZ_WEBSITE_REDIRECT_LOCATION,
-                HeaderValue::from_str(&self.website_redirect_location).expect("err"),
-            );
+            Self::insert_checked(&mut header, AMZ_WEBSITE_REDIRECT_LOCATION, &self.website_redirect_location);
         }
 
         if !self.internal.replication_status.as_str().is_empty() {
-            header.insert(
-                AMZ_BUCKET_REPLICATION_STATUS,
-                HeaderValue::from_str(self.internal.replication_status.as_str()).expect("err"),
-            );
+            Self::insert_checked(&mut header, AMZ_BUCKET_REPLICATION_STATUS, self.internal.replication_status.as_str());
         }
 
         for (k, v) in &self.user_metadata {
+            let Ok(header_value) = HeaderValue::from_str(v) else {
+                warn!("skipping user metadata header with invalid value: {}", k);
+                continue;
+            };
             if is_amz_header(k) || is_standard_header(k) || is_storageclass_header(k) || is_rustfs_header(k) || is_minio_header(k)
             {
                 if let Ok(header_name) = HeaderName::from_bytes(k.as_bytes()) {
-                    header.insert(header_name, HeaderValue::from_str(v).unwrap());
+                    header.insert(header_name, header_value);
                 }
             } else if let Ok(header_name) = HeaderName::from_bytes(format!("x-amz-meta-{k}").as_bytes()) {
-                header.insert(header_name, HeaderValue::from_str(v).unwrap());
+                header.insert(header_name, header_value);
             }
         }
 
@@ -1331,7 +1351,7 @@ impl PutObjectOptions {
         if !self.internal.source_version_id.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_VERSION_ID, &self.internal.source_version_id);
         }
-        if self.internal.source_etag.is_empty() {
+        if !self.internal.source_etag.is_empty() {
             insert_header(&mut header, SUFFIX_SOURCE_ETAG, &self.internal.source_etag);
         }
         if self.internal.source_mtime.unix_timestamp() != 0 {
@@ -1923,6 +1943,24 @@ mod tests {
         assert!(
             rustfs_utils::http::get_header(&headers, SUFFIX_SOURCE_DELETEMARKER).is_none(),
             "delete-marker version purges must not masquerade as delete-marker creations"
+        );
+    }
+
+    #[test]
+    fn put_object_headers_include_non_empty_source_etag_only() {
+        let mut opts = PutObjectOptions::default();
+
+        assert!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).is_none(),
+            "empty source etag must not be sent to replication targets"
+        );
+
+        opts.internal.source_etag = "etag-1".to_string();
+
+        assert_eq!(
+            rustfs_utils::http::get_header(&opts.header(), SUFFIX_SOURCE_ETAG).as_deref(),
+            Some("etag-1"),
+            "replication targets need the source etag for idempotency checks"
         );
     }
 

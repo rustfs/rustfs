@@ -1,6 +1,6 @@
 # ARCHITECTURE.md
 
-> Last updated: 2026-04-13 · Revision: 1 (draft)
+> Last updated: 2026-07-02 · Revision: 2
 >
 > This document describes the high-level architecture of RustFS.
 > If you want to familiarize yourself with the code base, you are in the right place!
@@ -52,7 +52,7 @@ rustfs/                      # Workspace root (virtual manifest)
 │       ├── auth.rs          # S3 request authentication
 │       ├── config/          # CLI args, config parsing, workload profiles
 │       └── ...
-├── crates/                  # 39 library crates
+├── crates/                  # library crates (authoritative list: Cargo.toml [workspace].members)
 │   ├── ecstore/             # Erasure-coded storage engine (⚠️ 87K lines)
 │   ├── rio/                 # Reader I/O pipeline (encrypt, compress, hash)
 │   ├── io-core/             # Zero-copy I/O, scheduling, buffer pool
@@ -83,6 +83,10 @@ A request flows **downward** through the layers. No layer should reach upward
 
 ### Crate Reference
 
+> Depth levels, line counts, and crate counts in this section are a
+> point-in-time snapshot and drift with refactors. Treat them as orders of
+> magnitude; `Cargo.toml` and `cargo tree` are the source of truth.
+
 Crates are organized in a dependency DAG with 9 depth levels (0 = leaf, 8 = top):
 
 ```
@@ -93,14 +97,14 @@ Depth 0 — LEAF (no internal deps):
 Depth 1:
   io-core (→ io-metrics)
   policy (→ config, credentials, crypto)
-  utils (→ config)                        ⚠️ inverted: utils should be leaf
+  utils                                   (historical → config edge removed; now effectively leaf)
 
 Depth 2:
   concurrency, filemeta, keystone, kms, lock, obs,
   signer, targets, trusted-proxies
 
 Depth 3:
-  common (→ filemeta, madmin)             ⚠️ inverted: common should be leaf
+  common                                  (historical → filemeta/madmin edges removed; now effectively leaf)
 
 Depth 4:
   object-capacity, protos, rio
@@ -209,7 +213,8 @@ Depth 8 — TOP:
 
 2. **Leaf crates have zero internal dependencies.** `config`, `credentials`, `crypto`,
    `io-metrics`, `madmin`, `s3-common` should depend only on external crates.
-   - ⚠️ VIOLATED: `utils` depends on `config`, `common` depends on `filemeta` and `madmin`.
+   - ✅ RESOLVED: the historical `utils → config` and `common → filemeta`/`madmin`
+     edges were removed; do not reintroduce them (see Known Structural Issues).
 
 3. **Each type has exactly one definition.** Types shared across crates must be defined
    in one crate and re-exported or imported by others.
@@ -249,7 +254,7 @@ Depth 8 — TOP:
   not regain upward dependencies.
 
 - **Three-layer BackpressureConfig/DeadlockConfig duplication** across io-core,
-  concurrency, and rustfs/storage. Storage policies now expose and consume
+  concurrency, and `rustfs/src/storage`. Storage policies now expose and consume
   explicit projections into the concurrency/io-core policy shapes, and workload
   admission snapshots are composed through provider registries; later work
   should use those bridges before deleting compatibility wrappers.

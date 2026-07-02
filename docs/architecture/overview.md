@@ -50,8 +50,8 @@ hot-path behavior must not drift during this migration.
 - [`config-model-boundary-adr.md`](config-model-boundary-adr.md): target crate,
   module path, dependency rules, and verification gates for moving the pure
   server-config model.
-- [`migration-progress.md`](migration-progress.md): current task state and context
-  handoff.
+- [`migration-progress.md`](../superpowers/plans/migration-progress.md): historical
+  task ledger for the closed migration (execution tracking moved to issue #665).
 - [`compat-cleanup-register.md`](compat-cleanup-register.md): temporary
   compatibility code that must be removed later.
 

@@ -4,7 +4,9 @@
 .vscode
 .cursor
 .direnv/
-.claude/
+# Ignore local Claude state but keep shared repo skills committable
+.claude/*
+!.claude/skills
 .tmp/
 /test
 /logs
@@ -51,6 +53,10 @@ __pycache__/
 docs/*
 !docs/architecture/
 !docs/architecture/**
+!docs/operations/
+!docs/operations/**
+!docs/superpowers/
+!docs/superpowers/**
 docs/heal-scanner-logging-governance.md
 docs/benchmark/rustfs-target-bench/
 docs/benchmark/*.md
@@ -74,3 +80,6 @@ crates/*/docs
 fuzz/target
 outputs
 worktrees/*
+
+# Local AI-agent review artifacts (omo evidence dumps)
+.omo/

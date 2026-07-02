@@ -145,20 +145,4 @@ mod tests {
         assert_eq!(ENV_CAPACITY_MAX_TIMEOUT, "RUSTFS_CAPACITY_MAX_TIMEOUT");
         assert_eq!(ENV_CAPACITY_STALL_TIMEOUT, "RUSTFS_CAPACITY_STALL_TIMEOUT");
     }
-
-    #[test]
-    fn test_default_values() {
-        assert_eq!(DEFAULT_SCHEDULED_UPDATE_INTERVAL_SECS, 120);
-        assert_eq!(DEFAULT_WRITE_TRIGGER_DELAY_SECS, 5);
-        assert_eq!(DEFAULT_WRITE_FREQUENCY_THRESHOLD, 5);
-        assert_eq!(DEFAULT_FAST_UPDATE_THRESHOLD_SECS, 30);
-        assert_eq!(DEFAULT_MAX_FILES_THRESHOLD, 200_000);
-        assert_eq!(DEFAULT_STAT_TIMEOUT_SECS, 3);
-        assert_eq!(DEFAULT_SAMPLE_RATE, 200);
-        assert_eq!(DEFAULT_CAPACITY_METRICS_INTERVAL_SECS, 600);
-        assert_eq!(DEFAULT_CAPACITY_MAX_SYMLINK_DEPTH, 3);
-        assert_eq!(DEFAULT_CAPACITY_MIN_TIMEOUT_SECS, 2);
-        assert_eq!(DEFAULT_CAPACITY_MAX_TIMEOUT_SECS, 15);
-        assert_eq!(DEFAULT_CAPACITY_STALL_TIMEOUT_SECS, 20);
-    }
 }

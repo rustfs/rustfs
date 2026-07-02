@@ -33,12 +33,10 @@ use crate::core::pools::ListCallback;
 use crate::data_movement;
 use crate::data_movement::backpressure::{self, DataMovementOperation};
 use crate::error::{Error, Result};
-use crate::object_api::{GetObjectReader, ObjectOptions};
+use crate::object_api::GetObjectReader;
 use crate::set_disk::SetDisks;
-use crate::storage_api_contracts::object::ObjectOperations as _;
 use crate::store::ECStore;
 use rustfs_filemeta::MetaCacheEntry;
-use rustfs_utils::path::encode_dir_object;
 use std::sync::Arc;
 use time::OffsetDateTime;
 use tokio_util::sync::CancellationToken;
@@ -259,15 +257,13 @@ impl ECStore {
 
         if should_cleanup_rebalance_source_entry(rebalanced, fivs.versions.len()) {
             let cleanup_warning = resolve_rebalance_entry_cleanup_delete_result(
-                set.delete_object(
+                data_movement::cleanup_source_entry_if_unchanged(
+                    set.clone(),
                     bucket.as_str(),
-                    &encode_dir_object(&entry.name),
-                    ObjectOptions {
-                        delete_prefix: true,
-                        delete_prefix_object: true,
-
-                        ..Default::default()
-                    },
+                    entry.name.as_str(),
+                    &fivs,
+                    &[],
+                    "rebalance",
                 )
                 .await,
                 bucket.as_str(),
