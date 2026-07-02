@@ -167,5 +167,5 @@ The queued multi-pool contract is guarded by:
 - `test_first_resumable_decommission_queue_indices_allows_after_completed_prefix`
 - `admin_pool_list_item_exposes_queued_decommission_state`
 
-These tests live in `crates/ecstore/src/pools.rs` and
+These tests live in `crates/ecstore/src/core/pools.rs` and
 `rustfs/src/app/admin_usecase.rs`.
