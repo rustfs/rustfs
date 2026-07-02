@@ -172,13 +172,13 @@ mod tests {
         assert_eq!(registry.registered_backend_count(), contract.backends.len());
         assert_eq!(
             registry.registration_for("cpu_pprof").map(|registration| registration.status),
-            Some(OpsProfilerBackendStatus::Enabled)
+            Some(OpsProfilerBackendStatus::Unsupported)
         );
         assert_eq!(
             registry
                 .registration_for("memory_pprof")
                 .map(|registration| registration.supports_profile_export),
-            Some(true)
+            Some(false)
         );
         assert_eq!(
             registry.authorize_read(OpsProfilerReadRequest {

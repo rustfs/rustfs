@@ -88,10 +88,10 @@ catalog extension.
 | Manifest/data/delete reachability cleanup | Supported | Reads manifest-list and manifest Avro references, reports reachable objects, and deletes only unreferenced table objects that pass the safety window. |
 | Maintenance worker run endpoint | Preview / controlled | Supports run-once execution, current-job backpressure, retry deferral, lease expiry recovery, and heartbeat updates. |
 | Maintenance scheduler guardrails | Preview / controlled | Exposes disabled, paused, ready, active-job backpressure, retry deferral, quarantine boundary, recommended actions, and recent maintenance job audit timeline state for external schedulers and operators. |
-| Compaction planning | Preview / controlled | Plans partition-local binpack candidates for Parquet files and does not mix data files from different partition directories in one rewrite group. |
-| Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog. |
+| Compaction planning | Preview / controlled | Plans partition-local and sort-order-local binpack candidates for Parquet files and does not mix data files from different partition directories or sort orders in one rewrite group. |
+| Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog while preserving Iceberg data file sort order IDs in the rewritten manifest. |
 | Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
-| Sort, delete-file, or row-level compaction | Not claimed | These remain future compatibility and maintenance validation items. |
+| Delete-file or row-level compaction | Not claimed | These remain future compatibility and maintenance validation items. |
 
 ## Recovery And Strong Backing Matrix
 

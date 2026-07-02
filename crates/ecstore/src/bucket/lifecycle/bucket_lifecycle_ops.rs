@@ -1657,6 +1657,9 @@ async fn cleanup_stale_multipart_uploads_in_set(set: &Arc<SetDisks>, now: Offset
     let mut deleted = 0usize;
     let mut candidates = HashMap::new();
 
+    // Discovery is intentionally local-owner based: each server lists the disks
+    // it owns locally. Once a stale upload path is found, delete_all fans out
+    // idempotently across the set to remove matching shards on every disk.
     for disk in set.get_local_disks().await.into_iter().flatten() {
         if !disk.is_online().await {
             continue;
@@ -1814,6 +1817,22 @@ async fn cleanup_stale_multipart_uploads_once_at(api: Arc<ECStore>, now: OffsetD
 
 pub async fn run_stale_multipart_upload_cleanup_once(api: Arc<ECStore>) -> usize {
     cleanup_stale_multipart_uploads_once_at(api, OffsetDateTime::now_utc(), stale_uploads_expiry()).await
+}
+
+pub fn schedule_stale_multipart_upload_cleanup_once(api: Arc<ECStore>) {
+    tokio::spawn(async move {
+        let deleted = run_stale_multipart_upload_cleanup_once(api).await;
+        if deleted > 0 {
+            debug!(
+                event = EVENT_LIFECYCLE_STALE_MULTIPART_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_LIFECYCLE,
+                deleted,
+                trigger = "on_demand",
+                "Completed stale multipart cleanup pass"
+            );
+        }
+    });
 }
 
 pub fn init_background_stale_multipart_upload_cleanup(api: Arc<ECStore>) {

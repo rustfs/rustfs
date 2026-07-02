@@ -19,15 +19,20 @@ use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     SUFFIX_REPLICATION_RESET_STATUS, get_header_map,
 };
+use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
+use uuid::Uuid;
 
 use crate::{
-    ObjectOpts, ReplicationStatusType, ReplicationType, ResyncTargetDecision, VersionPurgeStatusType, target_reset_header,
+    ObjectOpts, ReplicateDecision, ReplicateTargetDecision, ReplicationConfigurationExt as _, ReplicationState,
+    ReplicationStatusType, ReplicationType, ResyncTargetDecision, VersionPurgeStatusType, replication_statuses_map,
+    target_reset_header, version_purge_statuses_map,
 };
 
 #[derive(Debug, Clone, Default)]
 pub struct MustReplicateOptions {
     meta: HashMap<String, String>,
+    status: ReplicationStatusType,
     op_type: ReplicationType,
     replication_request: bool,
 }
@@ -41,16 +46,25 @@ impl MustReplicateOptions {
 
         Self {
             meta,
+            status: ReplicationStatusType::default(),
             op_type,
             replication_request,
         }
     }
 
+    pub fn with_replication_status(mut self, status: ReplicationStatusType) -> Self {
+        self.status = status;
+        self
+    }
+
     pub fn replication_status(&self) -> ReplicationStatusType {
         if let Some(rs) = self.meta.get(AMZ_BUCKET_REPLICATION_STATUS) {
-            return ReplicationStatusType::from(rs.as_str());
+            let status = ReplicationStatusType::from(rs.as_str());
+            if !status.is_empty() {
+                return status;
+            }
         }
-        ReplicationStatusType::default()
+        self.status.clone()
     }
 
     pub fn is_existing_object_replication(&self) -> bool {
@@ -95,6 +109,115 @@ pub fn delete_replication_object_opts(dobj: &ObjectToDelete, source: &Replicatio
         replica: source.replication_status == ReplicationStatusType::Replica,
         ..Default::default()
     }
+}
+
+#[derive(Debug, Clone)]
+pub struct ReplicationDeleteStateSource {
+    pub name: String,
+    pub user_tags: String,
+    pub version_id: Option<Uuid>,
+    pub delete_marker: bool,
+    pub replica: bool,
+}
+
+pub fn delete_replication_state_from_config(
+    config: &ReplicationConfiguration,
+    source: &ReplicationDeleteStateSource,
+) -> Option<ReplicationState> {
+    let opts = ObjectOpts {
+        name: source.name.clone(),
+        user_tags: source.user_tags.clone(),
+        version_id: source.version_id,
+        delete_marker: source.delete_marker,
+        op_type: ReplicationType::Delete,
+        replica: source.replica,
+        ..Default::default()
+    };
+    let target_arns = config.filter_target_arns(&opts);
+    if target_arns.is_empty() {
+        return None;
+    }
+
+    let mut decision = ReplicateDecision::new();
+    for target_arn in target_arns {
+        let mut target_opts = opts.clone();
+        target_opts.target_arn = target_arn.clone();
+        let replicate = config.replicate(&target_opts);
+        decision.set(ReplicateTargetDecision::new(target_arn, replicate, false));
+    }
+    if !decision.replicate_any() {
+        return None;
+    }
+
+    let pending_status = decision.pending_status();
+    let mut state = ReplicationState {
+        replicate_decision_str: decision.to_string(),
+        ..Default::default()
+    };
+    if source.version_id.is_some() {
+        state.version_purge_status_internal = pending_status.clone();
+        state.purge_targets = version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+    } else {
+        state.replication_status_internal = pending_status.clone();
+        state.targets = replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+    }
+    Some(state)
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationDeleteScheduleInput<'a> {
+    pub replication_request: bool,
+    pub version_id_requested: bool,
+    pub source_delete_marker: bool,
+    pub source_replication_status: &'a ReplicationStatusType,
+    pub source_version_purge_status: &'a VersionPurgeStatusType,
+    pub deleted_delete_marker_version: bool,
+}
+
+fn delete_version_purge_source_status(status: &ReplicationStatusType) -> bool {
+    status == &ReplicationStatusType::Replica
+        || status == &ReplicationStatusType::Pending
+        || status == &ReplicationStatusType::Completed
+        || status == &ReplicationStatusType::Failed
+}
+
+pub fn should_schedule_delete_replication(input: ReplicationDeleteScheduleInput<'_>) -> bool {
+    if input.replication_request {
+        return false;
+    }
+
+    if input.version_id_requested && !input.deleted_delete_marker_version && !input.source_delete_marker {
+        return delete_version_purge_source_status(input.source_replication_status);
+    }
+
+    input.source_replication_status == &ReplicationStatusType::Replica
+        || input.source_replication_status == &ReplicationStatusType::Pending
+        || input.source_version_purge_status == &VersionPurgeStatusType::Pending
+        || (input.deleted_delete_marker_version && input.source_replication_status == &ReplicationStatusType::Completed)
+}
+
+pub fn delete_replication_version_id(
+    source_delete_marker: bool,
+    source_version_id: Option<Uuid>,
+    deleted_delete_marker_version: bool,
+) -> Option<Uuid> {
+    if source_delete_marker && !deleted_delete_marker_version {
+        None
+    } else {
+        source_version_id
+    }
+}
+
+pub fn should_use_existing_delete_replication_source(
+    replication_request: bool,
+    deleted_delete_marker: bool,
+    has_existing_source: bool,
+) -> bool {
+    replication_request && deleted_delete_marker && has_existing_source
+}
+
+pub fn should_use_existing_delete_replication_info(version_id_requested: bool, delete_marker_request: bool) -> bool {
+    version_id_requested && !delete_marker_request
 }
 
 pub fn heal_uses_delete_replication_path(delete_marker: bool, version_purge_status: &VersionPurgeStatusType) -> bool {
@@ -189,12 +312,20 @@ pub fn resync_target_for_object(
 #[cfg(test)]
 mod tests {
     use super::{
-        MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
-        delete_replication_object_opts, heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
+        MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,
+        ReplicationResyncTargetObject, delete_replication_missing_source_decision, delete_replication_object_opts,
+        delete_replication_state_from_config, delete_replication_version_id, heal_uses_delete_replication_path,
+        is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     };
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use rustfs_storage_api::ObjectToDelete;
     use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER};
+    use s3s::dto::{
+        DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,
+        ExistingObjectReplicationStatus, ReplicaModifications, ReplicaModificationsStatus, ReplicationConfiguration,
+        ReplicationRule, ReplicationRuleStatus, SourceSelectionCriteria,
+    };
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
     use uuid::Uuid;
@@ -211,9 +342,18 @@ mod tests {
     #[test]
     fn must_replicate_options_reads_replication_status_header() {
         let meta = HashMap::from([(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "COMPLETED".to_string())]);
-        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Object, false);
+        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Object, false)
+            .with_replication_status(ReplicationStatusType::Replica);
 
         assert_eq!(options.replication_status(), ReplicationStatusType::Completed);
+    }
+
+    #[test]
+    fn must_replicate_options_falls_back_to_explicit_replication_status() {
+        let options = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Delete, false)
+            .with_replication_status(ReplicationStatusType::Replica);
+
+        assert_eq!(options.replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]
@@ -286,6 +426,162 @@ mod tests {
         assert_eq!(opts.version_id, Some(version_id));
         assert_eq!(opts.name, "obj");
         assert_eq!(opts.op_type, ReplicationType::Delete);
+    }
+
+    fn delete_replication_rule(arn: &str, replica_modifications: bool) -> ReplicationRule {
+        ReplicationRule {
+            delete_marker_replication: Some(DeleteMarkerReplication {
+                status: Some(DeleteMarkerReplicationStatus::from_static(DeleteMarkerReplicationStatus::ENABLED)),
+            }),
+            delete_replication: None,
+            destination: Destination {
+                bucket: arn.to_string(),
+                ..Default::default()
+            },
+            existing_object_replication: Some(ExistingObjectReplication {
+                status: ExistingObjectReplicationStatus::from_static(ExistingObjectReplicationStatus::ENABLED),
+            }),
+            filter: None,
+            id: Some("rule-1".to_string()),
+            prefix: Some("test/".to_string()),
+            priority: Some(1),
+            source_selection_criteria: replica_modifications.then_some(SourceSelectionCriteria {
+                replica_modifications: Some(ReplicaModifications {
+                    status: ReplicaModificationsStatus::from_static(ReplicaModificationsStatus::ENABLED),
+                }),
+                sse_kms_encrypted_objects: None,
+            }),
+            status: ReplicationRuleStatus::from_static(ReplicationRuleStatus::ENABLED),
+        }
+    }
+
+    #[test]
+    fn delete_replication_state_tracks_downstream_delete_marker_targets() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let config = ReplicationConfiguration {
+            role: arn.to_string(),
+            rules: vec![delete_replication_rule(arn, true)],
+        };
+        let source = ReplicationDeleteStateSource {
+            name: "test/object.txt".to_string(),
+            user_tags: String::new(),
+            version_id: None,
+            delete_marker: true,
+            replica: true,
+        };
+
+        let state = delete_replication_state_from_config(&config, &source)
+            .expect("replica delete marker should be forwarded to downstream targets");
+        let pending = format!("{arn}=PENDING;");
+
+        assert_eq!(state.replication_status_internal.as_deref(), Some(pending.as_str()));
+        assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
+        assert!(state.targets.contains_key(arn));
+    }
+
+    #[test]
+    fn delete_replication_state_skips_replica_delete_without_replica_modifications() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let config = ReplicationConfiguration {
+            role: arn.to_string(),
+            rules: vec![delete_replication_rule(arn, false)],
+        };
+        let source = ReplicationDeleteStateSource {
+            name: "test/object.txt".to_string(),
+            user_tags: String::new(),
+            version_id: None,
+            delete_marker: true,
+            replica: true,
+        };
+
+        assert!(delete_replication_state_from_config(&config, &source).is_none());
+    }
+
+    #[test]
+    fn delete_replication_state_tracks_delete_marker_version_purges() {
+        let arn = "arn:aws:s3:::target-bucket";
+        let config = ReplicationConfiguration {
+            role: arn.to_string(),
+            rules: vec![delete_replication_rule(arn, false)],
+        };
+        let source = ReplicationDeleteStateSource {
+            name: "test/object.txt".to_string(),
+            user_tags: String::new(),
+            version_id: Some(Uuid::new_v4()),
+            delete_marker: true,
+            replica: false,
+        };
+
+        let state = delete_replication_state_from_config(&config, &source)
+            .expect("delete-marker version purge should honor delete-marker replication rules");
+        let pending = format!("{arn}=PENDING;");
+
+        assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
+        assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
+        assert!(state.purge_targets.contains_key(arn));
+    }
+
+    #[test]
+    fn delete_replication_schedule_skips_replica_requests() {
+        assert!(!should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: true,
+            version_id_requested: true,
+            source_delete_marker: true,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: true,
+        }));
+    }
+
+    #[test]
+    fn delete_replication_schedule_keeps_marker_and_version_purges() {
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: true,
+            source_delete_marker: true,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: true,
+        }));
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: true,
+            source_delete_marker: false,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: false,
+        }));
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: false,
+            source_delete_marker: false,
+            source_replication_status: &ReplicationStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
+            deleted_delete_marker_version: false,
+        }));
+    }
+
+    #[test]
+    fn delete_replication_version_id_splits_marker_creation_and_purge() {
+        let version_id = Uuid::new_v4();
+
+        assert_eq!(delete_replication_version_id(true, Some(version_id), false), None);
+        assert_eq!(delete_replication_version_id(true, Some(version_id), true), Some(version_id));
+    }
+
+    #[test]
+    fn delete_replication_source_selection_prefers_existing_marker_source_only_for_replica_requests() {
+        assert!(should_use_existing_delete_replication_source(true, true, true));
+        assert!(!should_use_existing_delete_replication_source(false, true, true));
+        assert!(!should_use_existing_delete_replication_source(true, false, true));
+        assert!(!should_use_existing_delete_replication_source(true, true, false));
+    }
+
+    #[test]
+    fn existing_delete_replication_info_is_limited_to_version_delete_requests() {
+        assert!(should_use_existing_delete_replication_info(true, false));
+        assert!(!should_use_existing_delete_replication_info(true, true));
+        assert!(!should_use_existing_delete_replication_info(false, false));
     }
 
     #[test]

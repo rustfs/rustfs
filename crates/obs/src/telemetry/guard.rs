@@ -39,10 +39,6 @@ pub(crate) type ProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope:
     any(target_os = "macos", all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
 )))]
 pub(crate) type ProfilingAgent = ();
-#[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-pub(crate) type MemoryProfilingAgent = pyroscope::PyroscopeAgent<pyroscope::pyroscope::PyroscopeAgentRunning>;
-#[cfg(not(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64")))]
-pub(crate) type MemoryProfilingAgent = ();
 
 const LOG_COMPONENT_OBS: &str = "obs";
 const LOG_SUBSYSTEM_GUARD: &str = "guard";
@@ -67,7 +63,6 @@ pub struct OtelGuard {
     /// Optional logger provider for OTLP log export.
     pub(crate) logger_provider: Option<SdkLoggerProvider>,
     pub(crate) profiling_agent: Option<ProfilingAgent>,
-    pub(crate) memory_profiling_agent: Option<MemoryProfilingAgent>,
     /// Handle to the background log-cleanup task; aborted on drop.
     pub(crate) cleanup_handle: Option<tokio::task::JoinHandle<()>>,
     /// Worker guard that keeps the non-blocking `tracing_appender` thread
@@ -84,7 +79,6 @@ impl std::fmt::Debug for OtelGuard {
             .field("meter_provider", &self.meter_provider.is_some())
             .field("logger_provider", &self.logger_provider.is_some())
             .field("profiling_agent", &self.profiling_agent.is_some())
-            .field("memory_profiling_agent", &self.memory_profiling_agent.is_some())
             .field("cleanup_handle", &self.cleanup_handle.is_some())
             .field("tracing_guard", &self.tracing_guard.is_some())
             .field("stdout_guard", &self.stdout_guard.is_some())
@@ -153,30 +147,6 @@ impl Drop for OtelGuard {
                         );
                     } else {
                         eprintln!("{}", format_guard_shutdown_stderr_message("profiling_agent", err));
-                    }
-                }
-                Ok(stopped) => {
-                    stopped.shutdown();
-                }
-            }
-        }
-
-        #[cfg(all(feature = "pyroscope", target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-        if let Some(agent) = self.memory_profiling_agent.take() {
-            match agent.stop() {
-                Err(err) => {
-                    if tracing::dispatcher::has_been_set() {
-                        error!(
-                            event = EVENT_OBS_GUARD_SHUTDOWN,
-                            component = LOG_COMPONENT_OBS,
-                            subsystem = LOG_SUBSYSTEM_GUARD,
-                            resource = "memory_profiling_agent",
-                            result = "shutdown_failed",
-                            error = %err,
-                            "observability guard shutdown failed"
-                        );
-                    } else {
-                        eprintln!("{}", format_guard_shutdown_stderr_message("memory_profiling_agent", err));
                     }
                 }
                 Ok(stopped) => {
