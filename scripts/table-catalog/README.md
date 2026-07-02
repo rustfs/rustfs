@@ -137,8 +137,9 @@ Use these outputs when updating release notes, PR descriptions, or follow-up
 work items. They are intentionally conservative: only PyIceberg is automated by
 this script today. Spark has a repeatable manual/live harness with pinned
 client package inputs, generated configuration, generated SQL, expected
-results, and a CI opt-in gate; other engines are documented until a repeatable
-harness is added.
+results, and a CI opt-in gate. Trino, DuckDB, Databend, and Snowflake now have
+generated manual probe inputs, but they remain opt-in and do not promote write
+or full vendor interoperability claims.
 
 Vendor profiles are machine-readable connection references. They include the
 catalog URI shape, warehouse shape, signing name, credential model, namespace
@@ -244,11 +245,11 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
 |---|---|---|
 | PyIceberg | Automated smoke target | create namespace, create table, append, reload, scan, metadata-location, refs, views, maintenance, diagnostics, optional catalog-vended table credentials with exact-prefix data-plane scope probe |
 | Spark Iceberg REST catalog | Manual/live harness | pinned Spark and Iceberg package inputs, configuration, SQL, run command, expected row count, and cleanup can be generated for a running RustFS endpoint; CI execution is opt-in |
-| Trino Iceberg REST catalog | Documented, not automated | no write compatibility claim yet |
-| DuckDB Iceberg | Documented, not automated | read-path reference only |
+| Trino Iceberg REST catalog | Manual/live read probe | generated catalog properties and a read-only SELECT probe for a table created by PyIceberg or Spark; no write compatibility claim yet |
+| DuckDB Iceberg | Manual/live read probe | generated httpfs/iceberg SQL using an operator-supplied current metadata location; read-path only |
 | StarRocks Iceberg REST catalog | Documented, not automated | external catalog read-path reference only |
-| Databend | Documented, not automated | S3 data-plane reference only; Iceberg REST catalog integration is not claimed |
-| Snowflake/Open Catalog integrations | Documented, not automated | reference only |
+| Databend | Manual/live S3 stage probe | generated S3 stage read probe for table data files; Iceberg REST catalog integration is not claimed |
+| Snowflake/Open Catalog integrations | Manual reference probe | generated external volume/catalog SQL template; live RustFS interoperability is not claimed |
 
 ## Production Failure Coverage
 
@@ -451,3 +452,36 @@ count, and optional cleanup. Until Spark execution is enabled in CI through the
 explicit live-conformance gate, do not claim Spark support beyond a manually
 verified run with the exact RustFS build, Spark version, Iceberg version, and
 expected output recorded.
+
+## Additional Manual Engine Probes
+
+`--print-live-conformance` also generates conservative manual probe input for
+engines that are not run by default in RustFS CI:
+
+- Trino: catalog properties and a read-only `SELECT COUNT(*)` command for a
+  table already created by PyIceberg or Spark. Trino write compatibility is not
+  claimed.
+- DuckDB: `httpfs` and `iceberg` SQL using an operator-supplied current Iceberg
+  metadata location. DuckDB write and commit compatibility are not claimed.
+- Databend: an S3 stage read probe for Parquet data files under the table
+  warehouse. Databend Iceberg REST Catalog integration is not claimed.
+- Snowflake: an operator-adapted external volume/catalog integration SQL
+  template. Live RustFS interoperability is not claimed.
+
+Generate the full probe set:
+
+```bash
+python3 scripts/table-catalog/engine_compatibility.py \
+  --endpoint http://127.0.0.1:9000 \
+  --warehouse rustfs-s3table-smoke \
+  --namespace smoke \
+  --table events \
+  --metadata-location s3://rustfs-s3table-smoke/tables/table-id/metadata/v1.metadata.json \
+  --print-live-conformance \
+  --cleanup
+```
+
+Record the exact engine version, RustFS build, current metadata location, and
+expected row count when running any of these probes. Treat failures as
+compatibility findings, not as proof that the server can safely claim broader
+vendor or engine support.
