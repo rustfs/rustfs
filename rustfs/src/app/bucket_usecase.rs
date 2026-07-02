@@ -105,8 +105,7 @@ use s3s::dto::{
     PutBucketNotificationConfigurationOutput, PutBucketPolicyInput, PutBucketPolicyOutput, PutBucketReplicationInput,
     PutBucketReplicationOutput, PutBucketTaggingInput, PutBucketTaggingOutput, PutBucketVersioningInput,
     PutBucketVersioningOutput, PutPublicAccessBlockInput, PutPublicAccessBlockOutput, ReplicationConfiguration,
-    ReplicationRuleStatus, ServerSideEncryption, Tagging, Timestamp, UserMetadataCollection, UserMetadataEntry,
-    VersioningConfiguration,
+    ServerSideEncryption, Tagging, Timestamp, UserMetadataCollection, UserMetadataEntry, VersioningConfiguration,
 };
 use s3s::region::Region;
 use s3s::xml;
@@ -246,58 +245,25 @@ fn notify_bucket_metadata_reload(
     });
 }
 
-fn active_replication_rule_destination_arns(config: &ReplicationConfiguration) -> HashSet<String> {
-    let mut arns = HashSet::new();
-
-    for rule in &config.rules {
-        if rule.status == ReplicationRuleStatus::from_static(ReplicationRuleStatus::DISABLED) {
-            continue;
-        }
-
-        let arn = rule.destination.bucket.trim();
-        if !arn.is_empty() {
-            arns.insert(arn.to_string());
-        }
-    }
-
-    arns
-}
-
-fn replication_target_arns(config: &ReplicationConfiguration) -> HashSet<String> {
-    let role = config.role.trim();
-    if !role.is_empty() {
-        let mut arns = HashSet::new();
-        arns.insert(role.to_string());
-        return arns;
-    }
-
-    active_replication_rule_destination_arns(config)
-}
-
 fn validate_replication_config_targets(targets: &BucketTargets, config: &ReplicationConfiguration) -> S3Result<()> {
     let configured_arns = targets
         .targets
         .iter()
         .filter(|target| target.target_type == BucketTargetType::ReplicationService)
-        .map(|target| target.arn.as_str())
-        .collect::<HashSet<_>>();
+        .map(|target| target.arn.as_str());
 
-    let role = config.role.trim();
-    let destination_arns = active_replication_rule_destination_arns(config);
-    if !role.is_empty() && destination_arns.len() > 1 {
-        return Err(s3_error!(
-            InvalidRequest,
-            "replication config with Role cannot define multiple destination targets"
-        ));
-    }
-
-    for configured_arn in replication_target_arns(config) {
-        if !configured_arns.contains(configured_arn.as_str()) {
-            return Err(s3_error!(InvalidRequest, "replication config has a stale target"));
+    match rustfs_replication::validate_replication_config_target_arns(configured_arns, config) {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let message = match err {
+                rustfs_replication::ReplicationTargetValidationError::RoleWithMultipleDestinations => {
+                    "replication config with Role cannot define multiple destination targets"
+                }
+                rustfs_replication::ReplicationTargetValidationError::StaleTarget => "replication config has a stale target",
+            };
+            Err(S3Error::with_message(S3ErrorCode::InvalidRequest, message.to_string()))
         }
     }
-
-    Ok(())
 }
 
 async fn validate_bucket_replication_update(bucket: &str, config: &ReplicationConfiguration) -> S3Result<()> {
@@ -324,7 +290,7 @@ async fn replication_targets_without_config_targets(
     bucket: &str,
     config: &ReplicationConfiguration,
 ) -> S3Result<Option<(BucketTargets, usize)>> {
-    let target_arns = replication_target_arns(config);
+    let target_arns = rustfs_replication::replication_target_arns(config);
     if target_arns.is_empty() {
         return Ok(None);
     }
@@ -349,7 +315,11 @@ async fn replication_targets_without_config_targets(
 fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, target_arns: &HashSet<String>) -> usize {
     let original_len = targets.targets.len();
     targets.targets.retain(|target| {
-        target.target_type != BucketTargetType::ReplicationService || !target_arns.contains(target.arn.as_str())
+        !rustfs_replication::should_remove_replication_target(
+            target.arn.as_str(),
+            target.target_type == BucketTargetType::ReplicationService,
+            target_arns,
+        )
     });
 
     original_len - targets.targets.len()
@@ -2291,6 +2261,7 @@ impl DefaultBucketUsecase {
 mod tests {
     use super::*;
     use http::{Extensions, HeaderMap, Method, Uri};
+    use s3s::dto::ReplicationRuleStatus;
     use s3s::dto::{
         BucketVersioningStatus, CORSConfiguration, Destination, ExcludedPrefix, FilterRule, FilterRuleName, LifecycleExpiration,
         NoncurrentVersionTransition, PublicAccessBlockConfiguration, QueueConfiguration, ReplicationRule, S3KeyFilter,
@@ -2374,7 +2345,7 @@ mod tests {
             rules: vec![replication_rule_for_target(destination)],
         };
 
-        let arns = replication_target_arns(&config);
+        let arns = rustfs_replication::replication_target_arns(&config);
 
         assert!(arns.contains(role));
         assert!(!arns.contains(destination));
@@ -2388,7 +2359,7 @@ mod tests {
             rules: vec![replication_rule_for_target(destination)],
         };
 
-        let arns = replication_target_arns(&config);
+        let arns = rustfs_replication::replication_target_arns(&config);
 
         assert!(arns.contains(destination));
     }
