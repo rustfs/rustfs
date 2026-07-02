@@ -457,6 +457,30 @@ Keeping both workflows on this script means local runs, the PR gate, and the
 scheduled sweep always execute tests the same way (same pinned s3-tests
 revision, same config template, same user provisioning).
 
+A third workflow, **mint** (`.github/workflows/mint.yml`), complements ceph
+s3-tests with MinIO Mint: the functional suites of many real client SDKs and
+tools (awscli, mc, aws-sdk-java/go/php/ruby, minio-go/java/js/py, s3cmd, ...).
+It runs weekly, is report-only for test failures, and publishes a per-suite
+pass/fail table in the job summary.
+
+## Companion Tools
+
+- `report_compat.py` — diffs a junit.xml result against the classification
+  lists; run automatically at the end of `run.sh`, and used by the weekly
+  sweep to gate on whitelist regressions only (`--fail-on-regression`).
+- `api_coverage.py` — quantifies S3 API surface coverage by comparing the
+  s3s `S3` trait (at the revision pinned in Cargo.toml) against the methods
+  RustFS overrides in `impl S3 for FS`:
+
+  ```bash
+  python3 scripts/s3-tests/api_coverage.py            # summary + missing ops
+  python3 scripts/s3-tests/api_coverage.py --output api-coverage.md
+  ```
+
+- `compare_dual_targets.py` — sends one signed S3 request to two endpoints
+  (e.g. RustFS and MinIO) and diffs status, headers, and body; useful when
+  triaging a behavioral difference found by the suites above.
+
 ## See Also
 
 - [GitHub Actions Workflow](../../.github/workflows/e2e-s3tests.yml)

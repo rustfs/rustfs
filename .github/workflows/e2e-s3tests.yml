@@ -63,7 +63,8 @@ on:
         required: false
         default: ""
   schedule:
-    # Weekly full sweep (Sunday 02:00 UTC): full suite, single-node topology.
+    # Weekly full sweep (Sunday 02:00 UTC): full suite, run against BOTH the
+    # single-node and the 4-node distributed topologies (matrix below).
     - cron: "0 2 * * 0"
 
 env:
@@ -82,8 +83,7 @@ env:
   PLATFORM: linux/amd64
   BUILDX_CACHE_SCOPE: rustfs-e2e-s3tests-source
 
-  # Scheduled runs have no inputs; default to a single-node full sweep.
-  TEST_MODE: ${{ github.event.inputs.test-mode || 'single' }}
+  # Scheduled runs have no inputs; default to a full sweep.
   TEST_SCOPE: ${{ github.event.inputs.scope || 'all' }}
   XDIST: ${{ github.event.inputs.xdist || '4' }}
   MAXFAIL: ${{ github.event.inputs.maxfail || '0' }}
@@ -101,6 +101,13 @@ jobs:
   s3tests:
     runs-on: ubicloud-standard-4
     timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        # Scheduled sweeps cover both topologies; manual runs use the input.
+        test-mode: ${{ github.event_name == 'schedule' && fromJSON('["single", "multi"]') || fromJSON(format('["{0}"]', github.event.inputs.test-mode || 'single')) }}
+    env:
+      TEST_MODE: ${{ matrix.test-mode }}
     steps:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7
 
