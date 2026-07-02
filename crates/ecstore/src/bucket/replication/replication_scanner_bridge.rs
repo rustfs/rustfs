@@ -12,7 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::replication_pool::{ReplicationHealQueueResult, queue_replication_heal_internal};
+use super::ReplicationHealQueueResult;
+use super::replication_pool::queue_replication_heal_internal;
 use super::replication_resyncer::ReplicationConfig;
 use super::replication_storage_boundary::ObjectInfo;
 
@@ -31,7 +32,7 @@ impl ReplicationScannerBridge {
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_pool::ReplicationQueueAdmission;
+    use super::super::ReplicationQueueAdmission;
     use super::*;
 
     #[tokio::test]

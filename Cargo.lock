@@ -9897,9 +9897,12 @@ dependencies = [
  "rmp",
  "rmp-serde",
  "rustfs-filemeta",
+ "rustfs-storage-api",
+ "rustfs-utils",
  "s3s",
  "serde",
  "time",
+ "tokio",
  "url",
  "uuid",
 ]
