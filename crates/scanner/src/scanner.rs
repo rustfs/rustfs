@@ -724,8 +724,8 @@ async fn finalize_partial_scan_cycle(storeapi: Arc<impl ScannerObjectIO>, cycle_
     // next_cycle % DATA_USAGE_UPDATE_DIR_CYCLES; a pinned counter starves lifecycle
     // expiry and usage refresh on every folder outside the stuck window.
     cycle_info.next += 1;
-    persist_scanner_cycle_state(storeapi, cycle_info).await;
     mark_scan_cycle_idle(cycle_info).await;
+    persist_scanner_cycle_state(storeapi, cycle_info).await;
 }
 
 #[instrument(skip_all)]
@@ -1496,6 +1496,7 @@ mod tests {
         let mut decoded = CurrentCycle::default();
         decoded.unmarshal(&buf[8..]).expect("persisted cycle info should decode");
         assert_eq!(decoded.next, 13);
+        assert_eq!(decoded.current, 0);
 
         global_metrics().set_cycle(None).await;
     }
