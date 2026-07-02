@@ -16,6 +16,7 @@ pub mod config;
 pub mod delete;
 pub mod mrf;
 pub mod operation;
+pub mod queue;
 pub mod resync;
 pub mod rule;
 pub mod tagging;
@@ -24,6 +25,7 @@ pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use delete::DeletedObjectReplicationInfo;
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use operation::{MustReplicateOptions, is_ssec_encrypted};
+pub use queue::{ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
     decode_resync_file, encode_resync_file,
