@@ -139,6 +139,20 @@ impl ObjectDataCache {
             return ObjectDataCacheFillResult::SkippedByMode;
         }
 
+        if let ObjectDataCacheGetPlan::Cacheable { key } = plan
+            && fill_bytes != key.size
+        {
+            let result = ObjectDataCacheFillResult::SkippedSizeMismatch;
+            record_fill_result(
+                self.backend.as_metric_label(),
+                self.config.mode,
+                result.as_metric_label(),
+                fill_bytes,
+                0.0,
+            );
+            return result;
+        }
+
         let fill_start = Instant::now();
         let result = match &self.backend {
             ObjectDataCacheBackendKind::Noop(backend) => backend.fill_body(plan).await,
@@ -260,6 +274,8 @@ pub enum ObjectDataCacheFillResult {
     SkippedMemoryPressure,
     /// Fill was skipped because the per-identity key budget overflowed and was conservatively cleared.
     SkippedIdentityOverflow,
+    /// Fill was skipped because the provided body length did not match the cache key identity.
+    SkippedSizeMismatch,
     /// Fill waiters were released without a published leader result.
     SkippedSingleflightClosed,
     /// The cache entry was inserted successfully.
@@ -274,6 +290,7 @@ impl ObjectDataCacheFillResult {
             Self::SkippedNotCacheable => "skipped_not_cacheable",
             Self::SkippedMemoryPressure => "skipped_memory_pressure",
             Self::SkippedIdentityOverflow => "skipped_identity_overflow",
+            Self::SkippedSizeMismatch => "skipped_size_mismatch",
             Self::SkippedSingleflightClosed => "skipped_singleflight_closed",
             Self::Inserted => "inserted",
         }
@@ -293,6 +310,8 @@ pub enum ObjectDataCacheInvalidationReason {
     AfterCopySuccess,
     /// Invalidation after a successful complete multipart upload.
     AfterCompleteMultipartSuccess,
+    /// Invalidation after a cached body fails app-layer response validation.
+    CacheHitSizeMismatch,
     /// Manual invalidation requested by the caller.
     Manual,
 }
@@ -305,6 +324,7 @@ impl ObjectDataCacheInvalidationReason {
             Self::AfterDeleteSuccess => "after_delete_success",
             Self::AfterCopySuccess => "after_copy_success",
             Self::AfterCompleteMultipartSuccess => "after_complete_multipart_success",
+            Self::CacheHitSizeMismatch => "cache_hit_size_mismatch",
             Self::Manual => "manual",
         }
     }
@@ -315,4 +335,40 @@ impl ObjectDataCacheInvalidationReason {
 pub enum ObjectDataCacheInvalidationResult {
     /// Invalidation completed successfully.
     Success,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectDataCache, ObjectDataCacheFillResult, ObjectDataCacheGetRequest, ObjectDataCacheLookup};
+    use crate::config::{ObjectDataCacheConfig, ObjectDataCacheMode};
+    use crate::key::ObjectDataCacheBodyVariant;
+    use bytes::Bytes;
+
+    fn fill_enabled_cache() -> ObjectDataCache {
+        let config = ObjectDataCacheConfig {
+            mode: ObjectDataCacheMode::FillBufferedOnly,
+            max_bytes: 8_388_608,
+            ..ObjectDataCacheConfig::default()
+        };
+        ObjectDataCache::new(config).expect("fill-enabled cache config should initialize")
+    }
+
+    #[tokio::test]
+    async fn fill_body_rejects_size_mismatch() {
+        let cache = fill_enabled_cache();
+        let plan = cache.plan_get(ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+
+        let fill = cache.fill_body(&plan, Bytes::from_static(b"oops")).await;
+        let lookup = cache.lookup_body(&plan).await;
+
+        assert_eq!(fill, ObjectDataCacheFillResult::SkippedSizeMismatch);
+        assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
+    }
 }

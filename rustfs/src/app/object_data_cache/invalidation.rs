@@ -63,6 +63,15 @@ pub(crate) async fn invalidate_object_data_cache_after_complete_multipart_succes
         .await
 }
 
+/// Invalidates a single object after a cached body fails response validation.
+pub(crate) async fn invalidate_object_data_cache_after_hit_size_mismatch(
+    adapter: &ObjectDataCacheAdapter,
+    bucket: &str,
+    key: &str,
+) -> ObjectDataCacheInvalidationResult {
+    invalidate_object_data_cache_object(adapter, bucket, key, ObjectDataCacheInvalidationReason::CacheHitSizeMismatch).await
+}
+
 /// Invalidates a single object identity through the app-layer cache adapter.
 pub(crate) async fn invalidate_object_data_cache_object(
     adapter: &ObjectDataCacheAdapter,
@@ -114,8 +123,8 @@ pub(crate) async fn invalidate_object_data_cache_objects<'a, I>(
 #[cfg(test)]
 mod tests {
     use super::{
-        invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
-        invalidate_object_data_cache_objects_before_mutation,
+        invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_hit_size_mismatch,
+        invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_before_mutation,
     };
     use crate::app::object_data_cache::ObjectDataCacheAdapter;
     use bytes::Bytes;
@@ -181,5 +190,25 @@ mod tests {
 
         assert!(matches!(adapter.lookup_body(&plan_a).await, ObjectDataCacheLookup::Miss));
         assert!(matches!(adapter.lookup_body(&plan_b).await, ObjectDataCacheLookup::Miss));
+    }
+
+    #[tokio::test]
+    async fn hit_size_mismatch_invalidation_removes_cached_body() {
+        let adapter = enabled_adapter();
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "bucket",
+            object: "object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let fill = adapter.fill_body(&plan, Bytes::from_static(b"hello")).await;
+        let invalidation = invalidate_object_data_cache_after_hit_size_mismatch(&adapter, "bucket", "object").await;
+        let lookup = adapter.lookup_body(&plan).await;
+
+        assert_eq!(fill, ObjectDataCacheFillResult::Inserted);
+        assert_eq!(invalidation, ObjectDataCacheInvalidationResult::Success);
+        assert!(matches!(lookup, ObjectDataCacheLookup::Miss));
     }
 }

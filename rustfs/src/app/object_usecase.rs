@@ -192,9 +192,10 @@ use super::storage_api::object_usecase::{
 use crate::app::object_data_cache::{
     GetObjectBodyCacheLookup, GetObjectBodyCacheRequest, ObjectDataCacheAdapter, fill_get_object_body_cache_from_buffered_body,
     fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
-    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
-    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
-    invalidate_object_data_cache_objects_before_mutation, is_get_object_body_cacheable, lookup_get_object_body_cache_hit,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_hit_size_mismatch,
+    invalidate_object_data_cache_after_put_success, invalidate_object_data_cache_before_mutation,
+    invalidate_object_data_cache_objects_after_delete_success, invalidate_object_data_cache_objects_before_mutation,
+    is_get_object_body_cacheable, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -2857,15 +2858,17 @@ impl DefaultObjectUsecase {
             part_number,
             encryption_applied,
         };
+        let expected_body_len = usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX);
 
         match lookup_get_object_body_cache_hit(cache_adapter, cache_request).await {
             GetObjectBodyCacheLookup::Hit(bytes) => {
-                if bytes.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
+                if bytes.len() != expected_body_len {
                     warn!(
                         expected = response_content_length,
                         actual = bytes.len(),
                         "Cached GetObject body size mismatch"
                     );
+                    let _ = invalidate_object_data_cache_after_hit_size_mismatch(cache_adapter, bucket, key).await;
                 } else {
                     return Ok(Self::build_memory_bytes_blob(
                         bytes,
@@ -2879,14 +2882,15 @@ impl DefaultObjectUsecase {
         }
 
         if let Some(buffered_body) = buffered_body {
-            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
-
-            if buffered_body.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
+            if buffered_body.len() != expected_body_len {
                 warn!(
                     expected = response_content_length,
                     actual = buffered_body.len(),
                     "Buffered GetObject body size mismatch"
                 );
+            } else {
+                let _fill_result =
+                    fill_get_object_body_cache_from_buffered_body(cache_adapter, cache_request, &buffered_body).await;
             }
 
             return Ok(Self::build_memory_bytes_blob(
@@ -2937,7 +2941,7 @@ impl DefaultObjectUsecase {
             match read_result {
                 Ok(_) => {
                     let bytes = Bytes::from(buf);
-                    if bytes.len() != usize::try_from(response_content_length.max(0)).unwrap_or(usize::MAX) {
+                    if bytes.len() != expected_body_len {
                         warn!(
                             expected = response_content_length,
                             actual = bytes.len(),
@@ -6803,6 +6807,66 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn build_get_object_body_with_cache_rejects_size_mismatch_fill() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "cached-object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"oops")).await;
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("size-mismatched direct fill should not create a cache hit");
+        let lookup_after_mismatch = adapter.lookup_body(&plan).await;
+
+        assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::SkippedSizeMismatch);
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "size-mismatched rejected fill should construct the fallback stream without pre-reading"
+        );
+        assert!(
+            matches!(lookup_after_mismatch, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
+            "size-mismatched fill must not leave a reusable cache entry"
+        );
+    }
+
+    #[tokio::test]
     async fn build_get_object_body_with_cache_fills_from_buffered_body_without_reader_preread() {
         let first_reads = Arc::new(AtomicUsize::new(0));
         let first_reader = ReadProbeReader {
@@ -6872,6 +6936,64 @@ mod tests {
             second_reads.load(AtomicOrdering::Relaxed),
             0,
             "cache hit after buffered-body fill must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_skips_buffered_fill_on_size_mismatch() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "cached-object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"oops")),
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("size-mismatched buffered-body handoff should still return a response body");
+        let lookup = adapter.lookup_body(&plan).await;
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered-body handoff must not read from the fallback reader"
+        );
+        assert!(
+            matches!(lookup, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
+            "size-mismatched buffered body must not be filled into cache"
         );
     }
 

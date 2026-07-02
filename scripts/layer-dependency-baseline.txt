@@ -22,6 +22,7 @@ dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_delete_bucket_hook
 dep|rustfs/src/app/bucket_usecase.rs|app->interface|crate::admin::handlers::site_replication::site_replication_make_bucket_hook
 dep|rustfs/src/init.rs|infra->interface|crate::admin
+dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::object_data_cache::ObjectDataCacheAdapter
 dep|rustfs/src/runtime_sources.rs|infra->app|crate::app::context
 dep|rustfs/src/server/http.rs|infra->interface|crate::admin
 dep|rustfs/src/server/layer.rs|infra->interface|crate::admin::console::is_console_path
