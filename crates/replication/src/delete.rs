@@ -67,9 +67,24 @@ impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
     }
 }
 
+pub fn is_version_delete_replication(dobj: &DeletedObject) -> bool {
+    dobj.version_id.is_some() || (dobj.delete_marker_version_id.is_some() && !dobj.delete_marker)
+}
+
+pub fn should_retry_delete_marker_purge(dobj: &DeletedObject) -> bool {
+    dobj.delete_marker_version_id.is_some()
+}
+
+pub fn is_retryable_delete_replication_head_error(is_not_found: bool, code: Option<&str>) -> bool {
+    !(is_not_found || matches!(code, Some("MethodNotAllowed" | "405")))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::DeletedObjectReplicationInfo;
+    use super::{
+        DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
+        should_retry_delete_marker_purge,
+    };
     use crate::{MrfOpKind, ReplicationType, ReplicationWorkerOperation};
     use rustfs_storage_api::DeletedObject;
     use uuid::Uuid;
@@ -100,5 +115,68 @@ mod tests {
         assert_eq!(entry.op, MrfOpKind::Delete);
         assert!(entry.delete_marker);
         assert_eq!(info.get_object(), "object");
+    }
+
+    #[test]
+    fn version_delete_replication_tracks_delete_marker_version_purge() {
+        let dobj = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(is_version_delete_replication(&dobj));
+    }
+
+    #[test]
+    fn version_delete_replication_tracks_explicit_version_id() {
+        let dobj = DeletedObject {
+            version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(is_version_delete_replication(&dobj));
+    }
+
+    #[test]
+    fn version_delete_replication_keeps_delete_marker_creation_separate() {
+        let dobj = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(!is_version_delete_replication(&dobj));
+    }
+
+    #[test]
+    fn delete_marker_purge_retry_covers_version_purge_and_marker_creation() {
+        let version_purge = DeletedObject {
+            delete_marker: false,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+        let marker_creation = DeletedObject {
+            delete_marker: true,
+            delete_marker_version_id: Some(Uuid::new_v4()),
+            ..Default::default()
+        };
+
+        assert!(should_retry_delete_marker_purge(&version_purge));
+        assert!(should_retry_delete_marker_purge(&marker_creation));
+
+        let marker_without_version = DeletedObject {
+            delete_marker: true,
+            ..Default::default()
+        };
+        assert!(!should_retry_delete_marker_purge(&marker_without_version));
+    }
+
+    #[test]
+    fn retryable_delete_replication_head_error_allows_expected_delete_marker_responses() {
+        assert!(!is_retryable_delete_replication_head_error(false, Some("405")));
+        assert!(!is_retryable_delete_replication_head_error(false, Some("MethodNotAllowed")));
+        assert!(!is_retryable_delete_replication_head_error(true, Some("NoSuchKey")));
+        assert!(is_retryable_delete_replication_head_error(false, Some("AccessDenied")));
     }
 }

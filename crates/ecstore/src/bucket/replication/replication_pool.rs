@@ -33,8 +33,8 @@ use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncSt
 use lazy_static::lazy_static;
 use rustfs_replication::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueResult, ReplicationOperation, ReplicationPoolOpts,
-    ReplicationPriority, ReplicationQueueAdmission, WORKER_MAX_LIMIT, initial_worker_counts, next_large_worker_count,
-    next_mrf_worker_count, next_regular_worker_count, resized_worker_counts, should_grow_large_workers,
+    ReplicationPriority, ReplicationQueueAdmission, WORKER_MAX_LIMIT, initial_worker_counts, mrf_worker_size_to_count,
+    next_large_worker_count, next_mrf_worker_count, next_regular_worker_count, resized_worker_counts, should_grow_large_workers,
     should_queue_large_object,
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
@@ -366,7 +366,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         max_l_workers: Option<usize>,
     ) {
         let current_workers = self.workers.read().await.len();
-        let current_mrf = usize::try_from(self.mrf_worker_size.load(Ordering::SeqCst)).unwrap_or_default();
+        let current_mrf = mrf_worker_size_to_count(self.mrf_worker_size.load(Ordering::SeqCst));
         let worker_counts = resized_worker_counts(&pri, max_workers, current_workers, current_mrf);
 
         if let Some(max_w) = max_workers {

@@ -82,6 +82,14 @@ pub fn resized_worker_counts(
     }
 }
 
+pub fn mrf_worker_size_to_count(size: i32) -> usize {
+    let non_negative = size.max(0);
+    match usize::try_from(non_negative) {
+        Ok(size) => size,
+        Err(_) => 0,
+    }
+}
+
 pub fn worker_counts_for_priority(
     priority: &ReplicationPriority,
     current_workers: usize,
@@ -187,6 +195,13 @@ mod tests {
             resized_worker_counts(&ReplicationPriority::Fast, Some(5), WORKER_AUTO_DEFAULT, MRF_WORKER_AUTO_DEFAULT),
             ReplicationWorkerCounts::new(5, 5)
         );
+    }
+
+    #[test]
+    fn mrf_worker_size_to_count_clamps_negative_values() {
+        assert_eq!(mrf_worker_size_to_count(-1), 0);
+        assert_eq!(mrf_worker_size_to_count(0), 0);
+        assert_eq!(mrf_worker_size_to_count(3), 3);
     }
 
     #[test]
