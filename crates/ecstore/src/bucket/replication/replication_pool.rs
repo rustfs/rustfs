@@ -16,14 +16,16 @@ use super::datatypes::ResyncStatusType;
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
-    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
-    ReplicateObjectInfo, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
-    ResyncDecision, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
+    version_purge_statuses_map,
 };
+use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
+use super::replication_object_config::ReplicationConfig;
 use super::replication_resyncer::{
-    ReplicationConfig, ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
-    replicate_delete, replicate_object, save_resync_status,
+    ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, replicate_delete,
+    replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
@@ -32,10 +34,11 @@ use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
 use rustfs_replication::{
-    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueResult, ReplicationOperation, ReplicationPoolOpts,
-    ReplicationPriority, ReplicationQueueAdmission, WORKER_MAX_LIMIT, initial_worker_counts, mrf_worker_size_to_count,
-    next_large_worker_count, next_mrf_worker_count, next_regular_worker_count, resized_worker_counts, should_grow_large_workers,
-    should_queue_large_object,
+    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueAction, ReplicationHealQueueResult,
+    ReplicationHealResyncDeletes, ReplicationOperation, ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission,
+    WORKER_MAX_LIMIT, initial_worker_counts, mrf_worker_size_to_count, next_large_worker_count, next_mrf_worker_count,
+    next_regular_worker_count, replication_heal_queue_action, resized_worker_counts, should_auto_resume_resync,
+    should_grow_large_workers, should_queue_large_object,
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::sync::Arc;
@@ -53,19 +56,12 @@ use tokio::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, instrument, warn};
 
-const LOG_COMPONENT_ECSTORE: &str = "ecstore";
-const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 const EVENT_REPLICATION_WORKER_RESIZE_SKIPPED: &str = "replication_worker_resize_skipped";
 const EVENT_REPLICATION_WORKER_RESIZED: &str = "replication_worker_resized";
 const EVENT_REPLICATION_BACKPRESSURE: &str = "replication_backpressure";
 const EVENT_REPLICATION_RESYNC_LOAD_SKIPPED: &str = "replication_resync_load_skipped";
 const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
-const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
 const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
-
-fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
-    matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
-}
 
 /// Main replication pool structure
 #[derive(Debug)]
@@ -1383,140 +1379,52 @@ pub(crate) async fn queue_replication_heal_internal(
     roi = get_heal_replicate_object_info(&oi, &rcfg).await;
     roi.retry_count = retry_count;
 
-    if !roi.dsc.replicate_any() {
-        return ReplicationHealQueueResult {
+    match replication_heal_queue_action(&mut roi) {
+        ReplicationHealQueueAction::Skip => ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    // early return if replication already done, otherwise we need to determine if this
-    // version is an existing object that needs healing.
-    if roi.replication_status == ReplicationStatusType::Completed
-        && roi.version_purge_status.is_empty()
-        && !roi.existing_obj_resync.must_resync()
-    {
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    if roi.delete_marker || !roi.version_purge_status.is_empty() {
-        let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
-            (None, roi.version_id)
-        } else {
-            (roi.version_id, None)
-        };
-
-        let dv = DeletedObjectReplicationInfo {
-            delete_object: DeletedObject {
-                object_name: roi.name.clone(),
-                delete_marker_version_id: dm_version_id,
-                version_id,
-                replication_state: roi.replication_state.clone(),
-                delete_marker_mtime: roi.mod_time,
-                delete_marker: roi.delete_marker,
-                ..Default::default()
-            },
-            bucket: roi.bucket.clone(),
-            op_type: ReplicationType::Heal,
-            event_type: REPLICATE_HEAL_DELETE.to_string(),
-            ..Default::default()
-        };
-
-        // heal delete marker replication failure or versioned delete replication failure
-        if roi.replication_status == ReplicationStatusType::Pending
-            || roi.replication_status == ReplicationStatusType::Failed
-            || roi.version_purge_status == VersionPurgeStatusType::Failed
-            || roi.version_purge_status == VersionPurgeStatusType::Pending
-        {
-            let admission = if let Some(pool) = runtime_sources::replication_pool() {
-                pool.queue_replica_delete_task(dv).await
-            } else {
-                ReplicationQueueAdmission::Missed
-            };
-            return ReplicationHealQueueResult {
-                object_info: roi,
-                admission,
-            };
-        }
-
-        // if replication status is Complete on DeleteMarker and existing object resync required
-        let existing_obj_resync = roi.existing_obj_resync.clone();
-        if existing_obj_resync.must_resync()
-            && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
-        {
-            let admission = queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
-            return ReplicationHealQueueResult {
-                object_info: roi,
-                admission,
-            };
-        }
-
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    if roi.existing_obj_resync.must_resync() {
-        roi.op_type = ReplicationType::ExistingObject;
-    }
-
-    match roi.replication_status {
-        ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
-            roi.event_type = REPLICATE_HEAL.to_string();
+        },
+        ReplicationHealQueueAction::QueueObject => {
             let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_task(roi.clone()).await
             } else {
                 ReplicationQueueAdmission::Missed
             };
-            return ReplicationHealQueueResult {
+            ReplicationHealQueueResult {
                 object_info: roi,
                 admission,
-            };
+            }
         }
-        _ => {}
-    }
-
-    if roi.existing_obj_resync.must_resync() {
-        roi.event_type = REPLICATE_EXISTING.to_string();
-        let admission = if let Some(pool) = runtime_sources::replication_pool() {
-            pool.queue_replica_task(roi.clone()).await
-        } else {
-            ReplicationQueueAdmission::Missed
-        };
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission,
-        };
-    }
-
-    ReplicationHealQueueResult {
-        object_info: roi,
-        admission: ReplicationQueueAdmission::Skipped,
-    }
-}
-
-/// Wrapper function for queueing replicate deletes with resync decision
-async fn queue_replicate_deletes_wrapper(
-    doi: DeletedObjectReplicationInfo,
-    existing_obj_resync: ResyncDecision,
-) -> ReplicationQueueAdmission {
-    let mut admission = ReplicationQueueAdmission::Skipped;
-    for (k, v) in existing_obj_resync.targets.iter() {
-        if v.replicate {
-            let mut dv = doi.clone();
-            dv.reset_id = v.reset_id.clone();
-            dv.target_arn = k.clone();
-            let target_admission = if let Some(pool) = runtime_sources::replication_pool() {
+        ReplicationHealQueueAction::QueueDelete(dv) => {
+            let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {
                 ReplicationQueueAdmission::Missed
             };
-            admission.merge(target_admission);
+            ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            }
         }
+        ReplicationHealQueueAction::QueueResyncDeletes(batch) => {
+            let admission = queue_replicate_deletes(batch).await;
+            ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            }
+        }
+    }
+}
+
+async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> ReplicationQueueAdmission {
+    let mut admission = ReplicationQueueAdmission::Skipped;
+    for dv in batch.target_delete_infos() {
+        let target_admission = if let Some(pool) = runtime_sources::replication_pool() {
+            pool.queue_replica_delete_task(dv).await
+        } else {
+            ReplicationQueueAdmission::Missed
+        };
+        admission.merge(target_admission);
     }
     admission
 }
@@ -1536,16 +1444,6 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
-    }
-
-    #[test]
-    fn auto_resume_resync_only_for_inflight_states() {
-        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
-        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
-        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 
     // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────

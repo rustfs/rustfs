@@ -38,8 +38,8 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertContainsScenario(spark, "commit-conflict", "manual-validation-required")
 
         trino = by_client["Trino Iceberg REST catalog"]
-        self.assertEqual(trino["status"], "documented-read-path")
-        self.assertContainsScenario(trino, "catalog-load", "manual-validation-required")
+        self.assertEqual(trino["status"], "manual-live-read-probe")
+        self.assertContainsScenario(trino, "catalog-load", "manual-live-probe")
 
     def test_spark_config_uses_rustfs_rest_catalog_and_s3fileio(self) -> None:
         config = engine_compatibility.spark_catalog_config(
@@ -250,6 +250,33 @@ class EngineCompatibilityTest(unittest.TestCase):
         self.assertIn("spark-sql", spark["command"])
         self.assertIn("spark.sql.catalog.rustfs.uri=http://127.0.0.1:9000/iceberg", spark["command"])
         self.assertIn("SELECT COUNT(*) AS row_count", spark["sql"])
+
+        trino = by_client["Trino Iceberg REST catalog"]
+        self.assertEqual(trino["status"], "manual-live-read-probe")
+        self.assertIn("connector.name=iceberg", trino["catalog_properties"])
+        self.assertIn("iceberg.catalog.type=rest", trino["catalog_properties"])
+        self.assertIn("iceberg.rest-catalog.uri=http://127.0.0.1:9000/iceberg", trino["catalog_properties"])
+        self.assertIn("trino", trino["command"])
+        self.assertIn("SELECT COUNT(*) AS row_count", trino["sql"])
+        self.assertEqual(trino["write_compatibility"], "not-claimed")
+
+        duckdb = by_client["DuckDB Iceberg"]
+        self.assertEqual(duckdb["status"], "manual-live-read-probe")
+        self.assertIn("LOAD httpfs", duckdb["sql"])
+        self.assertIn("LOAD iceberg", duckdb["sql"])
+        self.assertIn("iceberg_scan", duckdb["sql"])
+        self.assertEqual(duckdb["write_compatibility"], "not-claimed")
+
+        snowflake = by_client["Snowflake Open Catalog / Iceberg integrations"]
+        self.assertEqual(snowflake["status"], "manual-reference-probe")
+        self.assertIn("CREATE OR REPLACE EXTERNAL VOLUME", snowflake["sql"])
+        self.assertEqual(snowflake["live_rustfs_interoperability"], "not-claimed")
+
+        databend = by_client["Databend"]
+        self.assertEqual(databend["status"], "manual-live-s3-stage-probe")
+        self.assertIn("CREATE STAGE", databend["sql"])
+        self.assertIn("SELECT COUNT(*)", databend["sql"])
+        self.assertEqual(databend["iceberg_rest_catalog"], "not-claimed")
 
     def test_cli_prints_live_conformance_harness(self) -> None:
         payload = engine_compatibility.cli_json(

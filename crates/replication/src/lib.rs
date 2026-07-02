@@ -24,7 +24,10 @@ pub mod runtime;
 pub mod stats;
 pub mod tagging;
 
-pub use config::{ObjectOpts, ReplicationConfigurationExt};
+pub use config::{
+    ObjectOpts, ReplicationConfigurationExt, ReplicationTargetValidationError, active_replication_rule_destination_arns,
+    replication_target_arns, should_remove_replication_target, validate_replication_config_target_arns,
+};
 pub use delete::{
     DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
     should_retry_delete_marker_purge,
@@ -35,13 +38,18 @@ pub use object::{
     replication_etags_match, target_is_newer_than_source_null_version,
 };
 pub use operation::{
-    MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
-    delete_replication_object_opts, heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
+    MustReplicateOptions, ReplicationDeleteSource, ReplicationDeleteStateSource, ReplicationResyncTargetObject,
+    delete_replication_missing_source_decision, delete_replication_object_opts, delete_replication_state_from_config,
+    heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
 };
-pub use queue::{ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
+pub use queue::{
+    ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission, replication_heal_queue_action,
+};
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
-    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, should_count_head_proxy_failure,
+    decode_resync_file, encode_resync_file, is_version_id_mismatch, resync_state_accepts_update, should_auto_resume_resync,
+    should_count_head_proxy_failure,
 };
 pub use rule::ReplicationRuleExt;
 pub use runtime::{
