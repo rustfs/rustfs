@@ -347,6 +347,8 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENABLE: bool = false; // Disabled until
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_MIN_SIZE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE: usize = MI_B;
+const ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE: usize = MI_B;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = "RUSTFS_GET_CODEC_STREAMING_ENGINE";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_ENGINE: &str = GET_CODEC_STREAMING_ENGINE_LEGACY;
@@ -365,6 +367,11 @@ const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE: bool = false;
 
 const ENV_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: &str = "RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS";
 const DEFAULT_RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS: usize = 256;
+
+const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE: &str = "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE: bool = false;
+const ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: &str = "RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE";
+const DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE: usize = 512 * 1024;
 
 const ENV_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: &str = "RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY";
 const DEFAULT_RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY: bool = false;
@@ -648,7 +655,57 @@ pub fn should_use_metadata_early_stop(bucket: &str, object: &str) -> bool {
 }
 
 fn get_codec_streaming_min_size() -> usize {
-    rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE)
+    if std::env::var_os(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE).is_some() {
+        return rustfs_utils::get_env_usize(ENV_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE, DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE);
+    }
+
+    match get_codec_streaming_engine() {
+        GetCodecStreamingEngine::Rustfs => rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE,
+        ),
+        GetCodecStreamingEngine::Legacy => DEFAULT_RUSTFS_GET_CODEC_STREAMING_MIN_SIZE,
+    }
+}
+
+fn is_get_codec_streaming_data_blocks_first_enabled() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<bool> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE,
+            )
+        })
+    }
+}
+
+fn get_codec_streaming_data_blocks_first_max_size() -> usize {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_usize(
+            ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE,
+            DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<usize> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_usize(
+                ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE,
+                DEFAULT_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE,
+            )
+        })
+    }
 }
 
 fn get_object_metadata_cache_max_entries() -> usize {
@@ -840,6 +897,7 @@ impl GetCodecStreamingObjectClass {
 struct GetCodecStreamingGate {
     object_class: GetCodecStreamingObjectClass,
     decision: GetCodecStreamingDecision,
+    prefer_data_blocks_first_reader_setup: bool,
 }
 
 fn record_get_codec_streaming_gate_decision(
@@ -946,6 +1004,24 @@ fn is_get_small_object_direct_memory_eligible(
         )
 }
 
+fn should_prefer_codec_streaming_data_blocks_first_reader_setup(
+    object_class: GetCodecStreamingObjectClass,
+    object_size: i64,
+) -> bool {
+    if !is_get_codec_streaming_data_blocks_first_enabled()
+        || object_class != GetCodecStreamingObjectClass::PlainSinglePart
+        || object_size <= 0
+    {
+        return false;
+    }
+
+    let Ok(object_size) = usize::try_from(object_size) else {
+        return false;
+    };
+    let max_size = get_codec_streaming_data_blocks_first_max_size();
+    max_size > 0 && object_size <= max_size
+}
+
 fn get_codec_streaming_reader_gate(
     bucket: &str,
     object: &str,
@@ -960,42 +1036,49 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Disabled),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if !get_codec_streaming_rollout().is_opted_in() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutNotOptedIn),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if !should_use_codec_streaming(bucket, object) {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::RolloutPctNotSelected),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if !is_get_codec_streaming_body_compat_confirmed() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BodyCompatibilityUnconfirmed),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if !is_get_codec_streaming_header_compat_confirmed() {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::HeaderCompatibilityUnconfirmed),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if object_class == GetCodecStreamingObjectClass::Range {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Range),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if !lock_optimization_enabled {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::LockOptimizationDisabled),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
 
@@ -1003,30 +1086,35 @@ fn get_codec_streaming_reader_gate(
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::InvalidMinSize),
+            prefer_data_blocks_first_reader_setup: false,
         };
     };
     if object_info.size < min_size {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::BelowMinSize),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if object_class == GetCodecStreamingObjectClass::Encrypted {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Encrypted),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if object_class == GetCodecStreamingObjectClass::Compressed {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Compressed),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if object_class == GetCodecStreamingObjectClass::Remote {
         return GetCodecStreamingGate {
             object_class,
             decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Remote),
+            prefer_data_blocks_first_reader_setup: false,
         };
     }
     if object_class == GetCodecStreamingObjectClass::Multipart {
@@ -1034,12 +1122,14 @@ fn get_codec_streaming_reader_gate(
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::Multipart),
+                prefer_data_blocks_first_reader_setup: false,
             };
         }
         if fi.parts.len() > get_codec_streaming_multipart_max_parts() {
             return GetCodecStreamingGate {
                 object_class,
                 decision: GetCodecStreamingDecision::Fallback(GetCodecStreamingFallbackReason::MultipartPartLimit),
+                prefer_data_blocks_first_reader_setup: false,
             };
         }
     }
@@ -1047,6 +1137,10 @@ fn get_codec_streaming_reader_gate(
     GetCodecStreamingGate {
         object_class,
         decision: GetCodecStreamingDecision::Use,
+        prefer_data_blocks_first_reader_setup: should_prefer_codec_streaming_data_blocks_first_reader_setup(
+            object_class,
+            object_info.size,
+        ),
     }
 }
 
@@ -1694,6 +1788,14 @@ fn classify_multipart_part_write_path(object_size: i64, block_size: usize) -> Sm
     }
 }
 
+fn known_put_object_storage_size(data_size: i64) -> i64 {
+    if data_size >= 0 {
+        data_size
+    } else {
+        HashReader::SIZE_PRESERVE_LAYER
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn build_inline_bitrot_readers(
     files: &[FileInfo],
@@ -2274,6 +2376,9 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     self.set_index,
                     self.pool_index,
                     opts.skip_verify_bitrot,
+                    object_class.as_str(),
+                    size_bucket,
+                    codec_streaming_gate.prefer_data_blocks_first_reader_setup,
                 )
                 .await?
                 {
@@ -2450,10 +2555,11 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let result: Result<ObjectInfo> = async {
             let erasure = coding::Erasure::new(fi.erasure.data_blocks, fi.erasure.parity_blocks, fi.erasure.block_size);
 
+            let put_object_size = known_put_object_storage_size(data.size());
             let is_inline_buffer =
-                runtime_sources::storage_class_should_inline(erasure.shard_file_size(data.size()), opts.versioned);
+                runtime_sources::storage_class_should_inline(erasure.shard_file_size(put_object_size), opts.versioned);
 
-            let shard_file_size = erasure.shard_file_size(data.size());
+            let shard_file_size = erasure.shard_file_size(put_object_size);
             let shard_size = erasure.shard_size();
             let writer_setup_stage_start = Instant::now();
             let writer_futs: Vec<_> = shuffle_disks
@@ -2531,7 +2637,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
             );
 
-            let write_path = classify_put_write_path(is_inline_buffer, data.size(), fi.erasure.block_size);
+            let write_path = classify_put_write_path(is_inline_buffer, put_object_size, fi.erasure.block_size);
             rustfs_io_metrics::record_put_object_path(write_path.metric_label());
 
             let encode_stage_start = Instant::now();
@@ -9895,8 +10001,29 @@ mod tests {
             SmallWritePath::Pipeline
         ));
         assert!(matches!(
+            classify_put_write_path(false, 31 * 1024 * 1024, 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
             classify_put_write_path(true, 64 * 1024 * 1024, 1024 * 1024),
             SmallWritePath::Pipeline
+        ));
+    }
+
+    #[test]
+    fn put_object_classification_uses_only_known_storage_size() {
+        assert_eq!(known_put_object_storage_size(42), 42);
+        assert_eq!(
+            known_put_object_storage_size(HashReader::SIZE_PRESERVE_LAYER),
+            HashReader::SIZE_PRESERVE_LAYER
+        );
+        assert!(matches!(
+            classify_put_write_path(false, known_put_object_storage_size(HashReader::SIZE_PRESERVE_LAYER), 1024 * 1024),
+            SmallWritePath::Pipeline
+        ));
+        assert!(matches!(
+            classify_put_write_path(false, known_put_object_storage_size(1024 * 1024), 1024 * 1024),
+            SmallWritePath::SingleBlockNonInline
         ));
     }
 

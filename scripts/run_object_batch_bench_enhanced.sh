@@ -14,12 +14,14 @@ ENDPOINT=""
 ACCESS_KEY=""
 SECRET_KEY=""
 BUCKET="rustfs-bench"
+BUCKET_SIZE_SUFFIX=false
 REGION="us-east-1"
 CONCURRENCY=128
 SIZES="$DEFAULT_SIZES"
 OUT_DIR=""
 INSECURE=false
 DRY_RUN=false
+PYTHON_BIN="python3"
 
 # warp options
 WARP_BIN="warp"
@@ -34,7 +36,7 @@ SAMPLES=20000
 ROUNDS=3
 RETRY_PER_ROUND=2
 RETRY_SLEEP_SECS=2
-COOLDOWN_SECS=0
+COOLDOWN_SECS=20
 BASELINE_CSV=""
 EXTRA_ARGS=()
 FAILED_FINAL_ROUNDS=0
@@ -44,7 +46,13 @@ SERVICE_METRICS_CAPTURE_ATTEMPTS=3
 SERVICE_METRICS_CAPTURE_RETRY_SECS=1
 SERVICE_METRICS_CONNECT_TIMEOUT_SECS=2
 SERVICE_METRICS_MAX_TIME_SECS=15
-SERVICE_METRICS_FILTER_REGEX="rustfs_io_get_object_"
+SERVICE_METRICS_SETTLE_SECS=0
+SERVICE_METRICS_FILTER_REGEX=""
+SERVICE_METRICS_FILTER_REGEX_EXPLICIT=false
+SERVICE_PROMETHEUS_QUERY_URL=""
+SERVICE_PROMETHEUS_QUERY=""
+SERVICE_PROMETHEUS_QUERY_EXPLICIT=false
+SERVICE_METRICS_SERVICE_NAME=""
 
 usage() {
   cat <<'USAGE'
@@ -60,12 +68,15 @@ Required:
 
 Core options:
   --bucket                     Bucket name (default: rustfs-bench)
+  --bucket-size-suffix         Append a sanitized object size suffix to the
+                               bucket for each size
   --region                     Region (default: us-east-1)
   --concurrency                Concurrency for all sizes (default: 128)
   --sizes                      Comma-separated sizes (default: 1KiB..10MiB matrix)
   --out-dir                    Output directory (default: target/bench/object-batch-enhanced-<timestamp>)
   --insecure                   Allow insecure TLS
   --dry-run                    Print commands only, do not execute
+  --python-bin                 Python binary for Prometheus query capture (default: python3)
 
 Warp options:
   --warp-bin                   warp binary (default: warp)
@@ -80,11 +91,17 @@ Enhanced options:
   --rounds                     Benchmark rounds per size (default: 3)
   --retry-per-round            Retry count per failed round (default: 2)
   --retry-sleep-secs           Sleep seconds between retries (default: 2)
-  --cooldown-secs              Sleep seconds between rounds/sizes (default: 0)
+  --cooldown-secs              Sleep seconds between rounds/sizes (default: 20)
   --round-cooldown-secs        Compatibility alias for --cooldown-secs
   --baseline-csv               Baseline median CSV to compare
   --extra-args                 Extra args appended to tool command, quoted as one string
   --service-metrics-url        Optional Prometheus scrape URL captured before/after each round attempt
+  --service-prometheus-query-url
+                               Optional Prometheus HTTP API /api/v1/query URL for OTLP-exported metrics
+  --service-prometheus-query   PromQL used with --service-prometheus-query-url
+                               (default: auto by tool/mode)
+  --service-metrics-service-name
+                               Optional service.name/service_name label filter for Prometheus query results
   --service-metrics-dir        Output directory for per-round service metric snapshots
   --service-metrics-attempts   Capture attempts for each snapshot (default: 3)
   --service-metrics-retry-secs Sleep seconds between failed capture attempts (default: 1)
@@ -92,9 +109,11 @@ Enhanced options:
                                Curl connect timeout for each metrics capture (default: 2)
   --service-metrics-max-time-secs
                                Curl max time for each metrics capture (default: 15)
+  --service-metrics-settle-secs
+                               Sleep seconds before after-snapshot capture (default: 0)
   --service-metrics-filter-regex
                                Regex for retained metrics lines after scrape
-                               (default: rustfs_io_get_object_)
+                               (default: auto by tool/mode)
 
 Output files:
   round_results.csv            One row per round attempt (with retry trace)
@@ -136,12 +155,14 @@ parse_args() {
       --access-key) ACCESS_KEY="$2"; shift 2 ;;
       --secret-key) SECRET_KEY="$2"; shift 2 ;;
       --bucket) BUCKET="$2"; shift 2 ;;
+      --bucket-size-suffix) BUCKET_SIZE_SUFFIX=true; shift ;;
       --region) REGION="$2"; shift 2 ;;
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --sizes) SIZES="$2"; shift 2 ;;
       --out-dir) OUT_DIR="$2"; shift 2 ;;
       --insecure) INSECURE=true; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
+      --python-bin) PYTHON_BIN="$2"; shift 2 ;;
       --warp-bin) WARP_BIN="$2"; shift 2 ;;
       --warp-mode) WARP_MODE="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
@@ -154,12 +175,16 @@ parse_args() {
       --round-cooldown-secs) COOLDOWN_SECS="$2"; shift 2 ;;
       --baseline-csv) BASELINE_CSV="$2"; shift 2 ;;
       --service-metrics-url) SERVICE_METRICS_URL="$2"; shift 2 ;;
+      --service-prometheus-query-url) SERVICE_PROMETHEUS_QUERY_URL="$2"; shift 2 ;;
+      --service-prometheus-query) SERVICE_PROMETHEUS_QUERY="$2"; SERVICE_PROMETHEUS_QUERY_EXPLICIT=true; shift 2 ;;
+      --service-metrics-service-name) SERVICE_METRICS_SERVICE_NAME="$2"; shift 2 ;;
       --service-metrics-dir) SERVICE_METRICS_DIR="$2"; shift 2 ;;
       --service-metrics-attempts) SERVICE_METRICS_CAPTURE_ATTEMPTS="$2"; shift 2 ;;
       --service-metrics-retry-secs) SERVICE_METRICS_CAPTURE_RETRY_SECS="$2"; shift 2 ;;
       --service-metrics-connect-timeout-secs) SERVICE_METRICS_CONNECT_TIMEOUT_SECS="$2"; shift 2 ;;
       --service-metrics-max-time-secs) SERVICE_METRICS_MAX_TIME_SECS="$2"; shift 2 ;;
-      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; shift 2 ;;
+      --service-metrics-settle-secs) SERVICE_METRICS_SETTLE_SECS="$2"; shift 2 ;;
+      --service-metrics-filter-regex) SERVICE_METRICS_FILTER_REGEX="$2"; SERVICE_METRICS_FILTER_REGEX_EXPLICIT=true; shift 2 ;;
       --extra-args)
         # shellcheck disable=SC2206
         EXTRA_ARGS=($2)
@@ -205,6 +230,48 @@ cooldown_sleep() {
   fi
 }
 
+default_service_metrics_filter_regex() {
+  if [[ "$TOOL" == "warp" ]]; then
+    case "$WARP_MODE" in
+      get)
+        echo "rustfs_io_get_object_|rustfs_s3_get_object_|rustfs_zero_copy_read|rustfs_mmap_|rustfs_get_object_"
+        return
+        ;;
+      put)
+        echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_write|rustfs_buffer_|rustfs_ec_|rustfs_io_bytespool_"
+        return
+        ;;
+      mixed)
+        echo "rustfs_s3_get_object_|rustfs_io_get_object_|rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_zero_copy_|rustfs_buffer_|rustfs_ec_"
+        return
+        ;;
+    esac
+  fi
+
+  echo "rustfs_s3_put_object_|rustfs_io_put_object_|rustfs_s3_get_object_|rustfs_io_get_object_"
+}
+
+default_service_prometheus_query() {
+  if [[ "$TOOL" == "warp" ]]; then
+    case "$WARP_MODE" in
+      get)
+        echo '{__name__=~"rustfs_(io_get_object|s3_get_object|zero_copy_read|mmap|get_object)_.*"}'
+        return
+        ;;
+      put)
+        echo '{__name__=~"rustfs_(s3_put_object|io_put_object|zero_copy_write|buffer|ec|io_bytespool)_.*"}'
+        return
+        ;;
+      mixed)
+        echo '{__name__=~"rustfs_(s3_get_object|io_get_object|s3_put_object|io_put_object|zero_copy|buffer|ec)_.*"}'
+        return
+        ;;
+    esac
+  fi
+
+  echo '{__name__=~"rustfs_(s3_put_object|io_put_object|s3_get_object|io_get_object)_.*"}'
+}
+
 validate_args() {
   if [[ "$TOOL" != "warp" && "$TOOL" != "s3bench" ]]; then
     echo "ERROR: --tool must be warp or s3bench" >&2
@@ -223,12 +290,20 @@ validate_args() {
   validate_nonnegative_int "$SERVICE_METRICS_CAPTURE_RETRY_SECS" "--service-metrics-retry-secs"
   validate_positive_int "$SERVICE_METRICS_CONNECT_TIMEOUT_SECS" "--service-metrics-connect-timeout-secs"
   validate_positive_int "$SERVICE_METRICS_MAX_TIME_SECS" "--service-metrics-max-time-secs"
-  if [[ -n "$SERVICE_METRICS_URL" && -z "$SERVICE_METRICS_DIR" ]]; then
-    echo "ERROR: --service-metrics-dir is required when --service-metrics-url is set" >&2
+  validate_nonnegative_int "$SERVICE_METRICS_SETTLE_SECS" "--service-metrics-settle-secs"
+  if [[ -n "$SERVICE_METRICS_URL" && -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    echo "ERROR: --service-metrics-url and --service-prometheus-query-url are mutually exclusive" >&2
+    exit 1
+  fi
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]] && [[ -z "$SERVICE_METRICS_DIR" ]]; then
+    echo "ERROR: --service-metrics-dir is required when service metrics capture is enabled" >&2
     exit 1
   fi
   if [[ -n "$SERVICE_METRICS_URL" ]]; then
     require_cmd curl
+  fi
+  if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    require_cmd "$PYTHON_BIN"
   fi
   if [[ "$TOOL" == "s3bench" ]]; then
     validate_positive_int "$SAMPLES" "--samples"
@@ -238,6 +313,10 @@ validate_args() {
     exit 1
   fi
   if [[ "$TOOL" == "warp" ]]; then
+    if [[ "$WARP_MODE" != "get" && "$WARP_MODE" != "put" && "$WARP_MODE" != "mixed" ]]; then
+      echo "ERROR: --warp-mode must be get, put, or mixed" >&2
+      exit 1
+    fi
     local warp_host
     warp_host="$(normalize_warp_host "$ENDPOINT")"
     if [[ -z "$warp_host" ]]; then
@@ -245,6 +324,89 @@ validate_args() {
       exit 1
     fi
   fi
+  if [[ "$SERVICE_METRICS_FILTER_REGEX_EXPLICIT" != "true" && -z "$SERVICE_METRICS_FILTER_REGEX" ]]; then
+    SERVICE_METRICS_FILTER_REGEX="$(default_service_metrics_filter_regex)"
+  fi
+  if [[ "$SERVICE_PROMETHEUS_QUERY_EXPLICIT" != "true" && -z "$SERVICE_PROMETHEUS_QUERY" ]]; then
+    SERVICE_PROMETHEUS_QUERY="$(default_service_prometheus_query)"
+  fi
+}
+
+git_value() {
+  local default_value="$1"
+  shift
+  git "$@" 2>/dev/null || echo "$default_value"
+}
+
+git_dirty_state() {
+  if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    echo "unknown"
+    return
+  fi
+  if ! git diff --quiet --ignore-submodules --; then
+    echo "dirty"
+    return
+  fi
+  if ! git diff --cached --quiet --ignore-submodules --; then
+    echo "dirty"
+    return
+  fi
+  echo "clean"
+}
+
+write_run_manifest() {
+  local manifest_file="$OUT_DIR/run_manifest.env"
+  local started_at_utc git_commit git_branch git_dirty rustc_version uname_s service_metrics_csv
+  started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  git_commit="$(git_value unknown rev-parse --short HEAD)"
+  git_branch="$(git_value unknown branch --show-current)"
+  git_dirty="$(git_dirty_state)"
+  rustc_version="$(rustc --version 2>/dev/null || echo unknown)"
+  uname_s="$(uname -a 2>/dev/null || echo unknown)"
+  service_metrics_csv="${SERVICE_METRICS_CSV:-}"
+
+  cat >"$manifest_file" <<EOF
+started_at_utc=${started_at_utc}
+git_commit=${git_commit}
+git_branch=${git_branch}
+git_dirty=${git_dirty}
+rustc_version=${rustc_version}
+uname=${uname_s}
+tool=${TOOL}
+endpoint=${ENDPOINT}
+access_key=REDACTED
+secret_key=REDACTED
+bucket=${BUCKET}
+bucket_size_suffix=${BUCKET_SIZE_SUFFIX}
+region=${REGION}
+concurrency=${CONCURRENCY}
+sizes=${SIZES}
+rounds=${ROUNDS}
+retry_per_round=${RETRY_PER_ROUND}
+retry_sleep_secs=${RETRY_SLEEP_SECS}
+cooldown_secs=${COOLDOWN_SECS}
+warp_bin=${WARP_BIN}
+warp_mode=${WARP_MODE}
+duration=${DURATION}
+s3bench_bin=${S3BENCH_BIN}
+samples=${SAMPLES}
+baseline_csv=${BASELINE_CSV}
+service_metrics_url=${SERVICE_METRICS_URL}
+service_prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL}
+service_prometheus_query=${SERVICE_PROMETHEUS_QUERY}
+service_prometheus_query_explicit=${SERVICE_PROMETHEUS_QUERY_EXPLICIT}
+service_metrics_service_name=${SERVICE_METRICS_SERVICE_NAME}
+service_metrics_dir=${SERVICE_METRICS_DIR}
+service_metrics_csv=${service_metrics_csv}
+service_metrics_filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+service_metrics_filter_regex_explicit=${SERVICE_METRICS_FILTER_REGEX_EXPLICIT}
+service_metrics_capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
+service_metrics_retry_secs=${SERVICE_METRICS_CAPTURE_RETRY_SECS}
+service_metrics_connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
+service_metrics_max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+service_metrics_settle_secs=${SERVICE_METRICS_SETTLE_SECS}
+dry_run=${DRY_RUN}
+EOF
 }
 
 setup_output() {
@@ -252,20 +414,38 @@ setup_output() {
     OUT_DIR="target/bench/object-batch-enhanced-$(date +%Y%m%d-%H%M%S)"
   fi
   mkdir -p "$OUT_DIR/logs"
-  if [[ -n "$SERVICE_METRICS_URL" ]]; then
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     mkdir -p "$SERVICE_METRICS_DIR"
   fi
 
   ROUND_CSV="$OUT_DIR/round_results.csv"
   MEDIAN_CSV="$OUT_DIR/median_summary.csv"
   COMPARE_CSV="$OUT_DIR/baseline_compare.csv"
+  SERVICE_METRICS_CSV="$OUT_DIR/service_metrics_captures.csv"
 
   echo "size,tool,round,attempt,concurrency,status,exit_code,round_started_at_utc,round_finished_at_utc,throughput_human,throughput_bps,reqps,latency_human,latency_ms,log_file,req_p90_human,req_p90_ms,req_p99_human,req_p99_ms" > "$ROUND_CSV"
   echo "size,tool,concurrency,successful_rounds,failed_rounds,median_throughput_bps,median_reqps,median_latency_ms,median_req_p90_ms,median_req_p99_ms" > "$MEDIAN_CSV"
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    echo "size,tool,round,attempt,phase,source,status,capture_attempt,raw_bytes,snapshot_bytes,status_file,snapshot_file,filter_regex,prometheus_query" > "$SERVICE_METRICS_CSV"
+  fi
+  write_run_manifest
 }
 
 trim() {
   echo "$1" | awk '{$1=$1;print}'
+}
+
+sanitize_bucket_suffix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-'
+}
+
+bucket_for_size() {
+  local size="$1"
+  if [[ "$BUCKET_SIZE_SUFFIX" != "true" ]]; then
+    echo "$BUCKET"
+    return
+  fi
+  echo "${BUCKET}-$(sanitize_bucket_suffix "$size")"
 }
 
 to_bps() {
@@ -400,17 +580,119 @@ filter_service_metrics_snapshot() {
   fi
 }
 
+settle_before_after_metrics_capture() {
+  if (( SERVICE_METRICS_SETTLE_SECS <= 0 )); then
+    return 0
+  fi
+  if [[ "$DRY_RUN" == "true" ]]; then
+    echo "[DRY-RUN] sleep ${SERVICE_METRICS_SETTLE_SECS}"
+  else
+    sleep "$SERVICE_METRICS_SETTLE_SECS"
+  fi
+}
+
+capture_prometheus_query_snapshot() {
+  local phase="$1"
+  local snapshot_file="$2"
+  local status_file="$3"
+  local capture_attempt="$4"
+
+  "$PYTHON_BIN" - "$SERVICE_PROMETHEUS_QUERY_URL" "$SERVICE_PROMETHEUS_QUERY" "$phase" "$snapshot_file" "$status_file" "$SERVICE_METRICS_SERVICE_NAME" "$SERVICE_METRICS_SETTLE_SECS" "$SERVICE_METRICS_MAX_TIME_SECS" "$SERVICE_METRICS_FILTER_REGEX" "$capture_attempt" <<'PY'
+import json
+import pathlib
+import sys
+import urllib.parse
+import urllib.request
+
+query_url, query, phase, snapshot_raw, status_raw, service_name, settle_secs, timeout_secs_raw, filter_regex, capture_attempt = sys.argv[1:]
+snapshot_path = pathlib.Path(snapshot_raw)
+status_path = pathlib.Path(status_raw)
+timeout_secs = float(timeout_secs_raw)
+
+
+def write_status(status):
+    status_path.write_text(
+        "\n".join(
+            [
+                f"phase={phase}",
+                f"status={status}",
+                f"url={query_url}",
+                f"query={query}",
+                f"service_name={service_name}",
+                f"settle_secs={settle_secs}",
+                f"max_time_secs={timeout_secs_raw}",
+                f"filter_regex={filter_regex}",
+                f"capture_attempt={capture_attempt}",
+                "",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+
+def escape_label(value):
+    return value.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+
+def sample_to_line(sample):
+    metric = dict(sample.get("metric", {}))
+    name = metric.pop("__name__", "")
+    if not name:
+        return None
+    labels = ",".join(f'{key}="{escape_label(value)}"' for key, value in sorted(metric.items()))
+    value = sample.get("value", [None, None])[1]
+    if value is None:
+        return None
+    if labels:
+        return f"{name}{{{labels}}} {value}"
+    return f"{name} {value}"
+
+
+try:
+    separator = "&" if "?" in query_url else "?"
+    url = f"{query_url}{separator}{urllib.parse.urlencode({'query': query})}"
+    request = urllib.request.Request(url, headers={"Accept": "application/json"})
+    with urllib.request.urlopen(request, timeout=timeout_secs) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+except Exception as err:  # noqa: BLE001 - shell harness reports failures in status files.
+    snapshot_path.write_text(f"# prometheus_query_failed error={err}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+if payload.get("status") != "success":
+    snapshot_path.write_text(f"# prometheus_query_failed payload_status={payload.get('status')}\n", encoding="utf-8")
+    write_status("query_failed")
+    raise SystemExit(0)
+
+samples = [
+    sample
+    for sample in payload.get("data", {}).get("result", [])
+    if not service_name
+    or sample.get("metric", {}).get("service.name") == service_name
+    or sample.get("metric", {}).get("service_name") == service_name
+]
+lines = [line for sample in samples if (line := sample_to_line(sample))]
+if not lines:
+    snapshot_path.write_text(f"# no_matching_metrics service_name={service_name}\n", encoding="utf-8")
+    write_status("no_matching_metrics")
+    raise SystemExit(0)
+
+snapshot_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+write_status("ok")
+PY
+}
+
 capture_round_service_metrics() {
   local size="$1"
   local round="$2"
   local attempt="$3"
   local phase="$4"
 
-  if [[ -z "$SERVICE_METRICS_URL" ]]; then
+  if [[ -z "$SERVICE_METRICS_URL" && -z "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
     return 0
   fi
 
-  local token snapshot_file status_file tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes
+  local token snapshot_file status_file tmp_file filtered_file capture_attempt raw_bytes snapshot_bytes capture_status
   token="$(metric_snapshot_token "$size" "$round" "$attempt")"
   snapshot_file="${SERVICE_METRICS_DIR}/${token}_${phase}.prom"
   status_file="${SERVICE_METRICS_DIR}/${token}_${phase}.status"
@@ -426,8 +708,54 @@ attempt=${attempt}
 phase=${phase}
 status=not_run_dry_run
 url=${SERVICE_METRICS_URL}
+prometheus_query_url=${SERVICE_PROMETHEUS_QUERY_URL}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+prometheus_query=${SERVICE_PROMETHEUS_QUERY}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
+    echo "$size,$TOOL,$round,$attempt,$phase,dry_run,not_run_dry_run,0,0,0,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+    return 0
+  fi
+
+  if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    for ((capture_attempt=1; capture_attempt<=SERVICE_METRICS_CAPTURE_ATTEMPTS; capture_attempt++)); do
+      capture_prometheus_query_snapshot "$phase" "$tmp_file" "$status_file" "$capture_attempt"
+      capture_status="$(awk -F= '$1=="status" {print $2; exit}' "$status_file")"
+      if [[ "${capture_status:-unknown}" == "ok" && -s "$tmp_file" ]]; then
+        raw_bytes="$(wc -c <"$tmp_file" | tr -d '[:space:]')"
+        filter_service_metrics_snapshot "$tmp_file" "$filtered_file"
+        mv "$filtered_file" "$snapshot_file"
+        snapshot_bytes="$(wc -c <"$snapshot_file" | tr -d '[:space:]')"
+        {
+          echo "raw_bytes=${raw_bytes}"
+          echo "snapshot_bytes=${snapshot_bytes}"
+        } >>"$status_file"
+        echo "$size,$TOOL,$round,$attempt,$phase,prometheus_query,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+        return 0
+      fi
+
+      rm -f "$tmp_file" "$filtered_file"
+      if (( capture_attempt < SERVICE_METRICS_CAPTURE_ATTEMPTS && SERVICE_METRICS_CAPTURE_RETRY_SECS > 0 )); then
+        sleep "$SERVICE_METRICS_CAPTURE_RETRY_SECS"
+      fi
+    done
+
+    : >"$snapshot_file"
+    cat >"$status_file" <<EOF
+size=${size}
+round=${round}
+attempt=${attempt}
+phase=${phase}
+status=capture_failed
+capture_attempts=${SERVICE_METRICS_CAPTURE_ATTEMPTS}
+url=${SERVICE_PROMETHEUS_QUERY_URL}
+query=${SERVICE_PROMETHEUS_QUERY}
+max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
+filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
+EOF
+    echo "$size,$TOOL,$round,$attempt,$phase,prometheus_query,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
+    echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
     return 0
   fi
 
@@ -454,7 +782,9 @@ max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
 raw_bytes=${raw_bytes}
 snapshot_bytes=${snapshot_bytes}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
+        echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,ok,$capture_attempt,$raw_bytes,$snapshot_bytes,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
         return 0
       fi
     fi
@@ -477,7 +807,9 @@ url=${SERVICE_METRICS_URL}
 connect_timeout_secs=${SERVICE_METRICS_CONNECT_TIMEOUT_SECS}
 max_time_secs=${SERVICE_METRICS_MAX_TIME_SECS}
 filter_regex=${SERVICE_METRICS_FILTER_REGEX}
+settle_secs=${SERVICE_METRICS_SETTLE_SECS}
 EOF
+  echo "$size,$TOOL,$round,$attempt,$phase,prometheus_text,capture_failed,$SERVICE_METRICS_CAPTURE_ATTEMPTS,N/A,N/A,$status_file,$snapshot_file,$SERVICE_METRICS_FILTER_REGEX,$SERVICE_PROMETHEUS_QUERY" >> "$SERVICE_METRICS_CSV"
   echo "WARN: failed to capture service metrics size=${size} round=${round} attempt=${attempt} phase=${phase}" >&2
 }
 
@@ -515,14 +847,15 @@ run_one_attempt() {
   started_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
   if [[ "$TOOL" == "warp" ]]; then
-    local warp_host
+    local warp_host bucket
     warp_host="$(normalize_warp_host "$ENDPOINT")"
+    bucket="$(bucket_for_size "$size")"
     local cmd=(
       "$WARP_BIN" "$WARP_MODE"
       "--host" "$warp_host"
       "--access-key" "$ACCESS_KEY"
       "--secret-key" "$SECRET_KEY"
-      "--bucket" "$BUCKET"
+      "--bucket" "$bucket"
       "--obj.size" "$size"
       "--concurrent" "$CONCURRENCY"
       "--duration" "$DURATION"
@@ -548,11 +881,13 @@ run_one_attempt() {
       fi
     fi
   else
+    local bucket
+    bucket="$(bucket_for_size "$size")"
     local cmd=(
       "$S3BENCH_BIN"
       "-accessKey=$ACCESS_KEY"
       "-secretKey=$SECRET_KEY"
-      "-bucket=$BUCKET"
+      "-bucket=$bucket"
       "-endpoint=$ENDPOINT"
       "-region=$REGION"
       "-numClients=$CONCURRENCY"
@@ -580,6 +915,7 @@ run_one_attempt() {
     fi
   fi
   finished_at_utc="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  settle_before_after_metrics_capture
   capture_round_service_metrics "$size" "$round" "$attempt" after
 
   local metrics throughput_human reqps latency_human throughput_bps latency_ms req_p90_human req_p90_ms req_p99_human req_p99_ms
@@ -733,6 +1069,16 @@ main() {
   echo "Rounds: $ROUNDS"
   echo "Retry per round: $RETRY_PER_ROUND"
   echo "Cooldown secs: $COOLDOWN_SECS"
+  if [[ -n "$SERVICE_METRICS_URL" || -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+    echo "Service metrics filter: $SERVICE_METRICS_FILTER_REGEX"
+    if [[ -n "$SERVICE_PROMETHEUS_QUERY_URL" ]]; then
+      echo "Service Prometheus query URL: $SERVICE_PROMETHEUS_QUERY_URL"
+      echo "Service Prometheus query: $SERVICE_PROMETHEUS_QUERY"
+      if [[ -n "$SERVICE_METRICS_SERVICE_NAME" ]]; then
+        echo "Service metrics service name: $SERVICE_METRICS_SERVICE_NAME"
+      fi
+    fi
+  fi
 
   IFS=',' read -r -a size_arr <<< "$SIZES"
   local total_sizes="${#size_arr[@]}"

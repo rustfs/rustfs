@@ -190,6 +190,9 @@ pub const GET_OBJECT_SIZE_BUCKET_LE_4_KIB: &str = "le_4kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_16_KIB: &str = "le_16kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_64_KIB: &str = "le_64kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_128_KIB: &str = "le_128kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_192_KIB: &str = "le_192kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_256_KIB: &str = "le_256kib";
+pub const GET_OBJECT_SIZE_BUCKET_LE_512_KIB: &str = "le_512kib";
 pub const GET_OBJECT_SIZE_BUCKET_LE_1_MIB: &str = "le_1mib";
 pub const GET_OBJECT_SIZE_BUCKET_GT_1_MIB: &str = "gt_1mib";
 
@@ -201,7 +204,10 @@ pub const fn get_object_size_bucket(size_bytes: i64) -> &'static str {
         4_097..=16_384 => GET_OBJECT_SIZE_BUCKET_LE_16_KIB,
         16_385..=65_536 => GET_OBJECT_SIZE_BUCKET_LE_64_KIB,
         65_537..=131_072 => GET_OBJECT_SIZE_BUCKET_LE_128_KIB,
-        131_073..=1_048_576 => GET_OBJECT_SIZE_BUCKET_LE_1_MIB,
+        131_073..=196_608 => GET_OBJECT_SIZE_BUCKET_LE_192_KIB,
+        196_609..=262_144 => GET_OBJECT_SIZE_BUCKET_LE_256_KIB,
+        262_145..=524_288 => GET_OBJECT_SIZE_BUCKET_LE_512_KIB,
+        524_289..=1_048_576 => GET_OBJECT_SIZE_BUCKET_LE_1_MIB,
         _ => GET_OBJECT_SIZE_BUCKET_GT_1_MIB,
     }
 }
@@ -1124,6 +1130,29 @@ pub fn record_get_object_reader_setup_strategy(strategy: &'static str, mode: &'s
     .increment(1);
 }
 
+/// Record the bitrot reader setup scheduling strategy with bounded GET attribution labels.
+#[inline(always)]
+pub fn record_get_object_reader_setup_strategy_by_size(
+    path: &'static str,
+    strategy: &'static str,
+    mode: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    counter!(
+        "rustfs_io_get_object_reader_setup_strategy_by_size_total",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .increment(1);
+}
+
 /// Record the final bitrot reader setup fanout shape for a GET read.
 #[inline(always)]
 pub fn record_get_object_reader_setup_fanout(
@@ -1166,6 +1195,71 @@ pub fn record_get_object_reader_setup_fanout(
         "rustfs_io_get_object_reader_setup_deferred",
         "strategy" => strategy,
         "mode" => mode
+    )
+    .record(shard_read_fanout_to_f64(deferred));
+}
+
+/// Record the final bitrot reader setup fanout shape with bounded GET attribution labels.
+#[inline(always)]
+#[allow(clippy::too_many_arguments)]
+pub fn record_get_object_reader_setup_fanout_by_size(
+    path: &'static str,
+    strategy: &'static str,
+    mode: &'static str,
+    object_class: &'static str,
+    size_bucket: &'static str,
+    scheduled: usize,
+    attempted: usize,
+    ready: usize,
+    failed: usize,
+    deferred: usize,
+) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!(
+        "rustfs_io_get_object_reader_setup_scheduled_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(scheduled));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_attempted_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(attempted));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_ready_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(ready));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_failed_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
+    )
+    .record(shard_read_fanout_to_f64(failed));
+    histogram!(
+        "rustfs_io_get_object_reader_setup_deferred_by_size",
+        "path" => path,
+        "strategy" => strategy,
+        "mode" => mode,
+        "object_class" => object_class,
+        "size_bucket" => size_bucket
     )
     .record(shard_read_fanout_to_f64(deferred));
 }
@@ -1456,6 +1550,72 @@ pub fn record_put_object_path(path: &'static str) {
         return;
     }
     counter!("rustfs_s3_put_object_path_total", "path" => path).increment(1);
+}
+
+#[inline(always)]
+fn put_object_size_bucket(size_bytes: i64) -> &'static str {
+    const MI_B: i64 = 1024 * 1024;
+
+    match size_bytes {
+        i64::MIN..=0 => "unknown",
+        1..=MI_B => "le_1mib",
+        _ if size_bytes <= 10 * MI_B => "le_10mib",
+        _ if size_bytes <= 16 * MI_B => "le_16mib",
+        _ if size_bytes <= 32 * MI_B => "le_32mib",
+        _ if size_bytes <= 64 * MI_B => "le_64mib",
+        _ => "gt_64mib",
+    }
+}
+
+#[inline(always)]
+fn put_object_buffer_bucket(buffer_size: usize) -> &'static str {
+    const KI_B: usize = 1024;
+    const MI_B: usize = 1024 * 1024;
+
+    match buffer_size {
+        0..=65536 => "le_64kib",
+        _ if buffer_size <= 128 * KI_B => "le_128kib",
+        _ if buffer_size <= 256 * KI_B => "le_256kib",
+        _ if buffer_size <= 512 * KI_B => "le_512kib",
+        _ if buffer_size <= MI_B => "le_1mib",
+        _ => "gt_1mib",
+    }
+}
+
+#[inline(always)]
+fn bool_label(value: bool) -> &'static str {
+    if value { "true" } else { "false" }
+}
+
+#[inline(always)]
+pub fn record_put_object_diagnostics(
+    path: &'static str,
+    eager_status: &'static str,
+    size_bytes: i64,
+    buffer_size: usize,
+    large_concurrency_tuning: bool,
+) {
+    if !put_stage_metrics_enabled() {
+        return;
+    }
+
+    let size_bucket = put_object_size_bucket(size_bytes);
+    let buffer_bucket = put_object_buffer_bucket(buffer_size);
+    counter!(
+        "rustfs_s3_put_object_diagnostics_total",
+        "path" => path,
+        "eager_status" => eager_status,
+        "size_bucket" => size_bucket,
+        "buffer_bucket" => buffer_bucket,
+        "large_concurrency_tuning" => bool_label(large_concurrency_tuning),
+    )
+    .increment(1);
+    histogram!(
+        "rustfs_s3_put_object_selected_buffer_size_bytes",
+        "path" => path,
+        "size_bucket" => size_bucket,
+    )
+    .record(buffer_size as f64);
 }
 
 #[inline(always)]
@@ -1935,7 +2095,26 @@ mod tests {
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
         record_get_object_reader_setup_strategy("data_blocks_first", "read_quorum");
+        record_get_object_reader_setup_strategy_by_size(
+            "codec_streaming",
+            "data_blocks_first",
+            "read_quorum",
+            "plain_single_part",
+            "le_1mib",
+        );
         record_get_object_reader_setup_fanout("data_blocks_first", "read_quorum", 3, 2, 2, 0, 2);
+        record_get_object_reader_setup_fanout_by_size(
+            "codec_streaming",
+            "data_blocks_first",
+            "read_quorum",
+            "plain_single_part",
+            "le_1mib",
+            3,
+            2,
+            2,
+            0,
+            2,
+        );
 
         assert!(0.005_f64.is_sign_positive());
     }
@@ -1977,7 +2156,20 @@ mod tests {
         record_put_object_path("write_inline");
         record_put_object_stage_duration("ingress_prepare", 12.5);
         record_put_object_stage_duration("set_disk_encode", 8.0);
+        record_put_object_diagnostics("zero_copy_eager", "eligible", 32 * 1024 * 1024, 256 * 1024, true);
+        assert!(put_stage_metrics_enabled());
         set_put_stage_metrics_enabled(false);
+    }
+
+    #[test]
+    fn test_put_object_diagnostic_buckets() {
+        assert_eq!(put_object_size_bucket(0), "unknown");
+        assert_eq!(put_object_size_bucket(10 * 1024 * 1024), "le_10mib");
+        assert_eq!(put_object_size_bucket(32 * 1024 * 1024), "le_32mib");
+        assert_eq!(put_object_size_bucket(32 * 1024 * 1024 + 1), "le_64mib");
+        assert_eq!(put_object_buffer_bucket(64 * 1024), "le_64kib");
+        assert_eq!(put_object_buffer_bucket(256 * 1024), "le_256kib");
+        assert_eq!(put_object_buffer_bucket(2 * 1024 * 1024), "gt_1mib");
     }
 
     #[test]
@@ -2098,7 +2290,13 @@ mod tests {
         assert_eq!(get_object_size_bucket((16 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_64_KIB);
         assert_eq!(get_object_size_bucket(100 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
         assert_eq!(get_object_size_bucket(128 * 1024), GET_OBJECT_SIZE_BUCKET_LE_128_KIB);
-        assert_eq!(get_object_size_bucket((128 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
+        assert_eq!(get_object_size_bucket((128 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_192_KIB);
+        assert_eq!(get_object_size_bucket(192 * 1024), GET_OBJECT_SIZE_BUCKET_LE_192_KIB);
+        assert_eq!(get_object_size_bucket((192 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_256_KIB);
+        assert_eq!(get_object_size_bucket(256 * 1024), GET_OBJECT_SIZE_BUCKET_LE_256_KIB);
+        assert_eq!(get_object_size_bucket((256 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_512_KIB);
+        assert_eq!(get_object_size_bucket(512 * 1024), GET_OBJECT_SIZE_BUCKET_LE_512_KIB);
+        assert_eq!(get_object_size_bucket((512 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
         assert_eq!(get_object_size_bucket(1024 * 1024), GET_OBJECT_SIZE_BUCKET_LE_1_MIB);
         assert_eq!(get_object_size_bucket((1024 * 1024) + 1), GET_OBJECT_SIZE_BUCKET_GT_1_MIB);
     }

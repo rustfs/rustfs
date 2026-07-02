@@ -35,6 +35,8 @@ PROFILE_ORDER="normal"
 CODEC_ENGINES="legacy"
 CODEC_MAX_INFLIGHT=1
 CODEC_READER_SETUP="all_shards"
+CODEC_DATA_BLOCKS_FIRST_GATE="off"
+CODEC_DATA_BLOCKS_FIRST_MAX_SIZE=""
 CODEC_MULTIPART="off"
 CODEC_MULTIPART_MAX_PARTS=256
 METADATA_EARLY_STOP="off"
@@ -62,7 +64,9 @@ OUT_DIR=""
 RUSTFS_BIN="${PROJECT_ROOT}/target/release/rustfs"
 WARP_BIN="warp"
 PYTHON_BIN="python3"
-CODEC_MIN_SIZE=1
+CODEC_MIN_SIZE=""
+DEFAULT_CODEC_MIN_SIZE=1048576
+DEFAULT_RUSTFS_CODEC_MIN_SIZE=1048576
 RUST_LOG="warn"
 HEALTH_TIMEOUT_SECS=60
 COMPAT_OBJECT_KEY="__rustfs_get_v2_pr24_compat/object.bin"
@@ -102,6 +106,12 @@ Core options:
   --codec-reader-setup <all_shards|data_blocks_first>
                                  RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
                                  for codec verify reader setup (default: all_shards)
+  --codec-data-blocks-first-gate <on|off>
+                                 Enable size-gated data-blocks-first reader setup for
+                                 codec-rustfs plain single-part GETs (default: off)
+  --codec-data-blocks-first-max-size <bytes>
+                                 RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE
+                                 for the gated path (default: server default)
   --codec-multipart <on|off>     Enable multipart codec streaming opt-in for codec profiles
                                  (default: off)
   --codec-multipart-max-parts <n>
@@ -172,7 +182,8 @@ Binary/options:
   --rustfs-bin <path>            RustFS binary (default: target/release/rustfs)
   --warp-bin <path>              warp binary (default: warp)
   --python-bin <path>            Python binary for SigV4 compatibility probe (default: python3)
-  --codec-min-size <bytes>       RUSTFS_GET_CODEC_STREAMING_MIN_SIZE (default: 1)
+  --codec-min-size <bytes>       Override RUSTFS_GET_CODEC_STREAMING_MIN_SIZE
+                                 (default: unset, use server size-aware default)
   --compat-object-key <key>      Object key used by the compatibility probe
   --compat-object-size <bytes>   Object size used by the compatibility probe (default: 65536)
   --skip-compat-probe            skip post-benchmark compatibility/fallback probes
@@ -282,6 +293,8 @@ parse_args() {
       --shard-locality-preference) SHARD_LOCALITY_PREFERENCE="$2"; shift 2 ;;
       --codec-max-inflight) CODEC_MAX_INFLIGHT="$2"; shift 2 ;;
       --codec-reader-setup) CODEC_READER_SETUP="$2"; shift 2 ;;
+      --codec-data-blocks-first-gate) CODEC_DATA_BLOCKS_FIRST_GATE="$2"; shift 2 ;;
+      --codec-data-blocks-first-max-size) CODEC_DATA_BLOCKS_FIRST_MAX_SIZE="$2"; shift 2 ;;
       --codec-multipart) CODEC_MULTIPART="$2"; shift 2 ;;
       --codec-multipart-max-parts) CODEC_MULTIPART_MAX_PARTS="$2"; shift 2 ;;
       --handoff-attribution) OUTPUT_HANDOFF_ATTRIBUTION=true; shift ;;
@@ -388,6 +401,13 @@ validate_args() {
     all_shards|data_blocks_first) ;;
     *) die "--codec-reader-setup must be all_shards or data_blocks_first" ;;
   esac
+  case "$CODEC_DATA_BLOCKS_FIRST_GATE" in
+    on|off) ;;
+    *) die "--codec-data-blocks-first-gate must be on or off" ;;
+  esac
+  if [[ -n "$CODEC_DATA_BLOCKS_FIRST_MAX_SIZE" ]]; then
+    validate_positive_int "$CODEC_DATA_BLOCKS_FIRST_MAX_SIZE" "--codec-data-blocks-first-max-size"
+  fi
   validate_positive_int "$CODEC_MULTIPART_MAX_PARTS" "--codec-multipart-max-parts"
   validate_positive_int "$ROUNDS" "--rounds"
   validate_positive_int "$RETRY_PER_ROUND" "--retry-per-round"
@@ -399,11 +419,6 @@ validate_args() {
     per-round|prepare-once|existing-only) ;;
     *) die "--warp-object-lifecycle must be per-round, prepare-once, or existing-only" ;;
   esac
-  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
-    local size_count
-    size_count="$(printf '%s\n' "$SIZES" | awk -F',' '{ count=0; for (i=1; i<=NF; i++) { gsub(/^[ \t]+|[ \t]+$/, "", $i); if ($i != "") count++ } print count }')"
-    [[ "$size_count" -eq 1 ]] || die "--warp-object-lifecycle=${WARP_OBJECT_LIFECYCLE} currently requires a single --sizes value to avoid mixing object sizes in one bucket"
-  fi
   if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
     validate_positive_int "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" "--metadata-cache-max-entries"
   fi
@@ -422,7 +437,9 @@ validate_args() {
       *) die "--local-read-copy-method must be mmap_copy or direct_read_copy" ;;
     esac
   fi
-  validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
+  if [[ -n "$CODEC_MIN_SIZE" ]]; then
+    validate_positive_int "$CODEC_MIN_SIZE" "--codec-min-size"
+  fi
   validate_positive_int "$COMPAT_OBJECT_SIZE" "--compat-object-size"
   validate_positive_int "$RESOURCE_SAMPLE_INTERVAL_SECS" "--resource-sample-interval-secs"
   validate_positive_int "$HEALTH_TIMEOUT_SECS" "--health-timeout-secs"
@@ -705,6 +722,8 @@ metadata_early_stop=${METADATA_EARLY_STOP}
 shard_locality_preference=${SHARD_LOCALITY_PREFERENCE}
 codec_max_inflight=${CODEC_MAX_INFLIGHT}
 codec_reader_setup=${CODEC_READER_SETUP}
+codec_data_blocks_first_gate=${CODEC_DATA_BLOCKS_FIRST_GATE}
+codec_data_blocks_first_max_size=${CODEC_DATA_BLOCKS_FIRST_MAX_SIZE:-server-default}
 codec_rollout_codec_profile=benchmark
 codec_body_compat_confirmed_codec_profile=true
 codec_header_compat_confirmed_codec_profile=true
@@ -748,7 +767,7 @@ dry_run=${DRY_RUN}
 rustfs_bin=${RUSTFS_BIN}
 warp_bin=${WARP_BIN}
 python_bin=${PYTHON_BIN}
-codec_min_size=${CODEC_MIN_SIZE}
+codec_min_size=${CODEC_MIN_SIZE:-server-default}
 compat_object_key=${COMPAT_OBJECT_KEY}
 compat_object_size=${COMPAT_OBJECT_SIZE}
 command_line=${command_line% }
@@ -819,6 +838,20 @@ profile_metrics_path() {
   esac
 }
 
+compat_probe_codec_min_size() {
+  local profile="$1"
+  if [[ -n "$CODEC_MIN_SIZE" ]]; then
+    echo "$CODEC_MIN_SIZE"
+    return
+  fi
+
+  case "$profile" in
+    codec-rustfs) echo "${RUSTFS_GET_CODEC_STREAMING_RUSTFS_MIN_SIZE:-$DEFAULT_RUSTFS_CODEC_MIN_SIZE}" ;;
+    codec-legacy) echo "$DEFAULT_CODEC_MIN_SIZE" ;;
+    *) echo "0" ;;
+  esac
+}
+
 profile_data_root() {
   local profile="$1"
   echo "${OUT_DIR}/${profile}/data"
@@ -843,6 +876,36 @@ single_benchmark_size() {
       }
     }
   }'
+}
+
+benchmark_sizes() {
+  printf '%s\n' "$SIZES" | awk -F',' '{
+    for (i=1; i<=NF; i++) {
+      gsub(/^[ \t]+|[ \t]+$/, "", $i)
+      if ($i != "") {
+        print $i
+      }
+    }
+  }'
+}
+
+benchmark_size_count() {
+  benchmark_sizes | awk 'END { print NR + 0 }'
+}
+
+sanitize_bucket_suffix() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9-' '-'
+}
+
+bucket_for_size() {
+  local size="$1"
+  local size_count
+  size_count="$(benchmark_size_count)"
+  if [[ "$WARP_OBJECT_LIFECYCLE" == "per-round" || "$size_count" -le 1 ]]; then
+    echo "$BUCKET"
+    return
+  fi
+  echo "${BUCKET}-$(sanitize_bucket_suffix "$size")"
 }
 
 write_manifest() {
@@ -895,10 +958,12 @@ RUSTFS_GET_METADATA_EARLY_STOP_ENABLE=$(bool_from_on_off "$METADATA_EARLY_STOP")
 RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE=$(bool_from_on_off "$SHARD_LOCALITY_PREFERENCE")
 RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT=${CODEC_MAX_INFLIGHT}
 RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP=$(codec_reader_setup_data_blocks_first)
+RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE=$(bool_from_on_off "$CODEC_DATA_BLOCKS_FIRST_GATE")
+RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE=${CODEC_DATA_BLOCKS_FIRST_MAX_SIZE:-server-default}
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE=$(bool_from_on_off "$CODEC_MULTIPART")
 RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS=${CODEC_MULTIPART_MAX_PARTS}
 RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE=${OUTPUT_HANDOFF_ATTRIBUTION}
-RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE}
+RUSTFS_GET_CODEC_STREAMING_MIN_SIZE=${CODEC_MIN_SIZE:-server-default}
 RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=${GET_OBJECT_METADATA_CACHE_MAX_ENTRIES}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY=${GET_SMALL_OBJECT_DIRECT_MEMORY}
 RUSTFS_GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=${GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD}
@@ -1027,11 +1092,22 @@ start_server() {
     export RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT="$CODEC_MAX_INFLIGHT"
     RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP="$(codec_reader_setup_data_blocks_first)"
     export RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP
+    RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE="$(bool_from_on_off "$CODEC_DATA_BLOCKS_FIRST_GATE")"
+    export RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE
+    if [[ -n "$CODEC_DATA_BLOCKS_FIRST_MAX_SIZE" ]]; then
+      export RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE="$CODEC_DATA_BLOCKS_FIRST_MAX_SIZE"
+    else
+      unset RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE
+    fi
     RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE="$(bool_from_on_off "$CODEC_MULTIPART")"
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE
     export RUSTFS_GET_CODEC_STREAMING_MULTIPART_MAX_PARTS="$CODEC_MULTIPART_MAX_PARTS"
     export RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE="$OUTPUT_HANDOFF_ATTRIBUTION"
-    export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    if [[ -n "$CODEC_MIN_SIZE" ]]; then
+      export RUSTFS_GET_CODEC_STREAMING_MIN_SIZE="$CODEC_MIN_SIZE"
+    else
+      unset RUSTFS_GET_CODEC_STREAMING_MIN_SIZE
+    fi
     if [[ -n "$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES" ]]; then
       export RUSTFS_GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$GET_OBJECT_METADATA_CACHE_MAX_ENTRIES"
     fi
@@ -1078,8 +1154,6 @@ prepare_warp_existing_objects() {
   local profile="$1"
   local profile_dir="${OUT_DIR}/${profile}"
   local prepare_dir="${profile_dir}/warp_prepare"
-  local size
-  size="$(single_benchmark_size)"
 
   if [[ "$WARP_OBJECT_LIFECYCLE" != "prepare-once" ]]; then
     return 0
@@ -1087,43 +1161,50 @@ prepare_warp_existing_objects() {
 
   mkdir -p "$prepare_dir"
 
-  local cmd=(
-    "$WARP_BIN" get
-    --host "$ADDRESS"
-    --access-key "$ACCESS_KEY"
-    --secret-key "$SECRET_KEY"
-    --bucket "$BUCKET"
-    --obj.size "$size"
-    --concurrent "$CONCURRENCY"
-    --duration "$WARP_PREPARE_DURATION"
-    --region "$REGION"
-    --noclear
-  )
-  if [[ -n "$WARP_OBJECTS" ]]; then
-    cmd+=(--objects "$WARP_OBJECTS")
-  fi
+  local size bucket size_slug
+  while IFS= read -r size; do
+    [[ -n "$size" ]] || continue
+    bucket="$(bucket_for_size "$size")"
+    size_slug="$(sanitize_bucket_suffix "$size")"
 
-  {
-    printf 'profile=%s\n' "$profile"
-    printf 'mode=prepare-once\n'
-    printf 'size=%s\n' "$size"
-    printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
-    printf 'bucket=%s\n' "$BUCKET"
-    printf 'command='
-    printf '%q ' "${cmd[@]}"
-    printf '\n'
-  } >"${prepare_dir}/manifest.env"
+    local cmd=(
+      "$WARP_BIN" get
+      --host "$ADDRESS"
+      --access-key "$ACCESS_KEY"
+      --secret-key "$SECRET_KEY"
+      --bucket "$bucket"
+      --obj.size "$size"
+      --concurrent "$CONCURRENCY"
+      --duration "$WARP_PREPARE_DURATION"
+      --region "$REGION"
+      --noclear
+    )
+    if [[ -n "$WARP_OBJECTS" ]]; then
+      cmd+=(--objects "$WARP_OBJECTS")
+    fi
 
-  if [[ "$DRY_RUN" == "true" ]]; then
-    log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size}"
-    printf '[DRY-RUN] ' >"${prepare_dir}/prepare.log"
-    printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare.log"
-    printf '\n' >>"${prepare_dir}/prepare.log"
-    return 0
-  fi
+    {
+      printf 'profile=%s\n' "$profile"
+      printf 'mode=prepare-once\n'
+      printf 'size=%s\n' "$size"
+      printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
+      printf 'bucket=%s\n' "$bucket"
+      printf 'command='
+      printf '%q ' "${cmd[@]}"
+      printf '\n'
+    } >"${prepare_dir}/manifest-${size_slug}.env"
 
-  log "Preparing existing warp objects profile=${profile} size=${size} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
-  "${cmd[@]}" >"${prepare_dir}/prepare.log" 2>&1
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[DRY-RUN] prepare existing warp objects profile=${profile} size=${size} bucket=${bucket}"
+      printf '[DRY-RUN] ' >"${prepare_dir}/prepare-${size_slug}.log"
+      printf '%q ' "${cmd[@]}" >>"${prepare_dir}/prepare-${size_slug}.log"
+      printf '\n' >>"${prepare_dir}/prepare-${size_slug}.log"
+      continue
+    fi
+
+    log "Preparing existing warp objects profile=${profile} size=${size} bucket=${bucket} lifecycle=${WARP_OBJECT_LIFECYCLE}..."
+    "${cmd[@]}" >"${prepare_dir}/prepare-${size_slug}.log" 2>&1
+  done < <(benchmark_sizes)
 }
 
 run_bench() {
@@ -1162,6 +1243,9 @@ run_bench() {
       lifecycle_args="${lifecycle_args} --objects ${WARP_OBJECTS}"
     fi
     cmd+=(--extra-args "$lifecycle_args")
+    if [[ "$(benchmark_size_count)" -gt 1 ]]; then
+      cmd+=(--bucket-size-suffix)
+    fi
   fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
     cmd+=(
@@ -1268,7 +1352,9 @@ if payload.get("status") != "success":
 samples = [
     sample
     for sample in payload.get("data", {}).get("result", [])
-    if not service_name or sample.get("metric", {}).get("service.name") == service_name
+    if not service_name
+    or sample.get("metric", {}).get("service.name") == service_name
+    or sample.get("metric", {}).get("service_name") == service_name
 ]
 lines = [line for sample in samples if (line := sample_to_line(sample))]
 if not lines:
@@ -2508,7 +2594,7 @@ EOF
     return
   fi
   "$PYTHON_BIN" - "$(endpoint_url)" "$ACCESS_KEY" "$SECRET_KEY" "$REGION" "$BUCKET" \
-    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$CODEC_MIN_SIZE" "$compat_dir" "$profile" \
+    "$COMPAT_OBJECT_KEY" "$COMPAT_OBJECT_SIZE" "$(compat_probe_codec_min_size "$profile")" "$compat_dir" "$profile" \
     "$COMPRESSED_FALLBACK_PROBE" "$COMPRESSED_PROBE_EXTENSION" "$COMPRESSED_PROBE_MIME_TYPE" \
     "$CODEC_MULTIPART" "$CODEC_MULTIPART_MAX_PARTS" <<'PY'
 import base64
@@ -3338,6 +3424,8 @@ for profile_dir in profile_dirs:
                 "shard_locality_preference": manifest.get("RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE", ""),
                 "codec_max_inflight": manifest.get("RUSTFS_GET_CODEC_STREAMING_MAX_INFLIGHT", ""),
                 "codec_reader_setup": manifest.get("RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP", ""),
+                "codec_data_blocks_first_gate": manifest.get("RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_ENABLE", ""),
+                "codec_data_blocks_first_max_size": manifest.get("RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_MAX_SIZE", ""),
                 "local_read_copy_method": manifest.get("RUSTFS_OBJECT_MMAP_READ_METHOD", ""),
                 "output_handoff_attribution": manifest.get("RUSTFS_GET_OUTPUT_HANDOFF_ATTRIBUTION_ENABLE", ""),
                 "round_cooldown_secs": manifest.get("round_cooldown_secs", ""),
@@ -3387,6 +3475,8 @@ fieldnames = [
     "shard_locality_preference",
     "codec_max_inflight",
     "codec_reader_setup",
+    "codec_data_blocks_first_gate",
+    "codec_data_blocks_first_max_size",
     "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
@@ -3423,6 +3513,8 @@ baseline_fields = [
     "shard_locality_preference",
     "codec_max_inflight",
     "codec_reader_setup",
+    "codec_data_blocks_first_gate",
+    "codec_data_blocks_first_max_size",
     "local_read_copy_method",
     "output_handoff_attribution",
     "round_cooldown_secs",
@@ -3467,6 +3559,8 @@ for row in rows:
             "shard_locality_preference": row["shard_locality_preference"],
             "codec_max_inflight": row["codec_max_inflight"],
             "codec_reader_setup": row["codec_reader_setup"],
+            "codec_data_blocks_first_gate": row["codec_data_blocks_first_gate"],
+            "codec_data_blocks_first_max_size": row["codec_data_blocks_first_max_size"],
             "local_read_copy_method": row["local_read_copy_method"],
             "output_handoff_attribution": row["output_handoff_attribution"],
             "round_cooldown_secs": row["round_cooldown_secs"],
