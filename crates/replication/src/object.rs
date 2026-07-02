@@ -138,10 +138,7 @@ fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &Replicati
             .unwrap_or_default()
             .as_str(),
     );
-    let source_tag_count = match i32::try_from(source_tags.len()) {
-        Ok(count) => count,
-        Err(_) => i32::MAX,
-    };
+    let source_tag_count = i32::try_from(source_tags.len()).unwrap_or(i32::MAX);
 
     (target.tag_count > 0 && source_tags != target_tags) || target.tag_count != source_tag_count
 }
