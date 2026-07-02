@@ -15,7 +15,7 @@
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, TryStreamExt as _};
-use http::HeaderMap;
+use http::{HeaderMap, Version};
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
@@ -31,7 +31,7 @@ use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{self, Sleep};
@@ -42,6 +42,11 @@ use tracing::{error, warn};
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
+const HTTP_VERSION_09_LABEL: &str = "http/0.9";
+const HTTP_VERSION_10_LABEL: &str = "http/1.0";
+const HTTP_VERSION_11_LABEL: &str = "http/1.1";
+const HTTP_VERSION_2_LABEL: &str = "h2";
+const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -597,6 +602,8 @@ pin_project! {
         internode_operation: Option<&'static str>,
         stall_timeout: Option<Duration>,
         stall_timer: Option<Pin<Box<Sleep>>>,
+        request_started: Instant,
+        duration_recorded: bool,
         #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
@@ -645,13 +652,17 @@ impl HttpReader {
             request = request.body(body);
         }
 
+        let request_started = Instant::now();
         let resp = request.send().await.map_err(|e| {
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
             internode_reqwest_error(&method, &url, internode_operation, e)
         })?;
 
+        record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
         if resp.status().is_success().not() {
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
             return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
@@ -676,6 +687,8 @@ impl HttpReader {
             internode_operation,
             stall_timer: None,
             stall_timeout,
+            request_started,
+            duration_recorded: false,
         })
     }
     pub fn url(&self) -> &str {
@@ -699,6 +712,13 @@ impl AsyncRead for HttpReader {
                 let bytes_read = buf.filled().len().saturating_sub(filled_before);
                 if bytes_read > 0 {
                     record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
+                } else {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
                 }
                 *this.stall_timer = None;
                 Poll::Ready(Ok(()))
@@ -709,6 +729,13 @@ impl AsyncRead for HttpReader {
                 };
                 let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
                 if timer.as_mut().poll(cx).is_ready() {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
                     record_internode_error(*this.track_internode_metrics, *this.internode_operation);
                     Poll::Ready(Err(Error::new(
                         io::ErrorKind::TimedOut,
@@ -718,7 +745,15 @@ impl AsyncRead for HttpReader {
                     Poll::Pending
                 }
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                record_internode_operation_duration_once(
+                    *this.track_internode_metrics,
+                    *this.internode_operation,
+                    *this.request_started,
+                    this.duration_recorded,
+                );
+                Poll::Ready(Err(err))
+            }
         }
     }
 }
@@ -788,6 +823,8 @@ pin_project! {
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
         pending_chunk: BytesMut,
         finish:bool,
+        track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
 
     }
 }
@@ -826,10 +863,17 @@ impl HttpWriter {
                 .body(body);
 
             // Hold the request until the shutdown signal is received
+            let request_started = Instant::now();
             let response = request.send().await;
 
             match response {
                 Ok(resp) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_http_version(
+                        track_internode_metrics,
+                        internode_operation,
+                        http_version_metric_label(resp.version()),
+                    );
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
@@ -845,6 +889,7 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
                     record_internode_error(track_internode_metrics, internode_operation);
                     let classified = classify_reqwest_error(&e);
                     record_internode_classified_error(track_internode_metrics, internode_operation, classified);
@@ -869,6 +914,8 @@ impl HttpWriter {
             handle,
             pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
             finish: false,
+            track_internode_metrics,
+            internode_operation,
         })
     }
 
@@ -896,6 +943,20 @@ fn internode_rpc_operation(url: &str) -> Option<&'static str> {
         PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
         _ => None,
+    }
+}
+
+fn http_version_metric_label(version: Version) -> &'static str {
+    if version == Version::HTTP_09 {
+        HTTP_VERSION_09_LABEL
+    } else if version == Version::HTTP_10 {
+        HTTP_VERSION_10_LABEL
+    } else if version == Version::HTTP_11 {
+        HTTP_VERSION_11_LABEL
+    } else if version == Version::HTTP_2 {
+        HTTP_VERSION_2_LABEL
+    } else {
+        HTTP_VERSION_UNKNOWN_LABEL
     }
 }
 
@@ -938,6 +999,60 @@ fn record_internode_classified_error(track: bool, operation: Option<&'static str
 
     if let Some(operation) = operation {
         crate::http_runtime_sources::record_classified_error(operation, classification.metric_label());
+    }
+}
+
+fn record_internode_operation_duration(track: bool, operation: Option<&'static str>, duration: Duration) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_duration(operation, duration);
+    }
+}
+
+fn record_internode_operation_duration_once(
+    track: bool,
+    operation: Option<&'static str>,
+    request_started: Instant,
+    duration_recorded: &mut bool,
+) {
+    if *duration_recorded {
+        return;
+    }
+
+    *duration_recorded = true;
+    record_internode_operation_duration(track, operation, request_started.elapsed());
+}
+
+fn record_internode_http_version(track: bool, operation: Option<&'static str>, http_version: &'static str) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_http_version(operation, http_version);
+    }
+}
+
+fn record_internode_stall_timeout(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_stall_timeout(operation);
+    }
+}
+
+fn record_internode_write_shutdown_error(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_write_shutdown_error(operation);
     }
 }
 
@@ -1072,12 +1187,16 @@ impl AsyncWrite for HttpWriter {
         // let method = self.method.clone();
 
         if let Err(err) = self.as_mut().get_mut().take_background_error() {
+            record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
             return Poll::Ready(Err(err));
         }
 
         match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Pending => return Poll::Pending,
         }
 
@@ -1086,11 +1205,15 @@ impl AsyncWrite for HttpWriter {
             let this = self.as_mut().get_mut();
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
-                    this.sender
-                        .send_item(None)
-                        .map_err(|e| send_error_to_io(e, "HttpWriter shutdown error"))?;
+                    this.sender.send_item(None).map_err(|e| {
+                        record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                        send_error_to_io(e, "HttpWriter shutdown error")
+                    })?;
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error"))),
+                Poll::Ready(Err(err)) => {
+                    record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                    return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error")));
+                }
                 Poll::Pending => return Poll::Pending,
             }
             // http_log!(
@@ -1103,7 +1226,7 @@ impl AsyncWrite for HttpWriter {
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
-        match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
+        match Pin::new(&mut self.as_mut().get_mut().handle).poll_unpin(cx) {
             Poll::Ready(Ok(Ok(()))) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
@@ -1111,8 +1234,12 @@ impl AsyncWrite for HttpWriter {
                 //     method
                 // );
             }
-            Poll::Ready(Ok(Err(err))) => return Poll::Ready(Err(err)),
+            Poll::Ready(Ok(Err(err))) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Ready(Err(e)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
                 return Poll::Ready(Err(Error::other(format!("HTTP request failed: {e}"))));
             }
@@ -1232,6 +1359,14 @@ mod tests {
             internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
             None
         );
+    }
+
+    #[test]
+    fn http_version_metrics_labels_are_low_cardinality() {
+        assert_eq!(http_version_metric_label(Version::HTTP_09), HTTP_VERSION_09_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_10), HTTP_VERSION_10_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_11), HTTP_VERSION_11_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_2), HTTP_VERSION_2_LABEL);
     }
 
     #[tokio::test]
