@@ -14,7 +14,13 @@
 
 use std::any::Any;
 
-use crate::{DeletedObjectReplicationInfo, MrfReplicateEntry, ReplicateObjectInfo, ReplicationType, ReplicationWorkerOperation};
+use rustfs_storage_api::DeletedObject;
+
+use crate::{
+    DeletedObjectReplicationInfo, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE,
+    ReplicateObjectInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision,
+    VersionPurgeStatusType,
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ReplicationQueueAdmission {
@@ -38,6 +44,116 @@ impl ReplicationQueueAdmission {
 pub struct ReplicationHealQueueResult {
     pub object_info: ReplicateObjectInfo,
     pub admission: ReplicationQueueAdmission,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum ReplicationHealQueueAction {
+    #[default]
+    Skip,
+    QueueObject,
+    QueueDelete(DeletedObjectReplicationInfo),
+    QueueResyncDeletes(ReplicationHealResyncDeletes),
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ReplicationHealResyncDeletes {
+    pub delete_info: DeletedObjectReplicationInfo,
+    pub existing_obj_resync: ResyncDecision,
+}
+
+impl ReplicationHealResyncDeletes {
+    pub fn target_delete_infos(&self) -> impl Iterator<Item = DeletedObjectReplicationInfo> + '_ {
+        self.existing_obj_resync
+            .targets
+            .iter()
+            .filter(|(_, target)| target.replicate)
+            .map(|(target_arn, target)| {
+                let mut delete_info = self.delete_info.clone();
+                delete_info.reset_id = target.reset_id.clone();
+                delete_info.target_arn = target_arn.clone();
+                delete_info
+            })
+    }
+}
+
+pub fn replication_heal_queue_action(roi: &mut ReplicateObjectInfo) -> ReplicationHealQueueAction {
+    if !roi.dsc.replicate_any() {
+        return ReplicationHealQueueAction::Skip;
+    }
+
+    if roi.replication_status == ReplicationStatusType::Completed
+        && roi.version_purge_status.is_empty()
+        && !roi.existing_obj_resync.must_resync()
+    {
+        return ReplicationHealQueueAction::Skip;
+    }
+
+    if roi.delete_marker || !roi.version_purge_status.is_empty() {
+        let delete_info = heal_deleted_object_replication_info(roi);
+
+        if is_pending_or_failed_object_heal(roi) || is_pending_or_failed_version_purge(roi) {
+            return ReplicationHealQueueAction::QueueDelete(delete_info);
+        }
+
+        if roi.existing_obj_resync.must_resync()
+            && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
+        {
+            return ReplicationHealQueueAction::QueueResyncDeletes(ReplicationHealResyncDeletes {
+                delete_info,
+                existing_obj_resync: roi.existing_obj_resync.clone(),
+            });
+        }
+
+        return ReplicationHealQueueAction::Skip;
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.op_type = ReplicationType::ExistingObject;
+    }
+
+    if is_pending_or_failed_object_heal(roi) {
+        roi.event_type = REPLICATE_HEAL.to_string();
+        return ReplicationHealQueueAction::QueueObject;
+    }
+
+    if roi.existing_obj_resync.must_resync() {
+        roi.event_type = REPLICATE_EXISTING.to_string();
+        return ReplicationHealQueueAction::QueueObject;
+    }
+
+    ReplicationHealQueueAction::Skip
+}
+
+fn heal_deleted_object_replication_info(roi: &ReplicateObjectInfo) -> DeletedObjectReplicationInfo {
+    let (version_id, delete_marker_version_id) = if roi.version_purge_status.is_empty() {
+        (None, roi.version_id)
+    } else {
+        (roi.version_id, None)
+    };
+
+    DeletedObjectReplicationInfo {
+        delete_object: DeletedObject {
+            object_name: roi.name.clone(),
+            delete_marker_version_id,
+            version_id,
+            replication_state: roi.replication_state.clone(),
+            delete_marker_mtime: roi.mod_time,
+            delete_marker: roi.delete_marker,
+            ..Default::default()
+        },
+        bucket: roi.bucket.clone(),
+        op_type: ReplicationType::Heal,
+        event_type: REPLICATE_HEAL_DELETE.to_string(),
+        ..Default::default()
+    }
+}
+
+fn is_pending_or_failed_object_heal(roi: &ReplicateObjectInfo) -> bool {
+    matches!(roi.replication_status, ReplicationStatusType::Pending | ReplicationStatusType::Failed)
+}
+
+fn is_pending_or_failed_version_purge(roi: &ReplicateObjectInfo) -> bool {
+    matches!(roi.version_purge_status, VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed)
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -129,9 +245,14 @@ mod tests {
     use std::str::FromStr;
 
     use rustfs_storage_api::DeletedObject;
+    use uuid::Uuid;
 
-    use super::{ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
-    use crate::{DeletedObjectReplicationInfo, ReplicateObjectInfo, ReplicationType, ReplicationWorkerOperation};
+    use super::{ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission};
+    use crate::{
+        DeletedObjectReplicationInfo, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
+        ReplicateObjectInfo, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
+        ResyncTargetDecision, VersionPurgeStatusType, replication_heal_queue_action,
+    };
 
     #[test]
     fn replication_queue_admission_combines_target_results() {
@@ -145,6 +266,102 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Skipped);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
+    }
+
+    #[test]
+    fn heal_queue_action_routes_failed_objects_to_heal_queue() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Failed);
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        assert!(matches!(action, ReplicationHealQueueAction::QueueObject));
+        assert_eq!(roi.event_type, REPLICATE_HEAL);
+    }
+
+    #[test]
+    fn heal_queue_action_routes_existing_object_resync() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.existing_obj_resync.targets.insert(
+            "arn:target".to_string(),
+            ResyncTargetDecision {
+                replicate: true,
+                reset_id: "reset-1".to_string(),
+                reset_before_date: None,
+            },
+        );
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        assert!(matches!(action, ReplicationHealQueueAction::QueueObject));
+        assert_eq!(roi.op_type, ReplicationType::ExistingObject);
+        assert_eq!(roi.event_type, REPLICATE_EXISTING);
+    }
+
+    #[test]
+    fn heal_queue_action_routes_pending_delete_marker() {
+        let version_id = Uuid::new_v4();
+        let mut roi = replicate_object_info(ReplicationStatusType::Pending);
+        roi.delete_marker = true;
+        roi.version_id = Some(version_id);
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        let ReplicationHealQueueAction::QueueDelete(delete_info) = action else {
+            panic!("expected delete queue action");
+        };
+        assert_eq!(delete_info.bucket, "bucket");
+        assert_eq!(delete_info.event_type, REPLICATE_HEAL_DELETE);
+        assert_eq!(delete_info.delete_object.object_name, "object");
+        assert_eq!(delete_info.delete_object.delete_marker_version_id, Some(version_id));
+        assert_eq!(delete_info.delete_object.version_id, None);
+    }
+
+    #[test]
+    fn heal_queue_action_expands_resync_delete_targets() {
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.delete_marker = true;
+        roi.existing_obj_resync.targets.insert(
+            "arn:replicate".to_string(),
+            ResyncTargetDecision {
+                replicate: true,
+                reset_id: "reset-1".to_string(),
+                reset_before_date: None,
+            },
+        );
+        roi.existing_obj_resync.targets.insert(
+            "arn:skip".to_string(),
+            ResyncTargetDecision {
+                replicate: false,
+                reset_id: "reset-2".to_string(),
+                reset_before_date: None,
+            },
+        );
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        let ReplicationHealQueueAction::QueueResyncDeletes(batch) = action else {
+            panic!("expected resync delete queue action");
+        };
+        let target_deletes = batch.target_delete_infos().collect::<Vec<_>>();
+        assert_eq!(target_deletes.len(), 1);
+        assert_eq!(target_deletes[0].target_arn, "arn:replicate");
+        assert_eq!(target_deletes[0].reset_id, "reset-1");
+    }
+
+    #[test]
+    fn heal_queue_action_routes_pending_version_purge() {
+        let version_id = Uuid::new_v4();
+        let mut roi = replicate_object_info(ReplicationStatusType::Completed);
+        roi.version_id = Some(version_id);
+        roi.version_purge_status = VersionPurgeStatusType::Pending;
+
+        let action = replication_heal_queue_action(&mut roi);
+
+        let ReplicationHealQueueAction::QueueDelete(delete_info) = action else {
+            panic!("expected version purge delete queue action");
+        };
+        assert_eq!(delete_info.delete_object.version_id, Some(version_id));
+        assert_eq!(delete_info.delete_object.delete_marker_version_id, None);
     }
 
     #[test]
@@ -193,5 +410,18 @@ mod tests {
         assert_eq!(operation.get_object(), "object");
         assert_eq!(operation.get_size(), 128);
         assert_eq!(operation.get_op_type(), ReplicationType::Object);
+    }
+
+    fn replicate_object_info(replication_status: ReplicationStatusType) -> ReplicateObjectInfo {
+        let mut dsc = ReplicateDecision::new();
+        dsc.set(ReplicateTargetDecision::new("arn:target".to_string(), true, false));
+
+        ReplicateObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            replication_status,
+            dsc,
+            ..Default::default()
+        }
     }
 }
