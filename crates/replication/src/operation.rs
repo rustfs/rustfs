@@ -28,6 +28,7 @@ use crate::{
 #[derive(Debug, Clone, Default)]
 pub struct MustReplicateOptions {
     meta: HashMap<String, String>,
+    status: ReplicationStatusType,
     op_type: ReplicationType,
     replication_request: bool,
 }
@@ -41,16 +42,25 @@ impl MustReplicateOptions {
 
         Self {
             meta,
+            status: ReplicationStatusType::default(),
             op_type,
             replication_request,
         }
     }
 
+    pub fn with_replication_status(mut self, status: ReplicationStatusType) -> Self {
+        self.status = status;
+        self
+    }
+
     pub fn replication_status(&self) -> ReplicationStatusType {
         if let Some(rs) = self.meta.get(AMZ_BUCKET_REPLICATION_STATUS) {
-            return ReplicationStatusType::from(rs.as_str());
+            let status = ReplicationStatusType::from(rs.as_str());
+            if !status.is_empty() {
+                return status;
+            }
         }
-        ReplicationStatusType::default()
+        self.status.clone()
     }
 
     pub fn is_existing_object_replication(&self) -> bool {
@@ -211,9 +221,18 @@ mod tests {
     #[test]
     fn must_replicate_options_reads_replication_status_header() {
         let meta = HashMap::from([(AMZ_BUCKET_REPLICATION_STATUS.to_string(), "COMPLETED".to_string())]);
-        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Object, false);
+        let options = MustReplicateOptions::new(&meta, String::new(), ReplicationType::Object, false)
+            .with_replication_status(ReplicationStatusType::Replica);
 
         assert_eq!(options.replication_status(), ReplicationStatusType::Completed);
+    }
+
+    #[test]
+    fn must_replicate_options_falls_back_to_explicit_replication_status() {
+        let options = MustReplicateOptions::new(&HashMap::new(), String::new(), ReplicationType::Delete, false)
+            .with_replication_status(ReplicationStatusType::Replica);
+
+        assert_eq!(options.replication_status(), ReplicationStatusType::Replica);
     }
 
     #[test]

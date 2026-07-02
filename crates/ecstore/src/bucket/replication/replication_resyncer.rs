@@ -1084,11 +1084,11 @@ impl ReplicationConfig {
 pub(crate) fn get_must_replicate_options(
     user_defined: &HashMap<String, String>,
     user_tags: String,
-    _status: ReplicationStatusType,
+    status: ReplicationStatusType,
     op_type: ReplicationType,
     opts: ObjectOptions,
 ) -> MustReplicateOptions {
-    MustReplicateOptions::new(user_defined, user_tags, op_type, opts.replication_request)
+    MustReplicateOptions::new(user_defined, user_tags, op_type, opts.replication_request).with_replication_status(status)
 }
 
 /// Returns whether object version is a delete marker and if object qualifies for replication
