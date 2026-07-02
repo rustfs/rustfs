@@ -890,7 +890,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         }
     }
 
-    let dsc = if heal_uses_delete_replication_path(oi.delete_marker, oi.version_purge_status.clone()) {
+    let dsc = if heal_uses_delete_replication_path(oi.delete_marker, &oi.version_purge_status) {
         check_replicate_delete(
             oi.bucket.as_str(),
             &ObjectToDelete {
@@ -1159,7 +1159,7 @@ pub(crate) async fn check_replicate_delete(
                 oi.delete_marker,
                 oi.target_replication_status(&tgt_arn),
                 replicate,
-                oi.version_purge_status.clone(),
+                &oi.version_purge_status,
             ) {
                 dsc.set(ReplicateTargetDecision::new(tgt_arn, replicate, sync));
             }

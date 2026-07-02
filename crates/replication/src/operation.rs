@@ -97,7 +97,7 @@ pub fn delete_replication_object_opts(dobj: &ObjectToDelete, source: &Replicatio
     }
 }
 
-pub fn heal_uses_delete_replication_path(delete_marker: bool, version_purge_status: VersionPurgeStatusType) -> bool {
+pub fn heal_uses_delete_replication_path(delete_marker: bool, version_purge_status: &VersionPurgeStatusType) -> bool {
     delete_marker || !version_purge_status.is_empty()
 }
 
@@ -105,7 +105,7 @@ pub fn delete_replication_missing_source_decision(
     delete_marker: bool,
     target_status: ReplicationStatusType,
     rule_replicates: bool,
-    version_purge_status: VersionPurgeStatusType,
+    version_purge_status: &VersionPurgeStatusType,
 ) -> Option<bool> {
     let valid_replication_status = matches!(
         target_status,
@@ -119,7 +119,7 @@ pub fn delete_replication_missing_source_decision(
     if !version_purge_status.is_empty() {
         return Some(matches!(
             version_purge_status,
-            VersionPurgeStatusType::Pending | VersionPurgeStatusType::Failed
+            &VersionPurgeStatusType::Pending | &VersionPurgeStatusType::Failed
         ));
     }
 
@@ -226,9 +226,9 @@ mod tests {
 
     #[test]
     fn heal_delete_path_is_limited_to_delete_markers_and_version_purges() {
-        assert!(heal_uses_delete_replication_path(true, VersionPurgeStatusType::Empty));
-        assert!(heal_uses_delete_replication_path(false, VersionPurgeStatusType::Pending));
-        assert!(!heal_uses_delete_replication_path(false, VersionPurgeStatusType::Empty));
+        assert!(heal_uses_delete_replication_path(true, &VersionPurgeStatusType::Empty));
+        assert!(heal_uses_delete_replication_path(false, &VersionPurgeStatusType::Pending));
+        assert!(!heal_uses_delete_replication_path(false, &VersionPurgeStatusType::Empty));
     }
 
     #[test]
@@ -238,7 +238,7 @@ mod tests {
                 true,
                 ReplicationStatusType::Completed,
                 false,
-                VersionPurgeStatusType::Empty,
+                &VersionPurgeStatusType::Empty,
             ),
             Some(false)
         );
@@ -247,12 +247,17 @@ mod tests {
                 false,
                 ReplicationStatusType::Empty,
                 false,
-                VersionPurgeStatusType::Pending,
+                &VersionPurgeStatusType::Pending,
             ),
             Some(true)
         );
         assert_eq!(
-            delete_replication_missing_source_decision(false, ReplicationStatusType::Empty, false, VersionPurgeStatusType::Empty),
+            delete_replication_missing_source_decision(
+                false,
+                ReplicationStatusType::Empty,
+                false,
+                &VersionPurgeStatusType::Empty
+            ),
             None
         );
     }
