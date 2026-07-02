@@ -36,7 +36,6 @@ use super::interfaces::{
 use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
-use rustfs_object_data_cache::ObjectDataCacheConfig;
 use std::sync::{Arc, OnceLock};
 
 /// Application-layer context with explicit dependencies.
@@ -79,11 +78,7 @@ pub struct AppContext {
 
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
-        let object_data_cache = match ObjectDataCacheAdapter::new(ObjectDataCacheConfig::default()) {
-            Ok(adapter) => Arc::new(adapter),
-            Err(_err) => ObjectDataCacheAdapter::disabled_arc(),
-        };
-        debug_assert!(object_data_cache.is_disabled());
+        let object_data_cache = ObjectDataCacheAdapter::from_env_or_disabled();
 
         Self {
             object_store,
