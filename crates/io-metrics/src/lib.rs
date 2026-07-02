@@ -1098,6 +1098,19 @@ pub fn record_get_object_shard_locality_policy_disabled(path: &'static str) {
     }
     counter!("rustfs_io_get_object_shard_locality_policy_disabled_total", "path" => path).increment(1);
 }
+
+/// Record observe-only shard-locality potential while scheduling remains disabled.
+#[inline(always)]
+pub fn record_get_object_shard_locality_observe_only(path: &'static str, remote_scheduled: usize, remote_avoid_potential: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_shard_remote_scheduled_observe_only", "path" => path)
+        .record(shard_read_fanout_to_f64(remote_scheduled));
+    histogram!("rustfs_io_get_object_shard_remote_avoid_potential", "path" => path)
+        .record(shard_read_fanout_to_f64(remote_avoid_potential));
+}
+
 /// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
 #[inline(always)]
 pub fn record_get_object_shard_read_fanout(
@@ -2094,6 +2107,7 @@ mod tests {
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
+        record_get_object_shard_locality_observe_only("codec_streaming", 2, 1);
         record_get_object_reader_setup_strategy("data_blocks_first", "read_quorum");
         record_get_object_reader_setup_strategy_by_size(
             "codec_streaming",
@@ -2117,6 +2131,16 @@ mod tests {
         );
 
         assert!(0.005_f64.is_sign_positive());
+    }
+
+    #[test]
+    fn test_get_object_shard_locality_observe_only_metrics_smoke() {
+        let remote_scheduled = 2;
+        let remote_avoid_potential = 1;
+
+        record_get_object_shard_locality_observe_only("codec_streaming", remote_scheduled, remote_avoid_potential);
+
+        assert!(remote_scheduled >= remote_avoid_potential);
     }
 
     #[test]

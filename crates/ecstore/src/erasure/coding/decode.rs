@@ -533,6 +533,11 @@ fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     }
 }
 
+fn shard_locality_remote_avoid_potential(remote_scheduled: usize, low_cost_available: usize, data_shards: usize) -> usize {
+    let theoretical_remote_needed = data_shards.saturating_sub(low_cost_available);
+    remote_scheduled.saturating_sub(theoretical_remote_needed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_scheduled_read_cost(
     read_cost: ShardReadCost,
@@ -544,15 +549,13 @@ fn record_scheduled_read_cost(
     remote_scheduled: &mut usize,
     fallback_to_remote: &mut usize,
 ) {
-    if !locality_preference_enabled {
-        return;
-    }
-
     if read_cost.is_low_cost() {
-        *local_preferred += 1;
+        if locality_preference_enabled {
+            *local_preferred += 1;
+        }
     } else if read_cost.is_remote() {
         *remote_scheduled += 1;
-        if count_remote_as_fallback || low_cost_available < data_shards {
+        if locality_preference_enabled && (count_remote_as_fallback || low_cost_available < data_shards) {
             *fallback_to_remote += 1;
         }
     }
@@ -889,6 +892,13 @@ where
                         fallback_to_remote,
                     );
                 } else {
+                    let remote_avoid_potential =
+                        shard_locality_remote_avoid_potential(remote_scheduled, low_cost_available, self.data_shards);
+                    rustfs_io_metrics::record_get_object_shard_locality_observe_only(
+                        path,
+                        remote_scheduled,
+                        remote_avoid_potential,
+                    );
                     rustfs_io_metrics::record_get_object_shard_locality_policy_disabled(path);
                 }
             }
@@ -1598,7 +1608,7 @@ mod tests {
     }
 
     #[test]
-    fn test_shard_read_launch_order_is_gated() {
+    fn test_shard_locality_read_launch_order_is_gated() {
         let read_costs = [
             ShardReadCost::Remote,
             ShardReadCost::Local,
@@ -1609,6 +1619,13 @@ mod tests {
 
         assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2, 3, 4]);
         assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), true), vec![1, 3, 2, 0, 4]);
+    }
+
+    #[test]
+    fn test_shard_locality_remote_avoid_potential_is_observe_only() {
+        assert_eq!(shard_locality_remote_avoid_potential(2, 4, 4), 2);
+        assert_eq!(shard_locality_remote_avoid_potential(2, 2, 4), 0);
+        assert_eq!(shard_locality_remote_avoid_potential(3, 3, 4), 2);
     }
 
     #[test]

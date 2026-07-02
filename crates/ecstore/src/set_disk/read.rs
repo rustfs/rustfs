@@ -595,12 +595,53 @@ fn resolve_read_part_from_responses(
     Err(DiskError::ErasureReadQuorum)
 }
 
-fn shard_read_cost_for_disk(disk: Option<&DiskStore>) -> ShardReadCost {
+fn shard_read_costs_for_disks(disks: &[Option<DiskStore>]) -> Vec<ShardReadCost> {
+    let local_endpoint_hosts = local_endpoint_hosts_for_shard_costs();
+    disks
+        .iter()
+        .map(|disk| shard_read_cost_for_disk(disk.as_ref(), &local_endpoint_hosts))
+        .collect()
+}
+
+fn shard_read_cost_for_disk(disk: Option<&DiskStore>, local_endpoint_hosts: &[String]) -> ShardReadCost {
     match disk {
         Some(disk) if disk.is_local() => ShardReadCost::Local,
-        Some(_) => ShardReadCost::Remote,
+        Some(disk) => shard_read_cost_for_endpoint(false, &disk.host_name(), local_endpoint_hosts),
         None => ShardReadCost::Unknown,
     }
+}
+
+fn shard_read_cost_for_endpoint(is_local: bool, host_name: &str, local_endpoint_hosts: &[String]) -> ShardReadCost {
+    if is_local {
+        return ShardReadCost::Local;
+    }
+
+    if !host_name.is_empty() && local_endpoint_hosts.iter().any(|host| host == host_name) {
+        return ShardReadCost::SameNode;
+    }
+
+    ShardReadCost::Remote
+}
+
+fn local_endpoint_hosts_for_shard_costs() -> Vec<String> {
+    let Some(endpoint_pools) = runtime_sources::endpoint_pools() else {
+        return Vec::new();
+    };
+
+    let mut hosts = Vec::new();
+    for pool in endpoint_pools.as_ref() {
+        for endpoint in pool.endpoints.as_ref() {
+            if !endpoint.is_local {
+                continue;
+            }
+
+            let host = endpoint.host_port();
+            if !host.is_empty() && !hosts.contains(&host) {
+                hosts.push(host);
+            }
+        }
+    }
+    hosts
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -2800,12 +2841,7 @@ impl SetDisks {
             let use_mmap_read = object_mmap_read_enabled();
 
             let reader_setup_stage_start = Instant::now();
-            let read_costs = coding::decode::should_collect_shard_read_costs().then(|| {
-                disks
-                    .iter()
-                    .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
-                    .collect::<Vec<_>>()
-            });
+            let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(&disks));
             let reader_setup = create_bitrot_readers_until_quorum_with_preference(
                 &files,
                 &disks,
@@ -3231,12 +3267,7 @@ impl SetDisks {
             bitrot_reader_init_stage: GET_STAGE_READER_TASK_BITROT_READER_INIT,
         });
         let reader_setup_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
-        let read_costs = coding::decode::should_collect_shard_read_costs().then(|| {
-            disks
-                .iter()
-                .map(|disk| shard_read_cost_for_disk(disk.as_ref()))
-                .collect::<Vec<_>>()
-        });
+        let read_costs = coding::decode::should_collect_shard_read_costs().then(|| shard_read_costs_for_disks(disks));
         let reader_setup = create_bitrot_readers_until_quorum_with_preference(
             files,
             disks,
@@ -3821,6 +3852,17 @@ mod tests {
 
     const CODEC_STREAMING_TEST_BUCKET: &str = "bucket";
     const CODEC_STREAMING_TEST_OBJECT: &str = "object";
+
+    #[test]
+    fn shard_read_cost_for_endpoint_maps_topology_classes() {
+        let local_hosts = vec!["node-a:9000".to_string()];
+
+        assert_eq!(shard_read_cost_for_endpoint(true, "node-a:9000", &local_hosts), ShardReadCost::Local);
+        assert_eq!(shard_read_cost_for_endpoint(false, "node-a:9000", &local_hosts), ShardReadCost::SameNode);
+        assert_eq!(shard_read_cost_for_endpoint(false, "node-b:9000", &local_hosts), ShardReadCost::Remote);
+        assert_eq!(shard_read_cost_for_endpoint(false, "", &local_hosts), ShardReadCost::Remote);
+        assert_eq!(shard_read_cost_for_disk(None, &local_hosts), ShardReadCost::Unknown);
+    }
 
     fn metadata_fanout_test_fileinfo(object: &str) -> FileInfo {
         let mut fi = FileInfo::new(object, 2, 2);
