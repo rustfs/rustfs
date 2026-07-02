@@ -19,9 +19,10 @@ pub(crate) mod backpressure;
 
 use crate::error::{Error, Result, is_err_data_movement_overwrite, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
-use crate::set_disk::SetDisks;
+use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::{
     multipart::{CompletePart, MultipartOperations as _},
+    namespace::NamespaceLocking as _,
     object::{ObjectIO as _, ObjectOperations as _},
 };
 use crate::store::ECStore;
@@ -490,6 +491,33 @@ pub(crate) async fn ensure_source_cleanup_versions_unchanged(
         object,
         "source versions changed after migration started",
     ))
+}
+
+pub(crate) async fn cleanup_source_entry_if_unchanged(
+    set: Arc<SetDisks>,
+    bucket: &str,
+    object: &str,
+    expected: &FileInfoVersions,
+    allowed_missing: &[SourceCleanupVersionIdentity],
+    op_label: &str,
+) -> Result<ObjectInfo> {
+    let cleanup_key = encode_dir_object(object);
+    let ns_lock = set.new_ns_lock(bucket, cleanup_key.as_str()).await?;
+    let _guard = ns_lock.get_write_lock(get_lock_acquire_timeout()).await?;
+
+    ensure_source_cleanup_versions_unchanged(set.clone(), bucket, object, expected, allowed_missing, op_label).await?;
+
+    set.delete_object(
+        bucket,
+        cleanup_key.as_str(),
+        ObjectOptions {
+            delete_prefix: true,
+            delete_prefix_object: true,
+            no_lock: true,
+            ..Default::default()
+        },
+    )
+    .await
 }
 
 fn should_check_data_movement_resume_target(src_pool_idx: usize, target_pool_idx: usize) -> bool {
