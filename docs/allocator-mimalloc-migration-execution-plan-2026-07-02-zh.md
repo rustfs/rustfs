@@ -361,9 +361,9 @@ scripts/run_object_batch_bench_enhanced.sh \
 
 下一步：
 
-- 将本轮 A/B 作为第一阶段准入证据，但不把它视为最终性能背书。
-- 在 PR 前补一轮低噪声复测，优先扩大到 `rounds=5` 或固定远程机空闲窗口。
-- 如后续复测仍显示 1KiB/32KiB latency 明显退化，需要先定位写入/删除阶段抖动，再决定是否合并。
+- `rounds=5` 复测已完成，结果见第 11 节。
+- PR 前需要明确披露两个剩余风险：`1KiB` median throughput 仍低于 jemalloc baseline；`4KiB` median latency 仍高于 jemalloc baseline。
+- 若需要把性能结论从“可继续推进”提升为“可直接合并”，建议在独占或更低噪声机器上再跑一轮同矩阵，重点确认 `1KiB` throughput 和 `4KiB` latency。
 
 ## 9. 已固定的 jemalloc baseline
 
@@ -482,3 +482,62 @@ A/B 对比：
 - 性能层面：本轮单机远程 A/B 不支持“全面性能提升”的结论，只支持“可继续推进到 PR 前复测”。4KiB 和 1MiB 改善，1KiB 和 32KiB 存在退化信号。
 - 风险层面：远程机同一时段存在 ansible 任务和明显 burst 型负载表现，latency 数据必须保守解读。
 - 准入建议：可以保留当前代码方向，但合并前必须执行低噪声复测；若 1KiB/32KiB 退化重复出现，应先定位 allocator collect、write/delete 路径和后台任务交互，再决定是否合并。
+
+## 11. rebase 后 rounds=5 低噪声复测结果
+
+远程路径：
+
+```bash
+/data/rustfs/rustfs-allocator-rounds5-cf902ce/target/bench/allocator-ab/mimalloc-rounds5-20260702T044922Z
+```
+
+代码状态：
+
+- 本地提交：`cf902ce62608e860a8d82ce6c6b0ae39eeb60da8`。
+- 远程应用后提交：`df3421f4e2c6da465c593bcc4bc516db5bf44440`。
+- 远程 worktree：`/data/rustfs/rustfs-allocator-rounds5-cf902ce`。
+- 基于 `origin/main` rebase 后构建，release build 通过。
+
+复测配置：
+
+- `tool=warp`
+- `mode=mixed`
+- `concurrency=128`
+- `duration=60s`
+- `rounds=5`
+- `cooldown=75s`
+- `sizes=1KiB,4KiB,32KiB,1MiB`
+- `RUSTFS_UNSAFE_BYPASS_DISK_CHECK=true`
+- baseline CSV：`/data/rustfs/rustfs-allocator-baseline/target/bench/allocator-ab/jemalloc-20260702T023842Z/mixed/median_summary.completed.csv`
+
+环境说明：
+
+- pre-run load：`0.36, 4.52, 32.90`。
+- final load：`288.74, 241.51, 190.40`，这是压测自身运行后产生的高负载状态，不应作为 pre-run 噪声判断。
+- `rustfs-uninstall.yml` ansible 进程在 pre-run snapshot 中仍存在，但 CPU 占用很低；因此本轮仍需标记为“较低噪声但非独占机器”。
+- 结束后确认无残留 `rustfs`/`warp` 复测进程。
+
+median summary：
+
+| size | mode | concurrency | successful rounds | median throughput bps | median req/s | median latency ms | median p90 ms | median p99 ms |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| `1KiB` | mixed | 128 | 5 | `2390753.280000` | `520.480000` | `408.900000` | `731.100000` | `4210.800000` |
+| `4KiB` | mixed | 128 | 5 | `7193231.360000` | `390.600000` | `3264.600000` | `3183.800000` | `6031.400000` |
+| `32KiB` | mixed | 128 | 5 | `42781900.800000` | `290.560000` | `26.500000` | `19.800000` | `1273.400000` |
+| `1MiB` | mixed | 128 | 5 | `49492787.200000` | `10.690000` | `82.400000` | `319.000000` | `848.400000` |
+
+与 jemalloc baseline 对比：
+
+| size | req/s delta | latency delta | throughput delta | 判读 |
+|---|---:|---:|---:|---|
+| `1KiB` | `-14.65%` | `-0.46%` | `-14.93%` | latency 基本持平，但小对象吞吐仍退化，需作为合并风险披露。 |
+| `4KiB` | `+39.72%` | `+145.46%` | `+39.71%` | 吞吐明显改善，但 median latency 明显变差，需确认是否为 mixed 阶段排队/远程负载形态。 |
+| `32KiB` | `+8.29%` | `-79.89%` | `+8.19%` | 吞吐小幅改善，latency 大幅改善，上一轮退化信号未复现。 |
+| `1MiB` | `+2.39%` | `-51.42%` | `+0.28%` | 吞吐基本持平略升，latency 明显改善。 |
+
+复测后的实战结论：
+
+- 替换方向仍可继续推进，不再认为 `32KiB` 存在稳定退化。
+- 最大遗留风险变为 `1KiB` throughput 约 `15%` 退化，以及 `4KiB` latency 约 `145%` 变差。
+- 如果产品目标优先降低 allocator 依赖复杂度、统一跨平台 allocator、移除 jemalloc memory pprof 维护成本，则第一阶段可以进入 PR，但 PR 必须披露上述性能 trade-off。
+- 如果产品目标要求无小对象吞吐退化，则当前结果不足以直接合并，需要继续做 `1KiB` 热点路径拆解和更独占环境复测。
