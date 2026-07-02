@@ -16,9 +16,9 @@ use super::datatypes::ResyncStatusType;
 use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::Error as EcstoreError;
 use super::replication_filemeta_boundary::{
-    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
-    ReplicateObjectInfo, ReplicatedTargetInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
-    ResyncDecision, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
+    MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
+    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replication_statuses_map,
+    version_purge_statuses_map,
 };
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_resyncer::{
@@ -31,9 +31,14 @@ use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
-use rustfs_replication::DeletedObjectReplicationInfo;
+use rustfs_replication::{
+    DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationHealQueueAction, ReplicationHealQueueResult,
+    ReplicationHealResyncDeletes, ReplicationOperation, ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission,
+    WORKER_MAX_LIMIT, initial_worker_counts, mrf_worker_size_to_count, next_large_worker_count, next_mrf_worker_count,
+    next_regular_worker_count, replication_heal_queue_action, resized_worker_counts, should_auto_resume_resync,
+    should_grow_large_workers, should_queue_large_object,
+};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
@@ -59,147 +64,6 @@ const EVENT_REPLICATION_RESYNC_RECOVERED: &str = "replication_resync_recovered";
 const EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED: &str = "replication_config_lookup_skipped";
 const EVENT_REPLICATION_MRF_QUEUE_OVERFLOW: &str = "replication_mrf_queue_overflow";
 
-fn should_auto_resume_resync(status: ResyncStatusType) -> bool {
-    matches!(status, ResyncStatusType::ResyncPending | ResyncStatusType::ResyncStarted)
-}
-
-// Worker limits
-pub const WORKER_MAX_LIMIT: usize = 500;
-pub const WORKER_MIN_LIMIT: usize = 50;
-pub const WORKER_AUTO_DEFAULT: usize = 100;
-pub const MRF_WORKER_MAX_LIMIT: usize = 8;
-pub const MRF_WORKER_MIN_LIMIT: usize = 2;
-pub const MRF_WORKER_AUTO_DEFAULT: usize = 4;
-pub const LARGE_WORKER_COUNT: usize = 10;
-pub const MIN_LARGE_OBJ_SIZE: i64 = 128 * 1024 * 1024; // 128MiB
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReplicationQueueAdmission {
-    #[default]
-    Skipped,
-    Queued,
-    Missed,
-}
-
-impl ReplicationQueueAdmission {
-    fn merge(&mut self, other: Self) {
-        *self = match (*self, other) {
-            (Self::Missed, _) | (_, Self::Missed) => Self::Missed,
-            (Self::Queued, _) | (_, Self::Queued) => Self::Queued,
-            (Self::Skipped, Self::Skipped) => Self::Skipped,
-        };
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ReplicationHealQueueResult {
-    pub object_info: ReplicateObjectInfo,
-    pub admission: ReplicationQueueAdmission,
-}
-
-/// Priority levels for replication
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReplicationPriority {
-    Fast,
-    Slow,
-    Auto,
-}
-
-impl std::str::FromStr for ReplicationPriority {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "fast" => Ok(ReplicationPriority::Fast),
-            "slow" => Ok(ReplicationPriority::Slow),
-            "auto" => Ok(ReplicationPriority::Auto),
-            _ => Ok(ReplicationPriority::Auto), // Default to Auto for unknown values
-        }
-    }
-}
-
-impl ReplicationPriority {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReplicationPriority::Fast => "fast",
-            ReplicationPriority::Slow => "slow",
-            ReplicationPriority::Auto => "auto",
-        }
-    }
-}
-
-/// Enum for different types of replication operations
-#[derive(Debug)]
-pub enum ReplicationOperation {
-    Object(Box<ReplicateObjectInfo>),
-    Delete(Box<DeletedObjectReplicationInfo>),
-}
-
-impl ReplicationWorkerOperation for ReplicationOperation {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn to_mrf_entry(&self) -> MrfReplicateEntry {
-        match self {
-            ReplicationOperation::Object(obj) => obj.to_mrf_entry(),
-            ReplicationOperation::Delete(del) => del.to_mrf_entry(),
-        }
-    }
-
-    fn get_bucket(&self) -> &str {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_bucket(),
-            ReplicationOperation::Delete(del) => del.get_bucket(),
-        }
-    }
-
-    fn get_object(&self) -> &str {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_object(),
-            ReplicationOperation::Delete(del) => del.get_object(),
-        }
-    }
-
-    fn get_size(&self) -> i64 {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_size(),
-            ReplicationOperation::Delete(del) => del.get_size(),
-        }
-    }
-
-    fn is_delete_marker(&self) -> bool {
-        match self {
-            ReplicationOperation::Object(obj) => obj.is_delete_marker(),
-            ReplicationOperation::Delete(del) => del.is_delete_marker(),
-        }
-    }
-
-    fn get_op_type(&self) -> ReplicationType {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_op_type(),
-            ReplicationOperation::Delete(del) => del.get_op_type(),
-        }
-    }
-}
-
-/// Replication pool options
-#[derive(Debug, Clone)]
-pub struct ReplicationPoolOpts {
-    pub priority: ReplicationPriority,
-    pub max_workers: Option<usize>,
-    pub max_l_workers: Option<usize>,
-}
-
-impl Default for ReplicationPoolOpts {
-    fn default() -> Self {
-        Self {
-            priority: ReplicationPriority::Auto,
-            max_workers: None,
-            max_l_workers: None,
-        }
-    }
-}
 /// Main replication pool structure
 #[derive(Debug)]
 pub struct ReplicationPool<S: ReplicationStorage> {
@@ -246,23 +110,14 @@ pub struct ReplicationPool<S: ReplicationStorage> {
 impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Creates a new replication pool with specified options
     pub async fn new(opts: ReplicationPoolOpts, stats: Arc<ReplicationStats>, storage: Arc<S>) -> Arc<Self> {
+        let worker_counts = initial_worker_counts(&opts);
         let max_workers = opts.max_workers.unwrap_or(WORKER_MAX_LIMIT);
-
-        let (workers, failed_workers) = match opts.priority {
-            ReplicationPriority::Fast => (WORKER_MAX_LIMIT, MRF_WORKER_MAX_LIMIT),
-            ReplicationPriority::Slow => (WORKER_MIN_LIMIT, MRF_WORKER_MIN_LIMIT),
-            ReplicationPriority::Auto => (WORKER_AUTO_DEFAULT, MRF_WORKER_AUTO_DEFAULT),
-        };
-
-        let workers = std::cmp::min(workers, max_workers);
-        let failed_workers = std::cmp::min(failed_workers, max_workers);
-
         let max_l_workers = opts.max_l_workers.unwrap_or(LARGE_WORKER_COUNT);
 
         // Create MRF channels
         let (mrf_replica_tx, mrf_replica_rx) = mpsc::channel(100000);
         let (mrf_save_tx, mrf_save_rx) = mpsc::channel(100000);
-        let (mrf_worker_kill_tx, _mrf_worker_kill_rx) = mpsc::channel(failed_workers);
+        let (mrf_worker_kill_tx, _mrf_worker_kill_rx) = mpsc::channel(worker_counts.mrf_workers);
         let (mrf_stop_tx, _mrf_stop_rx) = mpsc::channel(1);
 
         let pool = Arc::new(Self {
@@ -289,8 +144,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
         // Initialize workers
         pool.resize_lrg_workers(max_l_workers, 0).await;
-        pool.resize_workers(workers, 0).await;
-        pool.resize_failed_workers(failed_workers as i32).await;
+        pool.resize_workers(worker_counts.workers, 0).await;
+        pool.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
 
         // Start background tasks
         pool.start_mrf_processor().await;
@@ -507,39 +362,20 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
         max_workers: Option<usize>,
         max_l_workers: Option<usize>,
     ) {
-        let (workers, mrf_workers) = match pri {
-            ReplicationPriority::Fast => (WORKER_MAX_LIMIT, MRF_WORKER_MAX_LIMIT),
-            ReplicationPriority::Slow => (WORKER_MIN_LIMIT, MRF_WORKER_MIN_LIMIT),
-            ReplicationPriority::Auto => {
-                let mut workers = WORKER_AUTO_DEFAULT;
-                let mut mrf_workers = MRF_WORKER_AUTO_DEFAULT;
+        let current_workers = self.workers.read().await.len();
+        let current_mrf = mrf_worker_size_to_count(self.mrf_worker_size.load(Ordering::SeqCst));
+        let worker_counts = resized_worker_counts(&pri, max_workers, current_workers, current_mrf);
 
-                let current_workers = self.workers.read().await.len();
-                if current_workers < WORKER_AUTO_DEFAULT {
-                    workers = std::cmp::min(current_workers + 1, WORKER_AUTO_DEFAULT);
-                }
-
-                let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst) as usize;
-                if current_mrf < MRF_WORKER_AUTO_DEFAULT {
-                    mrf_workers = std::cmp::min(current_mrf + 1, MRF_WORKER_AUTO_DEFAULT);
-                }
-                (workers, mrf_workers)
-            }
-        };
-
-        let (final_workers, final_mrf_workers) = if let Some(max_w) = max_workers {
+        if let Some(max_w) = max_workers {
             *self.max_workers.write().await = max_w;
-            (std::cmp::min(workers, max_w), std::cmp::min(mrf_workers, max_w))
-        } else {
-            (workers, mrf_workers)
-        };
+        }
 
         let max_l_workers_val = max_l_workers.unwrap_or(LARGE_WORKER_COUNT);
         *self.max_l_workers.write().await = max_l_workers_val;
         *self.priority.write().await = pri;
 
-        self.resize_workers(final_workers, 0).await;
-        self.resize_failed_workers(final_mrf_workers as i32).await;
+        self.resize_workers(worker_counts.workers, 0).await;
+        self.resize_failed_workers(worker_counts.mrf_workers_i32()).await;
         self.resize_lrg_workers(max_l_workers_val, 0).await;
     }
 
@@ -564,7 +400,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
         // If object is large, queue it to a static set of large workers
-        if ri.size >= MIN_LARGE_OBJ_SIZE {
+        if should_queue_large_object(ri.size) {
             use std::collections::hash_map::DefaultHasher;
             use std::hash::{Hash, Hasher};
 
@@ -598,8 +434,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                     // Try to add more workers if possible
                     let max_l_workers = *self.max_l_workers.read().await;
                     let existing = lrg_workers.len();
-                    if self.active_lrg_workers() < std::cmp::min(max_l_workers, LARGE_WORKER_COUNT) as i32 {
-                        let workers = std::cmp::min(existing + 1, max_l_workers);
+                    if should_grow_large_workers(self.active_lrg_workers(), max_l_workers) {
+                        let workers = next_large_worker_count(existing, max_l_workers);
 
                         drop(lrg_workers);
                         self.resize_lrg_workers(workers, existing).await;
@@ -670,25 +506,16 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 );
             }
             ReplicationPriority::Auto => {
-                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                let active_workers = self.active_workers();
-
-                if active_workers < max_w as i32 {
-                    let workers = self.workers.read().await;
-                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                let workers = self.workers.read().await;
+                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
                     let existing = workers.len();
 
                     drop(workers);
                     self.resize_workers(new_count, existing).await;
                 }
 
-                let max_mrf_workers = std::cmp::min(max_workers, MRF_WORKER_MAX_LIMIT);
-                let active_mrf = self.active_mrf_workers();
-
-                if active_mrf < max_mrf_workers as i32 {
-                    let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
-                    let new_mrf = std::cmp::min(current_mrf + 1, max_mrf_workers as i32);
-
+                let current_mrf = self.mrf_worker_size.load(Ordering::SeqCst);
+                if let Some(new_mrf) = next_mrf_worker_count(current_mrf, self.active_mrf_workers(), max_workers) {
                     self.resize_failed_workers(new_mrf).await;
                 }
             }
@@ -753,10 +580,8 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                 );
             }
             ReplicationPriority::Auto => {
-                let max_w = std::cmp::min(max_workers, WORKER_MAX_LIMIT);
-                if self.active_workers() < max_w as i32 {
-                    let workers = self.workers.read().await;
-                    let new_count = std::cmp::min(workers.len() + 1, max_w);
+                let workers = self.workers.read().await;
+                if let Some(new_count) = next_regular_worker_count(workers.len(), self.active_workers(), max_workers) {
                     let existing = workers.len();
                     drop(workers);
                     self.resize_workers(new_count, existing).await;
@@ -1555,140 +1380,52 @@ pub(crate) async fn queue_replication_heal_internal(
     roi = get_heal_replicate_object_info(&oi, &rcfg).await;
     roi.retry_count = retry_count;
 
-    if !roi.dsc.replicate_any() {
-        return ReplicationHealQueueResult {
+    match replication_heal_queue_action(&mut roi) {
+        ReplicationHealQueueAction::Skip => ReplicationHealQueueResult {
             object_info: roi,
             admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    // early return if replication already done, otherwise we need to determine if this
-    // version is an existing object that needs healing.
-    if roi.replication_status == ReplicationStatusType::Completed
-        && roi.version_purge_status.is_empty()
-        && !roi.existing_obj_resync.must_resync()
-    {
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    if roi.delete_marker || !roi.version_purge_status.is_empty() {
-        let (version_id, dm_version_id) = if roi.version_purge_status.is_empty() {
-            (None, roi.version_id)
-        } else {
-            (roi.version_id, None)
-        };
-
-        let dv = DeletedObjectReplicationInfo {
-            delete_object: DeletedObject {
-                object_name: roi.name.clone(),
-                delete_marker_version_id: dm_version_id,
-                version_id,
-                replication_state: roi.replication_state.clone(),
-                delete_marker_mtime: roi.mod_time,
-                delete_marker: roi.delete_marker,
-                ..Default::default()
-            },
-            bucket: roi.bucket.clone(),
-            op_type: ReplicationType::Heal,
-            event_type: REPLICATE_HEAL_DELETE.to_string(),
-            ..Default::default()
-        };
-
-        // heal delete marker replication failure or versioned delete replication failure
-        if roi.replication_status == ReplicationStatusType::Pending
-            || roi.replication_status == ReplicationStatusType::Failed
-            || roi.version_purge_status == VersionPurgeStatusType::Failed
-            || roi.version_purge_status == VersionPurgeStatusType::Pending
-        {
-            let admission = if let Some(pool) = runtime_sources::replication_pool() {
-                pool.queue_replica_delete_task(dv).await
-            } else {
-                ReplicationQueueAdmission::Missed
-            };
-            return ReplicationHealQueueResult {
-                object_info: roi,
-                admission,
-            };
-        }
-
-        // if replication status is Complete on DeleteMarker and existing object resync required
-        let existing_obj_resync = roi.existing_obj_resync.clone();
-        if existing_obj_resync.must_resync()
-            && (roi.replication_status == ReplicationStatusType::Completed || roi.replication_status.is_empty())
-        {
-            let admission = queue_replicate_deletes_wrapper(dv, existing_obj_resync).await;
-            return ReplicationHealQueueResult {
-                object_info: roi,
-                admission,
-            };
-        }
-
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission: ReplicationQueueAdmission::Skipped,
-        };
-    }
-
-    if roi.existing_obj_resync.must_resync() {
-        roi.op_type = ReplicationType::ExistingObject;
-    }
-
-    match roi.replication_status {
-        ReplicationStatusType::Pending | ReplicationStatusType::Failed => {
-            roi.event_type = REPLICATE_HEAL.to_string();
+        },
+        ReplicationHealQueueAction::QueueObject => {
             let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_task(roi.clone()).await
             } else {
                 ReplicationQueueAdmission::Missed
             };
-            return ReplicationHealQueueResult {
+            ReplicationHealQueueResult {
                 object_info: roi,
                 admission,
-            };
+            }
         }
-        _ => {}
-    }
-
-    if roi.existing_obj_resync.must_resync() {
-        roi.event_type = REPLICATE_EXISTING.to_string();
-        let admission = if let Some(pool) = runtime_sources::replication_pool() {
-            pool.queue_replica_task(roi.clone()).await
-        } else {
-            ReplicationQueueAdmission::Missed
-        };
-        return ReplicationHealQueueResult {
-            object_info: roi,
-            admission,
-        };
-    }
-
-    ReplicationHealQueueResult {
-        object_info: roi,
-        admission: ReplicationQueueAdmission::Skipped,
-    }
-}
-
-/// Wrapper function for queueing replicate deletes with resync decision
-async fn queue_replicate_deletes_wrapper(
-    doi: DeletedObjectReplicationInfo,
-    existing_obj_resync: ResyncDecision,
-) -> ReplicationQueueAdmission {
-    let mut admission = ReplicationQueueAdmission::Skipped;
-    for (k, v) in existing_obj_resync.targets.iter() {
-        if v.replicate {
-            let mut dv = doi.clone();
-            dv.reset_id = v.reset_id.clone();
-            dv.target_arn = k.clone();
-            let target_admission = if let Some(pool) = runtime_sources::replication_pool() {
+        ReplicationHealQueueAction::QueueDelete(dv) => {
+            let admission = if let Some(pool) = runtime_sources::replication_pool() {
                 pool.queue_replica_delete_task(dv).await
             } else {
                 ReplicationQueueAdmission::Missed
             };
-            admission.merge(target_admission);
+            ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            }
         }
+        ReplicationHealQueueAction::QueueResyncDeletes(batch) => {
+            let admission = queue_replicate_deletes(batch).await;
+            ReplicationHealQueueResult {
+                object_info: roi,
+                admission,
+            }
+        }
+    }
+}
+
+async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> ReplicationQueueAdmission {
+    let mut admission = ReplicationQueueAdmission::Skipped;
+    for dv in batch.target_delete_infos() {
+        let target_admission = if let Some(pool) = runtime_sources::replication_pool() {
+            pool.queue_replica_delete_task(dv).await
+        } else {
+            ReplicationQueueAdmission::Missed
+        };
+        admission.merge(target_admission);
     }
     admission
 }
@@ -1708,16 +1445,6 @@ mod tests {
 
         admission.merge(ReplicationQueueAdmission::Missed);
         assert_eq!(admission, ReplicationQueueAdmission::Missed);
-    }
-
-    #[test]
-    fn auto_resume_resync_only_for_inflight_states() {
-        assert!(should_auto_resume_resync(ResyncStatusType::ResyncPending));
-        assert!(should_auto_resume_resync(ResyncStatusType::ResyncStarted));
-        assert!(!should_auto_resume_resync(ResyncStatusType::NoResync));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCanceled));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncCompleted));
-        assert!(!should_auto_resume_resync(ResyncStatusType::ResyncFailed));
     }
 
     // ── MrfReplicateEntry encode/decode roundtrips ────────────────────────────
