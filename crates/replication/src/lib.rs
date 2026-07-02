@@ -14,12 +14,14 @@
 
 pub mod config;
 pub mod mrf;
+pub mod operation;
 pub mod resync;
 pub mod rule;
 pub mod tagging;
 
 pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
+pub use operation::{MustReplicateOptions, is_ssec_encrypted};
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
     decode_resync_file, encode_resync_file,

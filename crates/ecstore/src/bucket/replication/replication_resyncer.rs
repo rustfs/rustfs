@@ -55,13 +55,12 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
+use rustfs_replication::{BucketReplicationResyncStatus, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP,
-    headers,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
 };
 use rustfs_utils::http::{
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
@@ -909,13 +908,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         must_replicate(
             oi.bucket.as_str(),
             &oi.name,
-            MustReplicateOptions::new(
-                &user_defined,
-                (*oi.user_tags).clone(),
-                ReplicationStatusType::Empty,
-                ReplicationType::Heal,
-                ObjectOptions::default(),
-            ),
+            MustReplicateOptions::new(&user_defined, (*oi.user_tags).clone(), ReplicationType::Heal, false),
         )
         .await
     };
@@ -1089,13 +1082,7 @@ impl ReplicationConfig {
         let dsc = must_replicate(
             oi.bucket.as_str(),
             &oi.name,
-            MustReplicateOptions::new(
-                &user_defined,
-                (*oi.user_tags).clone(),
-                ReplicationStatusType::Empty,
-                ReplicationType::ExistingObject,
-                ObjectOptions::default(),
-            ),
+            MustReplicateOptions::new(&user_defined, (*oi.user_tags).clone(), ReplicationType::ExistingObject, false),
         )
         .await;
 
@@ -1192,62 +1179,14 @@ pub fn resync_target(
     dec
 }
 
-pub struct MustReplicateOptions {
-    meta: HashMap<String, String>,
-    status: ReplicationStatusType,
-    op_type: ReplicationType,
-    replication_request: bool,
-}
-
-impl MustReplicateOptions {
-    pub fn new(
-        meta: &HashMap<String, String>,
-        user_tags: String,
-        status: ReplicationStatusType,
-        op_type: ReplicationType,
-        opts: ObjectOptions,
-    ) -> Self {
-        let mut meta = meta.clone();
-        if !user_tags.is_empty() {
-            meta.insert(AMZ_OBJECT_TAGGING.to_string(), user_tags);
-        }
-
-        Self {
-            meta,
-            status,
-            op_type,
-            replication_request: opts.replication_request,
-        }
-    }
-
-    pub fn from_object_info(oi: &ObjectInfo, op_type: ReplicationType, opts: ObjectOptions) -> Self {
-        Self::new(&oi.user_defined, (*oi.user_tags).clone(), oi.replication_status.clone(), op_type, opts)
-    }
-
-    pub fn replication_status(&self) -> ReplicationStatusType {
-        if let Some(rs) = self.meta.get(AMZ_BUCKET_REPLICATION_STATUS) {
-            return ReplicationStatusType::from(rs.as_str());
-        }
-        ReplicationStatusType::default()
-    }
-
-    pub fn is_existing_object_replication(&self) -> bool {
-        self.op_type == ReplicationType::ExistingObject
-    }
-
-    pub fn is_metadata_replication(&self) -> bool {
-        self.op_type == ReplicationType::Metadata
-    }
-}
-
 pub(crate) fn get_must_replicate_options(
     user_defined: &HashMap<String, String>,
     user_tags: String,
-    status: ReplicationStatusType,
+    _status: ReplicationStatusType,
     op_type: ReplicationType,
     opts: ObjectOptions,
 ) -> MustReplicateOptions {
-    MustReplicateOptions::new(user_defined, user_tags, status, op_type, opts)
+    MustReplicateOptions::new(user_defined, user_tags, op_type, opts.replication_request)
 }
 
 /// Returns whether object version is a delete marker and if object qualifies for replication
@@ -1343,7 +1282,7 @@ pub(crate) async fn check_replicate_delete(
 fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
     ObjectOpts {
         name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
+        ssec: rustfs_replication::is_ssec_encrypted(&oi.user_defined),
         user_tags: (*oi.user_tags).clone(),
         delete_marker: oi.delete_marker,
         version_id: dobj.version_id,
@@ -1351,13 +1290,6 @@ fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> Obj
         replica: oi.replication_status == ReplicationStatusType::Replica,
         ..Default::default()
     }
-}
-
-/// Check if the user-defined metadata contains SSEC encryption headers
-fn is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
-    user_defined.contains_key(SSEC_ALGORITHM_HEADER)
-        || user_defined.contains_key(SSEC_KEY_HEADER)
-        || user_defined.contains_key(SSEC_KEY_MD5_HEADER)
 }
 
 pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
@@ -1375,7 +1307,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         return ReplicateDecision::default();
     }
 
-    if mopts.replication_request {
+    if mopts.is_replication_request() {
         return ReplicateDecision::default();
     }
 
@@ -1396,7 +1328,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         name: object.to_string(),
         replica: replication_status == ReplicationStatusType::Replica,
         existing_object: mopts.is_existing_object_replication(),
-        user_tags: mopts.meta.get(AMZ_OBJECT_TAGGING).map(|s| s.to_string()).unwrap_or_default(),
+        user_tags: mopts.user_tags().to_string(),
         ..Default::default()
     };
 
@@ -3359,7 +3291,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     };
 
     let mut meta = HashMap::new();
-    let is_ssec = is_ssec_encrypted(&object_info.user_defined);
+    let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
 
     // Process user-defined metadata
     for (k, v) in object_info.user_defined.iter() {
