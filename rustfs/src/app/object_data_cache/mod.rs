@@ -12,20 +12,17 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Application layer module entry.
-//! Concrete use-case modules will be introduced incrementally in Phase 3.
+//! App-layer object data cache adapter boundary.
 
-pub mod admin_usecase;
-pub mod bucket_usecase;
-pub mod context;
-pub mod multipart_usecase;
-pub(crate) mod object_data_cache;
-pub mod object_usecase;
-pub(crate) mod runtime_sources;
-mod select_object;
-pub(crate) mod storage_api;
+mod adapter;
+mod body;
+mod invalidation;
+mod planner;
 
-#[cfg(test)]
-mod capacity_dirty_scope_test;
-#[cfg(test)]
-mod lifecycle_transition_api_test;
+pub(crate) use adapter::ObjectDataCacheAdapter;
+pub(crate) use body::{
+    GetObjectBodyCacheLookup, fill_get_object_body_cache_from_buffered_body, fill_get_object_body_cache_from_materialized_body,
+    lookup_get_object_body_cache_hit,
+};
+pub(crate) use invalidation::{invalidate_object_data_cache_object, invalidate_object_data_cache_objects};
+pub(crate) use planner::GetObjectBodyCacheRequest;

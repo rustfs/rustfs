@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::app::context;
+use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use std::sync::Arc;
 
 pub(crate) use context::{
@@ -35,6 +36,7 @@ pub(crate) use context::{
     resolve_notification_system_for_context as current_notification_system_for_context,
     resolve_notify_interface as current_notify_interface,
     resolve_notify_interface_for_context as current_notify_interface_for_context,
+    resolve_object_data_cache_handle_for_context as current_object_data_cache_handle_for_context,
     resolve_object_store_handle as current_object_store_handle,
     resolve_object_store_handle_for_context as current_object_store_handle_for_context,
     resolve_oidc_handle as current_oidc_handle,
@@ -55,4 +57,8 @@ pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     context::get_global_app_context()
+}
+
+pub(crate) fn fallback_object_data_cache_handle() -> Arc<ObjectDataCacheAdapter> {
+    ObjectDataCacheAdapter::disabled_arc()
 }

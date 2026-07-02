@@ -32,6 +32,7 @@ use super::storage_api::context::runtime::{
     ScannerMetricsReport, StorageClassConfig, TierConfigMgr, TransitionState,
 };
 use super::storage_api::context::{ECStore, EndpointServerPools};
+use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::config::RustFSBufferConfig;
 use rustfs_config::server_config::Config;
 use rustfs_credentials::Credentials;
@@ -123,6 +124,21 @@ pub fn resolve_object_store_handle() -> Option<Arc<ECStore>> {
 /// Resolve object store handle using an explicit AppContext.
 pub fn resolve_object_store_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ECStore>> {
     context.map(|context| context.object_store())
+}
+
+/// Resolve object data cache adapter using AppContext-first precedence.
+#[expect(
+    dead_code,
+    reason = "ST-05 exposes the global resolver; app use sites start in later cache phases"
+)]
+pub(crate) fn resolve_object_data_cache_handle() -> Option<Arc<ObjectDataCacheAdapter>> {
+    let context = get_global_app_context();
+    resolve_object_data_cache_handle_for_context(context.as_deref())
+}
+
+/// Resolve object data cache adapter using an explicit AppContext.
+pub(crate) fn resolve_object_data_cache_handle_for_context(context: Option<&AppContext>) -> Option<Arc<ObjectDataCacheAdapter>> {
+    context.map(|context| context.object_data_cache())
 }
 
 /// Resolve notify interface using AppContext-first precedence.
