@@ -20,8 +20,9 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
-    FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -30,6 +31,7 @@ use crate::disk::{
     },
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
+    validate_batch_read_version_item_count,
 };
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -40,11 +42,11 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
-    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
-    RenameDataRequest, RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
-    WriteMetadataRequest, node_service_client::NodeServiceClient,
+    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
+    DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest,
+    MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
+    ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest, StatVolumeRequest,
+    UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -63,7 +65,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
 use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
@@ -75,10 +77,43 @@ enum FailureHealthAction {
 
 const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
+const BATCH_METADATA_RPC_OFF: &str = "off";
+const BATCH_METADATA_RPC_AUTO: &str = "auto";
+const BATCH_METADATA_RPC_ON: &str = "on";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchMetadataRpcMode {
+    Off,
+    Auto,
+    On,
+}
+
+impl BatchMetadataRpcMode {
+    fn should_attempt(self) -> bool {
+        matches!(self, Self::Auto | Self::On)
+    }
+}
+
+fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
+    match raw.trim() {
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_AUTO) => BatchMetadataRpcMode::Auto,
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_ON) => BatchMetadataRpcMode::On,
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_OFF) => BatchMetadataRpcMode::Off,
+        _ => BatchMetadataRpcMode::Off,
+    }
+}
+
+fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
+    rustfs_utils::get_env_opt_str(ENV_RUSTFS_BATCH_METADATA_RPC)
+        .as_deref()
+        .map(parse_batch_metadata_rpc_mode)
+        .unwrap_or(BatchMetadataRpcMode::Off)
+}
 
 async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
 where
@@ -807,6 +842,48 @@ fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint:
     Ok(read_multiple_resps)
 }
 
+fn decode_batch_read_version_response_items(
+    response: BatchReadVersionResponse,
+    endpoint: &Endpoint,
+) -> Result<Vec<BatchReadVersionResp>> {
+    if !response.batch_read_version_resps_bin.is_empty() {
+        if !response.batch_read_version_resps.is_empty()
+            && response.batch_read_version_resps.len() != response.batch_read_version_resps_bin.len()
+        {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                json_count = response.batch_read_version_resps.len(),
+                msgpack_count = response.batch_read_version_resps_bin.len(),
+                op = "batch_read_version",
+                state = "response_count_mismatch",
+                "Remote disk BatchReadVersion compatibility payload counts differ"
+            );
+        }
+
+        let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps_bin.len());
+        for (index, buf) in response.batch_read_version_resps_bin.iter().enumerate() {
+            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "").map_err(|err| {
+                Error::other(format!("decode BatchReadVersionResp msgpack item {index} from {endpoint} failed: {err}"))
+            })?;
+            batch_read_version_resps.push(resp);
+        }
+        return Ok(batch_read_version_resps);
+    }
+
+    let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
+    for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
+        let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
+            Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
+        })?;
+        batch_read_version_resps.push(resp);
+    }
+
+    Ok(batch_read_version_resps)
+}
+
 // TODO: all api need to handle errors
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
@@ -1494,6 +1571,69 @@ impl DiskAPI for RemoteDisk {
                 let file_info = decode_msgpack_or_json::<FileInfo>(&response.file_info_bin, &response.file_info)?;
 
                 Ok(file_info)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    #[tracing::instrument(skip(self, req))]
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        validate_batch_read_version_item_count(req.items.len())?;
+
+        if !batch_metadata_rpc_mode().should_attempt() {
+            return batch_read_version_one_by_one(self, req).await;
+        }
+
+        debug!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            item_count = req.items.len(),
+            op = "batch_read_version",
+            state = "started",
+            "Remote disk RPC started"
+        );
+        let batch_read_version_req = serde_json::to_string(&req)?;
+        let batch_read_version_req_bin = encode_msgpack(&req)?;
+
+        self.execute_with_timeout_for_op(
+            "batch_read_version",
+            move || async move {
+                let disk = self.disk_ref().await;
+                let mut client = self
+                    .get_client()
+                    .await
+                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                let request = Request::new(BatchReadVersionRequest {
+                    disk,
+                    batch_read_version_req,
+                    batch_read_version_req_bin: batch_read_version_req_bin.into(),
+                });
+
+                let response = match client.batch_read_version(request).await {
+                    Ok(response) => response.into_inner(),
+                    Err(status) if status.code() == Code::Unimplemented => {
+                        warn!(
+                            event = EVENT_REMOTE_DISK_RPC,
+                            component = LOG_COMPONENT_ECSTORE,
+                            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                            endpoint = %self.endpoint,
+                            op = "batch_read_version",
+                            state = "fallback_unimplemented",
+                            "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                        );
+                        return batch_read_version_one_by_one(self, req).await;
+                    }
+                    Err(status) => return Err(Error::from(status)),
+                };
+
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+
+                decode_batch_read_version_response_items(response, &self.endpoint)
             },
             get_max_timeout_duration(),
         )
@@ -2517,6 +2657,76 @@ mod tests {
 
         assert!(err.contains("ReadMultipleResp msgpack item 1"), "unexpected error: {err}");
         assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
+    fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
+        BatchReadVersionResp {
+            index,
+            path: path.to_string(),
+            version_id: "version-a".to_string(),
+            success,
+            error: if success {
+                String::new()
+            } else {
+                "file version not found".to_string()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_prefers_msgpack_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let msgpack_resp = sample_batch_read_version_resp(7, "msgpack-object", true);
+        let json_resp = sample_batch_read_version_resp(1, "json-object", false);
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            batch_read_version_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
+            error: None,
+        };
+
+        let decoded = decode_batch_read_version_response_items(response, &endpoint).expect("msgpack response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].index, 7);
+        assert_eq!(decoded[0].path, "msgpack-object");
+        assert!(decoded[0].success);
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_reports_corrupt_msgpack_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: Vec::new(),
+            batch_read_version_resps_bin: vec![
+                encode_msgpack(&sample_batch_read_version_resp(0, "ok", true))
+                    .expect("msgpack response should encode")
+                    .into(),
+                bytes::Bytes::from_static(b"not-msgpack"),
+            ],
+            error: None,
+        };
+
+        let err = decode_batch_read_version_response_items(response, &endpoint)
+            .expect_err("corrupt msgpack item should fail")
+            .to_string();
+
+        assert!(err.contains("BatchReadVersionResp msgpack item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_defaults_to_off_and_parses_supported_values() {
+        assert_eq!(parse_batch_metadata_rpc_mode(""), BatchMetadataRpcMode::Off);
+        assert_eq!(parse_batch_metadata_rpc_mode("off"), BatchMetadataRpcMode::Off);
+        assert_eq!(parse_batch_metadata_rpc_mode("auto"), BatchMetadataRpcMode::Auto);
+        assert_eq!(parse_batch_metadata_rpc_mode("on"), BatchMetadataRpcMode::On);
+        assert_eq!(parse_batch_metadata_rpc_mode("unknown"), BatchMetadataRpcMode::Off);
+        assert!(!BatchMetadataRpcMode::Off.should_attempt());
+        assert!(BatchMetadataRpcMode::Auto.should_attempt());
+        assert!(BatchMetadataRpcMode::On.should_attempt());
     }
 
     #[test]

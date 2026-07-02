@@ -371,6 +371,19 @@ message ReadVersionResponse {
   bytes file_info_bin = 4;
 }
 
+message BatchReadVersionRequest {
+  string disk = 1;
+  string batch_read_version_req = 2;
+  bytes batch_read_version_req_bin = 3;
+}
+
+message BatchReadVersionResponse {
+  bool success = 1;
+  repeated string batch_read_version_resps = 2;
+  optional Error error = 3;
+  repeated bytes batch_read_version_resps_bin = 4;
+}
+
 message ReadXLRequest {
   string disk = 1;
   string volume = 2;
@@ -868,6 +881,7 @@ service NodeService {
   rpc ReadMetadata(ReadMetadataRequest) returns (ReadMetadataResponse) {};
   rpc WriteMetadata(WriteMetadataRequest) returns (WriteMetadataResponse) {};
   rpc ReadVersion(ReadVersionRequest) returns (ReadVersionResponse) {};
+  rpc BatchReadVersion(BatchReadVersionRequest) returns (BatchReadVersionResponse) {};
   rpc ReadXL(ReadXLRequest) returns (ReadXLResponse) {};
   rpc DeleteVersion(DeleteVersionRequest) returns (DeleteVersionResponse) {};
   rpc DeleteVersions(DeleteVersionsRequest) returns (DeleteVersionsResponse) {};

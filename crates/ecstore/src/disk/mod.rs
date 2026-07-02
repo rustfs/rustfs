@@ -577,6 +577,9 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         version_id: &str,
         opts: &ReadOptions,
     ) -> Result<FileInfo>;
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        batch_read_version_one_by_one(self, req).await
+    }
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo>;
     async fn read_metadata(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn rename_data(
@@ -635,6 +638,41 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     async fn read_all(&self, volume: &str, path: &str) -> Result<Bytes>;
     async fn disk_info(&self, opts: &DiskInfoOptions) -> Result<DiskInfo>;
     fn start_scan(&self) -> ScanGuard;
+}
+
+pub async fn batch_read_version_one_by_one<D>(disk: &D, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>>
+where
+    D: DiskAPI + ?Sized,
+{
+    validate_batch_read_version_item_count(req.items.len())?;
+
+    let mut responses = Vec::with_capacity(req.items.len());
+    for (index, item) in req.items.iter().enumerate() {
+        let response = match disk
+            .read_version(&item.org_volume, &item.volume, &item.path, &item.version_id, &req.opts)
+            .await
+        {
+            Ok(file_info) => BatchReadVersionResp {
+                index,
+                path: item.path.clone(),
+                version_id: item.version_id.clone(),
+                success: true,
+                file_info,
+                error: String::new(),
+            },
+            Err(err) => BatchReadVersionResp {
+                index,
+                path: item.path.clone(),
+                version_id: item.version_id.clone(),
+                success: false,
+                file_info: FileInfo::default(),
+                error: err.to_string(),
+            },
+        };
+        responses.push(response);
+    }
+
+    Ok(responses)
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -805,6 +843,41 @@ pub struct ReadMultipleResp {
     pub error: String,
     pub data: Vec<u8>,
     pub mod_time: Option<OffsetDateTime>,
+}
+
+pub const BATCH_READ_VERSION_MAX_ITEMS: usize = 128;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionItem {
+    pub org_volume: String,
+    pub volume: String,
+    pub path: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchReadVersionReq {
+    pub items: Vec<BatchReadVersionItem>,
+    pub opts: ReadOptions,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct BatchReadVersionResp {
+    pub index: usize,
+    pub path: String,
+    pub version_id: String,
+    pub success: bool,
+    pub file_info: FileInfo,
+    pub error: String,
+}
+
+pub fn validate_batch_read_version_item_count(item_count: usize) -> Result<()> {
+    if item_count > BATCH_READ_VERSION_MAX_ITEMS {
+        return Err(DiskError::other(format!(
+            "batch read version item count {item_count} exceeds limit {BATCH_READ_VERSION_MAX_ITEMS}"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Deserialize, Serialize)]
