@@ -19,10 +19,10 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
+    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo,
     ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType,
-    ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state,
-    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state, parse_replicate_decision,
+    replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_metadata_boundary::ReplicationMetadataStore;
@@ -55,13 +55,14 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
+use rustfs_replication::{
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ResyncOpts, TargetReplicationResyncStatus,
+};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, AMZ_TAGGING_DIRECTIVE, CONTENT_ENCODING, HeaderExt as _,
-    SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP,
-    SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP,
-    headers,
+    SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP, SUFFIX_REPLICATION_RESET,
+    SUFFIX_REPLICATION_STATUS, SUFFIX_TAGGING_TIMESTAMP, headers,
 };
 use rustfs_utils::http::{
     SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_RESET_STATUS, SUFFIX_REPLICATION_SSEC_CRC, get_header_map, get_str,
@@ -72,7 +73,6 @@ use rustfs_utils::{DEFAULT_SIP_HASH_KEY, sip_hash};
 use s3s::dto::ReplicationConfiguration;
 use serde::Deserialize;
 use serde::Serialize;
-use std::any::Any;
 use std::collections::HashMap;
 use std::sync::Arc;
 use time::OffsetDateTime;
@@ -909,13 +909,7 @@ pub async fn get_heal_replicate_object_info(oi: &ObjectInfo, rcfg: &ReplicationC
         must_replicate(
             oi.bucket.as_str(),
             &oi.name,
-            MustReplicateOptions::new(
-                &user_defined,
-                (*oi.user_tags).clone(),
-                ReplicationStatusType::Empty,
-                ReplicationType::Heal,
-                ObjectOptions::default(),
-            ),
+            MustReplicateOptions::new(&user_defined, (*oi.user_tags).clone(), ReplicationType::Heal, false),
         )
         .await
     };
@@ -970,57 +964,6 @@ pub(crate) async fn save_resync_status<S: ReplicationObjectIO>(
 
 async fn get_replication_config(bucket: &str) -> Result<Option<ReplicationConfiguration>> {
     ReplicationMetadataStore::optional_replication_config(bucket).await
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct DeletedObjectReplicationInfo {
-    pub delete_object: DeletedObject,
-    pub bucket: String,
-    pub event_type: String,
-    pub op_type: ReplicationType,
-    pub reset_id: String,
-    pub target_arn: String,
-}
-
-impl ReplicationWorkerOperation for DeletedObjectReplicationInfo {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn to_mrf_entry(&self) -> MrfReplicateEntry {
-        MrfReplicateEntry {
-            bucket: self.bucket.clone(),
-            object: self.delete_object.object_name.clone(),
-            // version_id here is the version being purged (if any); the delete-marker
-            // version is stored separately in delete_marker_version_id.
-            version_id: self.delete_object.version_id,
-            retry_count: 0,
-            size: 0,
-            op: MrfOpKind::Delete,
-            delete_marker_version_id: self.delete_object.delete_marker_version_id,
-            delete_marker: self.delete_object.delete_marker,
-        }
-    }
-
-    fn get_bucket(&self) -> &str {
-        &self.bucket
-    }
-
-    fn get_object(&self) -> &str {
-        &self.delete_object.object_name
-    }
-
-    fn get_size(&self) -> i64 {
-        0
-    }
-
-    fn is_delete_marker(&self) -> bool {
-        true
-    }
-
-    fn get_op_type(&self) -> ReplicationType {
-        self.op_type
-    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -1089,13 +1032,7 @@ impl ReplicationConfig {
         let dsc = must_replicate(
             oi.bucket.as_str(),
             &oi.name,
-            MustReplicateOptions::new(
-                &user_defined,
-                (*oi.user_tags).clone(),
-                ReplicationStatusType::Empty,
-                ReplicationType::ExistingObject,
-                ObjectOptions::default(),
-            ),
+            MustReplicateOptions::new(&user_defined, (*oi.user_tags).clone(), ReplicationType::ExistingObject, false),
         )
         .await;
 
@@ -1192,62 +1129,14 @@ pub fn resync_target(
     dec
 }
 
-pub struct MustReplicateOptions {
-    meta: HashMap<String, String>,
-    status: ReplicationStatusType,
-    op_type: ReplicationType,
-    replication_request: bool,
-}
-
-impl MustReplicateOptions {
-    pub fn new(
-        meta: &HashMap<String, String>,
-        user_tags: String,
-        status: ReplicationStatusType,
-        op_type: ReplicationType,
-        opts: ObjectOptions,
-    ) -> Self {
-        let mut meta = meta.clone();
-        if !user_tags.is_empty() {
-            meta.insert(AMZ_OBJECT_TAGGING.to_string(), user_tags);
-        }
-
-        Self {
-            meta,
-            status,
-            op_type,
-            replication_request: opts.replication_request,
-        }
-    }
-
-    pub fn from_object_info(oi: &ObjectInfo, op_type: ReplicationType, opts: ObjectOptions) -> Self {
-        Self::new(&oi.user_defined, (*oi.user_tags).clone(), oi.replication_status.clone(), op_type, opts)
-    }
-
-    pub fn replication_status(&self) -> ReplicationStatusType {
-        if let Some(rs) = self.meta.get(AMZ_BUCKET_REPLICATION_STATUS) {
-            return ReplicationStatusType::from(rs.as_str());
-        }
-        ReplicationStatusType::default()
-    }
-
-    pub fn is_existing_object_replication(&self) -> bool {
-        self.op_type == ReplicationType::ExistingObject
-    }
-
-    pub fn is_metadata_replication(&self) -> bool {
-        self.op_type == ReplicationType::Metadata
-    }
-}
-
 pub(crate) fn get_must_replicate_options(
     user_defined: &HashMap<String, String>,
     user_tags: String,
-    status: ReplicationStatusType,
+    _status: ReplicationStatusType,
     op_type: ReplicationType,
     opts: ObjectOptions,
 ) -> MustReplicateOptions {
-    MustReplicateOptions::new(user_defined, user_tags, status, op_type, opts)
+    MustReplicateOptions::new(user_defined, user_tags, op_type, opts.replication_request)
 }
 
 /// Returns whether object version is a delete marker and if object qualifies for replication
@@ -1343,7 +1232,7 @@ pub(crate) async fn check_replicate_delete(
 fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> ObjectOpts {
     ObjectOpts {
         name: dobj.object_name.clone(),
-        ssec: is_ssec_encrypted(&oi.user_defined),
+        ssec: rustfs_replication::is_ssec_encrypted(&oi.user_defined),
         user_tags: (*oi.user_tags).clone(),
         delete_marker: oi.delete_marker,
         version_id: dobj.version_id,
@@ -1351,13 +1240,6 @@ fn delete_replication_object_opts(dobj: &ObjectToDelete, oi: &ObjectInfo) -> Obj
         replica: oi.replication_status == ReplicationStatusType::Replica,
         ..Default::default()
     }
-}
-
-/// Check if the user-defined metadata contains SSEC encryption headers
-fn is_ssec_encrypted(user_defined: &HashMap<String, String>) -> bool {
-    user_defined.contains_key(SSEC_ALGORITHM_HEADER)
-        || user_defined.contains_key(SSEC_KEY_HEADER)
-        || user_defined.contains_key(SSEC_KEY_MD5_HEADER)
 }
 
 pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplicateOptions) -> ReplicateDecision {
@@ -1375,7 +1257,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         return ReplicateDecision::default();
     }
 
-    if mopts.replication_request {
+    if mopts.is_replication_request() {
         return ReplicateDecision::default();
     }
 
@@ -1396,7 +1278,7 @@ pub(crate) async fn must_replicate(bucket: &str, object: &str, mopts: MustReplic
         name: object.to_string(),
         replica: replication_status == ReplicationStatusType::Replica,
         existing_object: mopts.is_existing_object_replication(),
-        user_tags: mopts.meta.get(AMZ_OBJECT_TAGGING).map(|s| s.to_string()).unwrap_or_default(),
+        user_tags: mopts.user_tags().to_string(),
         ..Default::default()
     };
 
@@ -3359,7 +3241,7 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
     };
 
     let mut meta = HashMap::new();
-    let is_ssec = is_ssec_encrypted(&object_info.user_defined);
+    let is_ssec = rustfs_replication::is_ssec_encrypted(&object_info.user_defined);
 
     // Process user-defined metadata
     for (k, v) in object_info.user_defined.iter() {
