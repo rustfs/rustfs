@@ -30,11 +30,11 @@ byteorder.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
 rustfs-filemeta.workspace = true
+s3s.workspace = true
 serde.workspace = true
 time.workspace = true
-
-[dev-dependencies]
-uuid = { workspace = true, features = ["v4"] }
+url.workspace = true
+uuid = { workspace = true, features = ["v4", "serde"] }
 
 [lints]
 workspace = true
