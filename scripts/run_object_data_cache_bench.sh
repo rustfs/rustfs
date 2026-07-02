@@ -46,6 +46,7 @@ OBS_ENDPOINT="${RUSTFS_OBS_ENDPOINT:-}"
 OBS_METRIC_ENDPOINT="${RUSTFS_OBS_METRIC_ENDPOINT:-}"
 OBS_METER_INTERVAL="${RUSTFS_OBS_METER_INTERVAL:-1}"
 OBS_SERVICE_NAME_PREFIX="${RUSTFS_OBS_SERVICE_NAME:-RustFS-object-cache}"
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
 ALLOW_MISSING_CACHE_METRICS=false
 
 OBJECT_CACHE_MAX_BYTES=""
@@ -364,6 +365,7 @@ diagnostic_obs_endpoint=${OBS_ENDPOINT}
 diagnostic_obs_metric_endpoint=${OBS_METRIC_ENDPOINT}
 diagnostic_obs_meter_interval=${OBS_METER_INTERVAL}
 diagnostic_obs_service_name_prefix=${OBS_SERVICE_NAME_PREFIX}
+run_id=${RUN_ID}
 allow_missing_cache_metrics=${ALLOW_MISSING_CACHE_METRICS}
 RUSTFS_OBJECT_DATA_CACHE_ENABLE=mode-derived
 RUSTFS_OBJECT_DATA_CACHE_MAX_BYTES=${OBJECT_CACHE_MAX_BYTES:-server-default}
@@ -441,7 +443,7 @@ run_mode() {
 
   address="$(address_for_index "$index")"
   bucket="${BUCKET}-$(sanitize_name "$mode")"
-  obs_service_prefix="${OBS_SERVICE_NAME_PREFIX}-$(sanitize_name "$mode")"
+  obs_service_prefix="${OBS_SERVICE_NAME_PREFIX}-${RUN_ID}-$(sanitize_name "$mode")"
   mkdir -p "$mode_dir"
 
   cmd=(
@@ -529,7 +531,7 @@ write_summaries() {
     strict="false"
   fi
 
-  "$PYTHON_BIN" - "$OUT_DIR" "$MODES" "$strict" <<'PY'
+  "$PYTHON_BIN" - "$OUT_DIR" "$MODES" "$strict" "$RUN_ID" <<'PY'
 import csv
 import pathlib
 import re
@@ -538,6 +540,7 @@ import sys
 out_dir = pathlib.Path(sys.argv[1])
 modes = [mode.strip() for mode in sys.argv[2].split(",") if mode.strip()]
 strict = sys.argv[3] == "true"
+run_id = sys.argv[4] if len(sys.argv) > 4 else ""
 
 LINE = re.compile(
     r'^([a-zA-Z_:][a-zA-Z0-9_:]*)(?:\{([^}]*)\})?\s+'
@@ -578,25 +581,58 @@ def sanitize_mode(mode):
 
 def labels_belong_to_mode(labels, mode):
     label_map = labels_to_dict(labels)
-    if label_map.get("mode") == mode:
+    mode_slug = sanitize_mode(mode)
+    attribution_values = [label_map.get(key, "") for key in ("job", "service_name", "otel_scope_name")]
+    has_attribution = any(attribution_values)
+    mode_label_matches = label_map.get("mode") == mode
+    attribution_matches_mode = any(mode in value or mode_slug in value for value in attribution_values)
+    attribution_matches_run = not run_id or any(run_id in value for value in attribution_values)
+    if has_attribution:
+        return attribution_matches_run and (mode_label_matches or attribution_matches_mode)
+
+    if mode_label_matches:
         return True
 
-    mode_slug = sanitize_mode(mode)
-    for key in ("job", "service_name", "otel_scope_name"):
-        value = label_map.get(key, "")
-        if mode in value or mode_slug in value:
-            return True
     return False
+
+
+def labels_have_mode_attribution(labels):
+    label_map = labels_to_dict(labels)
+    return any(label_map.get(key) for key in ("mode", "job", "service_name", "otel_scope_name"))
+
+
+def labels_match_mode_or_unattributed(labels, mode):
+    if labels_belong_to_mode(labels, mode):
+        return True
+    return not labels_have_mode_attribution(labels)
 
 
 def metric_matches(metric, expected):
     return metric == expected or metric == f"{expected}_total"
 
 
-def sum_after(after, expected, **wanted_labels):
+def counter_delta(before, after, expected, expected_mode, **wanted_labels):
+    total = 0.0
+    for (metric, labels), after_value in after.items():
+        if not metric_matches(metric, expected):
+            continue
+        if not labels_match_mode_or_unattributed(labels, expected_mode):
+            continue
+        label_map = labels_to_dict(labels)
+        if all(label_map.get(key) == expected_value for key, expected_value in wanted_labels.items()):
+            before_value = before.get((metric, labels), 0.0)
+            delta = after_value - before_value
+            if delta > 0:
+                total += delta
+    return total
+
+
+def counter_observed(after, expected, expected_mode, **wanted_labels):
     total = 0.0
     for (metric, labels), value in after.items():
         if not metric_matches(metric, expected):
+            continue
+        if not labels_match_mode_or_unattributed(labels, expected_mode):
             continue
         label_map = labels_to_dict(labels)
         if all(label_map.get(key) == expected_value for key, expected_value in wanted_labels.items()):
@@ -609,7 +645,7 @@ def gauge_max(before, after, expected, mode):
     for rows in (before, after):
         for (metric, labels), value in rows.items():
             if metric_matches(metric, expected):
-                if not labels_belong_to_mode(labels, mode):
+                if not labels_match_mode_or_unattributed(labels, mode):
                     continue
                 values.append(value)
     return max(values) if values else 0.0
@@ -618,6 +654,8 @@ def gauge_max(before, after, expected, mode):
 def metric_delta_rows(mode, before, after):
     keys = sorted(set(before) | set(after))
     for metric, labels in keys:
+        if not labels_match_mode_or_unattributed(labels, mode):
+            continue
         before_value = before.get((metric, labels), 0.0)
         after_value = after.get((metric, labels), 0.0)
         yield {
@@ -634,13 +672,15 @@ def mode_metrics(mode):
     metrics_dir = out_dir / mode / "legacy" / "service-metrics"
     before = read_prom(metrics_dir / "before.prom")
     after = read_prom(metrics_dir / "after.prom")
-    requests = sum_after(after, "rustfs_object_data_cache_requests_total", mode=mode)
-    misses = sum_after(after, "rustfs_object_data_cache_requests_total", mode=mode, decision="miss")
-    cacheable = sum_after(after, "rustfs_object_data_cache_requests_total", mode=mode, decision="cacheable")
-    hits = sum_after(after, "rustfs_object_data_cache_requests_total", mode=mode, decision="hit")
-    hit_bytes = sum_after(after, "rustfs_object_data_cache_hit_bytes_total", mode=mode)
-    fill_inserted = sum_after(after, "rustfs_object_data_cache_fill_total", mode=mode, result="inserted")
-    fill_skipped_by_mode = sum_after(after, "rustfs_object_data_cache_fill_total", mode=mode, result="skipped_by_mode")
+    requests = counter_delta(before, after, "rustfs_object_data_cache_requests_total", mode, mode=mode)
+    misses = counter_delta(before, after, "rustfs_object_data_cache_requests_total", mode, mode=mode, decision="miss")
+    cacheable = counter_delta(before, after, "rustfs_object_data_cache_requests_total", mode, mode=mode, decision="cacheable")
+    hits = counter_delta(before, after, "rustfs_object_data_cache_requests_total", mode, mode=mode, decision="hit")
+    hit_bytes = counter_delta(before, after, "rustfs_object_data_cache_hit_bytes_total", mode, mode=mode)
+    fill_inserted = counter_observed(after, "rustfs_object_data_cache_fill_total", mode, mode=mode, result="inserted")
+    fill_skipped_by_mode = counter_observed(
+        after, "rustfs_object_data_cache_fill_total", mode, mode=mode, result="skipped_by_mode"
+    )
     weighted_bytes = gauge_max(before, after, "rustfs_object_data_cache_weighted_bytes", mode)
     entries = gauge_max(before, after, "rustfs_object_data_cache_entries", mode)
     return before, after, {
