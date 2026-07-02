@@ -200,6 +200,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
+REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
@@ -2573,6 +2574,21 @@ fi
 
 if [[ -s "$REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication operation contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_delete_worker_status=0
+  rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?struct\s+DeletedObjectReplicationInfo\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' >"$REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE" || replication_delete_worker_status=$?
+  if [[ "$replication_delete_worker_status" -ne 0 && "$replication_delete_worker_status" -ne 1 ]]; then
+    exit "$replication_delete_worker_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
+  report_failure "replication delete worker contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE")"
 fi
 
 (

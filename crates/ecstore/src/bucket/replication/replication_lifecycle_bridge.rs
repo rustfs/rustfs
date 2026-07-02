@@ -18,8 +18,9 @@ use super::config::ReplicationConfigurationExt as _;
 use super::replication_filemeta_boundary::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, version_purge_statuses_map,
 };
-use super::replication_resyncer::{DeletedObjectReplicationInfo, ReplicationConfig, check_replicate_delete};
+use super::replication_resyncer::{ReplicationConfig, check_replicate_delete};
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ObjectToDelete};
+use rustfs_replication::DeletedObjectReplicationInfo;
 
 pub(crate) type ReplicationLifecycleConfig = ReplicationConfig;
 
