@@ -21,9 +21,10 @@ use super::replication_filemeta_boundary::{
     version_purge_statuses_map,
 };
 use super::replication_metadata_boundary::ReplicationMetadataStore;
+use super::replication_object_config::ReplicationConfig;
 use super::replication_resyncer::{
-    ReplicationConfig, ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info,
-    replicate_delete, replicate_object, save_resync_status,
+    ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, replicate_delete,
+    replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};

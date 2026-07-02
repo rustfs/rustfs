@@ -25,6 +25,7 @@ mod replication_metadata_boundary;
 mod replication_migration_bridge;
 mod replication_msgp_boundary;
 mod replication_object_bridge;
+mod replication_object_config;
 pub(crate) mod replication_pool;
 mod replication_resyncer;
 mod replication_scanner_bridge;
@@ -41,11 +42,11 @@ pub use datatypes::ResyncStatusType;
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
+pub use replication_object_config::ReplicationConfig;
 pub use replication_pool::{
     DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
     init_background_replication,
 };
-pub use replication_resyncer::ReplicationConfig;
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
