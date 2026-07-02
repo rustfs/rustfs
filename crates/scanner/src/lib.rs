@@ -289,7 +289,7 @@ pub(crate) async fn list_runtime_tiers() -> Vec<EcstoreTierConfig> {
 }
 
 pub(crate) async fn enqueue_runtime_free_version(oi: ScannerObjectInfo) {
-    ecstore_expiry_state_handle().write().await.enqueue_free_version(oi).await;
+    ecstore_expiry_state_handle().write().await.enqueue_free_version(oi);
 }
 
 pub(crate) async fn enqueue_runtime_newer_noncurrent(
@@ -302,7 +302,6 @@ pub(crate) async fn enqueue_runtime_newer_noncurrent(
         .write()
         .await
         .enqueue_by_newer_noncurrent(bucket, to_delete_objs, event, src)
-        .await
 }
 
 pub(crate) async fn queue_replication_heal(
