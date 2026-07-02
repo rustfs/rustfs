@@ -140,10 +140,7 @@ fn tag_metadata_differs(source: &ReplicationSourceObject<'_>, target: &Replicati
         .and_then(|metadata| metadata.get(AMZ_OBJECT_TAGGING).map(String::as_str))
         .unwrap_or_default();
     let target_tags = ReplicationTagFilter::decode_tags_to_map(target_tagging);
-    let source_tag_count = match i32::try_from(source_tags.len()) {
-        Ok(count) => count,
-        Err(_) => i32::MAX,
-    };
+    let source_tag_count = i32::try_from(source_tags.len()).unwrap_or(i32::MAX);
 
     (target.tag_count > 0 && source_tags != target_tags) || target.tag_count != source_tag_count
 }
