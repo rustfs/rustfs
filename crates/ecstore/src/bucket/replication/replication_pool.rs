@@ -31,9 +31,11 @@ use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
 use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
-use rustfs_replication::DeletedObjectReplicationInfo;
+use rustfs_replication::{
+    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
+    ReplicationQueueAdmission,
+};
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
-use std::any::Any;
 use std::sync::Arc;
 use std::sync::atomic::AtomicI32;
 use std::sync::atomic::Ordering;
@@ -72,116 +74,6 @@ pub const MRF_WORKER_MIN_LIMIT: usize = 2;
 pub const MRF_WORKER_AUTO_DEFAULT: usize = 4;
 pub const LARGE_WORKER_COUNT: usize = 10;
 pub const MIN_LARGE_OBJ_SIZE: i64 = 128 * 1024 * 1024; // 128MiB
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ReplicationQueueAdmission {
-    #[default]
-    Skipped,
-    Queued,
-    Missed,
-}
-
-impl ReplicationQueueAdmission {
-    fn merge(&mut self, other: Self) {
-        *self = match (*self, other) {
-            (Self::Missed, _) | (_, Self::Missed) => Self::Missed,
-            (Self::Queued, _) | (_, Self::Queued) => Self::Queued,
-            (Self::Skipped, Self::Skipped) => Self::Skipped,
-        };
-    }
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct ReplicationHealQueueResult {
-    pub object_info: ReplicateObjectInfo,
-    pub admission: ReplicationQueueAdmission,
-}
-
-/// Priority levels for replication
-#[derive(Debug, Clone, PartialEq)]
-pub enum ReplicationPriority {
-    Fast,
-    Slow,
-    Auto,
-}
-
-impl std::str::FromStr for ReplicationPriority {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "fast" => Ok(ReplicationPriority::Fast),
-            "slow" => Ok(ReplicationPriority::Slow),
-            "auto" => Ok(ReplicationPriority::Auto),
-            _ => Ok(ReplicationPriority::Auto), // Default to Auto for unknown values
-        }
-    }
-}
-
-impl ReplicationPriority {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            ReplicationPriority::Fast => "fast",
-            ReplicationPriority::Slow => "slow",
-            ReplicationPriority::Auto => "auto",
-        }
-    }
-}
-
-/// Enum for different types of replication operations
-#[derive(Debug)]
-pub enum ReplicationOperation {
-    Object(Box<ReplicateObjectInfo>),
-    Delete(Box<DeletedObjectReplicationInfo>),
-}
-
-impl ReplicationWorkerOperation for ReplicationOperation {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
-    fn to_mrf_entry(&self) -> MrfReplicateEntry {
-        match self {
-            ReplicationOperation::Object(obj) => obj.to_mrf_entry(),
-            ReplicationOperation::Delete(del) => del.to_mrf_entry(),
-        }
-    }
-
-    fn get_bucket(&self) -> &str {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_bucket(),
-            ReplicationOperation::Delete(del) => del.get_bucket(),
-        }
-    }
-
-    fn get_object(&self) -> &str {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_object(),
-            ReplicationOperation::Delete(del) => del.get_object(),
-        }
-    }
-
-    fn get_size(&self) -> i64 {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_size(),
-            ReplicationOperation::Delete(del) => del.get_size(),
-        }
-    }
-
-    fn is_delete_marker(&self) -> bool {
-        match self {
-            ReplicationOperation::Object(obj) => obj.is_delete_marker(),
-            ReplicationOperation::Delete(del) => del.is_delete_marker(),
-        }
-    }
-
-    fn get_op_type(&self) -> ReplicationType {
-        match self {
-            ReplicationOperation::Object(obj) => obj.get_op_type(),
-            ReplicationOperation::Delete(del) => del.get_op_type(),
-        }
-    }
-}
 
 /// Replication pool options
 #[derive(Debug, Clone)]
