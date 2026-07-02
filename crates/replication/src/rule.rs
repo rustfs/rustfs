@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::config::ObjectOpts;
+use crate::config::ObjectOpts;
 use s3s::dto::ReplicaModificationsStatus;
 use s3s::dto::ReplicationRule;
 

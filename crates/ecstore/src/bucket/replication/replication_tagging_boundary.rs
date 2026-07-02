@@ -12,26 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::collections::HashMap;
-
-pub(crate) struct ReplicationTagFilter;
-
-impl ReplicationTagFilter {
-    pub(crate) fn decode_tags_to_map(tags: &str) -> HashMap<String, String> {
-        crate::bucket::tagging::decode_tags_to_map(tags)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ReplicationTagFilter;
-
-    #[test]
-    fn decode_tags_to_map_preserves_bucket_tagging_parser_behavior() {
-        let tags = ReplicationTagFilter::decode_tags_to_map("env=prod&encoded=a%2Fb&=ignored");
-
-        assert_eq!(tags.get("env").map(String::as_str), Some("prod"));
-        assert_eq!(tags.get("encoded").map(String::as_str), Some("a/b"));
-        assert!(!tags.contains_key(""));
-    }
-}
+pub(crate) use rustfs_replication::ReplicationTagFilter;

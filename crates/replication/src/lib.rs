@@ -12,14 +12,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+pub mod config;
 pub mod mrf;
 pub mod resync;
+pub mod rule;
+pub mod tagging;
 
+pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
 pub use resync::{
     BucketReplicationResyncStatus, Error, Result, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus,
     decode_resync_file, encode_resync_file,
 };
+pub use rule::ReplicationRuleExt;
 pub use rustfs_filemeta::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING_DELETE,
     ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
@@ -27,3 +32,4 @@ pub use rustfs_filemeta::{
     VersionPurgeStatusType, get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header,
     version_purge_statuses_map,
 };
+pub use tagging::{ReplicationTagFilter, decode_tags_to_map};
