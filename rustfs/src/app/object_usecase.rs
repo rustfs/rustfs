@@ -1528,24 +1528,14 @@ fn should_schedule_delete_replication(
     replication_source: &ObjectInfo,
     deleted_delete_marker_version: bool,
 ) -> bool {
-    if opts.replication_request {
-        return false;
-    }
-
-    if opts.version_id.is_some() && !deleted_delete_marker_version && !replication_source.delete_marker {
-        return matches!(
-            replication_source.replication_status,
-            ReplicationStatusType::Replica
-                | ReplicationStatusType::Pending
-                | ReplicationStatusType::Completed
-                | ReplicationStatusType::Failed
-        );
-    }
-
-    replication_source.replication_status == ReplicationStatusType::Replica
-        || replication_source.replication_status == ReplicationStatusType::Pending
-        || replication_source.version_purge_status == VersionPurgeStatusType::Pending
-        || (deleted_delete_marker_version && replication_source.replication_status == ReplicationStatusType::Completed)
+    rustfs_replication::should_schedule_delete_replication(rustfs_replication::ReplicationDeleteScheduleInput {
+        replication_request: opts.replication_request,
+        version_id_requested: opts.version_id.is_some(),
+        source_delete_marker: replication_source.delete_marker,
+        source_replication_status: &replication_source.replication_status,
+        source_version_purge_status: &replication_source.version_purge_status,
+        deleted_delete_marker_version,
+    })
 }
 
 async fn should_schedule_replica_delete_replication(
@@ -1561,15 +1551,15 @@ async fn should_schedule_replica_delete_replication(
 }
 
 fn delete_replication_version_id(replication_source: &ObjectInfo, deleted_delete_marker_version: bool) -> Option<Uuid> {
-    if replication_source.delete_marker && !deleted_delete_marker_version {
-        None
-    } else {
-        replication_source.version_id
-    }
+    rustfs_replication::delete_replication_version_id(
+        replication_source.delete_marker,
+        replication_source.version_id,
+        deleted_delete_marker_version,
+    )
 }
 
 fn should_use_existing_delete_replication_info(opts: &ObjectOptions) -> bool {
-    opts.version_id.is_some() && !opts.delete_marker
+    rustfs_replication::should_use_existing_delete_replication_info(opts.version_id.is_some(), opts.delete_marker)
 }
 
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
@@ -1606,9 +1596,11 @@ fn delete_replication_state_source<'a>(
     existing_object_info: Option<&'a ObjectInfo>,
     deleted_object_info: &'a ObjectInfo,
 ) -> &'a ObjectInfo {
-    if opts.replication_request
-        && deleted_object_info.delete_marker
-        && let Some(existing) = existing_object_info
+    if rustfs_replication::should_use_existing_delete_replication_source(
+        opts.replication_request,
+        deleted_object_info.delete_marker,
+        existing_object_info.is_some(),
+    ) && let Some(existing) = existing_object_info
     {
         return existing;
     }
