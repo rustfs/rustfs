@@ -27,6 +27,10 @@ const BATCH_PROCESSOR_OPERATION_CUSTOM: &str = "custom";
 const BATCH_PROCESSOR_OPERATION_READ: &str = "read";
 const BATCH_PROCESSOR_OPERATION_WRITE: &str = "write";
 const BATCH_PROCESSOR_OPERATION_METADATA: &str = "metadata";
+const ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE: &str = "RUSTFS_BATCH_PROCESSOR_ADAPTIVE";
+const BATCH_PROCESSOR_ADAPTIVE_OFF: &str = "off";
+const BATCH_PROCESSOR_ADAPTIVE_OBSERVE: &str = "observe";
+const BATCH_PROCESSOR_ADAPTIVE_ON: &str = "on";
 const BATCH_SUGGESTION_REASON_IMPROVING: &str = "improving";
 const BATCH_SUGGESTION_REASON_DEGRADING: &str = "degrading";
 const BATCH_SUGGESTION_REASON_STABLE: &str = "stable";
@@ -34,6 +38,35 @@ const BATCH_SUGGESTION_REASON_COOLDOWN: &str = "cooldown";
 const BATCH_OBSERVATION_IMPROVING_LATENCY: Duration = Duration::from_millis(50);
 const BATCH_OBSERVATION_DEGRADING_LATENCY: Duration = Duration::from_millis(250);
 const BATCH_OBSERVATION_COOLDOWN: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BatchProcessorAdaptiveMode {
+    Off,
+    Observe,
+    On,
+}
+
+impl BatchProcessorAdaptiveMode {
+    fn should_observe(self) -> bool {
+        matches!(self, Self::Observe | Self::On)
+    }
+}
+
+fn parse_batch_processor_adaptive_mode(raw: &str) -> BatchProcessorAdaptiveMode {
+    match raw.trim() {
+        value if value.eq_ignore_ascii_case(BATCH_PROCESSOR_ADAPTIVE_OBSERVE) => BatchProcessorAdaptiveMode::Observe,
+        value if value.eq_ignore_ascii_case(BATCH_PROCESSOR_ADAPTIVE_ON) => BatchProcessorAdaptiveMode::On,
+        value if value.eq_ignore_ascii_case(BATCH_PROCESSOR_ADAPTIVE_OFF) => BatchProcessorAdaptiveMode::Off,
+        _ => BatchProcessorAdaptiveMode::Off,
+    }
+}
+
+fn batch_processor_adaptive_mode() -> BatchProcessorAdaptiveMode {
+    rustfs_utils::get_env_opt_str(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE)
+        .as_deref()
+        .map(parse_batch_processor_adaptive_mode)
+        .unwrap_or(BatchProcessorAdaptiveMode::Off)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct BatchConcurrencySuggestion {
@@ -173,6 +206,13 @@ impl AsyncBatchProcessor {
     }
 
     fn observe_batch(&self, observation: BatchObservation) -> BatchConcurrencySuggestion {
+        if !batch_processor_adaptive_mode().should_observe() {
+            return BatchConcurrencySuggestion {
+                concurrency: self.max_concurrent,
+                reason: BATCH_SUGGESTION_REASON_STABLE,
+            };
+        }
+
         let suggestion = match self.observation_state.lock() {
             Ok(mut state) => state.suggest(self.max_concurrent, observation, Instant::now()),
             Err(_) => calculate_batch_concurrency_suggestion(self.max_concurrent, observation),
@@ -565,6 +605,54 @@ mod tests {
         let results = processor.execute_batch(tasks).await;
         assert_eq!(results.len(), 4);
         assert_eq!(processor.max_concurrent, 2);
+    }
+
+    #[test]
+    fn batch_processor_adaptive_mode_defaults_to_off_and_parses_supported_values() {
+        assert_eq!(parse_batch_processor_adaptive_mode(""), BatchProcessorAdaptiveMode::Off);
+        assert_eq!(parse_batch_processor_adaptive_mode("off"), BatchProcessorAdaptiveMode::Off);
+        assert_eq!(parse_batch_processor_adaptive_mode("observe"), BatchProcessorAdaptiveMode::Observe);
+        assert_eq!(parse_batch_processor_adaptive_mode("on"), BatchProcessorAdaptiveMode::On);
+        assert_eq!(parse_batch_processor_adaptive_mode("unknown"), BatchProcessorAdaptiveMode::Off);
+        assert!(!BatchProcessorAdaptiveMode::Off.should_observe());
+        assert!(BatchProcessorAdaptiveMode::Observe.should_observe());
+        assert!(BatchProcessorAdaptiveMode::On.should_observe());
+    }
+
+    #[test]
+    fn batch_processor_observation_gate_keeps_default_off_stable() {
+        let processor = AsyncBatchProcessor::new(8);
+        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, None::<&str>, || {
+            processor.observe_batch(BatchObservation {
+                batch_size: 16,
+                success_count: 16,
+                error_count: 0,
+                timeout_count: 0,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            })
+        });
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_STABLE);
+        assert_eq!(suggestion.concurrency, 8);
+    }
+
+    #[test]
+    fn batch_processor_observation_gate_observe_records_suggestion() {
+        let processor = AsyncBatchProcessor::new(8);
+        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, Some("observe"), || {
+            processor.observe_batch(BatchObservation {
+                batch_size: 16,
+                success_count: 16,
+                error_count: 0,
+                timeout_count: 0,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            })
+        });
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
+        assert!(suggestion.concurrency > 8);
     }
 
     #[test]
