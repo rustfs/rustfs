@@ -34,7 +34,6 @@ mod replication_tagging_boundary;
 mod replication_target_boundary;
 mod replication_target_config_bridge;
 mod replication_versioning_boundary;
-mod rule;
 mod runtime_boundary;
 
 pub use config::{ObjectOpts, ReplicationConfigurationExt};
