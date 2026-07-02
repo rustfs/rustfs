@@ -154,6 +154,62 @@ pub fn delete_replication_state_from_config(
     Some(state)
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct ReplicationDeleteScheduleInput<'a> {
+    pub replication_request: bool,
+    pub version_id_requested: bool,
+    pub source_delete_marker: bool,
+    pub source_replication_status: &'a ReplicationStatusType,
+    pub source_version_purge_status: &'a VersionPurgeStatusType,
+    pub deleted_delete_marker_version: bool,
+}
+
+fn delete_version_purge_source_status(status: &ReplicationStatusType) -> bool {
+    status == &ReplicationStatusType::Replica
+        || status == &ReplicationStatusType::Pending
+        || status == &ReplicationStatusType::Completed
+        || status == &ReplicationStatusType::Failed
+}
+
+pub fn should_schedule_delete_replication(input: ReplicationDeleteScheduleInput<'_>) -> bool {
+    if input.replication_request {
+        return false;
+    }
+
+    if input.version_id_requested && !input.deleted_delete_marker_version && !input.source_delete_marker {
+        return delete_version_purge_source_status(input.source_replication_status);
+    }
+
+    input.source_replication_status == &ReplicationStatusType::Replica
+        || input.source_replication_status == &ReplicationStatusType::Pending
+        || input.source_version_purge_status == &VersionPurgeStatusType::Pending
+        || (input.deleted_delete_marker_version && input.source_replication_status == &ReplicationStatusType::Completed)
+}
+
+pub fn delete_replication_version_id(
+    source_delete_marker: bool,
+    source_version_id: Option<Uuid>,
+    deleted_delete_marker_version: bool,
+) -> Option<Uuid> {
+    if source_delete_marker && !deleted_delete_marker_version {
+        None
+    } else {
+        source_version_id
+    }
+}
+
+pub fn should_use_existing_delete_replication_source(
+    replication_request: bool,
+    deleted_delete_marker: bool,
+    has_existing_source: bool,
+) -> bool {
+    replication_request && deleted_delete_marker && has_existing_source
+}
+
+pub fn should_use_existing_delete_replication_info(version_id_requested: bool, delete_marker_request: bool) -> bool {
+    version_id_requested && !delete_marker_request
+}
+
 pub fn heal_uses_delete_replication_path(delete_marker: bool, version_purge_status: &VersionPurgeStatusType) -> bool {
     delete_marker || !version_purge_status.is_empty()
 }
@@ -246,9 +302,11 @@ pub fn resync_target_for_object(
 #[cfg(test)]
 mod tests {
     use super::{
-        MustReplicateOptions, ReplicationDeleteSource, ReplicationDeleteStateSource, ReplicationResyncTargetObject,
-        delete_replication_missing_source_decision, delete_replication_object_opts, delete_replication_state_from_config,
-        heal_uses_delete_replication_path, is_ssec_encrypted, resync_target_for_object,
+        MustReplicateOptions, ReplicationDeleteScheduleInput, ReplicationDeleteSource, ReplicationDeleteStateSource,
+        ReplicationResyncTargetObject, delete_replication_missing_source_decision, delete_replication_object_opts,
+        delete_replication_state_from_config, delete_replication_version_id, heal_uses_delete_replication_path,
+        is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     };
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
     use rustfs_storage_api::ObjectToDelete;
@@ -442,6 +500,69 @@ mod tests {
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.purge_targets.contains_key(arn));
+    }
+
+    #[test]
+    fn delete_replication_schedule_skips_replica_requests() {
+        assert!(!should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: true,
+            version_id_requested: true,
+            source_delete_marker: true,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: true,
+        }));
+    }
+
+    #[test]
+    fn delete_replication_schedule_keeps_marker_and_version_purges() {
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: true,
+            source_delete_marker: true,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: true,
+        }));
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: true,
+            source_delete_marker: false,
+            source_replication_status: &ReplicationStatusType::Completed,
+            source_version_purge_status: &VersionPurgeStatusType::Empty,
+            deleted_delete_marker_version: false,
+        }));
+        assert!(should_schedule_delete_replication(ReplicationDeleteScheduleInput {
+            replication_request: false,
+            version_id_requested: false,
+            source_delete_marker: false,
+            source_replication_status: &ReplicationStatusType::Empty,
+            source_version_purge_status: &VersionPurgeStatusType::Pending,
+            deleted_delete_marker_version: false,
+        }));
+    }
+
+    #[test]
+    fn delete_replication_version_id_splits_marker_creation_and_purge() {
+        let version_id = Uuid::new_v4();
+
+        assert_eq!(delete_replication_version_id(true, Some(version_id), false), None);
+        assert_eq!(delete_replication_version_id(true, Some(version_id), true), Some(version_id));
+    }
+
+    #[test]
+    fn delete_replication_source_selection_prefers_existing_marker_source_only_for_replica_requests() {
+        assert!(should_use_existing_delete_replication_source(true, true, true));
+        assert!(!should_use_existing_delete_replication_source(false, true, true));
+        assert!(!should_use_existing_delete_replication_source(true, false, true));
+        assert!(!should_use_existing_delete_replication_source(true, true, false));
+    }
+
+    #[test]
+    fn existing_delete_replication_info_is_limited_to_version_delete_requests() {
+        assert!(should_use_existing_delete_replication_info(true, false));
+        assert!(!should_use_existing_delete_replication_info(true, true));
+        assert!(!should_use_existing_delete_replication_info(false, false));
     }
 
     #[test]
