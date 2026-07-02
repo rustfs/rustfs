@@ -219,6 +219,9 @@ pub fn should_count_head_proxy_failure(is_not_found: bool, code: Option<&str>, r
     !is_version_id_mismatch(code, raw_status)
 }
 
+// AWS returns 400 for root callers and 403 for IAM users when a UUID version ID
+// is rejected. The 403 case is safe: a real auth failure also returns 403 on the
+// versionId-less fallback, propagating as a hard error instead of silently skipping.
 pub fn is_version_id_mismatch(code: Option<&str>, raw_status: Option<u16>) -> bool {
     match code {
         Some(c) if !c.is_empty() => c == "InvalidArgument",
