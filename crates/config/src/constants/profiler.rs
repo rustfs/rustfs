@@ -15,7 +15,8 @@
 /// Profiler related environment variable names and default values
 pub const ENV_ENABLE_PROFILING: &str = "RUSTFS_ENABLE_PROFILING";
 
-// CPU profiling
+// Legacy local CPU pprof controls. Local pprof dumps are currently unsupported;
+// Pyroscope export is configured through observability settings.
 pub const ENV_CPU_MODE: &str = "RUSTFS_PROF_CPU_MODE"; // off|continuous|periodic
 /// Frequency of CPU profiling samples
 pub const ENV_CPU_FREQ: &str = "RUSTFS_PROF_CPU_FREQ";
@@ -24,7 +25,7 @@ pub const ENV_CPU_INTERVAL_SECS: &str = "RUSTFS_PROF_CPU_INTERVAL_SECS";
 /// Duration of each CPU profiling session (for periodic mode)
 pub const ENV_CPU_DURATION_SECS: &str = "RUSTFS_PROF_CPU_DURATION_SECS";
 
-/// Memory profiling (jemalloc)
+/// Periodic memory pprof dumps (currently unsupported with mimalloc)
 pub const ENV_MEM_PERIODIC: &str = "RUSTFS_PROF_MEM_PERIODIC";
 /// Interval between memory profiling snapshots (for periodic mode)
 pub const ENV_MEM_INTERVAL_SECS: &str = "RUSTFS_PROF_MEM_INTERVAL_SECS";
@@ -34,7 +35,7 @@ pub const ENV_OUTPUT_DIR: &str = "RUSTFS_PROF_OUTPUT_DIR";
 
 /// Defaults for profiler settings
 pub const DEFAULT_ENABLE_PROFILING: bool = false;
-/// CPU profiling
+/// Legacy local CPU pprof mode
 pub const DEFAULT_CPU_MODE: &str = "off";
 /// Frequency of CPU profiling samples
 pub const DEFAULT_CPU_FREQ: usize = 100;
@@ -42,7 +43,7 @@ pub const DEFAULT_CPU_FREQ: usize = 100;
 pub const DEFAULT_CPU_INTERVAL_SECS: u64 = 300;
 /// Duration of each CPU profiling session (for periodic mode)
 pub const DEFAULT_CPU_DURATION_SECS: u64 = 60;
-/// Memory profiling (jemalloc)
+/// Periodic memory pprof dumps (currently unsupported with mimalloc)
 pub const DEFAULT_MEM_PERIODIC: bool = false;
 /// Interval between memory profiling snapshots (for periodic mode)
 pub const DEFAULT_MEM_INTERVAL_SECS: u64 = 300;

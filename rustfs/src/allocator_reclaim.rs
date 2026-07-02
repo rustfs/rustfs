@@ -111,15 +111,7 @@ impl AllocatorReclaimController {
 }
 
 pub fn allocator_backend() -> &'static str {
-    #[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-    {
-        "jemalloc"
-    }
-
-    #[cfg(all(
-        not(target_os = "windows"),
-        not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-    ))]
+    #[cfg(not(target_os = "windows"))]
     {
         "mimalloc"
     }
@@ -206,7 +198,7 @@ fn configured_allocator_reclaim_interval_secs() -> u64 {
 }
 
 fn effective_allocator_reclaim_force(backend: &str, configured_force: bool) -> bool {
-    configured_force && backend != "jemalloc"
+    configured_force && backend != "mimalloc-windows"
 }
 
 fn build_allocator_reclaim_desired_snapshot(
@@ -302,10 +294,7 @@ pub fn allocator_reclaim_controller_snapshot(ctx: &CancellationToken) -> Allocat
     )
 }
 
-#[cfg(all(
-    not(target_os = "windows"),
-    not(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))
-))]
+#[cfg(not(target_os = "windows"))]
 #[allow(unsafe_code)]
 fn collect_allocator_memory(force: bool) -> Result<(), String> {
     // SAFETY: `mi_collect` is provided by the active global allocator backend
@@ -314,13 +303,6 @@ fn collect_allocator_memory(force: bool) -> Result<(), String> {
     unsafe {
         libmimalloc_sys::mi_collect(force);
     }
-    Ok(())
-}
-
-#[cfg(all(target_os = "linux", target_env = "gnu", target_arch = "x86_64"))]
-fn collect_allocator_memory(_force: bool) -> Result<(), String> {
-    let _ = tikv_jemalloc_ctl::background_thread::write(true);
-    tikv_jemalloc_ctl::epoch::advance().map_err(|err| err.to_string())?;
     Ok(())
 }
 
@@ -368,13 +350,6 @@ pub fn init_allocator_reclaim(ctx: CancellationToken) {
     }
 
     let configured_force = configured_allocator_reclaim_force();
-    if backend == "jemalloc" && configured_force {
-        warn!(
-            backend,
-            env = rustfs_config::ENV_ALLOCATOR_RECLAIM_FORCE,
-            "allocator reclaim force mode is not supported on jemalloc backend; ignoring configured force flag"
-        );
-    }
     let force = effective_allocator_reclaim_force(backend, configured_force);
     let idle_intervals = configured_allocator_reclaim_idle_intervals();
     let interval = Duration::from_secs(configured_allocator_reclaim_interval_secs());
@@ -473,8 +448,8 @@ mod tests {
     }
 
     #[test]
-    fn allocator_reclaim_force_preserves_jemalloc_override() {
-        assert!(!effective_allocator_reclaim_force("jemalloc", true));
+    fn allocator_reclaim_force_is_disabled_only_on_windows_backend() {
+        assert!(!effective_allocator_reclaim_force("mimalloc-windows", true));
         assert!(effective_allocator_reclaim_force("mimalloc", true));
         assert!(!effective_allocator_reclaim_force("mimalloc", false));
     }
