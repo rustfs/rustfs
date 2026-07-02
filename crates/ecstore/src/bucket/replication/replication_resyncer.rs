@@ -103,6 +103,8 @@ const EVENT_REPLICATION_FORCE_DELETE_SKIPPED: &str = "replication_force_delete_s
 const EVENT_RESYNC_TASK_FAILED: &str = "replication_resync_task_failed";
 const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_operation_failed";
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
+const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
+const ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED: &str = "managed SSE replication requires target encryption support";
 
 pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
 pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
@@ -2969,7 +2971,28 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         rinfo.replication_action = replication_action;
 
         if replication_action != ReplicationAction::All {
-            // TODO: copy object
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(ERR_REPLICATION_METADATA_COPY_UNSUPPORTED.to_string());
+            warn!(
+                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                bucket = %bucket,
+                arn = %tgt_client.arn,
+                object = %object,
+                operation = "copy_object_metadata",
+                error = ERR_REPLICATION_METADATA_COPY_UNSUPPORTED,
+                "Replication target operation failed"
+            );
+            send_local_event(EventArgs {
+                event_name: EventName::ObjectReplicationNotTracked.to_string(),
+                bucket_name: bucket.clone(),
+                object: object_info,
+                user_agent: "Internal: [Replication]".to_string(),
+                ..Default::default()
+            });
+            rinfo.duration = (OffsetDateTime::now_utc() - start_time).unsigned_abs();
+            return rinfo;
         } else {
             let (put_opts, is_multipart) = match put_replication_opts(&tgt_client.storage_class, &object_info) {
                 Ok((put_opts, is_mp)) => (put_opts, is_mp),
@@ -3323,33 +3346,20 @@ fn put_replication_opts(sc: &str, object_info: &ObjectInfo) -> Result<(PutObject
             };
     }
 
-    // Handle SSE-S3 encryption
-    if object_info
+    let has_sse_s3 = object_info
         .user_defined
         .get(AMZ_SERVER_SIDE_ENCRYPTION)
         .map(|v| v.eq_ignore_ascii_case("AES256"))
+        .unwrap_or(false);
+    let has_sse_kms = object_info
+        .user_defined
+        .get(AMZ_SERVER_SIDE_ENCRYPTION)
+        .map(|v| v.eq_ignore_ascii_case("aws:kms"))
         .unwrap_or(false)
-    {
-        // SSE-S3 detected - set ServerSideEncryption
-        // Note: This requires the PutObjectOptions to support SSE
-        // TODO: Implement SSE-S3 support in PutObjectOptions if not already present
-    }
+        || object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID);
 
-    // Handle SSE-KMS encryption
-    if object_info.user_defined.contains_key(AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID) {
-        // SSE-KMS detected
-        // If KMS key ID replication is enabled (as by default)
-        // we include the object's KMS key ID. In any case, we
-        // always set the SSE-KMS header. If no KMS key ID is
-        // specified, the server uses the default applicable
-        // config applies on the site or bucket.
-        // TODO: Implement SSE-KMS support with key ID replication
-        // let key_id = if kms::replicate_key_id() {
-        //     object_info.kms_key_id()
-        // } else {
-        //     None
-        // };
-        // TODO: Set SSE-KMS encryption in put_op
+    if has_sse_s3 || has_sse_kms {
+        return Err(Error::other(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 
     Ok((put_op, is_multipart))
@@ -3741,6 +3751,42 @@ mod tests {
 
         assert!(!live.to_object_info().delete_marker);
         assert!(delete_marker.to_object_info().delete_marker);
+    }
+
+    #[test]
+    fn put_replication_opts_rejects_sse_s3_until_target_encryption_is_supported() {
+        let object_info = ObjectInfo {
+            user_defined: HashMap::from([(AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "AES256".to_string())]).into(),
+            ..Default::default()
+        };
+
+        let err = match put_replication_opts("", &object_info) {
+            Ok(_) => panic!("SSE-S3 replication should fail closed until target encryption headers are supported"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
+    }
+
+    #[test]
+    fn put_replication_opts_rejects_sse_kms_until_target_encryption_is_supported() {
+        use rustfs_utils::http::AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID;
+
+        let object_info = ObjectInfo {
+            user_defined: HashMap::from([
+                (AMZ_SERVER_SIDE_ENCRYPTION.to_string(), "aws:kms".to_string()),
+                (AMZ_SERVER_SIDE_ENCRYPTION_KMS_ID.to_string(), "key-1".to_string()),
+            ])
+            .into(),
+            ..Default::default()
+        };
+
+        let err = match put_replication_opts("", &object_info) {
+            Ok(_) => panic!("SSE-KMS replication should fail closed until target encryption headers are supported"),
+            Err(err) => err,
+        };
+
+        assert!(err.to_string().contains(ERR_REPLICATION_MANAGED_SSE_UNSUPPORTED));
     }
 
     #[test]
