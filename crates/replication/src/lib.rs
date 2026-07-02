@@ -19,6 +19,7 @@ pub mod operation;
 pub mod queue;
 pub mod resync;
 pub mod rule;
+pub mod runtime;
 pub mod stats;
 pub mod tagging;
 
@@ -32,6 +33,12 @@ pub use resync::{
     decode_resync_file, encode_resync_file,
 };
 pub use rule::ReplicationRuleExt;
+pub use runtime::{
+    LARGE_WORKER_COUNT, MIN_LARGE_OBJ_SIZE, MRF_WORKER_AUTO_DEFAULT, MRF_WORKER_MAX_LIMIT, MRF_WORKER_MIN_LIMIT,
+    ReplicationPoolOpts, ReplicationWorkerCounts, WORKER_AUTO_DEFAULT, WORKER_MAX_LIMIT, WORKER_MIN_LIMIT, initial_worker_counts,
+    next_large_worker_count, next_mrf_worker_count, next_regular_worker_count, resized_worker_counts, should_grow_large_workers,
+    should_queue_large_object, worker_counts_for_priority,
+};
 pub use rustfs_filemeta::{
     REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, REPLICATE_INCOMING_DELETE,
     ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos, ReplicatedTargetInfo, ReplicationAction,
