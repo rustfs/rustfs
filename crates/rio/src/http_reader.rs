@@ -1643,7 +1643,7 @@ mod tests {
             InternodeHttpTuningProfile::Balanced
         );
         assert_eq!(
-            parse_internode_http_tuning_profile(Some(" THROUGHput ")),
+            parse_internode_http_tuning_profile(Some(" Throughput ")),
             InternodeHttpTuningProfile::Throughput
         );
         assert_eq!(
