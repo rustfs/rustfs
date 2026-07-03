@@ -19,6 +19,14 @@ mod storage_api;
 #[cfg(test)]
 pub mod common;
 
+// In-process fault-injection primitives (disk offline/replacement, shard corruption)
+#[cfg(test)]
+pub mod chaos;
+
+// Reliability tests built on the fault-injection harness
+#[cfg(test)]
+mod reliability_disk_fault_test;
+
 #[cfg(test)]
 mod version_id_regression_test;
 

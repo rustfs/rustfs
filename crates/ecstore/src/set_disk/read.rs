@@ -2568,7 +2568,6 @@ impl SetDisks {
             return Ok(None);
         }
 
-        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
             HashAlgorithm::HighwayHash256SLegacy
@@ -2578,7 +2577,11 @@ impl SetDisks {
         let read_length = erasure.shard_file_offset(0, object_size, object_size);
 
         if fi.data.is_some() {
-            let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(&files, fi, erasure.data_shards, |index| {
+            // Collect from the canonical disk-ordered inputs: the helper indexes
+            // fi.erasure.distribution by disk position, so passing shard-ordered
+            // (shuffled) arrays would apply the permutation twice and concatenate
+            // the wrong shards into the response body.
+            let Some(data_files) = collect_inline_data_shard_fileinfos_by_index(files, fi, erasure.data_shards, |index| {
                 disks.get(index).is_some_and(Option::is_some)
             }) else {
                 return Ok(None);
@@ -2628,6 +2631,7 @@ impl SetDisks {
             return Ok(body);
         }
 
+        let (disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
         let use_mmap_read = object_mmap_read_enabled();
 
         let reader_setup_stage_start = Instant::now();
@@ -2786,6 +2790,15 @@ impl SetDisks {
             fi.erasure.block_size,
             fi.uses_legacy_checksum,
         );
+
+        // Erasure params come from on-disk metadata; zero values must fail the read
+        // instead of panicking on the block/shard divisions below.
+        if erasure.block_size == 0 || erasure.data_shards == 0 {
+            return Err(Error::other(format!(
+                "invalid erasure metadata for {bucket}/{object}: block_size={}, data_blocks={}",
+                erasure.block_size, erasure.data_shards
+            )));
+        }
 
         let part_indices: Vec<usize> = (part_index..=last_part_index).collect();
         debug!(bucket, object, ?part_indices, "Multipart part indices to stream");

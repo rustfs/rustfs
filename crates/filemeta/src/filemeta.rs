@@ -665,12 +665,15 @@ impl FileMeta {
             err = self.add_version_filemata(ventry).err();
         }
 
-        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
-            return Ok(None);
-        }
-
+        // A failed delete-marker insertion must surface even when the data dir is
+        // shared: reporting success here silently turns the delete into a permanent
+        // delete that replication never propagates.
         if let Some(e) = err {
             return Err(e);
+        }
+
+        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+            return Ok(None);
         }
 
         Ok(obj_data_dir)

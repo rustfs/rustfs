@@ -29,6 +29,11 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete, get_replication_config, must_replicate};
+use super::replication_object_decision_boundary::{
+    MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
+    is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
+};
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
@@ -60,11 +65,6 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-use rustfs_replication::{
-    MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
-    replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
-};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
@@ -101,7 +101,7 @@ static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
 
 async fn finish_resync_workers(
     worker_txs: Vec<tokio::sync::mpsc::Sender<ReplicateObjectInfo>>,
-    results_tx: tokio::sync::broadcast::Sender<TargetReplicationResyncStatus>,
+    results_tx: tokio::sync::mpsc::Sender<TargetReplicationResyncStatus>,
     futures: Vec<JoinHandle<()>>,
     abort: bool,
 ) -> bool {
@@ -617,8 +617,12 @@ impl ReplicationResyncer {
                 .unwrap_or_default()
         };
 
-        let mut last_checkpoint = if status.resync_status == ResyncStatusType::ResyncStarted
-            || status.resync_status == ResyncStatusType::ResyncFailed
+        // An empty checkpoint means no per-object progress was persisted before the
+        // interruption: resume from the beginning, otherwise `object.name != checkpoint`
+        // below would skip every object and mark the resync completed without work.
+        let mut last_checkpoint = if (status.resync_status == ResyncStatusType::ResyncStarted
+            || status.resync_status == ResyncStatusType::ResyncFailed)
+            && !status.object.is_empty()
         {
             Some(status.object)
         } else {
@@ -626,7 +630,9 @@ impl ReplicationResyncer {
         };
 
         let mut worker_txs = Vec::new();
-        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        // mpsc, not broadcast: a lagging broadcast receiver returns Err(Lagged) which
+        // would end the collector and silently drop every subsequent worker result.
+        let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(RESYNC_WORKER_COUNT * 4);
 
         let opts_clone = opts.clone();
         let self_clone = self.clone();
@@ -634,7 +640,7 @@ impl ReplicationResyncer {
         let mut futures = Vec::new();
 
         let results_fut = tokio::spawn(async move {
-            while let Ok(st) = results_rx.recv().await {
+            while let Some(st) = results_rx.recv().await {
                 self_clone.inc_stats(&st, opts_clone.clone()).await;
             }
         });
@@ -746,7 +752,7 @@ impl ReplicationResyncer {
                         return;
                     }
 
-                    if let Err(err) = results_tx.send(st) {
+                    if let Err(err) = results_tx.send(st).await {
                         error!(
                             event = EVENT_RESYNC_RUNTIME_CHANNEL_FAILED,
                             component = LOG_COMPONENT_ECSTORE,
@@ -2128,7 +2134,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             Ok(gr) => gr,
             Err(e) => {
-                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if !(is_err_object_not_found(&e) || is_err_version_not_found(&e)) {
                     debug!(
                         event = EVENT_RESYNC_RUNTIME_SKIPPED,
                         component = LOG_COMPONENT_ECSTORE,
@@ -2414,7 +2420,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             Ok(gr) => gr,
             Err(e) => {
-                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if !(is_err_object_not_found(&e) || is_err_version_not_found(&e)) {
                     debug!(
                         event = EVENT_RESYNC_RUNTIME_SKIPPED,
                         component = LOG_COMPONENT_ECSTORE,
@@ -3376,9 +3382,9 @@ mod tests {
     #[tokio::test]
     async fn test_finish_resync_workers_closes_result_collector() {
         let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(1);
-        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(1);
         let worker = tokio::spawn(async move { while worker_rx.recv().await.is_some() {} });
-        let collector = tokio::spawn(async move { while results_rx.recv().await.is_ok() {} });
+        let collector = tokio::spawn(async move { while results_rx.recv().await.is_some() {} });
 
         let failed = tokio::time::timeout(
             TokioDuration::from_secs(1),
@@ -3392,7 +3398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finish_resync_workers_reports_join_failure() {
-        let (results_tx, _results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let (results_tx, _results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(1);
         let failed_worker = tokio::spawn(async {
             panic!("intentional resync worker failure");
         });

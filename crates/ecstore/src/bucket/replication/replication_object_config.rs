@@ -14,10 +14,6 @@
 
 use std::collections::HashMap;
 
-use rustfs_replication::{
-    MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
-    delete_replication_object_opts, resync_target_for_object,
-};
 use rustfs_utils::http::AMZ_BUCKET_REPLICATION_STATUS;
 use s3s::dto::ReplicationConfiguration;
 use serde::{Deserialize, Serialize};
@@ -30,6 +26,10 @@ use super::replication_filemeta_boundary::{
 };
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
+use super::replication_object_decision_boundary::{
+    MustReplicateOptions, ReplicationDeleteSource, ReplicationResyncTargetObject, delete_replication_missing_source_decision,
+    delete_replication_object_opts, resync_target_for_object,
+};
 use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete};
 use super::replication_target_boundary::{BucketTargets, ReplicationTargetStore};
 use super::replication_versioning_boundary::ReplicationVersioningStore;

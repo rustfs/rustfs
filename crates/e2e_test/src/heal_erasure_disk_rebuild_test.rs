@@ -16,12 +16,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging, local_http_client};
+    use crate::chaos::signed_admin_post;
+    use crate::common::{RustFSTestClusterEnvironment, RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
-    use http::header::{CONTENT_TYPE, HOST};
-    use rustfs_signer::constants::UNSIGNED_PAYLOAD;
-    use rustfs_signer::sign_v4;
-    use s3s::Body;
     use serial_test::serial;
     use std::collections::HashSet;
     use std::error::Error;
@@ -63,45 +60,6 @@ mod tests {
             .expect("GET should succeed during/after heal");
         let body = response.body.collect().await.expect("GET body should collect").into_bytes();
         assert_eq!(body.as_ref(), expected, "object body changed for {key}");
-    }
-
-    async fn signed_admin_post(
-        url: &str,
-        body: Option<&str>,
-        access_key: &str,
-        secret_key: &str,
-    ) -> Result<String, Box<dyn Error + Send + Sync>> {
-        let uri = url.parse::<http::Uri>()?;
-        let authority = uri.authority().ok_or("request URL missing authority")?.to_string();
-        let mut request = http::Request::builder()
-            .method(http::Method::POST)
-            .uri(uri)
-            .header(HOST, authority)
-            .header("x-amz-content-sha256", UNSIGNED_PAYLOAD);
-
-        if body.is_some() {
-            request = request.header(CONTENT_TYPE, "application/json");
-        }
-
-        let content_len = body.map(str::len).unwrap_or_default() as i64;
-        let signed = sign_v4(request.body(Body::empty())?, content_len, access_key, secret_key, "", "us-east-1");
-
-        let mut request_builder = local_http_client().post(url);
-        for (name, value) in signed.headers() {
-            request_builder = request_builder.header(name, value);
-        }
-        if let Some(body) = body {
-            request_builder = request_builder.body(body.to_string());
-        }
-
-        let response = request_builder.send().await?;
-        let status = response.status();
-        let body = response.text().await?;
-        if !status.is_success() {
-            return Err(format!("admin POST failed: {status} {body}").into());
-        }
-
-        Ok(body)
     }
 
     #[tokio::test]

@@ -16,10 +16,10 @@ use std::{collections::HashMap, sync::Arc};
 
 use super::replication_filemeta_boundary::{ReplicateDecision, ReplicationStatusType, ReplicationType};
 use super::replication_object_config::{check_replicate_delete, get_must_replicate_options, must_replicate};
+use super::replication_object_decision_boundary::MustReplicateOptions;
 use super::replication_pool::{schedule_replication, schedule_replication_delete};
 use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_storage_boundary::{ObjectInfo, ObjectOptions, ObjectToDelete, ReplicationStorage};
-use rustfs_replication::MustReplicateOptions;
 
 pub struct ReplicationObjectBridge;
 
