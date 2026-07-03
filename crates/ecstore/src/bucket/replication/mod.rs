@@ -12,9 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-mod config;
 pub mod datatypes;
 mod replication_bandwidth_boundary;
+mod replication_config_boundary;
 mod replication_config_store;
 mod replication_error_boundary;
 mod replication_event_sink;
@@ -42,8 +42,8 @@ mod replication_target_config_bridge;
 mod replication_versioning_boundary;
 mod runtime_boundary;
 
-pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use datatypes::ResyncStatusType;
+pub use replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt};
 #[cfg(test)]
 pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::{

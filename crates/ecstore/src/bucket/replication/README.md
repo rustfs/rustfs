@@ -34,6 +34,7 @@ paths.
 | `ReplicationObjectIO` | Object read/write primitives used by config, MRF, resync status, and multipart replication paths. | ECStore object API reader/writer types and storage-api object IO contracts are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationStorage` | Object read/write/delete, object walk, metadata update, and target object IO. | ECStore object API, storage-api contracts, and read option types are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Metadata sys access and replication metadata path constants are exposed through the contract type in `replication_metadata_boundary.rs`; versioning sys and config storage imports remain separate contracts. |
+| `EcstoreReplicationBoundaryImports` | ECStore-side imports from `rustfs-replication`. | Direct `rustfs-replication` imports under `crates/ecstore/src/bucket/replication` stay in `*_boundary.rs` modules, including config and resync facade re-exports. |
 | `ReplicationResyncContracts` | Resync options, target status, bucket status, status classifiers, and persisted resync/MRF status wire format. | Owned by `crates/replication`; ECStore imports them through `replication_resync_boundary.rs`, which maps crate errors to ECStore errors. |
 | `ReplicationCrateFileMetaFacade` | Replication facade compatibility symbols that still originate in filemeta wire contracts. | `crates/replication/src/filemeta.rs` is the only direct `rustfs-filemeta` import boundary inside `rustfs-replication`. |
 | `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
@@ -93,6 +94,8 @@ paths.
     concentrated in `crates/replication/src/filemeta.rs`.
 13. Keep direct `rustfs-storage-api` imports inside `rustfs-replication`
     concentrated in `crates/replication/src/storage_api.rs`.
+14. Keep direct `rustfs-replication` imports inside ECStore replication
+    concentrated in `*_boundary.rs` modules.
 
 ## First Code-Bearing Step
 

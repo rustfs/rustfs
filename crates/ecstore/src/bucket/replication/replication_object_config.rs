@@ -19,7 +19,7 @@ use s3s::dto::ReplicationConfiguration;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
-use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
+use super::replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::replication_error_boundary::Result;
 use super::replication_filemeta_boundary::{
     ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ResyncDecision,

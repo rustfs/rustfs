@@ -14,7 +14,7 @@
 
 use s3s::dto::ReplicationConfiguration;
 
-use super::config::ReplicationConfigurationExt as _;
+use super::replication_config_boundary::ReplicationConfigurationExt as _;
 use super::replication_filemeta_boundary::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicationState, version_purge_statuses_map,
 };
