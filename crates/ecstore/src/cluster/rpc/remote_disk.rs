@@ -95,6 +95,14 @@ enum BatchMetadataRpcMode {
 }
 
 impl BatchMetadataRpcMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => BATCH_METADATA_RPC_OFF,
+            Self::Auto => BATCH_METADATA_RPC_AUTO,
+            Self::On => BATCH_METADATA_RPC_ON,
+        }
+    }
+
     fn should_attempt(self) -> bool {
         matches!(self, Self::Auto | Self::On)
     }
@@ -1598,6 +1606,7 @@ impl DiskAPI for RemoteDisk {
             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
             endpoint = %self.endpoint,
             item_count = req.items.len(),
+            batch_metadata_rpc_mode = mode.as_str(),
             op = "batch_read_version",
             state = "started",
             "Remote disk RPC started"
@@ -1621,17 +1630,32 @@ impl DiskAPI for RemoteDisk {
 
                 let response = match client.batch_read_version(request).await {
                     Ok(response) => response.into_inner(),
-                    Err(status) if status.code() == Code::Unimplemented && mode.should_fallback_on_unimplemented() => {
+                    Err(status) if status.code() == Code::Unimplemented => {
+                        if mode.should_fallback_on_unimplemented() {
+                            warn!(
+                                event = EVENT_REMOTE_DISK_RPC,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                                endpoint = %self.endpoint,
+                                batch_metadata_rpc_mode = mode.as_str(),
+                                op = "batch_read_version",
+                                state = "fallback_unimplemented",
+                                "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                            );
+                            return batch_read_version_one_by_one(self, req).await;
+                        }
+
                         warn!(
                             event = EVENT_REMOTE_DISK_RPC,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
                             endpoint = %self.endpoint,
+                            batch_metadata_rpc_mode = mode.as_str(),
                             op = "batch_read_version",
-                            state = "fallback_unimplemented",
-                            "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                            state = "unsupported_no_fallback",
+                            "Remote disk BatchReadVersion unsupported and explicit batch RPC mode forbids fallback"
                         );
-                        return batch_read_version_one_by_one(self, req).await;
+                        return Err(Error::from(status));
                     }
                     Err(status) => return Err(Error::from(status)),
                 };
@@ -2731,6 +2755,9 @@ mod tests {
         assert_eq!(parse_batch_metadata_rpc_mode("auto"), BatchMetadataRpcMode::Auto);
         assert_eq!(parse_batch_metadata_rpc_mode("on"), BatchMetadataRpcMode::On);
         assert_eq!(parse_batch_metadata_rpc_mode("unknown"), BatchMetadataRpcMode::Off);
+        assert_eq!(BatchMetadataRpcMode::Off.as_str(), "off");
+        assert_eq!(BatchMetadataRpcMode::Auto.as_str(), "auto");
+        assert_eq!(BatchMetadataRpcMode::On.as_str(), "on");
         assert!(!BatchMetadataRpcMode::Off.should_attempt());
         assert!(BatchMetadataRpcMode::Auto.should_attempt());
         assert!(BatchMetadataRpcMode::On.should_attempt());
