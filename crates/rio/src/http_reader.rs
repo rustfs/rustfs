@@ -217,7 +217,6 @@ fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[
 #[derive(Clone)]
 struct CachedClients {
     generation: u64,
-    tuning: InternodeHttpClientTuning,
     client: Client,
     no_proxy_client: Client,
 }
@@ -256,6 +255,13 @@ struct InternodeHttpClientTuning {
     http2_initial_connection_window_size: Option<u32>,
     http2_adaptive_window: bool,
     proxy_mode: InternodeHttpProxyMode,
+}
+
+fn internode_http_client_tuning() -> InternodeHttpClientTuning {
+    // The tuning env vars cannot change at runtime; parse them once instead of
+    // re-reading the environment on every internode request.
+    static TUNING: LazyLock<InternodeHttpClientTuning> = LazyLock::new(InternodeHttpClientTuning::from_env);
+    *TUNING
 }
 
 impl InternodeHttpClientTuning {
@@ -474,7 +480,7 @@ fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) ->
 }
 
 async fn get_http_client(url: &str) -> Client {
-    let tuning = InternodeHttpClientTuning::from_env();
+    let tuning = internode_http_client_tuning();
     // Reuse HTTP connection pools while honoring the configured internode proxy
     // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
     let disable_proxy = should_disable_proxy_for_url(url, tuning);
@@ -485,7 +491,7 @@ async fn get_http_client(url: &str) -> Client {
 
     let guard = CLIENT_CACHE.lock().await;
     if let Some(cached) = guard.as_ref() {
-        if cached.generation == generation && cached.tuning == tuning {
+        if cached.generation == generation {
             return if disable_proxy {
                 cached.no_proxy_client.clone()
             } else {
@@ -503,7 +509,6 @@ async fn get_http_client(url: &str) -> Client {
     let no_proxy_client = build_http_client(true, tuning, &outbound_tls).await;
     let cached = CachedClients {
         generation,
-        tuning,
         client,
         no_proxy_client,
     };

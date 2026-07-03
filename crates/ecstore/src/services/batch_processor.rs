@@ -38,6 +38,7 @@ const BATCH_SUGGESTION_REASON_COOLDOWN: &str = "cooldown";
 const BATCH_OBSERVATION_IMPROVING_LATENCY: Duration = Duration::from_millis(50);
 const BATCH_OBSERVATION_DEGRADING_LATENCY: Duration = Duration::from_millis(250);
 const BATCH_OBSERVATION_COOLDOWN: Duration = Duration::from_secs(30);
+const BATCH_ADAPTIVE_MAX_CONCURRENCY_FACTOR: usize = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BatchProcessorAdaptiveMode {
@@ -65,11 +66,19 @@ fn parse_batch_processor_adaptive_mode(raw: &str) -> BatchProcessorAdaptiveMode 
     }
 }
 
-fn batch_processor_adaptive_mode() -> BatchProcessorAdaptiveMode {
+fn batch_processor_adaptive_mode_from_env() -> BatchProcessorAdaptiveMode {
     rustfs_utils::get_env_opt_str(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE)
         .as_deref()
         .map(parse_batch_processor_adaptive_mode)
         .unwrap_or(BatchProcessorAdaptiveMode::Off)
+}
+
+fn batch_processor_adaptive_mode() -> BatchProcessorAdaptiveMode {
+    // The gate cannot change at runtime; parse it once instead of re-reading
+    // the environment on every batch.
+    static MODE: std::sync::LazyLock<BatchProcessorAdaptiveMode> =
+        std::sync::LazyLock::new(batch_processor_adaptive_mode_from_env);
+    *MODE
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,13 +113,14 @@ impl BatchObservationState {
 
     fn suggest(
         &mut self,
+        current_concurrency: usize,
         configured_concurrency: usize,
         observation: BatchObservation,
         now: Instant,
     ) -> BatchConcurrencySuggestion {
-        let raw = calculate_batch_concurrency_suggestion(configured_concurrency, observation);
-        if raw.concurrency == configured_concurrency {
-            self.last_suggested_concurrency = configured_concurrency;
+        let raw = calculate_batch_concurrency_suggestion(current_concurrency, configured_concurrency, observation);
+        if raw.concurrency == current_concurrency {
+            self.last_suggested_concurrency = current_concurrency;
             return raw;
         }
 
@@ -131,56 +141,61 @@ impl BatchObservationState {
 }
 
 fn calculate_batch_concurrency_suggestion(
+    current_concurrency: usize,
     configured_concurrency: usize,
     observation: BatchObservation,
 ) -> BatchConcurrencySuggestion {
+    let current_concurrency = current_concurrency.max(1);
     let configured_concurrency = configured_concurrency.max(1);
 
     if observation.batch_size == 0 {
         return BatchConcurrencySuggestion {
-            concurrency: configured_concurrency,
+            concurrency: current_concurrency,
             reason: BATCH_SUGGESTION_REASON_STABLE,
         };
     }
 
     if observation.timeout_count > 0
         || observation.error_count > 0
-        || (observation.batch_size >= configured_concurrency
-            && observation.execution_latency >= BATCH_OBSERVATION_DEGRADING_LATENCY)
+        || (observation.batch_size >= current_concurrency && observation.execution_latency >= BATCH_OBSERVATION_DEGRADING_LATENCY)
     {
         return BatchConcurrencySuggestion {
-            concurrency: decrease_batch_concurrency(configured_concurrency),
+            concurrency: decrease_batch_concurrency(current_concurrency),
             reason: BATCH_SUGGESTION_REASON_DEGRADING,
         };
     }
 
     if observation.success_count == observation.batch_size
-        && observation.batch_size >= configured_concurrency
+        && observation.batch_size >= current_concurrency
         && observation.execution_latency <= BATCH_OBSERVATION_IMPROVING_LATENCY
     {
         return BatchConcurrencySuggestion {
-            concurrency: increase_batch_concurrency(configured_concurrency, observation.batch_size),
+            concurrency: increase_batch_concurrency(current_concurrency, configured_concurrency, observation.batch_size),
             reason: BATCH_SUGGESTION_REASON_IMPROVING,
         };
     }
 
     BatchConcurrencySuggestion {
-        concurrency: configured_concurrency,
+        concurrency: current_concurrency,
         reason: BATCH_SUGGESTION_REASON_STABLE,
     }
 }
 
-fn decrease_batch_concurrency(configured_concurrency: usize) -> usize {
-    (configured_concurrency.saturating_mul(3) / 4).max(1)
+fn decrease_batch_concurrency(current_concurrency: usize) -> usize {
+    (current_concurrency.saturating_mul(3) / 4).max(1)
 }
 
-fn increase_batch_concurrency(configured_concurrency: usize, batch_size: usize) -> usize {
-    let step = (configured_concurrency / 4).max(1);
-    let upper_bound = configured_concurrency.saturating_mul(2).max(configured_concurrency);
-    configured_concurrency
+fn increase_batch_concurrency(current_concurrency: usize, configured_concurrency: usize, batch_size: usize) -> usize {
+    let step = (current_concurrency / 4).max(1);
+    // Suggestions build on the previous suggestion, so bound the ratchet at a
+    // hard multiple of the configured baseline instead of the current value.
+    let upper_bound = configured_concurrency
+        .saturating_mul(BATCH_ADAPTIVE_MAX_CONCURRENCY_FACTOR)
+        .max(current_concurrency);
+    current_concurrency
         .saturating_add(step)
         .min(upper_bound)
-        .min(batch_size.max(configured_concurrency))
+        .min(batch_size.max(current_concurrency))
 }
 
 fn is_timeout_error(err: &Error) -> bool {
@@ -209,12 +224,6 @@ impl AsyncBatchProcessor {
         }
     }
 
-    fn observe_batch(&self, observation: BatchObservation) -> BatchConcurrencySuggestion {
-        let mode = batch_processor_adaptive_mode();
-        let execution_concurrency = self.execution_concurrency(mode);
-        self.observe_batch_with_mode(mode, execution_concurrency, observation)
-    }
-
     fn execution_concurrency(&self, mode: BatchProcessorAdaptiveMode) -> usize {
         if !mode.should_apply() {
             return self.max_concurrent;
@@ -241,8 +250,8 @@ impl AsyncBatchProcessor {
         }
 
         let suggestion = match self.observation_state.lock() {
-            Ok(mut state) => state.suggest(execution_concurrency, observation, Instant::now()),
-            Err(_) => calculate_batch_concurrency_suggestion(execution_concurrency, observation),
+            Ok(mut state) => state.suggest(execution_concurrency, self.max_concurrent, observation, Instant::now()),
+            Err(_) => calculate_batch_concurrency_suggestion(execution_concurrency, self.max_concurrent, observation),
         };
 
         rustfs_io_metrics::record_batch_processor_observation(rustfs_io_metrics::BatchProcessorObservation {
@@ -669,18 +678,30 @@ mod tests {
     }
 
     #[test]
+    fn batch_processor_adaptive_mode_env_gate_is_parsed_from_env() {
+        temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, None::<&str>, || {
+            assert_eq!(batch_processor_adaptive_mode_from_env(), BatchProcessorAdaptiveMode::Off);
+        });
+        temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, Some("observe"), || {
+            assert_eq!(batch_processor_adaptive_mode_from_env(), BatchProcessorAdaptiveMode::Observe);
+        });
+    }
+
+    #[test]
     fn batch_processor_observation_gate_keeps_default_off_stable() {
         let processor = AsyncBatchProcessor::new(8);
-        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, None::<&str>, || {
-            processor.observe_batch(BatchObservation {
+        let suggestion = processor.observe_batch_with_mode(
+            BatchProcessorAdaptiveMode::Off,
+            processor.execution_concurrency(BatchProcessorAdaptiveMode::Off),
+            BatchObservation {
                 batch_size: 16,
                 success_count: 16,
                 error_count: 0,
                 timeout_count: 0,
                 max_queue_wait: Duration::ZERO,
                 execution_latency: Duration::from_millis(20),
-            })
-        });
+            },
+        );
 
         assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_STABLE);
         assert_eq!(suggestion.concurrency, 8);
@@ -689,16 +710,18 @@ mod tests {
     #[test]
     fn batch_processor_observation_gate_observe_records_suggestion() {
         let processor = AsyncBatchProcessor::new(8);
-        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, Some("observe"), || {
-            processor.observe_batch(BatchObservation {
+        let suggestion = processor.observe_batch_with_mode(
+            BatchProcessorAdaptiveMode::Observe,
+            processor.execution_concurrency(BatchProcessorAdaptiveMode::Observe),
+            BatchObservation {
                 batch_size: 16,
                 success_count: 16,
                 error_count: 0,
                 timeout_count: 0,
                 max_queue_wait: Duration::ZERO,
                 execution_latency: Duration::from_millis(20),
-            })
-        });
+            },
+        );
 
         assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
         assert!(suggestion.concurrency > 8);
@@ -708,16 +731,18 @@ mod tests {
     #[test]
     fn batch_processor_adaptive_on_applies_last_suggestion_to_next_batch() {
         let processor = AsyncBatchProcessor::new(8);
-        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, Some("on"), || {
-            processor.observe_batch(BatchObservation {
+        let suggestion = processor.observe_batch_with_mode(
+            BatchProcessorAdaptiveMode::On,
+            processor.execution_concurrency(BatchProcessorAdaptiveMode::On),
+            BatchObservation {
                 batch_size: 16,
                 success_count: 16,
                 error_count: 0,
                 timeout_count: 0,
                 max_queue_wait: Duration::ZERO,
                 execution_latency: Duration::from_millis(20),
-            })
-        });
+            },
+        );
 
         assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
         assert!(suggestion.concurrency > 8);
@@ -727,6 +752,7 @@ mod tests {
     #[test]
     fn batch_processor_suggestion_increases_for_fast_successful_batches() {
         let suggestion = calculate_batch_concurrency_suggestion(
+            8,
             8,
             BatchObservation {
                 batch_size: 16,
@@ -746,6 +772,7 @@ mod tests {
     fn batch_processor_suggestion_decreases_for_timeout_batches() {
         let suggestion = calculate_batch_concurrency_suggestion(
             8,
+            8,
             BatchObservation {
                 batch_size: 16,
                 success_count: 14,
@@ -764,6 +791,7 @@ mod tests {
     #[test]
     fn batch_processor_suggestion_clamps_to_batch_size() {
         let suggestion = calculate_batch_concurrency_suggestion(
+            64,
             64,
             BatchObservation {
                 batch_size: 65,
@@ -792,11 +820,34 @@ mod tests {
             execution_latency: Duration::from_millis(20),
         };
 
-        let first = state.suggest(8, observation, now);
-        let second = state.suggest(8, observation, now + Duration::from_secs(1));
+        let first = state.suggest(8, 8, observation, now);
+        let second = state.suggest(8, 8, observation, now + Duration::from_secs(1));
 
         assert_eq!(first.reason, BATCH_SUGGESTION_REASON_IMPROVING);
         assert_eq!(second.reason, BATCH_SUGGESTION_REASON_COOLDOWN);
         assert_eq!(second.concurrency, first.concurrency);
+    }
+
+    #[test]
+    fn batch_processor_suggestion_growth_is_capped_relative_to_configured_concurrency() {
+        const CONFIGURED: usize = 8;
+        let mut state = BatchObservationState::new(CONFIGURED);
+        let mut current = CONFIGURED;
+        let mut now = Instant::now();
+        let observation = BatchObservation {
+            batch_size: 1024,
+            success_count: 1024,
+            error_count: 0,
+            timeout_count: 0,
+            max_queue_wait: Duration::ZERO,
+            execution_latency: Duration::from_millis(20),
+        };
+
+        for _ in 0..64 {
+            current = state.suggest(current, CONFIGURED, observation, now).concurrency;
+            now += BATCH_OBSERVATION_COOLDOWN;
+        }
+
+        assert_eq!(current, CONFIGURED * BATCH_ADAPTIVE_MAX_CONCURRENCY_FACTOR);
     }
 }
