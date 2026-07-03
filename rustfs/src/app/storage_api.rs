@@ -611,8 +611,6 @@ pub(crate) mod bucket {
 
         use crate::storage::storage_api::ecstore_bucket::replication as replication_contracts;
 
-        pub(crate) type DeletedObjectReplicationInfo =
-            crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
         type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type ReplicateDecision = replication_contracts::ReplicateDecision;
         #[cfg(test)]
@@ -671,8 +669,12 @@ pub(crate) mod bucket {
             ReplicationObjectBridge::schedule_object(oi, store, dsc, replication_contracts::ReplicationType::Object).await;
         }
 
-        pub(crate) async fn schedule_replication_delete(dv: DeletedObjectReplicationInfo) {
-            ReplicationObjectBridge::schedule_delete(dv).await;
+        pub(crate) async fn schedule_replication_delete(
+            delete_object: crate::storage::storage_api::StorageDeletedObject,
+            bucket: String,
+            event_type: String,
+        ) {
+            ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
         }
 
         pub(crate) fn delete_replication_state_from_config(

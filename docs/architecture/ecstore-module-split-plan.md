@@ -105,10 +105,9 @@ ready for a full standalone crate yet.
 Current coupling:
 
 - replication workers depend on `ReplicationStorage`, ECStore object APIs and
-  storage-api contracts through the replication storage boundary, bucket target
-  clients, bucket metadata, file metadata replication state through the
-  filemeta boundary, config-derived storage class labels through the config
-  store, scanner repair
+  owner storage-api contracts through the replication storage boundary, bucket
+  target clients, bucket metadata, file metadata replication state through the
+  filemeta boundary, config-derived storage class labels through the config store, scanner repair
   classification, runtime replication pool/stat handles, bucket monitor and
   bandwidth reader access through local boundaries, local node names, and
   notification events;
@@ -127,8 +126,10 @@ Current coupling:
   ECStore retaining only error mapping and MRF persistence locally;
 - `crates/replication/src/filemeta.rs` is the only direct filemeta wire-contract
   import boundary inside `rustfs-replication`;
-- `crates/replication/src/storage_api.rs` is the only direct storage-api delete
-  DTO import boundary inside `rustfs-replication`;
+- `ReplicationCrateStorageApiIndependence`: delete work DTOs are owned inside
+  `rustfs-replication`; ECStore converts storage-api delete DTOs at the
+  replication storage boundary instead of `rustfs-replication` importing
+  `rustfs-storage-api`;
 - direct ECStore replication imports from `rustfs-replication` are limited to
   `*_boundary.rs` modules;
 - storage-api delete replication status/state helpers use the local
@@ -192,10 +193,10 @@ Required contracts before crate movement:
   `rustfs-ecstore`; runtime code under `rustfs/src` does not import
   `rustfs-replication` directly, and the RustFS runtime/scanner crates do not
   depend on it.
-- `StorageApiReplicationContracts`: storage-api delete DTO replication
-  state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
-  until the underlying wire contracts can move without a
-  `rustfs-replication` / `rustfs-storage-api` dependency cycle.
+- `StorageApiReplicationContracts`: owner-facing storage-api delete DTO
+  replication state/status helpers remain concentrated in
+  `crates/storage-api/src/replication.rs`, while replication worker DTOs live in
+  `rustfs-replication`.
 - `ReplicationErrorBoundary`: ECStore error/result contracts and
   replication-specific error classifiers. `crate::error` imports are
   concentrated in

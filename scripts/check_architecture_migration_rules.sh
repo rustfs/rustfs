@@ -87,7 +87,7 @@ require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstor
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "EcstoreReplicationBoundaryImports" "ECStore split plan replication boundary imports section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "RuntimeReplicationFacadeConsumers" "ECStore split plan runtime replication facade consumer section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaFacade" "ECStore split plan replication crate filemeta facade section"
-require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiBoundary" "ECStore split plan replication crate storage-api boundary section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiIndependence" "ECStore split plan replication crate storage-api independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
@@ -2676,14 +2676,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'rustfs_storage_api::|use\s+rustfs_storage_api\b' \
+  rg -n --with-filename 'rustfs_storage_api::|use\s+rustfs_storage_api\b|^rustfs-storage-api\b' \
     crates/replication/src \
-    --glob '*.rs' |
-    rg -v '^crates/replication/src/storage_api\.rs:' || true
+    --glob '*.rs' \
+    crates/replication/Cargo.toml || true
 ) >"$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication crate storage-api contracts must stay behind crates/replication/src/storage_api.rs: $(paste -sd '; ' "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE")"
+  report_failure "replication crate delete DTO contracts must not import or depend on rustfs-storage-api: $(paste -sd '; ' "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE")"
 fi
 
 (

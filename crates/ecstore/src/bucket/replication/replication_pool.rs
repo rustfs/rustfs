@@ -38,7 +38,9 @@ use super::replication_resyncer::{
     ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
-use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
+use super::replication_storage_boundary::{
+    ObjectInfo, ObjectOptions, ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage,
+};
 use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
 use lazy_static::lazy_static;
@@ -616,7 +618,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
                         // get_object_info here because the delete-marker or version may
                         // already be absent from the local store — that is expected.
                         let dv = DeletedObjectReplicationInfo {
-                            delete_object: DeletedObject {
+                            delete_object: ReplicationDeletedObject {
                                 object_name: entry.object.clone(),
                                 version_id: entry.version_id,
                                 delete_marker_version_id: entry.delete_marker_version_id,

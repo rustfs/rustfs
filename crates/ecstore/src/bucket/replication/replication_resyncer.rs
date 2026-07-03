@@ -42,8 +42,8 @@ use super::replication_resync_boundary::{
 #[cfg(test)]
 use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
 use super::replication_storage_boundary::{
-    AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
-    ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
+    AdvancedGetOptions, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
+    ReplicationDeletedObject, ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
 use super::replication_target_boundary::{
     PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
@@ -671,7 +671,7 @@ impl ReplicationResyncer {
                         };
 
                         let doi = DeletedObjectReplicationInfo {
-                            delete_object: DeletedObject {
+                            delete_object: ReplicationDeletedObject {
                                 object_name: roi.name.clone(),
                                 delete_marker_version_id: dm_version_id,
                                 version_id,
@@ -3131,7 +3131,7 @@ mod tests {
 
     #[test]
     fn test_is_version_delete_replication_for_delete_marker_version_purge() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3145,7 +3145,7 @@ mod tests {
 
     #[test]
     fn test_is_version_delete_replication_for_delete_marker_creation() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: true,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3159,7 +3159,7 @@ mod tests {
 
     #[test]
     fn test_should_retry_delete_marker_purge_for_version_purge() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: false,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
@@ -3173,7 +3173,7 @@ mod tests {
 
     #[test]
     fn test_should_retry_delete_marker_purge_for_delete_marker_creation() {
-        let dobj = DeletedObject {
+        let dobj = ReplicationDeletedObject {
             delete_marker: true,
             delete_marker_version_id: Some(Uuid::new_v4()),
             ..Default::default()
