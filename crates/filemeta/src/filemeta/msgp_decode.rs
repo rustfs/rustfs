@@ -179,28 +179,30 @@ pub(crate) fn skip_msgp_value<R: Read>(rd: &mut R) -> Result<()> {
             }
             return Ok(());
         }
-        Marker::FixExt1 => 1,
-        Marker::FixExt2 => 2,
-        Marker::FixExt4 => 4,
-        Marker::FixExt8 => 8,
-        Marker::FixExt16 => 16,
+        // fixext N = marker + 1 type byte + N data bytes
+        Marker::FixExt1 => 2,
+        Marker::FixExt2 => 3,
+        Marker::FixExt4 => 5,
+        Marker::FixExt8 => 9,
+        Marker::FixExt16 => 17,
+        // ext 8/16/32 = marker + length bytes (read here) + 1 type byte + data
         Marker::Ext8 => {
             let mut b = [0u8; 1];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = b[0] as usize;
-            1 + len // type byte + data
+            1 + len
         }
         Marker::Ext16 => {
             let mut b = [0u8; 2];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = u16::from_be_bytes(b) as usize;
-            2 + len // type bytes + data
+            1 + len
         }
         Marker::Ext32 => {
             let mut b = [0u8; 4];
             rd.read_exact(&mut b).map_err(Error::from)?;
             let len = u32::from_be_bytes(b) as usize;
-            4 + len // type bytes + data
+            1 + len
         }
         Marker::Reserved => 0,
     };

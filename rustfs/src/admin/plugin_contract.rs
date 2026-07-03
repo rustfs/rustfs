@@ -163,24 +163,24 @@ pub(crate) struct PluginInstallationContract {
     pub validation_error: Option<String>,
 }
 
+impl From<rustfs_targets::TargetPluginRevision> for PluginRevisionContract {
+    fn from(value: rustfs_targets::TargetPluginRevision) -> Self {
+        Self {
+            version: value.version,
+            digest_sha256: value.digest_sha256,
+            source: value.source,
+            installed_at: value.installed_at,
+            artifact_id: value.artifact_id,
+        }
+    }
+}
+
 impl From<TargetPluginInstallation> for PluginInstallationContract {
     fn from(value: TargetPluginInstallation) -> Self {
         Self {
             install_state: PluginInstallState::from(value.install_state),
-            current_revision: value.current_revision.map(|revision| PluginRevisionContract {
-                version: revision.version,
-                digest_sha256: revision.digest_sha256,
-                source: revision.source,
-                installed_at: revision.installed_at,
-                artifact_id: revision.artifact_id,
-            }),
-            previous_revision: value.previous_revision.map(|revision| PluginRevisionContract {
-                version: revision.version,
-                digest_sha256: revision.digest_sha256,
-                source: revision.source,
-                installed_at: revision.installed_at,
-                artifact_id: revision.artifact_id,
-            }),
+            current_revision: value.current_revision.map(PluginRevisionContract::from),
+            previous_revision: value.previous_revision.map(PluginRevisionContract::from),
             validation_error: value.validation_error,
         }
     }
@@ -328,7 +328,7 @@ pub(crate) struct PluginInstanceEntry {
     pub config: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operational_state: Option<PluginOperationalStateContract>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
 }
 
@@ -361,14 +361,14 @@ pub(crate) struct PluginInstanceDiagnosticCount {
 pub(crate) struct PluginInstanceDetail {
     #[serde(flatten)]
     pub instance: PluginInstanceEntry,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostics: Vec<PluginInstanceDiagnostic>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct PluginInstancesResponse {
     pub instances: Vec<PluginInstanceEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_counts: Vec<PluginInstanceDiagnosticCount>,
     pub truncated: bool,
     pub next_marker: Option<String>,

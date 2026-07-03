@@ -12,18 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::BucketReplicationResyncStatus;
-use super::replication_error_boundary::Result;
-use super::replication_resync_boundary::{decode_resync_file, encode_resync_file};
-
-pub(crate) struct ReplicationMigrationBridge;
-
-impl ReplicationMigrationBridge {
-    pub(crate) fn decode_resync_status(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
-        decode_resync_file(data)
-    }
-
-    pub(crate) fn encode_resync_status(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
-        encode_resync_file(status)
-    }
-}
+pub use rustfs_replication::MustReplicateOptions;
+pub(crate) use rustfs_replication::{
+    ReplicationDeleteSource, ReplicationMultipartPartInput, ReplicationResyncTargetObject,
+    delete_replication_missing_source_decision, delete_replication_object_opts, heal_uses_delete_replication_path,
+    is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, resync_target_for_object,
+    should_retry_delete_marker_purge,
+};

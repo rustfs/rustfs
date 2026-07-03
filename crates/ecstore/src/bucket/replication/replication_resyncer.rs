@@ -16,12 +16,12 @@ use super::config::{ObjectOpts, ReplicationConfigurationExt as _};
 use super::datatypes::ResyncStatusType;
 use super::replication_bandwidth_boundary;
 use super::replication_config_store::ReplicationConfigStore;
-use super::replication_error_boundary::{Error, Result, is_err_object_not_found, is_err_version_not_found};
+use super::replication_error_boundary::{Result, is_err_object_not_found, is_err_version_not_found};
 use super::replication_event_sink::{EventArgs, send_event, send_local_event};
 use super::replication_filemeta_boundary::{
-    MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos,
-    ReplicatedTargetInfo, ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType,
-    get_replication_state, parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+    REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedInfos, ReplicatedTargetInfo,
+    ReplicationAction, ReplicationStatusType, ReplicationType, VersionPurgeStatusType, get_replication_state,
+    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_RESYNC_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION_RESYNC};
@@ -29,6 +29,18 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete, get_replication_config, must_replicate};
+use super::replication_object_decision_boundary::{
+    MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
+    is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
+};
+use super::replication_queue_boundary::DeletedObjectReplicationInfo;
+use super::replication_resync_boundary::{
+    BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
+    resync_state_accepts_update, should_count_head_proxy_failure,
+};
+#[cfg(test)]
+use super::replication_resync_boundary::{RESYNC_META_FORMAT, RESYNC_META_VERSION, WIRE_ZERO_TIME_UNIX, decode_resync_file};
 use super::replication_storage_boundary::{
     AdvancedGetOptions, DeletedObject, EcstoreObjectOperations, HTTPRangeSpec, ObjectInfo, ObjectOptions, ObjectToDelete,
     ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
@@ -53,13 +65,6 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationMultipartPartInput, ResyncOpts,
-    TargetReplicationResyncStatus, heal_uses_delete_replication_path, is_retryable_delete_replication_head_error,
-    is_version_delete_replication, is_version_id_mismatch, replication_etags_match, replication_multipart_complete_actual_size,
-    replication_multipart_part_plan, resync_state_accepts_update, should_count_head_proxy_failure,
-    should_retry_delete_marker_purge,
-};
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
     AMZ_TAGGING_DIRECTIVE, SUFFIX_REPLICATION_RESET, SUFFIX_REPLICATION_STATUS, has_internal_suffix, insert_str,
@@ -90,17 +95,13 @@ const EVENT_RESYNC_TARGET_OPERATION_FAILED: &str = "replication_resync_target_op
 const EVENT_RESYNC_RUNTIME_CHANNEL_FAILED: &str = "replication_resync_runtime_channel_failed";
 const ERR_REPLICATION_METADATA_COPY_UNSUPPORTED: &str = "metadata-only replication is not implemented";
 
-pub(crate) const RESYNC_META_FORMAT: u16 = rustfs_replication::resync::RESYNC_META_FORMAT;
-pub(crate) const RESYNC_META_VERSION: u16 = rustfs_replication::resync::RESYNC_META_VERSION;
-pub(crate) const MRF_META_FORMAT: u16 = rustfs_replication::mrf::MRF_META_FORMAT;
-pub(crate) const MRF_META_VERSION: u16 = rustfs_replication::mrf::MRF_META_VERSION;
 const RESYNC_TIME_INTERVAL: TokioDuration = TokioDuration::from_secs(60);
 
 static WARNED_MONITOR_UNINIT: std::sync::Once = std::sync::Once::new();
 
 async fn finish_resync_workers(
     worker_txs: Vec<tokio::sync::mpsc::Sender<ReplicateObjectInfo>>,
-    results_tx: tokio::sync::broadcast::Sender<TargetReplicationResyncStatus>,
+    results_tx: tokio::sync::mpsc::Sender<TargetReplicationResyncStatus>,
     futures: Vec<JoinHandle<()>>,
     abort: bool,
 ) -> bool {
@@ -180,29 +181,6 @@ async fn head_object_fallback(
         Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
         Err(e) => Err(e),
     }
-}
-
-fn map_replication_error(err: rustfs_replication::Error) -> Error {
-    match err {
-        rustfs_replication::Error::CorruptedFormat => Error::CorruptedFormat,
-        rustfs_replication::Error::Other(err) => Error::other(err),
-    }
-}
-
-pub(crate) fn encode_resync_file(status: &BucketReplicationResyncStatus) -> Result<Vec<u8>> {
-    rustfs_replication::encode_resync_file(status).map_err(map_replication_error)
-}
-
-pub(crate) fn decode_resync_file(data: &[u8]) -> Result<BucketReplicationResyncStatus> {
-    rustfs_replication::decode_resync_file(data).map_err(map_replication_error)
-}
-
-pub(crate) fn encode_mrf_file(entries: &[MrfReplicateEntry]) -> Result<Vec<u8>> {
-    rustfs_replication::encode_mrf_file(entries).map_err(map_replication_error)
-}
-
-pub(crate) fn decode_mrf_file(data: &[u8]) -> Result<Vec<MrfReplicateEntry>> {
-    rustfs_replication::decode_mrf_file(data).map_err(map_replication_error)
 }
 
 static RESYNC_WORKER_COUNT: usize = 10;
@@ -639,8 +617,12 @@ impl ReplicationResyncer {
                 .unwrap_or_default()
         };
 
-        let mut last_checkpoint = if status.resync_status == ResyncStatusType::ResyncStarted
-            || status.resync_status == ResyncStatusType::ResyncFailed
+        // An empty checkpoint means no per-object progress was persisted before the
+        // interruption: resume from the beginning, otherwise `object.name != checkpoint`
+        // below would skip every object and mark the resync completed without work.
+        let mut last_checkpoint = if (status.resync_status == ResyncStatusType::ResyncStarted
+            || status.resync_status == ResyncStatusType::ResyncFailed)
+            && !status.object.is_empty()
         {
             Some(status.object)
         } else {
@@ -648,7 +630,9 @@ impl ReplicationResyncer {
         };
 
         let mut worker_txs = Vec::new();
-        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        // mpsc, not broadcast: a lagging broadcast receiver returns Err(Lagged) which
+        // would end the collector and silently drop every subsequent worker result.
+        let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(RESYNC_WORKER_COUNT * 4);
 
         let opts_clone = opts.clone();
         let self_clone = self.clone();
@@ -656,7 +640,7 @@ impl ReplicationResyncer {
         let mut futures = Vec::new();
 
         let results_fut = tokio::spawn(async move {
-            while let Ok(st) = results_rx.recv().await {
+            while let Some(st) = results_rx.recv().await {
                 self_clone.inc_stats(&st, opts_clone.clone()).await;
             }
         });
@@ -768,7 +752,7 @@ impl ReplicationResyncer {
                         return;
                     }
 
-                    if let Err(err) = results_tx.send(st) {
+                    if let Err(err) = results_tx.send(st).await {
                         error!(
                             event = EVENT_RESYNC_RUNTIME_CHANNEL_FAILED,
                             component = LOG_COMPONENT_ECSTORE,
@@ -2150,7 +2134,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             Ok(gr) => gr,
             Err(e) => {
-                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if !(is_err_object_not_found(&e) || is_err_version_not_found(&e)) {
                     debug!(
                         event = EVENT_RESYNC_RUNTIME_SKIPPED,
                         component = LOG_COMPONENT_ECSTORE,
@@ -2436,7 +2420,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         {
             Ok(gr) => gr,
             Err(e) => {
-                if !is_err_object_not_found(&e) || is_err_version_not_found(&e) {
+                if !(is_err_object_not_found(&e) || is_err_version_not_found(&e)) {
                     debug!(
                         event = EVENT_RESYNC_RUNTIME_SKIPPED,
                         component = LOG_COMPONENT_ECSTORE,
@@ -3089,8 +3073,7 @@ mod tests {
 
     #[test]
     fn test_resync_none_time_encodes_as_wire_zero_and_decodes_to_none() {
-        let wire_zero = OffsetDateTime::from_unix_timestamp(rustfs_replication::resync::WIRE_ZERO_TIME_UNIX)
-            .expect("valid wire zero timestamp");
+        let wire_zero = OffsetDateTime::from_unix_timestamp(WIRE_ZERO_TIME_UNIX).expect("valid wire zero timestamp");
 
         let mut with_none = BucketReplicationResyncStatus::new();
         with_none.id = 77;
@@ -3399,9 +3382,9 @@ mod tests {
     #[tokio::test]
     async fn test_finish_resync_workers_closes_result_collector() {
         let (worker_tx, mut worker_rx) = tokio::sync::mpsc::channel::<ReplicateObjectInfo>(1);
-        let (results_tx, mut results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let (results_tx, mut results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(1);
         let worker = tokio::spawn(async move { while worker_rx.recv().await.is_some() {} });
-        let collector = tokio::spawn(async move { while results_rx.recv().await.is_ok() {} });
+        let collector = tokio::spawn(async move { while results_rx.recv().await.is_some() {} });
 
         let failed = tokio::time::timeout(
             TokioDuration::from_secs(1),
@@ -3415,7 +3398,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_finish_resync_workers_reports_join_failure() {
-        let (results_tx, _results_rx) = tokio::sync::broadcast::channel::<TargetReplicationResyncStatus>(1);
+        let (results_tx, _results_rx) = tokio::sync::mpsc::channel::<TargetReplicationResyncStatus>(1);
         let failed_worker = tokio::spawn(async {
             panic!("intentional resync worker failure");
         });

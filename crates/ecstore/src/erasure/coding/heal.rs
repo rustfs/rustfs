@@ -143,8 +143,11 @@ impl super::Erasure {
             let shard_size = self.shard_size().min(shard_file_size.saturating_sub(shard_offset));
             let (mut shards, errs) = read_heal_shards(&mut readers, shard_size, read_timeout).await;
 
-            // Data reads may use the first read quorum, but heal writes must only
-            // proceed when the source set is strong enough to validate itself.
+            // Every source shard is already bitrot-verified by its reader, so any
+            // data_shards survivors are sufficient to reconstruct — requiring more
+            // would make objects unhealable after losing exactly parity_shards disks,
+            // the failure EC is sized to tolerate. The parity cross-checks below stay
+            // opportunistic: they run whenever surplus source shards exist.
             let available_shards = errs.iter().filter(|e| e.is_none()).count();
             if available_shards < self.data_shards {
                 warn!(
@@ -155,19 +158,6 @@ impl super::Erasure {
                     "Erasure heal read quorum unavailable"
                 );
                 return Err(Error::ErasureReadQuorum);
-            }
-
-            let missing_data_source = shards.iter().take(self.data_shards).any(|shard| shard.is_none());
-            let required_shards = if missing_data_source && self.parity_shards > 0 {
-                self.data_shards + 1
-            } else {
-                self.data_shards
-            };
-            if available_shards < required_shards {
-                return Err(Error::other(format!(
-                    "can not reconstruct data: not enough verified heal source shards (need {}, have {}) {errs:?}",
-                    required_shards, available_shards
-                )));
             }
 
             let source_parity = shards

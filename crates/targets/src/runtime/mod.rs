@@ -22,12 +22,11 @@ pub mod tls;
 
 use crate::Target;
 use crate::arn::TargetID;
+use crate::plugin::PluginEvent;
 use crate::store::{Key, Store, ensure_store_entry_raw_readable};
 use crate::target::QueuedPayload;
 use crate::target::TargetDeliverySnapshot;
 use crate::{StoreError, TargetError};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::sync::Arc;
 use std::{collections::HashMap, fmt::Debug};
 use std::{future::Future, pin::Pin, time::Duration};
@@ -78,7 +77,7 @@ impl ReplayWorkerManager {
 
 pub struct RuntimeActivation<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub replay_workers: ReplayWorkerManager,
     pub targets: Vec<SharedTarget<E>>,
@@ -119,7 +118,7 @@ pub struct RuntimeTargetHealthSnapshot {
 
 pub enum ReplayEvent<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     Delivered {
         key: Key,
@@ -159,14 +158,14 @@ where
 /// be layered on top in later phases.
 pub struct TargetRuntimeManager<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     targets: HashMap<String, SharedTarget<E>>,
 }
 
 impl<E> Default for TargetRuntimeManager<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn default() -> Self {
         Self::new()
@@ -175,7 +174,7 @@ where
 
 impl<E> Debug for TargetRuntimeManager<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TargetRuntimeManager")
@@ -186,7 +185,7 @@ where
 
 impl<E> TargetRuntimeManager<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn new() -> Self {
         Self { targets: HashMap::new() }
@@ -320,7 +319,7 @@ pub async fn init_target_and_optionally_start_replay<E, F, G>(
     start_replay: G,
 ) -> Option<(SharedTarget<E>, Option<mpsc::Sender<()>>)>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     F: FnOnce(&str, bool),
     G: FnOnce(Box<dyn Store<QueuedPayload, Error = StoreError, Key = Key> + Send>, SharedTarget<E>) -> mpsc::Sender<()>,
 {
@@ -356,7 +355,7 @@ pub async fn activate_targets_with_replay<E, F, Fut>(
     mut activate_one: F,
 ) -> RuntimeActivation<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     F: FnMut(Box<dyn Target<E> + Send + Sync>) -> Fut,
     Fut: Future<Output = Option<(SharedTarget<E>, Option<mpsc::Sender<()>>)>>,
 {
@@ -388,7 +387,7 @@ pub fn start_replay_worker<E>(
     idle_sleep: Duration,
 ) -> mpsc::Sender<()>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     let (cancel_tx, cancel_rx) = mpsc::channel(1);
 
@@ -408,7 +407,7 @@ async fn stream_replay_worker<E>(
     batch_timeout: Duration,
     idle_sleep: Duration,
 ) where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     const MAX_RETRIES: usize = 5;
     const BASE_RETRY_DELAY: Duration = Duration::from_secs(2);
@@ -469,7 +468,7 @@ async fn stream_replay_worker<E>(
         hook: &ReplayHook<E>,
         semaphore: Option<Arc<Semaphore>>,
     ) where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: PluginEvent,
     {
         if batch_keys.is_empty() {
             return;
@@ -553,13 +552,13 @@ async fn stream_replay_worker<E>(
 #[cfg(test)]
 mod tests {
     use super::TargetRuntimeManager;
+    use crate::PluginEvent;
     use crate::StoreError;
     use crate::arn::TargetID;
     use crate::store::{Key, Store};
     use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
     use crate::{Target, TargetError};
     use async_trait::async_trait;
-    use serde::{Serialize, de::DeserializeOwned};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -581,7 +580,7 @@ mod tests {
     #[async_trait]
     impl<E> Target<E> for TestTarget
     where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: PluginEvent,
     {
         fn id(&self) -> TargetID {
             self.id.clone()

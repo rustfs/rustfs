@@ -441,10 +441,11 @@ impl SetDisks {
                                     }
                                 }
 
-                                let is_inline_buffer = runtime_sources::storage_class_should_inline(
-                                    erasure.shard_file_size(latest_meta.size),
-                                    false,
-                                );
+                                // Preserve the committed layout: recomputing inline-ness here
+                                // (with a hardcoded unversioned threshold) makes healed replicas
+                                // diverge from healthy ones in quorum identity, so heal would
+                                // flag them forever.
+                                let is_inline_buffer = latest_meta.inline_data();
                                 // create writers for all disk positions, but only for outdated disks
                                 for (index, disk_op) in out_dated_disks.iter().enumerate() {
                                     if let Some(outdated_disk) = disk_op {

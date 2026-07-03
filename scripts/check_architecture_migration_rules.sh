@@ -203,9 +203,12 @@ REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_con
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
+REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_queue_boundary_bypass_hits.txt"
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
+REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_resync_boundary_bypass_hits.txt"
+REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_object_decision_boundary_bypass_hits.txt"
 REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_object_compare_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
@@ -2612,6 +2615,31 @@ fi
 
 (
   cd "$ROOT_DIR"
+  replication_queue_boundary_status=0
+  rg -n --with-filename 'rustfs_replication::(DeletedObjectReplicationInfo|LARGE_WORKER_COUNT|ReplicationBackpressureRecommendation|ReplicationBackpressureState|ReplicationHealQueueAction|ReplicationHealQueueResult|ReplicationHealResyncDeletes|ReplicationOperation|ReplicationPoolOpts|ReplicationPriority|ReplicationQueueAdmission|ReplicationWorkerQueue|WORKER_MAX_LIMIT|initial_worker_counts|large_worker_backpressure_resize|mrf_worker_size_to_count|replication_backpressure_recommendation|replication_heal_queue_action|resized_worker_counts|should_queue_large_object|worker_queue_for_replication_type)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_queue_boundary.rs' >"$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE" || replication_queue_boundary_status=$?
+  if [[ "$replication_queue_boundary_status" -ne 0 && "$replication_queue_boundary_status" -ne 1 ]]; then
+    exit "$replication_queue_boundary_status"
+  fi
+
+  replication_queue_boundary_grouped_status=0
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(DeletedObjectReplicationInfo|LARGE_WORKER_COUNT|ReplicationBackpressureRecommendation|ReplicationBackpressureState|ReplicationHealQueueAction|ReplicationHealQueueResult|ReplicationHealResyncDeletes|ReplicationOperation|ReplicationPoolOpts|ReplicationPriority|ReplicationQueueAdmission|ReplicationWorkerQueue|WORKER_MAX_LIMIT|initial_worker_counts|large_worker_backpressure_resize|mrf_worker_size_to_count|replication_backpressure_recommendation|replication_heal_queue_action|resized_worker_counts|should_queue_large_object|worker_queue_for_replication_type)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_queue_boundary.rs' >>"$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE" || replication_queue_boundary_grouped_status=$?
+  if [[ "$replication_queue_boundary_grouped_status" -ne 0 && "$replication_queue_boundary_grouped_status" -ne 1 ]]; then
+    exit "$replication_queue_boundary_grouped_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication queue contracts must stay behind replication_queue_boundary: $(paste -sd '; ' "$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   replication_stats_status=0
   rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:struct\s+(?:ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample))\b' \
     crates/ecstore/src/bucket/replication \
@@ -2653,6 +2681,56 @@ fi
 
 if [[ -s "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "resync DTO contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_resync_boundary_status=0
+  rg -n --with-filename 'rustfs_replication::(resync::(RESYNC_META_FORMAT|RESYNC_META_VERSION|WIRE_ZERO_TIME_UNIX)|mrf::(MRF_META_FORMAT|MRF_META_VERSION)|(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b)' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_resync_boundary.rs' >"$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" || replication_resync_boundary_status=$?
+  if [[ "$replication_resync_boundary_status" -ne 0 && "$replication_resync_boundary_status" -ne 1 ]]; then
+    exit "$replication_resync_boundary_status"
+  fi
+
+  replication_resync_boundary_grouped_status=0
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_resync_boundary.rs' >>"$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" || replication_resync_boundary_grouped_status=$?
+  if [[ "$replication_resync_boundary_grouped_status" -ne 0 && "$replication_resync_boundary_grouped_status" -ne 1 ]]; then
+    exit "$replication_resync_boundary_grouped_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication resync contracts must stay behind replication_resync_boundary: $(paste -sd '; ' "$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_object_decision_boundary_status=0
+  rg -n --with-filename 'rustfs_replication::(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_target_for_object|should_retry_delete_marker_purge)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_object_decision_boundary.rs' >"$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE" || replication_object_decision_boundary_status=$?
+  if [[ "$replication_object_decision_boundary_status" -ne 0 && "$replication_object_decision_boundary_status" -ne 1 ]]; then
+    exit "$replication_object_decision_boundary_status"
+  fi
+
+  replication_object_decision_boundary_grouped_status=0
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(MustReplicateOptions|ReplicationDeleteSource|ReplicationMultipartPartInput|ReplicationResyncTargetObject|delete_replication_missing_source_decision|delete_replication_object_opts|heal_uses_delete_replication_path|is_retryable_delete_replication_head_error|is_version_delete_replication|replication_etags_match|replication_multipart_complete_actual_size|replication_multipart_part_plan|resync_target_for_object|should_retry_delete_marker_purge)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_object_decision_boundary.rs' >>"$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE" || replication_object_decision_boundary_grouped_status=$?
+  if [[ "$replication_object_decision_boundary_grouped_status" -ne 0 && "$replication_object_decision_boundary_grouped_status" -ne 1 ]]; then
+    exit "$replication_object_decision_boundary_grouped_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication object decision contracts must stay behind replication_object_decision_boundary: $(paste -sd '; ' "$REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

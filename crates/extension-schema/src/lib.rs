@@ -78,6 +78,8 @@ pub struct ExtensionSchema {
     pub disabled_by_default: bool,
 }
 
+/// Every supported hook point runs strictly after authentication and
+/// authorization; pre-auth hook points are intentionally not representable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum S3HookPoint {
@@ -85,12 +87,6 @@ pub enum S3HookPoint {
     PostAuthPutObject,
     PostAuthDeleteObject,
     PostAuthListObjects,
-}
-
-impl S3HookPoint {
-    pub const fn is_post_auth(self) -> bool {
-        true
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -693,7 +689,6 @@ mod tests {
             bypasses_iam: false,
         };
 
-        assert!(contract.hook_points.iter().all(|hook_point| hook_point.is_post_auth()));
         assert!(validate_s3_hook_contract(&contract).is_ok());
         assert_eq!(S3_POST_AUTH_HOOK_CAPABILITY, "s3.hook.post_auth.v1");
     }

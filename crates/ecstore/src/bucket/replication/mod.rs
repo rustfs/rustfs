@@ -27,7 +27,10 @@ mod replication_migration_bridge;
 mod replication_msgp_boundary;
 mod replication_object_bridge;
 mod replication_object_config;
+mod replication_object_decision_boundary;
 pub(crate) mod replication_pool;
+mod replication_queue_boundary;
+mod replication_resync_boundary;
 mod replication_resyncer;
 mod replication_scanner_bridge;
 mod replication_state;
@@ -44,15 +47,18 @@ pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, Replic
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::ReplicationConfig;
+pub use replication_object_decision_boundary::MustReplicateOptions;
 pub use replication_pool::{
     DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
     init_background_replication,
 };
+pub use replication_queue_boundary::{
+    DeletedObjectReplicationInfo, ReplicationHealQueueResult, ReplicationOperation, ReplicationPriority,
+    ReplicationQueueAdmission,
+};
+pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
-pub use rustfs_replication::{
-    BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationHealQueueResult,
-    ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ResyncOpts, TargetReplicationResyncStatus,
-};
+pub use rustfs_replication::BucketStats;

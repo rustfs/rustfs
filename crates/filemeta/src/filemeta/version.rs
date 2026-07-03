@@ -826,7 +826,10 @@ impl FileMetaVersionHeader {
 
     pub fn matches_not_strict(&self, o: &FileMetaVersionHeader) -> bool {
         let mut ok = self.version_id == o.version_id && self.version_type == o.version_type && self.matches_ec(o);
-        if self.version_id.is_none() {
+        // Disk-loaded headers keep the null version as Some(nil), not None: all null
+        // versions share one id, so mod_time is the only thing distinguishing an
+        // interrupted overwrite from the committed version.
+        if self.version_id.is_none() || self.version_id == Some(Uuid::nil()) {
             ok = ok && self.mod_time == o.mod_time;
         }
 
@@ -2916,11 +2919,14 @@ pub async fn read_xl_meta_no_data<R: AsyncRead + Unpin>(reader: &mut R, size: us
                     return Err(Error::FileCorrupt);
                 }
 
-                let tmp = &buf[want..];
+                // The metadata block is followed by a 5-byte msgp uint32 CRC trailer;
+                // a file truncated inside the trailer is corrupt, not a shorter meta.
                 let crc_size = 5;
-                let other_size = tmp.len() - crc_size;
+                if buf.len() - want < crc_size {
+                    return Err(Error::FileCorrupt);
+                }
 
-                want += tmp.len() - other_size;
+                want += crc_size;
 
                 buf.truncate(want);
                 Ok(buf)
