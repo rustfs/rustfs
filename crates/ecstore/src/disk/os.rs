@@ -117,6 +117,10 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
             volumes.push(name);
         } else if file_type.is_dir() {
             volumes.push(format!("{name}{SLASH_SEPARATOR}"));
+        } else {
+            // Entries we don't return (symlinks, sockets, fifos) must not consume
+            // the limit: is_empty_dir/list_dir(count=1) would misreport otherwise.
+            continue;
         }
         count -= 1;
         if count == 0 {
