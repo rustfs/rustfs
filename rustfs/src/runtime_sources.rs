@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::app::context;
-use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use std::sync::Arc;
 
 pub(crate) use context::{
     AppContext, NotifyInterface, default_notify_interface as fallback_notify_interface,
+    default_object_data_cache_handle as fallback_object_data_cache_handle,
     default_outbound_tls_runtime_interface as fallback_outbound_tls_runtime_interface,
     default_s3select_db_interface as fallback_s3select_db_interface,
     default_scanner_metrics_interface as fallback_scanner_metrics_interface,
@@ -57,8 +57,4 @@ pub(crate) fn set_test_outbound_tls_generation(generation: u64) {
 
 pub(crate) fn current_app_context() -> Option<Arc<AppContext>> {
     context::get_global_app_context()
-}
-
-pub(crate) fn fallback_object_data_cache_handle() -> Arc<ObjectDataCacheAdapter> {
-    ObjectDataCacheAdapter::disabled_arc()
 }

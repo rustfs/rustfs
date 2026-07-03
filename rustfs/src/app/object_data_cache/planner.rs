@@ -66,7 +66,13 @@ pub(crate) fn build_get_object_body_cache_plan(
         return GetObjectBodyCachePlan::Skip;
     };
 
-    let version_id = request.info.version_id.map(|version_id| version_id.to_string());
+    // Nil version ids mean "no value" (see CLAUDE.md); map them to None so the
+    // engine canonicalizes to the same "null" key as unversioned reads.
+    let version_id = request
+        .info
+        .version_id
+        .filter(|version_id| !version_id.is_nil())
+        .map(|version_id| version_id.to_string());
     let engine_request = ObjectDataCacheGetRequest {
         bucket: request.bucket,
         object: request.key,

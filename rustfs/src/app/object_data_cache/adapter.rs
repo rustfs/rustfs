@@ -150,6 +150,7 @@ fn object_data_cache_config_from_env() -> ObjectDataCacheConfig {
 fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> ObjectDataCacheConfig {
     let mut config = ObjectDataCacheConfig::default();
 
+    let mode_explicit = values.mode.is_some();
     if let Some(mode) = values.mode {
         config.mode = parse_object_data_cache_mode(&mode).unwrap_or_else(|| {
             warn!(
@@ -160,8 +161,16 @@ fn object_data_cache_config_from_values(values: ObjectDataCacheEnvValues) -> Obj
             ObjectDataCacheMode::Disabled
         });
     }
-    if matches!(values.enabled, Some(false)) {
-        config.mode = ObjectDataCacheMode::Disabled;
+    match values.enabled {
+        Some(false) => {
+            config.mode = ObjectDataCacheMode::Disabled;
+        }
+        Some(true) if !mode_explicit => {
+            // Enable flag without an explicit mode: start at the safest
+            // enabled stage instead of silently staying disabled.
+            config.mode = ObjectDataCacheMode::HitOnly;
+        }
+        _ => {}
     }
 
     if let Some(max_bytes) = values.max_bytes {
@@ -292,6 +301,27 @@ mod tests {
         let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
             enabled: Some(false),
             mode: Some("fill_materialize_enabled".to_string()),
+            ..ObjectDataCacheEnvValues::default()
+        });
+
+        assert_eq!(config.mode, ObjectDataCacheMode::Disabled);
+    }
+
+    #[test]
+    fn object_data_cache_enable_true_without_mode_defaults_to_hit_only() {
+        let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+            enabled: Some(true),
+            ..ObjectDataCacheEnvValues::default()
+        });
+
+        assert_eq!(config.mode, ObjectDataCacheMode::HitOnly);
+    }
+
+    #[test]
+    fn object_data_cache_explicit_mode_wins_over_enable_true() {
+        let config = object_data_cache_config_from_values(ObjectDataCacheEnvValues {
+            enabled: Some(true),
+            mode: Some("disabled".to_string()),
             ..ObjectDataCacheEnvValues::default()
         });
 

@@ -432,6 +432,10 @@ pub fn default_notify_interface() -> Arc<dyn NotifyInterface> {
     Arc::new(NotifyHandle)
 }
 
+pub(crate) fn default_object_data_cache_handle() -> Arc<crate::app::object_data_cache::ObjectDataCacheAdapter> {
+    crate::app::object_data_cache::ObjectDataCacheAdapter::disabled_arc()
+}
+
 pub fn default_notification_system_interface() -> Arc<dyn NotificationSystemInterface> {
     Arc::new(NotificationSystemHandle)
 }

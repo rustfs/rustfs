@@ -57,7 +57,7 @@ use super::storage_api::multipart_usecase::sse::{
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
-    invalidate_object_data_cache_before_mutation,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
 };
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
 use crate::app::runtime_sources::{
@@ -493,6 +493,7 @@ impl DefaultMultipartUsecase {
                     if !check_result.allowed {
                         // Quota exceeded, delete the completed object
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
                             S3ErrorCode::InvalidRequest,
                             format!(
