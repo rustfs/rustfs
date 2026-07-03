@@ -205,6 +205,7 @@ REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_opera
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
 REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_queue_boundary_bypass_hits.txt"
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
+REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_stats_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
 REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_resync_boundary_bypass_hits.txt"
@@ -2651,6 +2652,31 @@ fi
 
 if [[ -s "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication stats contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  replication_stats_boundary_status=0
+  rg -n --with-filename 'rustfs_replication::(ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_stats_boundary.rs' >"$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" || replication_stats_boundary_status=$?
+  if [[ "$replication_stats_boundary_status" -ne 0 && "$replication_stats_boundary_status" -ne 1 ]]; then
+    exit "$replication_stats_boundary_status"
+  fi
+
+  replication_stats_boundary_grouped_status=0
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_stats_boundary.rs' >>"$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" || replication_stats_boundary_grouped_status=$?
+  if [[ "$replication_stats_boundary_grouped_status" -ne 0 && "$replication_stats_boundary_grouped_status" -ne 1 ]]; then
+    exit "$replication_stats_boundary_grouped_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication stats contracts must stay behind replication_stats_boundary: $(paste -sd '; ' "$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

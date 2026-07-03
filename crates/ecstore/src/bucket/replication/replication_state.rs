@@ -14,11 +14,11 @@
 
 use super::replication_error_boundary::Error;
 use super::replication_filemeta_boundary::{ReplicatedTargetInfo, ReplicationStatusType, ReplicationType};
-use super::runtime_boundary as runtime_sources;
-use rustfs_replication::{
+use super::replication_stats_boundary::{
     ActiveWorkerStat, BucketReplicationStat, BucketReplicationStats, BucketStats, InQueueMetric, ProxyMetric, ProxyStatsCache,
     QueueCache, SRMetricsSummary, XferStats,
 };
+use super::runtime_boundary as runtime_sources;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, Ordering};
