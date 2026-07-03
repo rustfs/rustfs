@@ -59,6 +59,20 @@ pub fn validate_outbound_url(url: &Url) -> Result<(), OutboundUrlError> {
 }
 
 fn validate_outbound_ip(ip: IpAddr) -> Result<(), &'static str> {
+    // Normalize IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) to their embedded IPv4 form. The std
+    // `is_loopback` / `is_unicast_link_local` / `is_unique_local` checks on the IPv6 variant do
+    // NOT inspect the mapped IPv4, so without this an attacker could bypass the guard with e.g.
+    // ::ffff:127.0.0.1 (routes to loopback) or ::ffff:169.254.169.254 (routes to the cloud
+    // metadata service). `to_ipv4_mapped` matches only the true ::ffff:a.b.c.d form, leaving
+    // genuine IPv6 hosts (and ::1) untouched.
+    let ip = match ip {
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => IpAddr::V4(v4),
+            None => IpAddr::V6(v6),
+        },
+        other => other,
+    };
+
     if ip.is_unspecified() {
         return Err("unspecified address");
     }
@@ -169,5 +183,51 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_loopback() {
+        let url = Url::parse("http://[::ffff:127.0.0.1]/webhook").expect("mapped loopback URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped loopback should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "loopback address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_private() {
+        let url = Url::parse("http://[::ffff:10.0.0.5]/webhook").expect("mapped private URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped private should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "private address",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_rejects_ipv4_mapped_metadata_endpoint() {
+        let url = Url::parse("http://[::ffff:169.254.169.254]/latest/meta-data").expect("mapped metadata URL should parse");
+        let err = validate_outbound_url(&url).expect_err("IPv4-mapped metadata endpoint should be rejected");
+        assert!(matches!(
+            err,
+            OutboundUrlError::ForbiddenHost {
+                reason: "metadata endpoint",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn validate_outbound_url_still_allows_public_ipv6() {
+        // Pure public IPv6 (Google DNS) must remain allowed after normalization.
+        let url = Url::parse("https://[2001:4860:4860::8888]/webhook").expect("public IPv6 URL should parse");
+        assert!(validate_outbound_url(&url).is_ok());
     }
 }
