@@ -14,8 +14,7 @@
 
 use std::any::Any;
 
-use rustfs_storage_api::DeletedObject;
-
+use crate::storage_api::DeletedObject;
 use crate::{MrfOpKind, MrfReplicateEntry, ReplicationType, ReplicationWorkerOperation};
 
 #[derive(Debug, Clone, Default)]
@@ -85,8 +84,8 @@ mod tests {
         DeletedObjectReplicationInfo, is_retryable_delete_replication_head_error, is_version_delete_replication,
         should_retry_delete_marker_purge,
     };
+    use crate::storage_api::DeletedObject;
     use crate::{MrfOpKind, ReplicationType, ReplicationWorkerOperation};
-    use rustfs_storage_api::DeletedObject;
     use uuid::Uuid;
 
     #[test]
