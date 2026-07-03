@@ -1098,6 +1098,19 @@ pub fn record_get_object_shard_locality_policy_disabled(path: &'static str) {
     }
     counter!("rustfs_io_get_object_shard_locality_policy_disabled_total", "path" => path).increment(1);
 }
+
+/// Record observe-only shard-locality potential while scheduling remains disabled.
+#[inline(always)]
+pub fn record_get_object_shard_locality_observe_only(path: &'static str, remote_scheduled: usize, remote_avoid_potential: usize) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+    histogram!("rustfs_io_get_object_shard_remote_scheduled_observe_only", "path" => path)
+        .record(shard_read_fanout_to_f64(remote_scheduled));
+    histogram!("rustfs_io_get_object_shard_remote_avoid_potential", "path" => path)
+        .record(shard_read_fanout_to_f64(remote_avoid_potential));
+}
+
 /// Record per-stripe shard-read fanout shape for GetObject read-path attribution.
 #[inline(always)]
 pub fn record_get_object_shard_read_fanout(
@@ -1114,6 +1127,70 @@ pub fn record_get_object_shard_read_fanout(
     histogram!("rustfs_io_get_object_shard_read_completed", "path" => path).record(shard_read_fanout_to_f64(completed));
     histogram!("rustfs_io_get_object_shard_read_successful", "path" => path).record(shard_read_fanout_to_f64(successful));
     histogram!("rustfs_io_get_object_shard_read_failed", "path" => path).record(shard_read_fanout_to_f64(failed));
+}
+
+fn batch_processor_count_to_f64(value: usize) -> f64 {
+    u64::try_from(value).unwrap_or(u64::MAX) as f64
+}
+
+fn batch_processor_count_to_u64(value: usize) -> u64 {
+    u64::try_from(value).unwrap_or(u64::MAX)
+}
+
+/// Observe-only batch processor shape and adaptive-concurrency advice.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchProcessorObservation {
+    pub operation: &'static str,
+    pub batch_size: usize,
+    pub configured_concurrency: usize,
+    pub max_queue_wait_secs: f64,
+    pub execution_latency_secs: f64,
+    pub successes: usize,
+    pub errors: usize,
+    pub timeouts: usize,
+    pub suggested_concurrency: usize,
+    pub suggestion_reason: &'static str,
+}
+
+/// Record observe-only batch processor shape and adaptive-concurrency advice.
+#[inline(always)]
+pub fn record_batch_processor_observation(observation: BatchProcessorObservation) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
+    histogram!("rustfs_ecstore_batch_processor_batch_size", "operation" => observation.operation)
+        .record(batch_processor_count_to_f64(observation.batch_size));
+    histogram!("rustfs_ecstore_batch_processor_configured_concurrency", "operation" => observation.operation)
+        .record(batch_processor_count_to_f64(observation.configured_concurrency));
+    histogram!("rustfs_ecstore_batch_processor_queue_wait_seconds", "operation" => observation.operation)
+        .record(observation.max_queue_wait_secs);
+    histogram!("rustfs_ecstore_batch_processor_execution_latency_seconds", "operation" => observation.operation)
+        .record(observation.execution_latency_secs);
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => observation.operation,
+        "outcome" => "success"
+    )
+    .increment(batch_processor_count_to_u64(observation.successes));
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => observation.operation,
+        "outcome" => "error"
+    )
+    .increment(batch_processor_count_to_u64(observation.errors));
+    counter!(
+        "rustfs_ecstore_batch_processor_results_total",
+        "operation" => observation.operation,
+        "outcome" => "timeout"
+    )
+    .increment(batch_processor_count_to_u64(observation.timeouts));
+    histogram!(
+        "rustfs_ecstore_batch_processor_suggested_concurrency",
+        "operation" => observation.operation,
+        "reason" => observation.suggestion_reason
+    )
+    .record(batch_processor_count_to_f64(observation.suggested_concurrency));
 }
 
 /// Record the bitrot reader setup scheduling strategy selected for a GET read.
@@ -2034,6 +2111,26 @@ mod tests {
     }
 
     #[test]
+    fn test_record_batch_processor_observation() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_get_stage_metrics_enabled(true);
+        record_batch_processor_observation(BatchProcessorObservation {
+            operation: "read",
+            batch_size: 16,
+            configured_concurrency: 8,
+            max_queue_wait_secs: 0.001,
+            execution_latency_secs: 0.025,
+            successes: 15,
+            errors: 1,
+            timeouts: 0,
+            suggested_concurrency: 10,
+            suggestion_reason: "improving",
+        });
+        assert!(get_stage_metrics_enabled());
+        set_get_stage_metrics_enabled(false);
+    }
+
+    #[test]
     fn test_record_zero_copy_write() {
         record_zero_copy_write(1024, 10.5);
         record_zero_copy_write_fallback("test");
@@ -2094,6 +2191,7 @@ mod tests {
         record_get_object_pipeline_failure_for_path("codec_streaming", "decode", "read_quorum");
         record_get_object_shard_read_observation("codec_streaming", 0, "data", "local", "success", "none", 1024, 0.004, 0.001);
         record_get_object_shard_read_cost_summary("codec_streaming", 3, 1, 2, 0, 4, 4, 4, true);
+        record_get_object_shard_locality_observe_only("codec_streaming", 2, 1);
         record_get_object_reader_setup_strategy("data_blocks_first", "read_quorum");
         record_get_object_reader_setup_strategy_by_size(
             "codec_streaming",
@@ -2115,8 +2213,30 @@ mod tests {
             0,
             2,
         );
+        record_batch_processor_observation(BatchProcessorObservation {
+            operation: "read",
+            batch_size: 16,
+            configured_concurrency: 8,
+            max_queue_wait_secs: 0.001,
+            execution_latency_secs: 0.025,
+            successes: 15,
+            errors: 1,
+            timeouts: 0,
+            suggested_concurrency: 10,
+            suggestion_reason: "improving",
+        });
 
         assert!(0.005_f64.is_sign_positive());
+    }
+
+    #[test]
+    fn test_get_object_shard_locality_observe_only_metrics_smoke() {
+        let remote_scheduled = 2;
+        let remote_avoid_potential = 1;
+
+        record_get_object_shard_locality_observe_only("codec_streaming", remote_scheduled, remote_avoid_potential);
+
+        assert!(remote_scheduled >= remote_avoid_potential);
     }
 
     #[test]

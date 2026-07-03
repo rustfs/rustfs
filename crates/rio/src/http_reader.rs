@@ -15,14 +15,14 @@
 use crate::{EtagResolvable, HashReaderDetector, HashReaderMut};
 use bytes::{Bytes, BytesMut};
 use futures::{Stream, TryStreamExt as _};
-use http::HeaderMap;
+use http::{HeaderMap, Version};
 use pin_project_lite::pin_project;
 use reqwest::{Certificate, Client, Identity, Method, RequestBuilder};
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_OPERATION_PUT_FILE_STREAM, INTERNODE_OPERATION_READ_FILE_STREAM, INTERNODE_OPERATION_WALK_DIR,
 };
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use rustfs_utils::get_env_opt_str;
+use rustfs_utils::{get_env_bool, get_env_opt_str, get_env_opt_u64, get_env_opt_usize};
 use rustls_pki_types::pem::PemObject;
 use std::io::IoSlice;
 use std::io::{self, Error};
@@ -31,7 +31,7 @@ use std::ops::Not as _;
 use std::pin::Pin;
 use std::sync::LazyLock;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{Mutex, mpsc};
 use tokio::time::{self, Sleep};
@@ -42,6 +42,11 @@ use tracing::{error, warn};
 const READ_FILE_STREAM_PATH: &str = "/rustfs/rpc/read_file_stream";
 const PUT_FILE_STREAM_PATH: &str = "/rustfs/rpc/put_file_stream";
 const WALK_DIR_PATH: &str = "/rustfs/rpc/walk_dir";
+const HTTP_VERSION_09_LABEL: &str = "http/0.9";
+const HTTP_VERSION_10_LABEL: &str = "http/1.0";
+const HTTP_VERSION_11_LABEL: &str = "http/1.1";
+const HTTP_VERSION_2_LABEL: &str = "h2";
+const HTTP_VERSION_UNKNOWN_LABEL: &str = "unknown";
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum InternodeHttpErrorKind {
@@ -213,18 +218,192 @@ fn add_root_certificates_from_der(builder: reqwest::ClientBuilder, certs_der: &[
 struct CachedClients {
     generation: u64,
     client: Client,
-    local_client: Client,
+    no_proxy_client: Client,
 }
 
 static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
 
-async fn build_http_client(disable_proxy: bool, outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState) -> Client {
+const INTERNODE_HTTP_PROFILE_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROFILE_BALANCED: &str = "balanced";
+const INTERNODE_HTTP_PROFILE_THROUGHPUT: &str = "throughput";
+const INTERNODE_HTTP_PROXY_LEGACY: &str = "legacy";
+const INTERNODE_HTTP_PROXY_OFF: &str = "off";
+const INTERNODE_HTTP_PROXY_SYSTEM: &str = "system";
+const INTERNODE_HTTP2_WINDOW_MIN: u32 = 65_535;
+const INTERNODE_HTTP2_WINDOW_MAX: u32 = 64 * 1024 * 1024;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpTuningProfile {
+    Legacy,
+    Balanced,
+    Throughput,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InternodeHttpProxyMode {
+    Legacy,
+    NoProxy,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct InternodeHttpClientTuning {
+    profile: InternodeHttpTuningProfile,
+    pool_max_idle_per_host: Option<usize>,
+    pool_idle_timeout_secs: Option<u64>,
+    http2_initial_stream_window_size: Option<u32>,
+    http2_initial_connection_window_size: Option<u32>,
+    http2_adaptive_window: bool,
+    proxy_mode: InternodeHttpProxyMode,
+}
+
+fn internode_http_client_tuning() -> InternodeHttpClientTuning {
+    // The tuning env vars cannot change at runtime; parse them once instead of
+    // re-reading the environment on every internode request.
+    static TUNING: LazyLock<InternodeHttpClientTuning> = LazyLock::new(InternodeHttpClientTuning::from_env);
+    *TUNING
+}
+
+impl InternodeHttpClientTuning {
+    fn from_env() -> Self {
+        let profile =
+            parse_internode_http_tuning_profile(get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_TUNING_PROFILE).as_deref());
+        Self::from_values(
+            profile,
+            get_env_opt_usize(rustfs_config::ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE),
+            get_env_opt_u64(rustfs_config::ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE),
+            get_env_bool(
+                rustfs_config::ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW,
+                profile.default_http2_adaptive_window(),
+            ),
+            get_env_opt_str(rustfs_config::ENV_INTERNODE_HTTP_PROXY).as_deref(),
+        )
+    }
+
+    fn from_values(
+        profile: InternodeHttpTuningProfile,
+        pool_max_idle_per_host: Option<usize>,
+        pool_idle_timeout_secs: Option<u64>,
+        stream_window_size: Option<u64>,
+        connection_window_size: Option<u64>,
+        http2_adaptive_window: bool,
+        proxy_mode: Option<&str>,
+    ) -> Self {
+        Self {
+            profile,
+            pool_max_idle_per_host: pool_max_idle_per_host.or_else(|| profile.default_pool_max_idle_per_host()),
+            pool_idle_timeout_secs: pool_idle_timeout_secs.or_else(|| profile.default_pool_idle_timeout_secs()),
+            http2_initial_stream_window_size: clamp_http2_window(
+                stream_window_size.or_else(|| profile.default_stream_window_size()),
+            ),
+            http2_initial_connection_window_size: clamp_http2_window(
+                connection_window_size.or_else(|| profile.default_connection_window_size()),
+            ),
+            http2_adaptive_window,
+            proxy_mode: parse_internode_http_proxy_mode(proxy_mode, profile),
+        }
+    }
+}
+
+impl InternodeHttpTuningProfile {
+    fn default_pool_max_idle_per_host(self) -> Option<usize> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(64),
+            Self::Throughput => Some(256),
+        }
+    }
+
+    fn default_pool_idle_timeout_secs(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(120),
+            Self::Throughput => Some(300),
+        }
+    }
+
+    fn default_stream_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(1024 * 1024),
+            Self::Throughput => Some(4 * 1024 * 1024),
+        }
+    }
+
+    fn default_connection_window_size(self) -> Option<u64> {
+        match self {
+            Self::Legacy => None,
+            Self::Balanced => Some(4 * 1024 * 1024),
+            Self::Throughput => Some(16 * 1024 * 1024),
+        }
+    }
+
+    fn default_http2_adaptive_window(self) -> bool {
+        matches!(self, Self::Throughput)
+    }
+}
+
+fn parse_internode_http_tuning_profile(value: Option<&str>) -> InternodeHttpTuningProfile {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROFILE_LEGACY => InternodeHttpTuningProfile::Legacy,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_BALANCED => InternodeHttpTuningProfile::Balanced,
+        Some(value) if value == INTERNODE_HTTP_PROFILE_THROUGHPUT => InternodeHttpTuningProfile::Throughput,
+        _ => InternodeHttpTuningProfile::Legacy,
+    }
+}
+
+fn parse_internode_http_proxy_mode(value: Option<&str>, profile: InternodeHttpTuningProfile) -> InternodeHttpProxyMode {
+    match value.map(|value| value.trim().to_ascii_lowercase()) {
+        Some(value) if value == INTERNODE_HTTP_PROXY_SYSTEM => InternodeHttpProxyMode::System,
+        Some(value) if value == INTERNODE_HTTP_PROXY_LEGACY => InternodeHttpProxyMode::Legacy,
+        Some(value) if matches!(value.as_str(), INTERNODE_HTTP_PROXY_OFF | "none" | "no_proxy" | "disabled") => {
+            InternodeHttpProxyMode::NoProxy
+        }
+        Some(_) | None if matches!(profile, InternodeHttpTuningProfile::Legacy) => InternodeHttpProxyMode::Legacy,
+        Some(_) | None => InternodeHttpProxyMode::NoProxy,
+    }
+}
+
+fn clamp_http2_window(value: Option<u64>) -> Option<u32> {
+    let value = value?;
+    let value = value.clamp(u64::from(INTERNODE_HTTP2_WINDOW_MIN), u64::from(INTERNODE_HTTP2_WINDOW_MAX));
+    u32::try_from(value).ok()
+}
+
+fn apply_http_client_tuning(mut builder: reqwest::ClientBuilder, tuning: InternodeHttpClientTuning) -> reqwest::ClientBuilder {
+    if let Some(pool_max_idle_per_host) = tuning.pool_max_idle_per_host {
+        builder = builder.pool_max_idle_per_host(pool_max_idle_per_host);
+    }
+    if let Some(pool_idle_timeout_secs) = tuning.pool_idle_timeout_secs {
+        builder = builder.pool_idle_timeout(std::time::Duration::from_secs(pool_idle_timeout_secs));
+    }
+    if tuning.http2_adaptive_window {
+        builder = builder.http2_adaptive_window(true);
+    } else {
+        if let Some(stream_window_size) = tuning.http2_initial_stream_window_size {
+            builder = builder.http2_initial_stream_window_size(stream_window_size);
+        }
+        if let Some(connection_window_size) = tuning.http2_initial_connection_window_size {
+            builder = builder.http2_initial_connection_window_size(connection_window_size);
+        }
+    }
+    builder
+}
+
+async fn build_http_client(
+    disable_proxy: bool,
+    tuning: InternodeHttpClientTuning,
+    outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
+) -> Client {
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_keepalive(std::time::Duration::from_secs(10))
         .http2_keep_alive_interval(std::time::Duration::from_secs(5))
         .http2_keep_alive_timeout(std::time::Duration::from_secs(3))
         .http2_keep_alive_while_idle(true);
+    builder = apply_http_client_tuning(builder, tuning);
 
     if disable_proxy {
         builder = builder.no_proxy();
@@ -292,10 +471,19 @@ fn should_bypass_proxy_for_url(url: &str) -> bool {
     host.eq_ignore_ascii_case("localhost") || host.parse::<IpAddr>().is_ok_and(|addr| addr.is_loopback())
 }
 
+fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) -> bool {
+    match tuning.proxy_mode {
+        InternodeHttpProxyMode::System => false,
+        InternodeHttpProxyMode::NoProxy => true,
+        InternodeHttpProxyMode::Legacy => should_bypass_proxy_for_url(url),
+    }
+}
+
 async fn get_http_client(url: &str) -> Client {
-    // Reuse HTTP connection pools while keeping loopback traffic away from
-    // system proxies so local RPC/tests do not leak to proxy listeners.
-    let disable_proxy = should_bypass_proxy_for_url(url);
+    let tuning = internode_http_client_tuning();
+    // Reuse HTTP connection pools while honoring the configured internode proxy
+    // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
+    let disable_proxy = should_disable_proxy_for_url(url, tuning);
 
     // Fast path: check generation first (cheap atomic read) to avoid cloning
     // the full PEM + identity bytes when the TLS state hasn't changed.
@@ -305,7 +493,7 @@ async fn get_http_client(url: &str) -> Client {
     if let Some(cached) = guard.as_ref() {
         if cached.generation == generation {
             return if disable_proxy {
-                cached.local_client.clone()
+                cached.no_proxy_client.clone()
             } else {
                 cached.client.clone()
             };
@@ -317,16 +505,16 @@ async fn get_http_client(url: &str) -> Client {
     // Cache miss or stale generation — load full outbound TLS state.
     let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
-    let client = build_http_client(false, &outbound_tls).await;
-    let local_client = build_http_client(true, &outbound_tls).await;
+    let client = build_http_client(false, tuning, &outbound_tls).await;
+    let no_proxy_client = build_http_client(true, tuning, &outbound_tls).await;
     let cached = CachedClients {
         generation,
         client,
-        local_client,
+        no_proxy_client,
     };
 
     let return_client = if disable_proxy {
-        cached.local_client.clone()
+        cached.no_proxy_client.clone()
     } else {
         cached.client.clone()
     };
@@ -419,6 +607,8 @@ pin_project! {
         internode_operation: Option<&'static str>,
         stall_timeout: Option<Duration>,
         stall_timer: Option<Pin<Box<Sleep>>>,
+        request_started: Instant,
+        duration_recorded: bool,
         #[pin]
         inner: StreamReader<Pin<Box<dyn Stream<Item=std::io::Result<Bytes>>+Send+Sync>>, Bytes>,
     }
@@ -467,13 +657,17 @@ impl HttpReader {
             request = request.body(body);
         }
 
+        let request_started = Instant::now();
         let resp = request.send().await.map_err(|e| {
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_reqwest_error(&e));
             internode_reqwest_error(&method, &url, internode_operation, e)
         })?;
 
+        record_internode_http_version(track_internode_metrics, internode_operation, http_version_metric_label(resp.version()));
         if resp.status().is_success().not() {
+            record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
             record_internode_error(track_internode_metrics, internode_operation);
             record_internode_classified_error(track_internode_metrics, internode_operation, classify_http_status(resp.status()));
             return Err(internode_status_error(&method, &url, internode_operation, resp.status()));
@@ -498,6 +692,8 @@ impl HttpReader {
             internode_operation,
             stall_timer: None,
             stall_timeout,
+            request_started,
+            duration_recorded: false,
         })
     }
     pub fn url(&self) -> &str {
@@ -521,6 +717,13 @@ impl AsyncRead for HttpReader {
                 let bytes_read = buf.filled().len().saturating_sub(filled_before);
                 if bytes_read > 0 {
                     record_internode_recv_bytes(*this.track_internode_metrics, *this.internode_operation, bytes_read);
+                } else {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
                 }
                 *this.stall_timer = None;
                 Poll::Ready(Ok(()))
@@ -531,6 +734,13 @@ impl AsyncRead for HttpReader {
                 };
                 let timer = this.stall_timer.get_or_insert_with(|| Box::pin(time::sleep(stall_timeout)));
                 if timer.as_mut().poll(cx).is_ready() {
+                    record_internode_operation_duration_once(
+                        *this.track_internode_metrics,
+                        *this.internode_operation,
+                        *this.request_started,
+                        this.duration_recorded,
+                    );
+                    record_internode_stall_timeout(*this.track_internode_metrics, *this.internode_operation);
                     record_internode_error(*this.track_internode_metrics, *this.internode_operation);
                     Poll::Ready(Err(Error::new(
                         io::ErrorKind::TimedOut,
@@ -540,7 +750,15 @@ impl AsyncRead for HttpReader {
                     Poll::Pending
                 }
             }
-            other => other,
+            Poll::Ready(Err(err)) => {
+                record_internode_operation_duration_once(
+                    *this.track_internode_metrics,
+                    *this.internode_operation,
+                    *this.request_started,
+                    this.duration_recorded,
+                );
+                Poll::Ready(Err(err))
+            }
         }
     }
 }
@@ -610,6 +828,8 @@ pin_project! {
         handle: tokio::task::JoinHandle<std::io::Result<()>>,
         pending_chunk: BytesMut,
         finish:bool,
+        track_internode_metrics: bool,
+        internode_operation: Option<&'static str>,
 
     }
 }
@@ -648,10 +868,17 @@ impl HttpWriter {
                 .body(body);
 
             // Hold the request until the shutdown signal is received
+            let request_started = Instant::now();
             let response = request.send().await;
 
             match response {
                 Ok(resp) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
+                    record_internode_http_version(
+                        track_internode_metrics,
+                        internode_operation,
+                        http_version_metric_label(resp.version()),
+                    );
                     // http_log!("[HttpWriter::spawn] got response: status={}", resp.status());
                     if !resp.status().is_success() {
                         record_internode_error(track_internode_metrics, internode_operation);
@@ -667,6 +894,7 @@ impl HttpWriter {
                     }
                 }
                 Err(e) => {
+                    record_internode_operation_duration(track_internode_metrics, internode_operation, request_started.elapsed());
                     record_internode_error(track_internode_metrics, internode_operation);
                     let classified = classify_reqwest_error(&e);
                     record_internode_classified_error(track_internode_metrics, internode_operation, classified);
@@ -691,6 +919,8 @@ impl HttpWriter {
             handle,
             pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
             finish: false,
+            track_internode_metrics,
+            internode_operation,
         })
     }
 
@@ -718,6 +948,20 @@ fn internode_rpc_operation(url: &str) -> Option<&'static str> {
         PUT_FILE_STREAM_PATH => Some(INTERNODE_OPERATION_PUT_FILE_STREAM),
         WALK_DIR_PATH => Some(INTERNODE_OPERATION_WALK_DIR),
         _ => None,
+    }
+}
+
+fn http_version_metric_label(version: Version) -> &'static str {
+    if version == Version::HTTP_09 {
+        HTTP_VERSION_09_LABEL
+    } else if version == Version::HTTP_10 {
+        HTTP_VERSION_10_LABEL
+    } else if version == Version::HTTP_11 {
+        HTTP_VERSION_11_LABEL
+    } else if version == Version::HTTP_2 {
+        HTTP_VERSION_2_LABEL
+    } else {
+        HTTP_VERSION_UNKNOWN_LABEL
     }
 }
 
@@ -763,6 +1007,60 @@ fn record_internode_classified_error(track: bool, operation: Option<&'static str
     }
 }
 
+fn record_internode_operation_duration(track: bool, operation: Option<&'static str>, duration: Duration) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_duration(operation, duration);
+    }
+}
+
+fn record_internode_operation_duration_once(
+    track: bool,
+    operation: Option<&'static str>,
+    request_started: Instant,
+    duration_recorded: &mut bool,
+) {
+    if *duration_recorded {
+        return;
+    }
+
+    *duration_recorded = true;
+    record_internode_operation_duration(track, operation, request_started.elapsed());
+}
+
+fn record_internode_http_version(track: bool, operation: Option<&'static str>, http_version: &'static str) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_http_version(operation, http_version);
+    }
+}
+
+fn record_internode_stall_timeout(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_stall_timeout(operation);
+    }
+}
+
+fn record_internode_write_shutdown_error(track: bool, operation: Option<&'static str>) {
+    if !track {
+        return;
+    }
+
+    if let Some(operation) = operation {
+        crate::http_runtime_sources::record_write_shutdown_error(operation);
+    }
+}
+
 fn poll_send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -> io::Error {
     Error::other(format!("{context}: {err}"))
 }
@@ -772,6 +1070,13 @@ fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -
 }
 
 impl HttpWriter {
+    fn take_background_error(&mut self) -> io::Result<()> {
+        match self.err_rx.try_recv() {
+            Ok(err) => Err(err),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty | tokio::sync::oneshot::error::TryRecvError::Closed) => Ok(()),
+        }
+    }
+
     fn poll_send_pending_chunk(&mut self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         if self.pending_chunk.is_empty() {
             return Poll::Ready(Ok(()));
@@ -799,11 +1104,10 @@ impl AsyncWrite for HttpWriter {
         //     self.method,
         //     buf.len()
         // );
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
-        }
-
         let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
 
         if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
             match this.poll_send_pending_chunk(cx) {
@@ -832,15 +1136,19 @@ impl AsyncWrite for HttpWriter {
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), io::Error>> {
-        self.as_mut().get_mut().poll_send_pending_chunk(cx)
+        let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
+
+        this.poll_send_pending_chunk(cx)
     }
 
     fn poll_write_vectored(mut self: Pin<&mut Self>, cx: &mut Context<'_>, bufs: &[IoSlice<'_>]) -> Poll<io::Result<usize>> {
-        if let Ok(e) = Pin::new(&mut self.err_rx).try_recv() {
-            return Poll::Ready(Err(e));
-        }
-
         let this = self.as_mut().get_mut();
+        if let Err(err) = this.take_background_error() {
+            return Poll::Ready(Err(err));
+        }
 
         if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
             match this.poll_send_pending_chunk(cx) {
@@ -883,9 +1191,17 @@ impl AsyncWrite for HttpWriter {
         // let url = self.url.clone();
         // let method = self.method.clone();
 
+        if let Err(err) = self.as_mut().get_mut().take_background_error() {
+            record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+            return Poll::Ready(Err(err));
+        }
+
         match self.as_mut().get_mut().poll_send_pending_chunk(cx) {
             Poll::Ready(Ok(())) => {}
-            Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
+            Poll::Ready(Err(err)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Pending => return Poll::Pending,
         }
 
@@ -894,11 +1210,15 @@ impl AsyncWrite for HttpWriter {
             let this = self.as_mut().get_mut();
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
-                    this.sender
-                        .send_item(None)
-                        .map_err(|e| send_error_to_io(e, "HttpWriter shutdown error"))?;
+                    this.sender.send_item(None).map_err(|e| {
+                        record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                        send_error_to_io(e, "HttpWriter shutdown error")
+                    })?;
                 }
-                Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error"))),
+                Poll::Ready(Err(err)) => {
+                    record_internode_write_shutdown_error(this.track_internode_metrics, this.internode_operation);
+                    return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter shutdown error")));
+                }
                 Poll::Pending => return Poll::Pending,
             }
             // http_log!(
@@ -911,15 +1231,20 @@ impl AsyncWrite for HttpWriter {
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
-        match Pin::new(&mut self.get_mut().handle).poll_unpin(cx) {
-            Poll::Ready(Ok(_)) => {
+        match Pin::new(&mut self.as_mut().get_mut().handle).poll_unpin(cx) {
+            Poll::Ready(Ok(Ok(()))) => {
                 // http_log!(
                 //     "[HttpWriter::poll_shutdown] HTTP request finished successfully, url: {}, method: {:?}",
                 //     url,
                 //     method
                 // );
             }
+            Poll::Ready(Ok(Err(err))) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
+                return Poll::Ready(Err(err));
+            }
             Poll::Ready(Err(e)) => {
+                record_internode_write_shutdown_error(self.track_internode_metrics, self.internode_operation);
                 // http_log!("[HttpWriter::poll_shutdown] HTTP request failed: {e}, url: {}, method: {:?}", url, method);
                 return Poll::Ready(Err(Error::other(format!("HTTP request failed: {e}"))));
             }
@@ -992,6 +1317,13 @@ mod tests {
         StatusCode::OK
     }
 
+    async fn reject_put(State(state): State<TestState>, body: Body) -> impl IntoResponse {
+        state.put_count.fetch_add(1, Ordering::SeqCst);
+        let bytes = body.collect().await.unwrap().to_bytes();
+        state.put_bodies.lock().await.push(bytes.to_vec());
+        StatusCode::INTERNAL_SERVER_ERROR
+    }
+
     async fn start_test_server(state: TestState) -> Option<(String, tokio::task::JoinHandle<()>)> {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -1001,6 +1333,7 @@ mod tests {
         let addr = listener.local_addr().expect("listener local address should be available");
         let app = Router::new()
             .route("/stream", get(get_stream).head(reject_head).put(accept_put))
+            .route("/reject-put", get(get_stream).put(reject_put))
             .route("/stall", get(get_stalling_stream))
             .route("/delayed-first", get(get_delayed_first_chunk))
             .with_state(state);
@@ -1031,6 +1364,14 @@ mod tests {
             internode_rpc_operation("http://node:9000/rustfs/rpc/unknown?next=/rustfs/rpc/read_file_stream"),
             None
         );
+    }
+
+    #[test]
+    fn http_version_metrics_labels_are_low_cardinality() {
+        assert_eq!(http_version_metric_label(Version::HTTP_09), HTTP_VERSION_09_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_10), HTTP_VERSION_10_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_11), HTTP_VERSION_11_LABEL);
+        assert_eq!(http_version_metric_label(Version::HTTP_2), HTTP_VERSION_2_LABEL);
     }
 
     #[tokio::test]
@@ -1175,6 +1516,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_writer_shutdown_reports_http_status_error() {
+        let state = TestState::default();
+        let Some((base_url, handle)) = start_test_server(state.clone()).await else {
+            return;
+        };
+        let url = base_url.replace("/stream", "/reject-put");
+
+        let mut writer = HttpWriter::new(url, Method::PUT, HeaderMap::new()).await.unwrap();
+        writer.write_all(b"payload").await.unwrap();
+        let err = writer
+            .shutdown()
+            .await
+            .expect_err("shutdown should report the HTTP response failure");
+
+        let source = err
+            .get_ref()
+            .and_then(|source| source.downcast_ref::<InternodeHttpError>())
+            .expect("expected shutdown error to carry InternodeHttpError source");
+        assert_eq!(
+            source.kind(),
+            InternodeHttpErrorKind::HttpStatus(reqwest::StatusCode::INTERNAL_SERVER_ERROR)
+        );
+        assert_eq!(source.context().method(), "PUT");
+        assert!(source.context().target().contains("/reject-put"));
+        assert_eq!(state.put_count.load(Ordering::SeqCst), 1);
+        assert_eq!(state.put_bodies.lock().await.as_slice(), &[b"payload".to_vec()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn http_reader_request_error_includes_method_and_url() {
         let listener = match TcpListener::bind("127.0.0.1:0").await {
             Ok(listener) => listener,
@@ -1266,5 +1638,127 @@ mod tests {
         assert!(!should_bypass_proxy_for_url("http://192.168.1.10:9000/stream"));
         assert!(!should_bypass_proxy_for_url("http://example.com/stream"));
         assert!(!should_bypass_proxy_for_url("not-a-url"));
+    }
+
+    #[test]
+    fn internode_http_tuning_profile_parses_known_values_and_falls_back_to_legacy() {
+        assert_eq!(parse_internode_http_tuning_profile(None), InternodeHttpTuningProfile::Legacy);
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("balanced")),
+            InternodeHttpTuningProfile::Balanced
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some(" Throughput ")),
+            InternodeHttpTuningProfile::Throughput
+        );
+        assert_eq!(
+            parse_internode_http_tuning_profile(Some("aggressive")),
+            InternodeHttpTuningProfile::Legacy
+        );
+    }
+
+    #[test]
+    fn legacy_internode_http_tuning_keeps_existing_defaults() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Legacy.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, None);
+        assert_eq!(tuning.pool_idle_timeout_secs, None);
+        assert_eq!(tuning.http2_initial_stream_window_size, None);
+        assert_eq!(tuning.http2_initial_connection_window_size, None);
+        assert!(!tuning.http2_adaptive_window);
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::Legacy);
+    }
+
+    #[test]
+    fn balanced_and_throughput_profiles_apply_conservative_defaults() {
+        let balanced = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Balanced.default_http2_adaptive_window(),
+            None,
+        );
+        let throughput = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            InternodeHttpTuningProfile::Throughput.default_http2_adaptive_window(),
+            None,
+        );
+
+        assert_eq!(balanced.pool_max_idle_per_host, Some(64));
+        assert_eq!(balanced.pool_idle_timeout_secs, Some(120));
+        assert_eq!(balanced.http2_initial_stream_window_size, Some(1024 * 1024));
+        assert_eq!(balanced.http2_initial_connection_window_size, Some(4 * 1024 * 1024));
+        assert!(!balanced.http2_adaptive_window);
+        assert_eq!(balanced.proxy_mode, InternodeHttpProxyMode::NoProxy);
+
+        assert_eq!(throughput.pool_max_idle_per_host, Some(256));
+        assert_eq!(throughput.pool_idle_timeout_secs, Some(300));
+        assert!(throughput.http2_adaptive_window);
+        assert_eq!(throughput.proxy_mode, InternodeHttpProxyMode::NoProxy);
+    }
+
+    #[test]
+    fn internode_http_tuning_overrides_are_clamped() {
+        let tuning = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Balanced,
+            Some(8),
+            Some(30),
+            Some(1),
+            Some(u64::MAX),
+            false,
+            Some("system"),
+        );
+
+        assert_eq!(tuning.pool_max_idle_per_host, Some(8));
+        assert_eq!(tuning.pool_idle_timeout_secs, Some(30));
+        assert_eq!(tuning.http2_initial_stream_window_size, Some(INTERNODE_HTTP2_WINDOW_MIN));
+        assert_eq!(tuning.http2_initial_connection_window_size, Some(INTERNODE_HTTP2_WINDOW_MAX));
+        assert_eq!(tuning.proxy_mode, InternodeHttpProxyMode::System);
+    }
+
+    #[test]
+    fn internode_http_proxy_policy_matches_profile_and_overrides() {
+        let legacy =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Legacy, None, None, None, None, false, None);
+        let balanced =
+            InternodeHttpClientTuning::from_values(InternodeHttpTuningProfile::Balanced, None, None, None, None, false, None);
+        let system_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Throughput,
+            None,
+            None,
+            None,
+            None,
+            true,
+            Some("system"),
+        );
+        let no_proxy = InternodeHttpClientTuning::from_values(
+            InternodeHttpTuningProfile::Legacy,
+            None,
+            None,
+            None,
+            None,
+            false,
+            Some("off"),
+        );
+
+        assert!(should_disable_proxy_for_url("http://127.0.0.1:9000/stream", legacy));
+        assert!(!should_disable_proxy_for_url("http://192.168.1.10:9000/stream", legacy));
+        assert!(should_disable_proxy_for_url("http://192.168.1.10:9000/stream", balanced));
+        assert!(!should_disable_proxy_for_url("http://127.0.0.1:9000/stream", system_proxy));
+        assert!(should_disable_proxy_for_url("http://example.com/stream", no_proxy));
     }
 }

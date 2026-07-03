@@ -531,6 +531,26 @@ pub struct ReadVersionResponse {
     pub file_info_bin: ::prost::bytes::Bytes,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchReadVersionRequest {
+    #[prost(string, tag = "1")]
+    pub disk: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub batch_read_version_req: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "3")]
+    pub batch_read_version_req_bin: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct BatchReadVersionResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(string, repeated, tag = "2")]
+    pub batch_read_version_resps: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "3")]
+    pub error: ::core::option::Option<Error>,
+    #[prost(bytes = "bytes", repeated, tag = "4")]
+    pub batch_read_version_resps_bin: ::prost::alloc::vec::Vec<::prost::bytes::Bytes>,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ReadXlRequest {
     #[prost(string, tag = "1")]
     pub disk: ::prost::alloc::string::String,
@@ -1689,6 +1709,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "ReadVersion"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn batch_read_version(
+            &mut self,
+            request: impl tonic::IntoRequest<super::BatchReadVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchReadVersionResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/BatchReadVersion");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "BatchReadVersion"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn read_xl(
             &mut self,
             request: impl tonic::IntoRequest<super::ReadXlRequest>,
@@ -2610,6 +2645,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::ReadVersionRequest>,
         ) -> std::result::Result<tonic::Response<super::ReadVersionResponse>, tonic::Status>;
+        async fn batch_read_version(
+            &self,
+            request: tonic::Request<super::BatchReadVersionRequest>,
+        ) -> std::result::Result<tonic::Response<super::BatchReadVersionResponse>, tonic::Status>;
         async fn read_xl(
             &self,
             request: tonic::Request<super::ReadXlRequest>,
@@ -3697,6 +3736,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = ReadVersionSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/BatchReadVersion" => {
+                    #[allow(non_camel_case_types)]
+                    struct BatchReadVersionSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::BatchReadVersionRequest> for BatchReadVersionSvc<T> {
+                        type Response = super::BatchReadVersionResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::BatchReadVersionRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::batch_read_version(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = BatchReadVersionSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

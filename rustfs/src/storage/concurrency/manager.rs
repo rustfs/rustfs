@@ -679,7 +679,6 @@ mod integration_tests {
     use super::ConcurrencyManager;
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
-    use rustfs_config::MI_B;
     use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
     use std::time::Duration;
