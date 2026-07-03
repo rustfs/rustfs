@@ -43,7 +43,6 @@ use rustfs_config::server_config::{Config, KVS};
 use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY_SIZE};
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
-use rustfs_targets::manifest::builtin_target_manifest;
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
 use std::collections::{BTreeMap, HashMap};
@@ -100,27 +99,18 @@ fn audit_target_specs() -> &'static [AdminTargetSpec] {
 
 const REDACTED_SECRET_VALUE: &str = "***redacted***";
 
-fn builtin_secret_fields_for_service(plugin_id: &str, service: &str) -> &'static [&'static str] {
-    if !plugin_id.starts_with("builtin:") {
-        return &[];
-    }
-
-    match service.to_ascii_lowercase().as_str() {
-        "webhook" => builtin_target_manifest("webhook").secret_fields,
-        "mqtt" => builtin_target_manifest("mqtt").secret_fields,
-        "kafka" => builtin_target_manifest("kafka").secret_fields,
-        "amqp" => builtin_target_manifest("amqp").secret_fields,
-        "nats" => builtin_target_manifest("nats").secret_fields,
-        "pulsar" => builtin_target_manifest("pulsar").secret_fields,
-        "mysql" => builtin_target_manifest("mysql").secret_fields,
-        "redis" => builtin_target_manifest("redis").secret_fields,
-        "postgres" => builtin_target_manifest("postgres").secret_fields,
-        _ => &[],
-    }
+/// Secret fields for an instance, resolved from the plugin manifest carried by
+/// the domain's admin target specs (single source of truth for redaction).
+fn secret_fields_for_instance(domain: PluginContractDomain, subsystem: &str) -> &'static [&'static str] {
+    plugin_instance_domain_context(domain)
+        .specs
+        .iter()
+        .find(|spec| spec.subsystem == subsystem)
+        .map(|spec| spec.secret_fields)
+        .unwrap_or(&[])
 }
 
-fn map_instance_config(config: KVS, plugin_id: &str, service: &str) -> HashMap<String, String> {
-    let secret_fields = builtin_secret_fields_for_service(plugin_id, service);
+fn map_instance_config(config: KVS, secret_fields: &[&str]) -> HashMap<String, String> {
     config
         .0
         .into_iter()
@@ -134,6 +124,46 @@ fn map_instance_config(config: KVS, plugin_id: &str, service: &str) -> HashMap<S
             (kv.key, value)
         })
         .collect()
+}
+
+/// Restores stored secret values for keys the client sent back as the
+/// redacted placeholder. GET responses redact secrets, so a read-modify-write
+/// round trip must not persist the placeholder literal as the new secret.
+fn restore_redacted_secret_values(
+    key_values: &mut [KeyValue],
+    secret_fields: &[&str],
+    stored_config: Option<&KVS>,
+) -> S3Result<()> {
+    for kv in key_values {
+        if kv.value != REDACTED_SECRET_VALUE {
+            continue;
+        }
+        if !secret_fields.iter().any(|field| field.eq_ignore_ascii_case(&kv.key)) {
+            continue;
+        }
+        let stored = stored_config
+            .and_then(|kvs| kvs.lookup(&kv.key))
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                s3_error!(
+                    InvalidArgument,
+                    "config key '{}' uses the redacted placeholder but there is no stored secret to preserve",
+                    kv.key
+                )
+            })?;
+        kv.value = stored;
+    }
+    Ok(())
+}
+
+/// Case-insensitive lookup of an instance's persisted config section.
+fn stored_instance_config<'a>(config: &'a Config, subsystem: &str, target_name: &str) -> Option<&'a KVS> {
+    config.0.get(subsystem).and_then(|section| {
+        section
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(target_name))
+            .map(|(_, kvs)| kvs)
+    })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -163,17 +193,17 @@ fn plugin_instance_domain_context(domain: PluginContractDomain) -> PluginInstanc
 
 fn map_instance(instance: TargetInstanceReadModel) -> PluginInstanceEntry {
     let runtime_state = runtime_state_from_status_label(&instance.status);
-    let plugin_id = instance.plugin_id;
-    let service = instance.service;
-    let config = map_instance_config(instance.config, &plugin_id, &service);
+    let domain = PluginContractDomain::from(instance.domain);
+    let secret_fields = secret_fields_for_instance(domain, &instance.subsystem);
+    let config = map_instance_config(instance.config, secret_fields);
 
     PluginInstanceEntry {
         id: instance.canonical_id,
-        plugin_id,
-        domain: PluginContractDomain::from(instance.domain),
+        plugin_id: instance.plugin_id,
+        domain,
         subsystem: instance.subsystem,
         account_id: instance.account_id,
-        service,
+        service: instance.service,
         status: instance.status,
         source: map_instance_source(instance.source),
         enabled: instance.enabled,
@@ -236,10 +266,12 @@ fn collect_instance_diagnostics(
     diagnostics
 }
 
-async fn plugin_instance_detail(instance: TargetInstanceReadModel) -> PluginInstanceDetail {
-    let action = "reading plugin instance diagnostics";
-    let context = plugin_instance_domain_context(PluginContractDomain::from(instance.domain));
-    let diagnostics = collect_instance_diagnostics(&instance, plugin_instance_operation_block_reason(context, action).await);
+/// Builds an instance detail view. Callers must run
+/// [`refresh_persisted_module_switches`] once beforehand.
+fn plugin_instance_detail(instance: TargetInstanceReadModel) -> PluginInstanceDetail {
+    let domain = PluginContractDomain::from(instance.domain);
+    let module_disabled_reason = module_disabled_block_reason(domain, "reading plugin instance diagnostics");
+    let diagnostics = collect_instance_diagnostics(&instance, module_disabled_reason);
     let mut mapped = map_instance(instance);
     mapped.diagnostic_codes = diagnostics.iter().map(|item| item.code.clone()).collect();
 
@@ -577,15 +609,20 @@ fn plugin_instance_mutation_block_reason(
     shared_target_mutation_block_reason(context.specs, context.route_prefix, config, target_type, target_name, target_label)
 }
 
-async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainContext, action: &str) -> Option<String> {
+/// Reloads persisted module switches from the config store. Call once per
+/// admin request before evaluating [`module_disabled_block_reason`] so that
+/// list/detail paths do not hit the store once per domain or per instance.
+async fn refresh_persisted_module_switches() {
     if let Err(err) = refresh_persisted_module_switches_from_store().await {
         warn!(
             error = %err,
             "failed to reload persisted module switches before checking plugin instance operation gating"
         );
     }
+}
 
-    match context.domain {
+fn module_disabled_block_reason(domain: PluginContractDomain, action: &str) -> Option<String> {
+    match domain {
         PluginContractDomain::Notify => {
             refresh_notify_module_enabled();
             target_module_disabled_reason("notify", rustfs_config::ENV_NOTIFY_ENABLE, is_notify_module_enabled(), action)
@@ -595,6 +632,11 @@ async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainCon
             target_module_disabled_reason("audit", rustfs_config::ENV_AUDIT_ENABLE, is_audit_module_enabled(), action)
         }
     }
+}
+
+async fn plugin_instance_operation_block_reason(context: PluginInstanceDomainContext, action: &str) -> Option<String> {
+    refresh_persisted_module_switches().await;
+    module_disabled_block_reason(context.domain, action)
 }
 
 async fn plugin_instance_runtime_statuses(context: PluginInstanceDomainContext) -> S3Result<HashMap<(String, String), String>> {
@@ -623,7 +665,7 @@ async fn plugin_instance_config_snapshot(context: PluginInstanceDomainContext) -
 async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Result<Vec<PluginInstanceEntry>> {
     let runtime_statuses = plugin_instance_runtime_statuses(context).await?;
     let config = plugin_instance_config_snapshot(context).await?;
-    let module_disabled_reason = plugin_instance_operation_block_reason(context, "listing plugin instances").await;
+    let module_disabled_reason = module_disabled_block_reason(context.domain, "listing plugin instances");
     let mut entries = Vec::new();
     for instance in collect_target_instances(context.specs, context.route_prefix, &config, runtime_statuses) {
         entries.push(plugin_instance_list_entry(instance, module_disabled_reason.clone()));
@@ -632,6 +674,7 @@ async fn collect_domain_instances(context: PluginInstanceDomainContext) -> S3Res
 }
 
 pub(super) async fn collect_all_instances() -> S3Result<Vec<PluginInstanceEntry>> {
+    refresh_persisted_module_switches().await;
     let (mut notify_instances, audit_instances) = tokio::try_join!(
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Notify)),
         collect_domain_instances(plugin_instance_domain_context(PluginContractDomain::Audit))
@@ -714,11 +757,12 @@ impl Operation for GetPluginInstanceHandler {
             .get("id")
             .ok_or_else(|| s3_error!(InvalidArgument, "missing required parameter: 'id'"))?;
 
+        refresh_persisted_module_switches().await;
         let instance = find_plugin_instance(instance_id)
             .await?
             .ok_or_else(|| s3_error!(NoSuchKey, "plugin instance not found"))?;
 
-        let data = serde_json::to_vec(&plugin_instance_detail(instance).await)
+        let data = serde_json::to_vec(&plugin_instance_detail(instance))
             .map_err(|e| s3_error!(InternalError, "failed to serialize response: {}", e))?;
         Ok(build_json_response(StatusCode::OK, Body::from(data), req.headers.get("x-request-id")))
     }
@@ -746,57 +790,39 @@ impl Operation for PutPluginInstanceHandler {
             .store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE)
             .await
             .map_err(|_| s3_error!(InvalidRequest, "failed to read request body"))?;
-        let body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
+        let mut body: PluginInstanceBody = serde_json::from_slice(&body_bytes)
             .map_err(|e| s3_error!(InvalidArgument, "invalid json body for plugin instance config: {}", e))?;
 
-        match context.domain {
-            PluginContractDomain::Notify => {
-                let (_ns, config_snapshot) = load_notification_config_snapshot().await?;
-                if let Some(reason) = plugin_instance_mutation_block_reason(
-                    context,
-                    &config_snapshot,
-                    resolved.target_spec.subsystem,
-                    &resolved.target_name,
-                    "plugin instance",
-                ) {
-                    return Err(s3_error!(InvalidRequest, "{reason}"));
-                }
-
-                let kvs = build_enabled_target_kvs(
-                    context.specs,
-                    body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-                    resolved.target_spec.subsystem,
-                    context.default_queue_dir,
-                    "plugin instance",
-                )
-                .await?;
-
-                set_plugin_instance_config(context, &resolved, kvs).await?;
-            }
-            PluginContractDomain::Audit => {
-                let config_snapshot = load_server_config_from_store().await?;
-                if let Some(reason) = plugin_instance_mutation_block_reason(
-                    context,
-                    &config_snapshot,
-                    resolved.target_spec.subsystem,
-                    &resolved.target_name,
-                    "plugin instance",
-                ) {
-                    return Err(s3_error!(InvalidRequest, "{reason}"));
-                }
-
-                let kvs = build_enabled_target_kvs(
-                    context.specs,
-                    body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-                    resolved.target_spec.subsystem,
-                    context.default_queue_dir,
-                    "plugin instance",
-                )
-                .await?;
-
-                set_plugin_instance_config(context, &resolved, kvs).await?;
-            }
+        let config_snapshot = plugin_instance_config_snapshot(context).await?;
+        if let Some(reason) = plugin_instance_mutation_block_reason(
+            context,
+            &config_snapshot,
+            resolved.target_spec.subsystem,
+            &resolved.target_name,
+            "plugin instance",
+        ) {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
         }
+
+        // GET responses redact secret values; a read-modify-write round trip
+        // sends the placeholder back, which must restore the stored secret
+        // instead of persisting the placeholder literal.
+        restore_redacted_secret_values(
+            &mut body.key_values,
+            resolved.target_spec.secret_fields,
+            stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name),
+        )?;
+
+        let kvs = build_enabled_target_kvs(
+            context.specs,
+            body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            resolved.target_spec.subsystem,
+            context.default_queue_dir,
+            "plugin instance",
+        )
+        .await?;
+
+        set_plugin_instance_config(context, &resolved, kvs).await?;
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -819,36 +845,18 @@ impl Operation for DeletePluginInstanceHandler {
             return Err(s3_error!(InvalidRequest, "{reason}"));
         }
 
-        match context.domain {
-            PluginContractDomain::Notify => {
-                let (_ns, config_snapshot) = load_notification_config_snapshot().await?;
-                if let Some(reason) = plugin_instance_mutation_block_reason(
-                    context,
-                    &config_snapshot,
-                    resolved.target_spec.subsystem,
-                    &resolved.target_name,
-                    "plugin instance",
-                ) {
-                    return Err(s3_error!(InvalidRequest, "{reason}"));
-                }
-
-                remove_plugin_instance_config(context, &resolved).await?;
-            }
-            PluginContractDomain::Audit => {
-                let config_snapshot = load_server_config_from_store().await?;
-                if let Some(reason) = plugin_instance_mutation_block_reason(
-                    context,
-                    &config_snapshot,
-                    resolved.target_spec.subsystem,
-                    &resolved.target_name,
-                    "plugin instance",
-                ) {
-                    return Err(s3_error!(InvalidRequest, "{reason}"));
-                }
-
-                remove_plugin_instance_config(context, &resolved).await?;
-            }
+        let config_snapshot = plugin_instance_config_snapshot(context).await?;
+        if let Some(reason) = plugin_instance_mutation_block_reason(
+            context,
+            &config_snapshot,
+            resolved.target_spec.subsystem,
+            &resolved.target_name,
+            "plugin instance",
+        ) {
+            return Err(s3_error!(InvalidRequest, "{reason}"));
         }
+
+        remove_plugin_instance_config(context, &resolved).await?;
 
         Ok(build_json_response(StatusCode::OK, Body::empty(), req.headers.get("x-request-id")))
     }
@@ -1071,6 +1079,71 @@ mod tests {
             mapped.config.get(WEBHOOK_AUTH_TOKEN).map(String::as_str),
             Some(super::REDACTED_SECRET_VALUE)
         );
+    }
+
+    #[test]
+    fn put_round_trip_restores_stored_secret_for_redacted_placeholder() {
+        let mut key_values = vec![
+            super::KeyValue {
+                key: WEBHOOK_ENDPOINT.to_string(),
+                value: "https://example.com/webhook".to_string(),
+            },
+            super::KeyValue {
+                key: WEBHOOK_AUTH_TOKEN.to_string(),
+                value: super::REDACTED_SECRET_VALUE.to_string(),
+            },
+        ];
+        let mut stored = KVS::new();
+        stored.insert(WEBHOOK_AUTH_TOKEN.to_string(), "stored-secret-token".to_string());
+
+        super::restore_redacted_secret_values(&mut key_values, &[WEBHOOK_AUTH_TOKEN], Some(&stored))
+            .expect("redacted secret should be restored from stored config");
+
+        assert_eq!(key_values[0].value, "https://example.com/webhook");
+        assert_eq!(key_values[1].value, "stored-secret-token");
+    }
+
+    #[test]
+    fn put_round_trip_rejects_redacted_placeholder_without_stored_secret() {
+        let mut key_values = vec![super::KeyValue {
+            key: WEBHOOK_AUTH_TOKEN.to_string(),
+            value: super::REDACTED_SECRET_VALUE.to_string(),
+        }];
+
+        let err = super::restore_redacted_secret_values(&mut key_values, &[WEBHOOK_AUTH_TOKEN], None)
+            .expect_err("placeholder without a stored secret must be rejected");
+        assert!(err.to_string().contains("no stored secret"));
+
+        let empty_stored = KVS::new();
+        let err = super::restore_redacted_secret_values(&mut key_values, &[WEBHOOK_AUTH_TOKEN], Some(&empty_stored))
+            .expect_err("placeholder with an empty stored secret must be rejected");
+        assert!(err.to_string().contains("no stored secret"));
+    }
+
+    #[test]
+    fn put_round_trip_leaves_placeholder_on_non_secret_fields_untouched() {
+        let mut key_values = vec![super::KeyValue {
+            key: WEBHOOK_ENDPOINT.to_string(),
+            value: super::REDACTED_SECRET_VALUE.to_string(),
+        }];
+
+        super::restore_redacted_secret_values(&mut key_values, &[WEBHOOK_AUTH_TOKEN], None)
+            .expect("non-secret fields are not subject to placeholder restoration");
+        assert_eq!(key_values[0].value, super::REDACTED_SECRET_VALUE);
+    }
+
+    #[test]
+    fn stored_instance_config_lookup_is_case_insensitive_on_target_name() {
+        let mut stored = KVS::new();
+        stored.insert(WEBHOOK_AUTH_TOKEN.to_string(), "stored-secret-token".to_string());
+        let config = Config(HashMap::from([(
+            NOTIFY_WEBHOOK_SUB_SYS.to_string(),
+            HashMap::from([("Primary".to_string(), stored)]),
+        )]));
+
+        let found = super::stored_instance_config(&config, NOTIFY_WEBHOOK_SUB_SYS, "primary")
+            .expect("case-insensitive lookup should find the stored section");
+        assert_eq!(found.lookup(WEBHOOK_AUTH_TOKEN).as_deref(), Some("stored-secret-token"));
     }
 
     #[test]

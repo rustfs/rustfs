@@ -23,11 +23,19 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 use std::collections::HashSet;
 use std::sync::Arc;
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 type BoxedTarget<E> = Box<dyn Target<E> + Send + Sync>;
 type TargetCreateFn<E> = Arc<dyn Fn(String, &KVS) -> Result<BoxedTarget<E>, TargetError> + Send + Sync>;
 type TargetValidateFn = Arc<dyn Fn(&KVS) -> Result<(), TargetError> + Send + Sync>;
+
+/// Event payload contract shared by all target plugin machinery.
+///
+/// Blanket-implemented for every type meeting the bounds; it exists solely to
+/// keep this composite bound spelled in one place instead of on every generic.
+pub trait PluginEvent: Send + Sync + Clone + Serialize + DeserializeOwned + 'static {}
+
+impl<T> PluginEvent for T where T: Send + Sync + Clone + Serialize + DeserializeOwned + 'static {}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TargetRequestValidator {
@@ -105,7 +113,7 @@ impl BuiltinTargetAdminDescriptor {
 #[derive(Clone)]
 pub struct TargetPluginDescriptor<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     create_target: TargetCreateFn<E>,
     manifest: TargetPluginManifest,
@@ -117,7 +125,7 @@ where
 
 impl<E> TargetPluginDescriptor<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn new<Create, Validate>(
         target_type: &'static str,
@@ -186,7 +194,7 @@ where
 #[derive(Clone)]
 pub struct BuiltinTargetDescriptor<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     plugin: TargetPluginDescriptor<E>,
     admin: TargetAdminMetadata,
@@ -194,7 +202,7 @@ where
 
 impl<E> BuiltinTargetDescriptor<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn new(subsystem: &'static str, request_validator: TargetRequestValidator, plugin: TargetPluginDescriptor<E>) -> Self {
         Self {
@@ -226,7 +234,7 @@ where
 
 impl<E> From<BuiltinTargetDescriptor<E>> for BuiltinTargetAdminDescriptor
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn from(descriptor: BuiltinTargetDescriptor<E>) -> Self {
         Self::new(
@@ -239,14 +247,14 @@ where
 
 pub struct TargetPluginRegistry<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     plugins: HashMap<String, TargetPluginDescriptor<E>>,
 }
 
 impl<E> Default for TargetPluginRegistry<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn default() -> Self {
         Self::new()
@@ -255,14 +263,22 @@ where
 
 impl<E> TargetPluginRegistry<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn new() -> Self {
         Self { plugins: HashMap::new() }
     }
 
     pub fn register(&mut self, plugin: TargetPluginDescriptor<E>) -> Option<TargetPluginDescriptor<E>> {
-        self.plugins.insert(plugin.target_type().to_string(), plugin)
+        let replaced = self.plugins.insert(plugin.target_type().to_string(), plugin);
+        if let Some(previous) = &replaced {
+            warn!(
+                target_type = %previous.target_type(),
+                plugin_id = %previous.manifest().plugin_id,
+                "replacing previously registered target plugin descriptor"
+            );
+        }
+        replaced
     }
 
     pub fn register_all<I>(&mut self, plugins: I)
@@ -291,12 +307,18 @@ where
         plugin.create_target(id, config)
     }
 
+    /// Creates every enabled target instance found in `config`.
+    ///
+    /// Creation is fault-isolated per instance: one broken target must not
+    /// prevent the remaining targets from activating, so failures are logged
+    /// and summarized instead of aborting the whole activation.
     pub async fn create_targets_from_config(
         &self,
         config: &Config,
         route_prefix: &str,
     ) -> Result<Vec<BoxedTarget<E>>, TargetError> {
         let mut successful_targets = Vec::new();
+        let mut failed_targets = 0usize;
 
         for (target_type, plugin) in &self.plugins {
             info!(target_type = %target_type, "Start working on target type");
@@ -308,13 +330,25 @@ where
                         successful_targets.push(target);
                     }
                     Err(err) => {
+                        failed_targets += 1;
                         error!(target_type = %target_type, instance_id = %id, error = %err, "Failed to create target");
                     }
                 }
             }
         }
 
-        info!(count = successful_targets.len(), "All target processing completed");
+        if failed_targets > 0 {
+            warn!(
+                created = successful_targets.len(),
+                failed = failed_targets,
+                "Some configured targets failed to create and were skipped"
+            );
+        }
+        info!(
+            count = successful_targets.len(),
+            failed = failed_targets,
+            "All target processing completed"
+        );
         Ok(successful_targets)
     }
 
@@ -334,7 +368,7 @@ where
 
 pub fn boxed_target<E, T>(target: T) -> BoxedTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     T: Target<E> + Send + Sync + 'static,
 {
     Box::new(target)
@@ -343,6 +377,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::{TargetPluginDescriptor, TargetPluginRegistry};
+    use crate::PluginEvent;
     use crate::runtime::adapter::BuiltinPluginRuntimeAdapter;
     use crate::store::{Key, Store};
     use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
@@ -350,7 +385,6 @@ mod tests {
     use async_trait::async_trait;
     use rustfs_config::ENABLE_KEY;
     use rustfs_config::server_config::{Config, KVS};
-    use serde::{Serialize, de::DeserializeOwned};
     use std::collections::HashMap;
     use std::sync::Arc;
     use std::time::Duration;
@@ -363,7 +397,7 @@ mod tests {
     #[async_trait]
     impl<E> Target<E> for TestTarget
     where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: PluginEvent,
     {
         fn id(&self) -> crate::arn::TargetID {
             self.id.clone()

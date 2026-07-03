@@ -13,11 +13,11 @@
 // limitations under the License.
 
 use crate::arn::TargetID;
+use crate::plugin::PluginEvent;
 use crate::store::{Key, QueueStore, Store};
 use crate::{StoreError, TargetError, TargetLog};
 use async_trait::async_trait;
 use rustfs_s3_types::EventName;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::fmt::Formatter;
 use std::future::Future;
@@ -96,7 +96,7 @@ impl TargetDeliveryCounters {
 #[async_trait]
 pub trait Target<E>: Send + Sync + 'static
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Returns the ID of the target
     fn id(&self) -> TargetID;
@@ -428,7 +428,7 @@ pub fn decode_object_name(encoded: &str) -> Result<String, TargetError> {
 
 pub(crate) fn build_queued_payload<E>(event: &EntityTarget<E>) -> Result<QueuedPayload, TargetError>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     build_queued_payload_with_records(event, vec![event.data.clone()])
 }
@@ -438,7 +438,7 @@ pub(crate) fn build_queued_payload_with_records<E, R>(
     records: Vec<R>,
 ) -> Result<QueuedPayload, TargetError>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
     R: Serialize,
 {
     let object_name = decode_object_name(&event.object_name)?;

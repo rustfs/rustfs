@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -31,8 +32,6 @@ use async_trait::async_trait;
 use rustfs_kafka_async::error::{ConnectionError, Error as KafkaError};
 use rustfs_kafka_async::{AsyncProducer, AsyncProducerConfig, Record, RequiredAcks, SaslConfig, SecurityConfig};
 use rustfs_tls_runtime::{load_cert_bundle_der_bytes, load_private_key};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::{fmt, marker::PhantomData, sync::Arc, time::Duration};
 use tokio::sync::Mutex;
 use tracing::{debug, error, info, instrument, warn};
@@ -228,7 +227,7 @@ impl KafkaArgs {
 /// A target that sends events to an Apache Kafka topic
 pub struct KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: KafkaArgs,
@@ -245,7 +244,7 @@ where
 
 impl<E> KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn map_kafka_error(err: KafkaError, context: &str) -> TargetError {
         match err {
@@ -397,7 +396,7 @@ where
 #[async_trait]
 impl<E> Target<E> for KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -490,7 +489,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for KafkaTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Arc<AsyncProducer>;
 

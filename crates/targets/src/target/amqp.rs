@@ -18,6 +18,7 @@
 //! Queue-store mode uses the shared target store and replays the same raw JSON
 //! body through `send_raw_from_store`.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -42,8 +43,6 @@ use lapin::{
 use parking_lot::Mutex;
 use rustfs_config::{AMQP_TLS_CA, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -298,7 +297,7 @@ pub struct AMQPConnection {
 
 pub struct AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: AMQPArgs,
@@ -314,7 +313,7 @@ where
 
 impl<E> AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(AMQPTarget::<E> {
@@ -464,7 +463,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = AMQPConnection;
 
@@ -500,7 +499,7 @@ where
 #[async_trait]
 impl<E> Target<E> for AMQPTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()

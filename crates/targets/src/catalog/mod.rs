@@ -33,6 +33,14 @@ pub struct ExampleInstallableTargetPlugin {
     pub valid_fields: Vec<String>,
 }
 
+/// Test/demo fixture describing what an installable external plugin would
+/// look like. It must never be exposed through production admin responses;
+/// it exists so control-plane planning and contract tests can exercise the
+/// external-plugin shape before a real marketplace source exists.
+/// Test/demo fixture describing what an installable external plugin would
+/// look like. It must never be exposed through production admin responses;
+/// it exists so control-plane planning and contract tests can exercise the
+/// external-plugin shape before a real marketplace source exists.
 pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
     let base = TargetPluginManifest {
         plugin_id: "external:webhook-sidecar",
@@ -55,7 +63,7 @@ pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
                 artifact_id: "sidecar-linux-amd64",
                 target_triple: "x86_64-unknown-linux-gnu",
                 download_uri: "https://plugins.example.test/webhook-sidecar.tar.zst",
-                digest_sha256: "0123456789abcdef0123456789abcdef",
+                digest_sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
                 signature_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.sig",
                 provenance_uri: "https://plugins.example.test/webhook-sidecar.tar.zst.intoto.jsonl",
                 size_bytes: 8192,
@@ -88,7 +96,7 @@ pub fn example_external_webhook_plugin() -> ExampleInstallableTargetPlugin {
         manifest,
         installation: external_target_plugin_installation(
             base.version,
-            "0123456789abcdef0123456789abcdef",
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             "sidecar-linux-amd64",
             Some("2026-05-13T20:00:00Z".to_string()),
         ),
