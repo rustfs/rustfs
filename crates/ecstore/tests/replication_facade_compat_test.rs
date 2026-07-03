@@ -16,8 +16,12 @@ mod storage_api;
 
 use s3s::dto::ReplicationConfiguration;
 use storage_api::replication_compat::{
-    BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, ReplicationConfigurationExt,
-    ReplicationObjectBridge, ReplicationStats, ResyncStatusType,
+    BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
+    ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationObjectBridge,
+    ReplicationState, ReplicationStats, ReplicationTargetValidationError, ResyncStatusType, delete_replication_state_from_config,
+    delete_replication_version_id, replication_statuses_map, replication_target_arns, should_remove_replication_target,
+    should_schedule_delete_replication, should_use_existing_delete_replication_info,
+    should_use_existing_delete_replication_source, validate_replication_config_target_arns,
 };
 
 fn type_name<T>() -> &'static str {
@@ -54,4 +58,44 @@ fn replication_facade_exports_runtime_and_dto_types() {
     assert!(type_name::<DeletedObjectReplicationInfo>().contains("DeletedObjectReplicationInfo"));
     assert!(type_name::<ReplicationObjectBridge>().contains("ReplicationObjectBridge"));
     assert!(type_name_unsized::<DynReplicationPool>().contains("ReplicationPoolTrait"));
+}
+
+#[test]
+fn replication_facade_exports_app_storage_helper_contracts() {
+    let config = ReplicationConfiguration::default();
+    let target_arns = replication_target_arns(&config);
+    assert!(target_arns.is_empty());
+
+    let source = ReplicationDeleteStateSource {
+        name: String::new(),
+        user_tags: String::new(),
+        version_id: None,
+        delete_marker: false,
+        replica: false,
+    };
+    assert!(delete_replication_state_from_config(&config, &source).is_none());
+    assert!(replication_statuses_map("").is_empty());
+
+    let source_replication_status = Default::default();
+    let source_version_purge_status = Default::default();
+    let input = ReplicationDeleteScheduleInput {
+        replication_request: false,
+        version_id_requested: false,
+        source_delete_marker: false,
+        source_replication_status: &source_replication_status,
+        source_version_purge_status: &source_version_purge_status,
+        deleted_delete_marker_version: false,
+    };
+    assert!(!should_schedule_delete_replication(input));
+
+    assert!(delete_replication_version_id(false, None, false).is_none());
+    assert!(!should_remove_replication_target("arn", false, &target_arns));
+    assert!(!should_use_existing_delete_replication_info(false, false));
+    assert!(!should_use_existing_delete_replication_source(false, false, false));
+    assert!(validate_replication_config_target_arns(std::iter::empty(), &config).is_ok());
+
+    assert_eq!(REPLICATE_INCOMING_DELETE, "replicate:incoming:delete");
+    assert!(type_name::<ReplicateDecision>().contains("ReplicateDecision"));
+    assert!(type_name::<ReplicationState>().contains("ReplicationState"));
+    assert!(type_name::<ReplicationTargetValidationError>().contains("ReplicationTargetValidationError"));
 }
