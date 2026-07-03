@@ -125,12 +125,19 @@ fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
     }
 }
 
-fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
+fn batch_metadata_rpc_mode_from_env() -> BatchMetadataRpcMode {
     rustfs_utils::get_env_opt_str(ENV_RUSTFS_METADATA_BATCH_READ)
         .or_else(|| rustfs_utils::get_env_opt_str(LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC))
         .as_deref()
         .map(parse_batch_metadata_rpc_mode)
         .unwrap_or(BatchMetadataRpcMode::Off)
+}
+
+fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
+    // The gate cannot change at runtime; parse it once instead of re-reading
+    // the environment on every batch RPC.
+    static MODE: std::sync::LazyLock<BatchMetadataRpcMode> = std::sync::LazyLock::new(batch_metadata_rpc_mode_from_env);
+    *MODE
 }
 
 fn record_batch_read_version_gate_decision(mode: BatchMetadataRpcMode, decision: &'static str) {
@@ -1629,25 +1636,40 @@ impl DiskAPI for RemoteDisk {
         let batch_read_version_req = serde_json::to_string(&req)?;
         let batch_read_version_req_bin = encode_msgpack(&req)?;
 
-        self.execute_with_timeout_for_op(
-            "batch_read_version",
-            move || async move {
-                let disk = self.disk_ref().await;
-                let mut client = self
-                    .get_client()
-                    .await
-                    .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
-                let request = Request::new(BatchReadVersionRequest {
-                    disk,
-                    batch_read_version_req,
-                    batch_read_version_req_bin: batch_read_version_req_bin.into(),
-                });
+        let batch_result = self
+            .execute_with_timeout_for_op(
+                "batch_read_version",
+                move || async move {
+                    let disk = self.disk_ref().await;
+                    let mut client = self
+                        .get_client()
+                        .await
+                        .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                    let request = Request::new(BatchReadVersionRequest {
+                        disk,
+                        batch_read_version_req,
+                        batch_read_version_req_bin: batch_read_version_req_bin.into(),
+                    });
 
-                let response = match client.batch_read_version(request).await {
-                    Ok(response) => response.into_inner(),
-                    Err(status) if status.code() == Code::Unimplemented => {
-                        if mode.should_fallback_on_unimplemented() {
-                            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED);
+                    let response = match client.batch_read_version(request).await {
+                        Ok(response) => response.into_inner(),
+                        Err(status) if status.code() == Code::Unimplemented => {
+                            if mode.should_fallback_on_unimplemented() {
+                                record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED);
+                                warn!(
+                                    event = EVENT_REMOTE_DISK_RPC,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                                    endpoint = %self.endpoint,
+                                    batch_metadata_rpc_mode = mode.as_str(),
+                                    op = "batch_read_version",
+                                    state = "fallback_unimplemented",
+                                    "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                                );
+                                return Ok(None);
+                            }
+
+                            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK);
                             warn!(
                                 event = EVENT_REMOTE_DISK_RPC,
                                 component = LOG_COMPONENT_ECSTORE,
@@ -1655,37 +1677,31 @@ impl DiskAPI for RemoteDisk {
                                 endpoint = %self.endpoint,
                                 batch_metadata_rpc_mode = mode.as_str(),
                                 op = "batch_read_version",
-                                state = "fallback_unimplemented",
-                                "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                                state = "unsupported_no_fallback",
+                                "Remote disk BatchReadVersion unsupported and explicit batch RPC mode forbids fallback"
                             );
-                            return batch_read_version_one_by_one(self, req).await;
+                            return Err(Error::from(status));
                         }
+                        Err(status) => return Err(Error::from(status)),
+                    };
 
-                        record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK);
-                        warn!(
-                            event = EVENT_REMOTE_DISK_RPC,
-                            component = LOG_COMPONENT_ECSTORE,
-                            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
-                            endpoint = %self.endpoint,
-                            batch_metadata_rpc_mode = mode.as_str(),
-                            op = "batch_read_version",
-                            state = "unsupported_no_fallback",
-                            "Remote disk BatchReadVersion unsupported and explicit batch RPC mode forbids fallback"
-                        );
-                        return Err(Error::from(status));
+                    if !response.success {
+                        return Err(response.error.unwrap_or_default().into());
                     }
-                    Err(status) => return Err(Error::from(status)),
-                };
 
-                if !response.success {
-                    return Err(response.error.unwrap_or_default().into());
-                }
+                    decode_batch_read_version_response_items(response, &self.endpoint).map(Some)
+                },
+                get_max_timeout_duration(),
+            )
+            .await?;
 
-                decode_batch_read_version_response_items(response, &self.endpoint)
-            },
-            get_max_timeout_duration(),
-        )
-        .await
+        match batch_result {
+            Some(batch_read_version_resps) => Ok(batch_read_version_resps),
+            // Run the unary fallback outside the batch RPC deadline so each
+            // read_version keeps its own per-op timeout and health accounting
+            // instead of racing the whole batch against one drive timeout.
+            None => batch_read_version_one_by_one(self, req).await,
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(self))]
@@ -2792,7 +2808,7 @@ mod tests {
                 (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
             ],
             || {
-                assert_eq!(batch_metadata_rpc_mode(), BatchMetadataRpcMode::Auto);
+                assert_eq!(batch_metadata_rpc_mode_from_env(), BatchMetadataRpcMode::Auto);
             },
         );
     }
@@ -2805,7 +2821,7 @@ mod tests {
                 (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
             ],
             || {
-                assert_eq!(batch_metadata_rpc_mode(), BatchMetadataRpcMode::On);
+                assert_eq!(batch_metadata_rpc_mode_from_env(), BatchMetadataRpcMode::On);
             },
         );
     }

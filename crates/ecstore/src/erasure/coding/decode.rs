@@ -57,10 +57,6 @@ impl ShardLocalitySchedulingMode {
     fn is_on(self) -> bool {
         matches!(self, ShardLocalitySchedulingMode::On)
     }
-
-    fn collects_read_costs(self) -> bool {
-        matches!(self, ShardLocalitySchedulingMode::Observe | ShardLocalitySchedulingMode::On)
-    }
 }
 
 fn parse_shard_locality_scheduling_mode(value: &str) -> ShardLocalitySchedulingMode {
@@ -89,7 +85,9 @@ fn get_shard_locality_preference_enabled() -> bool {
 }
 
 pub(crate) fn should_collect_shard_read_costs() -> bool {
-    rustfs_io_metrics::get_stage_metrics_enabled() || get_shard_locality_scheduling_mode().collects_read_costs()
+    // `observe` mode only feeds the stage-metrics histograms, so skip the
+    // cost-collection overhead when those metrics cannot be reported anyway.
+    rustfs_io_metrics::get_stage_metrics_enabled() || get_shard_locality_scheduling_mode().is_on()
 }
 
 /// Number of stripes to prefetch in the legacy decode path.
@@ -1672,7 +1670,6 @@ mod tests {
             || {
                 assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::Observe);
                 assert!(!get_shard_locality_preference_enabled());
-                assert!(should_collect_shard_read_costs());
             },
         );
 
@@ -1728,18 +1725,24 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_shard_locality_scheduling_observe_collects_without_reordering() {
+    fn test_shard_locality_scheduling_observe_collects_only_with_stage_metrics() {
         temp_env::with_vars(
             [
                 (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("observe")),
                 (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
             ],
             || {
+                // Without stage metrics there is no reporting channel, so
+                // observe mode must not pay the cost-collection overhead.
                 rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+                assert!(!should_collect_shard_read_costs());
+
+                rustfs_io_metrics::set_get_stage_metrics_enabled(true);
                 assert!(should_collect_shard_read_costs());
                 assert!(!get_shard_locality_preference_enabled());
                 let read_costs = [ShardReadCost::Remote, ShardReadCost::Local, ShardReadCost::SameNode];
                 assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2]);
+                rustfs_io_metrics::set_get_stage_metrics_enabled(false);
             },
         );
     }

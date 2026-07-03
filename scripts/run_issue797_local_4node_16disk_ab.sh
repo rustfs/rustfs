@@ -93,6 +93,17 @@ arg_value() {
   printf '%s\n' "$value"
 }
 
+# Like arg_value, but accepts values that themselves start with `--`
+# (e.g. `--warp-extra-args --noclear`).
+arg_value_allow_dashes() {
+  local flag="$1"
+  local value="${2:-}"
+  if [[ -z "$value" ]]; then
+    die "missing value for ${flag}"
+  fi
+  printf '%s\n' "$value"
+}
+
 parse_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -106,7 +117,7 @@ parse_args() {
       --out-dir) OUT_DIR="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --data-root) DATA_ROOT="$(arg_value "$1" "${2:-}")"; shift 2 ;;
       --keep-data) KEEP_DATA=true; shift ;;
-      --warp-extra-args) WARP_EXTRA_ARGS="$(arg_value "$1" "${2:-}")"; shift 2 ;;
+      --warp-extra-args) WARP_EXTRA_ARGS="$(arg_value_allow_dashes "$1" "${2:-}")"; shift 2 ;;
       --skip-admin-metrics) CAPTURE_ADMIN_METRICS=false; shift ;;
       --dry-run) DRY_RUN=true; shift ;;
       -h|--help) usage; exit 0 ;;
@@ -181,18 +192,6 @@ all_endpoints_csv() {
   done
   local IFS=','
   printf '%s' "${endpoints[*]}"
-}
-
-warp_hosts_csv() {
-  local endpoints hosts=()
-  IFS=',' read -r -a endpoints <<<"$(all_endpoints_csv)"
-  for endpoint in "${endpoints[@]}"; do
-    endpoint="${endpoint#http://}"
-    endpoint="${endpoint#https://}"
-    hosts+=("$endpoint")
-  done
-  local IFS=','
-  printf '%s' "${hosts[*]}"
 }
 
 metrics_url() {

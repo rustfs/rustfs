@@ -599,7 +599,7 @@ fn shard_read_costs_for_disks(disks: &[Option<DiskStore>]) -> Vec<ShardReadCost>
     let local_endpoint_hosts = local_endpoint_hosts_for_shard_costs();
     disks
         .iter()
-        .map(|disk| shard_read_cost_for_disk(disk.as_ref(), &local_endpoint_hosts))
+        .map(|disk| shard_read_cost_for_disk(disk.as_ref(), local_endpoint_hosts))
         .collect()
 }
 
@@ -623,9 +623,18 @@ fn shard_read_cost_for_endpoint(is_local: bool, host_name: &str, local_endpoint_
     ShardReadCost::Remote
 }
 
-fn local_endpoint_hosts_for_shard_costs() -> Vec<String> {
+fn local_endpoint_hosts_for_shard_costs() -> &'static [String] {
+    // Endpoint pools are immutable after startup, so build the host list once
+    // instead of walking every pool on each read. Do not cache the empty
+    // pre-startup answer: only memoize once the pools are published.
+    static LOCAL_ENDPOINT_HOSTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+    if let Some(hosts) = LOCAL_ENDPOINT_HOSTS.get() {
+        return hosts;
+    }
+
     let Some(endpoint_pools) = runtime_sources::endpoint_pools() else {
-        return Vec::new();
+        return &[];
     };
 
     let mut hosts = Vec::new();
@@ -641,7 +650,7 @@ fn local_endpoint_hosts_for_shard_costs() -> Vec<String> {
             }
         }
     }
-    hosts
+    LOCAL_ENDPOINT_HOSTS.get_or_init(|| hosts)
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
