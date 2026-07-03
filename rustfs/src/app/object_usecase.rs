@@ -40,10 +40,10 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType,
-        check_replicate_delete, delete_replication_state_from_config, delete_replication_version_id, must_replicate_object,
-        schedule_object_replication, schedule_replication_delete, should_schedule_delete_replication,
-        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
+        REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType, check_replicate_delete,
+        delete_replication_state_from_config, delete_replication_version_id, must_replicate_object, schedule_object_replication,
+        schedule_replication_delete, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        should_use_existing_delete_replication_source,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -4852,13 +4852,7 @@ impl DefaultObjectUsecase {
                     dobj.version_id = Some(Uuid::nil());
                 }
 
-                let deleted_object = DeletedObjectReplicationInfo {
-                    delete_object: dobj,
-                    bucket: bucket.clone(),
-                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                    ..Default::default()
-                };
-                schedule_replication_delete(deleted_object).await;
+                schedule_replication_delete(dobj, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
             }
         }
 
@@ -5043,16 +5037,15 @@ impl DefaultObjectUsecase {
 
         if obj_info.name.is_empty() {
             if replicate_force_delete {
-                schedule_replication_delete(DeletedObjectReplicationInfo {
-                    delete_object: StorageDeletedObject {
+                schedule_replication_delete(
+                    StorageDeletedObject {
                         object_name: key.clone(),
                         force_delete: true,
                         ..Default::default()
                     },
-                    bucket: bucket.clone(),
-                    event_type: REPLICATE_INCOMING_DELETE.to_string(),
-                    ..Default::default()
-                })
+                    bucket.clone(),
+                    REPLICATE_INCOMING_DELETE.to_string(),
+                )
                 .await;
             }
             // Prefix/force-delete returns empty ObjectInfo; still emit bucket notification so webhooks match S3 DELETE.
@@ -5091,30 +5084,25 @@ impl DefaultObjectUsecase {
 
         if schedule_delete_replication {
             let _activity_guard = DeleteTailActivityGuard::new(DeleteTailStage::Replication);
-            let mut deleted_object = DeletedObjectReplicationInfo {
-                delete_object: StorageDeletedObject {
-                    delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
-                    delete_marker_version_id: if deleted_object_source.delete_marker {
-                        deleted_object_source.version_id
-                    } else {
-                        None
-                    },
-                    object_name: key.clone(),
-                    version_id: if deleted_object_source.delete_marker {
-                        None
-                    } else {
-                        deleted_object_source.version_id
-                    },
-                    delete_marker_mtime: deleted_object_source.mod_time,
-                    replication_state: Some(replication_state_source.replication_state()),
-                    ..Default::default()
+            let mut deleted_object = StorageDeletedObject {
+                delete_marker: deleted_object_source.delete_marker && !deleted_delete_marker_version,
+                delete_marker_version_id: if deleted_object_source.delete_marker {
+                    deleted_object_source.version_id
+                } else {
+                    None
                 },
-                bucket: bucket.clone(),
-                event_type: REPLICATE_INCOMING_DELETE.to_string(),
+                object_name: key.clone(),
+                version_id: if deleted_object_source.delete_marker {
+                    None
+                } else {
+                    deleted_object_source.version_id
+                },
+                delete_marker_mtime: deleted_object_source.mod_time,
+                replication_state: Some(replication_state_source.replication_state()),
                 ..Default::default()
             };
-            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object.delete_object, replication_state_source).await;
-            schedule_replication_delete(deleted_object).await;
+            enrich_delete_replication_state_if_needed(&bucket, &mut deleted_object, replication_state_source).await;
+            schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
         }
 
         let delete_marker = obj_info.delete_marker;

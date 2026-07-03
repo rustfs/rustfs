@@ -82,4 +82,5 @@ pub use stats::{
     FailedMetric, InQueueMetric, InQueueStats, LatencyStats, ProxyMetric, ProxyStatsCache, QueueCache, QueueNode, QueueStats,
     SRMetricsSummary, XferStats,
 };
+pub use storage_api::{DeletedObject, ObjectToDelete};
 pub use tagging::{ReplicationTagFilter, decode_tags_to_map};

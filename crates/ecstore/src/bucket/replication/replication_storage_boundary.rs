@@ -27,6 +27,7 @@ pub(crate) use crate::storage_api_contracts::object::{
     DeletedObject, EcstoreObjectOperations, ObjectIO, ObjectOperations, ObjectToDelete,
 };
 pub(crate) use crate::storage_api_contracts::range::HTTPRangeSpec;
+pub(crate) use rustfs_replication::{DeletedObject as ReplicationDeletedObject, ObjectToDelete as ReplicationObjectToDelete};
 
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
@@ -91,6 +92,30 @@ pub trait ReplicationStorage:
         WalkResultSender = tokio::sync::mpsc::Sender<ObjectInfoOrErr>,
     > + StorageNamespaceLocking<Error = Error, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
 {
+}
+
+pub(crate) fn deleted_object_for_replication(delete_object: DeletedObject) -> ReplicationDeletedObject {
+    ReplicationDeletedObject {
+        delete_marker: delete_object.delete_marker,
+        delete_marker_version_id: delete_object.delete_marker_version_id,
+        object_name: delete_object.object_name,
+        version_id: delete_object.version_id,
+        delete_marker_mtime: delete_object.delete_marker_mtime,
+        replication_state: delete_object.replication_state,
+        found: delete_object.found,
+        force_delete: delete_object.force_delete,
+    }
+}
+
+pub(crate) fn object_to_delete_for_replication(object: &ObjectToDelete) -> ReplicationObjectToDelete {
+    ReplicationObjectToDelete {
+        object_name: object.object_name.clone(),
+        version_id: object.version_id,
+        delete_marker_replication_status: object.delete_marker_replication_status.clone(),
+        version_purge_status: object.version_purge_status.clone(),
+        version_purge_statuses: object.version_purge_statuses.clone(),
+        replicate_decision_str: object.replicate_decision_str.clone(),
+    }
 }
 
 impl<T> ReplicationStorage for T where
