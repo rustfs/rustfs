@@ -23,23 +23,24 @@ use super::replication_filemeta_boundary::{
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
 use super::replication_metadata_boundary::ReplicationMetadataStore;
 use super::replication_object_config::ReplicationConfig;
+use super::replication_resync_boundary::{
+    BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, decode_mrf_file, decode_resync_file,
+    encode_mrf_file, should_auto_resume_resync,
+};
 use super::replication_resyncer::{
-    ReplicationResyncer, decode_mrf_file, decode_resync_file, encode_mrf_file, get_heal_replicate_object_info, replicate_delete,
-    replicate_object, save_resync_status,
+    ReplicationResyncer, get_heal_replicate_object_info, replicate_delete, replicate_object, save_resync_status,
 };
 use super::replication_state::ReplicationStats;
 use super::replication_storage_boundary::{DeletedObject, ObjectInfo, ObjectOptions, ReplicationObjectIO, ReplicationStorage};
 use super::replication_target_boundary::ReplicationTargetStore;
 use super::runtime_boundary as runtime_sources;
-use super::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 use lazy_static::lazy_static;
 use rustfs_replication::{
     DeletedObjectReplicationInfo, LARGE_WORKER_COUNT, ReplicationBackpressureRecommendation, ReplicationBackpressureState,
     ReplicationHealQueueAction, ReplicationHealQueueResult, ReplicationHealResyncDeletes, ReplicationOperation,
     ReplicationPoolOpts, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue, WORKER_MAX_LIMIT,
     initial_worker_counts, large_worker_backpressure_resize, mrf_worker_size_to_count, replication_backpressure_recommendation,
-    replication_heal_queue_action, resized_worker_counts, should_auto_resume_resync, should_queue_large_object,
-    worker_queue_for_replication_type,
+    replication_heal_queue_action, resized_worker_counts, should_queue_large_object, worker_queue_for_replication_type,
 };
 use rustfs_utils::http::{SUFFIX_REPLICATION_TIMESTAMP, get_str};
 use std::sync::Arc;
@@ -1412,7 +1413,7 @@ async fn queue_replicate_deletes(batch: ReplicationHealResyncDeletes) -> Replica
 
 #[cfg(test)]
 mod tests {
-    use super::super::replication_resyncer::{decode_mrf_file, encode_mrf_file};
+    use super::super::replication_resync_boundary::{decode_mrf_file, encode_mrf_file};
     use super::*;
     use uuid::Uuid;
 

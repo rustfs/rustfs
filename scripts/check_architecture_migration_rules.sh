@@ -206,6 +206,7 @@ REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_con
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
+REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_resync_boundary_bypass_hits.txt"
 REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_object_compare_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
@@ -2653,6 +2654,23 @@ fi
 
 if [[ -s "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "resync DTO contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_replication::(resync::(RESYNC_META_FORMAT|RESYNC_META_VERSION|WIRE_ZERO_TIME_UNIX)|mrf::(MRF_META_FORMAT|MRF_META_VERSION)|(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b)' \
+      crates/ecstore/src/bucket/replication \
+      --glob '*.rs'
+    rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(encode_resync_file|decode_resync_file|encode_mrf_file|decode_mrf_file|BucketReplicationResyncStatus|ResyncOpts|TargetReplicationResyncStatus|resync_state_accepts_update|should_count_head_proxy_failure|should_auto_resume_resync|is_version_id_mismatch)\b' \
+      crates/ecstore/src/bucket/replication \
+      --glob '*.rs'
+  } |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_resync_boundary\.rs:' || true
+) >"$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication resync contracts must stay behind replication_resync_boundary: $(paste -sd '; ' "$REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (

@@ -28,6 +28,7 @@ mod replication_msgp_boundary;
 mod replication_object_bridge;
 mod replication_object_config;
 pub(crate) mod replication_pool;
+mod replication_resync_boundary;
 mod replication_resyncer;
 mod replication_scanner_bridge;
 mod replication_state;
@@ -48,11 +49,12 @@ pub use replication_pool::{
     DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
     init_background_replication,
 };
+pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
 pub use rustfs_replication::{
-    BucketReplicationResyncStatus, BucketStats, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationHealQueueResult,
-    ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ResyncOpts, TargetReplicationResyncStatus,
+    BucketStats, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationHealQueueResult, ReplicationOperation,
+    ReplicationPriority, ReplicationQueueAdmission,
 };

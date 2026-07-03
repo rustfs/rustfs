@@ -19,6 +19,8 @@ use crate::bucket::bucket_target_sys::{BucketTargetError, BucketTargetSys};
 use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
+#[cfg(test)]
+use rustfs_replication::content_matches_by_etag;
 use rustfs_replication::{
     ReplicationSourceObject, ReplicationTargetObject, replication_action_for_target, target_is_newer_than_source_null_version,
 };
