@@ -14,8 +14,9 @@
 
 use crate::startup_fs_guard::enforce_unsupported_fs_policy;
 use crate::storage_api::startup::storage::{
-    ECStore, EndpointServerPools, init_background_replication, init_ecstore_config, init_global_config_sys, init_local_disks,
-    init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config, update_erasure_type,
+    ECStore, EndpointServerPools, global_config_init_error_is_deterministic, init_background_replication, init_ecstore_config,
+    init_global_config_sys, init_local_disks, init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints,
+    try_migrate_server_config, update_erasure_type,
 };
 use rustfs_common::{GlobalReadiness, SystemStage};
 use std::{
@@ -200,6 +201,20 @@ async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
 
     let mut retry_count = 0;
     while let Err(e) = init_global_config_sys(store.clone()).await {
+        if global_config_init_error_is_deterministic(&e) {
+            error!(
+                target: "rustfs::main::run",
+                event = EVENT_STARTUP_STORAGE_STAGE,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STORAGE,
+                stage = "global_config_initialization",
+                state = "failed",
+                retryable = false,
+                error = ?e,
+                "Global config initialization failed with a deterministic error, not retrying"
+            );
+            return Err(Error::other(format!("ecconfig::init_global_config_sys failed: {e}")));
+        }
         let next_retry_count = retry_count + 1;
         error!(
             target: "rustfs::main::run",
@@ -212,10 +227,9 @@ async fn init_startup_storage_global_config(store: Arc<ECStore>) -> Result<()> {
             error = ?e,
             "Global config initialization retry failed"
         );
-        // TODO: check error type
         retry_count = next_retry_count;
         if global_config_retry_exhausted(retry_count) {
-            return Err(Error::other("ecconfig::init_global_config_sys failed"));
+            return Err(Error::other(format!("ecconfig::init_global_config_sys failed: {e}")));
         }
         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
     }
@@ -229,6 +243,9 @@ async fn init_embedded_startup_storage_global_config(store: Arc<ECStore>) -> Res
 
     let mut retry = 0;
     while let Err(err) = init_global_config_sys(store.clone()).await {
+        if global_config_init_error_is_deterministic(&err) {
+            return Err(Error::other(format!("init_global_config_sys failed with a deterministic error: {err}")));
+        }
         retry += 1;
         if retry > GLOBAL_CONFIG_INIT_MAX_RETRIES {
             return Err(Error::other(format!(
