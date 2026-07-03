@@ -99,7 +99,7 @@ defaults:
 
 jobs:
   s3tests:
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 180
     strategy:
       fail-fast: false
