@@ -22,7 +22,8 @@ use crate::oidc_state::{OidcAuthSession, OidcLogoutSession, OidcStateStore};
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
     AsyncHttpClient, Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, IssuerUrl, LogoutRequest, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, Scope,
+    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, ProviderMetadataWithLogout, RedirectUrl, RequestTokenError,
+    Scope,
 };
 use reqwest::Client;
 use rustfs_config::oidc::*;
@@ -569,7 +570,14 @@ impl OidcSys {
             .set_redirect_uri(Cow::Owned(redirect))
             .request_async(&self.http_client)
             .await
-            .map_err(|e| format!("token exchange failed: {e}"))?;
+            .map_err(|e| match &e {
+                RequestTokenError::Parse(parse_err, body) => format!(
+                    "token exchange failed: {e}: parse_error_path={}, response_body_len={}",
+                    parse_err.path(),
+                    body.len()
+                ),
+                _ => format!("token exchange failed: {e}"),
+            })?;
 
         // Verify the ID token (signature, issuer, audience, expiry, nonce)
         let id_token = token_response
