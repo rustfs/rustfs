@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::filemeta::{ReplicationAction, ReplicationType};
 use crate::tagging::ReplicationTagFilter;
-use rustfs_filemeta::{ReplicationAction, ReplicationType};
 use rustfs_utils::http::{
     AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE, AMZ_OBJECT_TAGGING,
     AMZ_WEBSITE_REDIRECT_LOCATION, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_ENCODING, CONTENT_LANGUAGE, EXPIRES,
@@ -164,7 +164,7 @@ mod tests {
         ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
         replication_etags_match, target_is_newer_than_source_null_version,
     };
-    use rustfs_filemeta::{ReplicationAction, ReplicationType};
+    use crate::filemeta::{ReplicationAction, ReplicationType};
     use std::collections::HashMap;
     use time::{Duration, OffsetDateTime};
 

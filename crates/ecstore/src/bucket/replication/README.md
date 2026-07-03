@@ -35,6 +35,7 @@ paths.
 | `ReplicationStorage` | Object read/write/delete, object walk, metadata update, and target object IO. | ECStore object API, storage-api contracts, and read option types are concentrated in `replication_storage_boundary.rs`. |
 | `ReplicationMetadataStore` | Replication config, MRF/resync state, target reset headers, and status persistence. | Metadata sys access and replication metadata path constants are exposed through the contract type in `replication_metadata_boundary.rs`; versioning sys and config storage imports remain separate contracts. |
 | `ReplicationResyncContracts` | Resync options, target status, bucket status, status classifiers, and persisted resync/MRF status wire format. | Owned by `crates/replication`; ECStore imports them through `replication_resync_boundary.rs`, which maps crate errors to ECStore errors. |
+| `ReplicationCrateFileMetaFacade` | Replication facade compatibility symbols that still originate in filemeta wire contracts. | `crates/replication/src/filemeta.rs` is the only direct `rustfs-filemeta` import boundary inside `rustfs-replication`. |
 | `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
 | `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
 | `StorageApiReplicationContracts` | Storage-api delete DTO replication state/status helpers. | The temporary `rustfs-filemeta` dependency is isolated in `crates/storage-api/src/replication.rs` until the wire contracts can move without creating a `rustfs-replication` / `rustfs-storage-api` cycle. |
@@ -87,6 +88,8 @@ paths.
     `crates/storage-api/src/replication.rs` until the underlying wire contracts
     can move without a `rustfs-replication` / `rustfs-storage-api` dependency
     cycle.
+12. Keep direct `rustfs-filemeta` imports inside `rustfs-replication`
+    concentrated in `crates/replication/src/filemeta.rs`.
 
 ## First Code-Bearing Step
 
