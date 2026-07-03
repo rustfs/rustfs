@@ -125,6 +125,8 @@ Current coupling:
 - resync options, bucket/target resync status DTOs, status display labels, and
   the persisted resync status wire format live in `crates/replication`, with
   ECStore retaining only error mapping and MRF persistence locally;
+- `crates/replication/src/filemeta.rs` is the only direct filemeta wire-contract
+  import boundary inside `rustfs-replication`;
 - storage-api delete replication status/state helpers use the local
   `crates/storage-api/src/replication.rs` contract boundary while the
   underlying wire types remain in `rustfs-filemeta`;
@@ -171,6 +173,9 @@ Required contracts before crate movement:
   `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`,
   while `FileInfo` remains in the storage boundary for storage trait bindings
   and walk options.
+- `ReplicationCrateFileMetaFacade`: replication facade compatibility symbols
+  that still originate in filemeta wire contracts are concentrated in
+  `crates/replication/src/filemeta.rs` inside `rustfs-replication`.
 - `StorageApiReplicationContracts`: storage-api delete DTO replication
   state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
   until the underlying wire contracts can move without a
