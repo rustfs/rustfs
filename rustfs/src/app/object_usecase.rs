@@ -2914,6 +2914,14 @@ impl DefaultObjectUsecase {
 
             match read_result {
                 Ok(_) => {
+                    if buf.len() != materialized_capacity {
+                        warn!(
+                            expected = response_content_length,
+                            actual = buf.len(),
+                            "Object size mismatch during materialize-fill read"
+                        );
+                    }
+
                     let bytes = Bytes::from(buf);
                     let _fill_result =
                         fill_get_object_body_cache_from_materialized_body(cache_adapter, &cache_plan, &bytes).await;
@@ -2927,6 +2935,13 @@ impl DefaultObjectUsecase {
                 }
                 Err(e) => {
                     error!(error = %e, "GetObject materialize-fill buffering failed");
+                    // The stream is partially consumed; falling back to the
+                    // streaming path would send a body missing its prefix, so
+                    // fail the request like the encrypted-buffer path does.
+                    return Err(ApiError::from(StorageError::other(format!(
+                        "Failed to read object body for cache materialization: {e}"
+                    )))
+                    .into());
                 }
             }
         }

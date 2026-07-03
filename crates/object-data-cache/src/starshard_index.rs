@@ -47,23 +47,43 @@ impl StarshardIdentityIndex {
     }
 
     /// Inserts a key into the identity index.
+    ///
+    /// Runs the read-modify-write under the shard write lock so concurrent
+    /// fills for the same identity cannot drop each other's keys.
     pub async fn insert(&self, identity: ObjectDataCacheIdentity, key: ObjectDataCacheKey) -> ObjectDataCacheIndexInsertResult {
-        let mut key_set = self.by_object.get(&identity).await.unwrap_or_default();
-        let result = key_set.insert(key, self.max_keys_per_identity);
+        let max_keys = self.max_keys_per_identity;
+        loop {
+            let mut outcome = None;
+            {
+                let outcome = &mut outcome;
+                let key = key.clone();
+                let _ = self
+                    .by_object
+                    .compute_if_present(&identity, move |mut key_set| {
+                        let result = key_set.insert(key, max_keys);
+                        let keep = !matches!(result, ObjectDataCacheIndexInsertResult::Overflow { .. }) && !key_set.is_empty();
+                        *outcome = Some(result);
+                        keep.then_some(key_set)
+                    })
+                    .await;
+            }
+            if let Some(result) = outcome {
+                return result;
+            }
 
-        match &result {
-            ObjectDataCacheIndexInsertResult::Overflow { .. } => {
-                let _ = self.by_object.remove(&identity).await;
+            // Identity not tracked yet: publish a fresh single-key set.
+            let mut fresh = ObjectDataCacheKeySet::default();
+            let result = fresh.insert(key.clone(), max_keys);
+            if !matches!(result, ObjectDataCacheIndexInsertResult::Inserted) {
+                return result;
             }
-            _ if key_set.is_empty() => {
-                let _ = self.by_object.remove(&identity).await;
+            let final_set = self.by_object.compute_if_absent(identity.clone(), move || fresh).await;
+            if final_set.contains(&key) {
+                return ObjectDataCacheIndexInsertResult::Inserted;
             }
-            _ => {
-                let _ = self.by_object.insert(identity, key_set).await;
-            }
+            // Lost the race to a concurrent insert; retry against the now
+            // present entry.
         }
-
-        result
     }
 
     /// Removes all keys tracked for an identity.
@@ -76,22 +96,26 @@ impl StarshardIdentityIndex {
 
     /// Removes a single key tracked under an identity.
     pub async fn remove_key(&self, identity: &ObjectDataCacheIdentity, key: &ObjectDataCacheKey) -> bool {
-        let Some(mut key_set) = self.by_object.get(identity).await else {
-            return false;
-        };
-
-        let removed = key_set.remove_key(key);
-        if !removed {
-            return false;
+        let mut removed = false;
+        {
+            let removed = &mut removed;
+            let _ = self
+                .by_object
+                .compute_if_present(identity, move |mut key_set| {
+                    *removed = key_set.remove_key(key);
+                    (!key_set.is_empty()).then_some(key_set)
+                })
+                .await;
         }
+        removed
+    }
 
-        if key_set.is_empty() {
-            let _ = self.by_object.remove(identity).await;
-        } else {
-            let _ = self.by_object.insert(identity.clone(), key_set).await;
-        }
-
-        true
+    /// Returns whether the identity currently tracks the supplied key.
+    pub async fn contains_key(&self, identity: &ObjectDataCacheIdentity, key: &ObjectDataCacheKey) -> bool {
+        self.by_object
+            .get(identity)
+            .await
+            .is_some_and(|key_set| key_set.contains(key))
     }
 
     /// Removes index keys that no longer exist in the cache.
@@ -99,17 +123,13 @@ impl StarshardIdentityIndex {
     where
         F: FnMut(&ObjectDataCacheKey) -> bool,
     {
-        let Some(mut key_set) = self.by_object.get(identity).await else {
-            return;
-        };
-
-        key_set.retain(|key| key_exists(key));
-
-        if key_set.is_empty() {
-            let _ = self.by_object.remove(identity).await;
-        } else {
-            let _ = self.by_object.insert(identity.clone(), key_set).await;
-        }
+        let _ = self
+            .by_object
+            .compute_if_present(identity, move |mut key_set| {
+                key_set.retain(|key| key_exists(key));
+                (!key_set.is_empty()).then_some(key_set)
+            })
+            .await;
     }
 }
 
@@ -154,6 +174,25 @@ mod tests {
         let removed = index.remove_identity(&identity).await;
 
         assert_eq!(removed, vec![key_b]);
+    }
+
+    #[tokio::test]
+    async fn identity_index_concurrent_inserts_keep_all_keys() {
+        let index = StarshardIdentityIndex::new(64);
+        let identity = identity();
+
+        let mut handles = Vec::new();
+        for i in 0..32 {
+            let index = index.clone();
+            let identity = identity.clone();
+            handles.push(tokio::spawn(async move { index.insert(identity, key(&format!("v{i}"))).await }));
+        }
+        for handle in handles {
+            handle.await.expect("insert task should complete");
+        }
+
+        let removed = index.remove_identity(&identity).await;
+        assert_eq!(removed.len(), 32, "no concurrent insert may drop another fill's key");
     }
 
     #[tokio::test]

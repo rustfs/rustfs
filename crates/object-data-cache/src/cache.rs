@@ -278,6 +278,8 @@ pub enum ObjectDataCacheFillResult {
     SkippedSizeMismatch,
     /// Fill waiters were released without a published leader result.
     SkippedSingleflightClosed,
+    /// Fill was undone because an invalidation raced with the insert.
+    SkippedInvalidationRace,
     /// The cache entry was inserted successfully.
     Inserted,
 }
@@ -292,6 +294,7 @@ impl ObjectDataCacheFillResult {
             Self::SkippedIdentityOverflow => "skipped_identity_overflow",
             Self::SkippedSizeMismatch => "skipped_size_mismatch",
             Self::SkippedSingleflightClosed => "skipped_singleflight_closed",
+            Self::SkippedInvalidationRace => "skipped_invalidation_race",
             Self::Inserted => "inserted",
         }
     }

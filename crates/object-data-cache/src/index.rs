@@ -66,6 +66,10 @@ impl ObjectDataCacheKeySet {
         self.keys.is_empty()
     }
 
+    pub(crate) fn contains(&self, key: &ObjectDataCacheKey) -> bool {
+        self.keys.iter().any(|existing| existing == key)
+    }
+
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
         self.keys.len()

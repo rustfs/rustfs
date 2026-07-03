@@ -102,15 +102,24 @@ impl MokaBackend {
             .prune_missing(&identity, |candidate| self.cache.contains_key(candidate))
             .await;
 
-        let entry = Arc::new(ObjectDataCacheEntry::new(bytes, key.size, Arc::clone(&key.etag)));
-        self.cache.insert(key.clone(), entry).await;
-
-        let result = match self.index.insert(identity, key.clone()).await {
+        // Register the key in the identity index BEFORE the entry becomes
+        // visible in the cache, so a concurrent invalidation always finds it.
+        let result = match self.index.insert(identity.clone(), key.clone()).await {
             ObjectDataCacheIndexInsertResult::Inserted | ObjectDataCacheIndexInsertResult::Duplicate => {
-                ObjectDataCacheFillResult::Inserted
+                let entry = Arc::new(ObjectDataCacheEntry::new(bytes, key.size, Arc::clone(&key.etag)));
+                self.cache.insert(key.clone(), entry).await;
+
+                // An invalidation may have raced between the index and cache
+                // inserts; re-check the index and undo the fill so the stale
+                // body cannot outlive the invalidation.
+                if self.index.contains_key(&identity, key).await {
+                    ObjectDataCacheFillResult::Inserted
+                } else {
+                    self.cache.remove(key).await;
+                    ObjectDataCacheFillResult::SkippedInvalidationRace
+                }
             }
-            ObjectDataCacheIndexInsertResult::Overflow { mut cleared_keys } => {
-                cleared_keys.push(key.clone());
+            ObjectDataCacheIndexInsertResult::Overflow { cleared_keys } => {
                 for stale_key in cleared_keys {
                     self.cache.remove(&stale_key).await;
                 }
@@ -122,22 +131,13 @@ impl MokaBackend {
     }
 
     /// Conservatively invalidates all cached keys matching the object identity.
+    ///
+    /// The identity index is authoritative: fills register the key in the
+    /// index before the entry becomes visible in the cache (and undo the fill
+    /// if an invalidation raced in between), so no full-cache scan fallback is
+    /// needed when the index has no entry for the identity.
     pub async fn invalidate_object(&self, identity: &ObjectDataCacheIdentity) -> ObjectDataCacheInvalidationResult {
-        let mut keys_to_remove = self.index.remove_identity(identity).await;
-        if keys_to_remove.is_empty() {
-            keys_to_remove = self
-                .cache
-                .iter()
-                .filter_map(|(key, _value)| {
-                    if key.bucket.as_ref() == identity.bucket.as_ref() && key.object.as_ref() == identity.object.as_ref() {
-                        Some(Arc::unwrap_or_clone(key))
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>();
-        }
-
+        let keys_to_remove = self.index.remove_identity(identity).await;
         for key in keys_to_remove {
             self.cache.remove(&key).await;
         }
