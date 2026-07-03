@@ -20,8 +20,7 @@ use aws_sdk_s3::operation::head_object::HeadObjectOutput;
 use aws_sdk_s3::types::{ObjectLockLegalHoldStatus, ObjectLockRetentionMode};
 use http::HeaderMap;
 use rustfs_replication::{
-    ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
-    target_is_newer_than_source_null_version,
+    ReplicationSourceObject, ReplicationTargetObject, replication_action_for_target, target_is_newer_than_source_null_version,
 };
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
@@ -365,6 +364,7 @@ fn valid_sse_replication_header(key: &str) -> Option<&str> {
 mod tests {
     use super::*;
     use aws_smithy_types::DateTime;
+    use rustfs_replication::content_matches_by_etag;
     use rustfs_utils::http::{
         SSEC_ALGORITHM_HEADER, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE, SUFFIX_REPLICATION_SSEC_CRC, get_header_map,
     };
