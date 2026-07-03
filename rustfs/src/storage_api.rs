@@ -215,9 +215,9 @@ pub(crate) mod startup {
 
     pub(crate) mod storage {
         pub(crate) use crate::storage::storage_api::{
-            ECStore, EndpointServerPools, init_background_replication, init_compression_total_memory_from_backend,
-            init_ecstore_config, init_global_config_sys, init_local_disks, init_lock_clients, prewarm_local_disk_id_map,
-            set_global_endpoints, try_migrate_server_config, update_erasure_type,
+            ECStore, EndpointServerPools, global_config_init_error_is_deterministic, init_background_replication,
+            init_compression_total_memory_from_backend, init_ecstore_config, init_global_config_sys, init_local_disks,
+            init_lock_clients, prewarm_local_disk_id_map, set_global_endpoints, try_migrate_server_config, update_erasure_type,
         };
     }
 }
