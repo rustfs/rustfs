@@ -12,4 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use super::replication_resync_boundary::ResyncStatusType;
+pub use rustfs_filemeta::{
+    MrfOpKind, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_EXISTING_DELETE, REPLICATE_HEAL, REPLICATE_HEAL_DELETE,
+    REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicateTargetDecision, ReplicatedInfos,
+    ReplicatedTargetInfo, ReplicationAction, ReplicationState, ReplicationStatusType, ReplicationType,
+    ReplicationWorkerOperation, ResyncDecision, ResyncTargetDecision, VersionPurgeStatusType, get_replication_state,
+    parse_replicate_decision, replication_statuses_map, target_reset_header, version_purge_statuses_map,
+};

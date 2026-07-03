@@ -623,6 +623,16 @@ async fn handle_put_file(req: Request<Incoming>) -> Response<Body> {
         usize::try_from(copied).unwrap_or(usize::MAX),
     );
 
+    if put_body_size_mismatch(&query, copied) {
+        let err = std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            format!("body size mismatch: expected {} bytes, received {copied}", query.size),
+        );
+        let message = put_file_stage_error_message("verify_size", &query, &err);
+        log_internode_put_file_stage_failure!("verify_size", query, err);
+        return response_with_status(StatusCode::INTERNAL_SERVER_ERROR, message);
+    }
+
     if let Err(e) = file.flush().await {
         let message = put_file_stage_error_message("flush", &query, &e);
         log_internode_put_file_stage_failure!("flush", query, e);
@@ -705,6 +715,14 @@ fn internode_rpc_subsystem(operation: Option<&'static str>) -> &'static str {
     }
 }
 
+/// A writer that is dropped mid-stream (cancelled sender task) terminates the chunked
+/// body cleanly, indistinguishable from intentional EOF. When the client declared the
+/// exact size up front (create path; append and unknown-size writes send `size <= 0`),
+/// a byte-count mismatch means the body was truncated and must not be acknowledged.
+fn put_body_size_mismatch(query: &PutFileQuery, copied: u64) -> bool {
+    !query.append && query.size > 0 && copied != u64::try_from(query.size).unwrap_or(u64::MAX)
+}
+
 fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std::fmt::Display) -> String {
     format!(
         "{stage} file err {err} [disk={}, volume={}, path={}, append={}, size={}]",
@@ -717,7 +735,8 @@ mod tests {
     use super::{
         LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER, LOG_SUBSYSTEM_ROUTING, PUT_FILE_STREAM_PATH, PutFileQuery,
         READ_FILE_STREAM_PATH, WALK_DIR_PATH, internode_http_operation, internode_rpc_subsystem, is_internode_rpc_path,
-        put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature, write_body_chunks_to_writer,
+        put_body_size_mismatch, put_file_stage_error_message, read_file_body_stream, verify_internode_rpc_signature,
+        write_body_chunks_to_writer,
     };
     use bytes::Bytes;
     use http::{HeaderMap, Method, StatusCode, Uri};
@@ -779,6 +798,26 @@ mod tests {
         assert!(msg.contains("path=tmp/object/part.1"));
         assert!(msg.contains("append=false"));
         assert!(msg.contains("size=1024"));
+    }
+
+    #[test]
+    fn put_body_size_mismatch_rejects_truncated_create_only() {
+        let query = |append: bool, size: i64| PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: "bucket".to_string(),
+            path: "object/part.1".to_string(),
+            append,
+            size,
+        };
+
+        // Truncated (or over-long) body on the create path is rejected.
+        assert!(put_body_size_mismatch(&query(false, 1024), 512));
+        assert!(put_body_size_mismatch(&query(false, 1024), 2048));
+        assert!(!put_body_size_mismatch(&query(false, 1024), 1024));
+        // Append streams send size=0; unknown-size creates send size<=0 — never rejected.
+        assert!(!put_body_size_mismatch(&query(true, 0), 512));
+        assert!(!put_body_size_mismatch(&query(false, 0), 512));
+        assert!(!put_body_size_mismatch(&query(false, -1), 512));
     }
 
     #[test]

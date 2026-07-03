@@ -91,9 +91,10 @@ catalog extension.
 | Maintenance audit events | Preview / controlled | Job reports and scheduler job summaries include structured audit events for planning, worker transitions, heartbeats, lease expiry recovery, and mutating quarantine operations. |
 | Maintenance quarantine operations | Preview / controlled | Lets operators inspect, release, retry, or abandon the current quarantined maintenance job without moving the table pointer. |
 | Compaction planning | Preview / controlled | Plans partition-local and sort-order-local binpack candidates for Parquet files and does not mix data files from different partition directories or sort orders in one rewrite group. |
+| Delete-file or row-level compaction planning | Preview / controlled | Manifests with position or equality delete files produce machine-readable row-level planning and force the compaction report into manual review before any rewrite can run. |
 | Compaction commit | Preview / controlled | Can commit a safe partition-local Parquet rewrite through the catalog while preserving Iceberg data file sort order IDs in the rewritten manifest. |
 | Built-in periodic scheduler | Not claimed | Operators can trigger worker runs, but continuous in-process scheduling is not claimed. |
-| Delete-file or row-level compaction | Not claimed | These remain future compatibility and maintenance validation items. |
+| Delete-file or row-level compaction execution | Not claimed | RustFS does not rewrite delete files or execute row-level compaction; those cases remain manual-review maintenance items. |
 
 ## Recovery And Strong Backing Matrix
 
@@ -167,6 +168,7 @@ RustFS does not currently claim:
 - no-long-term-data-credential table bootstrap
 - online external catalog vendor SDK polling
 - external catalog policy mirroring
+- delete-file rewrite or row-level compaction execution
 - built-in SQL query execution
 - Delta Lake or Hudi table format support
 - end-to-end SQL row-level DML validation through Spark, Trino, or another SQL engine

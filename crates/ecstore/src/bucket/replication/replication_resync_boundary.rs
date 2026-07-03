@@ -15,7 +15,7 @@
 use super::replication_error_boundary::{Error, Result};
 use super::replication_filemeta_boundary::MrfReplicateEntry;
 
-pub use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
+pub use rustfs_replication::{BucketReplicationResyncStatus, ResyncOpts, ResyncStatusType, TargetReplicationResyncStatus};
 pub(crate) use rustfs_replication::{
     is_version_id_mismatch, resync_state_accepts_update, should_auto_resume_resync, should_count_head_proxy_failure,
 };

@@ -29,6 +29,12 @@ Contract crates must stay below implementation crates. Initial forbidden edges:
 - `extension-schema -> rustfs`
 - `extension-schema -> ecstore`
 
+`rustfs-storage-api` may only expose storage-facing replication status/state
+contracts through `crates/storage-api/src/replication.rs` while the underlying
+wire types still live in `rustfs-filemeta`. This keeps the temporary dependency
+centralized until those wire contracts can move without introducing a
+`rustfs-replication` / `rustfs-storage-api` cycle.
+
 Existing migration checks live in:
 
 - `scripts/check_layer_dependencies.sh`

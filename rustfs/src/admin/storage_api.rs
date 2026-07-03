@@ -150,7 +150,7 @@ pub(crate) trait AdminReplicationConfigExt {
 impl AdminReplicationConfigExt for s3s::dto::ReplicationConfiguration {
     fn filter_all_replication_target_arns(&self) -> Vec<String> {
         let obj = ecstore_bucket::replication::ObjectOpts {
-            op_type: rustfs_replication::ReplicationType::All,
+            op_type: ecstore_bucket::replication::ReplicationType::All,
             ..Default::default()
         };
         <s3s::dto::ReplicationConfiguration as ecstore_bucket::replication::ReplicationConfigurationExt>::filter_target_arns(
@@ -309,7 +309,7 @@ pub(crate) mod quota {
 pub(crate) mod replication {
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
-    pub(crate) type ReplicationStatusType = rustfs_replication::ReplicationStatusType;
+    pub(crate) type ReplicationStatusType = super::ecstore_bucket::replication::ReplicationStatusType;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;

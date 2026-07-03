@@ -125,9 +125,20 @@ Current coupling:
 - resync options, bucket/target resync status DTOs, status display labels, and
   the persisted resync status wire format live in `crates/replication`, with
   ECStore retaining only error mapping and MRF persistence locally;
+- `crates/replication/src/filemeta.rs` is the only direct filemeta wire-contract
+  import boundary inside `rustfs-replication`;
+- `crates/replication/src/storage_api.rs` is the only direct storage-api delete
+  DTO import boundary inside `rustfs-replication`;
+- direct ECStore replication imports from `rustfs-replication` are limited to
+  `*_boundary.rs` modules;
+- storage-api delete replication status/state helpers use the local
+  `crates/storage-api/src/replication.rs` contract boundary while the
+  underlying wire types remain in `rustfs-filemeta`;
 - admin replication extension target filtering and resync request construction
   stay behind the admin storage boundary instead of exposing replication work
   DTO construction to handlers;
+- scanner, admin, and storage-owner replication status/DTO consumers import
+  those contracts through the ECStore replication facade;
 - app object and multipart writes call object-replication boundary helpers
   instead of constructing replication work DTOs or choosing object replication
   operation types at the use-case layer;
@@ -168,6 +179,22 @@ Required contracts before crate movement:
   `crates/ecstore/src/bucket/replication/replication_filemeta_boundary.rs`,
   while `FileInfo` remains in the storage boundary for storage trait bindings
   and walk options.
+- `ReplicationCrateFileMetaFacade`: replication facade compatibility symbols
+  that still originate in filemeta wire contracts are concentrated in
+  `crates/replication/src/filemeta.rs` inside `rustfs-replication`.
+- `ReplicationCrateStorageApiBoundary`: storage API delete DTOs consumed by
+  replication delete/queue/operation helpers are concentrated in
+  `crates/replication/src/storage_api.rs` inside `rustfs-replication`.
+- `EcstoreReplicationBoundaryImports`: ECStore-side imports from
+  `rustfs-replication` are concentrated in replication `*_boundary.rs` modules.
+- `RuntimeReplicationFacadeConsumers`: scanner, admin, and storage-owner
+  replication status/DTO consumers import through `rustfs-ecstore`, while app
+  storage keeps direct object/delete helper calls inside its storage API
+  boundary.
+- `StorageApiReplicationContracts`: storage-api delete DTO replication
+  state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
+  until the underlying wire contracts can move without a
+  `rustfs-replication` / `rustfs-storage-api` dependency cycle.
 - `ReplicationErrorBoundary`: ECStore error/result contracts and
   replication-specific error classifiers. `crate::error` imports are
   concentrated in
