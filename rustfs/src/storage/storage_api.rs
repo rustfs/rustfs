@@ -724,6 +724,13 @@ pub(crate) async fn init_global_config_sys(store: Arc<ECStore>) -> Result<()> {
     ecstore_config::init_global_config_sys(store).await
 }
 
+/// Returns true when an `init_global_config_sys` failure is deterministic
+/// (corrupt persisted server config with the recovery fallback disabled), so
+/// retrying it cannot succeed and startup should fail fast.
+pub(crate) fn global_config_init_error_is_deterministic(err: &Error) -> bool {
+    ecstore_config::com::is_server_config_corrupt_error(err)
+}
+
 pub(crate) async fn init_local_disks(endpoint_pools: EndpointServerPools) -> Result<()> {
     ecstore_storage::init_local_disks(endpoint_pools).await
 }
