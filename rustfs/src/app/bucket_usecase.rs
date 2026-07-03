@@ -1010,6 +1010,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketEncryptionInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1025,6 +1026,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket encryption", request_context);
+
         let item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket encryption delete hook failed");
@@ -1038,6 +1041,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketCorsInput>,
     ) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketCorsInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1052,6 +1056,8 @@ impl DefaultBucketUsecase {
         metadata_sys::delete(&bucket, BUCKET_CORS_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket cors", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1127,6 +1133,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketReplicationInput { bucket, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -1160,6 +1167,8 @@ impl DefaultBucketUsecase {
             return Err(err);
         }
 
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket replication", request_context);
+
         let item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
             warn!(bucket = %bucket, error = ?err, "site replication bucket replication-config delete hook failed");
@@ -1176,11 +1185,14 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
         metadata_sys::delete(&bucket, BUCKET_TAGGING_CONFIG)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "delete bucket tagging", request_context);
 
         let item = sr_bucket_meta_item(bucket.clone(), "tags");
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -1615,6 +1627,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketEncryptionInput {
             bucket,
             mut server_side_encryption_configuration,
@@ -1655,6 +1668,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_SSECONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket encryption", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "sse-config");
         item.sse_config = Some(
@@ -1769,6 +1784,7 @@ impl DefaultBucketUsecase {
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let request_region = req.region.clone();
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
 
         let PutBucketNotificationConfigurationInput {
             bucket,
@@ -1791,6 +1807,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_NOTIFICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket notification", request_context);
 
         let region = resolve_notification_region(self.global_region(), request_region);
         let notify = current_notify_interface_for_context(self.context.as_deref());
@@ -1906,6 +1924,7 @@ impl DefaultBucketUsecase {
 
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketCorsInput {
             bucket,
             cors_configuration,
@@ -1926,6 +1945,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket cors", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "cors-config");
         item.cors =
             Some(serialize_config(&cors_configuration).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
@@ -1940,6 +1961,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketReplicationInput {
             bucket,
             replication_configuration,
@@ -1961,6 +1983,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_REPLICATION_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket replication", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "replication-config");
         item.replication_config = Some(
@@ -2010,6 +2034,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketTaggingInput>,
     ) -> S3Result<S3Response<PutBucketTaggingOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, tagging, .. } = req.input;
 
         let Some(store) = self.object_store() else {
@@ -2027,6 +2052,8 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket tagging", request_context);
+
         let mut item = sr_bucket_meta_item(bucket.clone(), "tags");
         item.tags = Some(serialize_config(&tagging).and_then(|bytes| String::from_utf8(bytes).map_err(to_internal_error))?);
         if let Err(err) = site_replication_bucket_meta_hook(item).await {
@@ -2042,6 +2069,7 @@ impl DefaultBucketUsecase {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketVersioningInput {
             bucket,
             versioning_configuration,
@@ -2055,6 +2083,8 @@ impl DefaultBucketUsecase {
         metadata_sys::update(&bucket, BUCKET_VERSIONING_CONFIG, data)
             .await
             .map_err(ApiError::from)?;
+
+        notify_bucket_metadata_reload(bucket.clone(), "put bucket versioning", request_context);
 
         let mut item = sr_bucket_meta_item(bucket.clone(), "version-config");
         item.versioning = Some(
@@ -2298,13 +2328,25 @@ mod tests {
     }
 
     #[test]
-    fn bucket_policy_and_public_access_block_changes_notify_peer_metadata_reload() {
+    fn bucket_metadata_config_changes_notify_peer_metadata_reload() {
         let source = include_str!("bucket_usecase.rs");
         for (method, operation) in [
             ("execute_delete_bucket_policy", "delete bucket policy"),
             ("execute_put_bucket_policy", "put bucket policy"),
             ("execute_delete_public_access_block", "delete public access block"),
             ("execute_put_public_access_block", "put public access block"),
+            ("execute_delete_bucket_lifecycle", "delete bucket lifecycle"),
+            ("execute_put_bucket_lifecycle_configuration", "put bucket lifecycle"),
+            ("execute_put_bucket_versioning", "put bucket versioning"),
+            ("execute_delete_bucket_tagging", "delete bucket tagging"),
+            ("execute_put_bucket_tagging", "put bucket tagging"),
+            ("execute_delete_bucket_replication", "delete bucket replication"),
+            ("execute_put_bucket_replication", "put bucket replication"),
+            ("execute_delete_bucket_cors", "delete bucket cors"),
+            ("execute_put_bucket_cors", "put bucket cors"),
+            ("execute_delete_bucket_encryption", "delete bucket encryption"),
+            ("execute_put_bucket_encryption", "put bucket encryption"),
+            ("execute_put_bucket_notification_configuration", "put bucket notification"),
         ] {
             let body = usecase_method_source(source, method);
             assert!(
