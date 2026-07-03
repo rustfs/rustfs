@@ -67,6 +67,21 @@ pub const DEFAULT_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: usize = 4;
 /// Default is set to 64 concurrent reads.
 pub const DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS: usize = 64;
 
+/// Environment variable for the disk read permit wait timeout (seconds).
+/// - Purpose: Bound how long a GET waits for a disk read permit before proceeding without one.
+/// - Unit: seconds (u64). `0` waits indefinitely.
+/// - Example: `export RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT=5`
+pub const ENV_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_PERMIT_WAIT_TIMEOUT";
+
+/// Maximum time a GET request waits for a disk read permit (seconds).
+///
+/// Permits are held for the whole response body transfer, so slow clients can
+/// occupy all of them while the disks sit idle. Instead of stalling until the
+/// request-level timeout fires, a GET that waits longer than this proceeds
+/// without a permit (degraded pass-through) and the bypass is counted in
+/// metrics/logs. Set to 0 to wait indefinitely (previous behavior).
+pub const DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT: u64 = 5;
+
 /// Skip bitrot hash verification on GetObject reads.
 ///
 /// When enabled, GetObject reads skip the per-shard hash

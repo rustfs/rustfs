@@ -17,7 +17,8 @@ pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint as EcstoreEndpoint;
 pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError, Result as EcstoreDiskResult};
 pub(crate) use rustfs_ecstore::api::disk::{
     BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes, DeleteOptions as EcstoreDeleteOptions,
-    DiskAPI as EcstoreDiskAPI, DiskStore as EcstoreDiskStore, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    DiskAPI as EcstoreDiskAPI, DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
+    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
@@ -30,9 +31,9 @@ pub(crate) mod owner {
     pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
 
     pub(crate) use super::{
-        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_RUSTFS_META_BUCKET, EcstoreDeleteOptions,
-        EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint,
-        EcstoreErrorType, EcstoreStorageError, EcstoreStore, ecstore_local_disk_map_read,
+        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
+        EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
+        EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ecstore_local_disk_map_read,
     };
 
     #[cfg(test)]

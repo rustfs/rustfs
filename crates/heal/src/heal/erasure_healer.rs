@@ -677,9 +677,7 @@ impl ErasureSetHealer {
             }
 
             *current_object_index = global_obj_idx;
-            checkpoint_manager
-                .update_position(bucket_index, *current_object_index)
-                .await?;
+            checkpoint_manager.complete_page(bucket_index, *current_object_index).await?;
             gauge!(
                 "rustfs_heal_page_concurrency_current",
                 "set" => set_disk_id.to_string()

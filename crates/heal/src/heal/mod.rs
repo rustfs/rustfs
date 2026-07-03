@@ -24,9 +24,10 @@ pub mod task;
 pub mod utils;
 
 use storage_api::owner::{
-    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_RUSTFS_META_BUCKET, EcstoreDeleteOptions, EcstoreDiskAPI,
-    EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
-    EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations, ecstore_local_disk_map_read,
+    ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_RUSTFS_META_BUCKET,
+    EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
+    EcstoreEndpoint, EcstoreErrorType, EcstoreStorageError, EcstoreStore, ObjectIO, ObjectOperations,
+    ecstore_local_disk_map_read,
 };
 #[cfg(test)]
 use storage_api::owner::{EcstoreDiskOption, ecstore_new_disk};
@@ -64,6 +65,64 @@ pub async fn clear_unclean_shutdown_markers() {
                 endpoint = %EcstoreDiskAPI::endpoint(disk.as_ref()),
                 error = ?err,
                 "failed to clear unclean-shutdown marker"
+            );
+        }
+    }
+}
+
+/// Per-disk healing marker path (inside `RUSTFS_META_BUCKET`), mirrored from
+/// ecstore so both sides agree on where `DiskInfo.healing` is derived from.
+pub(crate) const HEALING_MARKER_PATH: &str = ECSTORE_HEALING_MARKER_PATH;
+
+/// Write the healing marker on the local disks matching `endpoints` so their
+/// `DiskInfo.healing` reports true while the erasure-set heal rebuilds them.
+pub(crate) async fn set_healing_markers(endpoints: &[String], set_disk_id: &str) {
+    apply_healing_markers(endpoints, Some(set_disk_id)).await;
+}
+
+/// Remove the healing markers written by [`set_healing_markers`].
+pub(crate) async fn clear_healing_markers(endpoints: &[String]) {
+    apply_healing_markers(endpoints, None).await;
+}
+
+async fn apply_healing_markers(endpoints: &[String], set_disk_id: Option<&str>) {
+    if endpoints.is_empty() {
+        return;
+    }
+    let local_disk_map = local_disk_map_read().await;
+    for disk in local_disk_map.values().flatten() {
+        let endpoint = EcstoreDiskAPI::endpoint(disk.as_ref()).to_string();
+        if !endpoints.iter().any(|candidate| candidate == &endpoint) {
+            continue;
+        }
+        let result = match set_disk_id {
+            Some(set_disk_id) => {
+                EcstoreDiskAPI::write_all(
+                    disk.as_ref(),
+                    RUSTFS_META_BUCKET,
+                    HEALING_MARKER_PATH,
+                    EcstoreDiskBytes::copy_from_slice(set_disk_id.as_bytes()),
+                )
+                .await
+            }
+            None => match EcstoreDiskAPI::delete(
+                disk.as_ref(),
+                RUSTFS_META_BUCKET,
+                HEALING_MARKER_PATH,
+                EcstoreDeleteOptions::default(),
+            )
+            .await
+            {
+                Err(DiskError::FileNotFound) => Ok(()),
+                other => other,
+            },
+        };
+        if let Err(err) = result {
+            tracing::warn!(
+                endpoint = %endpoint,
+                action = if set_disk_id.is_some() { "set" } else { "clear" },
+                error = ?err,
+                "failed to update healing marker"
             );
         }
     }

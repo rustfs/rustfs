@@ -2371,6 +2371,7 @@ impl HealManager {
                                 HealPriority::Low,
                             );
                             req.source = HealRequestSource::AutoHeal;
+                            req.heal_endpoints = vec![ep.to_string()];
                             let config = config.read().await;
                             let mut queue = heal_queue.lock().await;
                             let admission = Self::admit_request_to_queue(&mut queue, req, &config, "auto_scan");

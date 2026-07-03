@@ -431,6 +431,10 @@ pub(crate) mod ecstore_rpc {
     };
 }
 
+pub(crate) mod ecstore_object {
+    pub(crate) use rustfs_ecstore::api::object::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
+}
+
 pub(crate) mod ecstore_set_disk {
     pub(crate) use rustfs_ecstore::api::set_disk::{DEFAULT_READ_BUFFER_SIZE, get_lock_acquire_timeout, is_valid_storage_class};
 }

@@ -52,8 +52,11 @@ use uuid::Uuid;
 pub const ERASURE_ALGORITHM: &str = "rs-vandermonde";
 pub const BLOCK_SIZE_V2: usize = 1024 * 1024; // 1M
 
+mod body_cache_hook;
 mod readers;
 mod types;
 
+pub(crate) use body_cache_hook::get_object_body_cache_hook;
+pub use body_cache_hook::{GetObjectBodyCacheHook, register_get_object_body_cache_hook};
 pub use readers::*;
 pub use types::*;

@@ -27,7 +27,7 @@ use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
 use crate::cluster::rpc::heal_bucket_local_on_disks;
 use crate::data_usage::record_compression_total_memory;
 use crate::diagnostics::get::{
-    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_CODEC_STREAMING,
+    GET_CODEC_STREAMING_OBJECT_CLASS_PLAIN_SINGLE_PART, GET_OBJECT_PATH_BODY_CACHE, GET_OBJECT_PATH_CODEC_STREAMING,
     GET_OBJECT_PATH_CODEC_STREAMING_LEGACY_ENGINE, GET_OBJECT_PATH_CODEC_STREAMING_RUSTFS_ENGINE, GET_OBJECT_PATH_DIRECT_MEMORY,
     GET_OBJECT_PATH_EMPTY, GET_OBJECT_PATH_INLINE_DIRECT, GET_OBJECT_PATH_LEGACY_DUPLEX, GET_OBJECT_PATH_REMOTE_TRANSITION,
     GET_OBJECT_PATH_SET_DISK, GET_STAGE_DECODE, GET_STAGE_EMIT, GET_STAGE_INLINE_PREPARE, GET_STAGE_LOCK_ACQUIRE,
@@ -51,6 +51,7 @@ use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
 use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
+use crate::object_api::get_object_body_cache_hook;
 use crate::runtime::sources as runtime_sources;
 use crate::services::batch_processor::AsyncBatchProcessor;
 use crate::storage_api_contracts::{
@@ -453,11 +454,27 @@ mod write;
 
 /// Get lock acquire timeout from environment variable RUSTFS_LOCK_ACQUIRE_TIMEOUT (in seconds)
 /// Defaults to 30 seconds if not set or invalid
+/// Lock acquisition timeout. Cached: this is consulted on every object
+/// lock acquisition and `std::env::var` takes a process-global lock. In test
+/// builds the env var is read directly so `temp_env` overrides take effect.
 pub fn get_lock_acquire_timeout() -> Duration {
-    Duration::from_secs(rustfs_utils::get_env_u64(
-        rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
-        rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
-    ))
+    #[cfg(test)]
+    {
+        Duration::from_secs(rustfs_utils::get_env_u64(
+            rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+            rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: OnceLock<Duration> = OnceLock::new();
+        *CACHED.get_or_init(|| {
+            Duration::from_secs(rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+                rustfs_config::DEFAULT_OBJECT_LOCK_ACQUIRE_TIMEOUT,
+            ))
+        })
+    }
 }
 
 pub fn is_object_lock_diag_enabled() -> bool {
@@ -2330,6 +2347,27 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 bucket,
                 object,
             ));
+        }
+
+        // App-layer object data cache probe: metadata (etag/size) is resolved
+        // but no data shards have been read yet, so a hit skips the erasure
+        // read, bitrot verify and decode entirely. The hook validates object
+        // identity and rejects anything it cannot serve byte-identically.
+        if range.is_none()
+            && opts.part_number.is_none()
+            && let Some(hook) = get_object_body_cache_hook()
+            && let Some(body) = hook.lookup(bucket, object, &object_info).await
+        {
+            record_get_object_reader_path_observation(GET_OBJECT_PATH_BODY_CACHE, object_class, size_bucket);
+            let reader = GetObjectReader {
+                stream: Box::new(Cursor::new(body.clone())),
+                object_info,
+                buffered_body: Some(body),
+            };
+            if lock_optimization_enabled {
+                release_materialized_read_lock(bucket, object, read_lock_guard.take());
+            }
+            return Ok(reader);
         }
 
         if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {

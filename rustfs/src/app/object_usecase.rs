@@ -329,7 +329,6 @@ struct GetObjectRequestContext {
 
 struct GetObjectReadSetup {
     info: ObjectInfo,
-    event_info: ObjectInfo,
     final_stream: DynReader,
     buffered_body: Option<Bytes>,
     rs: Option<HTTPRangeSpec>,
@@ -360,7 +359,7 @@ struct GetObjectStrategyContext {
 
 struct GetObjectOutputContext {
     output: GetObjectOutput,
-    event_info: ObjectInfo,
+    event_info: Option<ObjectInfo>,
     response_content_length: i64,
     optimal_buffer_size: usize,
 }
@@ -521,7 +520,7 @@ pin_project! {
     struct DiskReadPermitReader<R> {
         #[pin]
         inner: R,
-        _disk_permit: OwnedSemaphorePermit,
+        disk_permit: Option<OwnedSemaphorePermit>,
     }
 }
 
@@ -529,7 +528,7 @@ impl<R> DiskReadPermitReader<R> {
     fn new(inner: R, disk_permit: OwnedSemaphorePermit) -> Self {
         Self {
             inner,
-            _disk_permit: disk_permit,
+            disk_permit: Some(disk_permit),
         }
     }
 }
@@ -539,7 +538,16 @@ where
     R: AsyncRead,
 {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        self.project().inner.poll_read(cx, buf)
+        let this = self.project();
+        let had_capacity = buf.remaining() > 0;
+        let filled_before = buf.filled().len();
+        let poll = this.inner.poll_read(cx, buf);
+        // EOF: no more disk reads can happen through this stream, so release
+        // the permit instead of holding it until the client drops the body.
+        if had_capacity && matches!(poll, Poll::Ready(Ok(()))) && buf.filled().len() == filled_before {
+            this.disk_permit.take();
+        }
+        poll
     }
 }
 
@@ -2234,6 +2242,18 @@ impl DefaultObjectUsecase {
         })
     }
 
+    /// How long a GET waits for a disk read permit before degrading to a
+    /// permit-less read. Cached: consulted per GET. Zero disables the bound.
+    fn disk_permit_wait_timeout() -> Duration {
+        static CACHED: std::sync::OnceLock<Duration> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            Duration::from_secs(rustfs_utils::get_env_u64(
+                rustfs_config::ENV_OBJECT_DISK_PERMIT_WAIT_TIMEOUT,
+                rustfs_config::DEFAULT_OBJECT_DISK_PERMIT_WAIT_TIMEOUT,
+            ))
+        })
+    }
+
     async fn acquire_get_object_io_planning(
         manager: &ConcurrencyManager,
         wrapper: &RequestTimeoutWrapper,
@@ -2242,10 +2262,32 @@ impl DefaultObjectUsecase {
         key: &str,
     ) -> S3Result<GetObjectIoPlanning> {
         let permit_wait_start = std::time::Instant::now();
-        let disk_permit = manager
-            .acquire_owned_disk_read_permit()
-            .await
-            .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?;
+        let permit_wait_timeout = Self::disk_permit_wait_timeout();
+        // Permits are held for the whole body transfer, so slow clients can
+        // pin all of them while disks are idle. Bound the wait and degrade to
+        // a permit-less read instead of stalling into the request timeout.
+        let disk_permit = if permit_wait_timeout.is_zero() {
+            Some(
+                manager
+                    .acquire_owned_disk_read_permit()
+                    .await
+                    .map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?,
+            )
+        } else {
+            match tokio::time::timeout(permit_wait_timeout, manager.acquire_owned_disk_read_permit()).await {
+                Ok(permit) => Some(permit.map_err(|_| s3_error!(InternalError, "disk read semaphore closed"))?),
+                Err(_) => {
+                    metrics::counter!("rustfs.get_object.disk_permit.bypass.total").increment(1);
+                    warn!(
+                        bucket = %bucket,
+                        key = %key,
+                        wait_ms = permit_wait_start.elapsed().as_millis() as u64,
+                        "GetObject proceeding without disk read permit after bounded wait"
+                    );
+                    None
+                }
+            }
+        };
         let permit_wait_duration = permit_wait_start.elapsed();
 
         Self::ensure_get_object_not_timed_out(
@@ -2279,7 +2321,7 @@ impl DefaultObjectUsecase {
         Self::ensure_get_object_not_timed_out(wrapper, timeout_config, bucket, key, GetObjectTimeoutStage::BeforeRead)?;
 
         Ok(GetObjectIoPlanning {
-            disk_permit: Some(disk_permit),
+            disk_permit,
             permit_wait_duration,
             queue_status,
             queue_utilization,
@@ -2287,14 +2329,12 @@ impl DefaultObjectUsecase {
     }
 
     async fn prepare_get_object_request_context(req: &S3Request<GetObjectInput>) -> S3Result<GetObjectRequestContext> {
-        let GetObjectInput {
-            bucket,
-            key,
-            version_id,
-            part_number,
-            range,
-            ..
-        } = req.input.clone();
+        // Clone only the fields this path needs instead of the whole input.
+        let bucket = req.input.bucket.clone();
+        let key = req.input.key.clone();
+        let version_id = req.input.version_id.clone();
+        let part_number = req.input.part_number;
+        let range = req.input.range;
 
         validate_object_key(&key, "GET")?;
 
@@ -2446,7 +2486,6 @@ impl DefaultObjectUsecase {
             );
         }
 
-        let event_info = info.clone();
         let content_type = if let Some(content_type) = &info.content_type {
             match ContentType::from_str(content_type) {
                 Ok(res) => Some(res),
@@ -2536,7 +2575,6 @@ impl DefaultObjectUsecase {
 
         Ok(GetObjectReadSetup {
             info,
-            event_info,
             final_stream,
             buffered_body,
             rs,
@@ -2621,8 +2659,6 @@ impl DefaultObjectUsecase {
                 request_size = response_content_length,
                 "I/O priority assigned (based on actual request size)"
             );
-
-            rustfs_io_metrics::record_io_priority_assignment(io_priority.as_str());
         }
 
         rustfs_io_metrics::record_get_object_io_state(
@@ -3635,11 +3671,15 @@ impl DefaultObjectUsecase {
         bucket: &str,
         method: &hyper::Method,
         headers: &HeaderMap,
-        event_info: ObjectInfo,
+        event_info: Option<ObjectInfo>,
         version_id_for_event: String,
         output: GetObjectOutput,
     ) -> S3Result<S3Response<GetObjectOutput>> {
-        let helper = helper.object(event_info).version_id(version_id_for_event);
+        let helper = match event_info {
+            Some(event_info) => helper.object(event_info),
+            None => helper,
+        };
+        let helper = helper.version_id(version_id_for_event);
         let response = wrap_response_with_cors(bucket, method, headers, output).await;
         let result = Ok(response);
         let _ = helper.complete(&result);
@@ -3653,7 +3693,7 @@ impl DefaultObjectUsecase {
         bucket: &str,
         key: &str,
         info: ObjectInfo,
-        event_info: ObjectInfo,
+        event_info: Option<ObjectInfo>,
         final_stream: DynReader,
         buffered_body: Option<Bytes>,
         rs: Option<HTTPRangeSpec>,
@@ -3857,7 +3897,6 @@ impl DefaultObjectUsecase {
 
         let GetObjectReadSetup {
             info,
-            event_info,
             final_stream,
             buffered_body,
             rs,
@@ -3877,6 +3916,10 @@ impl DefaultObjectUsecase {
         } else {
             final_stream
         };
+
+        // Clone ObjectInfo for event notification only when an event will
+        // actually be built — the clone is expensive for multipart objects.
+        let event_info = helper.wants_object_info().then(|| info.clone());
 
         let output_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
         let output_context = self
@@ -5251,7 +5294,9 @@ impl DefaultObjectUsecase {
 
         // Compute x-amz-expiration header from lifecycle prediction (before info is partially moved)
         let expiration_header = resolve_put_object_expiration(&bucket, &info).await;
-        let event_info = info.clone();
+        // Clone ObjectInfo for event notification only when an event will
+        // actually be built — the clone is expensive for multipart objects.
+        let event_info = helper.wants_object_info().then(|| info.clone());
         let content_type = {
             if let Some(content_type) = &info.content_type {
                 match ContentType::from_str(content_type) {
@@ -5370,7 +5415,10 @@ impl DefaultObjectUsecase {
         };
 
         let version_id = req.input.version_id.clone().unwrap_or_default();
-        helper = helper.object(event_info).version_id(version_id);
+        if let Some(event_info) = event_info {
+            helper = helper.object(event_info);
+        }
+        helper = helper.version_id(version_id);
 
         // NOTE ON CORS:
         // Bucket-level CORS headers are intentionally applied only for object retrieval
@@ -7428,6 +7476,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disk_read_permit_reader_releases_permit_at_eof() {
+        use tokio::io::AsyncReadExt;
+
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.expect("acquire permit");
+        assert_eq!(semaphore.available_permits(), 0);
+
+        let mut reader = DiskReadPermitReader::new(std::io::Cursor::new(b"hello".to_vec()), permit);
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("read body");
+        assert_eq!(body, b"hello");
+
+        // The reader is still alive (client hasn't dropped the body), but EOF
+        // was observed, so the permit must already be back in the semaphore.
+        assert_eq!(semaphore.available_permits(), 1);
+        drop(reader);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
     async fn pooled_buffer_reader_keeps_buffer_alive_until_consumed() {
         use tokio::io::AsyncReadExt;
 
@@ -7809,7 +7877,7 @@ mod tests {
                 "test-bucket",
                 "path/raw",
                 info.clone(),
-                info,
+                Some(info),
                 wrap_reader(tokio::io::empty()),
                 None,
                 None,
