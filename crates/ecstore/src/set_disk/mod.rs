@@ -6861,13 +6861,20 @@ async fn get_storage_info(disks: &[Option<DiskStore>], eps: &[Endpoint]) -> rust
     }
 }
 pub async fn stat_all_dirs(disks: &[Option<DiskStore>], bucket: &str, prefix: &str) -> Vec<Option<DiskError>> {
-    let mut errs = Vec::with_capacity(disks.len());
     let mut futures = Vec::with_capacity(disks.len());
-    for disk in disks.iter().flatten() {
+    // Spawn one future per disk slot so the returned vector stays index-aligned with `disks`
+    // (and therefore with `set_endpoints`). Offline/None disks must yield DiskNotFound in-place
+    // rather than being skipped, otherwise callers that zip `errs` against the full disks array
+    // (heal_object_dir) would pair every error with the wrong disk/endpoint whenever any disk is
+    // offline — and could `make_volume` on the wrong disk.
+    for disk in disks.iter() {
         let disk = disk.clone();
         let bucket = bucket.to_string();
         let prefix = prefix.to_string();
         futures.push(tokio::spawn(async move {
+            let Some(disk) = disk else {
+                return Some(DiskError::DiskNotFound);
+            };
             match disk.list_dir("", &bucket, &prefix, 1).await {
                 Ok(entries) => {
                     if !entries.is_empty() {
@@ -6882,8 +6889,14 @@ pub async fn stat_all_dirs(disks: &[Option<DiskStore>], bucket: &str, prefix: &s
 
     let results = join_all(futures).await;
 
-    for err in results.into_iter().flatten() {
-        errs.push(err);
+    // Preserve length/index alignment: a panicked probe becomes a corrupt-state error instead of
+    // a silently-dropped slot that would re-shift every subsequent index.
+    let mut errs = Vec::with_capacity(disks.len());
+    for res in results.into_iter() {
+        match res {
+            Ok(err) => errs.push(err),
+            Err(join_err) => errs.push(Some(DiskError::other(join_err.to_string()))),
+        }
     }
     errs
 }
@@ -10613,5 +10626,29 @@ mod tests {
             .await
             .expect_err("abandoned-parts check should stay in the upper reconciliation layer");
         assert!(matches!(abandoned_err, StorageError::NotImplemented));
+    }
+
+    #[tokio::test]
+    async fn stat_all_dirs_returns_index_aligned_vector_for_offline_disks() {
+        // All-offline set: no real disk I/O needed. Isolates the length/index-alignment contract
+        // that heal_object_dir depends on when it zips `errs` against the full `disks` array.
+        let disks: Vec<Option<DiskStore>> = vec![None, None, None, None];
+
+        let errs = stat_all_dirs(&disks, "bucket", "object").await;
+
+        // Before the fix, offline disks contributed no future and the collected vector had length
+        // 0, so any zip against `disks` paired errors with the wrong disk. After the fix each slot
+        // is DiskNotFound, index-aligned with `disks`.
+        assert_eq!(
+            errs.len(),
+            disks.len(),
+            "stat_all_dirs must return one entry per disk slot to stay index-aligned"
+        );
+        for err in &errs {
+            assert!(
+                matches!(err, Some(DiskError::DiskNotFound)),
+                "offline (None) disk slot must map to DiskNotFound in-place, got {err:?}"
+            );
+        }
     }
 }

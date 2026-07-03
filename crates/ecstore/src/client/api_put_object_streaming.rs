@@ -208,20 +208,20 @@ impl TransitionClient {
 
         let mut compl_multipart_upload = CompleteMultipartUpload::default();
 
-        let mut all_parts = Vec::<ObjectPart>::with_capacity(parts_info.len());
-        let part_number = total_parts_count;
-        for i in 1..part_number {
-            let part = parts_info[&i].clone();
-
-            all_parts.push(part.clone());
+        // Parts are keyed 1..=total_parts_count during upload; every one — including the last —
+        // must be collected. The previous exclusive `1..total_parts_count` bound dropped the final
+        // part, silently truncating the completed object (and produced zero parts for a single-part
+        // upload).
+        let mut all_parts = collect_complete_parts(&parts_info, total_parts_count);
+        for part in &all_parts {
             compl_multipart_upload.parts.push(CompletePart {
-                etag: part.etag,
+                etag: part.etag.clone(),
                 part_num: part.part_num,
-                checksum_crc32: part.checksum_crc32,
-                checksum_crc32c: part.checksum_crc32c,
-                checksum_sha1: part.checksum_sha1,
-                checksum_sha256: part.checksum_sha256,
-                checksum_crc64nvme: part.checksum_crc64nvme,
+                checksum_crc32: part.checksum_crc32.clone(),
+                checksum_crc32c: part.checksum_crc32c.clone(),
+                checksum_sha1: part.checksum_sha1.clone(),
+                checksum_sha256: part.checksum_sha256.clone(),
+                checksum_crc64nvme: part.checksum_crc64nvme.clone(),
             });
         }
 
@@ -571,5 +571,52 @@ impl TransitionClient {
             },
             ..Default::default()
         })
+    }
+}
+
+/// Collect the uploaded parts for CompleteMultipartUpload in ascending part order.
+///
+/// Parts are keyed `1..=total_parts_count` during upload (see the upload loop that inserts each
+/// part), so every one — including the final part — must be collected. The previous exclusive
+/// `1..total_parts_count` bound dropped the last part, silently truncating the completed object,
+/// and collected zero parts for a single-part upload.
+fn collect_complete_parts(parts_info: &HashMap<i64, ObjectPart>, total_parts_count: i64) -> Vec<ObjectPart> {
+    let mut all_parts = Vec::with_capacity(parts_info.len());
+    for i in 1..=total_parts_count {
+        all_parts.push(parts_info[&i].clone());
+    }
+    all_parts
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ObjectPart, collect_complete_parts};
+    use std::collections::HashMap;
+
+    fn parts_map(n: i64) -> HashMap<i64, ObjectPart> {
+        let mut m = HashMap::new();
+        for i in 1..=n {
+            m.insert(
+                i,
+                ObjectPart {
+                    part_num: i,
+                    ..Default::default()
+                },
+            );
+        }
+        m
+    }
+
+    #[test]
+    fn collects_every_part_including_the_last() {
+        let collected: Vec<i64> = collect_complete_parts(&parts_map(3), 3).iter().map(|p| p.part_num).collect();
+        assert_eq!(collected, vec![1, 2, 3], "CompleteMultipartUpload must include the final part");
+    }
+
+    #[test]
+    fn single_part_upload_submits_one_part() {
+        let collected = collect_complete_parts(&parts_map(1), 1);
+        assert_eq!(collected.len(), 1, "a single-part object must submit exactly one part, not zero");
+        assert_eq!(collected[0].part_num, 1);
     }
 }
