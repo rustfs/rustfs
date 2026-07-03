@@ -43,7 +43,7 @@ checked_files=(
   "crates/targets/src/target/webhook.rs"
   "crates/ecstore/src/store/peer.rs"
   "crates/ecstore/src/store/init.rs"
-  "crates/ecstore/src/tier/tier.rs"
+  "crates/ecstore/src/services/tier/tier.rs"
   "crates/heal/src/heal/manager.rs"
   "crates/heal/src/heal/storage.rs"
   "crates/heal/src/heal/task.rs"
