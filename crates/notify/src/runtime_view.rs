@@ -79,7 +79,6 @@ mod tests {
     use rustfs_targets::store::{Key, Store};
     use rustfs_targets::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta, TargetDeliverySnapshot};
     use rustfs_targets::{ReplayWorkerManager, StoreError, Target, TargetError};
-    use serde::{Serialize, de::DeserializeOwned};
     use std::sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -128,7 +127,7 @@ mod tests {
     #[async_trait]
     impl<E> Target<E> for TestTarget
     where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: rustfs_targets::PluginEvent,
     {
         fn id(&self) -> TargetID {
             self.id.clone()

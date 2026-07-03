@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -37,8 +38,6 @@ use redis::{
 use rustfs_config::{REDIS_TLS_CA, REDIS_TLS_CLIENT_CERT, REDIS_TLS_CLIENT_KEY, REDIS_TLS_POLICY};
 use rustls::pki_types::CertificateDer;
 use rustls::pki_types::pem::PemObject;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::io::BufReader;
 use std::path::Path;
@@ -300,7 +299,7 @@ fn validate_redis_tls_config(url: &Url, tls: &RedisTlsConfig) -> Result<(), Targ
 
 pub struct RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: RedisArgs,
@@ -326,7 +325,7 @@ where
 
 impl<E> RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     #[instrument(skip(args), fields(target_id_as_string = %id))]
     pub fn new(id: String, args: RedisArgs) -> Result<Self, TargetError> {
@@ -518,7 +517,7 @@ where
 #[async_trait]
 impl<E> Target<E> for RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -796,7 +795,7 @@ fn compute_retry_delay(attempt: usize, min_delay: Duration, max_delay: Duration)
 #[async_trait]
 impl<E> ReloadableTargetTls for RedisTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Client;
 

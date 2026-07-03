@@ -25,6 +25,7 @@
 //! Connection pooling is delegated to `deadpool-postgres`; the pool itself
 //! is `Clone`, so no `Mutex` is required around it.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -44,8 +45,6 @@ use async_trait::async_trait;
 use deadpool_postgres::{Manager, ManagerConfig, Pool, RecyclingMethod};
 use rustfs_config::{POSTGRES_DSN_STRING, POSTGRES_TLS_CA, POSTGRES_TLS_CLIENT_CERT, POSTGRES_TLS_CLIENT_KEY};
 use rustfs_tls_runtime::{load_certs, load_private_key};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::Path;
 use std::sync::Arc;
@@ -555,7 +554,7 @@ fn resolve_payload_key(payload: &serde_json::Value, meta: &QueuedPayloadMeta) ->
 /// the legacy inline fingerprint check is used as a fallback.
 pub struct PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: PostgresArgs,
@@ -573,7 +572,7 @@ where
 
 impl<E> PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(PostgresTarget::<E> {
@@ -692,7 +691,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Pool;
 
@@ -727,7 +726,7 @@ where
 #[async_trait]
 impl<E> Target<E> for PostgresTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()

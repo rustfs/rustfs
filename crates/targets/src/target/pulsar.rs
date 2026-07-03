@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -30,8 +31,6 @@ use crate::{
 use async_trait::async_trait;
 use pulsar::{Authentication, Producer, Pulsar, TokioExecutor};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -186,7 +185,7 @@ pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, 
 
 pub struct PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: PulsarArgs,
@@ -203,7 +202,7 @@ where
 
 impl<E> PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(PulsarTarget::<E> {
@@ -339,7 +338,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Pulsar<TokioExecutor>;
 
@@ -384,7 +383,7 @@ where
 #[async_trait]
 impl<E> Target<E> for PulsarTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()

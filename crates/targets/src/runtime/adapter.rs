@@ -16,10 +16,9 @@ use super::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,
     TargetRuntimeManager, activate_targets_with_replay, init_target_and_optionally_start_replay, start_replay_worker,
 };
+use crate::plugin::PluginEvent;
 use crate::{Target, TargetError};
 use async_trait::async_trait;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -33,7 +32,7 @@ type ReplayStartObserver = Arc<dyn Fn(&str, bool) + Send + Sync>;
 #[async_trait]
 pub trait PluginRuntimeAdapter<E>: Send + Sync
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     async fn activate_with_replay(&self, targets: Vec<Box<dyn Target<E> + Send + Sync>>) -> RuntimeActivation<E>;
 
@@ -66,7 +65,7 @@ where
 #[derive(Clone)]
 pub struct BuiltinPluginRuntimeAdapter<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     replay_hook: ReplayHook<E>,
     replay_start_observer: ReplayStartObserver,
@@ -78,7 +77,7 @@ where
 
 impl<E> BuiltinPluginRuntimeAdapter<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn new(
         replay_hook: ReplayHook<E>,
@@ -102,7 +101,7 @@ where
 #[async_trait]
 impl<E> PluginRuntimeAdapter<E> for BuiltinPluginRuntimeAdapter<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     async fn activate_with_replay(&self, targets: Vec<Box<dyn Target<E> + Send + Sync>>) -> RuntimeActivation<E> {
         let replay_hook = Arc::clone(&self.replay_hook);
@@ -184,12 +183,12 @@ where
 #[cfg(test)]
 mod tests {
     use super::{BuiltinPluginRuntimeAdapter, PluginRuntimeAdapter};
+    use crate::PluginEvent;
     use crate::arn::TargetID;
     use crate::store::{Key, QueueStore, Store};
     use crate::target::{EntityTarget, QueuedPayload, QueuedPayloadMeta};
     use crate::{StoreError, Target, TargetError};
     use async_trait::async_trait;
-    use serde::{Serialize, de::DeserializeOwned};
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -230,7 +229,7 @@ mod tests {
     #[async_trait]
     impl<E> Target<E> for TestTarget
     where
-        E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+        E: PluginEvent,
     {
         fn id(&self) -> TargetID {
             self.id.clone()
