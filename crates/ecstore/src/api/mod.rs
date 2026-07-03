@@ -86,8 +86,8 @@ pub mod disk {
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
         CheckPartsResp, DeleteOptions, Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore,
-        FileInfoVersions, FileReader, FileWriter, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-        RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
+        FileInfoVersions, FileReader, FileWriter, HEALING_MARKER_PATH, RUSTFS_META_BUCKET, ReadMultipleReq, ReadMultipleResp,
+        ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, UpdateMetadataOpts, VolumeInfo, WalkDirOptions, new_disk,
         validate_batch_read_version_item_count,
     };
     pub use crate::disk::{endpoint, error, error_reduce};
@@ -145,8 +145,8 @@ pub mod notification {
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader, RangedDecompressReader,
-        StreamConsumer,
+        BLOCK_SIZE_V2, ERASURE_ALGORITHM, GetObjectBodyCacheHook, GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader,
+        RangedDecompressReader, StreamConsumer, register_get_object_body_cache_hook,
     };
 }
 

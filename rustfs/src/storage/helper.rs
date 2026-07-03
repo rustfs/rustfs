@@ -237,6 +237,13 @@ impl OperationHelper {
         }))
     }
 
+    /// True when a pending event notification still needs the final ObjectInfo.
+    /// Callers can use this to avoid cloning ObjectInfo when the event chain is
+    /// disabled or suppressed.
+    pub fn wants_object_info(&self) -> bool {
+        matches!(self, Self::Enabled(state) if state.event_builder.is_some())
+    }
+
     /// Sets the ObjectInfo for event notification.
     pub fn object(mut self, object_info: ObjectInfo) -> Self {
         if let Self::Enabled(state) = &mut self

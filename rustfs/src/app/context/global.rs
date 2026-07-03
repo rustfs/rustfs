@@ -79,6 +79,9 @@ pub struct AppContext {
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
         let object_data_cache = ObjectDataCacheAdapter::from_env_or_disabled();
+        // Let ecstore probe this cache inside get_object_reader, after
+        // metadata resolution but before the erasure data read (backlog#802).
+        crate::app::object_data_cache::register_object_data_cache_body_hook(Arc::clone(&object_data_cache));
 
         Self {
             object_store,

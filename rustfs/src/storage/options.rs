@@ -45,7 +45,44 @@ use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
+use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
+use s3s::dto::VersioningConfiguration;
+
+/// Fetch the bucket's versioning configuration once so callers can derive
+/// enabled/suspended state without repeated metadata-sys lookups per request.
+async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
+    match BucketVersioningSys::get(bucket).await {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!("{:?}", err);
+            VersioningConfiguration::default()
+        }
+    }
+}
+
+/// Whether GET should skip per-shard bitrot verification. Read once: the env
+/// flag is consulted on every GET and `std::env::var` takes a process-global
+/// lock. In tests the env is read directly so `temp_env` overrides apply.
+fn get_skip_verify_bitrot() -> bool {
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(
+            rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+            rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+        )
+    }
+    #[cfg(not(test))]
+    {
+        static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *CACHED.get_or_init(|| {
+            rustfs_utils::get_env_bool(
+                rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
+                rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
+            )
+        })
+    }
+}
 
 /// Creates options for deleting an object in a bucket.
 pub async fn del_opts(
@@ -55,8 +92,9 @@ pub async fn del_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::suspended(bucket).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.suspended();
 
     let vid = if vid.is_none() {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
@@ -120,8 +158,9 @@ pub async fn get_opts(
     part_num: Option<usize>,
     headers: &HeaderMap<HeaderValue>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.prefix_suspended(object);
 
     let vid = vid.map(|v| v.as_str().trim().to_owned());
 
@@ -159,10 +198,7 @@ pub async fn get_opts(
 
     // Optionally skip per-shard bitrot hash verification on reads to save CPU.
     // Background scanner still performs full integrity checks asynchronously.
-    opts.skip_verify_bitrot = rustfs_utils::get_env_bool(
-        rustfs_config::ENV_OBJECT_GET_SKIP_BITROT_VERIFY,
-        rustfs_config::DEFAULT_OBJECT_GET_SKIP_BITROT_VERIFY,
-    );
+    opts.skip_verify_bitrot = get_skip_verify_bitrot();
 
     fill_conditional_writes_opts_from_header(headers, &mut opts)?;
 
@@ -213,8 +249,9 @@ pub async fn put_opts(
     headers: &HeaderMap<HeaderValue>,
     metadata: HashMap<String, String>,
 ) -> Result<ObjectOptions> {
-    let versioned = BucketVersioningSys::prefix_enabled(bucket, object).await;
-    let version_suspended = BucketVersioningSys::prefix_suspended(bucket, object).await;
+    let versioning_cfg = bucket_versioning_config(bucket).await;
+    let versioned = versioning_cfg.prefix_enabled(object);
+    let version_suspended = versioning_cfg.prefix_suspended(object);
 
     let vid = if vid.is_none() {
         get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())

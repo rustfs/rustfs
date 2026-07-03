@@ -14,9 +14,10 @@
 
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 use tracing::{debug, warn};
 use uuid::Uuid;
@@ -32,6 +33,39 @@ const EVENT_HEAL_CHECKPOINT_STATE: &str = "heal_checkpoint_state";
 const RESUME_STATE_FILE: &str = "ahm_resume_state.json";
 const RESUME_PROGRESS_FILE: &str = "ahm_progress.json";
 const RESUME_CHECKPOINT_FILE: &str = "ahm_checkpoint.json";
+
+/// Persistence throttle for per-object bookkeeping: flush after this many
+/// buffered mutations or once the interval elapses, whichever comes first.
+/// Object heal is idempotent, so a crash re-heals at most one throttle window.
+const PERSIST_EVERY_MUTATIONS: usize = 1000;
+const PERSIST_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Tracks buffered mutations between persisted snapshots.
+#[derive(Debug)]
+struct PersistThrottle {
+    pending: usize,
+    last_save: Instant,
+}
+
+impl PersistThrottle {
+    fn new() -> Self {
+        Self {
+            pending: 0,
+            last_save: Instant::now(),
+        }
+    }
+
+    /// Record one mutation; returns true when the batch should be flushed.
+    fn record(&mut self) -> bool {
+        self.pending += 1;
+        self.pending >= PERSIST_EVERY_MUTATIONS || self.last_save.elapsed() >= PERSIST_INTERVAL
+    }
+
+    fn mark_saved(&mut self) {
+        self.pending = 0;
+        self.last_save = Instant::now();
+    }
+}
 
 /// Helper function to convert Path to &str, returning an error if conversion fails
 fn path_to_str(path: &Path) -> Result<&str> {
@@ -168,6 +202,7 @@ impl ResumeState {
 pub struct ResumeManager {
     disk: DiskStore,
     state: Arc<RwLock<ResumeState>>,
+    throttle: Mutex<PersistThrottle>,
 }
 
 impl ResumeManager {
@@ -183,6 +218,7 @@ impl ResumeManager {
         let manager = Self {
             disk,
             state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
         };
 
         // save initial state
@@ -210,6 +246,7 @@ impl ResumeManager {
         Ok(Self {
             disk,
             state: Arc::new(RwLock::new(state)),
+            throttle: Mutex::new(PersistThrottle::new()),
         })
     }
 
@@ -235,15 +272,31 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.update_progress(processed, successful, failed, skipped);
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
-    /// set current item
+    /// Set current item. Called once per healed object, so persistence is
+    /// throttled: the in-memory state always updates, but the snapshot is only
+    /// written every `PERSIST_EVERY_MUTATIONS` calls or `PERSIST_INTERVAL`.
     pub async fn set_current_item(&self, bucket: Option<String>, object: Option<String>) -> Result<()> {
         let mut state = self.state.write().await;
         state.set_current_item(bucket, object);
         drop(state);
-        self.save_state().await
+        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
+        if !should_save {
+            return Ok(());
+        }
+        self.save_state_throttled().await
+    }
+
+    async fn save_state_throttled(&self) -> Result<()> {
+        let result = self.save_state().await;
+        if result.is_ok()
+            && let Ok(mut throttle) = self.throttle.lock()
+        {
+            throttle.mark_saved();
+        }
+        result
     }
 
     /// complete bucket
@@ -251,7 +304,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.complete_bucket(bucket);
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
     /// mark task completed
@@ -259,7 +312,7 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         state.mark_completed();
         drop(state);
-        self.save_state().await
+        self.save_state_throttled().await
     }
 
     /// set error message
@@ -376,12 +429,15 @@ pub struct ResumeCheckpoint {
     pub current_bucket_index: usize,
     /// current object index
     pub current_object_index: usize,
-    /// processed objects
-    pub processed_objects: Vec<String>,
+    /// Objects healed since the last completed page. HashSet: with the
+    /// previous Vec the per-object `contains` was O(n) and made large-bucket
+    /// heals O(N²). Only spans the in-flight page — completed pages are
+    /// covered by `current_object_index`, so `complete_page` prunes the sets.
+    pub processed_objects: HashSet<String>,
     /// failed objects
-    pub failed_objects: Vec<String>,
+    pub failed_objects: HashSet<String>,
     /// skipped objects
-    pub skipped_objects: Vec<String>,
+    pub skipped_objects: HashSet<String>,
 }
 
 impl ResumeCheckpoint {
@@ -391,9 +447,9 @@ impl ResumeCheckpoint {
             checkpoint_time: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs(),
             current_bucket_index: 0,
             current_object_index: 0,
-            processed_objects: Vec::new(),
-            failed_objects: Vec::new(),
-            skipped_objects: Vec::new(),
+            processed_objects: HashSet::new(),
+            failed_objects: HashSet::new(),
+            skipped_objects: HashSet::new(),
         }
     }
 
@@ -404,21 +460,25 @@ impl ResumeCheckpoint {
     }
 
     pub fn add_processed_object(&mut self, object: String) {
-        if !self.processed_objects.contains(&object) {
-            self.processed_objects.push(object);
-        }
+        self.processed_objects.insert(object);
     }
 
     pub fn add_failed_object(&mut self, object: String) {
-        if !self.failed_objects.contains(&object) {
-            self.failed_objects.push(object);
-        }
+        self.failed_objects.insert(object);
     }
 
     pub fn add_skipped_object(&mut self, object: String) {
-        if !self.skipped_objects.contains(&object) {
-            self.skipped_objects.push(object);
-        }
+        self.skipped_objects.insert(object);
+    }
+
+    /// Advance past a fully-processed page: objects below `object_index` are
+    /// skipped by position on resume, so the per-object sets no longer need
+    /// their entries and would otherwise grow with the whole bucket.
+    pub fn complete_page(&mut self, bucket_index: usize, object_index: usize) {
+        self.update_position(bucket_index, object_index);
+        self.processed_objects.clear();
+        self.skipped_objects.clear();
+        self.failed_objects.clear();
     }
 }
 
@@ -426,6 +486,7 @@ impl ResumeCheckpoint {
 pub struct CheckpointManager {
     disk: DiskStore,
     checkpoint: Arc<RwLock<ResumeCheckpoint>>,
+    throttle: Mutex<PersistThrottle>,
 }
 
 impl CheckpointManager {
@@ -435,6 +496,7 @@ impl CheckpointManager {
         let manager = Self {
             disk,
             checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
         };
 
         // save initial checkpoint
@@ -462,6 +524,7 @@ impl CheckpointManager {
         Ok(Self {
             disk,
             checkpoint: Arc::new(RwLock::new(checkpoint)),
+            throttle: Mutex::new(PersistThrottle::new()),
         })
     }
 
@@ -487,31 +550,59 @@ impl CheckpointManager {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.update_position(bucket_index, object_index);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_throttled().await
     }
 
-    /// add processed object
+    /// Advance past a completed page and prune the per-object sets, then persist.
+    pub async fn complete_page(&self, bucket_index: usize, object_index: usize) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        checkpoint.complete_page(bucket_index, object_index);
+        drop(checkpoint);
+        self.save_checkpoint_throttled().await
+    }
+
+    /// Add a processed object. Called once per healed object, so persistence
+    /// is batched (`PERSIST_EVERY_MUTATIONS` / `PERSIST_INTERVAL`); positions
+    /// and page boundaries still persist unconditionally.
     pub async fn add_processed_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_processed_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
     }
 
-    /// add failed object
+    /// add failed object (batched, see `add_processed_object`)
     pub async fn add_failed_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_failed_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
     }
 
-    /// add skipped object
+    /// add skipped object (batched, see `add_processed_object`)
     pub async fn add_skipped_object(&self, object: String) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;
         checkpoint.add_skipped_object(object);
         drop(checkpoint);
-        self.save_checkpoint().await
+        self.save_checkpoint_if_due().await
+    }
+
+    async fn save_checkpoint_if_due(&self) -> Result<()> {
+        let should_save = self.throttle.lock().map(|mut throttle| throttle.record()).unwrap_or(true);
+        if !should_save {
+            return Ok(());
+        }
+        self.save_checkpoint_throttled().await
+    }
+
+    async fn save_checkpoint_throttled(&self) -> Result<()> {
+        let result = self.save_checkpoint().await;
+        if result.is_ok()
+            && let Ok(mut throttle) = self.throttle.lock()
+        {
+            throttle.mark_saved();
+        }
+        result
     }
 
     /// cleanup checkpoint
@@ -730,6 +821,55 @@ mod tests {
         assert_eq!(state.pending_buckets.len(), 1);
         assert_eq!(state.completed_buckets.len(), 1);
         assert!(state.completed_buckets.contains(&"bucket1".to_string()));
+    }
+
+    #[test]
+    fn test_checkpoint_object_sets_dedupe_and_prune() {
+        let mut checkpoint = ResumeCheckpoint::new("task".to_string());
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_processed_object("bucket/a".to_string());
+        checkpoint.add_skipped_object("bucket/b".to_string());
+        checkpoint.add_failed_object("bucket/c".to_string());
+        assert_eq!(checkpoint.processed_objects.len(), 1);
+        assert!(checkpoint.processed_objects.contains("bucket/a"));
+
+        checkpoint.complete_page(2, 2000);
+        assert_eq!(checkpoint.current_bucket_index, 2);
+        assert_eq!(checkpoint.current_object_index, 2000);
+        assert!(checkpoint.processed_objects.is_empty());
+        assert!(checkpoint.skipped_objects.is_empty());
+        assert!(checkpoint.failed_objects.is_empty());
+    }
+
+    #[test]
+    fn test_checkpoint_loads_legacy_vec_format() {
+        // Checkpoints written before the HashSet migration stored the object
+        // lists as JSON arrays (possibly with duplicates); they must still load.
+        let legacy = r#"{
+            "task_id": "t1",
+            "checkpoint_time": 1700000000,
+            "current_bucket_index": 1,
+            "current_object_index": 42,
+            "processed_objects": ["a", "b", "a"],
+            "failed_objects": [],
+            "skipped_objects": ["c"]
+        }"#;
+        let checkpoint: ResumeCheckpoint = serde_json::from_str(legacy).unwrap();
+        assert_eq!(checkpoint.current_object_index, 42);
+        assert_eq!(checkpoint.processed_objects.len(), 2);
+        assert!(checkpoint.processed_objects.contains("a"));
+        assert!(checkpoint.skipped_objects.contains("c"));
+    }
+
+    #[test]
+    fn test_persist_throttle_batches_until_threshold() {
+        let mut throttle = PersistThrottle::new();
+        for _ in 0..PERSIST_EVERY_MUTATIONS - 1 {
+            assert!(!throttle.record(), "must not flush below the mutation threshold");
+        }
+        assert!(throttle.record(), "must flush at the mutation threshold");
+        throttle.mark_saved();
+        assert!(!throttle.record(), "counter must reset after a save");
     }
 
     #[tokio::test]

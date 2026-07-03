@@ -198,6 +198,11 @@ pub struct HealRequest {
     pub force_start: bool,
     /// Number of recoverable retry attempts already scheduled for this request.
     pub retry_attempts: u32,
+    /// Endpoints of the disks being rebuilt by an erasure-set heal. Used to
+    /// write per-disk healing markers so `DiskInfo.healing` reflects reality;
+    /// empty when the trigger doesn't know the specific disks (admin API,
+    /// unclean-shutdown verification).
+    pub heal_endpoints: Vec<String>,
     /// Created time
     pub created_at: SystemTime,
     /// Queue admission time used for scheduler delay metrics
@@ -215,6 +220,7 @@ impl HealRequest {
             source: HealRequestSource::Internal,
             force_start: false,
             retry_attempts: 0,
+            heal_endpoints: Vec::new(),
             created_at: now,
             enqueued_at: now,
         }
@@ -267,6 +273,8 @@ pub struct HealTask {
     pub source: HealRequestSource,
     /// Number of recoverable retry attempts already scheduled for this task.
     pub retry_attempts: u32,
+    /// Endpoints of the disks being rebuilt (see `HealRequest::heal_endpoints`).
+    pub heal_endpoints: Vec<String>,
     /// Task status
     pub status: Arc<RwLock<HealTaskStatus>>,
     /// Progress tracking
@@ -298,6 +306,7 @@ impl HealTask {
             priority: request.priority,
             source: request.source,
             retry_attempts: request.retry_attempts,
+            heal_endpoints: request.heal_endpoints,
             status: Arc::new(RwLock::new(HealTaskStatus::Pending)),
             progress: Arc::new(RwLock::new(HealProgress::new())),
             result_items: Arc::new(RwLock::new(Vec::new())),
@@ -320,6 +329,7 @@ impl HealTask {
             source: self.source,
             force_start: false,
             retry_attempts: self.retry_attempts.saturating_add(1),
+            heal_endpoints: self.heal_endpoints.clone(),
             created_at: self.created_at,
             enqueued_at: SystemTime::now(),
         }
@@ -2038,6 +2048,10 @@ impl HealTask {
             progress.update_progress(1, 4, 0, 0);
         }
 
+        // The rebuilt disks are formatted now: mark them as healing so
+        // DiskInfo.healing reflects the rebuild until it completes.
+        super::set_healing_markers(&self.heal_endpoints, &set_disk_id).await;
+
         // Step 2: Get disk for resume functionality
         debug!(
             target: "rustfs::heal::task",
@@ -2151,6 +2165,12 @@ impl HealTask {
             "Heal erasure set stage entered"
         );
         let result = erasure_healer.heal_erasure_set(&buckets, &set_disk_id).await;
+
+        // Keep the markers on failure: the resume state also persists, and the
+        // next run of this set heal re-marks and eventually clears them.
+        if result.is_ok() {
+            super::clear_healing_markers(&self.heal_endpoints).await;
+        }
 
         {
             let mut progress = self.progress.write().await;

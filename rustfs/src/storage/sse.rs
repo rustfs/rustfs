@@ -2208,7 +2208,7 @@ pub fn mark_encrypted_multipart_metadata(metadata: &mut HashMap<String, String>)
     metadata.insert(MINIO_INTERNAL_ENCRYPTION_MULTIPART_HEADER.to_string(), String::new());
 }
 
-fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn contains_managed_encryption_metadata(metadata: &HashMap<String, String>) -> bool {
     metadata.contains_key(INTERNAL_ENCRYPTION_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_S3_SEALED_KEY_HEADER)
         || metadata.contains_key(MINIO_INTERNAL_ENCRYPTION_KMS_SEALED_KEY_HEADER)

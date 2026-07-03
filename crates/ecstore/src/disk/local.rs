@@ -864,6 +864,14 @@ impl LocalDisk {
                                 Vec::new()
                             }
                         };
+                        // An erasure-set heal drops a marker on the disks it is
+                        // rebuilding (see rustfs-heal); surface it so scanner
+                        // coordination, lock selection and admin/metrics see
+                        // the rebuild. Refreshed with this cache (~1s).
+                        let healing =
+                            tokio::fs::try_exists(root.join(super::RUSTFS_META_BUCKET).join(super::HEALING_MARKER_PATH))
+                                .await
+                                .unwrap_or(false);
                         let disk_info = DiskInfo {
                             total: info.total,
                             free: info.free,
@@ -876,13 +884,13 @@ impl LocalDisk {
                             root_disk: is_root_disk,
                             physical_device_ids,
                             id: disk_id,
+                            healing,
                             ..Default::default()
                         };
                         // if root {
                         //     return Err(Error::new(DiskError::DriveIsRoot));
                         // }
 
-                        // disk_info.healing =
                         Ok(disk_info)
                     }
                     Err(err) => Err(err.into()),
