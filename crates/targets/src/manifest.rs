@@ -13,6 +13,9 @@
 // limitations under the License.
 
 use crate::domain::TargetDomain;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+
 use rustfs_config::{
     AMQP_PASSWORD, AMQP_TLS_CLIENT_CERT, AMQP_TLS_CLIENT_KEY, KAFKA_SASL_PASSWORD, KAFKA_TLS_CLIENT_CERT, KAFKA_TLS_CLIENT_KEY,
     MQTT_PASSWORD, MQTT_TLS_CLIENT_CERT, MQTT_TLS_CLIENT_KEY, MYSQL_DSN_STRING, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY,
@@ -210,8 +213,20 @@ fn builtin_plugin_id(target_type: &'static str) -> &'static str {
         "mysql" => "builtin:mysql",
         "redis" => "builtin:redis",
         "postgres" => "builtin:postgres",
-        _ => "custom:target",
+        _ => custom_plugin_id(target_type),
     }
+}
+
+/// Interns a unique `custom:<target_type>` plugin id per non-builtin target type.
+/// A shared fallback id would make distinct custom plugins collide in every
+/// identity-keyed surface (registry keys, canonical instance ids, admin catalog).
+/// The leak is bounded by the number of distinct registered target types.
+fn custom_plugin_id(target_type: &'static str) -> &'static str {
+    static CUSTOM_PLUGIN_IDS: OnceLock<Mutex<HashMap<&'static str, &'static str>>> = OnceLock::new();
+    let ids = CUSTOM_PLUGIN_IDS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut ids = ids.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    ids.entry(target_type)
+        .or_insert_with(|| Box::leak(format!("custom:{target_type}").into_boxed_str()))
 }
 
 #[cfg(test)]
@@ -261,6 +276,18 @@ mod tests {
         let manifest = builtin_target_marketplace_manifest("kafka");
 
         assert_eq!(manifest.supported_domains, &[TargetDomain::Audit, TargetDomain::Notify]);
+    }
+
+    #[test]
+    fn custom_target_types_get_unique_stable_plugin_ids() {
+        let first = builtin_target_manifest("custom-a");
+        let second = builtin_target_manifest("custom-b");
+
+        assert_eq!(first.plugin_id, "custom:custom-a");
+        assert_eq!(second.plugin_id, "custom:custom-b");
+        assert_ne!(first.plugin_id, second.plugin_id);
+        // Interned: repeated lookups return the same &'static str.
+        assert!(std::ptr::eq(first.plugin_id, builtin_target_manifest("custom-a").plugin_id));
     }
 
     #[test]

@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -31,8 +32,6 @@ use async_trait::async_trait;
 use mysql_async::{Conn, Opts, OptsBuilder, Pool, PoolConstraints, PoolOpts, SslOpts, prelude::Queryable};
 use rustfs_config::{MYSQL_TLS_CA, MYSQL_TLS_CLIENT_CERT, MYSQL_TLS_CLIENT_KEY};
 use rustfs_tls_runtime::{load_certs, load_private_key};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::marker::PhantomData;
 use std::path::{Path, PathBuf};
@@ -505,7 +504,7 @@ async fn validate_existing_schema(conn: &mut Conn, table: &str) -> Result<(), Ta
 /// ```
 pub struct MySqlTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Unique target identifier (name + type)
     id: TargetID,
@@ -528,7 +527,7 @@ where
 
 impl<E> MySqlTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Creates a new MySqlTarget.
     ///
@@ -770,7 +769,7 @@ pub(crate) fn map_mysql_error(err: mysql_async::Error, operation: &str) -> Targe
 #[async_trait]
 impl<E> Target<E> for MySqlTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -927,7 +926,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for MySqlTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Pool;
 

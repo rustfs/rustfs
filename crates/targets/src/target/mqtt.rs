@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -39,8 +40,6 @@ use rustfs_config::{
 };
 use rustfs_tls_runtime::{load_certs, load_private_key};
 use rustls::ClientConfig;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::sync::Arc;
 use std::{
@@ -524,7 +523,7 @@ struct BgTaskManager {
 /// A target that sends events to an MQTT broker
 pub struct MQTTTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: MQTTArgs,
@@ -544,7 +543,7 @@ where
 
 impl<E> MQTTTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Creates a new MQTTTarget
     #[instrument(skip(args), fields(target_id_as_string = %id))]
@@ -844,7 +843,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for MQTTTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = MqttOptions;
 
@@ -1130,7 +1129,7 @@ fn is_fatal_mqtt_error(err: &ConnectionError) -> bool {
 #[async_trait]
 impl<E> Target<E> for MQTTTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()

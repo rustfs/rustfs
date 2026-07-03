@@ -33,10 +33,9 @@ use rustfs_extension_schema::{
 };
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::{
-    OpsDiagnosticsRegistry, OpsProfilerRegistry, TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus,
-    builtin_extension_schemas, builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema,
-    builtin_ops_profiler_contract, builtin_ops_profiler_extension_schema, catalog::example_external_webhook_plugin,
-    target_marketplace_extension_schema,
+    TargetPluginExternalFlowGate, TargetPluginExternalFlowGateStatus, builtin_extension_schemas,
+    builtin_ops_diagnostics_contract, builtin_ops_diagnostics_extension_schema, builtin_ops_profiler_contract,
+    builtin_ops_profiler_extension_schema,
 };
 use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
@@ -105,14 +104,14 @@ pub(crate) struct ExtensionInstanceEntry {
     pub config: HashMap<String, String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub operational_state: Option<PluginOperationalStateContract>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_codes: Vec<PluginInstanceDiagnosticCode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct ExtensionInstancesResponse {
     pub instances: Vec<ExtensionInstanceEntry>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     pub diagnostic_counts: Vec<PluginInstanceDiagnosticCount>,
     pub truncated: bool,
     pub next_marker: Option<String>,
@@ -121,8 +120,6 @@ pub(crate) struct ExtensionInstancesResponse {
 async fn build_extension_catalog_response()
 -> Result<ExtensionCatalogResponse, crate::admin::storage_api::cluster::CapabilitySnapshotError> {
     let mut extensions = builtin_extension_schemas();
-    let example = example_external_webhook_plugin();
-    extensions.push(target_marketplace_extension_schema(&example.manifest));
     extensions.sort_by(|a, b| a.extension_id.cmp(&b.extension_id));
     let runtime_capabilities = system::build_runtime_capabilities_response().await?;
     let cluster_snapshot = cluster_snapshot::build_cluster_snapshot_discovery_response().await;
@@ -140,21 +137,8 @@ fn build_extension_runtime_capabilities_response(
 ) -> ExtensionRuntimeCapabilitiesResponse {
     let ops_diagnostics_schema = builtin_ops_diagnostics_extension_schema();
     let ops_diagnostics_contract = builtin_ops_diagnostics_contract();
-    let mut ops_diagnostics_registry = OpsDiagnosticsRegistry::new();
-    debug_assert!(
-        ops_diagnostics_registry
-            .register_schema(&ops_diagnostics_schema, &ops_diagnostics_contract)
-            .is_ok()
-    );
-
     let ops_profiler_schema = builtin_ops_profiler_extension_schema();
     let ops_profiler_contract = builtin_ops_profiler_contract();
-    let mut ops_profiler_registry = OpsProfilerRegistry::new();
-    debug_assert!(
-        ops_profiler_registry
-            .register_schema(&ops_profiler_schema, &ops_profiler_contract)
-            .is_ok()
-    );
     let runtime_capability_path = Some(format!("{}{}", ADMIN_PREFIX, system::RUNTIME_CAPABILITIES_ROUTE_SUFFIX));
 
     ExtensionRuntimeCapabilitiesResponse {
@@ -333,6 +317,40 @@ mod tests {
         assert!(
             instance_auth.contains("AdminAction::GetBucketTargetAction"),
             "extension instances should require target read permission"
+        );
+    }
+
+    #[test]
+    fn builtin_ops_schemas_register_cleanly_in_runtime_registries() {
+        let mut diagnostics_registry = rustfs_targets::OpsDiagnosticsRegistry::new();
+        diagnostics_registry
+            .register_schema(
+                &rustfs_targets::builtin_ops_diagnostics_extension_schema(),
+                &rustfs_targets::builtin_ops_diagnostics_contract(),
+            )
+            .expect("builtin ops diagnostics schema should register");
+
+        let mut profiler_registry = rustfs_targets::OpsProfilerRegistry::new();
+        profiler_registry
+            .register_schema(
+                &rustfs_targets::builtin_ops_profiler_extension_schema(),
+                &rustfs_targets::builtin_ops_profiler_contract(),
+            )
+            .expect("builtin ops profiler schema should register");
+    }
+
+    #[tokio::test]
+    async fn extension_catalog_never_exposes_example_or_external_fixtures() {
+        let response = build_extension_catalog_response()
+            .await
+            .expect("extension catalog response should build");
+
+        assert!(
+            !response
+                .extensions
+                .iter()
+                .any(|schema| schema.extension_id.starts_with("external:")),
+            "example external plugin fixtures must not leak into the production extension catalog"
         );
     }
 

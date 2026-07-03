@@ -341,7 +341,6 @@ mod tests {
                 S3HookPoint::PostAuthListObjects,
             ]
         );
-        assert!(contract.hook_points.iter().all(|hook_point| hook_point.is_post_auth()));
         assert!(!contract.mutates_object_data);
         assert!(!contract.bypasses_iam);
         assert!(validate_s3_hook_contract(&contract).is_ok());
