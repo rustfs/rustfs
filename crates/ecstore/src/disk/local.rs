@@ -1623,12 +1623,11 @@ impl LocalDisk {
             return Ok(());
         }
 
-        // Update xl.meta
+        // Update xl.meta atomically: a concurrent reader or crash mid-write must
+        // never observe a truncated xl.meta for versions that were not deleted.
         let buf = fm.marshal_msg()?;
 
-        let volume_dir = self.get_bucket_path(volume)?;
-
-        self.write_all_private(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), buf.into(), true, &volume_dir)
+        self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &buf, true)
             .await?;
 
         Ok(())
@@ -2873,7 +2872,9 @@ impl DiskAPI for LocalDisk {
         if let Some(parent) = file_path.parent() {
             os::make_dir_all(parent, &volume_dir).await?;
         }
-        let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY)
+        // O_TRUNC: if a file already exists at this path, stale trailing bytes past
+        // the new content would otherwise survive and mismatch the metadata size.
+        let f = super::fs::open_file(&file_path, O_CREATE | O_WRONLY | O_TRUNC)
             .await
             .map_err(to_file_error)?;
         let reclaim_on_shutdown = should_reclaim_file_cache_after_write(_file_size);
@@ -3927,7 +3928,9 @@ impl DiskAPI for LocalDisk {
 
         let fm_data = meta.marshal_msg()?;
 
-        self.write_all(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), fm_data.into())
+        // Atomic temp+rename: this path also rewrites live xl.meta (delete markers,
+        // decommission), where an in-place truncate would expose torn metadata.
+        self.write_all_meta(volume, format!("{path}/{STORAGE_FORMAT_FILE}").as_str(), &fm_data, true)
             .await?;
 
         Ok(())
