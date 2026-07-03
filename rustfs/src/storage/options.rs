@@ -55,7 +55,11 @@ async fn bucket_versioning_config(bucket: &str) -> VersioningConfiguration {
     match BucketVersioningSys::get(bucket).await {
         Ok(cfg) => cfg,
         Err(err) => {
-            tracing::warn!("{:?}", err);
+            tracing::warn!(
+                bucket = %bucket,
+                error = ?err,
+                "failed to load bucket versioning configuration; using default configuration"
+            );
             VersioningConfiguration::default()
         }
     }

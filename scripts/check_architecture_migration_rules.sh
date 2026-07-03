@@ -84,6 +84,8 @@ require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" 
 require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" "crates/obs/src/metrics/storage_api.rs" "observability ECStore storage_api boundary"
 require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inventory.md" "architecture overview ECStore facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaFacade" "ECStore split plan replication crate filemeta facade section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Split Dependency Inventory" "ECStore split dependency inventory section"
@@ -138,6 +140,7 @@ LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_loc
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_crate_bypass_hits.txt"
 ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_contract_bypass_hits.txt"
+STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/storage_api_replication_contract_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -201,6 +204,7 @@ FUZZ_ECSTORE_COMPAT_BYPASS_HITS_FILE="${TMP_DIR}/fuzz_ecstore_compat_bypass_hits
 EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundary_hits.txt"
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
+REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
@@ -970,6 +974,18 @@ fi
 
 if [[ -s "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "ECStore owner replication contracts must stay behind crates/ecstore/src/bucket/replication: $(paste -sd '; ' "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename 'use\s+rustfs_filemeta::\{[^}]*\b(ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|rustfs_filemeta::(Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map)' \
+    crates/storage-api/src \
+    --glob '*.rs' |
+    rg -v '^crates/storage-api/src/replication\.rs:' || true
+) >"$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE"
+
+if [[ -s "$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE" ]]; then
+  report_failure "storage-api replication contracts must stay behind crates/storage-api/src/replication.rs: $(paste -sd '; ' "$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2591,6 +2607,18 @@ fi
 
 if [[ -s "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE" ]]; then
   report_failure "replication facade must use explicit compatibility exports instead of wildcard re-exports: $(paste -sd '; ' "$REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_filemeta::|use\s+rustfs_filemeta\b' \
+    crates/replication/src \
+    --glob '*.rs' |
+    rg -v '^crates/replication/src/filemeta\.rs:' || true
+) >"$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication crate filemeta contracts must stay behind crates/replication/src/filemeta.rs: $(paste -sd '; ' "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE")"
 fi
 
 (

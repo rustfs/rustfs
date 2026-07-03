@@ -23,6 +23,8 @@ pub mod object;
 pub mod observability;
 pub mod topology;
 
+mod replication;
+
 pub use admin::{DiskSetSelector, StorageAdminApi};
 pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOptions, MakeBucketOptions, SRBucketDeleteOp};
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
