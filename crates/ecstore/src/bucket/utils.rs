@@ -183,6 +183,29 @@ pub fn is_valid_object_name(object: &str) -> bool {
     is_valid_object_prefix(object)
 }
 
+/// Reserved DOS device names that shadow regular files on Windows, even when
+/// an extension is appended (e.g. `NUL.txt` resolves to the `NUL` device).
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3",
+    "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Returns true when `object` contains a path segment that NTFS can store but
+/// the Win32 API cannot address afterwards (issue #3449): segments ending in a
+/// dot or a space, and reserved DOS device names — bare or with an extension
+/// (`NUL.txt`), matching classic Win32 path resolution semantics.
+pub fn object_name_has_windows_incompatible_segment(object: &str) -> bool {
+    object.split(['/', '\\']).any(|segment| {
+        if segment.ends_with('.') || segment.ends_with(' ') {
+            return true;
+        }
+        // Device names are matched on the part before the first dot, with
+        // trailing spaces ignored (so `NUL .txt` is also reserved).
+        let base = segment.split('.').next().unwrap_or(segment).trim_end_matches(' ');
+        WINDOWS_RESERVED_NAMES.iter().any(|name| base.eq_ignore_ascii_case(name))
+    })
+}
+
 pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Result<()> {
     if object.len() > 1024 {
         return Err(StorageError::ObjectNameTooLong(bucket.to_owned(), object.to_owned()));
@@ -203,6 +226,12 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
             || object.contains('>')
         // || object.contains('\\')
         {
+            return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+        }
+
+        // Reject names that NTFS would happily create but the Win32 path
+        // layer cannot read back (os error 3), e.g. `baddir.` or `NUL.txt`.
+        if object_name_has_windows_incompatible_segment(object) {
             return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
         }
     }
@@ -440,6 +469,89 @@ mod tests {
         // Invalid cases - overly long path (>32KB)
         let long_path = "a/".repeat(16385); // 16385 * 2 = 32770 bytes, over 32KB (32768)
         assert!(!is_valid_object_prefix(&long_path));
+    }
+
+    #[test]
+    fn test_object_name_has_windows_incompatible_segment() {
+        // Segments ending in a dot are writable on NTFS but unreadable via Win32 paths.
+        assert!(object_name_has_windows_incompatible_segment("baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/dir2/baddir."));
+        assert!(object_name_has_windows_incompatible_segment("dir1/baddir./file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("file.txt."));
+
+        // Segments ending in a space.
+        assert!(object_name_has_windows_incompatible_segment("file.txt "));
+        assert!(object_name_has_windows_incompatible_segment("dir /file.txt"));
+
+        // Reserved DOS device names, bare and case-insensitive.
+        assert!(object_name_has_windows_incompatible_segment("NUL"));
+        assert!(object_name_has_windows_incompatible_segment("nul"));
+        assert!(object_name_has_windows_incompatible_segment("CON"));
+        assert!(object_name_has_windows_incompatible_segment("prn"));
+        assert!(object_name_has_windows_incompatible_segment("Aux"));
+        assert!(object_name_has_windows_incompatible_segment("COM1"));
+        assert!(object_name_has_windows_incompatible_segment("com9"));
+        assert!(object_name_has_windows_incompatible_segment("LPT1"));
+        assert!(object_name_has_windows_incompatible_segment("lpt9"));
+        assert!(object_name_has_windows_incompatible_segment("dir/NUL/file.txt"));
+
+        // Reserved device names with an extension still resolve to the device.
+        assert!(object_name_has_windows_incompatible_segment("NUL.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir/aux.log"));
+        assert!(object_name_has_windows_incompatible_segment("con.tar.gz"));
+        assert!(object_name_has_windows_incompatible_segment("com1.dat"));
+        assert!(object_name_has_windows_incompatible_segment("NUL .txt"));
+
+        // Backslash-separated segments are checked as well.
+        assert!(object_name_has_windows_incompatible_segment("dir\\baddir.\\file.txt"));
+        assert!(object_name_has_windows_incompatible_segment("dir\\nul"));
+
+        // Valid names must not be flagged.
+        assert!(!object_name_has_windows_incompatible_segment("file.txt"));
+        assert!(!object_name_has_windows_incompatible_segment("dir.name/file"));
+        assert!(!object_name_has_windows_incompatible_segment("path/to/file.tar.gz"));
+        assert!(!object_name_has_windows_incompatible_segment("nullable"));
+        assert!(!object_name_has_windows_incompatible_segment("CONSOLE"));
+        assert!(!object_name_has_windows_incompatible_segment("com10"));
+        assert!(!object_name_has_windows_incompatible_segment("com0"));
+        assert!(!object_name_has_windows_incompatible_segment("lpt"));
+        assert!(!object_name_has_windows_incompatible_segment("aux-data/file"));
+        assert!(!object_name_has_windows_incompatible_segment("object with spaces inside"));
+        assert!(!object_name_has_windows_incompatible_segment(""));
+    }
+
+    #[test]
+    fn test_check_object_name_windows_incompatible_segments() {
+        // Rejected on Windows (would be written but unreadable, issue #3449);
+        // valid on non-Windows platforms.
+        for object in [
+            "baddir.",
+            "dir1/dir2/baddir.",
+            "dir1/baddir./file.txt",
+            "file.txt ",
+            "NUL",
+            "nul.txt",
+            "COM1",
+            "dir/LPT9.log",
+        ] {
+            let result = check_object_name_for_length_and_slash("test-bucket", object);
+            if cfg!(target_os = "windows") {
+                assert!(
+                    matches!(result, Err(StorageError::ObjectNameInvalid(..))),
+                    "object name must be rejected on Windows: {object:?}"
+                );
+            } else {
+                assert!(result.is_ok(), "object name must remain valid on non-Windows: {object:?}");
+            }
+        }
+
+        // Valid on every platform.
+        for object in ["file.txt", "dir.name/file", "nullable", "CONSOLE", "com10"] {
+            assert!(
+                check_object_name_for_length_and_slash("test-bucket", object).is_ok(),
+                "object name must be valid on all platforms: {object:?}"
+            );
+        }
     }
 
     #[test]

@@ -14,6 +14,16 @@
 
 use super::*;
 
+/// Grace window during which a recently modified object is never deleted as
+/// dangling. 0 disables the grace window.
+const ENV_HEAL_DANGLING_DELETE_GRACE_SECS: &str = "RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS";
+const DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS: u64 = 3600;
+
+fn dangling_delete_grace() -> time::Duration {
+    let secs = rustfs_utils::get_env_u64(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS);
+    time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
 /// Result of scanning one disk's copy of a directory prefix while deciding
 /// whether an orphan (metadata-less) directory tree can be safely purged.
 enum OrphanDirScan {
@@ -582,6 +592,27 @@ impl SetDisks {
             return Err(DiskError::ErasureReadQuorum);
         }
 
+        // Recently written objects get a grace window before dangling cleanup: after
+        // an unclean shutdown some disks may still be catching up (or carry writes
+        // that were never made durable), and deleting the surviving shards right away
+        // turns a partial loss into a total one. Skip deletion and leave the object
+        // for a later heal/scanner pass to re-evaluate.
+        if m.is_valid()
+            && let Some(mod_time) = m.mod_time
+        {
+            let grace = dangling_delete_grace();
+            if !grace.is_zero() && OffsetDateTime::now_utc() - mod_time < grace {
+                info!(
+                    bucket = bucket,
+                    object = object,
+                    mod_time = %mod_time,
+                    grace_secs = grace.whole_seconds(),
+                    "skipping dangling-object deletion within grace window"
+                );
+                return Err(DiskError::ErasureReadQuorum);
+            }
+        }
+
         let mut tags: HashMap<String, String> = HashMap::new();
         tags.insert("set".to_string(), self.set_index.to_string());
         tags.insert("pool".to_string(), self.pool_index.to_string());
@@ -884,5 +915,27 @@ impl SetDisks {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dangling_delete_grace_defaults_to_one_hour() {
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, None::<&str>, || {
+            assert_eq!(dangling_delete_grace(), time::Duration::seconds(3600));
+        });
+    }
+
+    #[test]
+    fn dangling_delete_grace_env_override_and_disable() {
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("120"), || {
+            assert_eq!(dangling_delete_grace(), time::Duration::seconds(120));
+        });
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("0"), || {
+            assert!(dangling_delete_grace().is_zero());
+        });
     }
 }
