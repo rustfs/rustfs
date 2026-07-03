@@ -15,6 +15,7 @@
 pub mod config;
 pub mod delete;
 mod filemeta;
+mod http;
 pub mod mrf;
 pub mod multipart;
 pub mod object;

@@ -12,10 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::http::internal_key_rustfs;
 use bytes::Bytes;
 use core::fmt;
 use regex::Regex;
-use rustfs_utils::http::internal_key_rustfs;
 use serde::{Deserialize, Serialize};
 use std::any::Any;
 use std::collections::HashMap;

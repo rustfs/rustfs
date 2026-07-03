@@ -31,7 +31,6 @@ byteorder.workspace = true
 regex.workspace = true
 rmp.workspace = true
 rmp-serde.workspace = true
-rustfs-utils = { workspace = true, features = ["http", "path", "string"] }
 s3s.workspace = true
 serde.workspace = true
 time.workspace = true
