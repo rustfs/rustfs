@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use rustfs_config::{DEFAULT_ILM_PROCESS_TIME_SECS, ENV_ILM_PROCESS_TIME, ENV_ILM_PROCESS_TIME_DEPRECATED};
-use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use s3s::dto::{
     BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, LifecycleRuleFilter,
     NoncurrentVersionTransition, ObjectLockConfiguration, ObjectLockEnabled, RestoreRequest, Transition,
@@ -26,6 +25,7 @@ use time::{self, Duration, OffsetDateTime};
 use tracing::debug;
 use uuid::Uuid;
 
+use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
 use crate::bucket::lifecycle::rule::{NoncurrentVersionTransitionOps, TransitionOps};
 use crate::object_api::ObjectInfo;
 

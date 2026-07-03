@@ -170,7 +170,6 @@ mod tests {
     use std::sync::Arc;
 
     use rustfs_common::metrics::IlmAction;
-    use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, Transition, TransitionStorageClass,
     };
@@ -178,6 +177,7 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
+    use crate::bucket::lifecycle::replication_sink::{ReplicationStatusType, VersionPurgeStatusType};
     fn expired_marker_lifecycle() -> Arc<BucketLifecycleConfiguration> {
         Arc::new(BucketLifecycleConfiguration {
             expiry_updated_at: None,

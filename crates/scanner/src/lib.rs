@@ -154,6 +154,7 @@ pub(crate) type ObjectOpts = EcstoreObjectOpts;
 pub(crate) type ReplicationHealObject = ScannerReplicationHealObject;
 pub(crate) type ReplicationHealQueueResult = ScannerReplicationHealResult;
 pub(crate) type ReplicationQueueAdmission = ScannerReplicationQueueAdmission;
+pub(crate) type ReplicationStatusType = storage_api::ReplicationStatusType;
 pub(crate) type ScanGuard = EcstoreScanGuard;
 pub(crate) type SetDisks = EcstoreSetDisks;
 pub(crate) type StorageError = EcstoreStorageError;

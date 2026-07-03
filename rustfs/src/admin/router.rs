@@ -15,7 +15,7 @@
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata::BUCKET_TARGETS_FILE;
 use super::storage_api::bucket::metadata_sys;
-use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats};
+use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
 use super::storage_api::bucket::target::{BucketTarget, BucketTargetType, BucketTargets};
 use super::storage_api::bucket::target_sys::{
     BucketTargetSys, PutObjectOptions, RemoveObjectOptions, S3ClientError, TargetClient,
@@ -62,7 +62,6 @@ use rustfs_config::{
 use rustfs_madmin::utils::parse_duration;
 use rustfs_notify::{Event as NotificationEvent, notification_system};
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_replication::ReplicationStatusType;
 use rustfs_s3_types::EventName;
 use rustfs_signer::pre_sign_v4;
 use rustfs_utils::egress::validate_outbound_url;

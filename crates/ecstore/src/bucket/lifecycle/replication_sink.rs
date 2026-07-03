@@ -13,9 +13,14 @@
 // limitations under the License.
 
 use rustfs_common::metrics::IlmAction;
-use rustfs_replication::{ReplicateDecision, ReplicationStatusType};
 
 use crate::bucket::lifecycle::lifecycle::ObjectOpts;
+#[cfg(test)]
+pub(crate) use crate::bucket::replication::ReplicateTargetDecision;
+pub(crate) use crate::bucket::replication::{
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
+    version_purge_statuses_map,
+};
 use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::storage_api_contracts::object::{DeletedObject, ObjectToDelete};
@@ -70,7 +75,6 @@ mod tests {
     use std::collections::HashMap;
 
     use rustfs_common::metrics::IlmAction;
-    use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 
     use super::*;
 
