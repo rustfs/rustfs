@@ -1587,7 +1587,8 @@ impl DiskAPI for RemoteDisk {
     async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
         validate_batch_read_version_item_count(req.items.len())?;
 
-        if !batch_metadata_rpc_mode().should_attempt() {
+        let mode = batch_metadata_rpc_mode();
+        if !mode.should_attempt() {
             return batch_read_version_one_by_one(self, req).await;
         }
 
@@ -1618,7 +1619,6 @@ impl DiskAPI for RemoteDisk {
                     batch_read_version_req_bin: batch_read_version_req_bin.into(),
                 });
 
-                let mode = batch_metadata_rpc_mode();
                 let response = match client.batch_read_version(request).await {
                     Ok(response) => response.into_inner(),
                     Err(status) if status.code() == Code::Unimplemented && mode.should_fallback_on_unimplemented() => {
