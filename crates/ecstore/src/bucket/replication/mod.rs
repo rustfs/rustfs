@@ -34,6 +34,7 @@ mod replication_resync_boundary;
 mod replication_resyncer;
 mod replication_scanner_bridge;
 mod replication_state;
+mod replication_stats_boundary;
 mod replication_storage_boundary;
 mod replication_tagging_boundary;
 mod replication_target_boundary;
@@ -59,6 +60,6 @@ pub use replication_queue_boundary::{
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
+pub use replication_stats_boundary::BucketStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
-pub use rustfs_replication::BucketStats;

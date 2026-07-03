@@ -205,6 +205,7 @@ REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_opera
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
 REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_queue_boundary_bypass_hits.txt"
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
+REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_stats_boundary_bypass_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
 REPLICATION_RESYNC_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_resync_boundary_bypass_hits.txt"
@@ -214,6 +215,7 @@ REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
 APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
+APP_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_crate_bypass_hits.txt"
 SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_dto_boundary_bypass_hits.txt"
 OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/obs_replication_stats_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
@@ -2655,6 +2657,31 @@ fi
 
 (
   cd "$ROOT_DIR"
+  replication_stats_boundary_status=0
+  rg -n --with-filename 'rustfs_replication::(ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_stats_boundary.rs' >"$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" || replication_stats_boundary_status=$?
+  if [[ "$replication_stats_boundary_status" -ne 0 && "$replication_stats_boundary_status" -ne 1 ]]; then
+    exit "$replication_stats_boundary_status"
+  fi
+
+  replication_stats_boundary_grouped_status=0
+  rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(ExponentialMovingAverage|XferStats|InQueueStats|QueueSample|InQueueMetric|QueueCache|ProxyMetric|ProxyStatsCache|FailureSample|FailStats|FailedMetric|LatencyStats|BucketReplicationStat|QueueStats|QueueNode|BucketReplicationStats|BucketStats|SRMetricsSummary|ActiveWorkerStat|WorkerSample)\b' \
+    crates/ecstore/src/bucket/replication \
+    --glob '*.rs' \
+    --glob '!replication_stats_boundary.rs' >>"$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" || replication_stats_boundary_grouped_status=$?
+  if [[ "$replication_stats_boundary_grouped_status" -ne 0 && "$replication_stats_boundary_grouped_status" -ne 1 ]]; then
+    exit "$replication_stats_boundary_grouped_status"
+  fi
+)
+
+if [[ -s "$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication stats contracts must stay behind replication_stats_boundary: $(paste -sd '; ' "$REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   replication_runtime_status=0
   rg -n --with-filename '^\s*(?:pub(?:\([^)]*\))?\s+)?(?:(?:const\s+(?:WORKER_MAX_LIMIT|WORKER_MIN_LIMIT|WORKER_AUTO_DEFAULT|MRF_WORKER_MAX_LIMIT|MRF_WORKER_MIN_LIMIT|MRF_WORKER_AUTO_DEFAULT|LARGE_WORKER_COUNT|MIN_LARGE_OBJ_SIZE)\b)|(?:struct\s+(?:ReplicationPoolOpts|ReplicationWorkerCounts)\b)|(?:fn\s+(?:initial_worker_counts|resized_worker_counts|mrf_worker_size_to_count|worker_counts_for_priority|should_queue_large_object|should_grow_large_workers|next_large_worker_count|next_regular_worker_count|next_mrf_worker_count)\b))' \
     crates/ecstore/src/bucket/replication \
@@ -2830,6 +2857,18 @@ fi
 
 if [[ -s "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "app replication ObjectOpts/MustReplicateOptions/bridge access must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    rustfs/src/app \
+    --glob '*.rs' \
+    --glob '!rustfs/src/app/storage_api.rs' || true
+) >"$APP_REPLICATION_CRATE_BYPASS_HITS_FILE"
+
+if [[ -s "$APP_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "app replication crate access must stay behind rustfs/src/app/storage_api.rs: $(paste -sd '; ' "$APP_REPLICATION_CRATE_BYPASS_HITS_FILE")"
 fi
 
 (

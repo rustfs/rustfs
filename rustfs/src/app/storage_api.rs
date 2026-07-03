@@ -605,6 +605,7 @@ pub(crate) mod bucket {
 
     pub(crate) mod replication {
         use std::collections::HashMap;
+        use std::collections::HashSet;
         use std::sync::Arc;
         use uuid::Uuid;
 
@@ -612,6 +613,14 @@ pub(crate) mod bucket {
             crate::storage::storage_api::ecstore_bucket::replication::DeletedObjectReplicationInfo;
         type ReplicationObjectBridge = crate::storage::storage_api::ecstore_bucket::replication::ReplicationObjectBridge;
         pub(crate) type ReplicateDecision = rustfs_replication::ReplicateDecision;
+        #[cfg(test)]
+        pub(crate) type ReplicationState = rustfs_replication::ReplicationState;
+        pub(crate) type ReplicationStatusType = rustfs_replication::ReplicationStatusType;
+        pub(crate) type ReplicationTargetValidationError = rustfs_replication::ReplicationTargetValidationError;
+        pub(crate) type VersionPurgeStatusType = rustfs_replication::VersionPurgeStatusType;
+        pub(crate) const REPLICATE_INCOMING_DELETE: &str = rustfs_replication::REPLICATE_INCOMING_DELETE;
+        #[cfg(test)]
+        pub(crate) use rustfs_replication::replication_statuses_map;
 
         pub(crate) async fn check_replicate_delete(
             bucket: &str,
@@ -623,12 +632,23 @@ pub(crate) mod bucket {
             ReplicationObjectBridge::check_delete(bucket, dobj, oi, del_opts, gerr).await
         }
 
+        pub(crate) fn delete_replication_version_id(
+            replication_source: &crate::storage::storage_api::StorageObjectInfo,
+            deleted_delete_marker_version: bool,
+        ) -> Option<Uuid> {
+            rustfs_replication::delete_replication_version_id(
+                replication_source.delete_marker,
+                replication_source.version_id,
+                deleted_delete_marker_version,
+            )
+        }
+
         pub(crate) async fn must_replicate_object(
             bucket: &str,
             object: &str,
             user_defined: &HashMap<String, String>,
             user_tags: String,
-            status: rustfs_replication::ReplicationStatusType,
+            status: ReplicationStatusType,
             opts: crate::storage::storage_api::StorageObjectOptions,
         ) -> ReplicateDecision {
             let mopts = ReplicationObjectBridge::must_replicate_options(
@@ -667,6 +687,58 @@ pub(crate) mod bucket {
                 replica,
             };
             rustfs_replication::delete_replication_state_from_config(config, &source)
+        }
+
+        pub(crate) fn replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> HashSet<String> {
+            rustfs_replication::replication_target_arns(config)
+        }
+
+        pub(crate) fn should_remove_replication_target(
+            target_arn: &str,
+            is_replication_service: bool,
+            target_arns: &HashSet<String>,
+        ) -> bool {
+            rustfs_replication::should_remove_replication_target(target_arn, is_replication_service, target_arns)
+        }
+
+        pub(crate) fn should_schedule_delete_replication(
+            opts: &crate::storage::storage_api::StorageObjectOptions,
+            replication_source: &crate::storage::storage_api::StorageObjectInfo,
+            deleted_delete_marker_version: bool,
+        ) -> bool {
+            rustfs_replication::should_schedule_delete_replication(rustfs_replication::ReplicationDeleteScheduleInput {
+                replication_request: opts.replication_request,
+                version_id_requested: opts.version_id.is_some(),
+                source_delete_marker: replication_source.delete_marker,
+                source_replication_status: &replication_source.replication_status,
+                source_version_purge_status: &replication_source.version_purge_status,
+                deleted_delete_marker_version,
+            })
+        }
+
+        pub(crate) fn should_use_existing_delete_replication_info(
+            opts: &crate::storage::storage_api::StorageObjectOptions,
+        ) -> bool {
+            rustfs_replication::should_use_existing_delete_replication_info(opts.version_id.is_some(), opts.delete_marker)
+        }
+
+        pub(crate) fn should_use_existing_delete_replication_source(
+            replication_request: bool,
+            deleted_delete_marker: bool,
+            has_existing_info: bool,
+        ) -> bool {
+            rustfs_replication::should_use_existing_delete_replication_source(
+                replication_request,
+                deleted_delete_marker,
+                has_existing_info,
+            )
+        }
+
+        pub(crate) fn validate_replication_config_target_arns<'a>(
+            configured_arns: impl Iterator<Item = &'a str>,
+            config: &s3s::dto::ReplicationConfiguration,
+        ) -> Result<(), ReplicationTargetValidationError> {
+            rustfs_replication::validate_replication_config_target_arns(configured_arns, config)
         }
     }
 
