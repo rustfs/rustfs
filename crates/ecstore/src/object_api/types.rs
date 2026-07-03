@@ -791,7 +791,6 @@ fn versions_after_marker(file_infos: &rustfs_filemeta::FileInfoVersions, marker:
 mod tests {
     use super::*;
     use rustfs_filemeta::{FileInfo, FileMeta, MetaCacheEntry, TRANSITION_COMPLETE};
-    use rustfs_replication::ReplicationState;
 
     #[test]
     fn versions_after_marker_handles_null_version_marker() {

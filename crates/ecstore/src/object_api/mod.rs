@@ -16,6 +16,10 @@
 #![allow(dead_code)]
 
 use crate::bucket::metadata_sys::get_versioning_config;
+use crate::bucket::replication::{
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
+    version_purge_statuses_map,
+};
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;
 use crate::error::{Error, Result};
@@ -28,11 +32,7 @@ use crate::store::utils::clean_metadata;
 use crate::{bucket::lifecycle::bucket_lifecycle_audit::LcAuditEvent, bucket::lifecycle::lifecycle::TransitionOptions};
 use bytes::Bytes;
 use http::{HeaderMap, HeaderValue};
-use rustfs_filemeta::{
-    FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, ReplicateDecision, ReplicationState, ReplicationStatusType,
-    RestoreStatusOps as _, VersionPurgeStatusType, parse_restore_obj_status, replication_statuses_map,
-    version_purge_statuses_map,
-};
+use rustfs_filemeta::{FileInfo, MetaCacheEntriesSorted, ObjectPartInfo, RestoreStatusOps as _, parse_restore_obj_status};
 use rustfs_rio::Checksum;
 use rustfs_utils::CompressionAlgorithm;
 use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
