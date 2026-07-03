@@ -22,7 +22,9 @@
 //! Do NOT use `FileMetaVersion::default()` + `unmarshal_msg()` directly, as that fails on
 //! legacy (rmp_serde) format. `try_from` falls back to rmp_serde when hand-written decode fails.
 
-use super::msgp_decode::{PrependByteReader, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value};
+use super::msgp_decode::{
+    PrependByteReader, prealloc_hint, read_exact_vec, read_nil_or_array_len, read_nil_or_map_len, skip_msgp_value,
+};
 use super::*;
 use crate::ChecksumInfo;
 use rustfs_utils::HashAlgorithm;
@@ -42,16 +44,13 @@ const MSGPACK_TIME_EXT_OFFICIAL: i8 = -1;
 
 fn read_msgp_string<R: std::io::Read>(rd: &mut R) -> Result<String> {
     let len = rmp::decode::read_str_len(rd)? as usize;
-    let mut buf = vec![0u8; len];
-    rd.read_exact(&mut buf)?;
+    let buf = read_exact_vec(rd, len)?;
     Ok(String::from_utf8(buf)?)
 }
 
 fn read_msgp_bin<R: std::io::Read>(rd: &mut R) -> Result<Vec<u8>> {
     let len = rmp::decode::read_bin_len(rd)? as usize;
-    let mut buf = vec![0u8; len];
-    rd.read_exact(&mut buf)?;
-    Ok(buf)
+    read_exact_vec(rd, len)
 }
 
 fn deserialize_legacy_uuid_bytes<'de, D>(deserializer: D) -> std::result::Result<Vec<u8>, D::Error>
@@ -183,8 +182,7 @@ fn read_msgp_time<R: std::io::Read>(rd: &mut R) -> Result<OffsetDateTime> {
         other => return Err(Error::other(format!("unsupported msgpack time marker: 0x{other:02x}"))),
     };
 
-    let mut payload = vec![0u8; len];
-    rd.read_exact(&mut payload)?;
+    let payload = read_exact_vec(rd, len)?;
     decode_msgp_time_payload(ext_type, &payload)
 }
 
@@ -362,8 +360,7 @@ impl FileMetaVersion {
             fields -= 1;
 
             let key_len = rmp::decode::read_str_len(&mut cur)? as usize;
-            let mut key_buf = vec![0u8; key_len];
-            cur.read_exact(&mut key_buf)?;
+            let key_buf = read_exact_vec(&mut cur, key_len)?;
             let key = String::from_utf8(key_buf)?;
 
             match key.as_str() {
@@ -394,8 +391,7 @@ impl FileMetaVersion {
                         obj_fields -= 1;
 
                         let obj_key_len = rmp::decode::read_str_len(&mut prepend)? as usize;
-                        let mut obj_key_buf = vec![0u8; obj_key_len];
-                        prepend.read_exact(&mut obj_key_buf)?;
+                        let obj_key_buf = read_exact_vec(&mut prepend, obj_key_len)?;
                         let obj_key = String::from_utf8(obj_key_buf)?;
 
                         if obj_key == "DDir" {
@@ -493,8 +489,7 @@ impl FileMetaVersion {
             fields -= 1;
 
             let key_len = rmp::decode::read_str_len(rd)?;
-            let mut key_buf = vec![0u8; key_len as usize];
-            rd.read_exact(&mut key_buf)?;
+            let key_buf = read_exact_vec(rd, key_len as usize)?;
             let key = String::from_utf8(key_buf)?;
 
             match key.as_str() {
@@ -1307,7 +1302,7 @@ impl MetaObjectV1 {
                 "Parts" => {
                     let len = rmp::decode::read_array_len(rd)? as usize;
                     self.parts.clear();
-                    self.parts.reserve(len);
+                    self.parts.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let mut part = MetaObjectV1Part::default();
                         part.decode_from(rd)?;
@@ -1424,7 +1419,7 @@ impl MetaObjectV1Erasure {
                 "Distribution" => {
                     let len = rmp::decode::read_array_len(rd)? as usize;
                     self.distribution.clear();
-                    self.distribution.reserve(len);
+                    self.distribution.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         self.distribution.push(rmp::decode::read_int::<i64, _>(rd)? as usize);
                     }
@@ -1432,7 +1427,7 @@ impl MetaObjectV1Erasure {
                 "Checksums" => {
                     let len = rmp::decode::read_array_len(rd)? as usize;
                     self.checksums.clear();
-                    self.checksums.reserve(len);
+                    self.checksums.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let mut checksum = MetaObjectV1ChecksumInfo::default();
                         checksum.decode_from(rd)?;
@@ -1484,7 +1479,7 @@ impl MetaObjectV1Part {
                 "i" => self.index = Some(Bytes::from(read_msgp_bin(rd)?)),
                 "crc" => {
                     let len = rmp::decode::read_map_len(rd)? as usize;
-                    let mut checksums = HashMap::with_capacity(len);
+                    let mut checksums = HashMap::with_capacity(prealloc_hint(len));
                     for _ in 0..len {
                         checksums.insert(read_msgp_string(rd)?, read_msgp_string(rd)?);
                     }
@@ -1700,9 +1695,8 @@ impl MetaObject {
                 tracing::error!(error = %e, "decode_from: read_str_len key failed");
                 e
             })?;
-            let mut key_buf = vec![0u8; key_len as usize];
-            rd.read_exact(&mut key_buf).map_err(|e| {
-                tracing::error!(error = %e, "decode_from: read_exact key_buf failed");
+            let key_buf = read_exact_vec(rd, key_len as usize).map_err(|e| {
+                tracing::error!(error = %e, "decode_from: read key_buf failed");
                 e
             })?;
             let key = String::from_utf8(key_buf).map_err(|e| {
@@ -1778,7 +1772,7 @@ impl MetaObject {
                         e
                     })? as usize;
                     self.erasure_dist.clear();
-                    self.erasure_dist.reserve(len);
+                    self.erasure_dist.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_int EcDist item failed");
@@ -1800,7 +1794,7 @@ impl MetaObject {
                         e
                     })? as usize;
                     self.part_numbers.clear();
-                    self.part_numbers.reserve(len);
+                    self.part_numbers.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_int PartNums item failed");
@@ -1821,15 +1815,14 @@ impl MetaObject {
                         Some(n) => n,
                     };
                     self.part_etags.clear();
-                    self.part_etags.reserve(len);
+                    self.part_etags.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let s_len = rmp::decode::read_str_len(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_str_len PartETags item failed");
                             e
                         })?;
-                        let mut sbuf = vec![0u8; s_len as usize];
-                        rd.read_exact(&mut sbuf).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact PartETags sbuf failed");
+                        let sbuf = read_exact_vec(rd, s_len as usize).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read PartETags sbuf failed");
                             e
                         })?;
                         let s = String::from_utf8(sbuf).map_err(|e| {
@@ -1845,7 +1838,7 @@ impl MetaObject {
                         e
                     })? as usize;
                     self.part_sizes.clear();
-                    self.part_sizes.reserve(len);
+                    self.part_sizes.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_int PartSizes item failed");
@@ -1866,7 +1859,7 @@ impl MetaObject {
                         Some(n) => n,
                     };
                     self.part_actual_sizes.clear();
-                    self.part_actual_sizes.reserve(len);
+                    self.part_actual_sizes.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let v: i64 = rmp::decode::read_int(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_int PartASizes item failed");
@@ -1881,15 +1874,14 @@ impl MetaObject {
                         e
                     })? as usize;
                     self.part_indices.clear();
-                    self.part_indices.reserve(len);
+                    self.part_indices.reserve(prealloc_hint(len));
                     for _ in 0..len {
                         let blen = rmp::decode::read_bin_len(rd).map_err(|e| {
                             tracing::error!(error = %e, "decode_from: read_bin_len PartIdx item failed");
                             e
                         })? as usize;
-                        let mut buf = vec![0u8; blen];
-                        rd.read_exact(&mut buf).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact PartIdx buf failed");
+                        let buf = read_exact_vec(rd, blen).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read PartIdx buf failed");
                             e
                         })?;
                         self.part_indices.push(Bytes::from(buf));
@@ -1933,9 +1925,8 @@ impl MetaObject {
                             tracing::error!(error = %e, "decode_from: read_str_len MetaSys key failed");
                             e
                         })?;
-                        let mut kbuf = vec![0u8; k_len as usize];
-                        rd.read_exact(&mut kbuf).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact MetaSys kbuf failed");
+                        let kbuf = read_exact_vec(rd, k_len as usize).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read MetaSys kbuf failed");
                             e
                         })?;
                         let k = String::from_utf8(kbuf).map_err(|e| {
@@ -1947,9 +1938,8 @@ impl MetaObject {
                             tracing::error!(error = %e, "decode_from: read_bin_len MetaSys value failed");
                             e
                         })? as usize;
-                        let mut v = vec![0u8; blen];
-                        rd.read_exact(&mut v).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact MetaSys value failed");
+                        let v = read_exact_vec(rd, blen).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read MetaSys value failed");
                             e
                         })?;
 
@@ -1973,9 +1963,8 @@ impl MetaObject {
                             tracing::error!(error = %e, "decode_from: read_str_len MetaUsr key failed");
                             e
                         })?;
-                        let mut kbuf = vec![0u8; k_len as usize];
-                        rd.read_exact(&mut kbuf).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact MetaUsr kbuf failed");
+                        let kbuf = read_exact_vec(rd, k_len as usize).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read MetaUsr kbuf failed");
                             e
                         })?;
                         let k = String::from_utf8(kbuf).map_err(|e| {
@@ -1987,9 +1976,8 @@ impl MetaObject {
                             tracing::error!(error = %e, "decode_from: read_str_len MetaUsr value failed");
                             e
                         })?;
-                        let mut vbuf = vec![0u8; v_len as usize];
-                        rd.read_exact(&mut vbuf).map_err(|e| {
-                            tracing::error!(error = %e, "decode_from: read_exact MetaUsr vbuf failed");
+                        let vbuf = read_exact_vec(rd, v_len as usize).map_err(|e| {
+                            tracing::error!(error = %e, "decode_from: read MetaUsr vbuf failed");
                             e
                         })?;
                         let v = String::from_utf8(vbuf).map_err(|e| {
@@ -2446,8 +2434,7 @@ impl MetaDeleteMarker {
             fields -= 1;
 
             let key_len = rmp::decode::read_str_len(rd)?;
-            let mut key_buf = vec![0u8; key_len as usize];
-            rd.read_exact(&mut key_buf)?;
+            let key_buf = read_exact_vec(rd, key_len as usize)?;
             let key = String::from_utf8(key_buf)?;
 
             match key.as_str() {
@@ -2472,13 +2459,11 @@ impl MetaDeleteMarker {
                     self.meta_sys.clear();
                     for _ in 0..len {
                         let k_len = rmp::decode::read_str_len(rd)?;
-                        let mut kbuf = vec![0u8; k_len as usize];
-                        rd.read_exact(&mut kbuf)?;
+                        let kbuf = read_exact_vec(rd, k_len as usize)?;
                         let k = String::from_utf8(kbuf)?;
 
                         let blen = rmp::decode::read_bin_len(rd)? as usize;
-                        let mut v = vec![0u8; blen];
-                        rd.read_exact(&mut v)?;
+                        let v = read_exact_vec(rd, blen)?;
 
                         self.meta_sys.insert(k, v);
                     }

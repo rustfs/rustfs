@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::filemeta::msgp_decode::MAX_MSGP_ELEMENT_SIZE;
 use crate::{
     Error, FileInfo, FileInfoOpts, FileInfoVersions, FileMeta, FileMetaShallowVersion, Result, VersionType, get_file_info,
     merge_file_meta_versions, merge_file_meta_versions_with_write_quorum,
@@ -638,25 +639,36 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     }
 
     pub async fn read_more(&mut self, read_size: usize) -> Result<&[u8]> {
-        let ext_size = read_size + self.offset;
-
-        let extra = ext_size - self.offset;
-        if self.buf.capacity() >= ext_size {
-            // Extend the buffer if we have enough space.
-            self.buf.resize(ext_size, 0);
-        } else {
-            self.buf.extend(vec![0u8; extra]);
+        // `read_size` is usually a length decoded from the stream itself, so
+        // it is untrusted: a corrupted length prefix must yield a decode
+        // error instead of a huge allocation that aborts the process
+        // (see rustfs/rustfs#2715).
+        if read_size > MAX_MSGP_ELEMENT_SIZE {
+            let err = Error::other(format!(
+                "metacache stream corrupt: element length {read_size} exceeds the {MAX_MSGP_ELEMENT_SIZE} byte limit"
+            ));
+            self.err = Some(err.clone());
+            return Err(err);
         }
 
         let pref = self.offset;
+        let ext_size = pref + read_size;
+
+        if self.buf.len() < ext_size {
+            let extra = ext_size - self.buf.len();
+            if let Err(e) = self.buf.try_reserve(extra) {
+                let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+                self.err = Some(err.clone());
+                return Err(err);
+            }
+            self.buf.resize(ext_size, 0);
+        }
 
         self.rd.read_exact(&mut self.buf[pref..ext_size]).await?;
 
         self.offset += read_size;
 
-        let data = &self.buf[pref..ext_size];
-
-        Ok(data)
+        Ok(&self.buf[pref..ext_size])
     }
 
     fn reset(&mut self) {
@@ -988,6 +1000,74 @@ mod tests {
         let nobjs = r.read_all().await.unwrap();
 
         assert_eq!(objs, nobjs);
+    }
+
+    fn corrupt_stream_with_metadata_len(len_marker: u8, len: u32) -> Vec<u8> {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        rmp::encode::write_str(&mut data, "object").unwrap();
+        // Hand-written bin/str length prefix claiming an absurd payload size.
+        data.push(len_marker);
+        data.extend_from_slice(&len.to_be_bytes());
+        data
+    }
+
+    /// Regression test for rustfs/rustfs#2715: a corrupted metadata length
+    /// prefix must surface as a decode error instead of attempting a huge
+    /// allocation that aborts the process.
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_bin_length_prefix() {
+        // 0xc6 = bin32 marker.
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt bin length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+
+        // The reader must stay in the error state instead of retrying.
+        assert!(r.peek().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_reader_rejects_corrupt_str_length_prefix() {
+        let mut data = Vec::new();
+        rmp::encode::write_u8(&mut data, METACACHE_STREAM_VERSION).unwrap();
+        rmp::encode::write_bool(&mut data, true).unwrap();
+        // 0xdb = str32 marker with an absurd object-name length.
+        data.push(0xdb);
+        data.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        let err = r.peek().await.expect_err("corrupt str length prefix must fail to decode");
+        assert!(err.to_string().contains("exceeds"), "error should mention the exceeded limit, got: {err}");
+    }
+
+    #[tokio::test]
+    async fn test_reader_skip_rejects_corrupt_length_prefix() {
+        let data = corrupt_stream_with_metadata_len(0xc6, u32::MAX);
+        let mut r = MetacacheReader::new(Cursor::new(data));
+        assert!(r.skip(1).await.is_err(), "skip over a corrupt length prefix must fail");
+    }
+
+    /// Large-but-legitimate records (well above typical sizes, below the
+    /// corruption guard) must still round-trip.
+    #[tokio::test]
+    async fn test_reader_accepts_large_legitimate_metadata() {
+        let entry = MetaCacheEntry {
+            name: "big-object".to_string(),
+            metadata: vec![0xab; 4 << 20],
+            cached: None,
+            reusable: false,
+        };
+
+        let mut f = Cursor::new(Vec::new());
+        let mut w = MetacacheWriter::new(&mut f);
+        w.write(std::slice::from_ref(&entry)).await.unwrap();
+        w.close().await.unwrap();
+
+        let mut r = MetacacheReader::new(Cursor::new(f.into_inner()));
+        let decoded = r.read_all().await.unwrap();
+        assert_eq!(decoded, vec![entry]);
     }
 
     #[test]
