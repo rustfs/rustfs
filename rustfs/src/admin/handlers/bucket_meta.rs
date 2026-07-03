@@ -827,11 +827,96 @@ impl Operation for ImportBucketMetadata {
             }
         }
 
+        // Persist the assembled metadata to disk. Prior to this, the import only mutated the
+        // in-memory `bucket_metadatas` map and returned 200, silently dropping every imported
+        // config. `metadata_sys::update` loads the on-disk metadata, overwrites the given config
+        // field and saves it, preserving any configs not present in the import archive.
+        for (bucket_name, metadata) in &bucket_metadatas {
+            for (config_file, data) in imported_configs_to_persist(metadata) {
+                if let Err(e) = metadata_sys::update(bucket_name, config_file, data).await {
+                    warn!(
+                        event = EVENT_ADMIN_BUCKET_META_STATE,
+                        component = LOG_COMPONENT_ADMIN,
+                        subsystem = LOG_SUBSYSTEM_BUCKET_META,
+                        action = "import_bucket_metadata",
+                        result = "config_persist_failed",
+                        bucket = %bucket_name,
+                        config_name = %config_file,
+                        error = %e,
+                        "admin bucket meta state"
+                    );
+                    return Err(s3_error!(
+                        InternalError,
+                        "failed to persist imported bucket metadata for {bucket_name}/{config_file}: {e}"
+                    ));
+                }
+            }
+        }
+
         // TODO: site replication notify
 
         let mut header = HeaderMap::new();
         header.insert(CONTENT_TYPE, "application/json".parse().expect("valid header value"));
         header.insert(CONTENT_LENGTH, "0".parse().expect("valid header value"));
         Ok(S3Response::with_headers((StatusCode::OK, Body::empty()), header))
+    }
+}
+
+/// The `(config_file, data)` pairs to persist for an imported bucket's metadata: every non-empty
+/// config field keyed by its on-disk config-file name, as owned data ready for
+/// `metadata_sys::update`. Empty fields are skipped so an import never overwrites an existing
+/// on-disk config with an empty payload. Shared by [`import_bucket_metadata`] and its tests so both
+/// exercise the same mapping.
+fn imported_configs_to_persist(metadata: &BucketMetadata) -> Vec<(&'static str, Vec<u8>)> {
+    let configs: [(&'static str, &Vec<u8>); 10] = [
+        (BUCKET_POLICY_CONFIG, &metadata.policy_config_json),
+        (BUCKET_NOTIFICATION_CONFIG, &metadata.notification_config_xml),
+        (BUCKET_LIFECYCLE_CONFIG, &metadata.lifecycle_config_xml),
+        (BUCKET_SSECONFIG, &metadata.encryption_config_xml),
+        (BUCKET_TAGGING_CONFIG, &metadata.tagging_config_xml),
+        (BUCKET_QUOTA_CONFIG_FILE, &metadata.quota_config_json),
+        (OBJECT_LOCK_CONFIG, &metadata.object_lock_config_xml),
+        (BUCKET_VERSIONING_CONFIG, &metadata.versioning_config_xml),
+        (BUCKET_REPLICATION_CONFIG, &metadata.replication_config_xml),
+        (BUCKET_TARGETS_FILE, &metadata.bucket_targets_config_json),
+    ];
+    configs
+        .into_iter()
+        .filter(|(_, d)| !d.is_empty())
+        .map(|(name, d)| (name, d.clone()))
+        .collect()
+}
+
+#[cfg(test)]
+mod import_persist_tests {
+    use super::*;
+
+    #[test]
+    fn imported_versioning_and_policy_are_scheduled_for_persistence() {
+        // State the second pass builds in memory after importing a versioning + policy config.
+        let mut metadata = BucketMetadata::new("restored-bucket");
+        metadata.versioning_config_xml = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec();
+        metadata.policy_config_json = br#"{"Version":"2012-10-17","Statement":[]}"#.to_vec();
+
+        let plan = imported_configs_to_persist(&metadata);
+
+        // The bug: the old handler produced zero persistence calls (mutated memory, returned 200).
+        assert_eq!(plan.len(), 2, "both imported configs must be persisted, got {plan:?}");
+        assert!(
+            plan.iter()
+                .any(|(n, d)| *n == BUCKET_VERSIONING_CONFIG && d == &metadata.versioning_config_xml)
+        );
+        assert!(
+            plan.iter()
+                .any(|(n, d)| *n == BUCKET_POLICY_CONFIG && d == &metadata.policy_config_json)
+        );
+    }
+
+    #[test]
+    fn empty_configs_are_not_persisted() {
+        // A freshly-created metadata with no imported configs must schedule nothing, so import
+        // never overwrites existing on-disk configs with empty payloads.
+        let metadata = BucketMetadata::new("untouched-bucket");
+        assert!(imported_configs_to_persist(&metadata).is_empty());
     }
 }
