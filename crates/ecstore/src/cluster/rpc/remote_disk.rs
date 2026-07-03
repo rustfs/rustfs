@@ -77,7 +77,8 @@ enum FailureHealthAction {
 
 const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
-const ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
+const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
+const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
 const BATCH_METADATA_RPC_OFF: &str = "off";
 const BATCH_METADATA_RPC_AUTO: &str = "auto";
 const BATCH_METADATA_RPC_ON: &str = "on";
@@ -113,7 +114,8 @@ fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
 }
 
 fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
-    rustfs_utils::get_env_opt_str(ENV_RUSTFS_BATCH_METADATA_RPC)
+    rustfs_utils::get_env_opt_str(ENV_RUSTFS_METADATA_BATCH_READ)
+        .or_else(|| rustfs_utils::get_env_opt_str(LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC))
         .as_deref()
         .map(parse_batch_metadata_rpc_mode)
         .unwrap_or(BatchMetadataRpcMode::Off)
@@ -2732,6 +2734,32 @@ mod tests {
         assert!(!BatchMetadataRpcMode::Off.should_attempt());
         assert!(BatchMetadataRpcMode::Auto.should_attempt());
         assert!(BatchMetadataRpcMode::On.should_attempt());
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_uses_documented_env_before_legacy_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_METADATA_BATCH_READ, Some("auto")),
+                (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
+            ],
+            || {
+                assert_eq!(batch_metadata_rpc_mode(), BatchMetadataRpcMode::Auto);
+            },
+        );
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_falls_back_to_legacy_env_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_METADATA_BATCH_READ, None::<&str>),
+                (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
+            ],
+            || {
+                assert_eq!(batch_metadata_rpc_mode(), BatchMetadataRpcMode::On);
+            },
+        );
     }
 
     #[test]
