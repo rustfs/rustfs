@@ -23,8 +23,8 @@ use crate::bucket::lifecycle::lifecycle::{
 };
 use crate::bucket::lifecycle::replication_sink;
 use crate::bucket::lifecycle::replication_sink::{
-    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
@@ -2881,7 +2881,7 @@ async fn schedule_lifecycle_replication_delete_if_needed(oi: &ObjectInfo, dobj: 
         return;
     }
 
-    delete_object.replication_state = replication_state;
+    delete_object.replication_state = replication_state.as_ref().map(replication_state_to_filemeta);
 
     replication_sink::schedule_delete(oi.bucket.clone(), delete_object).await;
 }

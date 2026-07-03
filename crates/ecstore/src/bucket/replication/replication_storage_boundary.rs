@@ -16,6 +16,7 @@ use rustfs_filemeta::FileInfo;
 use tokio_util::sync::CancellationToken;
 
 use super::replication_error_boundary::Error;
+use super::replication_filemeta_boundary::{replication_state_from_filemeta, version_purge_status_from_filemeta};
 pub(crate) type ReplicationObjectStore = crate::store::ECStore;
 pub(crate) use crate::client::api_get_options::{AdvancedGetOptions, StatObjectOptions};
 pub(crate) use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader};
@@ -101,7 +102,7 @@ pub(crate) fn deleted_object_for_replication(delete_object: DeletedObject) -> Re
         object_name: delete_object.object_name,
         version_id: delete_object.version_id,
         delete_marker_mtime: delete_object.delete_marker_mtime,
-        replication_state: delete_object.replication_state,
+        replication_state: delete_object.replication_state.as_ref().map(replication_state_from_filemeta),
         found: delete_object.found,
         force_delete: delete_object.force_delete,
     }
@@ -112,7 +113,7 @@ pub(crate) fn object_to_delete_for_replication(object: &ObjectToDelete) -> Repli
         object_name: object.object_name.clone(),
         version_id: object.version_id,
         delete_marker_replication_status: object.delete_marker_replication_status.clone(),
-        version_purge_status: object.version_purge_status.clone(),
+        version_purge_status: object.version_purge_status.clone().map(version_purge_status_from_filemeta),
         version_purge_statuses: object.version_purge_statuses.clone(),
         replicate_decision_str: object.replicate_decision_str.clone(),
     }

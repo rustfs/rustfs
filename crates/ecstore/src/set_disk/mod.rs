@@ -22,6 +22,7 @@ use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
 use crate::bucket::replication::{
     ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+    replication_state_to_filemeta,
 };
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
@@ -2944,7 +2945,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
             record_capacity_scope_if_needed(opts.capacity_scope_token, &online_disks);
 
-            fi.replication_state_internal = Some(opts.put_replication_state());
+            fi.replication_state_internal = Some(replication_state_to_filemeta(&opts.put_replication_state()));
 
             fi.is_latest = true;
 
@@ -4152,7 +4153,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 deleted: delete_marker,
                 mark_deleted: mark_delete,
                 mod_time: Some(mod_time),
-                replication_state_internal: opts.delete_replication.clone(),
+                replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
                 ..Default::default() // TODO: Transition
             };
 
@@ -4190,7 +4191,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             mark_deleted: mark_delete,
             deleted: delete_marker,
             mod_time: Some(mod_time),
-            replication_state_internal: opts.delete_replication.clone(),
+            replication_state_internal: opts.delete_replication.as_ref().map(replication_state_to_filemeta),
             ..Default::default()
         };
 

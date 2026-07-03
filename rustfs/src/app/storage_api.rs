@@ -677,6 +677,29 @@ pub(crate) mod bucket {
             ReplicationObjectBridge::schedule_storage_delete(delete_object, bucket, event_type).await;
         }
 
+        pub(crate) fn set_deleted_object_replication_state(
+            delete_object: &mut crate::storage::storage_api::StorageDeletedObject,
+            state: &replication_contracts::ReplicationState,
+        ) {
+            delete_object.replication_state = Some(replication_contracts::replication_state_to_filemeta(state));
+        }
+
+        pub(crate) fn set_object_to_delete_version_purge_status(
+            object: &mut crate::storage::storage_api::StorageObjectToDelete,
+            status: VersionPurgeStatusType,
+        ) {
+            object.version_purge_status = Some(replication_contracts::version_purge_status_to_filemeta(status));
+        }
+
+        pub(crate) fn deleted_object_has_pending_replication_delete(
+            deleted_object: &crate::storage::storage_api::StorageDeletedObject,
+        ) -> bool {
+            deleted_object.delete_marker_replication_status()
+                == replication_contracts::replication_status_to_filemeta(ReplicationStatusType::Pending)
+                || deleted_object.version_purge_status()
+                    == replication_contracts::version_purge_status_to_filemeta(VersionPurgeStatusType::Pending)
+        }
+
         pub(crate) fn delete_replication_state_from_config(
             config: &s3s::dto::ReplicationConfiguration,
             obj_info: &crate::storage::storage_api::StorageObjectInfo,

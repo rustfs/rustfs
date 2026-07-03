@@ -18,8 +18,8 @@ use crate::bucket::lifecycle::lifecycle::ObjectOpts;
 #[cfg(test)]
 pub(crate) use crate::bucket::replication::ReplicateTargetDecision;
 pub(crate) use crate::bucket::replication::{
-    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_state_to_filemeta,
+    replication_statuses_map, version_purge_statuses_map,
 };
 use crate::bucket::replication::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 use crate::object_api::{ObjectInfo, ObjectOptions};

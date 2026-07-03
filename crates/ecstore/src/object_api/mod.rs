@@ -17,8 +17,8 @@
 
 use crate::bucket::metadata_sys::get_versioning_config;
 use crate::bucket::replication::{
-    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_status_from_filemeta,
+    replication_statuses_map, version_purge_status_from_filemeta, version_purge_statuses_map,
 };
 use crate::bucket::versioning::VersioningApi as _;
 use crate::config::storageclass;

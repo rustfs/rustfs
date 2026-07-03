@@ -86,7 +86,7 @@ require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inve
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "EcstoreReplicationBoundaryImports" "ECStore split plan replication boundary imports section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "RuntimeReplicationFacadeConsumers" "ECStore split plan runtime replication facade consumer section"
-require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaFacade" "ECStore split plan replication crate filemeta facade section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaIndependence" "ECStore split plan replication crate filemeta independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiIndependence" "ECStore split plan replication crate storage-api independence section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
@@ -976,7 +976,8 @@ fi
       rg -v '^crates/ecstore/src/bucket/replication/' || true
     rg -n -U --with-filename 'use\s+rustfs_filemeta::\{[^}]*\b(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|rustfs_filemeta::(Replicate|Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map)' \
       crates/ecstore/src \
-      --glob '*.rs' || true
+      --glob '*.rs' |
+      rg -v '^crates/ecstore/src/bucket/replication/' || true
   }
 ) >"$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE"
 
@@ -2664,14 +2665,14 @@ fi
 
 (
   cd "$ROOT_DIR"
-  rg -n --with-filename 'rustfs_filemeta::|use\s+rustfs_filemeta\b' \
-    crates/replication/src \
-    --glob '*.rs' |
-    rg -v '^crates/replication/src/filemeta\.rs:' || true
+  {
+    rg -n --with-filename 'rustfs_filemeta::|use\s+rustfs_filemeta\b' crates/replication/src --glob '*.rs'
+    rg -n --with-filename '^rustfs-filemeta\b' crates/replication/Cargo.toml
+  } || true
 ) >"$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE"
 
 if [[ -s "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE" ]]; then
-  report_failure "replication crate filemeta contracts must stay behind crates/replication/src/filemeta.rs: $(paste -sd '; ' "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE")"
+  report_failure "rustfs-replication must not import or depend on rustfs-filemeta: $(paste -sd '; ' "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE")"
 fi
 
 (
