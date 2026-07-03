@@ -55,8 +55,14 @@ use super::storage_api::multipart_usecase::sse::{
     mark_encrypted_multipart_metadata, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader};
+use crate::app::object_data_cache::{
+    ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_before_mutation,
+};
 use crate::app::object_usecase::{build_put_like_object_lock_metadata, validate_existing_object_lock_for_write};
-use crate::app::runtime_sources::{AppContext, current_app_context, current_object_store_handle_for_context};
+use crate::app::runtime_sources::{
+    AppContext, current_app_context, current_object_data_cache_for_context, current_object_store_handle_for_context,
+};
 use crate::capacity::record_capacity_write;
 use crate::error::ApiError;
 use crate::table_catalog;
@@ -297,6 +303,10 @@ impl DefaultMultipartUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
+    fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
+        current_object_data_cache_for_context(self.context.as_deref())
+    }
+
     #[instrument(level = "debug", skip(self))]
     pub async fn execute_abort_multipart_upload(
         &self,
@@ -447,6 +457,8 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &ObjectOptions::default())
             .await
             .map_err(ApiError::from)?;
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let server_side_encryption = multipart_info
             .user_defined
@@ -466,6 +478,7 @@ impl DefaultMultipartUsecase {
             .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
             .await
             .map_err(ApiError::from)?;
+        let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
         record_capacity_write(Some(capacity_scope_token)).await;
 
         // check quota after completing multipart upload
@@ -480,6 +493,7 @@ impl DefaultMultipartUsecase {
                     if !check_result.allowed {
                         // Quota exceeded, delete the completed object
                         let _ = store.delete_object(&bucket, &key, ObjectOptions::default()).await;
+                        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
                         return Err(S3Error::with_message(
                             S3ErrorCode::InvalidRequest,
                             format!(

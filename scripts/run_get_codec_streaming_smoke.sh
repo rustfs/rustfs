@@ -26,6 +26,9 @@ ROUND_COOLDOWN_SECS=20
 WARP_OBJECTS=""
 WARP_OBJECT_LIFECYCLE="per-round"
 WARP_PREPARE_DURATION="1s"
+WARP_MODE="get"
+WARP_EXTRA_ARGS=""
+WARP_WARMUP_GET_BEFORE_BENCH=false
 GET_OBJECT_METADATA_CACHE_MAX_ENTRIES=""
 GET_SMALL_OBJECT_DIRECT_MEMORY=""
 GET_SMALL_OBJECT_DIRECT_MEMORY_THRESHOLD=""
@@ -161,6 +164,13 @@ Core options:
   --duration <duration>          warp duration per round (default: 30s)
   --warp-objects <n>             Number of objects prepared by warp for each size
                                  (default: warp default)
+  --warp-mode <get|mixed>        warp workload mode used by the benchmark
+                                 (default: get)
+  --warp-extra-args <args>       Extra arguments passed to the warp benchmark
+                                 command after lifecycle arguments
+  --warp-warmup-get-before-bench Run a GET warmup with --noclear before the
+                                 measured benchmark. Useful for read/write
+                                 invalidation workloads.
   --warp-object-lifecycle <mode> Object lifecycle mode for warp GET:
                                  per-round|prepare-once|existing-only
                                  (default: per-round)
@@ -319,6 +329,9 @@ parse_args() {
       --concurrency) CONCURRENCY="$2"; shift 2 ;;
       --duration) DURATION="$2"; shift 2 ;;
       --warp-objects) WARP_OBJECTS="$2"; shift 2 ;;
+      --warp-mode) WARP_MODE="$2"; shift 2 ;;
+      --warp-extra-args) WARP_EXTRA_ARGS="$2"; shift 2 ;;
+      --warp-warmup-get-before-bench) WARP_WARMUP_GET_BEFORE_BENCH=true; shift ;;
       --warp-object-lifecycle) WARP_OBJECT_LIFECYCLE="$2"; shift 2 ;;
       --warp-prepare-duration) WARP_PREPARE_DURATION="$2"; shift 2 ;;
       --metadata-cache-max-entries) GET_OBJECT_METADATA_CACHE_MAX_ENTRIES="$2"; shift 2 ;;
@@ -415,6 +428,10 @@ validate_args() {
   if [[ -n "$WARP_OBJECTS" ]]; then
     validate_positive_int "$WARP_OBJECTS" "--warp-objects"
   fi
+  case "$WARP_MODE" in
+    get|mixed) ;;
+    *) die "--warp-mode must be get or mixed" ;;
+  esac
   case "$WARP_OBJECT_LIFECYCLE" in
     per-round|prepare-once|existing-only) ;;
     *) die "--warp-object-lifecycle must be per-round, prepare-once, or existing-only" ;;
@@ -940,6 +957,9 @@ rounds=${ROUNDS}
 retry_per_round=${RETRY_PER_ROUND}
 round_cooldown_secs=${ROUND_COOLDOWN_SECS}
 warp_objects=${WARP_OBJECTS}
+warp_mode=${WARP_MODE}
+warp_extra_args=${WARP_EXTRA_ARGS}
+warp_warmup_get_before_bench=${WARP_WARMUP_GET_BEFORE_BENCH}
 warp_object_lifecycle=${WARP_OBJECT_LIFECYCLE}
 warp_prepare_duration=${WARP_PREPARE_DURATION}
 rustfs_bin=${RUSTFS_BIN}
@@ -1207,6 +1227,63 @@ prepare_warp_existing_objects() {
   done < <(benchmark_sizes)
 }
 
+warmup_warp_get_before_bench() {
+  local profile="$1"
+  local profile_dir="${OUT_DIR}/${profile}"
+  local warmup_dir="${profile_dir}/warp_warmup_get"
+
+  if [[ "$WARP_WARMUP_GET_BEFORE_BENCH" != "true" ]]; then
+    return 0
+  fi
+
+  mkdir -p "$warmup_dir"
+
+  local size bucket size_slug
+  while IFS= read -r size; do
+    [[ -n "$size" ]] || continue
+    bucket="$(bucket_for_size "$size")"
+    size_slug="$(sanitize_bucket_suffix "$size")"
+
+    local cmd=(
+      "$WARP_BIN" get
+      --host "$ADDRESS"
+      --access-key "$ACCESS_KEY"
+      --secret-key "$SECRET_KEY"
+      --bucket "$bucket"
+      --obj.size "$size"
+      --concurrent "$CONCURRENCY"
+      --duration "$WARP_PREPARE_DURATION"
+      --region "$REGION"
+      --noclear
+    )
+    if [[ -n "$WARP_OBJECTS" ]]; then
+      cmd+=(--objects "$WARP_OBJECTS")
+    fi
+
+    {
+      printf 'profile=%s\n' "$profile"
+      printf 'mode=warmup-get-before-bench\n'
+      printf 'size=%s\n' "$size"
+      printf 'duration=%s\n' "$WARP_PREPARE_DURATION"
+      printf 'bucket=%s\n' "$bucket"
+      printf 'command='
+      printf '%q ' "${cmd[@]}"
+      printf '\n'
+    } >"${warmup_dir}/manifest-${size_slug}.env"
+
+    if [[ "$DRY_RUN" == "true" ]]; then
+      log "[DRY-RUN] warmup GET before benchmark profile=${profile} size=${size} bucket=${bucket}"
+      printf '[DRY-RUN] ' >"${warmup_dir}/warmup-${size_slug}.log"
+      printf '%q ' "${cmd[@]}" >>"${warmup_dir}/warmup-${size_slug}.log"
+      printf '\n' >>"${warmup_dir}/warmup-${size_slug}.log"
+      continue
+    fi
+
+    log "Running warmup GET before benchmark profile=${profile} size=${size} bucket=${bucket}..."
+    "${cmd[@]}" >"${warmup_dir}/warmup-${size_slug}.log" 2>&1
+  done < <(benchmark_sizes)
+}
+
 run_bench() {
   local profile="$1"
   local baseline_csv="${2:-}"
@@ -1221,7 +1298,7 @@ run_bench() {
     --bucket "$BUCKET"
     --region "$REGION"
     --warp-bin "$WARP_BIN"
-    --warp-mode get
+    --warp-mode "$WARP_MODE"
     --sizes "$SIZES"
     --concurrency "$CONCURRENCY"
     --duration "$DURATION"
@@ -1234,18 +1311,23 @@ run_bench() {
   if [[ -n "$baseline_csv" ]]; then
     cmd+=(--baseline-csv "$baseline_csv")
   fi
+  local lifecycle_args=""
   if [[ "$WARP_OBJECT_LIFECYCLE" == "per-round" && -n "$WARP_OBJECTS" ]]; then
-    cmd+=(--extra-args "--objects ${WARP_OBJECTS}")
-  fi
-  if [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
-    local lifecycle_args="--list-existing --noclear"
+    lifecycle_args="--objects ${WARP_OBJECTS}"
+  elif [[ "$WARP_OBJECT_LIFECYCLE" != "per-round" ]]; then
+    lifecycle_args="--list-existing --noclear"
     if [[ -n "$WARP_OBJECTS" ]]; then
       lifecycle_args="${lifecycle_args} --objects ${WARP_OBJECTS}"
     fi
-    cmd+=(--extra-args "$lifecycle_args")
     if [[ "$(benchmark_size_count)" -gt 1 ]]; then
       cmd+=(--bucket-size-suffix)
     fi
+  fi
+  if [[ -n "$WARP_EXTRA_ARGS" ]]; then
+    lifecycle_args="${lifecycle_args:+${lifecycle_args} }${WARP_EXTRA_ARGS}"
+  fi
+  if [[ -n "$lifecycle_args" ]]; then
+    cmd+=(--extra-args "$lifecycle_args")
   fi
   if [[ "$DIAGNOSTIC_METRICS" == "true" && -z "$DIAGNOSTIC_PROMETHEUS_QUERY_URL" ]]; then
     cmd+=(
@@ -3925,6 +4007,7 @@ run_profile() {
   stop_server
   start_server "$profile"
   prepare_warp_existing_objects "$profile"
+  warmup_warp_get_before_bench "$profile"
   capture_service_metrics_snapshot "$profile" before
   if run_bench "$profile" "$baseline_csv"; then
     :

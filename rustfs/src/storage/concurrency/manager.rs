@@ -988,10 +988,12 @@ mod integration_tests {
             StorageMedia::Hdd => config.hdd_buffer_cap,
             StorageMedia::Unknown => config.ssd_buffer_cap,
         };
-        let expected_max = media_cap;
 
-        // Large base buffer should be constrained by the active storage media cap.
-        assert_eq!(strategy.buffer_size, expected_max, "Buffer should be capped by the active media profile");
+        // Large base buffer should be constrained by the storage media cap.
+        // The final safety clamp is [32KiB, media_cap.max(MI_B)], so it never
+        // lowers the result below the media cap (e.g. NVMe's 2MiB cap stays
+        // effective even though the global floor clamp is 1MiB).
+        assert_eq!(strategy.buffer_size, media_cap, "Buffer should be capped by the storage media profile");
     }
 
     #[tokio::test]

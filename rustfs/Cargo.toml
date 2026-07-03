@@ -102,6 +102,7 @@ rustfs-zip = { workspace = true }
 rustfs-io-core = { workspace = true }
 rustfs-io-metrics = { workspace = true }
 rustfs-object-capacity = { workspace = true }
+rustfs-object-data-cache = { workspace = true }
 rustfs-concurrency = { workspace = true }
 rustfs-scanner = { workspace = true }
 tempfile = { workspace = true }

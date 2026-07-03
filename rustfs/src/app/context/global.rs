@@ -33,6 +33,7 @@ use super::interfaces::{
     ReplicationPoolInterface, ReplicationStatsInterface, RuntimePortInterface, S3SelectDbInterface, ScannerMetricsInterface,
     ServerConfigInterface, StorageClassInterface, TierConfigInterface, TransitionStateInterface,
 };
+use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use rustfs_iam::{oidc::OidcSys, store::object::ObjectStore, sys::IamSys};
 use rustfs_kms::KmsServiceManager;
 use std::sync::{Arc, OnceLock};
@@ -72,10 +73,13 @@ pub struct AppContext {
     server_config: Arc<dyn ServerConfigInterface>,
     storage_class: Arc<dyn StorageClassInterface>,
     buffer_config: Arc<dyn BufferConfigInterface>,
+    object_data_cache: Arc<ObjectDataCacheAdapter>,
 }
 
 impl AppContext {
     pub fn new(object_store: Arc<ECStore>, iam: Arc<dyn IamInterface>, kms: Arc<dyn KmsInterface>) -> Self {
+        let object_data_cache = ObjectDataCacheAdapter::from_env_or_disabled();
+
         Self {
             object_store,
             iam,
@@ -108,6 +112,7 @@ impl AppContext {
             server_config: default_server_config_interface(),
             storage_class: default_storage_class_interface(),
             buffer_config: default_buffer_config_interface(),
+            object_data_cache,
         }
     }
 
@@ -249,6 +254,10 @@ impl AppContext {
     pub fn buffer_config(&self) -> Arc<dyn BufferConfigInterface> {
         self.buffer_config.clone()
     }
+
+    pub(crate) fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
+        Arc::clone(&self.object_data_cache)
+    }
 }
 
 #[cfg(test)]
@@ -320,6 +329,7 @@ impl AppContext {
             server_config: interfaces.server_config,
             storage_class: interfaces.storage_class,
             buffer_config: interfaces.buffer_config,
+            object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
         }
     }
 }

@@ -17,6 +17,7 @@ use std::sync::Arc;
 
 pub(crate) use context::{
     AppContext, NotifyInterface, default_notify_interface as fallback_notify_interface,
+    default_object_data_cache_handle as fallback_object_data_cache_handle,
     default_outbound_tls_runtime_interface as fallback_outbound_tls_runtime_interface,
     default_s3select_db_interface as fallback_s3select_db_interface,
     default_scanner_metrics_interface as fallback_scanner_metrics_interface,
@@ -35,6 +36,7 @@ pub(crate) use context::{
     resolve_notification_system_for_context as current_notification_system_for_context,
     resolve_notify_interface as current_notify_interface,
     resolve_notify_interface_for_context as current_notify_interface_for_context,
+    resolve_object_data_cache_handle_for_context as current_object_data_cache_handle_for_context,
     resolve_object_store_handle as current_object_store_handle,
     resolve_object_store_handle_for_context as current_object_store_handle_for_context,
     resolve_oidc_handle as current_oidc_handle,

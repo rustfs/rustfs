@@ -94,7 +94,7 @@ use super::storage_api::object_usecase::{
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_expiry_state_handle, current_notify_interface_for_context,
-    current_object_store_handle_for_context,
+    current_object_data_cache_for_context, current_object_store_handle_for_context,
 };
 use crate::config::RustFSBufferConfig;
 use crate::delete_tail_activity::{DeleteTailActivityGuard, DeleteTailStage};
@@ -188,6 +188,14 @@ use uuid::Uuid;
 use super::storage_api::object_usecase::{
     StorageDeletedObject, StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions,
     StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
+};
+use crate::app::object_data_cache::{
+    GetObjectBodyCacheLookup, GetObjectBodyCachePlan, GetObjectBodyCacheRequest, ObjectDataCacheAdapter,
+    build_get_object_body_cache_plan, fill_get_object_body_cache_from_buffered_body,
+    fill_get_object_body_cache_from_materialized_body, invalidate_object_data_cache_after_copy_success,
+    invalidate_object_data_cache_after_delete_success, invalidate_object_data_cache_after_put_success,
+    invalidate_object_data_cache_before_mutation, invalidate_object_data_cache_objects_after_delete_success,
+    invalidate_object_data_cache_objects_before_mutation, lookup_get_object_body_cache_hit,
 };
 
 type S3StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
@@ -393,8 +401,11 @@ const GET_READER_STREAM_POLL_READY_DATA: &str = "ready_data";
 const GET_READER_STREAM_POLL_READY_EMPTY: &str = "ready_empty";
 const GET_READER_STREAM_POLL_READY_ERROR: &str = "ready_error";
 const GET_MEMORY_BODY_SOURCE_BUFFERED_BODY: &str = "buffered_body";
+const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE: &str = "object_data_cache";
+const GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED: &str = "object_data_cache_materialized";
 const GET_MEMORY_BODY_SOURCE_SEEK_BUFFER: &str = "seek_buffer";
 const GET_MEMORY_BODY_SOURCE_ENCRYPTED_BUFFER: &str = "encrypted_buffer";
+const GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ: &str = "body_cache_materialize_read";
 
 fn get_reader_stream_buffer_size_override() -> Option<usize> {
     static GET_READER_STREAM_BUFFER_SIZE_OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
@@ -1286,6 +1297,25 @@ fn should_buffer_get_object_in_memory(
     )
 }
 
+fn should_materialize_get_object_body_for_cache(
+    info: &ObjectInfo,
+    response_content_length: i64,
+    part_number: Option<usize>,
+    has_range: bool,
+    concurrent_requests: usize,
+) -> bool {
+    let configured_threshold = object_seek_support_threshold() as i64;
+    should_buffer_get_object_in_memory_with_threshold(
+        info,
+        response_content_length,
+        part_number,
+        has_range,
+        configured_threshold,
+        concurrent_requests,
+        true,
+    )
+}
+
 fn should_buffer_get_object_in_memory_with_threshold(
     _info: &ObjectInfo,
     response_content_length: i64,
@@ -2045,6 +2075,10 @@ impl DefaultObjectUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
+    fn object_data_cache(&self) -> Arc<ObjectDataCacheAdapter> {
+        current_object_data_cache_for_context(self.context.as_deref())
+    }
+
     fn base_buffer_size(&self) -> usize {
         self.context
             .clone()
@@ -2788,6 +2822,147 @@ impl DefaultObjectUsecase {
         ))
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn build_get_object_body_with_cache<R>(
+        cache_adapter: &ObjectDataCacheAdapter,
+        mut final_stream: R,
+        info: &ObjectInfo,
+        response_content_length: i64,
+        optimal_buffer_size: usize,
+        enable_readahead: bool,
+        concurrent_requests: usize,
+        part_number: Option<usize>,
+        has_range: bool,
+        encryption_applied: bool,
+        buffered_body: Option<Bytes>,
+        bucket: &str,
+        key: &str,
+    ) -> S3Result<Option<StreamingBlob>>
+    where
+        R: AsyncRead + Send + Sync + Unpin + 'static,
+    {
+        let cache_request = GetObjectBodyCacheRequest {
+            bucket,
+            key,
+            info,
+            response_content_length,
+            has_range,
+            part_number,
+            encryption_applied,
+        };
+        let cache_plan = build_get_object_body_cache_plan(cache_adapter, cache_request);
+
+        match lookup_get_object_body_cache_hit(cache_adapter, &cache_plan).await {
+            GetObjectBodyCacheLookup::Hit(bytes) => {
+                return Ok(Self::build_memory_bytes_blob(
+                    bytes,
+                    response_content_length,
+                    optimal_buffer_size,
+                    GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE,
+                ));
+            }
+            GetObjectBodyCacheLookup::Disabled | GetObjectBodyCacheLookup::Skip | GetObjectBodyCacheLookup::Miss => {}
+        }
+
+        if let Some(buffered_body) = buffered_body {
+            let _fill_result = fill_get_object_body_cache_from_buffered_body(cache_adapter, &cache_plan, &buffered_body).await;
+
+            return Ok(Self::build_memory_bytes_blob(
+                buffered_body,
+                response_content_length,
+                optimal_buffer_size,
+                GET_MEMORY_BODY_SOURCE_BUFFERED_BODY,
+            ));
+        }
+
+        let should_materialize_for_cache = cache_adapter.materialize_fill_enabled()
+            && matches!(cache_plan, GetObjectBodyCachePlan::Cacheable(_))
+            && should_materialize_get_object_body_for_cache(
+                info,
+                response_content_length,
+                part_number,
+                has_range,
+                concurrent_requests,
+            );
+
+        if should_materialize_for_cache {
+            let Ok(materialized_capacity) = usize::try_from(response_content_length) else {
+                warn!(
+                    expected = response_content_length,
+                    "GetObject materialize-fill skipped because content length is not representable"
+                );
+                return Self::build_get_object_body(
+                    final_stream,
+                    info,
+                    response_content_length,
+                    optimal_buffer_size,
+                    enable_readahead,
+                    concurrent_requests,
+                    part_number,
+                    has_range,
+                    encryption_applied,
+                    None,
+                    bucket,
+                    key,
+                )
+                .await;
+            };
+            let mut buf = Vec::with_capacity(materialized_capacity);
+            let buffer_read_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+            let read_result = tokio::io::AsyncReadExt::read_to_end(&mut final_stream, &mut buf).await;
+            record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ, buffer_read_start);
+
+            match read_result {
+                Ok(_) => {
+                    if buf.len() != materialized_capacity {
+                        warn!(
+                            expected = response_content_length,
+                            actual = buf.len(),
+                            "Object size mismatch during materialize-fill read"
+                        );
+                    }
+
+                    let bytes = Bytes::from(buf);
+                    let _fill_result =
+                        fill_get_object_body_cache_from_materialized_body(cache_adapter, &cache_plan, &bytes).await;
+
+                    return Ok(Self::build_memory_bytes_blob(
+                        bytes,
+                        response_content_length,
+                        optimal_buffer_size,
+                        GET_MEMORY_BODY_SOURCE_OBJECT_DATA_CACHE_MATERIALIZED,
+                    ));
+                }
+                Err(e) => {
+                    error!(error = %e, "GetObject materialize-fill buffering failed");
+                    // The stream is partially consumed; falling back to the
+                    // streaming path would send a body missing its prefix, so
+                    // fail the request like the encrypted-buffer path does.
+                    return Err(ApiError::from(StorageError::other(format!(
+                        "Failed to read object body for cache materialization: {e}"
+                    )))
+                    .into());
+                }
+            }
+        }
+
+        Self::build_get_object_body(
+            final_stream,
+            info,
+            response_content_length,
+            optimal_buffer_size,
+            enable_readahead,
+            concurrent_requests,
+            part_number,
+            has_range,
+            encryption_applied,
+            None,
+            bucket,
+            key,
+        )
+        .await
+    }
+
     fn put_object_execution_context(req: &S3Request<PutObjectInput>) -> (EventName, QuotaOperation, &'static str) {
         if req.extensions.get::<PostObjectRequestMarker>().is_some() {
             (put_event_name_for_post_object(true), QuotaOperation::PostObject, "POST")
@@ -3199,6 +3374,9 @@ impl DefaultObjectUsecase {
             );
         }
 
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+
         let store_put_watchdog = tokio_util::sync::CancellationToken::new();
         spawn_traced({
             let store_put_watchdog = store_put_watchdog.clone();
@@ -3277,6 +3455,7 @@ impl DefaultObjectUsecase {
         };
 
         maybe_enqueue_transition_immediate(&obj_info, LcEventSrc::S3PutObject).await;
+        let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &key).await;
 
         let put_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Fast in-memory update for immediate quota and admin usage consistency
@@ -3513,9 +3692,11 @@ impl DefaultObjectUsecase {
             optimal_buffer_size,
             enable_readahead,
         } = strategy;
+        let cache_adapter = self.object_data_cache();
 
         let body_build_start = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
-        let body = Self::build_get_object_body(
+        let body = Self::build_get_object_body_with_cache(
+            &cache_adapter,
             final_stream,
             &info,
             response_content_length,
@@ -4285,6 +4466,8 @@ impl DefaultObjectUsecase {
         self.check_bucket_quota(&bucket, QuotaOperation::CopyObject, src_info.size as u64)
             .await?;
         let has_bucket_metadata = self.bucket_metadata_sys().is_some();
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
         let oi = store
             .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
@@ -4292,6 +4475,7 @@ impl DefaultObjectUsecase {
             .map_err(ApiError::from)?;
 
         maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
+        let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
 
         let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
         // Update quota tracking after successful copy
@@ -4514,6 +4698,13 @@ impl DefaultObjectUsecase {
             existing_object_infos.push(gerr.is_none().then_some(goi));
         }
 
+        let cache_adapter = self.object_data_cache();
+        let cache_keys_before_delete = object_to_delete
+            .iter()
+            .map(|object| object.object_name.clone())
+            .collect::<Vec<_>>();
+        invalidate_object_data_cache_objects_before_mutation(&cache_adapter, &bucket, cache_keys_before_delete.iter()).await;
+
         let (mut dobjs, errs) = store
             .delete_objects(
                 &bucket,
@@ -4616,6 +4807,11 @@ impl DefaultObjectUsecase {
                 },
             })
             .collect();
+        let deleted_cache_keys = delete_results
+            .iter()
+            .filter_map(|result| result.delete_object.as_ref().map(|deleted| deleted.object_name.clone()))
+            .collect::<Vec<_>>();
+        invalidate_object_data_cache_objects_after_delete_success(&cache_adapter, &bucket, deleted_cache_keys.iter()).await;
 
         let errors = delete_results
             .iter()
@@ -4787,6 +4983,9 @@ impl DefaultObjectUsecase {
             }
         };
 
+        let cache_adapter = self.object_data_cache();
+        let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
+
         let obj_info = {
             match store.delete_object(&bucket, &key, opts.clone()).await {
                 Ok(obj) => obj,
@@ -4816,6 +5015,7 @@ impl DefaultObjectUsecase {
                 "failed to persist transitioned object cleanup journal"
             );
         }
+        let _ = invalidate_object_data_cache_after_delete_success(&cache_adapter, &bucket, &key).await;
 
         // Fast in-memory update for immediate quota and admin usage consistency
         if delete_creates_delete_marker(&opts) {
@@ -5829,6 +6029,8 @@ impl DefaultObjectUsecase {
             hrd = write_plan.apply(hrd, actual_size).map_err(ApiError::from)?;
             opts.user_defined.extend(metadata);
             let mut reader = PutObjReader::new(hrd);
+            let cache_adapter = self.object_data_cache();
+            let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &fpath).await;
 
             let obj_info = match store.put_object(&bucket, &fpath, &mut reader, &opts).await {
                 Ok(info) => info,
@@ -5840,6 +6042,7 @@ impl DefaultObjectUsecase {
                     return Err(ApiError::from(e).into());
                 }
             };
+            let _ = invalidate_object_data_cache_after_put_success(&cache_adapter, &bucket, &fpath).await;
             if !wrote_any_entry {
                 rustfs_scanner::record_dirty_usage_bucket(&bucket);
                 wrote_any_entry = true;
@@ -6355,6 +6558,33 @@ mod tests {
         }
     }
 
+    struct DataProbeReader {
+        reads: Arc<AtomicUsize>,
+        data: std::io::Cursor<Vec<u8>>,
+    }
+
+    impl AsyncRead for DataProbeReader {
+        fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, AtomicOrdering::Relaxed);
+
+            let remaining = buf.remaining();
+            if remaining == 0 {
+                return Poll::Ready(Ok(()));
+            }
+
+            let position = usize::try_from(self.data.position()).unwrap_or(usize::MAX);
+            let source = self.data.get_ref();
+            if position >= source.len() {
+                return Poll::Ready(Ok(()));
+            }
+
+            let end = position.saturating_add(remaining).min(source.len());
+            buf.put_slice(&source[position..end]);
+            self.data.set_position(u64::try_from(end).unwrap_or(u64::MAX));
+            Poll::Ready(Ok(()))
+        }
+    }
+
     struct PendingReader;
 
     impl AsyncRead for PendingReader {
@@ -6498,6 +6728,374 @@ mod tests {
             reads.load(AtomicOrdering::Relaxed),
             0,
             "buffered GetObject body must not be read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_uses_cached_body_without_reader_preread() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "cached-object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"hello")).await;
+
+        assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::Inserted);
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("cache hit body handoff should succeed");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "cache hit body handoff must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_rejects_size_mismatch_fill() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "cached-object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let fill = adapter.cache().fill_body(&plan, Bytes::from_static(b"oops")).await;
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("size-mismatched direct fill should not create a cache hit");
+        let lookup_after_mismatch = adapter.lookup_body(&plan).await;
+
+        assert_eq!(fill, rustfs_object_data_cache::ObjectDataCacheFillResult::SkippedSizeMismatch);
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "size-mismatched rejected fill should construct the fallback stream without pre-reading"
+        );
+        assert!(
+            matches!(lookup_after_mismatch, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
+            "size-mismatched fill must not leave a reusable cache entry"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_fills_from_buffered_body_without_reader_preread() {
+        let first_reads = Arc::new(AtomicUsize::new(0));
+        let first_reader = ReadProbeReader {
+            reads: Arc::clone(&first_reads),
+        };
+        let second_reads = Arc::new(AtomicUsize::new(0));
+        let second_reader = ReadProbeReader {
+            reads: Arc::clone(&second_reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+
+        let first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            first_reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"hello")),
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("buffered-body handoff should succeed");
+
+        let second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            second_reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("follow-up cache hit should succeed");
+
+        assert!(first_body.is_some());
+        assert!(second_body.is_some());
+        assert_eq!(
+            first_reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered-body fill path must not read from the fallback reader"
+        );
+        assert_eq!(
+            second_reads.load(AtomicOrdering::Relaxed),
+            0,
+            "cache hit after buffered-body fill must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_skips_buffered_fill_on_size_mismatch() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = ReadProbeReader {
+            reads: Arc::clone(&reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillBufferedOnly,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("fill-enabled cache adapter should initialize");
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "test-bucket",
+            object: "cached-object",
+            version_id: None,
+            etag: "etag",
+            size: 5,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            Some(Bytes::from_static(b"oops")),
+            "test-bucket",
+            "cached-object",
+        )
+        .await
+        .expect("size-mismatched buffered-body handoff should still return a response body");
+        let lookup = adapter.lookup_body(&plan).await;
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "buffered-body handoff must not read from the fallback reader"
+        );
+        assert!(
+            matches!(lookup, rustfs_object_data_cache::ObjectDataCacheLookup::Miss),
+            "size-mismatched buffered body must not be filled into cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_materializes_once_and_hits_later() {
+        let first_reads = Arc::new(AtomicUsize::new(0));
+        let first_reader = DataProbeReader {
+            reads: Arc::clone(&first_reads),
+            data: std::io::Cursor::new(b"hello".to_vec()),
+        };
+        let second_reads = Arc::new(AtomicUsize::new(0));
+        let second_reader = ReadProbeReader {
+            reads: Arc::clone(&second_reads),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let first_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            first_reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "materialized-object",
+        )
+        .await
+        .expect("materialize-fill handoff should succeed");
+
+        let second_body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            second_reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "materialized-object",
+        )
+        .await
+        .expect("follow-up cache hit should succeed");
+
+        assert!(first_body.is_some());
+        assert!(second_body.is_some());
+        assert_eq!(
+            first_reads.load(AtomicOrdering::Relaxed),
+            2,
+            "materialize-fill path should read the source stream once to data and once for EOF"
+        );
+        assert_eq!(
+            second_reads.load(AtomicOrdering::Relaxed),
+            0,
+            "cache hit after materialize-fill must not read from the fallback reader"
+        );
+    }
+
+    #[tokio::test]
+    async fn build_get_object_body_with_cache_skips_materialize_when_too_large_for_cache() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reader = DataProbeReader {
+            reads: Arc::clone(&reads),
+            data: std::io::Cursor::new(b"hello".to_vec()),
+        };
+        let info = ObjectInfo {
+            size: 5,
+            etag: Some("etag".to_string()),
+            ..Default::default()
+        };
+        let adapter =
+            crate::app::object_data_cache::ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 8_388_608,
+                max_entry_bytes: 4,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("materialize-fill cache adapter should initialize");
+
+        let body = DefaultObjectUsecase::build_get_object_body_with_cache(
+            &adapter,
+            reader,
+            &info,
+            5,
+            128 * 1024,
+            false,
+            1,
+            None,
+            false,
+            false,
+            None,
+            "test-bucket",
+            "too-large-object",
+        )
+        .await
+        .expect("too-large cache candidate should use streaming fallback");
+
+        assert!(body.is_some());
+        assert_eq!(
+            reads.load(AtomicOrdering::Relaxed),
+            0,
+            "too-large materialize-fill candidate must not pre-read the fallback reader"
         );
     }
 

@@ -12,13 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::app::object_data_cache::ObjectDataCacheAdapter;
 use crate::app::storage_api::runtime_sources::ExpiryState;
 #[cfg(test)]
 use crate::app::storage_api::runtime_sources::TierConfigMgr;
 use crate::runtime_sources as root_runtime_sources;
 pub(crate) use crate::runtime_sources::{
     AppContext, current_encryption_service, current_endpoints_handle, current_notification_system,
-    current_object_store_handle_for_context,
+    current_object_data_cache_handle_for_context, current_object_store_handle_for_context,
 };
 use rustfs_s3select_api::{QueryResult, server::dbms::DatabaseManagerSystem};
 use s3s::dto::SelectObjectContentInput;
@@ -34,6 +35,11 @@ pub(crate) fn current_notify_interface_for_context(
 ) -> Arc<dyn root_runtime_sources::NotifyInterface> {
     root_runtime_sources::current_notify_interface_for_context(app_context)
         .unwrap_or_else(root_runtime_sources::fallback_notify_interface)
+}
+
+pub(crate) fn current_object_data_cache_for_context(app_context: Option<&AppContext>) -> Arc<ObjectDataCacheAdapter> {
+    current_object_data_cache_handle_for_context(app_context)
+        .unwrap_or_else(root_runtime_sources::fallback_object_data_cache_handle)
 }
 
 pub(crate) async fn current_s3select_db(

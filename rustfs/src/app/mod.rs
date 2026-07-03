@@ -19,6 +19,7 @@ pub mod admin_usecase;
 pub mod bucket_usecase;
 pub mod context;
 pub mod multipart_usecase;
+pub(crate) mod object_data_cache;
 pub mod object_usecase;
 pub(crate) mod runtime_sources;
 mod select_object;
