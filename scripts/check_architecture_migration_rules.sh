@@ -210,6 +210,7 @@ REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wild
 ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_boundary_bypass_hits.txt"
 SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_facade_bypass_hits.txt"
 RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_replication_facade_bypass_hits.txt"
+RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE="${TMP_DIR}/runtime_replication_dependency_bypass_hits.txt"
 REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
 REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_storage_api_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
@@ -2643,12 +2644,22 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
     rustfs/src \
-    --glob '*.rs' |
-    rg -v '^rustfs/src/app/storage_api\.rs:' || true
+    --glob '*.rs' || true
 ) >"$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE"
 
 if [[ -s "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
-  report_failure "RustFS runtime replication contracts must stay behind storage API facades: $(paste -sd '; ' "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE")"
+  report_failure "RustFS runtime replication contracts must come through storage API / ECStore replication facades: $(paste -sd '; ' "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename '^rustfs-replication\b' \
+    rustfs/Cargo.toml \
+    crates/scanner/Cargo.toml || true
+) >"$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE"
+
+if [[ -s "$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS runtime and scanner crates must not depend on rustfs-replication directly: $(paste -sd '; ' "$RUNTIME_REPLICATION_DEPENDENCY_BYPASS_HITS_FILE")"
 fi
 
 (

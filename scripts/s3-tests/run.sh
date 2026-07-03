@@ -744,6 +744,29 @@ envsubst < "${TEMPLATE_PATH}" > "${CONF_OUTPUT_PATH}" || {
 log_info "Provisioning s3-tests alt user..."
 
 # Helper function to install Python packages with fallback for externally-managed environments
+ensure_python_pip() {
+    if python3 -m pip --version >/dev/null 2>&1; then
+        return 0
+    fi
+
+    log_info "Installing pip for Python package setup..."
+    if python3 -m ensurepip --upgrade >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v apt-get >/dev/null 2>&1; then
+        sudo apt-get update && sudo apt-get install -y python3-pip || {
+            log_warn "Failed to install python3-pip via apt-get"
+        }
+    elif command -v brew >/dev/null 2>&1; then
+        brew install python || {
+            log_warn "Failed to install Python via brew"
+        }
+    fi
+
+    python3 -m pip --version >/dev/null 2>&1
+}
+
 install_python_package() {
     local package=$1
     local error_output
@@ -758,6 +781,11 @@ install_python_package() {
         fi
         log_warn "Failed to install ${package} with uv, falling back to python3 -m pip"
     fi
+
+    ensure_python_pip || {
+        log_error "python3 -m pip is unavailable"
+        return 1
+    }
 
     # Try --user first (works on most Linux systems)
     error_output=$(python3 -m pip install --user --upgrade pip "${package}" 2>&1)

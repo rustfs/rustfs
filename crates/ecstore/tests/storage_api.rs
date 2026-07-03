@@ -22,8 +22,12 @@ pub(crate) mod contract_compat {
 
 pub(crate) mod replication_compat {
     pub(crate) use rustfs_ecstore::api::bucket::replication::{
-        BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, ReplicationConfigurationExt,
-        ReplicationObjectBridge, ReplicationStats, ResyncStatusType,
+        BucketStats, DeletedObjectReplicationInfo, DynReplicationPool, ObjectOpts, REPLICATE_INCOMING_DELETE, ReplicateDecision,
+        ReplicationConfigurationExt, ReplicationDeleteScheduleInput, ReplicationDeleteStateSource, ReplicationObjectBridge,
+        ReplicationState, ReplicationStats, ReplicationTargetValidationError, ResyncStatusType,
+        delete_replication_state_from_config, delete_replication_version_id, replication_statuses_map, replication_target_arns,
+        should_remove_replication_target, should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        should_use_existing_delete_replication_source, validate_replication_config_target_arns,
     };
 }
 
