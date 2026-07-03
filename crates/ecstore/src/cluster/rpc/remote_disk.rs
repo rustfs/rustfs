@@ -82,6 +82,10 @@ const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
 const BATCH_METADATA_RPC_OFF: &str = "off";
 const BATCH_METADATA_RPC_AUTO: &str = "auto";
 const BATCH_METADATA_RPC_ON: &str = "on";
+const BATCH_READ_VERSION_GATE_ATTEMPT: &str = "attempt";
+const BATCH_READ_VERSION_GATE_OFF_UNARY: &str = "off_unary";
+const BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED: &str = "fallback_unimplemented";
+const BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK: &str = "unsupported_no_fallback";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
@@ -127,6 +131,15 @@ fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
         .as_deref()
         .map(parse_batch_metadata_rpc_mode)
         .unwrap_or(BatchMetadataRpcMode::Off)
+}
+
+fn record_batch_read_version_gate_decision(mode: BatchMetadataRpcMode, decision: &'static str) {
+    counter!(
+        "rustfs_remote_disk_batch_read_version_gate_total",
+        "mode" => mode.as_str(),
+        "decision" => decision
+    )
+    .increment(1);
 }
 
 async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
@@ -1597,8 +1610,10 @@ impl DiskAPI for RemoteDisk {
 
         let mode = batch_metadata_rpc_mode();
         if !mode.should_attempt() {
+            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_OFF_UNARY);
             return batch_read_version_one_by_one(self, req).await;
         }
+        record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_ATTEMPT);
 
         debug!(
             event = EVENT_REMOTE_DISK_RPC,
@@ -1632,6 +1647,7 @@ impl DiskAPI for RemoteDisk {
                     Ok(response) => response.into_inner(),
                     Err(status) if status.code() == Code::Unimplemented => {
                         if mode.should_fallback_on_unimplemented() {
+                            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED);
                             warn!(
                                 event = EVENT_REMOTE_DISK_RPC,
                                 component = LOG_COMPONENT_ECSTORE,
@@ -1645,6 +1661,7 @@ impl DiskAPI for RemoteDisk {
                             return batch_read_version_one_by_one(self, req).await;
                         }
 
+                        record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK);
                         warn!(
                             event = EVENT_REMOTE_DISK_RPC,
                             component = LOG_COMPONENT_ECSTORE,
@@ -2761,6 +2778,10 @@ mod tests {
         assert!(!BatchMetadataRpcMode::Off.should_attempt());
         assert!(BatchMetadataRpcMode::Auto.should_attempt());
         assert!(BatchMetadataRpcMode::On.should_attempt());
+        assert_eq!(BATCH_READ_VERSION_GATE_ATTEMPT, "attempt");
+        assert_eq!(BATCH_READ_VERSION_GATE_OFF_UNARY, "off_unary");
+        assert_eq!(BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED, "fallback_unimplemented");
+        assert_eq!(BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK, "unsupported_no_fallback");
     }
 
     #[test]
