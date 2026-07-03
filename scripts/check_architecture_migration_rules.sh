@@ -136,6 +136,7 @@ LIFECYCLE_METADATA_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_metadata_boun
 LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_boundary_bypass_hits.txt"
 LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_lock_boundary_bypass_hits.txt"
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
+LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_crate_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -213,10 +214,13 @@ REPLICATION_OBJECT_DECISION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_ob
 REPLICATION_OBJECT_COMPARE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_object_compare_contract_backslide_hits.txt"
 REPLICATION_MRF_WIRE_FORMAT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_mrf_wire_format_backslide_hits.txt"
 STORAGE_REPLICATION_HANDLE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_handle_boundary_bypass_hits.txt"
+STORAGE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/storage_replication_crate_bypass_hits.txt"
 ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_dto_boundary_bypass_hits.txt"
+ADMIN_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/admin_replication_crate_bypass_hits.txt"
 APP_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_dto_boundary_bypass_hits.txt"
 APP_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/app_replication_crate_bypass_hits.txt"
 SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_dto_boundary_bypass_hits.txt"
+SCANNER_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_crate_bypass_hits.txt"
 OBS_REPLICATION_STATS_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/obs_replication_stats_boundary_bypass_hits.txt"
 REPLICATION_BANDWIDTH_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_bandwidth_boundary_bypass_hits.txt"
 REPLICATION_CONFIG_STORE_BYPASS_HITS_FILE="${TMP_DIR}/replication_config_store_bypass_hits.txt"
@@ -932,6 +936,22 @@ fi
 
 if [[ -s "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle replication scheduling must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+      crates/ecstore/src/bucket/lifecycle \
+      --glob '*.rs' || true
+    rg -n -U --with-filename 'rustfs_filemeta::\{[^}]*\b(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType)\b' \
+      crates/ecstore/src/bucket/lifecycle \
+      --glob '*.rs' || true
+  }
+) >"$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE"
+
+if [[ -s "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "lifecycle replication status/state contracts must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2806,6 +2826,18 @@ fi
 
 (
   cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    rustfs/src/storage \
+    --glob '*.rs' \
+    --glob '!rustfs/src/storage/storage_api.rs' || true
+) >"$STORAGE_REPLICATION_CRATE_BYPASS_HITS_FILE"
+
+if [[ -s "$STORAGE_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS storage replication crate access must stay behind rustfs/src/storage/storage_api.rs: $(paste -sd '; ' "$STORAGE_REPLICATION_CRATE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
   {
     rg -n --with-filename '\b(ObjectOpts|ResyncOpts)\s*\{' \
       rustfs/src/admin \
@@ -2824,6 +2856,18 @@ fi
 
 if [[ -s "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "admin replication ObjectOpts/ResyncOpts construction must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$ADMIN_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    rustfs/src/admin \
+    --glob '*.rs' \
+    --glob '!rustfs/src/admin/storage_api.rs' || true
+) >"$ADMIN_REPLICATION_CRATE_BYPASS_HITS_FILE"
+
+if [[ -s "$ADMIN_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "admin replication crate access must stay behind rustfs/src/admin/storage_api.rs: $(paste -sd '; ' "$ADMIN_REPLICATION_CRATE_BYPASS_HITS_FILE")"
 fi
 
 (
@@ -2887,6 +2931,18 @@ fi
 
 if [[ -s "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "scanner replication queue DTO access must stay behind crates/scanner/src/storage_api.rs: $(paste -sd '; ' "$SCANNER_REPLICATION_DTO_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    crates/scanner/src crates/scanner/tests \
+    --glob '*.rs' \
+    --glob '!crates/scanner/src/storage_api.rs' || true
+) >"$SCANNER_REPLICATION_CRATE_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication crate access must stay behind crates/scanner/src/storage_api.rs: $(paste -sd '; ' "$SCANNER_REPLICATION_CRATE_BYPASS_HITS_FILE")"
 fi
 
 (
