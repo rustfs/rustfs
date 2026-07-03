@@ -14,7 +14,7 @@
 
 use super::BucketReplicationResyncStatus;
 use super::replication_error_boundary::Result;
-use super::replication_resyncer::{decode_resync_file, encode_resync_file};
+use super::replication_resync_boundary::{decode_resync_file, encode_resync_file};
 
 pub(crate) struct ReplicationMigrationBridge;
 
