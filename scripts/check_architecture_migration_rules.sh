@@ -203,6 +203,7 @@ REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_con
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
 REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_queue_contract_backslide_hits.txt"
+REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/replication_queue_boundary_bypass_hits.txt"
 REPLICATION_STATS_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_stats_contract_backslide_hits.txt"
 REPLICATION_RUNTIME_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_runtime_contract_backslide_hits.txt"
 REPLICATION_RESYNC_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_resync_contract_backslide_hits.txt"
@@ -2609,6 +2610,23 @@ fi
 
 if [[ -s "$REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE" ]]; then
   report_failure "replication queue contracts must stay in crates/replication: $(paste -sd '; ' "$REPLICATION_QUEUE_CONTRACT_BACKSLIDE_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_replication::(DeletedObjectReplicationInfo|LARGE_WORKER_COUNT|ReplicationBackpressureRecommendation|ReplicationBackpressureState|ReplicationHealQueueAction|ReplicationHealQueueResult|ReplicationHealResyncDeletes|ReplicationOperation|ReplicationPoolOpts|ReplicationPriority|ReplicationQueueAdmission|ReplicationWorkerQueue|WORKER_MAX_LIMIT|initial_worker_counts|large_worker_backpressure_resize|mrf_worker_size_to_count|replication_backpressure_recommendation|replication_heal_queue_action|resized_worker_counts|should_queue_large_object|worker_queue_for_replication_type)\b' \
+      crates/ecstore/src/bucket/replication \
+      --glob '*.rs'
+    rg -n -U --with-filename 'use\s+rustfs_replication::\{[^}]*\b(DeletedObjectReplicationInfo|LARGE_WORKER_COUNT|ReplicationBackpressureRecommendation|ReplicationBackpressureState|ReplicationHealQueueAction|ReplicationHealQueueResult|ReplicationHealResyncDeletes|ReplicationOperation|ReplicationPoolOpts|ReplicationPriority|ReplicationQueueAdmission|ReplicationWorkerQueue|WORKER_MAX_LIMIT|initial_worker_counts|large_worker_backpressure_resize|mrf_worker_size_to_count|replication_backpressure_recommendation|replication_heal_queue_action|resized_worker_counts|should_queue_large_object|worker_queue_for_replication_type)\b' \
+      crates/ecstore/src/bucket/replication \
+      --glob '*.rs'
+  } |
+    rg -v '^crates/ecstore/src/bucket/replication/replication_queue_boundary\.rs:' || true
+) >"$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication queue contracts must stay behind replication_queue_boundary: $(paste -sd '; ' "$REPLICATION_QUEUE_BOUNDARY_BYPASS_HITS_FILE")"
 fi
 
 (
