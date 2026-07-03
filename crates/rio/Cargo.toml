@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-rio/latest/rustfs_rio/"
 workspace = true
 
 [dependencies]
+arc-swap.workspace = true
 tokio = { workspace = true, features = ["full"] }
 rand = { workspace = true }
 http.workspace = true

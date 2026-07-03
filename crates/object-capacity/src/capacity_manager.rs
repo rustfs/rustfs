@@ -50,6 +50,7 @@ const EVENT_CAPACITY_REFRESH_CACHE_UPDATED: &str = "capacity_refresh_cache_updat
 const EVENT_CAPACITY_REFRESH_WRITE_RECORDED: &str = "capacity_refresh_write_recorded";
 const EVENT_CAPACITY_REFRESH_DEBOUNCE_STATE: &str = "capacity_refresh_debounce_state";
 const EVENT_CAPACITY_REFRESH_PANIC: &str = "capacity_refresh_panic";
+const EVENT_CAPACITY_REFRESH_CANCELLED: &str = "capacity_refresh_cancelled";
 const EVENT_CAPACITY_REFRESH_RUNTIME_SUMMARY: &str = "capacity_refresh_runtime_summary";
 const EVENT_CAPACITY_REFRESH_INTERVAL_CLAMPED: &str = "capacity_refresh_interval_clamped";
 const EVENT_CAPACITY_REFRESH_SCHEDULED: &str = "capacity_refresh_scheduled";
@@ -545,6 +546,55 @@ impl Default for RefreshState {
     }
 }
 
+fn reset_cancelled_refresh_state(state: &mut RefreshState) {
+    state.running = false;
+    record_capacity_refresh_inflight(0);
+    let _ = state
+        .result_tx
+        .send(Some(Err("capacity refresh leader was cancelled".to_string())));
+}
+
+/// Resets the singleflight leader state if the leading future is dropped before the
+/// refresh cycle completes (e.g. the admin request that became leader is cancelled by
+/// a client disconnect). Without this, `running` stays `true` forever: joiners block
+/// indefinitely and no future refresh can start. `catch_unwind` covers panics but not
+/// cancellation, so the reset must live in `Drop`.
+struct RefreshLeaderGuard {
+    state: Option<Arc<Mutex<RefreshState>>>,
+}
+
+impl RefreshLeaderGuard {
+    fn disarm(&mut self) {
+        self.state = None;
+    }
+}
+
+impl Drop for RefreshLeaderGuard {
+    fn drop(&mut self) {
+        let Some(state) = self.state.take() else {
+            return;
+        };
+        warn!(
+            event = EVENT_CAPACITY_REFRESH_CANCELLED,
+            component = LOG_COMPONENT_CAPACITY,
+            subsystem = LOG_SUBSYSTEM_REFRESH,
+            result = "cancelled",
+            "capacity refresh leader dropped before completing; resetting refresh state"
+        );
+        if let Ok(mut guard) = state.try_lock() {
+            reset_cancelled_refresh_state(&mut guard);
+            return;
+        }
+        // The mutex is momentarily held by a joiner subscribing; finish the
+        // reset from a detached task since Drop cannot await.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                reset_cancelled_refresh_state(&mut *state.lock().await);
+            });
+        }
+    }
+}
+
 /// Hybrid capacity manager
 pub struct HybridCapacityManager {
     /// Capacity cache
@@ -843,6 +893,13 @@ impl HybridCapacityManager {
                 .unwrap_or_else(|| Err("capacity refresh completed without a result".to_string()));
         }
 
+        // From here on this future is the leader; if it is dropped at any await point
+        // below (request cancellation), the guard resets the singleflight state so
+        // joiners unblock and later refreshes are not wedged behind `running = true`.
+        let mut leader_guard = RefreshLeaderGuard {
+            state: Some(self.refresh_state.clone()),
+        };
+
         let refresh_start = Instant::now();
         let result = AssertUnwindSafe(refresh_fn()).catch_unwind().await.unwrap_or_else(|err| {
             warn!(
@@ -871,6 +928,7 @@ impl HybridCapacityManager {
 
         {
             let mut state = self.refresh_state.lock().await;
+            leader_guard.disarm();
             state.running = false;
             record_capacity_refresh_inflight(0);
             let _ = state.result_tx.send(Some(result.clone()));
@@ -1434,6 +1492,63 @@ mod tests {
         let cached = manager.get_capacity().await.unwrap();
         assert_eq!(cached.total_used, 2048);
         assert_eq!(cached.file_count, 8);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refresh_or_join_recovers_after_leader_cancellation() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+
+        // Become the leader with a refresh that never completes, then drop the
+        // future mid-flight to simulate a cancelled admin request.
+        let mgr = manager.clone();
+        let mut leader = Box::pin(mgr.refresh_or_join(DataSource::Scheduled, || async {
+            futures::future::pending::<Result<CapacityUpdate, String>>().await
+        }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
+        drop(leader);
+        // Let a possibly-spawned reset task run.
+        tokio::task::yield_now().await;
+
+        // A joiner that subscribed to the cancelled cycle must unblock with an error
+        // (not hang), and a subsequent refresh must be able to become the new leader.
+        let refreshed = tokio::time::timeout(
+            Duration::from_secs(1),
+            manager.refresh_or_join(DataSource::WriteTriggered, || async { Ok(CapacityUpdate::exact(1024, 4)) }),
+        )
+        .await
+        .expect("refresh after cancelled leader must not hang")
+        .expect("new leader refresh should succeed");
+        assert_eq!(refreshed.total_used, 1024);
+        assert!(!manager.refresh_in_progress().await);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_refresh_or_join_cancelled_leader_unblocks_joiner() {
+        let manager = Arc::new(HybridCapacityManager::from_env());
+
+        let mgr = manager.clone();
+        let mut leader = Box::pin(mgr.refresh_or_join(DataSource::Scheduled, || async {
+            futures::future::pending::<Result<CapacityUpdate, String>>().await
+        }));
+        assert!(futures::poll!(leader.as_mut()).is_pending());
+
+        // Subscribe a joiner while the leader is still alive.
+        let mgr2 = manager.clone();
+        let joiner = tokio::spawn(async move {
+            mgr2.refresh_or_join(DataSource::WriteTriggered, || async { Ok(CapacityUpdate::exact(2048, 8)) })
+                .await
+        });
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        drop(leader);
+
+        let joined = tokio::time::timeout(Duration::from_secs(1), joiner)
+            .await
+            .expect("joiner must unblock after leader cancellation")
+            .expect("joiner task must not panic");
+        assert!(joined.is_err(), "joiner should observe the cancellation error, got {joined:?}");
     }
 
     #[tokio::test]

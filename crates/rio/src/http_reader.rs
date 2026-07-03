@@ -33,7 +33,7 @@ use std::sync::LazyLock;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::mpsc;
 use tokio::time::{self, Sleep};
 use tokio_util::io::StreamReader;
 use tokio_util::sync::PollSender;
@@ -221,7 +221,20 @@ struct CachedClients {
     no_proxy_client: Client,
 }
 
-static CLIENT_CACHE: LazyLock<Mutex<Option<CachedClients>>> = LazyLock::new(|| Mutex::new(None));
+impl CachedClients {
+    fn client_for(&self, disable_proxy: bool) -> Client {
+        if disable_proxy {
+            self.no_proxy_client.clone()
+        } else {
+            self.client.clone()
+        }
+    }
+}
+
+// Lock-free reads: this cache is hit once per stream open (data_shards times per
+// GET), so the hot path must not serialize on a mutex. Writes only happen on
+// outbound-TLS generation bumps (cert rotation), which are rare.
+static CLIENT_CACHE: arc_swap::ArcSwapOption<CachedClients> = arc_swap::ArcSwapOption::const_empty();
 
 const INTERNODE_HTTP_PROFILE_LEGACY: &str = "legacy";
 const INTERNODE_HTTP_PROFILE_BALANCED: &str = "balanced";
@@ -396,7 +409,7 @@ async fn build_http_client(
     disable_proxy: bool,
     tuning: InternodeHttpClientTuning,
     outbound_tls: &rustfs_tls_runtime::GlobalPublishedOutboundTlsState,
-) -> Client {
+) -> io::Result<Client> {
     let mut builder = Client::builder()
         .connect_timeout(std::time::Duration::from_secs(5))
         .tcp_keepalive(std::time::Duration::from_secs(10))
@@ -456,7 +469,11 @@ async fn build_http_client(
         }
     }
 
-    builder.build().expect("Failed to create global HTTP client")
+    // This runs lazily on the first internode request and again on every TLS
+    // generation bump, so a build failure must surface as an error, not a panic.
+    builder
+        .build()
+        .map_err(|err| Error::other(format!("failed to build internode HTTP client: {err}")))
 }
 
 fn should_bypass_proxy_for_url(url: &str) -> bool {
@@ -479,7 +496,7 @@ fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) ->
     }
 }
 
-async fn get_http_client(url: &str) -> Client {
+async fn get_http_client(url: &str) -> io::Result<Client> {
     let tuning = internode_http_client_tuning();
     // Reuse HTTP connection pools while honoring the configured internode proxy
     // policy. The legacy profile only bypasses loopback URLs to preserve defaults.
@@ -489,44 +506,55 @@ async fn get_http_client(url: &str) -> Client {
     // the full PEM + identity bytes when the TLS state hasn't changed.
     let generation = crate::http_runtime_sources::outbound_tls_generation();
 
-    let guard = CLIENT_CACHE.lock().await;
-    if let Some(cached) = guard.as_ref() {
+    let previous = CLIENT_CACHE.load_full();
+    if let Some(cached) = previous.as_ref() {
         if cached.generation == generation {
-            return if disable_proxy {
-                cached.no_proxy_client.clone()
-            } else {
-                cached.client.clone()
-            };
+            return Ok(cached.client_for(disable_proxy));
         }
         crate::http_runtime_sources::record_stale_outbound_tls_generation("rio_http_reader");
     }
-    drop(guard);
 
     // Cache miss or stale generation — load full outbound TLS state.
     let outbound_tls = crate::http_runtime_sources::outbound_tls_state().await;
 
-    let client = build_http_client(false, tuning, &outbound_tls).await;
-    let no_proxy_client = build_http_client(true, tuning, &outbound_tls).await;
-    let cached = CachedClients {
+    let built = match build_http_client(false, tuning, &outbound_tls).await {
+        Ok(client) => match build_http_client(true, tuning, &outbound_tls).await {
+            Ok(no_proxy_client) => Ok((client, no_proxy_client)),
+            Err(err) => Err(err),
+        },
+        Err(err) => Err(err),
+    };
+    let (client, no_proxy_client) = match built {
+        Ok(pair) => pair,
+        Err(err) => {
+            // Prefer serving with the previous TLS generation over failing the
+            // request outright; the stale-generation metric already fired above.
+            if let Some(cached) = previous {
+                warn!(
+                    error = %err,
+                    stale_generation = cached.generation,
+                    target_generation = generation,
+                    "failed to rebuild internode HTTP client; falling back to previous TLS generation"
+                );
+                return Ok(cached.client_for(disable_proxy));
+            }
+            return Err(err);
+        }
+    };
+    let cached = std::sync::Arc::new(CachedClients {
         generation,
         client,
         no_proxy_client,
-    };
+    });
 
-    let return_client = if disable_proxy {
-        cached.no_proxy_client.clone()
-    } else {
-        cached.client.clone()
-    };
-
-    let mut guard = CLIENT_CACHE.lock().await;
-    // Guard against races: only overwrite the cache if it is empty or
-    // contains an older generation, so a slower task cannot regress the
-    // TLS state after a faster task already cached a newer generation.
-    if guard.as_ref().is_none_or(|c| c.generation <= generation) {
-        *guard = Some(cached);
-    }
-    return_client
+    // Guard against races: only overwrite the cache if it is empty or contains an
+    // older generation, so a slower task cannot regress the TLS state after a
+    // faster task already cached a newer generation.
+    CLIENT_CACHE.rcu(|current| match current {
+        Some(existing) if existing.generation > generation => Some(existing.clone()),
+        _ => Some(cached.clone()),
+    });
+    Ok(cached.client_for(disable_proxy))
 }
 
 fn internode_request_context(method: &Method, url: &str, operation: Option<&'static str>) -> InternodeHttpRequestContext {
@@ -651,7 +679,9 @@ impl HttpReader {
     ) -> io::Result<Self> {
         let track_internode_metrics = is_internode_rpc_url(&url);
         let internode_operation = internode_rpc_operation(&url);
-        let client = get_http_client(&url).await;
+        let client = get_http_client(&url).await.inspect_err(|_| {
+            record_internode_error(track_internode_metrics, internode_operation);
+        })?;
         let mut request: RequestBuilder = client.request(method.clone(), url.clone()).headers(headers.clone());
         if let Some(body) = body {
             request = request.body(body);
@@ -861,7 +891,14 @@ impl HttpWriter {
             //     "[HttpWriter::spawn] sending HTTP request: url={url_clone}, method={method_clone:?}, headers={headers_clone:?}"
             // );
 
-            let client = get_http_client(&url_clone).await;
+            let client = match get_http_client(&url_clone).await {
+                Ok(client) => client,
+                Err(err) => {
+                    record_internode_error(track_internode_metrics, internode_operation);
+                    let _ = err_tx.send(Error::new(err.kind(), err.to_string()));
+                    return Err(err);
+                }
+            };
             let request = client
                 .request(method_clone.clone(), url_clone.clone())
                 .headers(headers_clone.clone())
