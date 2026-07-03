@@ -34,9 +34,10 @@ use super::replication_storage_boundary::{
     ReplicationObjectIO, ReplicationStorage, StatObjectOptions, WalkOptions,
 };
 use super::replication_target_boundary::{
-    PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_complete_multipart_options,
-    replication_delete_marker_purge_remove_options, replication_delete_remove_options, replication_force_delete_remove_options,
-    replication_put_object_header_size, replication_put_object_options,
+    PutObjectOptions, PutObjectPartOptions, ReplicationTargetStore, TargetClient, replication_action_for_target_head,
+    replication_complete_multipart_options, replication_delete_marker_purge_remove_options, replication_delete_remove_options,
+    replication_force_delete_remove_options, replication_put_object_header_size, replication_put_object_options,
+    replication_target_head_is_newer_null_version,
 };
 use super::replication_versioning_boundary::ReplicationVersioningStore;
 use super::runtime_boundary as runtime_sources;
@@ -52,14 +53,12 @@ use http_body::Frame;
 use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
-#[cfg(test)]
-use rustfs_replication::content_matches_by_etag;
 use rustfs_replication::{
-    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationSourceObject,
-    ReplicationTargetObject, ResyncOpts, TargetReplicationResyncStatus, heal_uses_delete_replication_path,
-    is_retryable_delete_replication_head_error, is_version_delete_replication, is_version_id_mismatch,
-    replication_action_for_target, replication_etags_match, resync_state_accepts_update, should_count_head_proxy_failure,
-    should_retry_delete_marker_purge, target_is_newer_than_source_null_version,
+    BucketReplicationResyncStatus, DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationMultipartPartInput, ResyncOpts,
+    TargetReplicationResyncStatus, heal_uses_delete_replication_path, is_retryable_delete_replication_head_error,
+    is_version_delete_replication, is_version_id_mismatch, replication_etags_match, replication_multipart_complete_actual_size,
+    replication_multipart_part_plan, resync_state_accepts_update, should_count_head_proxy_failure,
+    should_retry_delete_marker_purge,
 };
 use rustfs_s3_types::EventName;
 use rustfs_utils::http::{
@@ -180,38 +179,6 @@ async fn head_object_fallback(
         Ok(oi) => Ok(Some(oi)),
         Err(e) if e.as_service_error().is_some_and(|se| se.is_not_found()) || has_raw_status(&e, 404) => Ok(None),
         Err(e) => Err(e),
-    }
-}
-
-fn head_object_last_modified(oi: &HeadObjectOutput) -> Option<OffsetDateTime> {
-    oi.last_modified
-        .map(|dt| OffsetDateTime::from_unix_timestamp(dt.secs()).unwrap_or(OffsetDateTime::UNIX_EPOCH))
-}
-
-fn replication_source_object(oi: &ObjectInfo) -> ReplicationSourceObject<'_> {
-    ReplicationSourceObject {
-        mod_time: oi.mod_time,
-        version_id: oi.version_id.map(|version_id| version_id.to_string()),
-        etag: oi.etag.as_deref(),
-        actual_size: oi.get_actual_size().unwrap_or_default(),
-        delete_marker: oi.delete_marker,
-        content_type: oi.content_type.as_deref(),
-        content_encoding: oi.content_encoding.as_deref(),
-        user_tags: oi.user_tags.as_str(),
-        user_defined: oi.user_defined.as_ref(),
-    }
-}
-
-fn replication_target_object(oi: &HeadObjectOutput) -> ReplicationTargetObject<'_> {
-    ReplicationTargetObject {
-        last_modified: head_object_last_modified(oi),
-        version_id: oi.version_id.as_deref(),
-        etag: oi.e_tag.as_deref(),
-        content_length: oi.content_length.unwrap_or_default(),
-        delete_marker: oi.delete_marker.unwrap_or_default(),
-        content_type: oi.content_type.as_deref(),
-        metadata: oi.metadata.as_ref(),
-        tag_count: oi.tag_count.unwrap_or_default(),
     }
 }
 
@@ -2267,11 +2234,7 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             Ok(oi) => {
-                replication_action = replication_action_for_target(
-                    &replication_source_object(&object_info),
-                    &replication_target_object(&oi),
-                    self.op_type,
-                );
+                replication_action = replication_action_for_target_head(&object_info, &oi, self.op_type);
                 if replication_action == ReplicationAction::None {
                     rinfo.replication_status = ReplicationStatusType::Completed;
                     rinfo.replication_resynced = true;
@@ -2588,18 +2551,11 @@ impl ReplicateObjectInfoExt for ReplicateObjectInfo {
         .await
         {
             Ok(oi) => {
-                replication_action = replication_action_for_target(
-                    &replication_source_object(&object_info),
-                    &replication_target_object(&oi),
-                    self.op_type,
-                );
+                replication_action = replication_action_for_target_head(&object_info, &oi, self.op_type);
                 rinfo.replication_status = ReplicationStatusType::Completed;
                 if replication_action == ReplicationAction::None {
                     if self.op_type == ReplicationType::ExistingObject
-                        && target_is_newer_than_source_null_version(
-                            &replication_source_object(&object_info),
-                            &replication_target_object(&oi),
-                        )
+                        && replication_target_head_is_newer_null_version(&object_info, &oi)
                     {
                         warn!(
                             event = EVENT_RESYNC_RUNTIME_SKIPPED,
@@ -2885,29 +2841,6 @@ fn async_read_to_bytestream(reader: impl AsyncRead + Send + Sync + Unpin + 'stat
     ByteStream::new(SdkBody::from_body_1_x(body))
 }
 
-fn part_range_spec_from_actual_size(offset: i64, part_size: i64) -> std::io::Result<(HTTPRangeSpec, i64)> {
-    if offset < 0 {
-        return Err(std::io::Error::other("invalid part offset"));
-    }
-    if part_size <= 0 {
-        return Err(std::io::Error::other(format!("invalid part size {part_size}")));
-    }
-    let end = offset
-        .checked_add(part_size - 1)
-        .ok_or_else(|| std::io::Error::other("part range overflow"))?;
-    let next_offset = end
-        .checked_add(1)
-        .ok_or_else(|| std::io::Error::other("part offset overflow"))?;
-    Ok((
-        HTTPRangeSpec {
-            is_suffix_length: false,
-            start: offset,
-            end,
-        },
-        next_offset,
-    ))
-}
-
 struct MultipartReplicationContext<'a, S: ReplicationObjectIO> {
     storage: Arc<S>,
     cli: Arc<TargetClient>,
@@ -2956,11 +2889,18 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
     let mut header_size = replication_put_object_header_size(&put_opts);
     let mut offset: i64 = 0;
     for part_info in object_info.parts.iter() {
-        let part_number = i32::try_from(part_info.number)
-            .map_err(|_| std::io::Error::other(format!("part number {} overflows i32", part_info.number)))?;
-        let part_size = part_info.actual_size;
-        let (range_spec, next_offset) = part_range_spec_from_actual_size(offset, part_size)?;
-        offset = next_offset;
+        let part_plan = replication_multipart_part_plan(ReplicationMultipartPartInput {
+            offset,
+            part_number: part_info.number,
+            part_size: part_info.actual_size,
+        })
+        .map_err(|err| std::io::Error::other(err.to_string()))?;
+        let range_spec = HTTPRangeSpec {
+            is_suffix_length: false,
+            start: part_plan.range.start,
+            end: part_plan.range.end,
+        };
+        offset = part_plan.next_offset;
 
         let part_reader = storage
             .get_object_reader(src_bucket, object, Some(range_spec), HeaderMap::new(), obj_opts)
@@ -2976,8 +2916,8 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
                 dst_bucket,
                 object,
                 &upload_id,
-                part_number,
-                part_size,
+                part_plan.part_number,
+                part_plan.part_size,
                 byte_stream,
                 &PutObjectPartOptions { ..Default::default() },
             )
@@ -2986,11 +2926,15 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 
         let etag = object_part.e_tag.unwrap_or_default();
 
-        uploaded_parts.push(CompletedPart::builder().part_number(part_number).e_tag(etag).build());
+        uploaded_parts.push(
+            CompletedPart::builder()
+                .part_number(part_plan.part_number)
+                .e_tag(etag)
+                .build(),
+        );
     }
 
-    let actual_size =
-        rustfs_utils::http::get_str(&object_info.user_defined, rustfs_utils::http::SUFFIX_ACTUAL_SIZE).unwrap_or_default();
+    let actual_size = replication_multipart_complete_actual_size(&object_info.user_defined);
 
     cli.complete_multipart_upload(
         dst_bucket,
@@ -3008,24 +2952,9 @@ async fn replicate_object_with_multipart<S: ReplicationObjectIO>(ctx: MultipartR
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aws_smithy_types::DateTime;
     use std::collections::HashMap;
-    use time::{Duration, OffsetDateTime};
+    use time::OffsetDateTime;
     use uuid::Uuid;
-
-    #[test]
-    fn test_part_range_spec_from_actual_size() {
-        let (rs, next) = part_range_spec_from_actual_size(0, 10).unwrap();
-        assert_eq!(rs.start, 0);
-        assert_eq!(rs.end, 9);
-        assert_eq!(next, 10);
-    }
-
-    #[test]
-    fn test_part_range_spec_rejects_non_positive() {
-        assert!(part_range_spec_from_actual_size(0, 0).is_err());
-        assert!(part_range_spec_from_actual_size(0, -1).is_err());
-    }
 
     #[test]
     fn test_unmarshal_resync_payload() {
@@ -3196,46 +3125,6 @@ mod tests {
         assert_eq!(target.start_time, None);
         assert_eq!(target.last_update, None);
         assert_eq!(target.resync_before_date, None);
-    }
-
-    #[test]
-    fn test_get_replication_action_existing_object_source_newer_null_version_requires_replication() {
-        let source = ObjectInfo {
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(20)),
-            version_id: None,
-            ..Default::default()
-        };
-        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(10)).build();
-
-        assert_eq!(
-            replication_action_for_target(
-                &replication_source_object(&source),
-                &replication_target_object(&target),
-                ReplicationType::ExistingObject,
-            ),
-            ReplicationAction::All,
-            "a newer source null version must not be skipped during existing-object replication"
-        );
-    }
-
-    #[test]
-    fn test_get_replication_action_existing_object_target_newer_null_version_skips() {
-        let source = ObjectInfo {
-            mod_time: Some(OffsetDateTime::UNIX_EPOCH + Duration::seconds(10)),
-            version_id: None,
-            ..Default::default()
-        };
-        let target = HeadObjectOutput::builder().last_modified(DateTime::from_secs(20)).build();
-
-        assert_eq!(
-            replication_action_for_target(
-                &replication_source_object(&source),
-                &replication_target_object(&target),
-                ReplicationType::ExistingObject,
-            ),
-            ReplicationAction::None,
-            "a newer target null-version object should not be overwritten by existing-object replication"
-        );
     }
 
     #[test]
@@ -3418,57 +3307,6 @@ mod tests {
         assert!(
             !is_version_id_mismatch(Some("EntityTooLarge"), Some(400)),
             "EntityTooLarge/400 is a real request error and must not trigger version-ID fallback"
-        );
-    }
-
-    #[test]
-    fn test_content_matches_compares_etag_only() {
-        let src = ObjectInfo {
-            etag: Some("\"abc123\"".to_string()),
-            ..Default::default()
-        };
-
-        let tgt_match = HeadObjectOutput::builder().e_tag("\"abc123\"").build();
-        assert!(
-            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_match)),
-            "identical ETags must match"
-        );
-
-        let tgt_unquoted_match = HeadObjectOutput::builder().e_tag("abc123").build();
-        assert!(
-            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_unquoted_match)),
-            "quoted and unquoted ETags with identical values must match"
-        );
-
-        // version_id on the target is intentionally ignored
-        let tgt_different_version = HeadObjectOutput::builder()
-            .e_tag("\"abc123\"")
-            .version_id("aws-alphanumeric-id")
-            .build();
-        assert!(
-            content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_different_version)),
-            "matching ETags with different version IDs must still match"
-        );
-
-        let tgt_different_content = HeadObjectOutput::builder().e_tag("\"def456\"").build();
-        assert!(
-            !content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_different_content)),
-            "different ETags must not match"
-        );
-
-        let src_no_etag = ObjectInfo {
-            etag: None,
-            ..Default::default()
-        };
-        assert!(
-            !content_matches_by_etag(&replication_source_object(&src_no_etag), &replication_target_object(&tgt_match)),
-            "missing source ETag must not match"
-        );
-
-        let tgt_no_etag = HeadObjectOutput::builder().build();
-        assert!(
-            !content_matches_by_etag(&replication_source_object(&src), &replication_target_object(&tgt_no_etag)),
-            "missing target ETag must not match"
         );
     }
 
