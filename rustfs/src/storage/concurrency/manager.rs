@@ -994,10 +994,7 @@ mod integration_tests {
         // The final safety clamp is [32KiB, media_cap.max(MI_B)], so it never
         // lowers the result below the media cap (e.g. NVMe's 2MiB cap stays
         // effective even though the global floor clamp is 1MiB).
-        assert_eq!(
-            strategy.buffer_size, media_cap,
-            "Buffer should be capped by the storage media profile"
-        );
+        assert_eq!(strategy.buffer_size, media_cap, "Buffer should be capped by the storage media profile");
     }
 
     #[tokio::test]
