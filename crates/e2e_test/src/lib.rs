@@ -61,6 +61,10 @@ mod anonymous_access_test;
 #[cfg(test)]
 mod special_chars_test;
 
+// Leading/duplicate slash key normalization tests (Issue #2427)
+#[cfg(test)]
+mod leading_slash_key_test;
+
 // Content-Encoding header preservation test
 #[cfg(test)]
 mod content_encoding_test;

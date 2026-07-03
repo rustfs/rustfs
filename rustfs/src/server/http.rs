@@ -54,7 +54,12 @@ use rustfs_protocols::SwiftService;
 use rustfs_protos::proto_gen::node_service::node_service_server::NodeServiceServer;
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::net::parse_and_resolve_address;
-use s3s::{host::MultiDomain, service::S3Service, service::S3ServiceBuilder};
+use s3s::{
+    config::{S3Config, StaticConfigProvider},
+    host::MultiDomain,
+    service::S3Service,
+    service::S3ServiceBuilder,
+};
 use socket2::{SockRef, TcpKeepalive};
 use std::io::{Error, Result};
 use std::net::SocketAddr;
@@ -528,6 +533,15 @@ pub async fn start_http_server(config: &config::Config, readiness: Arc<GlobalRea
         b.set_auth(IAMAuth::new(access_key, secret_key));
         b.set_access(store);
         b.set_route(admin::make_admin_route(config.console_enable)?);
+
+        // Normalize leading/duplicate forward slashes in object keys (MinIO parity).
+        // AWS S3 accepts keys such as "/foo/bar"; without this, requests like
+        // `PUT /bucket//foo/bar` are rejected downstream with InvalidArgument
+        // (ObjectNamePrefixAsSlash, issue #2427). MinIO collapses these slashes instead of preserving them,
+        // so `//foo/bar` is stored and served as `foo/bar`.
+        let mut s3_config = S3Config::default();
+        s3_config.normalize_forward_slash_path = true;
+        b.set_config(Arc::new(StaticConfigProvider::new(Arc::new(s3_config))));
 
         // Virtual-hosted-style requests are only set up for S3 API when server domains are configured and console is disabled
         if !config.server_domains.is_empty() && !config.console_enable {
