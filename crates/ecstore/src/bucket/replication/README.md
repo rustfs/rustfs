@@ -39,6 +39,7 @@ paths.
 | `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
 | `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
 | `StorageApiReplicationContracts` | Storage-api delete DTO replication state/status helpers. | The temporary `rustfs-filemeta` dependency is isolated in `crates/storage-api/src/replication.rs` until the wire contracts can move without creating a `rustfs-replication` / `rustfs-storage-api` cycle. |
+| `ReplicationCrateStorageApiBoundary` | Storage API delete DTOs consumed by `rustfs-replication`. | `crates/replication/src/storage_api.rs` is the only direct `rustfs-storage-api` import boundary inside `rustfs-replication`. |
 | `ReplicationObjectDecisionContracts` | Object replication options, delete replication decisions, resync target projection, multipart planning, and delete-marker retry classifiers. | Owned by `crates/replication`; ECStore imports them through `replication_object_decision_boundary.rs`. |
 | `ReplicationQueueContracts` | Queue admission, heal queue results/actions, worker operations, worker sizing, and backpressure decisions. | Owned by `crates/replication`; ECStore imports them through `replication_queue_boundary.rs`. |
 | `ReplicationStatsContracts` | Bucket stats, replication target stats, queue/proxy metrics, and worker metric snapshots. | Owned by `crates/replication`; ECStore imports them through `replication_stats_boundary.rs`. |
@@ -90,6 +91,8 @@ paths.
     cycle.
 12. Keep direct `rustfs-filemeta` imports inside `rustfs-replication`
     concentrated in `crates/replication/src/filemeta.rs`.
+13. Keep direct `rustfs-storage-api` imports inside `rustfs-replication`
+    concentrated in `crates/replication/src/storage_api.rs`.
 
 ## First Code-Bearing Step
 

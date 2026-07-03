@@ -14,7 +14,6 @@
 
 use std::collections::HashMap;
 
-use rustfs_storage_api::ObjectToDelete;
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_TAGGING, SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER,
     SUFFIX_REPLICATION_RESET_STATUS, get_header_map,
@@ -23,6 +22,7 @@ use s3s::dto::ReplicationConfiguration;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::storage_api::ObjectToDelete;
 use crate::{
     ObjectOpts, ReplicateDecision, ReplicateTargetDecision, ReplicationConfigurationExt as _, ReplicationState,
     ReplicationStatusType, ReplicationType, ResyncTargetDecision, VersionPurgeStatusType, replication_statuses_map,
@@ -318,8 +318,8 @@ mod tests {
         is_ssec_encrypted, resync_target_for_object, should_schedule_delete_replication,
         should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     };
+    use crate::storage_api::ObjectToDelete;
     use crate::{ReplicationStatusType, ReplicationType, VersionPurgeStatusType, target_reset_header};
-    use rustfs_storage_api::ObjectToDelete;
     use rustfs_utils::http::{AMZ_BUCKET_REPLICATION_STATUS, SSEC_ALGORITHM_HEADER};
     use s3s::dto::{
         DeleteMarkerReplication, DeleteMarkerReplicationStatus, Destination, ExistingObjectReplication,

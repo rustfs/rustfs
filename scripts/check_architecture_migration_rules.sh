@@ -85,6 +85,7 @@ require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" 
 require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inventory.md" "architecture overview ECStore facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaFacade" "ECStore split plan replication crate filemeta facade section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiBoundary" "ECStore split plan replication crate storage-api boundary section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## Facade Group Inventory" "ECStore facade inventory group section"
 require_source_contains "docs/architecture/ecstore-api-facade-inventory.md" "## External Consumer Boundaries" "ECStore facade inventory consumer boundary section"
@@ -205,6 +206,7 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
+REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_storage_api_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
 REPLICATION_DELETE_WORKER_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_delete_worker_contract_backslide_hits.txt"
 REPLICATION_OPERATION_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_operation_contract_backslide_hits.txt"
@@ -2619,6 +2621,18 @@ fi
 
 if [[ -s "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE" ]]; then
   report_failure "replication crate filemeta contracts must stay behind crates/replication/src/filemeta.rs: $(paste -sd '; ' "$REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_storage_api::|use\s+rustfs_storage_api\b' \
+    crates/replication/src \
+    --glob '*.rs' |
+    rg -v '^crates/replication/src/storage_api\.rs:' || true
+) >"$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE"
+
+if [[ -s "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE" ]]; then
+  report_failure "replication crate storage-api contracts must stay behind crates/replication/src/storage_api.rs: $(paste -sd '; ' "$REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE")"
 fi
 
 (

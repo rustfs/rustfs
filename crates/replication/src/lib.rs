@@ -24,6 +24,7 @@ pub mod resync;
 pub mod rule;
 pub mod runtime;
 pub mod stats;
+mod storage_api;
 pub mod tagging;
 
 pub use config::{

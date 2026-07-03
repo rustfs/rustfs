@@ -127,6 +127,8 @@ Current coupling:
   ECStore retaining only error mapping and MRF persistence locally;
 - `crates/replication/src/filemeta.rs` is the only direct filemeta wire-contract
   import boundary inside `rustfs-replication`;
+- `crates/replication/src/storage_api.rs` is the only direct storage-api delete
+  DTO import boundary inside `rustfs-replication`;
 - storage-api delete replication status/state helpers use the local
   `crates/storage-api/src/replication.rs` contract boundary while the
   underlying wire types remain in `rustfs-filemeta`;
@@ -176,6 +178,9 @@ Required contracts before crate movement:
 - `ReplicationCrateFileMetaFacade`: replication facade compatibility symbols
   that still originate in filemeta wire contracts are concentrated in
   `crates/replication/src/filemeta.rs` inside `rustfs-replication`.
+- `ReplicationCrateStorageApiBoundary`: storage API delete DTOs consumed by
+  replication delete/queue/operation helpers are concentrated in
+  `crates/replication/src/storage_api.rs` inside `rustfs-replication`.
 - `StorageApiReplicationContracts`: storage-api delete DTO replication
   state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
   until the underlying wire contracts can move without a

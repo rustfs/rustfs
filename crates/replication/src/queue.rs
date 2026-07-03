@@ -14,8 +14,7 @@
 
 use std::any::Any;
 
-use rustfs_storage_api::DeletedObject;
-
+use crate::storage_api::DeletedObject;
 use crate::{
     DeletedObjectReplicationInfo, MrfReplicateEntry, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE,
     ReplicateObjectInfo, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision,
@@ -265,12 +264,12 @@ impl ReplicationWorkerOperation for ReplicationOperation {
 mod tests {
     use std::str::FromStr;
 
-    use rustfs_storage_api::DeletedObject;
     use uuid::Uuid;
 
     use super::{
         ReplicationHealQueueAction, ReplicationOperation, ReplicationPriority, ReplicationQueueAdmission, ReplicationWorkerQueue,
     };
+    use crate::storage_api::DeletedObject;
     use crate::{
         DeletedObjectReplicationInfo, REPLICATE_EXISTING, REPLICATE_HEAL, REPLICATE_HEAL_DELETE, ReplicateDecision,
         ReplicateObjectInfo, ReplicateTargetDecision, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation,
