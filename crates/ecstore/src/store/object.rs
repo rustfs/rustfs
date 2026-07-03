@@ -15,7 +15,7 @@
 use super::*;
 use crate::set_disk::{
     get_lock_acquire_timeout, get_object_lock_diag_slow_acquire_threshold, get_object_lock_diag_slow_hold_threshold,
-    is_object_lock_diag_enabled,
+    is_lock_optimization_enabled, is_object_lock_diag_enabled,
 };
 use crate::storage_api_contracts::object::{ObjectIO as _, ObjectOperations as _};
 use rustfs_io_metrics::{
@@ -442,7 +442,7 @@ impl ECStore {
     }
 
     fn attach_read_lock_guard(mut reader: GetObjectReader, guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-        if reader.buffered_body.is_some() {
+        if is_lock_optimization_enabled() || reader.buffered_body.is_some() {
             return reader;
         }
 
@@ -1978,7 +1978,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn reader_lock_is_held_for_stream_when_optimization_is_enabled() {
+    async fn reader_lock_is_not_held_for_stream_when_optimization_is_enabled() {
         temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
             let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
             let lock = rustfs_lock::NamespaceLock::with_local_manager("test".to_string(), manager);
@@ -2004,13 +2004,10 @@ mod tests {
 
             let reader = ECStore::attach_read_lock_guard(reader, Some(read_guard));
 
-            lock.get_write_lock(key.clone(), "writer", Duration::from_millis(20))
-                .await
-                .expect_err("streaming reader should hold the read lock");
-            drop(reader);
             lock.get_write_lock(key, "writer", Duration::from_secs(1))
                 .await
-                .expect("dropping the reader should release the read lock");
+                .expect("lock optimization should release the read lock before returning the stream");
+            drop(reader);
         })
         .await;
     }

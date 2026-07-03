@@ -270,10 +270,19 @@ impl AsyncRead for SetDiskLockGuardedReader {
     }
 }
 
-fn attach_set_disk_read_lock_guard(mut reader: GetObjectReader, read_lock_guard: Option<ObjectLockDiagGuard>) -> GetObjectReader {
-    if let Some(guard) = read_lock_guard
-        && reader.buffered_body.is_none()
-    {
+fn finish_set_disk_read_lock(
+    mut reader: GetObjectReader,
+    read_lock_guard: Option<ObjectLockDiagGuard>,
+    lock_optimization_enabled: bool,
+    bucket: &str,
+    object: &str,
+) -> GetObjectReader {
+    if lock_optimization_enabled || reader.buffered_body.is_some() {
+        release_materialized_read_lock(bucket, object, read_lock_guard);
+        return reader;
+    }
+
+    if let Some(guard) = read_lock_guard {
         reader.stream = Box::new(SetDiskLockGuardedReader {
             inner: reader.stream,
             guard: Some(guard),
@@ -2314,7 +2323,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 opts.part_number = Some(1);
             }
             let gr = get_transitioned_object_reader(bucket, object, &range, &h, &object_info, &opts).await?;
-            return Ok(attach_set_disk_read_lock_guard(gr, read_lock_guard.take()));
+            return Ok(finish_set_disk_read_lock(
+                gr,
+                read_lock_guard.take(),
+                lock_optimization_enabled,
+                bucket,
+                object,
+            ));
         }
 
         if is_get_small_object_direct_memory_eligible(&range, &object_info, &fi, opts) {
@@ -2418,7 +2433,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                         );
                         record_get_object_reader_path_observation(GET_OBJECT_PATH_CODEC_STREAMING, object_class, size_bucket);
                         let (reader, _offset, _length) = GetObjectReader::new(stream, range, &object_info, opts, &h).await?;
-                        return Ok(attach_set_disk_read_lock_guard(reader, read_lock_guard.take()));
+                        return Ok(finish_set_disk_read_lock(
+                            reader,
+                            read_lock_guard.take(),
+                            lock_optimization_enabled,
+                            bucket,
+                            object,
+                        ));
                     }
                     read::GetCodecStreamingReaderBuildOutcome::Fallback(reason) => {
                         record_get_codec_streaming_gate_decision(
@@ -2454,8 +2475,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let set_index = self.set_index;
         let pool_index = self.pool_index;
         let skip_verify = opts.skip_verify_bitrot;
-        // Move the read-lock guard into the task so it lives for the duration of the read.
-        // Fully materialized paths release it before returning; streaming paths keep it.
+        if lock_optimization_enabled {
+            release_materialized_read_lock(&bucket, &object, read_lock_guard.take());
+            debug!(bucket, object, "Lock optimization: released read lock before streaming read");
+        }
+
+        // When lock optimization is disabled, keep the read-lock guard in the
+        // task so it lives for the duration of the streaming read.
         tokio::spawn(async move {
             let _guard = read_lock_guard;
             let mut writer = wd;
