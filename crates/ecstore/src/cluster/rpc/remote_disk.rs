@@ -97,6 +97,10 @@ impl BatchMetadataRpcMode {
     fn should_attempt(self) -> bool {
         matches!(self, Self::Auto | Self::On)
     }
+
+    fn should_fallback_on_unimplemented(self) -> bool {
+        matches!(self, Self::Auto)
+    }
 }
 
 fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
@@ -1612,9 +1616,10 @@ impl DiskAPI for RemoteDisk {
                     batch_read_version_req_bin: batch_read_version_req_bin.into(),
                 });
 
+                let mode = batch_metadata_rpc_mode();
                 let response = match client.batch_read_version(request).await {
                     Ok(response) => response.into_inner(),
-                    Err(status) if status.code() == Code::Unimplemented => {
+                    Err(status) if status.code() == Code::Unimplemented && mode.should_fallback_on_unimplemented() => {
                         warn!(
                             event = EVENT_REMOTE_DISK_RPC,
                             component = LOG_COMPONENT_ECSTORE,
@@ -2727,6 +2732,13 @@ mod tests {
         assert!(!BatchMetadataRpcMode::Off.should_attempt());
         assert!(BatchMetadataRpcMode::Auto.should_attempt());
         assert!(BatchMetadataRpcMode::On.should_attempt());
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_only_auto_falls_back_on_unimplemented() {
+        assert!(!BatchMetadataRpcMode::Off.should_fallback_on_unimplemented());
+        assert!(BatchMetadataRpcMode::Auto.should_fallback_on_unimplemented());
+        assert!(!BatchMetadataRpcMode::On.should_fallback_on_unimplemented());
     }
 
     #[test]
