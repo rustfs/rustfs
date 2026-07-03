@@ -1130,6 +1130,13 @@ impl Erasure {
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid number of readers")));
         }
 
+        // block_size/data_shards come from on-disk metadata; a corrupt FileInfo with a
+        // zero here must surface as an error, not a divide-by-zero panic on every GET.
+        if self.block_size == 0 || self.data_shards == 0 {
+            record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
+            return (0, Some(io::Error::new(ErrorKind::InvalidInput, "Invalid erasure coding parameters")));
+        }
+
         let Some(end_offset) = offset.checked_add(length) else {
             record_get_object_pipeline_failure(GET_STAGE_RANGE, GetObjectFailureReason::RangeOrLengthInvalid);
             return (0, Some(io::Error::new(ErrorKind::InvalidInput, "offset + length exceeds total length")));

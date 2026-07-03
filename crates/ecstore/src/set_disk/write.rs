@@ -14,6 +14,29 @@
 
 use super::*;
 
+/// Grace window during which a recently modified object is never deleted as
+/// dangling. 0 disables the grace window.
+const ENV_HEAL_DANGLING_DELETE_GRACE_SECS: &str = "RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS";
+const DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS: u64 = 3600;
+
+fn dangling_delete_grace() -> time::Duration {
+    let secs = rustfs_utils::get_env_u64(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, DEFAULT_HEAL_DANGLING_DELETE_GRACE_SECS);
+    time::Duration::seconds(i64::try_from(secs).unwrap_or(i64::MAX))
+}
+
+/// Result of scanning one disk's copy of a directory prefix while deciding
+/// whether an orphan (metadata-less) directory tree can be safely purged.
+enum OrphanDirScan {
+    /// The subtree holds at least one regular file (object metadata or data), so
+    /// it is a real object and must not be purged.
+    HasData,
+    /// The prefix exists on this disk and contains only nested empty directories.
+    /// Carries every directory path in pre-order (parents before children).
+    Empty(Vec<String>),
+    /// The prefix does not exist on this disk.
+    Missing,
+}
+
 impl SetDisks {
     pub(super) fn default_read_quorum(&self) -> usize {
         self.set_drive_count - self.default_parity_count
@@ -569,6 +592,27 @@ impl SetDisks {
             return Err(DiskError::ErasureReadQuorum);
         }
 
+        // Recently written objects get a grace window before dangling cleanup: after
+        // an unclean shutdown some disks may still be catching up (or carry writes
+        // that were never made durable), and deleting the surviving shards right away
+        // turns a partial loss into a total one. Skip deletion and leave the object
+        // for a later heal/scanner pass to re-evaluate.
+        if m.is_valid()
+            && let Some(mod_time) = m.mod_time
+        {
+            let grace = dangling_delete_grace();
+            if !grace.is_zero() && OffsetDateTime::now_utc() - mod_time < grace {
+                info!(
+                    bucket = bucket,
+                    object = object,
+                    mod_time = %mod_time,
+                    grace_secs = grace.whole_seconds(),
+                    "skipping dangling-object deletion within grace window"
+                );
+                return Err(DiskError::ErasureReadQuorum);
+            }
+        }
+
         let mut tags: HashMap<String, String> = HashMap::new();
         tags.insert("set".to_string(), self.set_index.to_string());
         tags.insert("pool".to_string(), self.pool_index.to_string());
@@ -712,6 +756,118 @@ impl SetDisks {
         Ok(())
     }
 
+    /// Scan a single disk's copy of `prefix` and decide whether it is an orphan
+    /// (metadata-less) directory subtree. Walks the tree iteratively and returns
+    /// [`OrphanDirScan::HasData`] as soon as any regular file is found.
+    async fn scan_orphan_dir(disk: &DiskStore, bucket: &str, prefix: &str) -> OrphanDirScan {
+        let root = prefix.trim_end_matches(SLASH_SEPARATOR).to_string();
+        let mut stack = vec![root.clone()];
+        // Pre-order list of directories (a parent always precedes its descendants),
+        // so reversing it yields a safe children-first removal order.
+        let mut dirs: Vec<String> = Vec::new();
+        let mut existed = false;
+
+        while let Some(dir) = stack.pop() {
+            let entries = match disk.list_dir("", bucket, &dir, 0).await {
+                Ok(entries) => entries,
+                Err(_) => {
+                    // The root missing (or never existing) means there is nothing to
+                    // purge on this disk. A nested directory vanishing mid-scan is a
+                    // benign race, so skip it and keep walking.
+                    if dir == root {
+                        return OrphanDirScan::Missing;
+                    }
+                    continue;
+                }
+            };
+
+            existed = true;
+            dirs.push(dir.clone());
+
+            for entry in entries {
+                match entry.strip_suffix(SLASH_SEPARATOR) {
+                    // `read_dir` marks directories with a trailing slash; anything else
+                    // is a regular file, which means real object data lives here.
+                    Some(child) => stack.push(format!("{dir}{SLASH_SEPARATOR}{child}")),
+                    None => return OrphanDirScan::HasData,
+                }
+            }
+        }
+
+        if existed {
+            OrphanDirScan::Empty(dirs)
+        } else {
+            OrphanDirScan::Missing
+        }
+    }
+
+    /// Purge an orphan directory prefix — a trailing-slash key that exists on disk
+    /// as an empty directory tree with no object metadata on any disk of this set.
+    /// Such prefixes are listable (see `scan_dir`) yet are not real objects, so the
+    /// normal delete path returns NotFound and leaves them stranded (issue #4189).
+    ///
+    /// Callers pass the *decoded* directory name (`prefix/`), not the `__XLDIR__`
+    /// encoded object key — the orphan tree on disk uses the plain path.
+    ///
+    /// Returns `Ok(true)` when the prefix was an orphan tree on this set and was
+    /// removed, `Ok(false)` when it holds real data or does not exist on any disk
+    /// of this set (the caller should surface the original NotFound), and `Err` on
+    /// a hard disk failure.
+    pub(crate) async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> disk::error::Result<bool> {
+        let disks = self.get_disks_internal().await;
+
+        // Phase 1: classify every online disk. Refuse to purge if ANY disk holds
+        // object data under the prefix, so a degraded/healable object is never
+        // destroyed.
+        let mut per_disk_dirs: Vec<(usize, Vec<String>)> = Vec::new();
+        let mut existed = false;
+        for (i, disk) in disks.iter().enumerate() {
+            let Some(disk) = disk else { continue };
+            match Self::scan_orphan_dir(disk, bucket, object).await {
+                OrphanDirScan::HasData => return Ok(false),
+                OrphanDirScan::Empty(dirs) => {
+                    existed = true;
+                    per_disk_dirs.push((i, dirs));
+                }
+                OrphanDirScan::Missing => {}
+            }
+        }
+
+        if !existed {
+            return Ok(false);
+        }
+
+        // Phase 2: remove the empty directories children-first on each disk. A
+        // non-recursive delete performs an empty-only `rmdir`, so a directory that
+        // concurrently gained an object fails with DirectoryNotEmpty and is skipped —
+        // a racing PutObject is never clobbered.
+        for (i, mut dirs) in per_disk_dirs {
+            let Some(disk) = disks[i].as_ref() else { continue };
+            dirs.reverse();
+            for dir in dirs {
+                if let Err(err) = disk
+                    .delete(
+                        bucket,
+                        &dir,
+                        DeleteOptions {
+                            recursive: false,
+                            immediate: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                {
+                    // Best effort: a sibling removal may have already cleared a shared
+                    // parent, or a concurrent writer repopulated the directory. Neither
+                    // is fatal to purging the orphan tree.
+                    debug!(bucket, object, dir, error = ?err, "purge_orphan_dir_object: skipped non-empty/absent directory");
+                }
+            }
+        }
+
+        Ok(true)
+    }
+
     pub(super) async fn check_write_precondition(
         &self,
         bucket: &str,
@@ -759,5 +915,27 @@ impl SetDisks {
         }
 
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dangling_delete_grace_defaults_to_one_hour() {
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, None::<&str>, || {
+            assert_eq!(dangling_delete_grace(), time::Duration::seconds(3600));
+        });
+    }
+
+    #[test]
+    fn dangling_delete_grace_env_override_and_disable() {
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("120"), || {
+            assert_eq!(dangling_delete_grace(), time::Duration::seconds(120));
+        });
+        temp_env::with_var(ENV_HEAL_DANGLING_DELETE_GRACE_SECS, Some("0"), || {
+            assert!(dangling_delete_grace().is_zero());
+        });
     }
 }

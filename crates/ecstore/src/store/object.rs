@@ -814,6 +814,34 @@ impl ECStore {
         ))
     }
 
+    /// Best-effort purge of an orphan directory prefix — an on-disk tree of empty
+    /// directories with no `xl.meta` anywhere (issue #4189). Orphan fragments can sit
+    /// on any erasure set of any pool (they are left behind by whichever sets stored
+    /// the now-deleted children), so every set is swept. Returns true when at least
+    /// one set removed an orphan tree. Hard per-set failures are logged and skipped:
+    /// the caller falls back to surfacing the original NotFound.
+    async fn purge_orphan_dir_object(&self, bucket: &str, object: &str) -> bool {
+        let prefix = decode_dir_object(object);
+        let mut purged = false;
+        for pool in self.pools.iter() {
+            for set in pool.disk_set.iter() {
+                match set.purge_orphan_dir_object(bucket, &prefix).await {
+                    Ok(set_purged) => purged |= set_purged,
+                    Err(err) => {
+                        warn!(
+                            bucket,
+                            prefix,
+                            pool_index = pool.pool_idx,
+                            error = ?err,
+                            "failed to purge orphan directory prefix"
+                        );
+                    }
+                }
+            }
+        }
+        purged
+    }
+
     #[instrument(skip(self))]
     pub(super) async fn handle_delete_object(&self, bucket: &str, object: &str, opts: ObjectOptions) -> Result<ObjectInfo> {
         check_del_obj_args(bucket, object)?;
@@ -905,7 +933,23 @@ impl ECStore {
                 obj.name = decode_dir_object(object);
                 return Ok(obj);
             }
-            Err(err) => return Err(err),
+            Err(err) => {
+                // A folder key (`prefix/`) with no object metadata may still exist on
+                // disk as an orphan empty-directory tree (issue #4189): listings show
+                // it as a common prefix, but no regular delete path can remove it.
+                // Purge the orphan tree so folder deletes actually take effect.
+                if is_err_object_not_found(&err)
+                    && rustfs_utils::path::is_dir_object(object)
+                    && self.purge_orphan_dir_object(bucket, object).await
+                {
+                    return Ok(ObjectInfo {
+                        bucket: bucket.to_owned(),
+                        name: decode_dir_object(object),
+                        ..Default::default()
+                    });
+                }
+                return Err(err);
+            }
         };
 
         if pinfo.object_info.delete_marker && opts.version_id.is_none() {

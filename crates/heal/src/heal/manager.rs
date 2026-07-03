@@ -48,6 +48,7 @@ const EVENT_HEAL_QUEUE_ADMISSION: &str = "heal_queue_admission";
 const EVENT_HEAL_MAINLINE_THROTTLE: &str = "heal_mainline_throttle";
 const EVENT_HEAL_SCHEDULER_STATE: &str = "heal_scheduler_state";
 const EVENT_HEAL_QUEUE_STATE: &str = "heal_queue_state";
+const EVENT_HEAL_UNCLEAN_SHUTDOWN: &str = "heal_unclean_shutdown";
 const MAX_RECOVERABLE_HEAL_RETRIES: u32 = 3;
 const MAX_RECOVERABLE_HEAL_RETRY_DELAY: Duration = Duration::from_secs(30);
 
@@ -1251,6 +1252,10 @@ impl HealManager {
             );
         }
 
+        // Detect a previous unclean shutdown (crash/power loss) and proactively
+        // verify all local erasure sets instead of waiting for the periodic scanner.
+        self.process_unclean_shutdown().await;
+
         info!(
             target: "rustfs::heal::manager",
             event = EVENT_HEAL_MANAGER_STATE,
@@ -1260,6 +1265,117 @@ impl HealManager {
             "Heal manager started"
         );
         Ok(())
+    }
+
+    /// Detect whether the previous run ended without a clean shutdown and, if so,
+    /// enqueue a full erasure-set heal for every local set. Also (re)writes the
+    /// marker for the current run; [`super::clear_unclean_shutdown_markers`]
+    /// removes it again during graceful shutdown. Best-effort: failures only log.
+    async fn process_unclean_shutdown(&self) {
+        let mut unclean = false;
+        let mut set_disk_ids = HashSet::new();
+
+        {
+            let local_disk_map = local_disk_map_read().await;
+            for disk in local_disk_map.values().flatten() {
+                let endpoint = disk.endpoint();
+                match disk
+                    .read_all(super::RUSTFS_META_BUCKET, super::UNCLEAN_SHUTDOWN_MARKER_PATH)
+                    .await
+                {
+                    Ok(_) => unclean = true,
+                    Err(DiskError::FileNotFound) | Err(DiskError::VolumeNotFound) => {}
+                    Err(err) => {
+                        debug!(
+                            target: "rustfs::heal::manager",
+                            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                            component = LOG_COMPONENT_HEAL,
+                            subsystem = LOG_SUBSYSTEM_MANAGER,
+                            endpoint = %endpoint,
+                            error = ?err,
+                            "Unclean-shutdown marker check failed"
+                        );
+                    }
+                }
+
+                let marker = SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs().to_string())
+                    .unwrap_or_default();
+                if let Err(err) = disk
+                    .write_all(super::RUSTFS_META_BUCKET, super::UNCLEAN_SHUTDOWN_MARKER_PATH, marker.into())
+                    .await
+                {
+                    warn!(
+                        target: "rustfs::heal::manager",
+                        event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                        component = LOG_COMPONENT_HEAL,
+                        subsystem = LOG_SUBSYSTEM_MANAGER,
+                        endpoint = %endpoint,
+                        error = ?err,
+                        "Unclean-shutdown marker write failed"
+                    );
+                }
+
+                if let Some(set_disk_id) = crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx) {
+                    set_disk_ids.insert(set_disk_id);
+                }
+            }
+        }
+
+        if !unclean || set_disk_ids.is_empty() {
+            return;
+        }
+
+        info!(
+            target: "rustfs::heal::manager",
+            event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+            component = LOG_COMPONENT_HEAL,
+            subsystem = LOG_SUBSYSTEM_MANAGER,
+            set_count = set_disk_ids.len(),
+            "Unclean shutdown detected; scheduling erasure-set heal for local sets"
+        );
+
+        let buckets = match self.storage.list_buckets().await {
+            Ok(buckets) => buckets.iter().map(|b| b.name.clone()).collect::<Vec<String>>(),
+            Err(err) => {
+                error!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    error = %err,
+                    "Unclean-shutdown heal skipped: bucket listing failed"
+                );
+                return;
+            }
+        };
+
+        for set_disk_id in set_disk_ids {
+            let mut req = HealRequest::new(
+                HealType::ErasureSet {
+                    buckets: buckets.clone(),
+                    set_disk_id: set_disk_id.clone(),
+                },
+                HealOptions {
+                    timeout: None,
+                    ..HealOptions::default()
+                },
+                HealPriority::Low,
+            );
+            req.source = HealRequestSource::AutoHeal;
+            if let Err(err) = self.submit_heal_request(req).await {
+                warn!(
+                    target: "rustfs::heal::manager",
+                    event = EVENT_HEAL_UNCLEAN_SHUTDOWN,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_MANAGER,
+                    set_disk_id,
+                    error = %err,
+                    "Unclean-shutdown heal enqueue failed"
+                );
+            }
+        }
     }
 
     /// Stop HealManager

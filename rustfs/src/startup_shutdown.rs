@@ -201,6 +201,9 @@ pub(crate) async fn run_startup_shutdown_sequence(
         console_shutdown_handle.shutdown().await;
     }
     shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
+    // The data plane is drained: record this shutdown as clean so the next
+    // startup skips the unclean-restart erasure-set heal.
+    rustfs_heal::heal::clear_unclean_shutdown_markers().await;
     state_manager.update(ServiceState::Stopped);
     info!(
         target: "rustfs::main::handle_shutdown",

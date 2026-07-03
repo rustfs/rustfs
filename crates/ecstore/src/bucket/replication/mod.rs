@@ -27,6 +27,7 @@ mod replication_migration_bridge;
 mod replication_msgp_boundary;
 mod replication_object_bridge;
 mod replication_object_config;
+mod replication_object_decision_boundary;
 pub(crate) mod replication_pool;
 mod replication_queue_boundary;
 mod replication_resync_boundary;
@@ -46,6 +47,7 @@ pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, Replic
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
 pub use replication_object_config::ReplicationConfig;
+pub use replication_object_decision_boundary::MustReplicateOptions;
 pub use replication_pool::{
     DynReplicationPool, ReplicationPoolTrait, get_global_replication_pool, get_global_replication_stats,
     init_background_replication,
@@ -59,4 +61,4 @@ pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
-pub use rustfs_replication::{BucketStats, MustReplicateOptions};
+pub use rustfs_replication::BucketStats;

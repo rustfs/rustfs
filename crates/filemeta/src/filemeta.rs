@@ -99,7 +99,7 @@ pub fn is_skip_meta_key(key: &str) -> bool {
 
 mod codec;
 mod inline_data;
-mod msgp_decode;
+pub(crate) mod msgp_decode;
 mod validation;
 mod version;
 
@@ -665,12 +665,15 @@ impl FileMeta {
             err = self.add_version_filemata(ventry).err();
         }
 
-        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
-            return Ok(None);
-        }
-
+        // A failed delete-marker insertion must surface even when the data dir is
+        // shared: reporting success here silently turns the delete into a permanent
+        // delete that replication never propagates.
         if let Some(e) = err {
             return Err(e);
+        }
+
+        if self.shared_data_dir_count(obj_version_id, obj_data_dir) > 0 {
+            return Ok(None);
         }
 
         Ok(obj_data_dir)
@@ -915,6 +918,60 @@ mod test {
     use crate::test_data::*;
     use proptest::collection::vec;
     use proptest::prelude::*;
+
+    /// Wraps a raw meta block in a valid XL2 container (header, bin32 length
+    /// prefix, and CRC trailer) so decode tests exercise the meta parsing
+    /// itself rather than the envelope checks.
+    fn build_xl_buffer(meta: &[u8]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&XL_FILE_HEADER);
+        buf.extend_from_slice(&XL_FILE_VERSION_MAJOR.to_le_bytes());
+        buf.extend_from_slice(&XL_FILE_VERSION_MINOR.to_le_bytes());
+        buf.push(0xc6); // bin32
+        buf.extend_from_slice(&(meta.len() as u32).to_be_bytes());
+        buf.extend_from_slice(meta);
+        let crc = xxh64::xxh64(meta, XXHASH_SEED) as u32;
+        buf.push(0xce); // u32
+        buf.extend_from_slice(&crc.to_be_bytes());
+        buf
+    }
+
+    /// Regression test for rustfs/rustfs#2715: a corrupted version count in
+    /// xl.meta must yield a decode error instead of sizing a huge allocation
+    /// from the bogus count (which aborts the whole process).
+    #[test]
+    fn test_unmarshal_rejects_absurd_version_count() {
+        let mut meta = Vec::new();
+        rmp::encode::write_uint(&mut meta, XL_HEADER_VERSION as u64).unwrap();
+        rmp::encode::write_uint(&mut meta, XL_META_VERSION as u64).unwrap();
+        // Claim ~10^15 versions with no version data behind it.
+        rmp::encode::write_sint(&mut meta, 1i64 << 50).unwrap();
+
+        let buf = build_xl_buffer(&meta);
+        let mut fm = FileMeta::default();
+        let err = fm.unmarshal_msg(&buf).expect_err("absurd version count must fail to decode");
+        assert!(err.to_string().contains("version count"), "unexpected error: {err}");
+    }
+
+    /// Regression test for rustfs/rustfs#2715: a corrupted per-version binary
+    /// length must yield a decode error instead of a giant allocation.
+    #[test]
+    fn test_unmarshal_rejects_absurd_version_header_length() {
+        let mut meta = Vec::new();
+        rmp::encode::write_uint(&mut meta, XL_HEADER_VERSION as u64).unwrap();
+        rmp::encode::write_uint(&mut meta, XL_META_VERSION as u64).unwrap();
+        rmp::encode::write_sint(&mut meta, 1).unwrap();
+        // One version whose header claims to be u32::MAX bytes long.
+        meta.push(0xc6); // bin32
+        meta.extend_from_slice(&u32::MAX.to_be_bytes());
+
+        let buf = build_xl_buffer(&meta);
+        let mut fm = FileMeta::default();
+        let err = fm
+            .unmarshal_msg(&buf)
+            .expect_err("absurd version header length must fail to decode");
+        assert!(err.to_string().contains("version header length"), "unexpected error: {err}");
+    }
 
     #[test]
     fn test_new_file_meta() {

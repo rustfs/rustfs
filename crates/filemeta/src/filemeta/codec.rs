@@ -179,6 +179,22 @@ impl FileMeta {
 
             self.meta_ver = meta_ver;
 
+            // `versions_len` is decoded from a potentially corrupted buffer.
+            // Every version contributes at least two msgpack bin headers to
+            // `meta`, so a count larger than the remaining bytes is corrupt;
+            // reject it before sizing any allocation from it (rustfs/rustfs#2715).
+            if versions_len > meta.len() {
+                error!(
+                    "corrupt xl.meta: version count {} exceeds remaining metadata size {}",
+                    versions_len,
+                    meta.len()
+                );
+                return Err(Error::other(format!(
+                    "corrupt xl.meta: version count {versions_len} exceeds metadata size {}",
+                    meta.len()
+                )));
+            }
+
             self.versions = Vec::with_capacity(versions_len);
 
             let mut cur: Cursor<&[u8]> = Cursor::new(meta);
@@ -188,6 +204,11 @@ impl FileMeta {
                     Error::other(format!("failed to read binary length for version header: {e}"))
                 })? as usize;
 
+                let remaining = meta.len().saturating_sub(cur.position() as usize);
+                if bin_len > remaining {
+                    error!("corrupt xl.meta: version header length {} exceeds remaining {} bytes", bin_len, remaining);
+                    return Err(Error::other("corrupt xl.meta: version header length exceeds metadata size"));
+                }
                 let mut header_buf = vec![0u8; bin_len];
 
                 cur.read_exact(&mut header_buf)?;
@@ -203,6 +224,14 @@ impl FileMeta {
                     Error::other(format!("failed to read binary length for version metadata: {e}"))
                 })? as usize;
 
+                let remaining = meta.len().saturating_sub(cur.position() as usize);
+                if bin_len > remaining {
+                    error!(
+                        "corrupt xl.meta: version metadata length {} exceeds remaining {} bytes",
+                        bin_len, remaining
+                    );
+                    return Err(Error::other("corrupt xl.meta: version metadata length exceeds metadata size"));
+                }
                 let mut ver_meta_buf = vec![0u8; bin_len];
                 cur.read_exact(&mut ver_meta_buf)?;
 
@@ -242,14 +271,18 @@ impl FileMeta {
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
-            let header_buf = &buf[start..end];
+            let header_buf = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("corrupt xl.meta: version header segment out of range"))?;
 
             cur.set_position(end as u64);
 
             let bin_len = rmp::decode::read_bin_len(&mut cur)? as usize;
             let start = cur.position() as usize;
             let end = start + bin_len;
-            let ver_meta_buf = &buf[start..end];
+            let ver_meta_buf = buf
+                .get(start..end)
+                .ok_or_else(|| Error::other("corrupt xl.meta: version metadata segment out of range"))?;
 
             cur.set_position(end as u64);
 

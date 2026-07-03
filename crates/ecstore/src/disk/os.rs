@@ -63,6 +63,43 @@ pub fn check_path_length(path_name: &str) -> Result<()> {
     Ok(())
 }
 
+/// Fsync a directory so recently created or renamed entries survive power loss.
+/// No-op on non-Unix platforms where directories cannot be opened for syncing.
+pub fn fsync_dir_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::fs::File::open(dir.as_ref())?.sync_all()?;
+    }
+    #[cfg(not(unix))]
+    let _ = dir;
+    Ok(())
+}
+
+/// Async wrapper around [`fsync_dir_std`]; runs the blocking fsync off the runtime.
+pub async fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || fsync_dir_std(dir)).await?
+}
+
+/// Fdatasync every regular file directly inside `dir`, then fsync the directory
+/// itself. Used at commit points so erasure shard files written through the page
+/// cache are durable before their directory is renamed into its final location.
+pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
+    for entry in std::fs::read_dir(dir.as_ref())? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            std::fs::File::open(entry.path())?.sync_data()?;
+        }
+    }
+    fsync_dir_std(dir)
+}
+
+/// Async wrapper around [`sync_dir_files_std`]; runs the blocking syncs off the runtime.
+pub async fn sync_dir_files(dir: impl AsRef<Path>) -> io::Result<()> {
+    let dir = dir.as_ref().to_path_buf();
+    tokio::task::spawn_blocking(move || sync_dir_files_std(dir)).await?
+}
+
 /// Check if the given disk path is the root disk.
 /// On Windows, always return false.
 /// On Unix, compare the disk paths.
@@ -117,6 +154,10 @@ pub async fn read_dir(path: impl AsRef<Path>, count: i32) -> std::io::Result<Vec
             volumes.push(name);
         } else if file_type.is_dir() {
             volumes.push(format!("{name}{SLASH_SEPARATOR}"));
+        } else {
+            // Entries we don't return (symlinks, sockets, fifos) must not consume
+            // the limit: is_empty_dir/list_dir(count=1) would misreport otherwise.
+            continue;
         }
         count -= 1;
         if count == 0 {
@@ -299,5 +340,31 @@ mod tests {
             .expect("missing cleanup source must be ignored");
 
         assert!(!dst.exists());
+    }
+
+    #[tokio::test]
+    async fn fsync_dir_succeeds_on_directory() {
+        let temp_dir = tempdir().expect("create temp dir");
+
+        fsync_dir(temp_dir.path()).await.expect("fsync dir must succeed");
+    }
+
+    #[tokio::test]
+    async fn sync_dir_files_syncs_regular_files_and_dir() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("part.1"), b"shard-one").expect("write part.1");
+        std::fs::write(temp_dir.path().join("part.2"), b"shard-two").expect("write part.2");
+        std::fs::create_dir(temp_dir.path().join("subdir")).expect("create subdir");
+
+        sync_dir_files(temp_dir.path()).await.expect("sync dir files must succeed");
+    }
+
+    #[tokio::test]
+    async fn sync_dir_files_missing_dir_returns_not_found() {
+        let temp_dir = tempdir().expect("create temp dir");
+        let missing = temp_dir.path().join("missing");
+
+        let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 }
