@@ -406,7 +406,7 @@ jobs:
     name: S3 Implemented Tests
     needs: [ skip-check, build-rustfs-debug-binary, e2e-tests ]
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 60
     steps:
       - name: Checkout repository
