@@ -40,6 +40,35 @@ pub(crate) const DATA_USAGE_CACHE_NAME: &str = ECSTORE_DATA_USAGE_CACHE_NAME;
 pub(crate) const BUCKET_META_PREFIX: &str = ECSTORE_BUCKET_META_PREFIX;
 pub(crate) const RUSTFS_META_BUCKET: &str = ECSTORE_RUSTFS_META_BUCKET;
 
+/// Marker written to every local disk while the process runs; removed by
+/// [`clear_unclean_shutdown_markers`] on graceful shutdown. Finding it at
+/// startup means the previous run crashed or lost power, so the heal manager
+/// proactively re-verifies all local erasure sets.
+pub(crate) const UNCLEAN_SHUTDOWN_MARKER_PATH: &str = "unclean-shutdown";
+
+/// Remove the unclean-shutdown markers from all local disks. Call at the end of
+/// a graceful shutdown, after the data plane has stopped accepting writes.
+pub async fn clear_unclean_shutdown_markers() {
+    let local_disk_map = local_disk_map_read().await;
+    for disk in local_disk_map.values().flatten() {
+        if let Err(err) = EcstoreDiskAPI::delete(
+            disk.as_ref(),
+            RUSTFS_META_BUCKET,
+            UNCLEAN_SHUTDOWN_MARKER_PATH,
+            EcstoreDeleteOptions::default(),
+        )
+        .await
+            && err != DiskError::FileNotFound
+        {
+            tracing::warn!(
+                endpoint = %EcstoreDiskAPI::endpoint(disk.as_ref()),
+                error = ?err,
+                "failed to clear unclean-shutdown marker"
+            );
+        }
+    }
+}
+
 pub(crate) type DiskError = EcstoreDiskError;
 pub(crate) type DiskResult<T> = EcstoreDiskResult<T>;
 pub(crate) type DiskStore = EcstoreDiskStore;

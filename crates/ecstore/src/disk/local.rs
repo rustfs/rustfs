@@ -229,6 +229,13 @@ const ENV_RUSTFS_OBJECT_MMAP_READ_METHOD: &str = "RUSTFS_OBJECT_MMAP_READ_METHOD
 const RUSTFS_OBJECT_MMAP_READ_METHOD_MMAP_COPY: &str = "mmap_copy";
 const RUSTFS_OBJECT_MMAP_READ_METHOD_DIRECT_READ_COPY: &str = "direct_read_copy";
 
+/// Fsync writes and commit-point renames so acknowledged data survives power loss.
+/// Disabling trades durability for latency: data acknowledged with 200 OK may only
+/// live in the page cache and be lost on a whole-node power failure.
+/// Default: true.
+const ENV_RUSTFS_DRIVE_SYNC_ENABLE: &str = "RUSTFS_DRIVE_SYNC_ENABLE";
+const DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE: bool = true;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum LocalReadCopyMethod {
     MmapCopy,
@@ -238,6 +245,11 @@ enum LocalReadCopyMethod {
 /// Check if O_DIRECT reads are enabled.
 fn is_direct_io_read_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE, DEFAULT_RUSTFS_OBJECT_DIRECT_IO_READ_ENABLE)
+}
+
+/// Check if durable (fsync) writes are enabled.
+pub(crate) fn drive_sync_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_RUSTFS_DRIVE_SYNC_ENABLE, DEFAULT_RUSTFS_DRIVE_SYNC_ENABLE)
 }
 
 /// Get the O_DIRECT read threshold size.
@@ -1646,6 +1658,13 @@ impl LocalDisk {
 
         rename_all(tmp_file_path, &file_path, volume_dir).await?;
 
+        if sync
+            && drive_sync_enabled()
+            && let Some(parent) = file_path.parent()
+        {
+            os::fsync_dir(parent).await.map_err(to_file_error)?;
+        }
+
         Ok(())
     }
 
@@ -1682,10 +1701,20 @@ impl LocalDisk {
             skip_parent
         };
 
+        let sync = sync && drive_sync_enabled();
+
         match data {
             InternalBuf::Ref(buf) => {
                 let mut f = self.open_file(file_path, O_CREATE | O_WRONLY | O_TRUNC, skip_parent).await?;
                 f.write_all(buf).await.map_err(to_file_error)?;
+                if sync {
+                    f.sync_data().await.map_err(to_file_error)?;
+                    // Persist the directory entry too, so a freshly created file
+                    // survives power loss along with its contents.
+                    if let Some(parent) = file_path.parent() {
+                        os::fsync_dir(parent).await.map_err(to_file_error)?;
+                    }
+                }
             }
             InternalBuf::Owned(buf) => {
                 let path = file_path.to_path_buf();
@@ -1700,10 +1729,16 @@ impl LocalDisk {
                         .create(true)
                         .write(true)
                         .truncate(true)
-                        .open(path)
+                        .open(&path)
                         .map_err(to_file_error)?;
 
                     std::io::Write::write_all(&mut f, buf.as_ref()).map_err(to_file_error)?;
+                    if sync {
+                        f.sync_data().map_err(to_file_error)?;
+                        if let Some(parent) = path.parent() {
+                            os::fsync_dir_std(parent).map_err(to_file_error)?;
+                        }
+                    }
 
                     Ok::<(), std::io::Error>(())
                 })
@@ -1711,9 +1746,6 @@ impl LocalDisk {
                 .map_err(DiskError::from)??;
             }
         }
-
-        // Keep existing durability contract: this path intentionally ignores `sync`.
-        let _ = sync;
 
         Ok(())
     }
@@ -2770,7 +2802,22 @@ impl DiskAPI for LocalDisk {
             }
         }
 
+        // UploadPart is acknowledged once this rename lands, so the part data and
+        // its directory entry must be durable before we return.
+        let sync = drive_sync_enabled();
+        if sync && !src_is_dir {
+            let src = src_file_path.clone();
+            tokio::task::spawn_blocking(move || std::fs::File::open(&src)?.sync_data())
+                .await
+                .map_err(DiskError::from)?
+                .map_err(to_file_error)?;
+        }
+
         rename_all(&src_file_path, &dst_file_path, &dst_volume_dir).await?;
+
+        if sync && let Some(parent) = dst_file_path.parent() {
+            os::fsync_dir(parent).await.map_err(to_file_error)?;
+        }
 
         let dst_meta = lstat_std(&dst_file_path).map_err(|e| -> DiskError { to_file_error(e).into() })?;
         if src_is_dir != dst_meta.is_dir() {
@@ -3593,6 +3640,19 @@ impl DiskAPI for LocalDisk {
             )
             .await?;
 
+            // Make shard files durable before the commit rename: once rename_data
+            // succeeds the write is acknowledged, so data must not live only in the
+            // page cache. Multipart parts were already synced during rename_part, so
+            // their fdatasync here is a cheap no-op. A missing source dir is left for
+            // the rename below to report through the existing rollback path.
+            if drive_sync_enabled()
+                && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
+                && let Err(err) = os::sync_dir_files(src_data_path).await
+                && err.kind() != ErrorKind::NotFound
+            {
+                return Err(to_file_error(err).into());
+            }
+
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref()
                 && let Err(err) = rename_all(src_data_path, dst_data_path, &skip_parent).await
             {
@@ -3667,6 +3727,15 @@ impl DiskAPI for LocalDisk {
                 return Err(err);
             }
 
+            // Persist the directory entries for both the data dir and xl.meta renames;
+            // without this the commit itself can vanish on power loss.
+            if drive_sync_enabled()
+                && let Some(parent) = dst_file_path.parent()
+                && let Err(err) = os::fsync_dir(parent).await
+            {
+                return Err(to_file_error(err).into());
+            }
+
             if let Some(src_file_path_parent) = src_file_path.parent() {
                 if src_volume != super::RUSTFS_META_MULTIPART_BUCKET {
                     let _ = remove_std(src_file_path_parent);
@@ -3719,12 +3788,16 @@ impl DiskAPI for LocalDisk {
                 if let Some(parent) = src.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
+                let sync = drive_sync_enabled();
                 let mut f = std::fs::OpenOptions::new()
                     .create(true)
                     .write(true)
                     .truncate(true)
                     .open(&src)?;
                 std::io::Write::write_all(&mut f, &new_buf)?;
+                if sync {
+                    f.sync_data()?;
+                }
                 if let Some(old_dir) = old_data_dir.as_ref()
                     && let Some(ref buf) = has_dst_buf
                     && let Some(dst_parent) = dst.parent()
@@ -3748,6 +3821,11 @@ impl DiskAPI for LocalDisk {
                     }
                     Err(err) => Err(to_file_error(err)),
                 }?;
+
+                // Persist the commit rename's directory entry across power loss.
+                if sync && let Some(dst_parent) = dst.parent() {
+                    os::fsync_dir_std(dst_parent)?;
+                }
 
                 Ok::<(Option<uuid::Uuid>, Option<Bytes>), std::io::Error>((old_data_dir, has_dst_buf))
             })
