@@ -309,9 +309,10 @@ where
         // bytes and stops at the terminator), so pass the whole slice instead of a fixed
         // `[0..16]` index that panics on corrupted/truncated blocks shorter than 16 bytes.
         let (uncompress_len, uvarint) = uvarint(compressed_buf);
-        // A non-positive `uvarint` means the length prefix could not be decoded (buffer too
-        // small -> 0, or overflow -> negative); a value larger than the buffer would make the
-        // slice below panic. Reject such corrupted blocks with a clean error instead.
+        // Reject a length prefix that could not be decoded: `uvarint <= 0` means the varint was
+        // empty/unterminated (0) or overflowed (negative — as usize it would index far past the
+        // buffer and panic the slice below). The `> len` bound is belt-and-suspenders (uvarint's
+        // positive return is always <= buf.len()) but keeps the slice panic-free regardless.
         if uvarint <= 0 || uvarint as usize > compressed_buf.len() {
             *this.compressed_read = 0;
             *this.compressed_len = 0;
@@ -514,5 +515,28 @@ mod tests {
         let res = decompress_reader.read_to_end(&mut out).await;
         assert!(res.is_err(), "corrupted short block must return an error, not panic or succeed");
         assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    // Directly exercises the length-prefix guard: an unterminated varint (all continuation bytes)
+    // makes `uvarint` return 0, which must be rejected as an invalid length prefix.
+    #[tokio::test]
+    async fn test_decompress_reader_unterminated_length_prefix_is_rejected() {
+        let len: usize = 3;
+        let mut input = Vec::new();
+        input.push(COMPRESS_TYPE_COMPRESSED);
+        input.push((len & 0xFF) as u8);
+        input.push(((len >> 8) & 0xFF) as u8);
+        input.push(((len >> 16) & 0xFF) as u8);
+        input.extend_from_slice(&[0u8; 4]); // bogus CRC
+        input.extend_from_slice(&[0x80, 0x80, 0x80]); // 3 continuation bytes, no terminator
+
+        let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::default());
+        let mut out = Vec::new();
+        let err = decompress_reader
+            .read_to_end(&mut out)
+            .await
+            .expect_err("unterminated length prefix must error");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("length prefix"), "got: {err}");
     }
 }

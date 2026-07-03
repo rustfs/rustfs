@@ -395,6 +395,9 @@ where
             // it can be shorter than 16 bytes. `uvarint` is safe on any slice length, so pass the
             // whole slice instead of a fixed `[0..16]` index that panics on corrupted/truncated
             // blocks shorter than 16 bytes.
+            // `uvarint_len <= 0` means the length varint was empty/unterminated (0) or overflowed
+            // (negative — as usize it would index far past the buffer). The `> len` bound is
+            // belt-and-suspenders (a positive return is always <= buf.len()).
             let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(ciphertext_buf);
             if uvarint_len <= 0 || uvarint_len as usize > ciphertext_buf.len() {
                 *this.ciphertext_read = 0;
