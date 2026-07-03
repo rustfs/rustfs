@@ -129,6 +129,8 @@ Current coupling:
   import boundary inside `rustfs-replication`;
 - `crates/replication/src/storage_api.rs` is the only direct storage-api delete
   DTO import boundary inside `rustfs-replication`;
+- direct ECStore replication imports from `rustfs-replication` are limited to
+  `*_boundary.rs` modules;
 - storage-api delete replication status/state helpers use the local
   `crates/storage-api/src/replication.rs` contract boundary while the
   underlying wire types remain in `rustfs-filemeta`;
@@ -181,6 +183,8 @@ Required contracts before crate movement:
 - `ReplicationCrateStorageApiBoundary`: storage API delete DTOs consumed by
   replication delete/queue/operation helpers are concentrated in
   `crates/replication/src/storage_api.rs` inside `rustfs-replication`.
+- `EcstoreReplicationBoundaryImports`: ECStore-side imports from
+  `rustfs-replication` are concentrated in replication `*_boundary.rs` modules.
 - `StorageApiReplicationContracts`: storage-api delete DTO replication
   state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
   until the underlying wire contracts can move without a

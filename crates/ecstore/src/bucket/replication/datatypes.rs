@@ -12,4 +12,4 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub use rustfs_replication::ResyncStatusType;
+pub use super::replication_resync_boundary::ResyncStatusType;
