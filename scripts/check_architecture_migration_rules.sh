@@ -137,6 +137,7 @@ LIFECYCLE_TAGGING_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_tagging_bounda
 LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_lock_boundary_bypass_hits.txt"
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_crate_bypass_hits.txt"
+ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_contract_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -952,6 +953,23 @@ fi
 
 if [[ -s "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE" ]]; then
   report_failure "lifecycle replication status/state contracts must stay behind lifecycle replication_sink: $(paste -sd '; ' "$LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  {
+    rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+      crates/ecstore/src \
+      --glob '*.rs' |
+      rg -v '^crates/ecstore/src/bucket/replication/' || true
+    rg -n -U --with-filename 'use\s+rustfs_filemeta::\{[^}]*\b(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicateDecision|ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|rustfs_filemeta::(Replicate|Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map)' \
+      crates/ecstore/src \
+      --glob '*.rs' || true
+  }
+) >"$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE"
+
+if [[ -s "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE" ]]; then
+  report_failure "ECStore owner replication contracts must stay behind crates/ecstore/src/bucket/replication: $(paste -sd '; ' "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE")"
 fi
 
 (

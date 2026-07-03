@@ -49,6 +49,7 @@ use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome,
     RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
 };
+use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
 use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::RUSTFS_META_BUCKET;
@@ -222,8 +223,8 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
     let mod_time = OffsetDateTime::now_utc();
     let version = FileInfo {
         mod_time: Some(mod_time),
-        replication_state_internal: Some(rustfs_replication::ReplicationState {
-            replica_status: rustfs_replication::ReplicationStatusType::Replica,
+        replication_state_internal: Some(ReplicationState {
+            replica_status: ReplicationStatusType::Replica,
             delete_marker: true,
             replicate_decision_str: "existing".to_string(),
             ..Default::default()
@@ -241,7 +242,7 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
     assert_eq!(opts.src_pool_idx, 7);
     assert_eq!(opts.version_id.as_deref(), Some("version-id"));
     assert_eq!(opts.mod_time, Some(mod_time));
-    assert_eq!(replication.replica_status, rustfs_replication::ReplicationStatusType::Replica);
+    assert_eq!(replication.replica_status, ReplicationStatusType::Replica);
     assert!(replication.delete_marker);
     assert_eq!(replication.replicate_decision_str, "existing");
 }

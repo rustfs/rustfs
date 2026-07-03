@@ -20,7 +20,9 @@
 use crate::bucket::lifecycle::lifecycle::TRANSITION_COMPLETE;
 use crate::bucket::metadata_sys;
 use crate::bucket::object_lock::objectlock_sys::check_retention_for_modification;
-use crate::bucket::replication::ReplicationObjectBridge;
+use crate::bucket::replication::{
+    ReplicateDecision, ReplicationObjectBridge, ReplicationState, ReplicationStatusType, VersionPurgeStatusType,
+};
 use crate::bucket::versioning::VersioningApi;
 use crate::bucket::versioning_sys::BucketVersioningSys;
 use crate::client::{object_api_utils::get_raw_etag, transition_api::ReaderImpl};
@@ -97,8 +99,7 @@ use rustfs_common::heal_channel::{
 use rustfs_config::MI_B;
 use rustfs_filemeta::{
     FileInfo, FileMeta, FileMetaShallowVersion, MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams, ObjectPartInfo,
-    RawFileInfo, ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, file_info_from_raw,
-    merge_file_meta_versions,
+    RawFileInfo, file_info_from_raw, merge_file_meta_versions,
 };
 use rustfs_io_metrics::{
     record_object_lock_diag_acquire_duration, record_object_lock_diag_enabled, record_object_lock_diag_hold_duration,
@@ -6985,6 +6986,7 @@ pub fn is_infrequent_access_class(storage_class: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bucket::replication::{replication_statuses_map, version_purge_statuses_map};
     use crate::disk::CHECK_PART_UNKNOWN;
     use crate::disk::CHECK_PART_VOLUME_NOT_FOUND;
     use crate::disk::DiskOption;
@@ -7010,7 +7012,6 @@ mod tests {
     use rustfs_filemeta::MetaCacheEntry;
     use rustfs_lock::client::local::LocalClient;
     use rustfs_lock::{LockError, LockInfo, LockResponse, LockStats};
-    use rustfs_replication::ReplicationState;
     use serial_test::serial;
     use std::collections::HashMap;
     use tempfile::TempDir;
@@ -7462,7 +7463,7 @@ mod tests {
             delete_replication: Some(ReplicationState {
                 replicate_decision_str: "target=true;false;target;".to_string(),
                 replication_status_internal: Some("target=COMPLETED;".to_string()),
-                targets: rustfs_replication::replication_statuses_map("target=COMPLETED;"),
+                targets: replication_statuses_map("target=COMPLETED;"),
                 ..Default::default()
             }),
             ..Default::default()
@@ -7494,7 +7495,7 @@ mod tests {
             version_id: Some(Uuid::new_v4().to_string()),
             delete_replication: Some(ReplicationState {
                 version_purge_status_internal: Some("target=PENDING;".to_string()),
-                purge_targets: rustfs_replication::version_purge_statuses_map("target=PENDING;"),
+                purge_targets: version_purge_statuses_map("target=PENDING;"),
                 ..Default::default()
             }),
             ..Default::default()

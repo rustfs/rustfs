@@ -15,7 +15,7 @@
 use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
-use crate::bucket::replication::ReplicationTargetConfigBridge;
+use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
 use crate::bucket::target::ARN;
 use crate::bucket::target::BucketTargetType;
 use crate::bucket::target::{self, BucketTarget, BucketTargets, Credentials};
@@ -49,7 +49,6 @@ use hyper_util::client::legacy::Client as HyperClient;
 use hyper_util::rt::{TokioExecutor, TokioTimer};
 use reqwest::Client as HttpClient;
 use rustfs_config::{DEFAULT_TRUST_LEAF_CERT_AS_CA, ENV_TRUST_LEAF_CERT_AS_CA, RUSTFS_CA_CERT, RUSTFS_TLS_CERT};
-use rustfs_replication::ReplicationStatusType;
 use rustfs_utils::egress::{OutboundUrlError, validate_outbound_url};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, AMZ_OBJECT_LOCK_BYPASS_GOVERNANCE, AMZ_OBJECT_LOCK_LEGAL_HOLD, AMZ_OBJECT_LOCK_MODE,
