@@ -15,7 +15,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use rustfs_filemeta::{
+use crate::replication::{
     ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map, version_purge_statuses_map,
 };
 use time::OffsetDateTime;

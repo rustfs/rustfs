@@ -138,6 +138,7 @@ LIFECYCLE_OBJECT_LOCK_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_object_loc
 LIFECYCLE_REPLICATION_SINK_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_sink_bypass_hits.txt"
 LIFECYCLE_REPLICATION_CRATE_BYPASS_HITS_FILE="${TMP_DIR}/lifecycle_replication_crate_bypass_hits.txt"
 ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_contract_bypass_hits.txt"
+STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE="${TMP_DIR}/storage_api_replication_contract_bypass_hits.txt"
 STORE_API_EXTERNAL_LIST_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_list_consumer_hits.txt"
 STORE_API_EXTERNAL_OPERATION_CONSUMER_HITS_FILE="${TMP_DIR}/store_api_external_operation_consumer_hits.txt"
 STORE_API_OBJECT_OPERATION_LOCAL_METHOD_HITS_FILE="${TMP_DIR}/store_api_object_operation_local_method_hits.txt"
@@ -970,6 +971,18 @@ fi
 
 if [[ -s "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE" ]]; then
   report_failure "ECStore owner replication contracts must stay behind crates/ecstore/src/bucket/replication: $(paste -sd '; ' "$ECSTORE_REPLICATION_CONTRACT_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n -U --with-filename 'use\s+rustfs_filemeta::\{[^}]*\b(ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|use\s+rustfs_filemeta::(ReplicationState|ReplicationStatusType|VersionPurgeStatusType|replication_statuses_map|version_purge_statuses_map)\b|rustfs_filemeta::(Replication|VersionPurge|replication_statuses_map|version_purge_statuses_map)' \
+    crates/storage-api/src \
+    --glob '*.rs' |
+    rg -v '^crates/storage-api/src/replication\.rs:' || true
+) >"$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE"
+
+if [[ -s "$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE" ]]; then
+  report_failure "storage-api replication contracts must stay behind crates/storage-api/src/replication.rs: $(paste -sd '; ' "$STORAGE_API_REPLICATION_CONTRACT_BYPASS_HITS_FILE")"
 fi
 
 (
