@@ -167,7 +167,7 @@ tower-http = { version = "0.7.0", features = ["cors"] }
 # Serialization and Data Formats
 apache-avro = "0.21.0"
 bytes = { version = "1.12.0", features = ["serde"] }
-bytesize = "2.4.0"
+bytesize = "2.4.2"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
 form_urlencoded = "1.2.2"
