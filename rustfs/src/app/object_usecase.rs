@@ -22,6 +22,8 @@ use super::storage_api::object_usecase::access::{
     PostObjectRequestMarker, authorize_request, has_bypass_governance_header, req_info_mut,
 };
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
+#[cfg(test)]
+use super::storage_api::object_usecase::bucket::replication::{ReplicationState, replication_statuses_map};
 use super::storage_api::object_usecase::bucket::{
     VersioningConfigExt as _,
     lifecycle::{
@@ -38,8 +40,10 @@ use super::storage_api::object_usecase::bucket::{
     predict_lifecycle_expiration,
     quota::QuotaOperation,
     replication::{
-        DeletedObjectReplicationInfo, check_replicate_delete, delete_replication_state_from_config, must_replicate_object,
-        schedule_object_replication, schedule_replication_delete,
+        DeletedObjectReplicationInfo, REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType,
+        check_replicate_delete, delete_replication_state_from_config, delete_replication_version_id, must_replicate_object,
+        schedule_object_replication, schedule_replication_delete, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info, should_use_existing_delete_replication_source,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -116,9 +120,6 @@ use rustfs_lock::NamespaceLockGuard;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_object_capacity::capacity_manager::get_capacity_manager;
 use rustfs_policy::policy::action::{Action, S3Action};
-use rustfs_replication::{REPLICATE_INCOMING_DELETE, ReplicationStatusType, VersionPurgeStatusType};
-#[cfg(test)]
-use rustfs_replication::{ReplicationState, replication_statuses_map};
 use rustfs_s3_ops::{S3Operation, delete_event_name_for_marker, put_event_name_for_post_object};
 use rustfs_s3select_api::object_store::bytes_stream;
 use rustfs_targets::{
@@ -1531,21 +1532,6 @@ async fn enrich_delete_replication_state_if_needed(
     }
 }
 
-fn should_schedule_delete_replication(
-    opts: &ObjectOptions,
-    replication_source: &ObjectInfo,
-    deleted_delete_marker_version: bool,
-) -> bool {
-    rustfs_replication::should_schedule_delete_replication(rustfs_replication::ReplicationDeleteScheduleInput {
-        replication_request: opts.replication_request,
-        version_id_requested: opts.version_id.is_some(),
-        source_delete_marker: replication_source.delete_marker,
-        source_replication_status: &replication_source.replication_status,
-        source_version_purge_status: &replication_source.version_purge_status,
-        deleted_delete_marker_version,
-    })
-}
-
 async fn should_schedule_replica_delete_replication(
     bucket: &str,
     replication_source: &ObjectInfo,
@@ -1556,18 +1542,6 @@ async fn should_schedule_replica_delete_replication(
     };
 
     delete_replication_state_from_config(&config, replication_source, version_id, true).is_some()
-}
-
-fn delete_replication_version_id(replication_source: &ObjectInfo, deleted_delete_marker_version: bool) -> Option<Uuid> {
-    rustfs_replication::delete_replication_version_id(
-        replication_source.delete_marker,
-        replication_source.version_id,
-        deleted_delete_marker_version,
-    )
-}
-
-fn should_use_existing_delete_replication_info(opts: &ObjectOptions) -> bool {
-    rustfs_replication::should_use_existing_delete_replication_info(opts.version_id.is_some(), opts.delete_marker)
 }
 
 fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
@@ -1604,7 +1578,7 @@ fn delete_replication_state_source<'a>(
     existing_object_info: Option<&'a ObjectInfo>,
     deleted_object_info: &'a ObjectInfo,
 ) -> &'a ObjectInfo {
-    if rustfs_replication::should_use_existing_delete_replication_source(
+    if should_use_existing_delete_replication_source(
         opts.replication_request,
         deleted_object_info.delete_marker,
         existing_object_info.is_some(),

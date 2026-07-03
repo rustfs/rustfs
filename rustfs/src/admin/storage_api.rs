@@ -309,6 +309,7 @@ pub(crate) mod quota {
 pub(crate) mod replication {
     pub(crate) type BucketReplicationResyncStatus = super::ecstore_bucket::replication::BucketReplicationResyncStatus;
     pub(crate) type BucketStats = super::ecstore_bucket::replication::BucketStats;
+    pub(crate) type ReplicationStatusType = rustfs_replication::ReplicationStatusType;
     pub(crate) type ResyncOpts = super::ecstore_bucket::replication::ResyncOpts;
     #[cfg(test)]
     pub(crate) type ResyncStatusType = super::ecstore_bucket::replication::ResyncStatusType;

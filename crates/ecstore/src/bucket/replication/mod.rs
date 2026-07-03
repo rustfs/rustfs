@@ -34,6 +34,7 @@ mod replication_resync_boundary;
 mod replication_resyncer;
 mod replication_scanner_bridge;
 mod replication_state;
+mod replication_stats_boundary;
 mod replication_storage_boundary;
 mod replication_tagging_boundary;
 mod replication_target_boundary;
@@ -43,6 +44,12 @@ mod runtime_boundary;
 
 pub use config::{ObjectOpts, ReplicationConfigurationExt};
 pub use datatypes::ResyncStatusType;
+#[cfg(test)]
+pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
+pub(crate) use replication_filemeta_boundary::{
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
+    version_purge_statuses_map,
+};
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;
@@ -59,6 +66,6 @@ pub use replication_queue_boundary::{
 pub use replication_resync_boundary::{BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus};
 pub use replication_scanner_bridge::ReplicationScannerBridge;
 pub use replication_state::ReplicationStats;
+pub use replication_stats_boundary::BucketStats;
 pub use replication_storage_boundary::{ReplicationObjectIO, ReplicationStorage};
 pub(crate) use replication_target_config_bridge::ReplicationTargetConfigBridge;
-pub use rustfs_replication::BucketStats;

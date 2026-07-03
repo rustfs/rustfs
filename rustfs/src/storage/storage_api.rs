@@ -522,6 +522,7 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
+pub(crate) type ReplicationStatusType = rustfs_replication::ReplicationStatusType;
 pub(crate) type ReplicationStats = StorageReplicationStatsHandle;
 pub(crate) type SetupType = ecstore_layout::SetupType;
 pub(crate) type StorageError = ecstore_error::StorageError;

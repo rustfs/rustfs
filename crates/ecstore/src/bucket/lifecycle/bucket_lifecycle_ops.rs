@@ -22,6 +22,10 @@ use crate::bucket::lifecycle::lifecycle::{
     self, Lifecycle, ObjectOpts, TransitionOptions, abort_incomplete_multipart_upload_due,
 };
 use crate::bucket::lifecycle::replication_sink;
+use crate::bucket::lifecycle::replication_sink::{
+    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
+    version_purge_statuses_map,
+};
 use crate::bucket::lifecycle::tier_delete_journal::{process_tier_delete_journal_entry, run_tier_delete_journal_recovery_loop};
 use crate::bucket::lifecycle::tier_free_version_recovery::{DEFAULT_FREE_VERSION_RECOVERY_LIMIT, recover_tier_free_versions};
 use crate::bucket::lifecycle::tier_last_day_stats::{DailyAllTierStats, LastDayTierStats};
@@ -57,10 +61,7 @@ use rustfs_config::{
     ENV_TRANSITION_WORKERS_ABSOLUTE_MAX,
 };
 use rustfs_data_usage::TierStats;
-use rustfs_filemeta::{
-    FileInfo, FileInfoOpts, NULL_VERSION_ID, ReplicateDecision, ReplicationState, RestoreStatusOps, VersionPurgeStatusType,
-    get_file_info, is_restored_object_on_disk,
-};
+use rustfs_filemeta::{FileInfo, FileInfoOpts, NULL_VERSION_ID, RestoreStatusOps, get_file_info, is_restored_object_on_disk};
 use rustfs_utils::{get_env_i64, get_env_usize, path::encode_dir_object, string::strings_has_prefix_fold};
 use s3s::dto::{
     BucketLifecycleConfiguration, DefaultRetention, ExpirationStatus, ObjectLockConfiguration, RestoreRequest,
@@ -2890,12 +2891,12 @@ fn should_reuse_lifecycle_delete_replication_state(oi: &ObjectInfo, version_dele
     if version_delete {
         oi.version_purge_status == VersionPurgeStatusType::Pending && !state.purge_targets.is_empty()
     } else {
-        oi.replication_status == rustfs_replication::ReplicationStatusType::Pending && !state.targets.is_empty()
+        oi.replication_status == ReplicationStatusType::Pending && !state.targets.is_empty()
     }
 }
 
 fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Option<ReplicationState> {
-    if oi.replication_status != rustfs_replication::ReplicationStatusType::Completed {
+    if oi.replication_status != ReplicationStatusType::Completed {
         return None;
     }
 
@@ -2909,7 +2910,7 @@ fn lifecycle_version_purge_state_from_completed_targets(oi: &ObjectInfo) -> Opti
     Some(ReplicationState {
         replicate_decision_str: oi.replication_decision.clone(),
         version_purge_status_internal: Some(pending_status.clone()),
-        purge_targets: rustfs_replication::version_purge_statuses_map(&pending_status),
+        purge_targets: version_purge_statuses_map(&pending_status),
         ..Default::default()
     })
 }
@@ -2955,10 +2956,10 @@ fn replication_state_for_delete(dsc: ReplicateDecision, version_delete: bool) ->
     };
     if version_delete {
         state.version_purge_status_internal = pending_status.clone();
-        state.purge_targets = rustfs_replication::version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
+        state.purge_targets = version_purge_statuses_map(pending_status.as_deref().unwrap_or_default());
     } else {
         state.replication_status_internal = pending_status.clone();
-        state.targets = rustfs_replication::replication_statuses_map(pending_status.as_deref().unwrap_or_default());
+        state.targets = replication_statuses_map(pending_status.as_deref().unwrap_or_default());
     }
     state
 }
@@ -2998,6 +2999,9 @@ mod tests {
         should_reuse_lifecycle_delete_replication_state, transitioned_cleanup_tuple,
     };
     use crate::bucket::lifecycle::bucket_lifecycle_audit::LcEventSrc;
+    use crate::bucket::lifecycle::replication_sink::{
+        ReplicateDecision, ReplicateTargetDecision, ReplicationStatusType, VersionPurgeStatusType,
+    };
     use crate::bucket::lifecycle::runtime_boundary as runtime_sources;
     use crate::bucket::lifecycle::tier_sweeper::Jentry;
     use crate::bucket::metadata::BUCKET_LIFECYCLE_CONFIG;
@@ -3017,7 +3021,6 @@ mod tests {
     use futures::FutureExt;
     use rustfs_common::metrics::{IlmAction, global_metrics};
     use rustfs_config::ENV_TRANSITION_WORKERS_ABSOLUTE_MAX;
-    use rustfs_replication::{ReplicateDecision, ReplicationStatusType, VersionPurgeStatusType};
     use s3s::dto::{
         BucketLifecycleConfiguration, ExpirationStatus, LifecycleExpiration, LifecycleRule, MetadataEntry, OutputLocation,
         RestoreRequest, RestoreRequestType, S3Location, Timestamp, Transition, TransitionStorageClass,
@@ -3915,7 +3918,7 @@ mod tests {
     fn replication_state_for_delete_uses_replication_targets_for_current_delete() {
         let arn = "arn:aws:s3:::target-bucket";
         let mut dsc = ReplicateDecision::default();
-        dsc.set(rustfs_replication::ReplicateTargetDecision::new(arn.to_string(), true, false));
+        dsc.set(ReplicateTargetDecision::new(arn.to_string(), true, false));
 
         let state = replication_state_for_delete(dsc, false);
 
@@ -3928,7 +3931,7 @@ mod tests {
     fn replication_state_for_delete_uses_purge_targets_for_version_delete() {
         let arn = "arn:aws:s3:::target-bucket";
         let mut dsc = ReplicateDecision::default();
-        dsc.set(rustfs_replication::ReplicateTargetDecision::new(arn.to_string(), true, false));
+        dsc.set(ReplicateTargetDecision::new(arn.to_string(), true, false));
 
         let state = replication_state_for_delete(dsc, true);
 
@@ -3953,7 +3956,7 @@ mod tests {
     #[test]
     fn lifecycle_delete_replication_state_does_not_reuse_put_replication_for_version_delete() {
         let oi = ObjectInfo {
-            replication_status: rustfs_replication::ReplicationStatusType::Completed,
+            replication_status: ReplicationStatusType::Completed,
             replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
             replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
             ..Default::default()
@@ -3968,7 +3971,7 @@ mod tests {
     #[test]
     fn lifecycle_version_purge_state_from_completed_targets_derives_pending_purge_targets() {
         let oi = ObjectInfo {
-            replication_status: rustfs_replication::ReplicationStatusType::Completed,
+            replication_status: ReplicationStatusType::Completed,
             replication_status_internal: Some("arn:aws:s3:::target=COMPLETED;".to_string()),
             replication_decision: "arn:aws:s3:::target=true;false;arn:aws:s3:::target;".to_string(),
             ..Default::default()

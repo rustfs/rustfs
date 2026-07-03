@@ -42,7 +42,6 @@ use rustfs_common::metrics::{
     current_path_updater, global_metrics,
 };
 use rustfs_filemeta::{MetaCacheEntries, MetaCacheEntry, MetadataResolutionParams};
-use rustfs_replication::ReplicationStatusType;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
 use s3s::dto::{BucketLifecycleConfiguration, ObjectLockConfiguration};
 use time::OffsetDateTime;
@@ -53,10 +52,11 @@ use tracing::{debug, error, warn};
 
 use crate::{
     BucketVersioningSys, Disk, DiskError, DiskInfoOptions, Evaluator, Event, LcEventSrc, ListPathRawOptions, ObjectOpts,
-    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ScannerDiskExt as _, ScannerLifecycleConfigExt as _,
-    ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule, enqueue_runtime_newer_noncurrent,
-    is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object, path2_bucket_object_with_base_path,
-    queue_replication_heal, scanner_is_erasure, scanner_replication_config_for_lifecycle_eval,
+    ReplicationConfig, ReplicationHealObject, ReplicationQueueAdmission, ReplicationStatusType, ScannerDiskExt as _,
+    ScannerLifecycleConfigExt as _, ScannerVersioningConfigExt as _, StorageError, apply_expiry_rule, apply_transition_rule,
+    enqueue_runtime_newer_noncurrent, is_reserved_or_invalid_bucket, list_path_raw, path2_bucket_object,
+    path2_bucket_object_with_base_path, queue_replication_heal, scanner_is_erasure,
+    scanner_replication_config_for_lifecycle_eval,
 };
 use crate::{ScannerObjectInfo as ObjectInfo, ScannerObjectToDelete as ObjectToDelete};
 
@@ -2862,9 +2862,9 @@ mod tests {
     use crate::SCANNER_SLEEPER;
 
     use super::*;
+    use crate::storage_api::VersionPurgeStatusType;
     use crate::{DiskOption, Endpoint, new_disk};
     use rustfs_filemeta::{FileInfo, FileMeta};
-    use rustfs_replication::VersionPurgeStatusType;
     use serial_test::serial;
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
