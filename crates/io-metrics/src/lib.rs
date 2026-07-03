@@ -1137,51 +1137,56 @@ fn batch_processor_count_to_u64(value: usize) -> u64 {
     u64::try_from(value).unwrap_or(u64::MAX)
 }
 
+/// Observe-only batch processor shape and adaptive-concurrency advice.
+#[derive(Clone, Copy, Debug)]
+pub struct BatchProcessorObservation {
+    pub operation: &'static str,
+    pub batch_size: usize,
+    pub configured_concurrency: usize,
+    pub max_queue_wait_secs: f64,
+    pub execution_latency_secs: f64,
+    pub successes: usize,
+    pub errors: usize,
+    pub timeouts: usize,
+    pub suggested_concurrency: usize,
+    pub suggestion_reason: &'static str,
+}
+
 /// Record observe-only batch processor shape and adaptive-concurrency advice.
 #[inline(always)]
-pub fn record_batch_processor_observation(
-    operation: &'static str,
-    batch_size: usize,
-    configured_concurrency: usize,
-    max_queue_wait_secs: f64,
-    execution_latency_secs: f64,
-    successes: usize,
-    errors: usize,
-    timeouts: usize,
-    suggested_concurrency: usize,
-    suggestion_reason: &'static str,
-) {
-    histogram!("rustfs_ecstore_batch_processor_batch_size", "operation" => operation)
-        .record(batch_processor_count_to_f64(batch_size));
-    histogram!("rustfs_ecstore_batch_processor_configured_concurrency", "operation" => operation)
-        .record(batch_processor_count_to_f64(configured_concurrency));
-    histogram!("rustfs_ecstore_batch_processor_queue_wait_seconds", "operation" => operation).record(max_queue_wait_secs);
-    histogram!("rustfs_ecstore_batch_processor_execution_latency_seconds", "operation" => operation)
-        .record(execution_latency_secs);
+pub fn record_batch_processor_observation(observation: BatchProcessorObservation) {
+    histogram!("rustfs_ecstore_batch_processor_batch_size", "operation" => observation.operation)
+        .record(batch_processor_count_to_f64(observation.batch_size));
+    histogram!("rustfs_ecstore_batch_processor_configured_concurrency", "operation" => observation.operation)
+        .record(batch_processor_count_to_f64(observation.configured_concurrency));
+    histogram!("rustfs_ecstore_batch_processor_queue_wait_seconds", "operation" => observation.operation)
+        .record(observation.max_queue_wait_secs);
+    histogram!("rustfs_ecstore_batch_processor_execution_latency_seconds", "operation" => observation.operation)
+        .record(observation.execution_latency_secs);
     counter!(
         "rustfs_ecstore_batch_processor_results_total",
-        "operation" => operation,
+        "operation" => observation.operation,
         "outcome" => "success"
     )
-    .increment(batch_processor_count_to_u64(successes));
+    .increment(batch_processor_count_to_u64(observation.successes));
     counter!(
         "rustfs_ecstore_batch_processor_results_total",
-        "operation" => operation,
+        "operation" => observation.operation,
         "outcome" => "error"
     )
-    .increment(batch_processor_count_to_u64(errors));
+    .increment(batch_processor_count_to_u64(observation.errors));
     counter!(
         "rustfs_ecstore_batch_processor_results_total",
-        "operation" => operation,
+        "operation" => observation.operation,
         "outcome" => "timeout"
     )
-    .increment(batch_processor_count_to_u64(timeouts));
+    .increment(batch_processor_count_to_u64(observation.timeouts));
     histogram!(
         "rustfs_ecstore_batch_processor_suggested_concurrency",
-        "operation" => operation,
-        "reason" => suggestion_reason
+        "operation" => observation.operation,
+        "reason" => observation.suggestion_reason
     )
-    .record(batch_processor_count_to_f64(suggested_concurrency));
+    .record(batch_processor_count_to_f64(observation.suggested_concurrency));
 }
 
 /// Record the bitrot reader setup scheduling strategy selected for a GET read.
@@ -2103,7 +2108,18 @@ mod tests {
 
     #[test]
     fn test_record_batch_processor_observation() {
-        record_batch_processor_observation("read", 16, 8, 0.001, 0.025, 15, 1, 0, 10, "improving");
+        record_batch_processor_observation(BatchProcessorObservation {
+            operation: "read",
+            batch_size: 16,
+            configured_concurrency: 8,
+            max_queue_wait_secs: 0.001,
+            execution_latency_secs: 0.025,
+            successes: 15,
+            errors: 1,
+            timeouts: 0,
+            suggested_concurrency: 10,
+            suggestion_reason: "improving",
+        });
     }
 
     #[test]
@@ -2189,7 +2205,18 @@ mod tests {
             0,
             2,
         );
-        record_batch_processor_observation("read", 16, 8, 0.001, 0.025, 15, 1, 0, 10, "improving");
+        record_batch_processor_observation(BatchProcessorObservation {
+            operation: "read",
+            batch_size: 16,
+            configured_concurrency: 8,
+            max_queue_wait_secs: 0.001,
+            execution_latency_secs: 0.025,
+            successes: 15,
+            errors: 1,
+            timeouts: 0,
+            suggested_concurrency: 10,
+            suggestion_reason: "improving",
+        });
 
         assert!(0.005_f64.is_sign_positive());
     }

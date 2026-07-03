@@ -218,18 +218,18 @@ impl AsyncBatchProcessor {
             Err(_) => calculate_batch_concurrency_suggestion(self.max_concurrent, observation),
         };
 
-        rustfs_io_metrics::record_batch_processor_observation(
-            self.operation,
-            observation.batch_size,
-            self.max_concurrent,
-            observation.max_queue_wait.as_secs_f64(),
-            observation.execution_latency.as_secs_f64(),
-            observation.success_count,
-            observation.error_count,
-            observation.timeout_count,
-            suggestion.concurrency,
-            suggestion.reason,
-        );
+        rustfs_io_metrics::record_batch_processor_observation(rustfs_io_metrics::BatchProcessorObservation {
+            operation: self.operation,
+            batch_size: observation.batch_size,
+            configured_concurrency: self.max_concurrent,
+            max_queue_wait_secs: observation.max_queue_wait.as_secs_f64(),
+            execution_latency_secs: observation.execution_latency.as_secs_f64(),
+            successes: observation.success_count,
+            errors: observation.error_count,
+            timeouts: observation.timeout_count,
+            suggested_concurrency: suggestion.concurrency,
+            suggestion_reason: suggestion.reason,
+        });
 
         suggestion
     }
