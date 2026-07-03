@@ -29,6 +29,7 @@ use super::replication_metadata_boundary::ReplicationMetadataStore;
 #[cfg(test)]
 use super::replication_msgp_boundary::ReplicationMsgpCodec;
 use super::replication_object_config::{ReplicationConfig, check_replicate_delete, get_replication_config, must_replicate};
+use super::replication_queue_boundary::DeletedObjectReplicationInfo;
 use super::replication_resync_boundary::{
     BucketReplicationResyncStatus, ResyncOpts, TargetReplicationResyncStatus, encode_resync_file, is_version_id_mismatch,
     resync_state_accepts_update, should_count_head_proxy_failure,
@@ -60,7 +61,7 @@ use http_body_util::StreamBody;
 #[cfg(test)]
 use rmp_serde;
 use rustfs_replication::{
-    DeletedObjectReplicationInfo, MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
+    MustReplicateOptions, ReplicationMultipartPartInput, heal_uses_delete_replication_path,
     is_retryable_delete_replication_head_error, is_version_delete_replication, replication_etags_match,
     replication_multipart_complete_actual_size, replication_multipart_part_plan, should_retry_delete_marker_purge,
 };
