@@ -1125,11 +1125,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    type ConfigGetterCase = (&'static str, fn() -> u64, u64, &'static str, u64);
+
     /// Table of env-configurable getters: (env var, getter normalized to u64,
     /// expected default, override string, expected override value).
     /// Durations are normalized to whole seconds.
-    #[allow(clippy::type_complexity)]
-    fn config_getter_cases() -> Vec<(&'static str, fn() -> u64, u64, &'static str, u64)> {
+    fn config_getter_cases() -> Vec<ConfigGetterCase> {
         vec![
             (
                 ENV_CAPACITY_SCHEDULED_INTERVAL,

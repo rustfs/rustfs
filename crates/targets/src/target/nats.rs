@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -29,8 +30,6 @@ use crate::{
 };
 use async_trait::async_trait;
 use rustfs_config::{NATS_CREDENTIALS_FILE, NATS_TLS_CA, NATS_TLS_CLIENT_CERT, NATS_TLS_CLIENT_KEY};
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -192,7 +191,7 @@ pub async fn connect_nats(args: &NATSArgs) -> Result<async_nats::Client, TargetE
 
 pub struct NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: NATSArgs,
@@ -210,7 +209,7 @@ where
 
 impl<E> NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
         Box::new(NATSTarget::<E> {
@@ -318,7 +317,7 @@ where
 #[async_trait]
 impl<E> Target<E> for NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -415,7 +414,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for NATSTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = async_nats::Client;
 

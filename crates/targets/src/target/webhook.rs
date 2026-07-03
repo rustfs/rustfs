@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::plugin::PluginEvent;
 use crate::{
     StoreError, Target,
     arn::TargetID,
@@ -32,8 +33,6 @@ use parking_lot::Mutex;
 use reqwest::{Client, StatusCode, Url};
 use rustfs_tls_runtime::load_cert_bundle_der_bytes;
 use rustfs_utils::egress::validate_outbound_url;
-use serde::Serialize;
-use serde::de::DeserializeOwned;
 use std::{
     fmt,
     marker::PhantomData,
@@ -132,7 +131,7 @@ impl WebhookArgs {
 /// A target that sends events to a webhook
 pub struct WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     id: TargetID,
     args: WebhookArgs,
@@ -152,7 +151,7 @@ where
 
 impl<E> WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     /// Clones the WebhookTarget, creating a new instance with the same configuration
     pub fn clone_box(&self) -> Box<dyn Target<E> + Send + Sync> {
@@ -476,7 +475,7 @@ where
 #[async_trait]
 impl<E> Target<E> for WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     fn id(&self) -> TargetID {
         self.id.clone()
@@ -643,7 +642,7 @@ where
 #[async_trait]
 impl<E> ReloadableTargetTls for WebhookTarget<E>
 where
-    E: Send + Sync + 'static + Clone + Serialize + DeserializeOwned,
+    E: PluginEvent,
 {
     type Material = Client;
 

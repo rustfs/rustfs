@@ -15,6 +15,7 @@
 pub mod config;
 pub mod delete;
 pub mod mrf;
+pub mod multipart;
 pub mod object;
 pub mod operation;
 pub mod queue;
@@ -33,6 +34,10 @@ pub use delete::{
     should_retry_delete_marker_purge,
 };
 pub use mrf::{MrfOpKind, MrfReplicateEntry, decode_mrf_file, encode_mrf_file};
+pub use multipart::{
+    ReplicationMultipartPartInput, ReplicationMultipartPartPlan, ReplicationMultipartPlanError, ReplicationMultipartRange,
+    replication_multipart_complete_actual_size, replication_multipart_part_plan,
+};
 pub use object::{
     ReplicationSourceObject, ReplicationTargetObject, content_matches_by_etag, replication_action_for_target,
     replication_etags_match, target_is_newer_than_source_null_version,

@@ -60,8 +60,8 @@ pub use manifest::{
 };
 pub use net::*;
 pub use plugin::{
-    BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, TargetAdminMetadata, TargetPluginDescriptor, TargetPluginRegistry,
-    TargetRequestValidator, boxed_target,
+    BuiltinTargetAdminDescriptor, BuiltinTargetDescriptor, PluginEvent, TargetAdminMetadata, TargetPluginDescriptor,
+    TargetPluginRegistry, TargetRequestValidator, boxed_target,
 };
 pub use runtime::{
     ReplayEvent, ReplayWorkerManager, RuntimeActivation, RuntimeStatusSnapshot, RuntimeTargetHealthSnapshot,
