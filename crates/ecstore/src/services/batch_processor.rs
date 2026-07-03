@@ -50,6 +50,10 @@ impl BatchProcessorAdaptiveMode {
     fn should_observe(self) -> bool {
         matches!(self, Self::Observe | Self::On)
     }
+
+    fn should_apply(self) -> bool {
+        matches!(self, Self::On)
+    }
 }
 
 fn parse_batch_processor_adaptive_mode(raw: &str) -> BatchProcessorAdaptiveMode {
@@ -206,22 +210,45 @@ impl AsyncBatchProcessor {
     }
 
     fn observe_batch(&self, observation: BatchObservation) -> BatchConcurrencySuggestion {
-        if !batch_processor_adaptive_mode().should_observe() {
+        let mode = batch_processor_adaptive_mode();
+        let execution_concurrency = self.execution_concurrency(mode);
+        self.observe_batch_with_mode(mode, execution_concurrency, observation)
+    }
+
+    fn execution_concurrency(&self, mode: BatchProcessorAdaptiveMode) -> usize {
+        if !mode.should_apply() {
+            return self.max_concurrent;
+        }
+
+        self.observation_state
+            .lock()
+            .map(|state| state.last_suggested_concurrency.max(1))
+            .unwrap_or(self.max_concurrent)
+    }
+
+    fn observe_batch_with_mode(
+        &self,
+        mode: BatchProcessorAdaptiveMode,
+        execution_concurrency: usize,
+        observation: BatchObservation,
+    ) -> BatchConcurrencySuggestion {
+        let execution_concurrency = execution_concurrency.max(1);
+        if !mode.should_observe() {
             return BatchConcurrencySuggestion {
-                concurrency: self.max_concurrent,
+                concurrency: execution_concurrency,
                 reason: BATCH_SUGGESTION_REASON_STABLE,
             };
         }
 
         let suggestion = match self.observation_state.lock() {
-            Ok(mut state) => state.suggest(self.max_concurrent, observation, Instant::now()),
-            Err(_) => calculate_batch_concurrency_suggestion(self.max_concurrent, observation),
+            Ok(mut state) => state.suggest(execution_concurrency, observation, Instant::now()),
+            Err(_) => calculate_batch_concurrency_suggestion(execution_concurrency, observation),
         };
 
         rustfs_io_metrics::record_batch_processor_observation(rustfs_io_metrics::BatchProcessorObservation {
             operation: self.operation,
             batch_size: observation.batch_size,
-            configured_concurrency: self.max_concurrent,
+            configured_concurrency: execution_concurrency,
             max_queue_wait_secs: observation.max_queue_wait.as_secs_f64(),
             execution_latency_secs: observation.execution_latency.as_secs_f64(),
             successes: observation.success_count,
@@ -246,7 +273,9 @@ impl AsyncBatchProcessor {
 
         let batch_size = tasks.len();
         let batch_started_at = Instant::now();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        let adaptive_mode = batch_processor_adaptive_mode();
+        let execution_concurrency = self.execution_concurrency(adaptive_mode);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(execution_concurrency));
         let mut join_set = JoinSet::new();
         let mut results = Vec::with_capacity(batch_size);
         for _ in 0..batch_size {
@@ -296,14 +325,18 @@ impl AsyncBatchProcessor {
                 Err(_) => error_count += 1,
             }
         }
-        self.observe_batch(BatchObservation {
-            batch_size,
-            success_count,
-            error_count,
-            timeout_count,
-            max_queue_wait,
-            execution_latency: batch_started_at.elapsed(),
-        });
+        self.observe_batch_with_mode(
+            adaptive_mode,
+            execution_concurrency,
+            BatchObservation {
+                batch_size,
+                success_count,
+                error_count,
+                timeout_count,
+                max_queue_wait,
+                execution_latency: batch_started_at.elapsed(),
+            },
+        );
 
         results
     }
@@ -326,7 +359,9 @@ impl AsyncBatchProcessor {
 
         let batch_size = tasks.len();
         let batch_started_at = Instant::now();
-        let semaphore = Arc::new(tokio::sync::Semaphore::new(self.max_concurrent));
+        let adaptive_mode = batch_processor_adaptive_mode();
+        let execution_concurrency = self.execution_concurrency(adaptive_mode);
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(execution_concurrency));
         let mut join_set = JoinSet::new();
         let mut successes = Vec::new();
         let mut pending_tasks = batch_size;
@@ -356,14 +391,18 @@ impl AsyncBatchProcessor {
                     max_queue_wait = max_queue_wait.max(queue_wait);
                     successes.push(value);
                     if successes.len() >= required_successes {
-                        self.observe_batch(BatchObservation {
-                            batch_size,
-                            success_count: successes.len(),
-                            error_count,
-                            timeout_count,
-                            max_queue_wait,
-                            execution_latency: batch_started_at.elapsed(),
-                        });
+                        self.observe_batch_with_mode(
+                            adaptive_mode,
+                            execution_concurrency,
+                            BatchObservation {
+                                batch_size,
+                                success_count: successes.len(),
+                                error_count,
+                                timeout_count,
+                                max_queue_wait,
+                                execution_latency: batch_started_at.elapsed(),
+                            },
+                        );
                         return Ok(successes);
                     }
                 }
@@ -387,14 +426,18 @@ impl AsyncBatchProcessor {
             }
 
             if successes.len() + pending_tasks < required_successes {
-                self.observe_batch(BatchObservation {
-                    batch_size,
-                    success_count: successes.len(),
-                    error_count,
-                    timeout_count,
-                    max_queue_wait,
-                    execution_latency: batch_started_at.elapsed(),
-                });
+                self.observe_batch_with_mode(
+                    adaptive_mode,
+                    execution_concurrency,
+                    BatchObservation {
+                        batch_size,
+                        success_count: successes.len(),
+                        error_count,
+                        timeout_count,
+                        max_queue_wait,
+                        execution_latency: batch_started_at.elapsed(),
+                    },
+                );
                 return Err(first_error.unwrap_or_else(|| {
                     Error::other(format!(
                         "Insufficient successful results: got {}, needed {}",
@@ -405,14 +448,18 @@ impl AsyncBatchProcessor {
             }
         }
 
-        self.observe_batch(BatchObservation {
-            batch_size,
-            success_count: successes.len(),
-            error_count,
-            timeout_count,
-            max_queue_wait,
-            execution_latency: batch_started_at.elapsed(),
-        });
+        self.observe_batch_with_mode(
+            adaptive_mode,
+            execution_concurrency,
+            BatchObservation {
+                batch_size,
+                success_count: successes.len(),
+                error_count,
+                timeout_count,
+                max_queue_wait,
+                execution_latency: batch_started_at.elapsed(),
+            },
+        );
         Err(first_error.unwrap_or_else(|| {
             Error::other(format!(
                 "Insufficient successful results: got {}, needed {}",
@@ -617,6 +664,8 @@ mod tests {
         assert!(!BatchProcessorAdaptiveMode::Off.should_observe());
         assert!(BatchProcessorAdaptiveMode::Observe.should_observe());
         assert!(BatchProcessorAdaptiveMode::On.should_observe());
+        assert!(!BatchProcessorAdaptiveMode::Observe.should_apply());
+        assert!(BatchProcessorAdaptiveMode::On.should_apply());
     }
 
     #[test]
@@ -653,6 +702,26 @@ mod tests {
 
         assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
         assert!(suggestion.concurrency > 8);
+        assert_eq!(processor.execution_concurrency(BatchProcessorAdaptiveMode::Observe), 8);
+    }
+
+    #[test]
+    fn batch_processor_adaptive_on_applies_last_suggestion_to_next_batch() {
+        let processor = AsyncBatchProcessor::new(8);
+        let suggestion = temp_env::with_var(ENV_RUSTFS_BATCH_PROCESSOR_ADAPTIVE, Some("on"), || {
+            processor.observe_batch(BatchObservation {
+                batch_size: 16,
+                success_count: 16,
+                error_count: 0,
+                timeout_count: 0,
+                max_queue_wait: Duration::ZERO,
+                execution_latency: Duration::from_millis(20),
+            })
+        });
+
+        assert_eq!(suggestion.reason, BATCH_SUGGESTION_REASON_IMPROVING);
+        assert!(suggestion.concurrency > 8);
+        assert_eq!(processor.execution_concurrency(BatchProcessorAdaptiveMode::On), suggestion.concurrency);
     }
 
     #[test]

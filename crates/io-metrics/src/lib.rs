@@ -1155,6 +1155,10 @@ pub struct BatchProcessorObservation {
 /// Record observe-only batch processor shape and adaptive-concurrency advice.
 #[inline(always)]
 pub fn record_batch_processor_observation(observation: BatchProcessorObservation) {
+    if !get_stage_metrics_enabled() {
+        return;
+    }
+
     histogram!("rustfs_ecstore_batch_processor_batch_size", "operation" => observation.operation)
         .record(batch_processor_count_to_f64(observation.batch_size));
     histogram!("rustfs_ecstore_batch_processor_configured_concurrency", "operation" => observation.operation)
@@ -2108,6 +2112,8 @@ mod tests {
 
     #[test]
     fn test_record_batch_processor_observation() {
+        let _guard = METRICS_FLAG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        set_get_stage_metrics_enabled(true);
         record_batch_processor_observation(BatchProcessorObservation {
             operation: "read",
             batch_size: 16,
@@ -2120,6 +2126,8 @@ mod tests {
             suggested_concurrency: 10,
             suggestion_reason: "improving",
         });
+        assert!(get_stage_metrics_enabled());
+        set_get_stage_metrics_enabled(false);
     }
 
     #[test]

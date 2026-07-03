@@ -126,7 +126,7 @@ impl NodeService {
             Ok(Response::new(DiskInfoResponse {
                 success: false,
                 disk_info: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -150,7 +150,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeleteVolumeResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -210,7 +210,7 @@ impl NodeService {
                 success: false,
                 read_multiple_resps: Vec::new(),
                 read_multiple_resps_bin: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -280,7 +280,7 @@ impl NodeService {
                 success: false,
                 batch_read_version_resps: Vec::new(),
                 batch_read_version_resps_bin: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -334,7 +334,7 @@ impl NodeService {
             Ok(Response::new(DeleteVersionsResponse {
                 success: false,
                 errors: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -391,7 +391,7 @@ impl NodeService {
             Ok(Response::new(DeleteVersionResponse {
                 success: false,
                 raw_file_info: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -436,7 +436,7 @@ impl NodeService {
                 success: false,
                 raw_file_info: String::new(),
                 raw_file_info_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -498,7 +498,7 @@ impl NodeService {
                 success: false,
                 file_info: String::new(),
                 file_info_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -531,7 +531,7 @@ impl NodeService {
         } else {
             Ok(Response::new(WriteMetadataResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -575,7 +575,7 @@ impl NodeService {
         } else {
             Ok(Response::new(UpdateMetadataResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -602,7 +602,7 @@ impl NodeService {
             Ok(Response::new(ReadMetadataResponse {
                 success: false,
                 data: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -626,7 +626,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeletePathsResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -660,7 +660,7 @@ impl NodeService {
             Ok(Response::new(StatVolumeResponse {
                 success: false,
                 volume_info: String::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -693,7 +693,7 @@ impl NodeService {
             Ok(Response::new(ListVolumesResponse {
                 success: false,
                 volume_infos: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -717,7 +717,7 @@ impl NodeService {
         } else {
             Ok(Response::new(MakeVolumeResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -741,7 +741,7 @@ impl NodeService {
         } else {
             Ok(Response::new(MakeVolumesResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -803,7 +803,7 @@ impl NodeService {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -827,7 +827,7 @@ impl NodeService {
             Ok(Response::new(ListDirResponse {
                 success: false,
                 volumes: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -858,7 +858,7 @@ impl NodeService {
         } else {
             Ok(Response::new(RenameFileResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -891,7 +891,7 @@ impl NodeService {
         } else {
             Ok(Response::new(RenamePartResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -940,7 +940,7 @@ impl NodeService {
             Ok(Response::new(CheckPartsResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -980,7 +980,7 @@ impl NodeService {
             Ok(Response::new(ReadPartsResponse {
                 success: false,
                 object_part_infos: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1029,7 +1029,7 @@ impl NodeService {
             Ok(Response::new(VerifyFileResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1059,7 +1059,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeleteResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1098,7 +1098,7 @@ impl NodeService {
             metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(WriteAllResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1143,7 +1143,7 @@ impl NodeService {
             Ok(Response::new(ReadAllResponse {
                 success: false,
                 data: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }

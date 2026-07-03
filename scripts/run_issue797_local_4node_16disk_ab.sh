@@ -23,7 +23,7 @@ WARP_MODE="${WARP_MODE:-mixed}"
 WARP_EXTRA_ARGS="${WARP_EXTRA_ARGS:---noclear}"
 PROFILES="${PROFILES:-baseline,metrics_logging}"
 OUT_DIR="${OUT_DIR:-${PROJECT_ROOT}/target/bench/issue-797-local-4node-16disk-ab-$(date -u +%Y%m%dT%H%M%SZ)}"
-DATA_ROOT="${DATA_ROOT:-/private/tmp/issue797-local-4node-16disk-ab-$(date -u +%Y%m%dT%H%M%SZ)}"
+DATA_ROOT="${DATA_ROOT:-/tmp/issue797-local-4node-16disk-ab-$(date -u +%Y%m%dT%H%M%SZ)}"
 KEEP_DATA="${KEEP_DATA:-false}"
 WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-180}"
 HEALTH_POLL_SECS="${HEALTH_POLL_SECS:-2}"
@@ -130,6 +130,34 @@ require_cmd() {
   if ! command -v "$1" >/dev/null 2>&1; then
     die "command not found: $1"
   fi
+}
+
+print_redacted_command() {
+  local redact_next=false
+  local arg
+
+  printf 'Command:'
+  for arg in "$@"; do
+    if [[ "$redact_next" == "true" ]]; then
+      printf ' %q' "REDACTED"
+      redact_next=false
+      continue
+    fi
+
+    case "$arg" in
+      --access-key|--secret-key)
+        printf ' %q' "$arg"
+        redact_next=true
+        ;;
+      -accessKey=*|-secretKey=*)
+        printf ' %q' "${arg%%=*}=REDACTED"
+        ;;
+      *)
+        printf ' %q' "$arg"
+        ;;
+    esac
+  done
+  printf '\n'
 }
 
 endpoint_for_node() {
@@ -468,9 +496,7 @@ run_bench() {
     cmd+=(--extra-args "$WARP_EXTRA_ARGS")
   fi
 
-  printf 'Command:' >"$profile_dir/bench/command.txt"
-  printf ' %q' "${cmd[@]}" >>"$profile_dir/bench/command.txt"
-  printf '\n' >>"$profile_dir/bench/command.txt"
+  print_redacted_command "${cmd[@]}" >"$profile_dir/bench/command.txt"
   log "${profile}: running warp benchmark"
   "${cmd[@]}" 2>&1 | tee "$profile_dir/bench/run.log"
 }
@@ -536,7 +562,6 @@ main() {
 
   require_cmd "$CURL_BIN"
   require_cmd "$WARP_BIN"
-  require_cmd "$RG_BIN"
 
   if [[ "$BUILD_BIN" == "true" ]]; then
     log "building rustfs binary"
