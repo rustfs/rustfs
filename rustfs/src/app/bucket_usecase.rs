@@ -33,6 +33,10 @@ use super::storage_api::bucket_usecase::bucket::{
     },
     metadata_sys,
     policy_sys::PolicySys,
+    replication::{
+        ReplicationTargetValidationError, replication_target_arns, should_remove_replication_target,
+        validate_replication_config_target_arns,
+    },
     target::{BucketTargetType, BucketTargets},
     utils::serialize,
     versioning_sys::BucketVersioningSys,
@@ -252,14 +256,14 @@ fn validate_replication_config_targets(targets: &BucketTargets, config: &Replica
         .filter(|target| target.target_type == BucketTargetType::ReplicationService)
         .map(|target| target.arn.as_str());
 
-    match rustfs_replication::validate_replication_config_target_arns(configured_arns, config) {
+    match validate_replication_config_target_arns(configured_arns, config) {
         Ok(()) => Ok(()),
         Err(err) => {
             let message = match err {
-                rustfs_replication::ReplicationTargetValidationError::RoleWithMultipleDestinations => {
+                ReplicationTargetValidationError::RoleWithMultipleDestinations => {
                     "replication config with Role cannot define multiple destination targets"
                 }
-                rustfs_replication::ReplicationTargetValidationError::StaleTarget => "replication config has a stale target",
+                ReplicationTargetValidationError::StaleTarget => "replication config has a stale target",
             };
             Err(S3Error::with_message(S3ErrorCode::InvalidRequest, message))
         }
@@ -290,7 +294,7 @@ async fn replication_targets_without_config_targets(
     bucket: &str,
     config: &ReplicationConfiguration,
 ) -> S3Result<Option<(BucketTargets, usize)>> {
-    let target_arns = rustfs_replication::replication_target_arns(config);
+    let target_arns = replication_target_arns(config);
     if target_arns.is_empty() {
         return Ok(None);
     }
@@ -315,7 +319,7 @@ async fn replication_targets_without_config_targets(
 fn remove_replication_targets_from_config_targets(targets: &mut BucketTargets, target_arns: &HashSet<String>) -> usize {
     let original_len = targets.targets.len();
     targets.targets.retain(|target| {
-        !rustfs_replication::should_remove_replication_target(
+        !should_remove_replication_target(
             target.arn.as_str(),
             target.target_type == BucketTargetType::ReplicationService,
             target_arns,
@@ -2387,7 +2391,7 @@ mod tests {
             rules: vec![replication_rule_for_target(destination)],
         };
 
-        let arns = rustfs_replication::replication_target_arns(&config);
+        let arns = replication_target_arns(&config);
 
         assert!(arns.contains(role));
         assert!(!arns.contains(destination));
@@ -2401,7 +2405,7 @@ mod tests {
             rules: vec![replication_rule_for_target(destination)],
         };
 
-        let arns = rustfs_replication::replication_target_arns(&config);
+        let arns = replication_target_arns(&config);
 
         assert!(arns.contains(destination));
     }
