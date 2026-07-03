@@ -49,7 +49,7 @@ use super::{
     DiskStat, GetObjectReader, ObjectInfo, ObjectOptions, RebalSaveOpt, RebalStatus, RebalanceBucketOutcome,
     RebalanceCleanupWarnings, RebalanceEntryOutcome, RebalanceInfo, RebalanceMeta, RebalanceStats,
 };
-use crate::bucket::replication::{ReplicationState, ReplicationStatusType};
+use crate::bucket::replication::{ReplicationState, ReplicationStatusType, replication_state_to_filemeta};
 use crate::data_movement;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::disk::RUSTFS_META_BUCKET;
@@ -223,12 +223,12 @@ fn test_rebalance_delete_marker_opts_preserves_replication_state() {
     let mod_time = OffsetDateTime::now_utc();
     let version = FileInfo {
         mod_time: Some(mod_time),
-        replication_state_internal: Some(ReplicationState {
+        replication_state_internal: Some(replication_state_to_filemeta(&ReplicationState {
             replica_status: ReplicationStatusType::Replica,
             delete_marker: true,
             replicate_decision_str: "existing".to_string(),
             ..Default::default()
-        }),
+        })),
         ..version_deleted()
     };
 

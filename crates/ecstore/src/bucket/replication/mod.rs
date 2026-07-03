@@ -52,7 +52,11 @@ pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::version_purge_statuses_map;
 pub use replication_filemeta_boundary::{
     REPLICATE_INCOMING_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicationState, ReplicationStatusType, ReplicationType,
-    VersionPurgeStatusType, replication_statuses_map,
+    VersionPurgeStatusType, replication_state_to_filemeta, replication_status_to_filemeta, replication_statuses_map,
+    version_purge_status_to_filemeta,
+};
+pub(crate) use replication_filemeta_boundary::{
+    replication_state_from_filemeta, replication_status_from_filemeta, version_purge_status_from_filemeta,
 };
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;

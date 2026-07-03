@@ -37,11 +37,11 @@ paths.
 | `EcstoreReplicationBoundaryImports` | ECStore-side imports from `rustfs-replication`. | Direct `rustfs-replication` imports under `crates/ecstore/src/bucket/replication` stay in `*_boundary.rs` modules, including config and resync facade re-exports. |
 | `RuntimeReplicationFacadeConsumers` | Runtime owner consumers of replication DTOs and status types. | Scanner, admin, and storage owner facades import replication DTOs/status types through `rustfs-ecstore`; app storage keeps the remaining direct object/delete helper calls behind its local storage API boundary. |
 | `ReplicationResyncContracts` | Resync options, target status, bucket status, status classifiers, and persisted resync/MRF status wire format. | Owned by `crates/replication`; ECStore imports them through `replication_resync_boundary.rs`, which maps crate errors to ECStore errors. |
-| `ReplicationCrateFileMetaFacade` | Replication facade compatibility symbols that still originate in filemeta wire contracts. | `crates/replication/src/filemeta.rs` is the only direct `rustfs-filemeta` import boundary inside `rustfs-replication`. |
+| `ReplicationCrateFileMetaIndependence` | Replication status, decision, MRF, resync, and target-reset wire contracts owned by `rustfs-replication`. | `crates/replication/src/filemeta.rs` owns these contracts; `rustfs-replication` must not import or depend on `rustfs-filemeta`. |
 | `ReplicationConfigStore` | Replication config persistence and config-derived labels used by target options. | Config read/save helpers and storage class labels are exposed through the contract type in `replication_config_store.rs`. |
-| `ReplicationFileMeta` | Replication status, decisions, MRF entries, resync decisions, and target reset helpers. | `rustfs_filemeta` replication contracts are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
-| `StorageApiReplicationContracts` | Storage-api delete DTO replication state/status helpers. | The temporary `rustfs-filemeta` dependency is isolated in `crates/storage-api/src/replication.rs` until the wire contracts can move without creating a `rustfs-replication` / `rustfs-storage-api` cycle. |
-| `ReplicationCrateStorageApiBoundary` | Storage API delete DTOs consumed by `rustfs-replication`. | `crates/replication/src/storage_api.rs` is the only direct `rustfs-storage-api` import boundary inside `rustfs-replication`. |
+| `ReplicationFileMeta` | ECStore compatibility conversions for filemeta replication state/status. | `rustfs_filemeta` to `rustfs_replication` conversions are concentrated in `replication_filemeta_boundary.rs`; `FileInfo` remains in the storage boundary for storage trait bindings and walk options. |
+| `StorageApiReplicationContracts` | Storage-api delete DTO replication state/status helpers. | Storage-api owner DTOs keep their local replication boundary; ECStore converts them in `replication_storage_boundary.rs` before queueing replication work. |
+| `ReplicationCrateStorageApiIndependence` | Delete work DTOs consumed by `rustfs-replication`. | `crates/replication/src/storage_api.rs` owns these DTOs; `rustfs-replication` must not import or depend on `rustfs-storage-api`. |
 | `ReplicationObjectDecisionContracts` | Object replication options, delete replication decisions, resync target projection, multipart planning, and delete-marker retry classifiers. | Owned by `crates/replication`; ECStore imports them through `replication_object_decision_boundary.rs`. |
 | `ReplicationQueueContracts` | Queue admission, heal queue results/actions, worker operations, worker sizing, and backpressure decisions. | Owned by `crates/replication`; ECStore imports them through `replication_queue_boundary.rs`. |
 | `ReplicationStatsContracts` | Bucket stats, replication target stats, queue/proxy metrics, and worker metric snapshots. | Owned by `crates/replication`; ECStore imports them through `replication_stats_boundary.rs`. |
@@ -88,13 +88,12 @@ paths.
 10. Keep ECStore owner modules outside `bucket/replication` behind bridge
     contracts when they need replication codec or config helper behavior.
 11. Keep storage-api replication status/state helpers behind
-    `crates/storage-api/src/replication.rs` until the underlying wire contracts
-    can move without a `rustfs-replication` / `rustfs-storage-api` dependency
-    cycle.
-12. Keep direct `rustfs-filemeta` imports inside `rustfs-replication`
-    concentrated in `crates/replication/src/filemeta.rs`.
-13. Keep direct `rustfs-storage-api` imports inside `rustfs-replication`
-    concentrated in `crates/replication/src/storage_api.rs`.
+    `crates/storage-api/src/replication.rs`; ECStore converts owner DTOs at the
+    replication storage boundary.
+12. Keep `rustfs-replication` independent from `rustfs-filemeta`; ECStore
+    compatibility conversions live in `replication_filemeta_boundary.rs`.
+13. Keep `rustfs-replication` independent from `rustfs-storage-api`; ECStore
+    compatibility conversions live in `replication_storage_boundary.rs`.
 14. Keep direct `rustfs-replication` imports inside ECStore replication
     concentrated in `*_boundary.rs` modules.
 15. Keep scanner, admin, and storage-owner replication status/DTO consumers

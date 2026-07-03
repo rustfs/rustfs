@@ -1,4 +1,5 @@
 use super::worker::{is_transient_rebalance_error, rebalance_migration_retry_delay, sleep_rebalance_migration_retry};
+use crate::bucket::replication::replication_state_from_filemeta;
 use crate::data_usage::DATA_USAGE_CACHE_NAME;
 use crate::error::{Error, Result, is_err_object_not_found, is_err_version_not_found};
 use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions};
@@ -32,7 +33,10 @@ pub(super) fn rebalance_delete_marker_opts(version: &FileInfo, version_id: Optio
         data_movement: true,
         delete_marker: true,
         skip_decommissioned: true,
-        delete_replication: version.replication_state_internal.clone(),
+        delete_replication: version
+            .replication_state_internal
+            .as_ref()
+            .map(replication_state_from_filemeta),
         ..Default::default()
     }
 }
