@@ -19,10 +19,12 @@ use crate::object_api::{GetObjectReader, ObjectInfo, ObjectOptions, PutObjReader
 use crate::runtime::sources as runtime_sources;
 use crate::storage_api_contracts::{
     admin::StorageAdminApi,
+    heal::HealOperations,
     object::{DeletedObject, EcstoreObjectIO, ObjectIO, ObjectOperations, ObjectToDelete},
     range::HTTPRangeSpec,
 };
 use http::HeaderMap;
+use rustfs_common::heal_channel::{HealOpts, HealScanMode};
 use rustfs_config::audit::{
     AUDIT_AMQP_KEYS, AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_KEYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_KEYS, AUDIT_MQTT_SUB_SYS,
     AUDIT_MYSQL_KEYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_KEYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_KEYS, AUDIT_POSTGRES_SUB_SYS,
@@ -47,6 +49,44 @@ use tracing::{debug, error, info, instrument, warn};
 
 pub const CONFIG_PREFIX: &str = "config";
 const CONFIG_FILE: &str = "config.json";
+
+/// Environment variable gating the startup fallback to the default server
+/// config when the persisted `config.json` object is corrupt beyond repair
+/// (unreadable or undecodable even after a heal attempt).
+///
+/// Enabled by default: `config.json` only holds server settings (storage
+/// class, notify/audit targets, OIDC), never object data, and environment
+/// overrides are re-applied on top of the defaults, so booting with defaults
+/// is safe while a startup crash loop is not. Set to `false`/`off` to fail
+/// startup instead of falling back.
+pub const ENV_CONFIG_RECOVER_ON_CORRUPTION: &str = "RUSTFS_CONFIG_RECOVER_ON_CORRUPTION";
+const DEFAULT_CONFIG_RECOVER_ON_CORRUPTION: bool = true;
+
+const LOG_COMPONENT_CONFIG: &str = "ecstore";
+const LOG_SUBSYSTEM_CONFIG: &str = "config";
+const EVENT_SERVER_CONFIG_DECODE_FAILED: &str = "server_config_decode_failed";
+const EVENT_SERVER_CONFIG_READ_FAILED: &str = "server_config_read_failed";
+const EVENT_SERVER_CONFIG_HEAL_RESULT: &str = "server_config_heal_result";
+const EVENT_SERVER_CONFIG_RECOVERED: &str = "server_config_recovered_after_heal";
+const EVENT_SERVER_CONFIG_FALLBACK: &str = "server_config_corruption_fallback";
+
+fn config_corruption_recovery_enabled() -> bool {
+    rustfs_utils::get_env_bool(ENV_CONFIG_RECOVER_ON_CORRUPTION, DEFAULT_CONFIG_RECOVER_ON_CORRUPTION)
+}
+
+/// Marker wrapped around decode failures of the persisted server config so
+/// callers can tell deterministic corruption (retrying cannot help) apart
+/// from transient read failures; a bare `Error::Io` cannot be classified.
+#[derive(Debug, thiserror::Error)]
+#[error("server config corrupt: {0}")]
+pub struct ServerConfigCorruptError(pub String);
+
+/// Returns true when `err` is a [`ServerConfigCorruptError`] produced by the
+/// server config decode path. Such failures are deterministic: the persisted
+/// blob itself is damaged and re-reading it cannot succeed.
+pub fn is_server_config_corrupt_error(err: &Error) -> bool {
+    matches!(err, Error::Io(io_err) if io_err.get_ref().is_some_and(|inner| inner.is::<ServerConfigCorruptError>()))
+}
 
 pub const STORAGE_CLASS_SUB_SYS: &str = "storage_class";
 
@@ -1205,7 +1245,7 @@ where
         match read_config_no_lock(api.clone(), &config_file).await {
             Ok(cfg_data) => {
                 // TODO: decrypt
-                let cfg = decode_server_config_blob(&cfg_data)?;
+                let cfg = decode_persisted_server_config(&cfg_data)?;
                 return Ok(cfg.merge());
             }
             Err(Error::ConfigNotFound) => return handle_missing_config(api, "Read alternate configuration").await,
@@ -1214,8 +1254,178 @@ where
     }
 
     // Process non-empty configuration data
-    let cfg = decode_server_config_blob(data)?;
+    let cfg = decode_persisted_server_config(data)?;
     Ok(cfg.merge())
+}
+
+/// Decode the persisted server config blob, marking decode failures as
+/// deterministic corruption (see [`ServerConfigCorruptError`]).
+fn decode_persisted_server_config(data: &[u8]) -> Result<Config> {
+    decode_server_config_blob(data).map_err(|err| {
+        error!(
+            event = EVENT_SERVER_CONFIG_DECODE_FAILED,
+            component = LOG_COMPONENT_CONFIG,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            size = data.len(),
+            error = %err,
+            "persisted server config cannot be decoded, object is corrupt"
+        );
+        Error::other(ServerConfigCorruptError(err.to_string()))
+    })
+}
+
+/// Startup-only read of the server config with layered recovery:
+///
+/// 1. plain read (a missing config is created from defaults as usual);
+/// 2. on failure, heal the config object (reconstructs corrupted shards from
+///    erasure parity) and re-read once;
+/// 3. if the object is still unreadable or undecodable, fall back to the
+///    default config plus environment overrides (gated by
+///    [`ENV_CONFIG_RECOVER_ON_CORRUPTION`], enabled by default) instead of
+///    crash-looping the server.
+///
+/// Availability failures (lost read quorum, offline disks) are still returned
+/// to the caller so the startup retry loop can wait for disks to come back.
+pub(crate) async fn read_config_without_migrate_with_recovery<S>(api: Arc<S>) -> Result<Config>
+where
+    S: EcstoreObjectIO + StorageAdminApi + HealOperations<Error = Error, HealOptions = HealOpts>,
+{
+    let first_err = match read_config_without_migrate(api.clone()).await {
+        Ok(cfg) => return Ok(cfg),
+        Err(err) => err,
+    };
+
+    let config_file = get_config_file();
+    warn!(
+        event = EVENT_SERVER_CONFIG_READ_FAILED,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_object = %config_file,
+        error = %first_err,
+        "server config read failed, attempting heal and re-read"
+    );
+
+    heal_server_config_object(api.clone(), &config_file).await;
+
+    let retry_err = match read_config_without_migrate(api.clone()).await {
+        Ok(cfg) => {
+            info!(
+                event = EVENT_SERVER_CONFIG_RECOVERED,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                "server config recovered after heal"
+            );
+            return Ok(cfg);
+        }
+        Err(err) => err,
+    };
+
+    fallback_server_config_after_corruption(retry_err, &config_file, config_corruption_recovery_enabled())
+}
+
+/// Best-effort deep heal of the server config object so corrupted shards are
+/// reconstructed from erasure parity. Failures are logged, never propagated:
+/// the caller decides how to proceed based on the follow-up read.
+async fn heal_server_config_object<S>(api: Arc<S>, config_file: &str)
+where
+    S: HealOperations<Error = Error, HealOptions = HealOpts>,
+{
+    let opts = HealOpts {
+        recursive: false,
+        dry_run: false,
+        remove: false,
+        recreate: false,
+        scan_mode: HealScanMode::Deep,
+        update_parity: false,
+        no_lock: false,
+        pool: None,
+        set: None,
+    };
+    match api.heal_object(RUSTFS_META_BUCKET, config_file, "", &opts).await {
+        Ok((_, None)) => {
+            info!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "completed",
+                "server config heal completed"
+            );
+        }
+        Ok((_, Some(err))) => {
+            warn!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "partial",
+                error = %err,
+                "server config heal reported an error"
+            );
+        }
+        Err(err) => {
+            warn!(
+                event = EVENT_SERVER_CONFIG_HEAL_RESULT,
+                component = LOG_COMPONENT_CONFIG,
+                subsystem = LOG_SUBSYSTEM_CONFIG,
+                config_object = %config_file,
+                result = "failed",
+                error = %err,
+                "server config heal failed"
+            );
+        }
+    }
+}
+
+/// Availability failures that a startup retry loop can reasonably wait out:
+/// falling back to a default config would mask them, so they are propagated.
+fn config_read_failure_is_retryable(err: &Error) -> bool {
+    err.is_quorum_error()
+        || matches!(
+            err,
+            Error::DiskNotFound | Error::FaultyDisk | Error::FaultyRemoteDisk | Error::TooManyOpenFiles | Error::SlowDown
+        )
+}
+
+/// Last recovery layer: the config object survived a heal attempt and is
+/// still unreadable or undecodable, so the failure is deterministic. Boot
+/// with the default config (environment overrides are applied by the caller
+/// via `lookup_configs`) unless the operator disabled the fallback.
+///
+/// The corrupt object is intentionally left in place: nothing is written, so
+/// a later manual heal or inspection can still recover the old settings.
+/// Saving any config change (e.g. via the admin API) rewrites a clean object.
+fn fallback_server_config_after_corruption(err: Error, config_file: &str, recovery_enabled: bool) -> Result<Config> {
+    if config_read_failure_is_retryable(&err) {
+        return Err(err);
+    }
+
+    if !recovery_enabled {
+        error!(
+            event = EVENT_SERVER_CONFIG_FALLBACK,
+            component = LOG_COMPONENT_CONFIG,
+            subsystem = LOG_SUBSYSTEM_CONFIG,
+            config_object = %config_file,
+            env = ENV_CONFIG_RECOVER_ON_CORRUPTION,
+            result = "disabled",
+            error = %err,
+            "server config is corrupt after heal and the default-config fallback is disabled, startup will fail; unset or enable RUSTFS_CONFIG_RECOVER_ON_CORRUPTION to boot with the default config"
+        );
+        return Err(err);
+    }
+
+    error!(
+        event = EVENT_SERVER_CONFIG_FALLBACK,
+        component = LOG_COMPONENT_CONFIG,
+        subsystem = LOG_SUBSYSTEM_CONFIG,
+        config_object = %config_file,
+        env = ENV_CONFIG_RECOVER_ON_CORRUPTION,
+        result = "default_config",
+        error = %err,
+        "server config is corrupt after heal, booting with the default config plus environment overrides; settings previously saved via the admin API are not applied until the config is saved again"
+    );
+    Ok(new_server_config())
 }
 
 pub async fn save_server_config<S>(api: Arc<S>, cfg: &Config) -> Result<()>
@@ -2585,5 +2795,261 @@ mod tests {
         let external_json = r#"{"version":"33","storageclass":{"standard":"EC:4","rrs":"EC:2"}}"#;
         let result = Config::unmarshal(external_json.as_bytes());
         assert!(result.is_err(), "Config::unmarshal should fail on external format, but got: {:?}", result);
+    }
+
+    // ── Corrupted server config recovery (issue #4156) ─────────────────
+
+    use super::{
+        STORAGE_CLASS_SUB_SYS, ServerConfigCorruptError, config_read_failure_is_retryable, decode_persisted_server_config,
+        fallback_server_config_after_corruption, is_server_config_corrupt_error, read_config_without_migrate_with_recovery,
+    };
+    use rustfs_common::heal_channel::HealOpts;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Bytes mirroring issue #4156: a bitrot-corrupted `config.json` whose
+    /// shards decoded into garbage that is valid neither as the internal nor
+    /// the external config shape.
+    fn corrupt_config_blob() -> Vec<u8> {
+        let mut blob = br#"{"version":"33","credential""#.to_vec();
+        blob.extend_from_slice(&[0u8, 0xFF, 0x13, 0x37]);
+        blob
+    }
+
+    fn corrupt_config_error() -> Error {
+        decode_persisted_server_config(&corrupt_config_blob()).expect_err("corrupt blob must not decode")
+    }
+
+    #[test]
+    fn test_decode_persisted_server_config_marks_corruption() {
+        let err = corrupt_config_error();
+        assert!(is_server_config_corrupt_error(&err), "decode failures must be marked corrupt: {err:?}");
+        assert!(!config_read_failure_is_retryable(&err), "corruption is deterministic, not retryable");
+    }
+
+    #[test]
+    fn test_is_server_config_corrupt_error_ignores_other_errors() {
+        assert!(!is_server_config_corrupt_error(&Error::other("boom")));
+        assert!(!is_server_config_corrupt_error(&Error::ErasureReadQuorum));
+        assert!(!is_server_config_corrupt_error(&Error::ConfigNotFound));
+        assert!(is_server_config_corrupt_error(&Error::other(ServerConfigCorruptError("bad".to_string()))));
+    }
+
+    #[test]
+    fn test_fallback_returns_default_config_when_recovery_enabled() {
+        let cfg = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", true)
+            .expect("recovery enabled must fall back to the default config");
+        assert!(
+            configs_semantically_equal(&cfg, &Config::new()),
+            "fallback config should be the default server config"
+        );
+    }
+
+    #[test]
+    fn test_fallback_propagates_error_when_recovery_disabled() {
+        let err = fallback_server_config_after_corruption(corrupt_config_error(), "config/config.json", false)
+            .expect_err("recovery disabled must propagate the corruption error");
+        assert!(is_server_config_corrupt_error(&err));
+    }
+
+    #[test]
+    fn test_fallback_propagates_retryable_availability_errors() {
+        for err in [Error::ErasureReadQuorum, Error::FaultyDisk, Error::DiskNotFound] {
+            let out = fallback_server_config_after_corruption(err, "config/config.json", true)
+                .expect_err("availability errors must stay retryable, not masked by defaults");
+            assert!(config_read_failure_is_retryable(&out));
+        }
+    }
+
+    /// What reads of the config object currently return.
+    enum RecoveryReadState {
+        Blob(Vec<u8>),
+        QuorumError,
+    }
+
+    /// Minimal storage stub for the startup recovery path: serves the config
+    /// object from memory and lets `heal_object` swap in repaired bytes.
+    struct RecoveryMockStore {
+        state: Mutex<RecoveryReadState>,
+        heal_replacement: Option<Vec<u8>>,
+        heal_calls: AtomicUsize,
+    }
+
+    impl RecoveryMockStore {
+        fn new(state: RecoveryReadState, heal_replacement: Option<Vec<u8>>) -> Self {
+            Self {
+                state: Mutex::new(state),
+                heal_replacement,
+                heal_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl Debug for RecoveryMockStore {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecoveryMockStore").finish()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::object::ObjectIO for RecoveryMockStore {
+        type Error = Error;
+        type RangeSpec = HTTPRangeSpec;
+        type HeaderMap = HeaderMap;
+        type ObjectOptions = ObjectOptions;
+        type ObjectInfo = ObjectInfo;
+        type GetObjectReader = GetObjectReader;
+        type PutObjectReader = PutObjReader;
+
+        async fn get_object_reader(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _range: Option<HTTPRangeSpec>,
+            _h: HeaderMap,
+            _opts: &ObjectOptions,
+        ) -> Result<GetObjectReader> {
+            let data = match &*self.state.lock().expect("state lock poisoned") {
+                RecoveryReadState::Blob(data) => data.clone(),
+                RecoveryReadState::QuorumError => return Err(Error::ErasureReadQuorum),
+            };
+            let object_info = ObjectInfo {
+                size: data.len() as i64,
+                actual_size: data.len() as i64,
+                ..Default::default()
+            };
+            Ok(GetObjectReader {
+                stream: Box::new(Cursor::new(data)),
+                object_info,
+                buffered_body: None,
+            })
+        }
+
+        async fn put_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _data: &mut PutObjReader,
+            _opts: &ObjectOptions,
+        ) -> Result<ObjectInfo> {
+            panic!("unused in test")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl StorageAdminApi for RecoveryMockStore {
+        type BackendInfo = rustfs_madmin::BackendInfo;
+        type StorageInfo = rustfs_madmin::StorageInfo;
+        type Disk = crate::disk::DiskStore;
+        type Error = Error;
+
+        async fn backend_info(&self) -> rustfs_madmin::BackendInfo {
+            panic!("unused in test")
+        }
+
+        async fn storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn local_storage_info(&self) -> rustfs_madmin::StorageInfo {
+            panic!("unused in test")
+        }
+
+        async fn disk_set_inventory(
+            &self,
+            _selector: crate::storage_api_contracts::admin::DiskSetSelector,
+        ) -> Result<Vec<Option<crate::disk::DiskStore>>> {
+            panic!("unused in test")
+        }
+
+        fn set_drive_counts(&self) -> Vec<usize> {
+            vec![2]
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl crate::storage_api_contracts::heal::HealOperations for RecoveryMockStore {
+        type Error = Error;
+        type HealResultItem = ();
+        type HealOptions = HealOpts;
+
+        async fn heal_format(&self, _dry_run: bool) -> Result<((), Option<Error>)> {
+            panic!("unused in test")
+        }
+
+        async fn heal_bucket(&self, _bucket: &str, _opts: &HealOpts) -> Result<()> {
+            panic!("unused in test")
+        }
+
+        async fn heal_object(
+            &self,
+            _bucket: &str,
+            _object: &str,
+            _version_id: &str,
+            _opts: &HealOpts,
+        ) -> Result<((), Option<Error>)> {
+            self.heal_calls.fetch_add(1, Ordering::SeqCst);
+            if let Some(repaired) = &self.heal_replacement {
+                *self.state.lock().expect("state lock poisoned") = RecoveryReadState::Blob(repaired.clone());
+            }
+            Ok(((), None))
+        }
+
+        async fn get_pool_and_set(&self, _id: &str) -> Result<(Option<usize>, Option<usize>, Option<usize>)> {
+            panic!("unused in test")
+        }
+
+        async fn check_abandoned_parts(&self, _bucket: &str, _object: &str, _opts: &HealOpts) -> Result<()> {
+            panic!("unused in test")
+        }
+    }
+
+    #[tokio::test]
+    async fn test_recovery_uses_healed_config_object() {
+        // Heal reconstructs a valid config from parity: no fallback needed.
+        let valid = br#"{"version":"33","storageclass":{"standard":"EC:4","rrs":"EC:2"}}"#.to_vec();
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), Some(valid)));
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("healed config should be readable");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should run exactly once");
+        let kvs = cfg
+            .get_value(STORAGE_CLASS_SUB_SYS, DEFAULT_DELIMITER)
+            .expect("healed config should have storage_class");
+        assert_eq!(kvs.get("standard"), "EC:4", "healed settings must be preserved, not replaced by defaults");
+    }
+
+    #[tokio::test]
+    async fn test_recovery_falls_back_to_default_config_when_blob_stays_corrupt() {
+        // Heal cannot repair the blob (all shards corrupt): boot with the
+        // default config instead of crash-looping (issue #4156).
+        // RUSTFS_CONFIG_RECOVER_ON_CORRUPTION is unset, so the default (on) applies.
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::Blob(corrupt_config_blob()), None));
+
+        let cfg = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect("unrecoverable corruption should fall back to the default config");
+
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should be attempted before falling back");
+        assert!(
+            configs_semantically_equal(&cfg, &Config::new()),
+            "fallback config should be the default server config"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_recovery_propagates_persistent_quorum_errors() {
+        // Lost read quorum is an availability problem, not corruption: the
+        // startup retry loop must keep retrying instead of booting defaults.
+        let store = Arc::new(RecoveryMockStore::new(RecoveryReadState::QuorumError, None));
+
+        let err = read_config_without_migrate_with_recovery(store.clone())
+            .await
+            .expect_err("quorum errors must propagate to the startup retry loop");
+
+        assert!(err.is_quorum_error(), "expected quorum error, got {err:?}");
+        assert_eq!(store.heal_calls.load(Ordering::SeqCst), 1, "heal should still be attempted");
     }
 }

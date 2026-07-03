@@ -137,7 +137,7 @@ jobs:
     name: Test and Lint
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -173,7 +173,7 @@ jobs:
     name: Test and Lint (rio-v2)
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 60
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -201,7 +201,7 @@ jobs:
     name: "Test and Lint (${{ matrix.features.name }})"
     needs: skip-check
     if: needs.skip-check.outputs.should_skip != 'true'
-    runs-on: ubicloud-standard-4
+    runs-on: sm-standard-4
     timeout-minutes: 60
     strategy:
       fail-fast: false

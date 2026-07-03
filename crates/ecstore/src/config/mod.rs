@@ -26,7 +26,7 @@ pub mod storageclass;
 
 use crate::error::Result;
 use crate::store::ECStore;
-use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate};
+use com::{STORAGE_CLASS_SUB_SYS, lookup_configs, read_config_without_migrate_with_recovery};
 use rustfs_config::HEAL_SUB_SYS;
 use rustfs_config::audit::{
     AUDIT_AMQP_SUB_SYS, AUDIT_KAFKA_SUB_SYS, AUDIT_MQTT_SUB_SYS, AUDIT_MYSQL_SUB_SYS, AUDIT_NATS_SUB_SYS, AUDIT_POSTGRES_SUB_SYS,
@@ -61,7 +61,7 @@ impl ConfigSys {
         Self {}
     }
     pub async fn init(&self, api: Arc<ECStore>) -> Result<()> {
-        let mut cfg = read_config_without_migrate(api.clone().clone()).await?;
+        let mut cfg = read_config_without_migrate_with_recovery(api.clone()).await?;
 
         lookup_configs(&mut cfg, api).await;
 
