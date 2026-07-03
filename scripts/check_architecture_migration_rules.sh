@@ -85,6 +85,7 @@ require_source_contains "docs/architecture/obs-ecstore-dependency-inventory.md" 
 require_source_contains "docs/architecture/overview.md" "ecstore-api-facade-inventory.md" "architecture overview ECStore facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ecstore-api-facade-inventory.md" "ECStore split plan facade inventory link"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "EcstoreReplicationBoundaryImports" "ECStore split plan replication boundary imports section"
+require_source_contains "docs/architecture/ecstore-module-split-plan.md" "RuntimeReplicationFacadeConsumers" "ECStore split plan runtime replication facade consumer section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateFileMetaFacade" "ECStore split plan replication crate filemeta facade section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "ReplicationCrateStorageApiBoundary" "ECStore split plan replication crate storage-api boundary section"
 require_source_contains "docs/architecture/ecstore-module-split-plan.md" "StorageApiReplicationContracts" "ECStore split plan storage-api replication contract section"
@@ -207,6 +208,8 @@ EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE="${TMP_DIR}/external_ecstore_api_boundar
 REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/replication_facade_bypass_hits.txt"
 REPLICATION_FACADE_WILDCARD_EXPORT_HITS_FILE="${TMP_DIR}/replication_facade_wildcard_export_hits.txt"
 ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE="${TMP_DIR}/ecstore_replication_boundary_bypass_hits.txt"
+SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/scanner_replication_facade_bypass_hits.txt"
+RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE="${TMP_DIR}/rustfs_replication_facade_bypass_hits.txt"
 REPLICATION_CRATE_FILEMETA_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_filemeta_bypass_hits.txt"
 REPLICATION_CRATE_STORAGE_API_BYPASS_HITS_FILE="${TMP_DIR}/replication_crate_storage_api_bypass_hits.txt"
 REPLICATION_CONFIG_RULE_CONTRACT_BACKSLIDE_HITS_FILE="${TMP_DIR}/replication_config_rule_contract_backslide_hits.txt"
@@ -2623,6 +2626,29 @@ fi
 
 if [[ -s "$ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE" ]]; then
   report_failure "ECStore replication rustfs-replication imports must stay behind *_boundary.rs modules: $(paste -sd '; ' "$ECSTORE_REPLICATION_BOUNDARY_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    crates/scanner/src \
+    --glob '*.rs' || true
+) >"$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "scanner replication contracts must come through the ECStore replication facade: $(paste -sd '; ' "$SCANNER_REPLICATION_FACADE_BYPASS_HITS_FILE")"
+fi
+
+(
+  cd "$ROOT_DIR"
+  rg -n --with-filename 'rustfs_replication::|use\s+rustfs_replication\b' \
+    rustfs/src \
+    --glob '*.rs' |
+    rg -v '^rustfs/src/app/storage_api\.rs:' || true
+) >"$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE"
+
+if [[ -s "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE" ]]; then
+  report_failure "RustFS runtime replication contracts must stay behind storage API facades: $(paste -sd '; ' "$RUSTFS_REPLICATION_FACADE_BYPASS_HITS_FILE")"
 fi
 
 (

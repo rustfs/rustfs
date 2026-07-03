@@ -137,6 +137,8 @@ Current coupling:
 - admin replication extension target filtering and resync request construction
   stay behind the admin storage boundary instead of exposing replication work
   DTO construction to handlers;
+- scanner, admin, and storage-owner replication status/DTO consumers import
+  those contracts through the ECStore replication facade;
 - app object and multipart writes call object-replication boundary helpers
   instead of constructing replication work DTOs or choosing object replication
   operation types at the use-case layer;
@@ -185,6 +187,10 @@ Required contracts before crate movement:
   `crates/replication/src/storage_api.rs` inside `rustfs-replication`.
 - `EcstoreReplicationBoundaryImports`: ECStore-side imports from
   `rustfs-replication` are concentrated in replication `*_boundary.rs` modules.
+- `RuntimeReplicationFacadeConsumers`: scanner, admin, and storage-owner
+  replication status/DTO consumers import through `rustfs-ecstore`, while app
+  storage keeps direct object/delete helper calls inside its storage API
+  boundary.
 - `StorageApiReplicationContracts`: storage-api delete DTO replication
   state/status helpers are concentrated in `crates/storage-api/src/replication.rs`
   until the underlying wire contracts can move without a
