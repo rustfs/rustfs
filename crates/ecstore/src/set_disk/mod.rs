@@ -7869,6 +7869,140 @@ mod tests {
         assert!(result.is_err(), "exact prefix delete should wait on the real object namespace lock");
     }
 
+    async fn make_single_local_disk() -> (TempDir, DiskStore) {
+        let dir = tempfile::tempdir().expect("tempdir should be created");
+        let endpoint =
+            Endpoint::try_from(dir.path().to_str().expect("tempdir path should be utf8")).expect("endpoint should parse");
+        let disk = new_disk(
+            &endpoint,
+            &DiskOption {
+                cleanup: false,
+                health_check: false,
+            },
+        )
+        .await
+        .expect("disk should be created");
+        (dir, disk)
+    }
+
+    async fn make_set_disks_with(disks: Vec<Option<DiskStore>>) -> Arc<SetDisks> {
+        let drive_count = disks.len();
+        let endpoints = (0..drive_count)
+            .map(|i| Endpoint::try_from(format!("http://127.0.0.1:{}/data", 9000 + i).as_str()).expect("endpoint should parse"))
+            .collect::<Vec<_>>();
+
+        SetDisks::new(
+            "test-owner".to_string(),
+            Arc::new(RwLock::new(disks)),
+            drive_count,
+            0,
+            0,
+            0,
+            endpoints,
+            FormatV3::new(1, drive_count),
+            vec![Arc::new(LocalClient::with_manager(Arc::new(
+                rustfs_lock::GlobalLockManager::new(),
+            )))],
+        )
+        .await
+    }
+
+    // issue #4189: an orphan directory tree (empty dirs, no xl.meta) must be purged.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_removes_empty_tree() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        fs::create_dir_all(root.join("bucket").join("pfx").join("a").join("b"))
+            .await
+            .expect("nested empty dir should be created");
+        fs::create_dir_all(root.join("bucket").join("pfx").join("c"))
+            .await
+            .expect("sibling empty dir should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("purge should succeed");
+
+        assert!(purged, "orphan empty tree should be purged");
+        assert!(!root.join("bucket").join("pfx").exists(), "prefix directory should be gone");
+        assert!(root.join("bucket").exists(), "bucket volume should remain");
+    }
+
+    // issue #4189: a prefix that still anchors a real object must be left intact.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_preserves_prefix_with_object() {
+        let (dir, disk) = make_single_local_disk().await;
+        let root = dir.path();
+        let obj_dir = root.join("bucket").join("pfx").join("obj");
+        fs::create_dir_all(&obj_dir).await.expect("object dir should be created");
+        fs::write(obj_dir.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("object metadata should be written");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "prefix containing an object must not be purged");
+        assert!(obj_dir.join(STORAGE_FORMAT_FILE).exists(), "object metadata must be preserved");
+    }
+
+    #[tokio::test]
+    async fn purge_orphan_dir_object_missing_returns_false() {
+        let (dir, disk) = make_single_local_disk().await;
+        fs::create_dir_all(dir.path().join("bucket"))
+            .await
+            .expect("bucket volume should be created");
+
+        let set = make_set_disks_with(vec![Some(disk)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "does-not-exist/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "a missing prefix should report nothing to purge");
+    }
+
+    // Cross-disk safety: if any drive still holds object data under the prefix, refuse
+    // to purge on every drive so a degraded/healable object is never destroyed.
+    #[tokio::test]
+    async fn purge_orphan_dir_object_refuses_when_any_disk_has_data() {
+        let (dir0, disk0) = make_single_local_disk().await;
+        let (dir1, disk1) = make_single_local_disk().await;
+
+        fs::create_dir_all(dir0.path().join("bucket").join("pfx").join("a"))
+            .await
+            .expect("disk0 empty tree should be created");
+
+        let obj_dir = dir1.path().join("bucket").join("pfx").join("a");
+        fs::create_dir_all(&obj_dir)
+            .await
+            .expect("disk1 object dir should be created");
+        fs::write(obj_dir.join(STORAGE_FORMAT_FILE), b"meta")
+            .await
+            .expect("disk1 object metadata should be written");
+
+        let set = make_set_disks_with(vec![Some(disk0), Some(disk1)]).await;
+        let purged = set
+            .purge_orphan_dir_object("bucket", "pfx/")
+            .await
+            .expect("scan should succeed");
+
+        assert!(!purged, "must not purge when any disk holds object data");
+        assert!(
+            obj_dir.join(STORAGE_FORMAT_FILE).exists(),
+            "object metadata on the healthy disk must be preserved"
+        );
+        assert!(
+            dir0.path().join("bucket").join("pfx").join("a").exists(),
+            "empty tree must be left untouched when the purge is aborted"
+        );
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
     async fn test_acquire_dist_delete_object_locks_batch_succeeds_with_two_healthy_lockers() {
