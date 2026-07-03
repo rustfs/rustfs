@@ -391,7 +391,16 @@ where
             }
 
             let ciphertext_buf = &this.ciphertext_buf[..*this.ciphertext_len];
-            let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(&ciphertext_buf[0..16]);
+            // `ciphertext_buf`'s length derives from the untrusted 24-bit header length field, so
+            // it can be shorter than 16 bytes. `uvarint` is safe on any slice length, so pass the
+            // whole slice instead of a fixed `[0..16]` index that panics on corrupted/truncated
+            // blocks shorter than 16 bytes.
+            let (plaintext_len, uvarint_len) = rustfs_utils::uvarint(ciphertext_buf);
+            if uvarint_len <= 0 || uvarint_len as usize > ciphertext_buf.len() {
+                *this.ciphertext_read = 0;
+                *this.ciphertext_len = 0;
+                return Poll::Ready(Err(Error::new(std::io::ErrorKind::InvalidData, "Invalid encrypted block length prefix")));
+            }
             let ciphertext = &ciphertext_buf[uvarint_len as usize..];
             let block_nonce = derive_block_nonce(this.current_nonce_base, *this.block_index);
             let nonce = Nonce::try_from(block_nonce.as_slice()).map_err(|_| Error::other("invalid nonce length"))?;
@@ -1006,5 +1015,30 @@ mod tests {
         expected.extend_from_slice(&part_two);
 
         assert_eq!(decrypted, expected);
+    }
+
+    // Regression: a corrupted block header whose length yields a payload shorter than 16 bytes
+    // must not panic. Header (8 bytes): [typ, len_lo, len_mid, len_hi, crc0..crc3]; payload is
+    // `len - 4` bytes. Pre-fix, poll_read sliced `ciphertext_buf[0..16]` unconditionally,
+    // panicking with "range end index 16 out of range for slice of length N" when N < 16.
+    #[tokio::test]
+    async fn test_decrypt_reader_short_block_no_panic() {
+        let key = [0u8; 32];
+        let nonce = [0u8; 12];
+
+        // len = 8 -> payload_len = 4 (< 16). Provide exactly 4 payload bytes.
+        let len: usize = 8;
+        let mut input = Vec::new();
+        input.push(0x00); // typ (regular block)
+        input.push((len & 0xFF) as u8);
+        input.push(((len >> 8) & 0xFF) as u8);
+        input.push(((len >> 16) & 0xFF) as u8);
+        input.extend_from_slice(&[0u8; 4]); // crc (unused before the panic site)
+        input.extend_from_slice(&[0x01u8, 0x02, 0x03, 0x04]); // 4-byte payload
+
+        let mut decrypt_reader = DecryptReader::new(Cursor::new(input), key, nonce);
+        let mut out = Vec::new();
+        let res = decrypt_reader.read_to_end(&mut out).await;
+        assert!(res.is_err(), "corrupted short encrypted block must return an error, not panic");
     }
 }

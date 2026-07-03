@@ -304,7 +304,19 @@ where
             }
         }
         let compressed_buf = &this.compressed_buf[..*this.compressed_len];
-        let (uncompress_len, uvarint) = uvarint(&compressed_buf[0..16]);
+        // `compressed_buf`'s length comes from the untrusted 24-bit header length field, so it
+        // can be shorter than 16 bytes. `uvarint` is safe on any slice length (reads at most 10
+        // bytes and stops at the terminator), so pass the whole slice instead of a fixed
+        // `[0..16]` index that panics on corrupted/truncated blocks shorter than 16 bytes.
+        let (uncompress_len, uvarint) = uvarint(compressed_buf);
+        // A non-positive `uvarint` means the length prefix could not be decoded (buffer too
+        // small -> 0, or overflow -> negative); a value larger than the buffer would make the
+        // slice below panic. Reject such corrupted blocks with a clean error instead.
+        if uvarint <= 0 || uvarint as usize > compressed_buf.len() {
+            *this.compressed_read = 0;
+            *this.compressed_len = 0;
+            return Poll::Ready(Err(io::Error::new(io::ErrorKind::InvalidData, "Invalid compressed block length prefix")));
+        }
         let compressed_data = &compressed_buf[uvarint as usize..];
         let decompressed = if typ == COMPRESS_TYPE_COMPRESSED {
             match decompress_block(compressed_data, *this.compression_algorithm) {
@@ -478,5 +490,29 @@ mod tests {
         decompress_reader.read_to_end(&mut decompressed).await.unwrap();
 
         assert_eq!(&decompressed, &data);
+    }
+
+    // Regression: a corrupted block whose 24-bit length field is < 16 must not panic.
+    // Header layout (HEADER_LEN = 8): [type, len_lo, len_mid, len_hi, crc0..crc3], then `len`
+    // bytes of block body. Pre-fix, poll_read sliced `compressed_buf[0..16]` unconditionally,
+    // panicking with "range end index 16 out of range for slice of length N" when N < 16.
+    #[tokio::test]
+    async fn test_decompress_reader_short_block_no_panic() {
+        let len: usize = 3;
+        let mut input = Vec::new();
+        input.push(COMPRESS_TYPE_COMPRESSED);
+        input.push((len & 0xFF) as u8);
+        input.push(((len >> 8) & 0xFF) as u8);
+        input.push(((len >> 16) & 0xFF) as u8);
+        input.extend_from_slice(&[0u8; 4]); // bogus CRC
+        // Body: a uvarint claiming uncompressed length = 127, followed by 2 bytes that are not
+        // a valid compressed stream — post-fix this must surface as a clean InvalidData error.
+        input.extend_from_slice(&[0x7f, 0xAB, 0xCD]);
+
+        let mut decompress_reader = DecompressReader::new(Cursor::new(input), CompressionAlgorithm::default());
+        let mut out = Vec::new();
+        let res = decompress_reader.read_to_end(&mut out).await;
+        assert!(res.is_err(), "corrupted short block must return an error, not panic or succeed");
+        assert_eq!(res.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
     }
 }
