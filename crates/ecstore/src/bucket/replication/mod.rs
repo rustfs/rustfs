@@ -47,9 +47,9 @@ pub use replication_config_boundary::{ObjectOpts, ReplicationConfigurationExt};
 #[cfg(test)]
 pub(crate) use replication_filemeta_boundary::ReplicateTargetDecision;
 pub(crate) use replication_filemeta_boundary::{
-    ReplicateDecision, ReplicationState, ReplicationStatusType, VersionPurgeStatusType, replication_statuses_map,
-    version_purge_statuses_map,
+    ReplicateDecision, ReplicationState, replication_statuses_map, version_purge_statuses_map,
 };
+pub use replication_filemeta_boundary::{ReplicateObjectInfo, ReplicationStatusType, ReplicationType, VersionPurgeStatusType};
 pub(crate) use replication_lifecycle_bridge::{ReplicationLifecycleBridge, ReplicationLifecycleConfig};
 pub(crate) use replication_migration_bridge::ReplicationMigrationBridge;
 pub use replication_object_bridge::ReplicationObjectBridge;

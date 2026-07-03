@@ -15,8 +15,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use rustfs_replication::{ReplicateObjectInfo, ReplicationType};
-pub(crate) use rustfs_replication::{ReplicationStatusType, VersionPurgeStatusType};
 use serde::{Deserialize, Serialize};
 
 pub(crate) use rustfs_ecstore::api::bucket::bucket_target_sys::BucketTargetSys as EcstoreBucketTargetSys;
@@ -34,10 +32,13 @@ pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
     get_replication_config as ecstore_get_replication_config,
 };
 pub(crate) use rustfs_ecstore::api::bucket::replication::{
-    ReplicationConfig as EcstoreReplicationConfig, ReplicationConfigurationExt as EcstoreReplicationConfigurationExt,
+    ReplicateObjectInfo, ReplicationConfig as EcstoreReplicationConfig,
+    ReplicationConfigurationExt as EcstoreReplicationConfigurationExt,
     ReplicationHealQueueResult as EcstoreReplicationHealQueueResult,
     ReplicationQueueAdmission as EcstoreReplicationQueueAdmission, ReplicationScannerBridge as EcstoreReplicationScannerBridge,
+    ReplicationType,
 };
+pub(crate) use rustfs_ecstore::api::bucket::replication::{ReplicationStatusType, VersionPurgeStatusType};
 pub(crate) use rustfs_ecstore::api::bucket::target::BucketTargets as EcstoreBucketTargets;
 pub(crate) use rustfs_ecstore::api::bucket::versioning::VersioningApi as EcstoreVersioningApi;
 pub(crate) use rustfs_ecstore::api::bucket::versioning_sys::BucketVersioningSys as EcstoreBucketVersioningSys;
