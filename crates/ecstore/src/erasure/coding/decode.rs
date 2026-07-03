@@ -40,18 +40,54 @@ use tracing::{error, warn};
 
 type ShardReadFuture<'a> = Pin<Box<dyn Future<Output = (usize, ShardReadCost, Result<Vec<u8>, Error>, bool)> + Send + 'a>>;
 
+const ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING: &str = "RUSTFS_SHARD_LOCALITY_SCHEDULING";
 const ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: &str = "RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE";
-const DEFAULT_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE: bool = false;
+const SHARD_LOCALITY_SCHEDULING_OFF: &str = "off";
+const SHARD_LOCALITY_SCHEDULING_OBSERVE: &str = "observe";
+const SHARD_LOCALITY_SCHEDULING_ON: &str = "on";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShardLocalitySchedulingMode {
+    Off,
+    Observe,
+    On,
+}
+
+impl ShardLocalitySchedulingMode {
+    fn is_on(self) -> bool {
+        matches!(self, ShardLocalitySchedulingMode::On)
+    }
+}
+
+fn parse_shard_locality_scheduling_mode(value: &str) -> ShardLocalitySchedulingMode {
+    match value.trim() {
+        value if value.eq_ignore_ascii_case(SHARD_LOCALITY_SCHEDULING_OFF) => ShardLocalitySchedulingMode::Off,
+        value if value.eq_ignore_ascii_case(SHARD_LOCALITY_SCHEDULING_OBSERVE) => ShardLocalitySchedulingMode::Observe,
+        value if value.eq_ignore_ascii_case(SHARD_LOCALITY_SCHEDULING_ON) => ShardLocalitySchedulingMode::On,
+        _ => ShardLocalitySchedulingMode::Off,
+    }
+}
+
+fn get_shard_locality_scheduling_mode() -> ShardLocalitySchedulingMode {
+    if let Some(value) = rustfs_utils::get_env_opt_str(ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING) {
+        return parse_shard_locality_scheduling_mode(&value);
+    }
+
+    if rustfs_utils::get_env_bool(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, false) {
+        return ShardLocalitySchedulingMode::On;
+    }
+
+    ShardLocalitySchedulingMode::Off
+}
 
 fn get_shard_locality_preference_enabled() -> bool {
-    rustfs_utils::get_env_bool(
-        ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE,
-        DEFAULT_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE,
-    )
+    get_shard_locality_scheduling_mode().is_on()
 }
 
 pub(crate) fn should_collect_shard_read_costs() -> bool {
-    rustfs_io_metrics::get_stage_metrics_enabled() || get_shard_locality_preference_enabled()
+    // `observe` mode only feeds the stage-metrics histograms, so skip the
+    // cost-collection overhead when those metrics cannot be reported anyway.
+    rustfs_io_metrics::get_stage_metrics_enabled() || get_shard_locality_scheduling_mode().is_on()
 }
 
 /// Number of stripes to prefetch in the legacy decode path.
@@ -108,9 +144,10 @@ impl ShardReadCostCounts {
 }
 fn shard_read_launch_rank(cost: ShardReadCost) -> u8 {
     match cost {
-        ShardReadCost::Local | ShardReadCost::SameNode => 0,
-        ShardReadCost::Unknown => 1,
+        ShardReadCost::Local => 0,
+        ShardReadCost::SameNode => 1,
         ShardReadCost::Remote => 2,
+        ShardReadCost::Unknown => 3,
     }
 }
 
@@ -533,6 +570,11 @@ fn shard_read_hedge_delay(read_timeout: Duration) -> Option<Duration> {
     }
 }
 
+fn shard_locality_remote_avoid_potential(remote_scheduled: usize, low_cost_available: usize, data_shards: usize) -> usize {
+    let theoretical_remote_needed = data_shards.saturating_sub(low_cost_available);
+    remote_scheduled.saturating_sub(theoretical_remote_needed)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn record_scheduled_read_cost(
     read_cost: ShardReadCost,
@@ -544,15 +586,13 @@ fn record_scheduled_read_cost(
     remote_scheduled: &mut usize,
     fallback_to_remote: &mut usize,
 ) {
-    if !locality_preference_enabled {
-        return;
-    }
-
     if read_cost.is_low_cost() {
-        *local_preferred += 1;
+        if locality_preference_enabled {
+            *local_preferred += 1;
+        }
     } else if read_cost.is_remote() {
         *remote_scheduled += 1;
-        if count_remote_as_fallback || low_cost_available < data_shards {
+        if locality_preference_enabled && (count_remote_as_fallback || low_cost_available < data_shards) {
             *fallback_to_remote += 1;
         }
     }
@@ -889,6 +929,13 @@ where
                         fallback_to_remote,
                     );
                 } else {
+                    let remote_avoid_potential =
+                        shard_locality_remote_avoid_potential(remote_scheduled, low_cost_available, self.data_shards);
+                    rustfs_io_metrics::record_get_object_shard_locality_observe_only(
+                        path,
+                        remote_scheduled,
+                        remote_avoid_potential,
+                    );
                     rustfs_io_metrics::record_get_object_shard_locality_policy_disabled(path);
                 }
             }
@@ -1598,14 +1645,138 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_shard_locality_preference_gate_defaults_disabled() {
-        temp_env::with_var(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>, || {
-            assert!(!get_shard_locality_preference_enabled());
-        });
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, None::<&str>),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::Off);
+                assert!(!get_shard_locality_preference_enabled());
+            },
+        );
     }
 
     #[test]
-    fn test_shard_read_launch_order_is_gated() {
+    #[serial_test::serial]
+    fn test_shard_locality_scheduling_mode_parses_supported_values() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("observe")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::Observe);
+                assert!(!get_shard_locality_preference_enabled());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::On);
+                assert!(get_shard_locality_preference_enabled());
+                assert!(should_collect_shard_read_costs());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("unexpected")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true")),
+            ],
+            || {
+                assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::Off);
+                assert!(!get_shard_locality_preference_enabled());
+            },
+        );
+
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, None::<&str>),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true")),
+            ],
+            || {
+                assert_eq!(get_shard_locality_scheduling_mode(), ShardLocalitySchedulingMode::On);
+                assert!(get_shard_locality_preference_enabled());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_shard_locality_scheduling_off_does_not_collect_without_metrics() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("off")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+                assert!(!should_collect_shard_read_costs());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_shard_locality_scheduling_observe_collects_only_with_stage_metrics() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("observe")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                // Without stage metrics there is no reporting channel, so
+                // observe mode must not pay the cost-collection overhead.
+                rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+                assert!(!should_collect_shard_read_costs());
+
+                rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+                assert!(should_collect_shard_read_costs());
+                assert!(!get_shard_locality_preference_enabled());
+                let read_costs = [ShardReadCost::Remote, ShardReadCost::Local, ShardReadCost::SameNode];
+                assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2]);
+                rustfs_io_metrics::set_get_stage_metrics_enabled(false);
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_shard_locality_scheduling_on_enables_reordering() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            || {
+                assert!(get_shard_locality_preference_enabled());
+            },
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_shard_locality_legacy_preference_gate_still_enables_on() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, None::<&str>),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true")),
+            ],
+            || {
+                assert!(get_shard_locality_preference_enabled());
+            },
+        );
+    }
+
+    #[test]
+    fn test_shard_locality_read_launch_order_is_gated() {
         let read_costs = [
             ShardReadCost::Remote,
             ShardReadCost::Local,
@@ -1615,7 +1786,14 @@ mod tests {
         ];
 
         assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), false), vec![0, 1, 2, 3, 4]);
-        assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), true), vec![1, 3, 2, 0, 4]);
+        assert_eq!(shard_read_launch_order(&read_costs, read_costs.len(), true), vec![1, 3, 0, 4, 2]);
+    }
+
+    #[test]
+    fn test_shard_locality_remote_avoid_potential_is_observe_only() {
+        assert_eq!(shard_locality_remote_avoid_potential(2, 4, 4), 2);
+        assert_eq!(shard_locality_remote_avoid_potential(2, 2, 4), 0);
+        assert_eq!(shard_locality_remote_avoid_potential(3, 3, 4), 2);
     }
 
     #[test]
@@ -1639,90 +1817,107 @@ mod tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn test_parallel_reader_local_first_avoids_remote_when_local_quorum_exists() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
-            const NUM_SHARDS: usize = 1;
-            const BLOCK_SIZE: usize = 64;
-            const DATA_SHARDS: usize = 4;
-            const PARITY_SHARDS: usize = 2;
-            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            async {
+                const NUM_SHARDS: usize = 1;
+                const BLOCK_SIZE: usize = 64;
+                const DATA_SHARDS: usize = 4;
+                const PARITY_SHARDS: usize = 2;
+                const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
 
-            let hash_algo = HashAlgorithm::HighwayHash256;
-            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[]).await;
-            let read_costs = vec![
-                ShardReadCost::Remote,
-                ShardReadCost::Remote,
-                ShardReadCost::Local,
-                ShardReadCost::SameNode,
-                ShardReadCost::Local,
-                ShardReadCost::SameNode,
-            ];
-            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
-                readers,
-                erasure,
-                0,
-                NUM_SHARDS * BLOCK_SIZE,
-                None,
-                read_costs,
-            );
+                let hash_algo = HashAlgorithm::HighwayHash256;
+                let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[], &[]).await;
+                let read_costs = vec![
+                    ShardReadCost::Remote,
+                    ShardReadCost::Remote,
+                    ShardReadCost::Local,
+                    ShardReadCost::SameNode,
+                    ShardReadCost::Local,
+                    ShardReadCost::SameNode,
+                ];
+                let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+                let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                    readers,
+                    erasure,
+                    0,
+                    NUM_SHARDS * BLOCK_SIZE,
+                    None,
+                    read_costs,
+                );
 
-            let (bufs, errs) = parallel_reader.read().await;
+                let (bufs, errs) = parallel_reader.read().await;
 
-            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
-            assert!(bufs[0].is_none());
-            assert!(bufs[1].is_none());
-            for (index, buf) in bufs.iter().enumerate().take(DATA_SHARDS + PARITY_SHARDS).skip(2) {
-                assert_eq!(buf.as_deref(), Some(&[(index % 256) as u8; SHARD_SIZE][..]));
-            }
-            assert!(errs.iter().all(Option::is_none));
-        })
+                assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+                assert!(bufs[0].is_none());
+                assert!(bufs[1].is_none());
+                for (index, buf) in bufs.iter().enumerate().take(DATA_SHARDS + PARITY_SHARDS).skip(2) {
+                    assert_eq!(buf.as_deref(), Some(&[(index % 256) as u8; SHARD_SIZE][..]));
+                }
+                assert!(errs.iter().all(Option::is_none));
+            },
+        )
         .await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn test_parallel_reader_local_missing_falls_back_to_remote() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
-            const NUM_SHARDS: usize = 1;
-            const BLOCK_SIZE: usize = 64;
-            const DATA_SHARDS: usize = 4;
-            const PARITY_SHARDS: usize = 2;
-            const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            async {
+                const NUM_SHARDS: usize = 1;
+                const BLOCK_SIZE: usize = 64;
+                const DATA_SHARDS: usize = 4;
+                const PARITY_SHARDS: usize = 2;
+                const SHARD_SIZE: usize = BLOCK_SIZE / DATA_SHARDS;
 
-            let hash_algo = HashAlgorithm::HighwayHash256;
-            let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[1], &[]).await;
-            let read_costs = vec![
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::Remote,
-                ShardReadCost::Remote,
-            ];
-            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-            let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
-                readers,
-                erasure,
-                0,
-                NUM_SHARDS * BLOCK_SIZE,
-                None,
-                read_costs,
-            );
+                let hash_algo = HashAlgorithm::HighwayHash256;
+                let readers = make_test_readers(DATA_SHARDS + PARITY_SHARDS, SHARD_SIZE, NUM_SHARDS, &hash_algo, &[1], &[]).await;
+                let read_costs = vec![
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::Remote,
+                    ShardReadCost::Remote,
+                ];
+                let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+                let mut parallel_reader = ParallelReader::new_with_metrics_path_and_read_costs(
+                    readers,
+                    erasure,
+                    0,
+                    NUM_SHARDS * BLOCK_SIZE,
+                    None,
+                    read_costs,
+                );
 
-            let (bufs, errs) = parallel_reader.read().await;
+                let (bufs, errs) = parallel_reader.read().await;
 
-            assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
-            assert!(matches!(errs[1], Some(Error::FileNotFound)));
-            assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
-            assert!(bufs[5].is_none());
-        })
+                assert_eq!(DATA_SHARDS, bufs.iter().filter(|buf| buf.is_some()).count());
+                assert!(matches!(errs[1], Some(Error::FileNotFound)));
+                assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
+                assert!(bufs[5].is_none());
+            },
+        )
         .await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn test_parallel_reader_local_corrupt_falls_back_to_remote() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            async {
             const NUM_SHARDS: usize = 1;
             const BLOCK_SIZE: usize = 64;
             const DATA_SHARDS: usize = 4;
@@ -1757,45 +1952,52 @@ mod tests {
             );
             assert_eq!(bufs[4].as_deref(), Some(&[4u8; SHARD_SIZE][..]));
             assert!(bufs[5].is_none());
-        })
+            },
+        )
         .await;
     }
 
     #[tokio::test]
     #[serial_test::serial]
     async fn test_erasure_decode_local_first_preserves_output_order() {
-        temp_env::async_with_vars([(ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, Some("true"))], async {
-            const DATA_SHARDS: usize = 4;
-            const PARITY_SHARDS: usize = 2;
-            const BLOCK_SIZE: usize = 64;
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_SHARD_LOCALITY_SCHEDULING, Some("on")),
+                (ENV_RUSTFS_GET_SHARD_LOCALITY_PREFERENCE_ENABLE, None::<&str>),
+            ],
+            async {
+                const DATA_SHARDS: usize = 4;
+                const PARITY_SHARDS: usize = 2;
+                const BLOCK_SIZE: usize = 64;
 
-            let total_data: Vec<u8> = (0..BLOCK_SIZE as u32).map(|i| i as u8).collect();
-            let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
-            let shard_size = erasure.shard_size();
-            let hash_algo = HashAlgorithm::HighwayHash256;
-            let shard_bufs = encode_test_object(&erasure, &total_data, shard_size, &hash_algo).await;
-            let readers = shard_bufs
-                .iter()
-                .map(|buf| Some(BitrotReader::new(Cursor::new(buf.clone()), shard_size, hash_algo.clone(), false)))
-                .collect();
-            let read_costs = vec![
-                ShardReadCost::Remote,
-                ShardReadCost::Remote,
-                ShardReadCost::Local,
-                ShardReadCost::Local,
-                ShardReadCost::SameNode,
-                ShardReadCost::SameNode,
-            ];
+                let total_data: Vec<u8> = (0..BLOCK_SIZE as u32).map(|i| i as u8).collect();
+                let erasure = Erasure::new(DATA_SHARDS, PARITY_SHARDS, BLOCK_SIZE);
+                let shard_size = erasure.shard_size();
+                let hash_algo = HashAlgorithm::HighwayHash256;
+                let shard_bufs = encode_test_object(&erasure, &total_data, shard_size, &hash_algo).await;
+                let readers = shard_bufs
+                    .iter()
+                    .map(|buf| Some(BitrotReader::new(Cursor::new(buf.clone()), shard_size, hash_algo.clone(), false)))
+                    .collect();
+                let read_costs = vec![
+                    ShardReadCost::Remote,
+                    ShardReadCost::Remote,
+                    ShardReadCost::Local,
+                    ShardReadCost::Local,
+                    ShardReadCost::SameNode,
+                    ShardReadCost::SameNode,
+                ];
 
-            let mut output = Vec::new();
-            let (written, err) = erasure
-                .decode_with_read_costs(&mut output, readers, 0, total_data.len(), total_data.len(), read_costs)
-                .await;
+                let mut output = Vec::new();
+                let (written, err) = erasure
+                    .decode_with_read_costs(&mut output, readers, 0, total_data.len(), total_data.len(), read_costs)
+                    .await;
 
-            assert!(err.is_none(), "unexpected decode error: {err:?}");
-            assert_eq!(written, total_data.len());
-            assert_eq!(output, total_data);
-        })
+                assert!(err.is_none(), "unexpected decode error: {err:?}");
+                assert_eq!(written, total_data.len());
+                assert_eq!(output, total_data);
+            },
+        )
         .await;
     }
 

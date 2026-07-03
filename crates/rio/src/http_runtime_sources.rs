@@ -17,6 +17,7 @@ use rustfs_tls_runtime::{
     GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation, load_global_outbound_tls_state,
     record_tls_consumer_stale_generation,
 };
+use std::time::Duration;
 
 pub(crate) fn outbound_tls_generation() -> u64 {
     load_global_outbound_tls_generation().0
@@ -75,4 +76,29 @@ pub(crate) fn record_classified_error(operation: &'static str, classification: &
         INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         classification,
     );
+}
+
+pub(crate) fn record_duration(operation: &'static str, duration: Duration) {
+    global_internode_metrics().record_duration_for_operation_and_backend(
+        operation,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        duration,
+    );
+}
+
+pub(crate) fn record_http_version(operation: &'static str, http_version: &'static str) {
+    global_internode_metrics().record_http_version_for_operation_and_backend(
+        operation,
+        INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        http_version,
+    );
+}
+
+pub(crate) fn record_stall_timeout(operation: &'static str) {
+    global_internode_metrics().record_stall_timeout_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
+}
+
+pub(crate) fn record_write_shutdown_error(operation: &'static str) {
+    global_internode_metrics()
+        .record_write_shutdown_error_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP);
 }

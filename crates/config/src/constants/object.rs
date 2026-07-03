@@ -191,8 +191,9 @@ pub const DEFAULT_OBJECT_IO_BUFFER_SIZE: usize = 128 * 1024;
 
 /// Environment variable to enable/disable lock optimization.
 ///
-/// When enabled, fully materialized reads may release read locks before the
-/// reader is returned. Streaming reads keep the lock until EOF or drop.
+/// When enabled, read locks may be released before the reader is returned.
+/// Disable this only when streaming readers must keep the object namespace
+/// locked until EOF or drop.
 ///
 /// Default: true (enabled, can be overridden by `RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE`).
 pub const ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE: &str = "RUSTFS_OBJECT_LOCK_OPTIMIZATION_ENABLE";

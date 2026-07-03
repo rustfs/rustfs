@@ -33,6 +33,7 @@ const BACKEND_LABEL: &str = "backend";
 const CLASSIFICATION_LABEL: &str = "classification";
 const STAGE_LABEL: &str = "stage";
 const DOMINANT_ERROR_LABEL: &str = "dominant_error";
+const HTTP_VERSION_LABEL: &str = "http_version";
 const INTERNODE_OPERATION_SENT_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_sent_bytes_total";
 const INTERNODE_OPERATION_RECV_BYTES_TOTAL: &str = "rustfs_system_network_internode_operation_recv_bytes_total";
 const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_outgoing_total";
@@ -42,6 +43,10 @@ const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_o
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
 const INTERNODE_OPERATION_RETRY_SUCCESSES_TOTAL: &str = "rustfs_system_network_internode_operation_retry_successes_total";
+const INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL: &str = "rustfs_system_network_internode_operation_http_versions_total";
+const INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL: &str = "rustfs_system_network_internode_operation_stall_timeouts_total";
+const INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL: &str =
+    "rustfs_system_network_internode_operation_write_shutdown_errors_total";
 const ERASURE_WRITE_QUORUM_FAILURES_TOTAL: &str = "rustfs_system_storage_erasure_write_quorum_failures_total";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +57,7 @@ pub struct InternodeOperationMetricDescriptor {
 
 const OPERATION_BACKEND_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL];
 const OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
+const OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
 const QUORUM_FAILURE_LABELS: &[&str] = &[STAGE_LABEL, DOMINANT_ERROR_LABEL];
 
 pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &[
@@ -92,6 +98,18 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         labels: OPERATION_BACKEND_CLASSIFICATION_LABELS,
     },
     InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
+        labels: OPERATION_BACKEND_HTTP_VERSION_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL,
+        labels: OPERATION_BACKEND_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
         name: ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
         labels: QUORUM_FAILURE_LABELS,
     },
@@ -107,6 +125,9 @@ pub struct InternodeMetricsSnapshot {
     pub dial_errors_total: u64,
     pub dial_avg_time_nanos: u64,
     pub last_dial_unix_millis: u64,
+    pub operation_http_versions_total: u64,
+    pub operation_stall_timeouts_total: u64,
+    pub operation_write_shutdown_errors_total: u64,
 }
 
 #[derive(Debug, Default)]
@@ -120,6 +141,9 @@ pub struct InternodeMetrics {
     dial_total_time_nanos: AtomicU64,
     dial_samples_total: AtomicU64,
     last_dial_unix_millis: AtomicU64,
+    operation_http_versions_total: AtomicU64,
+    operation_stall_timeouts_total: AtomicU64,
+    operation_write_shutdown_errors_total: AtomicU64,
 }
 
 impl InternodeMetrics {
@@ -264,6 +288,33 @@ impl InternodeMetrics {
         .increment(1);
     }
 
+    pub fn record_http_version_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        http_version: &'static str,
+    ) {
+        self.operation_http_versions_total.fetch_add(1, Ordering::Relaxed);
+        counter!(
+            INTERNODE_OPERATION_HTTP_VERSIONS_TOTAL,
+            OPERATION_LABEL => operation,
+            BACKEND_LABEL => backend,
+            HTTP_VERSION_LABEL => http_version
+        )
+        .increment(1);
+    }
+
+    pub fn record_stall_timeout_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
+        self.operation_stall_timeouts_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_OPERATION_STALL_TIMEOUTS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend).increment(1);
+    }
+
+    pub fn record_write_shutdown_error_for_operation_and_backend(&self, operation: &'static str, backend: &'static str) {
+        self.operation_write_shutdown_errors_total.fetch_add(1, Ordering::Relaxed);
+        counter!(INTERNODE_OPERATION_WRITE_SHUTDOWN_ERRORS_TOTAL, OPERATION_LABEL => operation, BACKEND_LABEL => backend)
+            .increment(1);
+    }
+
     pub fn record_erasure_write_quorum_failure(&self, stage: &'static str, dominant_error: &'static str) {
         counter!(
             ERASURE_WRITE_QUORUM_FAILURES_TOTAL,
@@ -307,6 +358,9 @@ impl InternodeMetrics {
             dial_errors_total: self.dial_errors_total.load(Ordering::Relaxed),
             dial_avg_time_nanos,
             last_dial_unix_millis: self.last_dial_unix_millis.load(Ordering::Relaxed),
+            operation_http_versions_total: self.operation_http_versions_total.load(Ordering::Relaxed),
+            operation_stall_timeouts_total: self.operation_stall_timeouts_total.load(Ordering::Relaxed),
+            operation_write_shutdown_errors_total: self.operation_write_shutdown_errors_total.load(Ordering::Relaxed),
         }
     }
 
@@ -321,6 +375,9 @@ impl InternodeMetrics {
         self.dial_total_time_nanos.store(0, Ordering::Relaxed);
         self.dial_samples_total.store(0, Ordering::Relaxed);
         self.last_dial_unix_millis.store(0, Ordering::Relaxed);
+        self.operation_http_versions_total.store(0, Ordering::Relaxed);
+        self.operation_stall_timeouts_total.store(0, Ordering::Relaxed);
+        self.operation_write_shutdown_errors_total.store(0, Ordering::Relaxed);
     }
 }
 
@@ -393,14 +450,21 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 10);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 13);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
         }
         for metric in &INTERNODE_OPERATION_METRICS[6..9] {
             assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL]);
         }
-        assert_eq!(INTERNODE_OPERATION_METRICS[9].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[9].labels,
+            &[OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL]
+        );
+        for metric in &INTERNODE_OPERATION_METRICS[10..12] {
+            assert_eq!(metric.labels, &[OPERATION_LABEL, BACKEND_LABEL]);
+        }
+        assert_eq!(INTERNODE_OPERATION_METRICS[12].labels, &[STAGE_LABEL, DOMINANT_ERROR_LABEL]);
     }
 
     #[test]
@@ -433,6 +497,18 @@ mod tests {
         );
         assert_eq!(
             INTERNODE_OPERATION_METRICS[9].name,
+            "rustfs_system_network_internode_operation_http_versions_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[10].name,
+            "rustfs_system_network_internode_operation_stall_timeouts_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[11].name,
+            "rustfs_system_network_internode_operation_write_shutdown_errors_total"
+        );
+        assert_eq!(
+            INTERNODE_OPERATION_METRICS[12].name,
             "rustfs_system_storage_erasure_write_quorum_failures_total"
         );
     }
@@ -456,6 +532,19 @@ mod tests {
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
             "connection_reset",
         );
+        metrics.record_http_version_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+            "http/1.1",
+        );
+        metrics.record_stall_timeout_for_operation_and_backend(
+            INTERNODE_OPERATION_READ_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        );
+        metrics.record_write_shutdown_error_for_operation_and_backend(
+            INTERNODE_OPERATION_PUT_FILE_STREAM,
+            INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
+        );
         metrics.record_erasure_write_quorum_failure("write", "connection_reset");
 
         let snapshot = metrics.snapshot();
@@ -463,5 +552,8 @@ mod tests {
         assert_eq!(snapshot.recv_bytes_total, 0);
         assert_eq!(snapshot.outgoing_requests_total, 0);
         assert_eq!(snapshot.incoming_requests_total, 0);
+        assert_eq!(snapshot.operation_http_versions_total, 1);
+        assert_eq!(snapshot.operation_stall_timeouts_total, 1);
+        assert_eq!(snapshot.operation_write_shutdown_errors_total, 1);
     }
 }

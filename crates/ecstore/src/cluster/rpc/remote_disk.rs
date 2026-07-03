@@ -20,8 +20,9 @@ use crate::cluster::rpc::internode_data_transport::{
 };
 use crate::disk::error::{Error, Result};
 use crate::disk::{
-    CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader,
-    FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
+    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, DeleteOptions, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
+    DiskOption, FileInfoVersions, FileReader, FileWriter, ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp,
+    UpdateMetadataOpts, VolumeInfo, WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -30,6 +31,7 @@ use crate::disk::{
     },
     endpoint::Endpoint,
     health_state::{RuntimeDriveHealthState, get_drive_returning_probe_interval, record_drive_runtime_state},
+    validate_batch_read_version_item_count,
 };
 use crate::disk::{disk_store::DiskHealthTracker, error::DiskError, local::ScanGuard};
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
@@ -40,11 +42,11 @@ use rustfs_filemeta::{FileInfo, ObjectPartInfo, RawFileInfo};
 use rustfs_protos::evict_failed_connection;
 use rustfs_protos::proto_gen::node_service::RenamePartRequest;
 use rustfs_protos::proto_gen::node_service::{
-    CheckPartsRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest,
-    DiskInfoRequest, ListDirRequest, ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest,
-    ReadMetadataRequest, ReadMultipleRequest, ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest,
-    RenameFileRequest, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, DeletePathsRequest, DeleteRequest,
+    DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest, ListDirRequest, ListVolumesRequest,
+    MakeVolumeRequest, MakeVolumesRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
+    ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RenameDataRequest, RenameFileRequest, StatVolumeRequest,
+    UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -63,7 +65,7 @@ use tokio::{
     time::timeout,
 };
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, service::interceptor::InterceptedService, transport::Channel};
+use tonic::{Code, Request, service::interceptor::InterceptedService, transport::Channel};
 use tracing::{Instrument, debug, warn};
 use uuid::Uuid;
 
@@ -75,10 +77,77 @@ enum FailureHealthAction {
 
 const REMOTE_DISK_OPEN_WRITE_MAX_ATTEMPTS: usize = 2;
 const REMOTE_DISK_OPEN_WRITE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+const ENV_RUSTFS_METADATA_BATCH_READ: &str = "RUSTFS_METADATA_BATCH_READ";
+const LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC: &str = "RUSTFS_BATCH_METADATA_RPC";
+const BATCH_METADATA_RPC_OFF: &str = "off";
+const BATCH_METADATA_RPC_AUTO: &str = "auto";
+const BATCH_METADATA_RPC_ON: &str = "on";
+const BATCH_READ_VERSION_GATE_ATTEMPT: &str = "attempt";
+const BATCH_READ_VERSION_GATE_OFF_UNARY: &str = "off_unary";
+const BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED: &str = "fallback_unimplemented";
+const BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK: &str = "unsupported_no_fallback";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_DISK: &str = "remote_disk";
 const EVENT_REMOTE_DISK_HEALTH: &str = "remote_disk_health";
 const EVENT_REMOTE_DISK_RPC: &str = "remote_disk_rpc";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BatchMetadataRpcMode {
+    Off,
+    Auto,
+    On,
+}
+
+impl BatchMetadataRpcMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => BATCH_METADATA_RPC_OFF,
+            Self::Auto => BATCH_METADATA_RPC_AUTO,
+            Self::On => BATCH_METADATA_RPC_ON,
+        }
+    }
+
+    fn should_attempt(self) -> bool {
+        matches!(self, Self::Auto | Self::On)
+    }
+
+    fn should_fallback_on_unimplemented(self) -> bool {
+        matches!(self, Self::Auto)
+    }
+}
+
+fn parse_batch_metadata_rpc_mode(raw: &str) -> BatchMetadataRpcMode {
+    match raw.trim() {
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_AUTO) => BatchMetadataRpcMode::Auto,
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_ON) => BatchMetadataRpcMode::On,
+        value if value.eq_ignore_ascii_case(BATCH_METADATA_RPC_OFF) => BatchMetadataRpcMode::Off,
+        _ => BatchMetadataRpcMode::Off,
+    }
+}
+
+fn batch_metadata_rpc_mode_from_env() -> BatchMetadataRpcMode {
+    rustfs_utils::get_env_opt_str(ENV_RUSTFS_METADATA_BATCH_READ)
+        .or_else(|| rustfs_utils::get_env_opt_str(LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC))
+        .as_deref()
+        .map(parse_batch_metadata_rpc_mode)
+        .unwrap_or(BatchMetadataRpcMode::Off)
+}
+
+fn batch_metadata_rpc_mode() -> BatchMetadataRpcMode {
+    // The gate cannot change at runtime; parse it once instead of re-reading
+    // the environment on every batch RPC.
+    static MODE: std::sync::LazyLock<BatchMetadataRpcMode> = std::sync::LazyLock::new(batch_metadata_rpc_mode_from_env);
+    *MODE
+}
+
+fn record_batch_read_version_gate_decision(mode: BatchMetadataRpcMode, decision: &'static str) {
+    counter!(
+        "rustfs_remote_disk_batch_read_version_gate_total",
+        "mode" => mode.as_str(),
+        "decision" => decision
+    )
+    .increment(1);
+}
 
 async fn copy_stream_with_buffer<R, W>(reader: &mut R, writer: &mut W, buffer_size: usize) -> io::Result<u64>
 where
@@ -767,6 +836,86 @@ fn decode_msgpack_or_json<T: DeserializeOwned>(binary: &[u8], json: &str) -> Res
     }
 
     serde_json::from_str(json).map_err(Error::from)
+}
+
+fn decode_read_multiple_response_items(response: ReadMultipleResponse, endpoint: &Endpoint) -> Result<Vec<ReadMultipleResp>> {
+    if !response.read_multiple_resps_bin.is_empty() {
+        if !response.read_multiple_resps.is_empty()
+            && response.read_multiple_resps.len() != response.read_multiple_resps_bin.len()
+        {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                json_count = response.read_multiple_resps.len(),
+                msgpack_count = response.read_multiple_resps_bin.len(),
+                op = "read_multiple",
+                state = "response_count_mismatch",
+                "Remote disk ReadMultiple compatibility payload counts differ"
+            );
+        }
+
+        let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps_bin.len());
+        for (index, buf) in response.read_multiple_resps_bin.iter().enumerate() {
+            let resp = decode_msgpack_or_json::<ReadMultipleResp>(buf, "").map_err(|err| {
+                Error::other(format!("decode ReadMultipleResp msgpack item {index} from {endpoint} failed: {err}"))
+            })?;
+            read_multiple_resps.push(resp);
+        }
+        return Ok(read_multiple_resps);
+    }
+
+    let mut read_multiple_resps = Vec::with_capacity(response.read_multiple_resps.len());
+    for (index, json_str) in response.read_multiple_resps.iter().enumerate() {
+        let resp = serde_json::from_str::<ReadMultipleResp>(json_str)
+            .map_err(|err| Error::other(format!("decode ReadMultipleResp json item {index} from {endpoint} failed: {err}")))?;
+        read_multiple_resps.push(resp);
+    }
+
+    Ok(read_multiple_resps)
+}
+
+fn decode_batch_read_version_response_items(
+    response: BatchReadVersionResponse,
+    endpoint: &Endpoint,
+) -> Result<Vec<BatchReadVersionResp>> {
+    if !response.batch_read_version_resps_bin.is_empty() {
+        if !response.batch_read_version_resps.is_empty()
+            && response.batch_read_version_resps.len() != response.batch_read_version_resps_bin.len()
+        {
+            warn!(
+                event = EVENT_REMOTE_DISK_RPC,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                endpoint = %endpoint,
+                json_count = response.batch_read_version_resps.len(),
+                msgpack_count = response.batch_read_version_resps_bin.len(),
+                op = "batch_read_version",
+                state = "response_count_mismatch",
+                "Remote disk BatchReadVersion compatibility payload counts differ"
+            );
+        }
+
+        let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps_bin.len());
+        for (index, buf) in response.batch_read_version_resps_bin.iter().enumerate() {
+            let resp = decode_msgpack_or_json::<BatchReadVersionResp>(buf, "").map_err(|err| {
+                Error::other(format!("decode BatchReadVersionResp msgpack item {index} from {endpoint} failed: {err}"))
+            })?;
+            batch_read_version_resps.push(resp);
+        }
+        return Ok(batch_read_version_resps);
+    }
+
+    let mut batch_read_version_resps = Vec::with_capacity(response.batch_read_version_resps.len());
+    for (index, json_str) in response.batch_read_version_resps.iter().enumerate() {
+        let resp = serde_json::from_str::<BatchReadVersionResp>(json_str).map_err(|err| {
+            Error::other(format!("decode BatchReadVersionResp json item {index} from {endpoint} failed: {err}"))
+        })?;
+        batch_read_version_resps.push(resp);
+    }
+
+    Ok(batch_read_version_resps)
 }
 
 // TODO: all api need to handle errors
@@ -1462,6 +1611,99 @@ impl DiskAPI for RemoteDisk {
         .await
     }
 
+    #[tracing::instrument(skip(self, req))]
+    async fn batch_read_version(&self, req: BatchReadVersionReq) -> Result<Vec<BatchReadVersionResp>> {
+        validate_batch_read_version_item_count(req.items.len())?;
+
+        let mode = batch_metadata_rpc_mode();
+        if !mode.should_attempt() {
+            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_OFF_UNARY);
+            return batch_read_version_one_by_one(self, req).await;
+        }
+        record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_ATTEMPT);
+
+        debug!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            endpoint = %self.endpoint,
+            item_count = req.items.len(),
+            batch_metadata_rpc_mode = mode.as_str(),
+            op = "batch_read_version",
+            state = "started",
+            "Remote disk RPC started"
+        );
+        let batch_read_version_req = serde_json::to_string(&req)?;
+        let batch_read_version_req_bin = encode_msgpack(&req)?;
+
+        let batch_result = self
+            .execute_with_timeout_for_op(
+                "batch_read_version",
+                move || async move {
+                    let disk = self.disk_ref().await;
+                    let mut client = self
+                        .get_client()
+                        .await
+                        .map_err(|err| Error::other(format!("can not get client, err: {err}")))?;
+                    let request = Request::new(BatchReadVersionRequest {
+                        disk,
+                        batch_read_version_req,
+                        batch_read_version_req_bin: batch_read_version_req_bin.into(),
+                    });
+
+                    let response = match client.batch_read_version(request).await {
+                        Ok(response) => response.into_inner(),
+                        Err(status) if status.code() == Code::Unimplemented => {
+                            if mode.should_fallback_on_unimplemented() {
+                                record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED);
+                                warn!(
+                                    event = EVENT_REMOTE_DISK_RPC,
+                                    component = LOG_COMPONENT_ECSTORE,
+                                    subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                                    endpoint = %self.endpoint,
+                                    batch_metadata_rpc_mode = mode.as_str(),
+                                    op = "batch_read_version",
+                                    state = "fallback_unimplemented",
+                                    "Remote disk BatchReadVersion unsupported; falling back to unary read_version"
+                                );
+                                return Ok(None);
+                            }
+
+                            record_batch_read_version_gate_decision(mode, BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK);
+                            warn!(
+                                event = EVENT_REMOTE_DISK_RPC,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+                                endpoint = %self.endpoint,
+                                batch_metadata_rpc_mode = mode.as_str(),
+                                op = "batch_read_version",
+                                state = "unsupported_no_fallback",
+                                "Remote disk BatchReadVersion unsupported and explicit batch RPC mode forbids fallback"
+                            );
+                            return Err(Error::from(status));
+                        }
+                        Err(status) => return Err(Error::from(status)),
+                    };
+
+                    if !response.success {
+                        return Err(response.error.unwrap_or_default().into());
+                    }
+
+                    decode_batch_read_version_response_items(response, &self.endpoint).map(Some)
+                },
+                get_max_timeout_duration(),
+            )
+            .await?;
+
+        match batch_result {
+            Some(batch_read_version_resps) => Ok(batch_read_version_resps),
+            // Run the unary fallback outside the batch RPC deadline so each
+            // read_version keeps its own per-op timeout and health accounting
+            // instead of racing the whole batch against one drive timeout.
+            None => batch_read_version_one_by_one(self, req).await,
+        }
+    }
+
     #[tracing::instrument(level = "debug", skip(self))]
     async fn read_xl(&self, volume: &str, path: &str, read_data: bool) -> Result<RawFileInfo> {
         debug!(
@@ -2069,19 +2311,7 @@ impl DiskAPI for RemoteDisk {
                     return Err(response.error.unwrap_or_default().into());
                 }
 
-                let read_multiple_resps = if !response.read_multiple_resps_bin.is_empty() {
-                    response
-                        .read_multiple_resps_bin
-                        .into_iter()
-                        .filter_map(|buf| decode_msgpack_or_json::<ReadMultipleResp>(&buf, "").ok())
-                        .collect()
-                } else {
-                    response
-                        .read_multiple_resps
-                        .into_iter()
-                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(&json_str).ok())
-                        .collect()
-                };
+                let read_multiple_resps = decode_read_multiple_response_items(response, &self.endpoint)?;
 
                 Ok(read_multiple_resps)
             },
@@ -2411,6 +2641,196 @@ mod tests {
             },
             ..Default::default()
         }
+    }
+
+    fn sample_read_multiple_resp(file: &str, data: &[u8]) -> ReadMultipleResp {
+        ReadMultipleResp {
+            bucket: "bucket".to_string(),
+            prefix: "prefix".to_string(),
+            file: file.to_string(),
+            exists: true,
+            data: data.to_vec(),
+            ..Default::default()
+        }
+    }
+
+    fn sample_remote_endpoint() -> Endpoint {
+        Endpoint {
+            url: url::Url::parse("http://server:9000/disk-a").expect("endpoint URL should parse"),
+            is_local: false,
+            pool_idx: 0,
+            set_idx: 0,
+            disk_idx: 0,
+        }
+    }
+
+    #[test]
+    fn read_multiple_response_decode_prefers_msgpack_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let msgpack_resp = sample_read_multiple_resp("msgpack", b"binary");
+        let json_resp = sample_read_multiple_resp("json", b"fallback");
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            read_multiple_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
+            error: None,
+        };
+
+        let decoded = decode_read_multiple_response_items(response, &endpoint).expect("msgpack response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file, "msgpack");
+        assert_eq!(decoded[0].data, b"binary");
+    }
+
+    #[test]
+    fn read_multiple_response_decode_falls_back_to_json_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let json_resp = sample_read_multiple_resp("json", b"fallback");
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            read_multiple_resps_bin: Vec::new(),
+            error: None,
+        };
+
+        let decoded = decode_read_multiple_response_items(response, &endpoint).expect("json response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].file, "json");
+        assert_eq!(decoded[0].data, b"fallback");
+    }
+
+    #[test]
+    fn read_multiple_response_decode_reports_corrupt_msgpack_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = ReadMultipleResponse {
+            success: true,
+            read_multiple_resps: Vec::new(),
+            read_multiple_resps_bin: vec![
+                encode_msgpack(&sample_read_multiple_resp("ok", b"data"))
+                    .expect("msgpack response should encode")
+                    .into(),
+                bytes::Bytes::from_static(b"not-msgpack"),
+            ],
+            error: None,
+        };
+
+        let err = decode_read_multiple_response_items(response, &endpoint).expect_err("corrupt msgpack item should fail");
+        let err = err.to_string();
+
+        assert!(err.contains("ReadMultipleResp msgpack item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
+    fn sample_batch_read_version_resp(index: usize, path: &str, success: bool) -> BatchReadVersionResp {
+        BatchReadVersionResp {
+            index,
+            path: path.to_string(),
+            version_id: "version-a".to_string(),
+            success,
+            error: if success {
+                String::new()
+            } else {
+                "file version not found".to_string()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_prefers_msgpack_payloads() {
+        let endpoint = sample_remote_endpoint();
+        let msgpack_resp = sample_batch_read_version_resp(7, "msgpack-object", true);
+        let json_resp = sample_batch_read_version_resp(1, "json-object", false);
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: vec![serde_json::to_string(&json_resp).expect("json fallback should encode")],
+            batch_read_version_resps_bin: vec![encode_msgpack(&msgpack_resp).expect("msgpack response should encode").into()],
+            error: None,
+        };
+
+        let decoded = decode_batch_read_version_response_items(response, &endpoint).expect("msgpack response should decode");
+
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].index, 7);
+        assert_eq!(decoded[0].path, "msgpack-object");
+        assert!(decoded[0].success);
+    }
+
+    #[test]
+    fn batch_read_version_response_decode_reports_corrupt_msgpack_item() {
+        let endpoint = sample_remote_endpoint();
+        let response = BatchReadVersionResponse {
+            success: true,
+            batch_read_version_resps: Vec::new(),
+            batch_read_version_resps_bin: vec![
+                encode_msgpack(&sample_batch_read_version_resp(0, "ok", true))
+                    .expect("msgpack response should encode")
+                    .into(),
+                bytes::Bytes::from_static(b"not-msgpack"),
+            ],
+            error: None,
+        };
+
+        let err = decode_batch_read_version_response_items(response, &endpoint)
+            .expect_err("corrupt msgpack item should fail")
+            .to_string();
+
+        assert!(err.contains("BatchReadVersionResp msgpack item 1"), "unexpected error: {err}");
+        assert!(err.contains("server:9000"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_defaults_to_off_and_parses_supported_values() {
+        assert_eq!(parse_batch_metadata_rpc_mode(""), BatchMetadataRpcMode::Off);
+        assert_eq!(parse_batch_metadata_rpc_mode("off"), BatchMetadataRpcMode::Off);
+        assert_eq!(parse_batch_metadata_rpc_mode("auto"), BatchMetadataRpcMode::Auto);
+        assert_eq!(parse_batch_metadata_rpc_mode("on"), BatchMetadataRpcMode::On);
+        assert_eq!(parse_batch_metadata_rpc_mode("unknown"), BatchMetadataRpcMode::Off);
+        assert_eq!(BatchMetadataRpcMode::Off.as_str(), "off");
+        assert_eq!(BatchMetadataRpcMode::Auto.as_str(), "auto");
+        assert_eq!(BatchMetadataRpcMode::On.as_str(), "on");
+        assert!(!BatchMetadataRpcMode::Off.should_attempt());
+        assert!(BatchMetadataRpcMode::Auto.should_attempt());
+        assert!(BatchMetadataRpcMode::On.should_attempt());
+        assert_eq!(BATCH_READ_VERSION_GATE_ATTEMPT, "attempt");
+        assert_eq!(BATCH_READ_VERSION_GATE_OFF_UNARY, "off_unary");
+        assert_eq!(BATCH_READ_VERSION_GATE_FALLBACK_UNIMPLEMENTED, "fallback_unimplemented");
+        assert_eq!(BATCH_READ_VERSION_GATE_UNSUPPORTED_NO_FALLBACK, "unsupported_no_fallback");
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_uses_documented_env_before_legacy_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_METADATA_BATCH_READ, Some("auto")),
+                (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
+            ],
+            || {
+                assert_eq!(batch_metadata_rpc_mode_from_env(), BatchMetadataRpcMode::Auto);
+            },
+        );
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_falls_back_to_legacy_env_alias() {
+        temp_env::with_vars(
+            [
+                (ENV_RUSTFS_METADATA_BATCH_READ, None::<&str>),
+                (LEGACY_ENV_RUSTFS_BATCH_METADATA_RPC, Some("on")),
+            ],
+            || {
+                assert_eq!(batch_metadata_rpc_mode_from_env(), BatchMetadataRpcMode::On);
+            },
+        );
+    }
+
+    #[test]
+    fn batch_metadata_rpc_mode_only_auto_falls_back_on_unimplemented() {
+        assert!(!BatchMetadataRpcMode::Off.should_fallback_on_unimplemented());
+        assert!(BatchMetadataRpcMode::Auto.should_fallback_on_unimplemented());
+        assert!(!BatchMetadataRpcMode::On.should_fallback_on_unimplemented());
     }
 
     #[test]

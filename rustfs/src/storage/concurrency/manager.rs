@@ -679,7 +679,6 @@ mod integration_tests {
     use super::ConcurrencyManager;
     use crate::storage::storage_api::concurrency_consumer::PutObjectGuard;
     use rustfs_concurrency::{AdmissionState, WorkloadAdmissionSnapshotProvider, WorkloadClass};
-    use rustfs_config::MI_B;
     use rustfs_io_core::io_profile::{AccessPattern, StorageMedia};
     use serial_test::serial;
     use std::time::Duration;
@@ -989,13 +988,10 @@ mod integration_tests {
             StorageMedia::Hdd => config.hdd_buffer_cap,
             StorageMedia::Unknown => config.ssd_buffer_cap,
         };
-        let expected_max = media_cap.min(MI_B);
+        let expected_max = media_cap;
 
-        // Large base buffer should be constrained by storage cap first, then global clamp.
-        assert_eq!(
-            strategy.buffer_size, expected_max,
-            "Buffer should be capped by media profile and global clamp"
-        );
+        // Large base buffer should be constrained by the active storage media cap.
+        assert_eq!(strategy.buffer_size, expected_max, "Buffer should be capped by the active media profile");
     }
 
     #[tokio::test]

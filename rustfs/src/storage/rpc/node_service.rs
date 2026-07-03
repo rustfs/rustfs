@@ -495,6 +495,13 @@ impl Node for NodeService {
         self.handle_read_version(request).await
     }
 
+    async fn batch_read_version(
+        &self,
+        request: Request<BatchReadVersionRequest>,
+    ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        self.handle_batch_read_version(request).await
+    }
+
     async fn read_xl(&self, request: Request<ReadXlRequest>) -> Result<Response<ReadXlResponse>, Status> {
         self.handle_read_xl(request).await
     }

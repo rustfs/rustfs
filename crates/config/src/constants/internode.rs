@@ -32,6 +32,28 @@ pub const DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS: u64 = 3;
 pub const ENV_INTERNODE_RPC_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS";
 pub const DEFAULT_INTERNODE_RPC_TIMEOUT_SECS: u64 = 10;
 
+/// Profile selector for conservative internode HTTP data-plane client tuning.
+pub const ENV_INTERNODE_HTTP_TUNING_PROFILE: &str = "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE";
+pub const DEFAULT_INTERNODE_HTTP_TUNING_PROFILE: &str = "legacy";
+
+/// Internode HTTP connection pool maximum idle connections per host.
+pub const ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST: &str = "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST";
+
+/// Internode HTTP connection pool idle timeout in seconds.
+pub const ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS: &str = "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS";
+
+/// Internode HTTP/2 initial stream window size in bytes.
+pub const ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE";
+
+/// Internode HTTP/2 initial connection window size in bytes.
+pub const ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE: &str = "RUSTFS_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE";
+
+/// Whether internode HTTP/2 adaptive window sizing is enabled.
+pub const ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW: &str = "RUSTFS_INTERNODE_HTTP2_ADAPTIVE_WINDOW";
+
+/// Internode HTTP proxy mode: legacy, off, or system.
+pub const ENV_INTERNODE_HTTP_PROXY: &str = "RUSTFS_INTERNODE_HTTP_PROXY";
+
 /// Environment variable for selecting the internode data-plane transport backend.
 pub const ENV_RUSTFS_INTERNODE_DATA_TRANSPORT: &str = "RUSTFS_INTERNODE_DATA_TRANSPORT";
 pub const DEFAULT_INTERNODE_DATA_TRANSPORT: &str = "tcp-http";
@@ -53,6 +75,7 @@ mod tests {
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_INTERVAL_SECS, 5);
         assert_eq!(DEFAULT_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS, 3);
         assert_eq!(DEFAULT_INTERNODE_RPC_TIMEOUT_SECS, 10);
+        assert_eq!(DEFAULT_INTERNODE_HTTP_TUNING_PROFILE, "legacy");
     }
 
     #[test]
@@ -68,6 +91,19 @@ mod tests {
             "RUSTFS_INTERNODE_HTTP2_KEEPALIVE_TIMEOUT_SECS"
         );
         assert_eq!(ENV_INTERNODE_RPC_TIMEOUT_SECS, "RUSTFS_INTERNODE_RPC_TIMEOUT_SECS");
+        assert_eq!(ENV_INTERNODE_HTTP_TUNING_PROFILE, "RUSTFS_INTERNODE_HTTP_TUNING_PROFILE");
+        assert_eq!(ENV_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST, "RUSTFS_INTERNODE_HTTP_POOL_MAX_IDLE_PER_HOST");
+        assert_eq!(ENV_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS, "RUSTFS_INTERNODE_HTTP_POOL_IDLE_TIMEOUT_SECS");
+        assert_eq!(
+            ENV_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_HTTP2_INITIAL_STREAM_WINDOW_SIZE"
+        );
+        assert_eq!(
+            ENV_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE,
+            "RUSTFS_INTERNODE_HTTP2_INITIAL_CONNECTION_WINDOW_SIZE"
+        );
+        assert_eq!(ENV_INTERNODE_HTTP2_ADAPTIVE_WINDOW, "RUSTFS_INTERNODE_HTTP2_ADAPTIVE_WINDOW");
+        assert_eq!(ENV_INTERNODE_HTTP_PROXY, "RUSTFS_INTERNODE_HTTP_PROXY");
         assert_eq!(ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, "RUSTFS_INTERNODE_DATA_TRANSPORT");
         assert_eq!(DEFAULT_INTERNODE_DATA_TRANSPORT, "tcp-http");
         assert_eq!(INTERNODE_DATA_TRANSPORT_TCP, "tcp");

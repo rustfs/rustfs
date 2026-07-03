@@ -36,8 +36,8 @@ use super::wedge_watchdog;
 use crate::common::client::s3::StorageBackend;
 use crate::common::session::{Protocol, ProtocolPrincipal, SessionContext};
 use russh::keys::{self, PrivateKey, PublicKeyBase64};
-use russh::server::{Auth, Msg, Session};
-use russh::{Channel, ChannelId, MethodKind, MethodSet, Pty, Sig};
+use russh::server::{Auth, ChannelOpenHandle, Msg, Session};
+use russh::{Channel, ChannelId, ChannelOpenFailure, MethodKind, MethodSet, Pty, Sig};
 use rustfs_config::{
     DEFAULT_SFTP_HOST_KEY_RELOAD_ENABLE, DEFAULT_SFTP_HOST_KEY_RELOAD_INTERVAL, ENV_SFTP_HOST_KEY_RELOAD_ENABLE,
     ENV_SFTP_HOST_KEY_RELOAD_INTERVAL,
@@ -1135,15 +1135,19 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         }
     }
 
-    #[tracing::instrument(level = "debug", skip(self, channel, _session), fields(peer = %self.peer_addr))]
+    #[tracing::instrument(level = "debug", skip(self, channel, reply, _session), fields(peer = %self.peer_addr))]
     fn channel_open_session(
         &mut self,
         channel: Channel<Msg>,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
         let id = channel.id();
         self.channels.insert(id, channel);
-        async { Ok(true) }
+        async move {
+            reply.accept().await;
+            Ok(())
+        }
     }
 
     #[tracing::instrument(level = "debug", skip(self, _session), fields(peer = %self.peer_addr, channel = ?channel))]
@@ -1404,13 +1408,13 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         async { Ok(false) }
     }
 
-    // Channel-open rejections. russh 0.60 defaults all of these to
-    // Ok(false), but we override them explicitly with a warn log so
+    // Channel-open rejections. russh defaults to rejecting dropped channel-open
+    // handles, but we override them explicitly with a warn log so
     // (a) probe attempts are visible in operator logs and
     // (b) a future russh default flip cannot silently allow these
     //     channel types.
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
     fn channel_open_direct_tcpip(
         &mut self,
         _channel: Channel<Msg>,
@@ -1418,12 +1422,16 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, host = %host_to_connect, port = port_to_connect))]
     fn channel_open_forwarded_tcpip(
         &mut self,
         _channel: Channel<Msg>,
@@ -1431,30 +1439,42 @@ impl<S: StorageBackend + Send + Sync + 'static> russh::server::Handler for SshSe
         port_to_connect: u32,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr))]
     fn channel_open_x11(
         &mut self,
         _channel: Channel<Msg>,
         _originator_address: &str,
         _originator_port: u32,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 
-    #[tracing::instrument(level = "warn", skip(self, _channel, _session), fields(peer = %self.peer_addr, socket = %socket_path))]
+    #[tracing::instrument(level = "warn", skip(self, _channel, reply, _session), fields(peer = %self.peer_addr, socket = %socket_path))]
     fn channel_open_direct_streamlocal(
         &mut self,
         _channel: Channel<Msg>,
         socket_path: &str,
+        reply: ChannelOpenHandle,
         _session: &mut Session,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        async { Ok(false) }
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        async move {
+            reply.reject(ChannelOpenFailure::AdministrativelyProhibited).await;
+            Ok(())
+        }
     }
 }
 

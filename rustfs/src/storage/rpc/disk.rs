@@ -14,8 +14,8 @@
 
 use super::NodeService;
 use crate::storage::storage_api::rpc_consumer::node_service::{
-    DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq, ReadMultipleResp, ReadOptions,
-    StorageDiskRpcExt as _, UpdateMetadataOpts,
+    BatchReadVersionReq, BatchReadVersionResp, DeleteOptions, DiskError, DiskInfoOptions, FileInfoVersions, ReadMultipleReq,
+    ReadMultipleResp, ReadOptions, StorageDiskRpcExt as _, UpdateMetadataOpts, validate_batch_read_version_item_count,
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use bytes::Bytes;
@@ -55,6 +55,40 @@ fn encode_msgpack_named<T: serde::Serialize>(value: &T, value_name: &str) -> std
     Ok(serializer.into_inner())
 }
 
+fn encode_read_multiple_response_payloads(
+    read_multiple_resps: &[ReadMultipleResp],
+) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
+    let mut read_multiple_resps_json = Vec::with_capacity(read_multiple_resps.len());
+    let mut read_multiple_resps_bin = Vec::with_capacity(read_multiple_resps.len());
+
+    for read_multiple_resp in read_multiple_resps {
+        read_multiple_resps_json.push(
+            serde_json::to_string(read_multiple_resp)
+                .map_err(|err| DiskError::other(format!("encode ReadMultipleResp json failed: {err}")))?,
+        );
+        read_multiple_resps_bin.push(Bytes::from(encode_msgpack(read_multiple_resp, "ReadMultipleResp")?));
+    }
+
+    Ok((read_multiple_resps_json, read_multiple_resps_bin))
+}
+
+fn encode_batch_read_version_response_payloads(
+    batch_read_version_resps: &[BatchReadVersionResp],
+) -> std::result::Result<(Vec<String>, Vec<Bytes>), DiskError> {
+    let mut batch_read_version_resps_json = Vec::with_capacity(batch_read_version_resps.len());
+    let mut batch_read_version_resps_bin = Vec::with_capacity(batch_read_version_resps.len());
+
+    for batch_read_version_resp in batch_read_version_resps {
+        batch_read_version_resps_json.push(
+            serde_json::to_string(batch_read_version_resp)
+                .map_err(|err| DiskError::other(format!("encode BatchReadVersionResp json failed: {err}")))?,
+        );
+        batch_read_version_resps_bin.push(Bytes::from(encode_msgpack(batch_read_version_resp, "BatchReadVersionResp")?));
+    }
+
+    Ok((batch_read_version_resps_json, batch_read_version_resps_bin))
+}
+
 impl NodeService {
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
         let request = request.into_inner();
@@ -92,7 +126,7 @@ impl NodeService {
             Ok(Response::new(DiskInfoResponse {
                 success: false,
                 disk_info: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -116,7 +150,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeleteVolumeResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -144,16 +178,18 @@ impl NodeService {
             };
             match disk.read_multiple(read_multiple_req).await {
                 Ok(read_multiple_resps) => {
-                    let read_multiple_resps: Vec<String> = read_multiple_resps
-                        .into_iter()
-                        .filter_map(|read_multiple_resp| serde_json::to_string(&read_multiple_resp).ok())
-                        .collect();
-                    let read_multiple_resps_bin = read_multiple_resps
-                        .iter()
-                        .filter_map(|json_str| serde_json::from_str::<ReadMultipleResp>(json_str).ok())
-                        .filter_map(|resp| encode_msgpack(&resp, "ReadMultipleResp").ok())
-                        .map(Into::into)
-                        .collect();
+                    let (read_multiple_resps, read_multiple_resps_bin) =
+                        match encode_read_multiple_response_payloads(&read_multiple_resps) {
+                            Ok(payloads) => payloads,
+                            Err(err) => {
+                                return Ok(Response::new(ReadMultipleResponse {
+                                    success: false,
+                                    read_multiple_resps: Vec::new(),
+                                    read_multiple_resps_bin: Vec::new(),
+                                    error: Some(err.into()),
+                                }));
+                            }
+                        };
 
                     Ok(Response::new(ReadMultipleResponse {
                         success: true,
@@ -174,7 +210,77 @@ impl NodeService {
                 success: false,
                 read_multiple_resps: Vec::new(),
                 read_multiple_resps_bin: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
+            }))
+        }
+    }
+
+    pub(super) async fn handle_batch_read_version(
+        &self,
+        request: Request<BatchReadVersionRequest>,
+    ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        let request = request.into_inner();
+        if let Some(disk) = self.find_disk(&request.disk).await {
+            let batch_read_version_req: BatchReadVersionReq = match decode_msgpack_or_json(
+                &request.batch_read_version_req_bin,
+                &request.batch_read_version_req,
+                "BatchReadVersionReq",
+            ) {
+                Ok(batch_read_version_req) => batch_read_version_req,
+                Err(err) => {
+                    return Ok(Response::new(BatchReadVersionResponse {
+                        success: false,
+                        batch_read_version_resps: Vec::new(),
+                        batch_read_version_resps_bin: Vec::new(),
+                        error: Some(DiskError::other(format!("decode BatchReadVersionReq failed: {err}")).into()),
+                    }));
+                }
+            };
+
+            if let Err(err) = validate_batch_read_version_item_count(batch_read_version_req.items.len()) {
+                return Ok(Response::new(BatchReadVersionResponse {
+                    success: false,
+                    batch_read_version_resps: Vec::new(),
+                    batch_read_version_resps_bin: Vec::new(),
+                    error: Some(err.into()),
+                }));
+            }
+
+            match disk.batch_read_version(batch_read_version_req).await {
+                Ok(batch_read_version_resps) => {
+                    let (batch_read_version_resps, batch_read_version_resps_bin) =
+                        match encode_batch_read_version_response_payloads(&batch_read_version_resps) {
+                            Ok(payloads) => payloads,
+                            Err(err) => {
+                                return Ok(Response::new(BatchReadVersionResponse {
+                                    success: false,
+                                    batch_read_version_resps: Vec::new(),
+                                    batch_read_version_resps_bin: Vec::new(),
+                                    error: Some(err.into()),
+                                }));
+                            }
+                        };
+
+                    Ok(Response::new(BatchReadVersionResponse {
+                        success: true,
+                        batch_read_version_resps,
+                        batch_read_version_resps_bin,
+                        error: None,
+                    }))
+                }
+                Err(err) => Ok(Response::new(BatchReadVersionResponse {
+                    success: false,
+                    batch_read_version_resps: Vec::new(),
+                    batch_read_version_resps_bin: Vec::new(),
+                    error: Some(err.into()),
+                })),
+            }
+        } else {
+            Ok(Response::new(BatchReadVersionResponse {
+                success: false,
+                batch_read_version_resps: Vec::new(),
+                batch_read_version_resps_bin: Vec::new(),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -228,7 +334,7 @@ impl NodeService {
             Ok(Response::new(DeleteVersionsResponse {
                 success: false,
                 errors: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -285,7 +391,7 @@ impl NodeService {
             Ok(Response::new(DeleteVersionResponse {
                 success: false,
                 raw_file_info: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -330,7 +436,7 @@ impl NodeService {
                 success: false,
                 raw_file_info: String::new(),
                 raw_file_info_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -392,7 +498,7 @@ impl NodeService {
                 success: false,
                 file_info: String::new(),
                 file_info_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -425,7 +531,7 @@ impl NodeService {
         } else {
             Ok(Response::new(WriteMetadataResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -469,7 +575,7 @@ impl NodeService {
         } else {
             Ok(Response::new(UpdateMetadataResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -496,7 +602,7 @@ impl NodeService {
             Ok(Response::new(ReadMetadataResponse {
                 success: false,
                 data: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -520,7 +626,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeletePathsResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -554,7 +660,7 @@ impl NodeService {
             Ok(Response::new(StatVolumeResponse {
                 success: false,
                 volume_info: String::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -587,7 +693,7 @@ impl NodeService {
             Ok(Response::new(ListVolumesResponse {
                 success: false,
                 volume_infos: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -611,7 +717,7 @@ impl NodeService {
         } else {
             Ok(Response::new(MakeVolumeResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -635,7 +741,7 @@ impl NodeService {
         } else {
             Ok(Response::new(MakeVolumesResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -697,7 +803,7 @@ impl NodeService {
                 success: false,
                 rename_data_resp: String::new(),
                 rename_data_resp_bin: Vec::new().into(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -721,7 +827,7 @@ impl NodeService {
             Ok(Response::new(ListDirResponse {
                 success: false,
                 volumes: Vec::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -752,7 +858,7 @@ impl NodeService {
         } else {
             Ok(Response::new(RenameFileResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -785,7 +891,7 @@ impl NodeService {
         } else {
             Ok(Response::new(RenamePartResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -834,7 +940,7 @@ impl NodeService {
             Ok(Response::new(CheckPartsResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -874,7 +980,7 @@ impl NodeService {
             Ok(Response::new(ReadPartsResponse {
                 success: false,
                 object_part_infos: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -923,7 +1029,7 @@ impl NodeService {
             Ok(Response::new(VerifyFileResponse {
                 success: false,
                 check_parts_resp: "".to_string(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -953,7 +1059,7 @@ impl NodeService {
         } else {
             Ok(Response::new(DeleteResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -992,7 +1098,7 @@ impl NodeService {
             metrics.record_error_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
             Ok(Response::new(WriteAllResponse {
                 success: false,
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1037,7 +1143,7 @@ impl NodeService {
             Ok(Response::new(ReadAllResponse {
                 success: false,
                 data: Bytes::new(),
-                error: Some(DiskError::other("can not find disk".to_string()).into()),
+                error: Some(DiskError::other("cannot find disk".to_string()).into()),
             }))
         }
     }
@@ -1045,7 +1151,12 @@ impl NodeService {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_msgpack_or_json, encode_msgpack};
+    use super::{
+        decode_msgpack_or_json, encode_batch_read_version_response_payloads, encode_msgpack,
+        encode_read_multiple_response_payloads,
+    };
+    use crate::storage::storage_api::ReadMultipleResp;
+    use crate::storage::storage_api::rpc_consumer::node_service::BatchReadVersionResp;
     use serde::{Deserialize, Serialize};
 
     #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -1079,5 +1190,69 @@ mod tests {
                 count: 7,
             }
         );
+    }
+
+    #[test]
+    fn encode_read_multiple_response_payloads_keeps_json_and_msgpack_in_sync() {
+        let responses = vec![
+            ReadMultipleResp {
+                bucket: "bucket".to_string(),
+                prefix: "prefix".to_string(),
+                file: "a".to_string(),
+                exists: true,
+                data: b"alpha".to_vec(),
+                ..Default::default()
+            },
+            ReadMultipleResp {
+                bucket: "bucket".to_string(),
+                prefix: "prefix".to_string(),
+                file: "b".to_string(),
+                exists: true,
+                data: b"beta".to_vec(),
+                ..Default::default()
+            },
+        ];
+
+        let (json_payloads, msgpack_payloads) =
+            encode_read_multiple_response_payloads(&responses).expect("read multiple responses should encode");
+
+        assert_eq!(json_payloads.len(), responses.len());
+        assert_eq!(msgpack_payloads.len(), responses.len());
+
+        let json_decoded: ReadMultipleResp =
+            serde_json::from_str(&json_payloads[0]).expect("json read multiple response should decode");
+        let msgpack_decoded = decode_msgpack_or_json::<ReadMultipleResp>(&msgpack_payloads[0], "", "ReadMultipleResp")
+            .expect("msgpack read multiple response should decode");
+
+        assert_eq!(json_decoded.file, responses[0].file);
+        assert_eq!(msgpack_decoded.file, responses[0].file);
+        assert_eq!(msgpack_decoded.data, responses[0].data);
+    }
+
+    #[test]
+    fn encode_batch_read_version_response_payloads_keeps_json_and_msgpack_in_sync() {
+        let responses = vec![BatchReadVersionResp {
+            index: 3,
+            path: "object-a".to_string(),
+            version_id: "version-a".to_string(),
+            success: false,
+            error: "file version not found".to_string(),
+            ..Default::default()
+        }];
+
+        let (json_payloads, msgpack_payloads) =
+            encode_batch_read_version_response_payloads(&responses).expect("batch read version responses should encode");
+
+        assert_eq!(json_payloads.len(), responses.len());
+        assert_eq!(msgpack_payloads.len(), responses.len());
+
+        let json_decoded: BatchReadVersionResp =
+            serde_json::from_str(&json_payloads[0]).expect("json batch read version response should decode");
+        let msgpack_decoded = decode_msgpack_or_json::<BatchReadVersionResp>(&msgpack_payloads[0], "", "BatchReadVersionResp")
+            .expect("msgpack batch read version response should decode");
+
+        assert_eq!(json_decoded.index, responses[0].index);
+        assert_eq!(msgpack_decoded.path, responses[0].path);
+        assert_eq!(msgpack_decoded.error, responses[0].error);
     }
 }
