@@ -19,12 +19,9 @@ pub mod bandwidth;
 pub mod bucket_target_sys;
 pub mod error;
 pub mod lifecycle;
-#[path = "../metadata/bucket.rs"]
 pub mod metadata;
-#[path = "../metadata/bucket_sys.rs"]
 pub mod metadata_sys;
 #[cfg(test)]
-#[path = "../metadata/bucket_test.rs"]
 mod metadata_test;
 pub mod migration;
 mod msgp_decode;

@@ -1209,7 +1209,7 @@ fi
     --glob '!**/ecstore_test_compat/**' \
     --glob '!**/ecstore_fuzz_compat.rs' \
     --glob '!target/**' \
-    | rg -v '^(rustfs/src/(admin/mod|app/mod)\.rs|rustfs/src/storage/storage_api\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
+    | rg -v '^(rustfs/src/(admin/mod|app/mod)\.rs|rustfs/src/storage/storage_api\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
 ) |
   cat >"$DIRECT_ECSTORE_IMPORT_HITS_FILE"
 
@@ -1606,7 +1606,7 @@ fi
     --glob '!**/ecstore_compat.rs' \
     --glob '!**/ecstore_test_compat.rs' \
     --glob '!**/ecstore_test_compat/**' |
-    rg -v '^(fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/storage_api\.rs):' || true
+    rg -v '^(fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs|crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|rustfs/src/admin/mod\.rs|rustfs/src/app/mod\.rs|rustfs/src/storage/storage_api\.rs):' || true
 ) >"$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE"
 
 if [[ -s "$ALL_ECSTORE_API_RAW_SUBPATH_HITS_FILE" ]]; then
@@ -1617,9 +1617,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename '^(?:pub\(crate\) )?use rustfs_ecstore::api::[a-z_]+ as ecstore_[a-z_]+;' \
     crates/heal/src/heal/storage_api.rs \
-    crates/heal/tests/endpoint_index_test/storage_api.rs \
-    crates/heal/tests/heal_bug_fixes_test/storage_api.rs \
-    crates/heal/tests/heal_integration_test/storage_api.rs \
+    crates/heal/tests/storage_api.rs \
     crates/iam/src/lib.rs \
     crates/notify/src/lib.rs \
     crates/obs/src/metrics/mod.rs \
@@ -1645,9 +1643,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename '^(?:pub\(crate\)\s+)?use\s+rustfs_ecstore::api::[a-z_]+\s*;|^(?:pub\(crate\)\s+)?use\s+rustfs_ecstore::api::[a-z_]+::\*\s*;' \
     crates/heal/src/heal/storage_api.rs \
-    crates/heal/tests/endpoint_index_test/storage_api.rs \
-    crates/heal/tests/heal_bug_fixes_test/storage_api.rs \
-    crates/heal/tests/heal_integration_test/storage_api.rs \
+    crates/heal/tests/storage_api.rs \
     crates/iam/src/lib.rs \
     crates/notify/src/lib.rs \
     crates/obs/src/metrics/mod.rs \
@@ -1673,9 +1669,7 @@ fi
   cd "$ROOT_DIR"
   rg -n --with-filename 'rustfs_ecstore::api::[a-z_]+::' \
     crates/heal/src/heal/storage_api.rs \
-    crates/heal/tests/endpoint_index_test/storage_api.rs \
-    crates/heal/tests/heal_bug_fixes_test/storage_api.rs \
-    crates/heal/tests/heal_integration_test/storage_api.rs \
+    crates/heal/tests/storage_api.rs \
     crates/iam/src/lib.rs \
     crates/notify/src/lib.rs \
     crates/obs/src/metrics/mod.rs \
@@ -2036,8 +2030,8 @@ fi
     rustfs/src/storage/helper.rs \
     rustfs/src/storage/concurrency/manager.rs \
     rustfs/src/storage/sse.rs \
-    rustfs/src/storage/rpc/disk.rs \
-    rustfs/src/storage/rpc/health.rs \
+    rustfs/src/storage/rpc/node_service/disk.rs \
+    rustfs/src/storage/rpc/node_service/health.rs \
     rustfs/src/storage/rpc/http_service.rs \
     --glob '*.rs' || true
 ) >"$RUSTFS_STORAGE_RUNTIME_SOURCE_BYPASS_HITS_FILE"
@@ -2559,7 +2553,7 @@ fi
     crates/scanner/tests \
     crates/e2e_test/src \
     --glob '*.rs' \
-    | rg -v '^(crates/e2e_test/src/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs):' || true
+    | rg -v '^(crates/e2e_test/src/storage_api\.rs|crates/heal/tests/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs):' || true
 ) >"$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE"
 
 if [[ -s "$EXTERNAL_TEST_ECSTORE_COMPAT_BYPASS_HITS_FILE" ]]; then
@@ -2593,7 +2587,7 @@ fi
     crates/scanner/tests \
     fuzz/fuzz_targets \
     --glob '*.rs' |
-    rg -v '^(crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
+    rg -v '^(crates/e2e_test/src/storage_api\.rs|crates/heal/src/heal/storage_api\.rs|crates/heal/tests/storage_api\.rs|crates/iam/src/storage_api\.rs|crates/notify/src/storage_api\.rs|crates/obs/src/metrics/storage_api\.rs|crates/protocols/src/swift/storage_api\.rs|crates/s3select-api/src/storage_api\.rs|crates/scanner/src/storage_api\.rs|crates/scanner/tests/storage_api/mod\.rs|fuzz/fuzz_targets/(bucket_validation_storage_api|path_containment_storage_api)\.rs):' || true
 ) >"$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE"
 
 if [[ -s "$EXTERNAL_ECSTORE_API_BOUNDARY_HITS_FILE" ]]; then
@@ -3777,7 +3771,7 @@ fi
   rg -n --with-filename '\bGLOBAL_(BucketMetadataSys|BUCKET_METADATA_SYS)\b' \
     crates rustfs fuzz \
     --glob '*.rs' |
-    rg -v '^crates/ecstore/src/metadata/bucket_sys\.rs:' || true
+    rg -v '^crates/ecstore/src/bucket/metadata_sys\.rs:' || true
 ) >"$GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE"
 
 if [[ -s "$GLOBAL_BUCKET_METADATA_SYS_BYPASS_HITS_FILE" ]]; then
@@ -4816,7 +4810,7 @@ fi
   rg -n --with-filename 'rustfs_ecstore::api::|rustfs_storage_api' \
     crates/heal/tests \
     --glob '*.rs' |
-    rg -v '^crates/heal/tests/(endpoint_index_test|heal_bug_fixes_test|heal_integration_test)/storage_api\.rs:' || true
+    rg -v '^crates/heal/tests/storage_api\.rs:' || true
 ) >"$HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE"
 
 if [[ -s "$HEAL_STORAGE_API_TEST_BYPASS_HITS_FILE" ]]; then
@@ -5187,16 +5181,16 @@ require_source_contains \
 (
   cd "$ROOT_DIR"
   {
-    [[ -e crates/ecstore/src/bucket/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata.rs'
-    [[ -e crates/ecstore/src/bucket/metadata_sys.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_sys.rs'
-    [[ -e crates/ecstore/src/bucket/metadata_test.rs ]] && printf '%s\n' 'crates/ecstore/src/bucket/metadata_test.rs'
-    [[ -e crates/ecstore/src/set_disk/metadata.rs ]] && printf '%s\n' 'crates/ecstore/src/set_disk/metadata.rs'
+    [[ -e crates/ecstore/src/metadata/bucket.rs ]] && printf '%s\n' 'crates/ecstore/src/metadata/bucket.rs'
+    [[ -e crates/ecstore/src/metadata/bucket_sys.rs ]] && printf '%s\n' 'crates/ecstore/src/metadata/bucket_sys.rs'
+    [[ -e crates/ecstore/src/metadata/bucket_test.rs ]] && printf '%s\n' 'crates/ecstore/src/metadata/bucket_test.rs'
+    [[ -e crates/ecstore/src/metadata/set_disk.rs ]] && printf '%s\n' 'crates/ecstore/src/metadata/set_disk.rs'
     true
   }
 ) >"$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE"
 
 if [[ -s "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE" ]]; then
-  report_failure "ECStore metadata modules must stay under the metadata owner directory: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
+  report_failure "ECStore metadata modules must use canonical bucket/set_disk module directories: $(paste -sd '; ' "$ECSTORE_OLD_METADATA_OWNER_PATH_HITS_FILE")"
 fi
 
 rg -n --with-filename '#\[path = "(data_movement|layout|core|store|diagnostics|services|io_support|runtime)/' \
